@@ -3300,6 +3300,81 @@ packaging question below from deciding anyone's security posture.
 This is what runs: "How the provider is chosen" above has no host rung,
 and `taste_devcontainer::substrate` has no `Provider::Local`.
 
+### Startup, step by step
+
+What happens between a window opening and the primary running, in order,
+with what may act on the primary at each step (audited 2026-09-21; the
+code is `window.rs` → `EnvironmentRegistry::reconcile`, and the
+supervisor's `reload_locked_with`).
+
+1. **The window.** `EnvironmentRegistry::new` builds the registry with
+   `Substrate::unresolved()` — nothing runs against it; its target is a
+   podman connection that does not exist — and the primary's supervisor
+   in `NoConfig`. The window claims supervision of the folder (a file
+   lock). A window that is **not** supervising sets
+   `Substrate::not_supervising()` and checks the primary at once, whose
+   every start then refuses by name; nothing below happens in it.
+2. **Persisted tabs** are opened where the checkout is now, which is the
+   folder; `Event::CheckoutMoved` carries them into the VM later.
+3. **The chats** come up. The primary's agent is **held** while its
+   environment is in transition (`Preparing`, `Building`, `Starting`)
+   and spawned when it settles — inside the container when there is one,
+   outside when the environment settled without one, so the coordinator
+   can still speak. Agent environments' agents wait the same way.
+4. **Reconcile**, on the runtime, supervising windows only. The primary's
+   row says each step (`Preparing { what }`, `announce_preparing`, never
+   over a state that knows more):
+   1. *bringing up the workspace's VM*: the ladder
+      (`Substrate::resolve_with`) — the named connection, else the pool
+      (`Pool::ensure_one`: the VM the primary's placement names,
+      `pinned_primary_vm`, else the first, else a new one), else nothing.
+      The guest image is fetched here if it is not on the machine, drawn
+      in the backlog's header.
+   2. the legacy sweep and the stale-VM listing (reports, never removes
+      a VM).
+   3. environments on disk are restored (`restore_from_disk`, not the
+      primary), every VM a restored checkout is in is brought up and
+      registered, and one keeper per VM is connected.
+   4. *placing the checkout in the VM*: `place_primary_now`, one caller
+      at a time — the checkout made from the folder with its uncommitted
+      work, or synced when it is there. The folder becomes the peer.
+      `Event::CheckoutMoved` re-aims the panes.
+   5. environments whose checkouts are still on this host are moved into
+      the VM (`migrate_environment`); environments whose VM is gone are
+      placed anew (`replace_environment`).
+   6. each restored environment: `recheck`, its config watch, its agent
+      hosting probe.
+   7. **the primary's first check**: `recheck` adopts a container of its
+      own left running by a previous window, or reads the config and
+      says `ConfigDetected`; its config watch is armed (the keeper's
+      watch on `.devcontainer/` in the VM, since the folder is not the
+      checkout); its hosting probe runs.
+   8. every supervisor confirms its container is still there
+      (`reconcile_container_presence`); the substrate's note or log line
+      is said once.
+5. **The baseline starts itself.** The window, on the primary's
+   `ConfigDetected` or `NoConfig` (never on `Preparing`), calls
+   `reload_baseline`, which is the one automatic start: the project's
+   own build stays the user's Rebuild or the agent's approved
+   `devcontainer_reload`. It returns at once when a baseline is already
+   running.
+6. **Every start** (`reload_locked_with`) logs its first line as what
+   asked for it and what state it found, so a container replaced under
+   its agent is attributable. Then, in order: a substrate still pending
+   → the environment waits in `Preparing`; a checkout the substrate
+   cannot host → placed first when there is a placer (the primary's),
+   refused with the reason otherwise; the config resolved and validated
+   where the files are; the previous container torn down; the grant and
+   the primary's priority applied; the container run.
+
+What may start the primary, exhaustively: the window's automatic
+baseline (step 5); the banner's Start or Rebuild and the row's Rebuild
+(`console::rebuild_environment`); the agent's `devcontainer_reload`,
+which asks when the config has drifted and runs without asking when it
+has not; a typed send into a stopped environment (`revive_wanted`, never
+while in transition); and a new environment's own start. Nothing else
+tears a running container down except Stop and Destroy.
+
 ### The plan
 
 **The files service** (`taste_core::files::Files`, and the **keeper**,

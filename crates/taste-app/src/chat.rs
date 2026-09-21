@@ -187,8 +187,21 @@ fn container_gate(facts: GateFacts) -> Gate {
     // The user's own environment is exempt: its chat is the coordinator,
     // and one that cannot speak until a container is up cannot tell the
     // user why it is silent.
-    if facts.primary || facts.inside_container || facts.gave_up || facts.live_agent {
+    if facts.inside_container || facts.gave_up || facts.live_agent {
         return Gate::Spawn;
+    }
+    // The user's own environment while the IDE is getting it somewhere to
+    // run — the VM coming up, the checkout being placed, the container
+    // starting — waits like every other: an agent spawned outside in that
+    // minute is a session thrown away when the container arrives
+    // (`session/load` against a home that is not there, then a respawn
+    // inside; 2026-09-21). Settled without a container, it spawns anyway:
+    // its chat is the coordinator, and a silent coordinator cannot say why.
+    if facts.primary {
+        return match facts.env {
+            Some(env) if env.in_transition && !env.has_exec_target => Gate::Hold,
+            _ => Gate::Spawn,
+        };
     }
     let Some(env) = facts.env else {
         // No supervisor: nothing to wait for and nothing to start.
@@ -4406,6 +4419,7 @@ impl ChatPane {
                 s.state(),
                 taste_devcontainer::SupervisorState::Building
                     | taste_devcontainer::SupervisorState::Starting
+                    | taste_devcontainer::SupervisorState::Preparing { .. }
             )
         })
     }
@@ -4701,7 +4715,7 @@ impl ChatPane {
         // most honest thing a live-but-idle session can be saying. A
         // respawn that follows writes the line again from `Ready`.
         self.sync_ready_status();
-        if matches!(state, S::Building | S::Starting) {
+        if matches!(state, S::Building | S::Starting | S::Preparing { .. }) {
             return;
         }
         // A settled state is a fresh chance to say why relocation was
@@ -12332,14 +12346,30 @@ mod tests {
             Gate::Hold
         );
 
-        // The user's own environment never waits: its chat is the
-        // coordinator, and a silent coordinator cannot say why.
+        // The user's own environment does not wait once things have
+        // settled: its chat is the coordinator, and a silent coordinator
+        // cannot say why...
         assert_eq!(
             container_gate(GateFacts {
                 primary: true,
                 ..facts
             }),
             Gate::Spawn
+        );
+        // ...but while the IDE is still getting it somewhere to run, it
+        // waits like everyone else, rather than spending a session outside.
+        assert_eq!(
+            container_gate(GateFacts {
+                primary: true,
+                env: Some(EnvGate {
+                    has_exec_target: false,
+                    hosting_unknown: true,
+                    in_transition: true,
+                    can_start: false,
+                }),
+                ..facts
+            }),
+            Gate::Hold
         );
 
         // EVERY "no" ends in a spawn. Below the container rungs there is
