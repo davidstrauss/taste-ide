@@ -1560,9 +1560,15 @@ impl EnvironmentRegistry {
                 }
             })
         };
+        self.primary()
+            .announce_preparing("bringing up the workspace's VM");
         self.set_substrate(Substrate::resolve_with(&self.workspace_root, reporter).await);
 
         let substrate = self.substrate();
+        if let Some(vm) = substrate.vm_details() {
+            self.primary()
+                .announce_preparing(&format!("connecting the files service of VM {}", vm.domain));
+        }
         // The legacy scheme's containers were made before any checkout
         // could be in a VM, so they are wherever a local checkout runs.
         let mut swept = reconcile::sweep_legacy_resources(
@@ -1651,7 +1657,9 @@ impl EnvironmentRegistry {
         // The primary too. Its checkout moves into the VM — seeded from the
         // user's folder, uncommitted work included — or, when it is already
         // there, the folder is brought up to date with it.
-        if substrate.vm_details().is_some() {
+        if let Some(vm) = substrate.vm_details() {
+            self.primary()
+                .announce_preparing(&format!("placing the checkout in VM {}", vm.domain));
             let registry = self.clone();
             match tokio::task::spawn_blocking(move || registry.place_primary_now()).await {
                 Ok(Ok(Some(sync))) => {
@@ -1691,6 +1699,7 @@ impl EnvironmentRegistry {
                 if !supervisor.checkout().is_local() {
                     continue;
                 }
+                supervisor.announce_preparing("moving the checkout into the workspace's VM");
                 let registry = self.clone();
                 let outcome = {
                     let id = id.clone();
@@ -2224,10 +2233,15 @@ mod tests {
         let restored_events = restarted.events.subscribe();
         let seen = restarted.reconcile().await;
         assert_eq!(seen.restored, vec![env("later")]);
-        assert!(matches!(
-            restored_events.recv().await.unwrap(),
-            Event::EnvironmentCreated { env: ref id } if *id == env("later")
-        ));
+        // Past the primary's own words about what reconcile is doing for
+        // it (`Preparing`), which come first.
+        let announced = loop {
+            match restored_events.recv().await.unwrap() {
+                Event::EnvironmentCreated { env: id } => break id,
+                _ => continue,
+            }
+        };
+        assert_eq!(announced, env("later"));
     }
 
     /// The budget is what the *agents* spend, so the sum runs over their

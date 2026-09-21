@@ -379,12 +379,22 @@ pub const ACTION_TOAST_SECS: u32 = 30;
 /// UI and MCP server need not depend on it directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DevcontainerStateEvent {
+    /// The IDE is getting the environment somewhere it can run — the VM
+    /// coming up, its files service connecting, the checkout being placed
+    /// — and `what` is the step under way.
+    Preparing {
+        what: String,
+    },
     NoConfig,
     ConfigDetected,
     Building,
     Starting,
-    Running { container_id: String },
-    Failed { message: String },
+    Running {
+        container_id: String,
+    },
+    Failed {
+        message: String,
+    },
     Stopped,
 }
 

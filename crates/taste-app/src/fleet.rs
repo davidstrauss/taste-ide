@@ -339,7 +339,9 @@ impl FleetRow {
             | SupervisorState::ConfigDetected
             | SupervisorState::Stopped => Light::Off,
             // On its way.
-            SupervisorState::Building | SupervisorState::Starting => Light::Amber,
+            SupervisorState::Building
+            | SupervisorState::Starting
+            | SupervisorState::Preparing { .. } => Light::Amber,
             SupervisorState::Running { .. } => {
                 // Up, but wanting something from the user: an unanswered
                 // question, a config the container no longer matches, a
@@ -373,6 +375,7 @@ impl FleetRow {
     /// the mode when the mode is worth saying ([`Self::mode_text`]).
     pub fn state_text(&self) -> String {
         let detail = match &self.state {
+            SupervisorState::Preparing { what } => format!("{what}…"),
             SupervisorState::NoConfig => "not configured".to_string(),
             SupervisorState::ConfigDetected => "configured, not started".to_string(),
             SupervisorState::Building => "building…".to_string(),
@@ -455,6 +458,7 @@ impl FleetRow {
     /// explicit and not a `Debug` string.
     pub fn state_slug(&self) -> &'static str {
         match self.state {
+            SupervisorState::Preparing { .. } => "preparing",
             SupervisorState::NoConfig => "no-config",
             SupervisorState::ConfigDetected => "config-detected",
             SupervisorState::Building => "building",

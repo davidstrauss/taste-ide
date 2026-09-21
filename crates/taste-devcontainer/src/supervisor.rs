@@ -260,12 +260,25 @@ pub type Placer = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorState {
+    /// Getting the environment somewhere it can run: the workspace's VM
+    /// coming up, its files service connecting, the checkout being placed
+    /// in it. `what` is the step under way, in the row's words (David,
+    /// 2026-09-21: "show what it's doing or waiting on in the mean time").
+    /// Before any of it the state is `NoConfig`, which reads as "not
+    /// configured" — a claim about the project that is not the fact.
+    Preparing {
+        what: String,
+    },
     NoConfig,
     ConfigDetected,
     Building,
     Starting,
-    Running { container_id: String },
-    Failed { message: String },
+    Running {
+        container_id: String,
+    },
+    Failed {
+        message: String,
+    },
     Stopped,
 }
 
@@ -309,6 +322,9 @@ impl SupervisorState {
 
     fn to_event(&self) -> DevcontainerStateEvent {
         match self {
+            SupervisorState::Preparing { what } => {
+                DevcontainerStateEvent::Preparing { what: what.clone() }
+            }
             SupervisorState::NoConfig => DevcontainerStateEvent::NoConfig,
             SupervisorState::ConfigDetected => DevcontainerStateEvent::ConfigDetected,
             SupervisorState::Building => DevcontainerStateEvent::Building,
@@ -826,6 +842,22 @@ impl Supervisor {
     /// binds the checkout where it is now.
     pub fn set_checkout(&self, checkout: Checkout) {
         *self.checkout.lock().unwrap() = checkout;
+    }
+
+    /// The registry's: say what is being done to get this environment
+    /// somewhere it can run — the VM, the files service, the placement —
+    /// while nothing else is known about it. Never over a state that
+    /// knows more: a container that is running, or a start that failed,
+    /// keeps its word.
+    pub fn announce_preparing(&self, what: &str) {
+        if matches!(
+            self.state(),
+            SupervisorState::NoConfig | SupervisorState::Preparing { .. }
+        ) {
+            self.set_state(SupervisorState::Preparing {
+                what: what.to_string(),
+            });
+        }
     }
 
     /// The registry's: how to place this checkout where it can run
@@ -1352,8 +1384,11 @@ impl Supervisor {
         // The CONFIG decides, not the folder: the IDE makes `.devcontainer/`
         // itself as the bind source the agent writes into, so an empty one
         // is the ordinary state of a project with no config yet.
-        let has_config = !matches!(state, SupervisorState::NoConfig)
-            && !matches!(DevcontainerConfig::discover(&self.config_root()), Ok(None));
+        let has_config =
+            !matches!(
+                state,
+                SupervisorState::NoConfig | SupervisorState::Preparing { .. }
+            ) && !matches!(DevcontainerConfig::discover(&self.config_root()), Ok(None));
         let next = match &state {
             SupervisorState::Building | SupervisorState::Starting => {
                 "The environment is coming up. Wait a few seconds and call environment again."
@@ -2090,7 +2125,7 @@ impl Supervisor {
                     || resolved.authority != self.config_authority();
                 self.set_pending(drift);
             }
-            SupervisorState::NoConfig => {
+            SupervisorState::NoConfig | SupervisorState::Preparing { .. } => {
                 // A previous IDE instance may have left a container running
                 // — of either authority. Adopt it rather than sitting in
                 // safe mode next to a healthy environment.

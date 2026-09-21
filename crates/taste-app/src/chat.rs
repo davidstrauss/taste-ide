@@ -1191,7 +1191,9 @@ fn revive_wanted(state: &taste_devcontainer::SupervisorState, user_initiated: bo
     // Exhaustive, no wildcard: a new lifecycle state must be ruled on here
     // rather than defaulting into spending the user's machine.
     match state {
-        S::Running { .. } | S::Building | S::Starting => false,
+        // On its way — including the IDE getting it somewhere to run — so
+        // a send holds for it rather than starting a second start.
+        S::Running { .. } | S::Building | S::Starting | S::Preparing { .. } => false,
         S::NoConfig | S::ConfigDetected | S::Failed { .. } | S::Stopped => true,
     }
 }

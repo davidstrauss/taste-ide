@@ -670,6 +670,14 @@ impl DevcontainerBanner {
                 // divergence").
                 self.show_baseline_face(BaselineFace::BuildFailed);
             }
+            DevcontainerStateEvent::Preparing { what } => {
+                // What the IDE is doing to get the environment somewhere it
+                // can run; nothing to press, since it is doing it.
+                self.set_face("emblem-synchronizing-symbolic", true);
+                self.set_title(&format!("Getting the environment ready — {what}"));
+                self.set_button(None);
+                self.set_revealed(true);
+            }
             DevcontainerStateEvent::NoConfig => {
                 // State + one action: Create opens the blank config, the
                 // same flow as the tree's ghost row.

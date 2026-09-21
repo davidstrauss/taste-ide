@@ -4373,6 +4373,7 @@ fn lines_arg(args: &Value) -> usize {
 /// A supervisor state as one word an agent can match on.
 fn phase_word(state: &SupervisorState) -> &'static str {
     match state {
+        SupervisorState::Preparing { .. } => "preparing",
         SupervisorState::NoConfig => "no-config",
         SupervisorState::ConfigDetected => "config-detected",
         SupervisorState::Building => "building",

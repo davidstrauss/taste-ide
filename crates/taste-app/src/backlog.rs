@@ -308,7 +308,9 @@ fn decline_note(issue: &Issue) -> Option<String> {
 /// chat says whether "up" is stopped on a person.
 fn runtime_of(row: &FleetRow) -> Runtime {
     match row.state {
-        SupervisorState::Building | SupervisorState::Starting => Runtime::Starting,
+        SupervisorState::Building
+        | SupervisorState::Starting
+        | SupervisorState::Preparing { .. } => Runtime::Starting,
         SupervisorState::Running { .. } => Runtime::Running {
             waiting: row.awaits_user() || row.pending_rebuild,
         },
