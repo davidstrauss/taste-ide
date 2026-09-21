@@ -1459,7 +1459,9 @@ impl Supervisor {
         if let Err(e) = config.validate() {
             return baseline(Some(format!("the project config is not usable: {e:#}")));
         }
-        if let Err(e) = crate::security::validate_security(&config, self.checkout().path()) {
+        if let Err(e) =
+            crate::security::validate_security_via(&self.files(), &config, self.checkout().path())
+        {
             return baseline(Some(format!("the project config was refused: {e:#}")));
         }
         // A setup that would not build or pull last time, unchanged since:
@@ -3339,6 +3341,12 @@ impl Supervisor {
             }];
         }
         let mut resources = Vec::new();
+        // Nothing to list before the ladder has resolved, and nothing to
+        // ask: every query would fail against the connection that does
+        // not exist and land in the log as noise.
+        if !self.substrate().is_resolved() {
+            return resources;
+        }
 
         // The substrate first, when it is not the user's own host. It is
         // not this environment's resource — one machine hosts every

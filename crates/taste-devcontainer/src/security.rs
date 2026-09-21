@@ -84,6 +84,19 @@ pub fn bind_sources(config: &DevcontainerConfig, workspace_root: &Path) -> Vec<s
 }
 
 pub fn validate_security(config: &DevcontainerConfig, workspace_root: &Path) -> Result<()> {
+    validate_security_via(&taste_core::files::Files::Local, config, workspace_root)
+}
+
+/// [`validate_security`] for a checkout reached through `files` — the
+/// VM's service when the checkout is over there. The bind-source
+/// resolution has to happen where the files are: resolving a VM path on
+/// this host walked up to `/var/home`, which exists here, and refused the
+/// project's own `${localWorkspaceFolder}` as "outside the workspace".
+pub fn validate_security_via(
+    files: &taste_core::files::Files,
+    config: &DevcontainerConfig,
+    workspace_root: &Path,
+) -> Result<()> {
     validate_run_args(&config.run_args)?;
     validate_build(config)?;
     for port in &config.forward_ports {
@@ -97,11 +110,11 @@ pub fn validate_security(config: &DevcontainerConfig, workspace_root: &Path) -> 
         bail!("devcontainer.json forwardPorts: more than 32 ports");
     }
     if let Some(mount) = &config.workspace_mount {
-        validate_mount(mount, workspace_root)?;
+        validate_mount(files, mount, workspace_root)?;
     }
     for mount in &config.mounts {
         if let Some(mount) = mount.as_str() {
-            validate_mount(mount, workspace_root)?;
+            validate_mount(files, mount, workspace_root)?;
         } else {
             bail!(
                 "devcontainer.json: object-form mounts are not supported yet; use the string form"
@@ -183,7 +196,11 @@ fn validate_run_args(run_args: &[String]) -> Result<()> {
 
 /// A mount string (`source=…,target=…,type=…`) may bind only paths inside
 /// the workspace, or use named volumes.
-fn validate_mount(mount: &str, workspace_root: &Path) -> Result<()> {
+fn validate_mount(
+    files: &taste_core::files::Files,
+    mount: &str,
+    workspace_root: &Path,
+) -> Result<()> {
     let mut source: Option<String> = None;
     let mut mount_type: Option<String> = None;
     for part in mount.split(',') {
@@ -223,6 +240,35 @@ fn validate_mount(mount: &str, workspace_root: &Path) -> Result<()> {
             // devcontainer.json passed over with nothing on screen saying
             // so, 2026-09-16) — so what is resolved is its nearest existing
             // ancestor, which is where a symlink could sit.
+            if !files.is_local() {
+                // Where the files are, component by component: a symlink
+                // anywhere under the root on the way to the source is the
+                // repo pointing the bind elsewhere, and is refused by
+                // name; a component that does not exist ends the walk,
+                // since nothing below it can be a link yet.
+                let mut probe = workspace_root.to_path_buf();
+                for component in path
+                    .strip_prefix(workspace_root)
+                    .unwrap_or(path)
+                    .components()
+                {
+                    probe.push(component);
+                    match files.stat(&probe) {
+                        Ok(stat) if stat.kind == taste_core::files::Kind::Symlink => bail!(
+                            "devcontainer.json mount \"{mount}\": {} is a symlink, so the \
+                             source could resolve outside the workspace (the repo is untrusted)",
+                            probe.display()
+                        ),
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(e) => bail!(
+                            "devcontainer.json mount \"{mount}\": bind source cannot be \
+                             resolved: {e}"
+                        ),
+                    }
+                }
+                return Ok(());
+            }
             let canonical_root = workspace_root
                 .canonicalize()
                 .unwrap_or_else(|_| workspace_root.to_path_buf());
