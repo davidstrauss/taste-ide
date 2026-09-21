@@ -320,18 +320,20 @@ impl EnvironmentRegistry {
     }
 
     fn make_supervisor(&self, identity: EnvironmentIdentity, exec: ExecContext) -> Arc<Supervisor> {
-        // One substrate, every environment — and the exec context aimed at
-        // it before the supervisor can resolve a single command against it.
-        exec.set_podman_target(self.substrate().target().clone());
+        // The substrate this checkout can run on — and the exec context
+        // aimed at it before the supervisor can resolve a single command
+        // against it.
+        let substrate = self.substrate_for(&identity.checkout);
+        exec.set_podman_target(substrate.target().clone());
         let supervisor = if self.outside_container_for_tests {
             Supervisor::new_outside_container_for_tests(
                 identity,
                 self.events.clone(),
                 exec,
-                self.substrate(),
+                substrate,
             )
         } else {
-            Supervisor::new(identity, self.events.clone(), exec, self.substrate())
+            Supervisor::new(identity, self.events.clone(), exec, substrate)
         };
         // An environment created after the window wired itself up must be
         // able to host an agent too — the alternative is relocation working
@@ -359,20 +361,52 @@ impl EnvironmentRegistry {
         &self.workspace_root
     }
 
-    /// Where this workspace's containers live.
+    /// The substrate the ladder resolved for this workspace: its VM, when
+    /// it has one, or the machine, connection, or local podman the ladder
+    /// ended on. Where a checkout that is IN the VM runs, and what the
+    /// window stops when it closes — not necessarily where every
+    /// environment's containers are; see [`Self::substrate_for`].
     pub fn substrate(&self) -> Arc<Substrate> {
         self.substrate.lock().unwrap().clone()
     }
 
-    /// Point the whole workspace at a substrate.
+    /// Where a checkout's containers run. **The substrate follows the
+    /// checkout.** A checkout in a VM runs in that VM; a checkout on this
+    /// host runs on the host's podman even when the workspace has a VM,
+    /// because a VM shares no filesystem and a host path bound into a
+    /// container there would fail at the bind. Until every checkout has
+    /// moved, a workspace is therefore half on its VM and half on the host
+    /// by design, and each environment's exec context is aimed at its own
+    /// half.
+    pub fn substrate_for(&self, checkout: &taste_core::environment::Checkout) -> Arc<Substrate> {
+        let resolved = self.substrate();
+        if resolved.can_host(checkout) {
+            return resolved;
+        }
+        match checkout {
+            // A VM resolved, a checkout still here: the host's own podman,
+            // sandboxed exactly as the resolved one is.
+            taste_core::environment::Checkout::Local(_) => {
+                Arc::new(Substrate::local_like(&resolved))
+            }
+            // A checkout in a VM this workspace did not resolve to. Nothing
+            // can run it; the resolved substrate is returned so the
+            // container start fails loudly there rather than silently on
+            // the host, and placement (the next batch) is what prevents
+            // the situation.
+            taste_core::environment::Checkout::Remote { .. } => resolved,
+        }
+    }
+
+    /// Point the workspace at the substrate the ladder resolved.
     ///
-    /// Every supervisor and every [`ExecContext`] together, in one place,
-    /// because a workspace half on a VM and half on the host is not a state
-    /// this design has a meaning for: one machine hosts every environment.
+    /// Every supervisor and every [`ExecContext`] together, in one place —
+    /// each at the substrate its own checkout can run on
+    /// ([`Self::substrate_for`]).
     pub fn set_substrate(&self, substrate: Arc<Substrate>) {
-        *self.substrate.lock().unwrap() = substrate.clone();
+        *self.substrate.lock().unwrap() = substrate;
         for supervisor in self.environments.lock().unwrap().values() {
-            supervisor.set_substrate(substrate.clone());
+            supervisor.set_substrate(self.substrate_for(supervisor.checkout()));
         }
     }
 
@@ -731,7 +765,15 @@ impl EnvironmentRegistry {
         self.set_substrate(Substrate::resolve(&self.workspace_root).await);
 
         let substrate = self.substrate();
-        let mut swept = reconcile::sweep_legacy_resources(&self.workspace_root, &substrate).await;
+        // The legacy scheme's containers were made before any checkout
+        // could be in a VM, so they are wherever a local checkout runs.
+        let mut swept = reconcile::sweep_legacy_resources(
+            &self.workspace_root,
+            &self.substrate_for(&taste_core::environment::Checkout::Local(
+                self.workspace_root.clone(),
+            )),
+        )
+        .await;
         // VMs whose workspaces have left this machine. Asked only where a
         // VM could have been made, so a host without libvirt is not asked
         // anything.
@@ -886,6 +928,46 @@ impl EnvironmentRegistry {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A VM resolved for the workspace never becomes a local checkout's
+    /// substrate: the primary's container would be started in the VM with
+    /// a host bind that does not exist there. Caught after the batch that
+    /// auto-provisioned every workspace had already pointed every
+    /// supervisor at the VM.
+    #[test]
+    fn a_workspaces_vm_does_not_reach_a_local_checkout() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let vm = crate::provision::Vm {
+            domain: "taste-799f-k7m2qx".into(),
+            ssh_port: 40022,
+            workspace_root: fixture.workspace.path().to_path_buf(),
+            state: crate::provision::DomainState::Running,
+        };
+        let facts = crate::provision::VmFacts {
+            running: true,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_ceiling_gib: 64,
+            host_storage_bytes: None,
+        };
+        registry.set_substrate(Arc::new(Substrate::vm(&vm, facts, false)));
+        // The workspace knows its VM...
+        assert_eq!(registry.substrate().connection(), Some("taste-799f-k7m2qx"));
+        // ...and the primary, a local checkout, still runs on local podman,
+        // with its exec context aimed there too.
+        let primary = registry.primary();
+        assert!(
+            primary.substrate().is_local(),
+            "{:?}",
+            primary.substrate().provider()
+        );
+        let (program, args) = primary.exec().podman_target().argv(["ps"]);
+        assert_eq!((program.as_str(), args), ("podman", vec!["ps".to_string()]));
+        // A new local clone is placed on local podman as well.
+        let review = registry.create(env("review")).unwrap();
+        assert!(review.substrate().is_local());
+    }
 
     /// What a destroy left behind is named, because nothing can name it
     /// later.

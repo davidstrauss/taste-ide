@@ -139,6 +139,10 @@ pub struct Substrate {
     /// Held so the environment facts can be honest about what the
     /// substrate costs without asking the hypervisor again on a UI thread.
     vm: Option<VmFacts>,
+    /// The VM itself, when the provider is one: what placing a checkout
+    /// there needs — its ssh port, its workspace — without asking libvirt
+    /// again.
+    vm_info: Option<Vm>,
 }
 
 /// The environment variable that points the IDE at an already-registered
@@ -258,6 +262,7 @@ impl Substrate {
             note,
             log: None,
             vm: None,
+            vm_info: None,
         }
     }
 
@@ -273,7 +278,15 @@ impl Substrate {
             note: descents.iter().find_map(Descent::note),
             log: (!logged.is_empty()).then(|| logged.join("; ")),
             vm: None,
+            vm_info: None,
         }
+    }
+
+    /// The host's own podman, reached the way `other` reaches its podman
+    /// binary — through the sandbox or not. What a checkout on this host
+    /// runs on when the workspace's substrate is a VM it cannot be in.
+    pub fn local_like(other: &Substrate) -> Self {
+        Self::local_with_note(PodmanTarget::local(other.target().sandboxed()), None)
     }
 
     /// A provisioned VM, brought up, with its facts.
@@ -286,6 +299,7 @@ impl Substrate {
             note: None,
             log: None,
             vm: Some(facts),
+            vm_info: Some(vm.clone()),
         }
     }
 
@@ -304,6 +318,7 @@ impl Substrate {
             note: None,
             log: None,
             vm: None,
+            vm_info: None,
         })
     }
 
@@ -333,6 +348,7 @@ impl Substrate {
                         note: None,
                         log: None,
                         vm: None,
+                        vm_info: None,
                     },
                     Err(e) => Self::local_after(
                         local,
@@ -403,6 +419,7 @@ impl Substrate {
                         note: None,
                         log: None,
                         vm: Some(facts),
+                        vm_info: None,
                     },
                     Err(e) => Self::local_after(
                         local,
@@ -453,6 +470,27 @@ impl Substrate {
 
     pub fn vm_facts(&self) -> Option<&VmFacts> {
         self.vm.as_ref()
+    }
+
+    /// The VM this substrate is, when it is one.
+    pub fn vm_details(&self) -> Option<&Vm> {
+        self.vm_info.as_ref()
+    }
+
+    /// Whether a checkout may run its containers here. A checkout on this
+    /// host can be bound into a container on this host, a machine (which
+    /// shares the home directory), or a connection the user pointed the IDE
+    /// at; it cannot be bound into a container in a VM, which shares no
+    /// filesystem with anything. A checkout in a VM runs only in that VM.
+    pub fn can_host(&self, checkout: &taste_core::environment::Checkout) -> bool {
+        match (&self.provider, checkout) {
+            (Provider::Vm { domain }, taste_core::environment::Checkout::Remote { vm, .. }) => {
+                domain == vm
+            }
+            (Provider::Vm { .. }, taste_core::environment::Checkout::Local(_)) => false,
+            (_, taste_core::environment::Checkout::Remote { .. }) => false,
+            (_, taste_core::environment::Checkout::Local(_)) => true,
+        }
     }
 
     /// The substrate as a row in the environment's Resources view.
@@ -782,5 +820,47 @@ mod tests {
         assert_eq!(row.name, "taste-799f-k7m2qx");
         assert!(row.status.contains("10.0 GiB"), "{}", row.status);
         assert!(row.status.contains("12 vCPU"), "{}", row.status);
+        assert_eq!(substrate.vm_details().map(|v| v.ssh_port), Some(40022));
+    }
+
+    /// A VM hosts only checkouts that are in it. A checkout on this host
+    /// bound into a container in a VM would fail at the bind — there is
+    /// no shared filesystem, by decision — so the substrate says no before
+    /// podman has to.
+    #[test]
+    fn a_vm_hosts_only_the_checkouts_that_are_in_it() {
+        use taste_core::environment::Checkout;
+        let vm = Vm {
+            domain: "taste-a".into(),
+            ssh_port: 40022,
+            workspace_root: "/work/proj".into(),
+            state: crate::provision::DomainState::Running,
+        };
+        let on_vm = Substrate::vm(
+            &vm,
+            VmFacts {
+                running: true,
+                cpus: 2,
+                memory_mib: 4096,
+                disk_ceiling_gib: 64,
+                host_storage_bytes: None,
+            },
+            false,
+        );
+        let local_checkout = Checkout::Local("/work/proj".into());
+        let in_this_vm = Checkout::Remote {
+            vm: "taste-a".into(),
+            path: "/var/home/core/taste/x/i-1".into(),
+        };
+        let in_another = Checkout::Remote {
+            vm: "taste-b".into(),
+            path: "/var/home/core/taste/x/i-1".into(),
+        };
+        assert!(!on_vm.can_host(&local_checkout));
+        assert!(on_vm.can_host(&in_this_vm));
+        assert!(!on_vm.can_host(&in_another));
+        let local = Substrate::local_for_tests();
+        assert!(local.can_host(&local_checkout));
+        assert!(!local.can_host(&in_this_vm));
     }
 }
