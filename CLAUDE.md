@@ -136,6 +136,10 @@ poses the backlog's status filter on that button, through the toggle
 itself — the filtered list, and the panel's height, which a filter must
 not move;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
+`TASTE_PROBE_RESOURCES=vm` (with `TASTE_PROBE_VIEW=consolidated-console`)
+poses the console's Resources list as a workspace on a VM has it — the VM
+at the root, the container under it, its image and volumes under that —
+which a shot otherwise never has, since a probe provisions nothing;
 `TASTE_PROBE_PORT=loopback` (or `nothing`) poses the port tab in the
 state its published address cannot show — a server on the container's
 own loopback, or nothing behind the port at all — on the browser face,

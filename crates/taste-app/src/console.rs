@@ -2223,6 +2223,44 @@ impl Console {
         });
     }
 
+    /// TASTE_PROBE_CHECK only: the Resources list as a workspace on a VM
+    /// has it — the VM, the primary's container under it, its image and
+    /// volumes under that — and the Resources tab in front. A shot cannot
+    /// have a VM; this is the shape the list draws when it has one.
+    pub fn seed_resources_for_probe(self: &Rc<Self>) {
+        use taste_devcontainer::supervisor::ResourceKind as K;
+        let row = |kind: K, name: &str, status: &str| ResourceInfo {
+            kind,
+            name: name.into(),
+            id: name.into(),
+            status: status.into(),
+        };
+        self.render_resources(&[
+            row(
+                K::Substrate,
+                "taste-799fd7acd369bf5c-pdd5hl",
+                "running, 12 vCPU, 10.4 GiB committed, 14.5 GiB on disk of 64 GiB",
+            ),
+            row(
+                K::Container,
+                "taste-799fd7acd369bf5c-primary",
+                "Up 4 seconds · 2 CPU, 4.0 GiB granted",
+            ),
+            row(K::Image, "localhost/taste-img-467e4f7486ed", "3.42 GB"),
+            row(
+                K::Volume,
+                "taste-env-799fd7acd369bf5c-primary-home",
+                "present",
+            ),
+            row(
+                K::Volume,
+                "taste-env-799fd7acd369bf5c-primary-cfg-taste-ide-cargo",
+                "present",
+            ),
+        ]);
+        self.host().set_selected_page(&self.resources_page);
+    }
+
     fn render_resources(self: &Rc<Self>, resources: &[ResourceInfo]) {
         while let Some(child) = self.resources_list.first_child() {
             self.resources_list.remove(&child);
@@ -2237,29 +2275,22 @@ impl Console {
             self.resources_list.append(&empty);
             return;
         }
-        // These resources ARE a hierarchy: the container on top, the
-        // image it committed and the volumes mounted into it beneath;
-        // base images stand alone.
-        let container_names: Vec<&str> = resources
-            .iter()
-            .filter(|r| r.kind == ResourceKind::Container)
-            .map(|r| r.name.as_str())
-            .collect();
+        // These resources ARE a hierarchy, and the list draws it as one:
+        // the VM everything sits on at the root, the container under it,
+        // the image it runs from and the volumes mounted into it under the
+        // container (David, 2026-09-21: "Show this resource listing as a
+        // hierarchy with the VM as parent"). Without a container the image
+        // and the volumes stand directly under the VM; without a VM the
+        // container is the root, as it was on the host.
+        let has_vm = resources.iter().any(|r| r.kind == ResourceKind::Substrate);
+        let has_container = resources.iter().any(|r| r.kind == ResourceKind::Container);
         let depth_of = |resource: &ResourceInfo| -> i32 {
             match resource.kind {
-                // The substrate is what everything else sits on, so it
-                // sits at the top of the tree rather than under a
-                // container it does not belong to.
                 ResourceKind::Substrate => 0,
-                ResourceKind::Container => 0,
-                ResourceKind::Image => {
-                    if container_names.iter().any(|c| resource.name.contains(c)) {
-                        1
-                    } else {
-                        0
-                    }
+                ResourceKind::Container => i32::from(has_vm),
+                ResourceKind::Image | ResourceKind::Volume => {
+                    i32::from(has_vm) + i32::from(has_container)
                 }
-                ResourceKind::Volume => i32::from(!container_names.is_empty()),
             }
         };
         let mut ordered: Vec<&ResourceInfo> = resources
@@ -2271,9 +2302,9 @@ impl Console {
             .filter(|r| r.kind == ResourceKind::Container)
         {
             ordered.push(container);
-            ordered.extend(resources.iter().filter(|r| {
-                r.kind == ResourceKind::Image && r.name.contains(container.name.as_str())
-            }));
+            // The environment lists one image — the one its config runs
+            // from — so it is the container's whichever name it carries.
+            ordered.extend(resources.iter().filter(|r| r.kind == ResourceKind::Image));
             ordered.extend(resources.iter().filter(|r| r.kind == ResourceKind::Volume));
         }
         // Anything not claimed above (base images; everything, when no

@@ -2710,6 +2710,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let ui = workspace.ui.clone();
         let app = app.clone();
         let editor_for_probe = editor.clone();
+        let console_for_probe = console.clone();
         let view_for_open = view.clone();
         let filetree_for_probe = filetree.clone();
         let chats_for_probe = chats.clone();
@@ -2755,6 +2756,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let app = app.clone();
             let probe_open = probe_open.clone();
             let editor_for_probe = editor_for_probe.clone();
+            let console_for_probe = console_for_probe.clone();
             let view_for_open = view_for_open.clone();
             let filetree_for_probe = filetree_for_probe.clone();
             let chats_for_probe = chats_for_probe.clone();
@@ -2859,10 +2861,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // rung has to get right — a grafted page keeps
                         // everything it had — and Resources on a
                         // fabricated environment is an honest empty state
-                        // and a poor frame.
-                        for offset in [2, 1, 0] {
-                            if editor_for_probe.select_console_tab(offset) {
-                                break;
+                        // and a poor frame. `TASTE_PROBE_RESOURCES=vm`
+                        // poses the Resources list instead, as a workspace
+                        // on a VM has it, for the hierarchy it draws.
+                        if std::env::var_os("TASTE_PROBE_RESOURCES").is_some() {
+                            console_for_probe.seed_resources_for_probe();
+                            editor_for_probe.select_console_tab(0);
+                        } else {
+                            for offset in [2, 1, 0] {
+                                if editor_for_probe.select_console_tab(offset) {
+                                    break;
+                                }
                             }
                         }
                     } else {
