@@ -2735,47 +2735,58 @@ impl FileTree {
     /// Ask the chat agent for a commit message describing the staged diff;
     /// the reply lands in the commit entry (editable before committing).
     fn suggest_commit_message(self: &Rc<Self>, button: gtk::Button) {
-        let diff = self
-            .git
-            .borrow()
-            .as_ref()
-            .and_then(|git| git.staged_diff(48 * 1024).ok())
-            .unwrap_or_default();
-        if diff.trim().is_empty() {
-            self.workspace.events.publish(Event::Toast(
-                "Stage changes first, then ask for a suggestion".into(),
-            ));
+        if self.commit_suggester.borrow().is_none() {
             return;
         }
-        let suggester = self.commit_suggester.borrow();
-        let Some(suggester) = suggester.as_ref() else {
-            return;
-        };
+        // The diff of the WORKING tree's index, which is in the VM when
+        // the checkout is: the peer's index is not where staging happens.
+        // Off the main thread, since for a remote checkout it is a `git`
+        // through the keeper and not a libgit2 call.
+        let worktree = self.worktree();
         button.set_sensitive(false);
         let weak = Rc::downgrade(self);
         let button = button.downgrade();
-        let prompt = format!(
-            "Suggest a concise git commit message (imperative mood, one line, \
-             no quotes or code fences) for these staged changes. Reply with \
-             ONLY the commit message.\n\n{diff}"
-        );
-        suggester(
-            prompt,
-            Box::new(move |reply| {
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime()
+                .spawn_blocking(move || worktree.staged_diff(48 * 1024).unwrap_or_default());
+            let diff = handle.await.unwrap_or_default();
+            let Some(tree) = weak.upgrade() else { return };
+            if diff.trim().is_empty() {
                 if let Some(button) = button.upgrade() {
                     button.set_sensitive(true);
                 }
-                let message = clean_commit_message(&reply);
-                if message.is_empty() {
-                    return;
-                }
-                if let Some(tree) = weak.upgrade() {
-                    if let Some(hook) = tree.on_suggestion.borrow().as_ref() {
-                        hook(message);
+                tree.workspace.events.publish(Event::Toast(
+                    "Stage changes first, then ask for a suggestion".into(),
+                ));
+                return;
+            }
+            let suggester = tree.commit_suggester.borrow();
+            let Some(suggester) = suggester.as_ref() else {
+                return;
+            };
+            let prompt = format!(
+                "Suggest a concise git commit message (imperative mood, one line, \
+                 no quotes or code fences) for these staged changes. Reply with \
+                 ONLY the commit message.\n\n{diff}"
+            );
+            suggester(
+                prompt,
+                Box::new(move |reply| {
+                    if let Some(button) = button.upgrade() {
+                        button.set_sensitive(true);
                     }
-                }
-            }),
-        );
+                    let message = clean_commit_message(&reply);
+                    if message.is_empty() {
+                        return;
+                    }
+                    if let Some(tree) = weak.upgrade() {
+                        if let Some(hook) = tree.on_suggestion.borrow().as_ref() {
+                            hook(message);
+                        }
+                    }
+                }),
+            );
+        });
     }
 
     /// Where a drafted commit message lands: the universal composer, on
@@ -3837,11 +3848,7 @@ impl FileTree {
     /// have a blue highlight if selected and showing in the editor panel
     /// area").
     fn mark_open_change_row(&self) {
-        let workdir = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|git| git.workdir().to_path_buf());
+        let workdir = self.worktree_root();
         let active = self
             .workspace
             .ide
@@ -3934,11 +3941,7 @@ impl FileTree {
             self.list_holder.set_child(Some(&empty));
             return;
         }
-        let workdir = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|git| git.workdir().to_path_buf());
+        let workdir = self.worktree_root();
         // The list is KEPT and reconciled, not rebuilt: rows whose path and
         // state are unchanged are the same widgets, checkboxes and all, so
         // a status tick under an agent's edits changes the one row that
@@ -4213,12 +4216,9 @@ impl FileTree {
         if self.git.borrow().is_none() {
             return;
         }
-        let Some(workdir) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf())
-        else {
+        // The checkout's root, wherever it is: the rows are files to open,
+        // and the peer's folder is not where the files are.
+        let Some(workdir) = self.worktree_root() else {
             return;
         };
         let weak = Rc::downgrade(self);
@@ -4494,11 +4494,7 @@ impl FileTree {
         }
         let status = self.status.borrow();
         let stashed = self.stashed.borrow();
-        let workdir = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf());
+        let workdir = self.worktree_root();
         let rel_of = |abs: &PathBuf| {
             workdir
                 .as_ref()
@@ -4785,11 +4781,7 @@ impl FileTree {
         if self.pane.get() != PaneKind::Staged {
             return;
         }
-        let workdir = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf());
+        let workdir = self.worktree_root();
         let selection = self.selection.borrow();
         let all_selected = self
             .status
