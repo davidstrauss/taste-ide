@@ -2877,12 +2877,41 @@ impl Console {
         {
             let page = page.clone();
             let sink = sink.clone();
-            terminal.connect_child_exited(move |_, status| {
+            terminal.connect_child_exited(move |terminal, status| {
+                // A shell whose container was stopped or rebuilt under it
+                // ends with podman's own last words — "no such exec
+                // session", "no container with ID" — which say what
+                // happened to podman and nothing to a person. Say it in
+                // the tab, and in the terminal above the dead prompt.
+                let tail = match terminal.vadjustment() {
+                    Some(adjustment) => {
+                        let hi = adjustment.upper() as i64;
+                        let lo = (adjustment.lower() as i64).max(hi - TAIL_ROWS);
+                        terminal_rows(terminal, lo, hi - 1)
+                    }
+                    None => String::new(),
+                };
+                let container_gone = tail.contains("no such exec session")
+                    || tail.contains("no container with ID")
+                    || tail.contains("no such container");
+                if container_gone {
+                    terminal.feed(
+                        b"\r\n\x1b[2mThe container this shell was in is gone: it was stopped \
+                          or rebuilt. Open a new shell.\x1b[0m\r\n",
+                    );
+                }
                 sink.finish(taste_core::ShellState::Exited {
                     code: Some(status),
                     signal: None,
                 });
-                Self::mark_tab_exited(&page, "Shell exited");
+                Self::mark_tab_exited(
+                    &page,
+                    if container_gone {
+                        "Shell exited — its container is gone"
+                    } else {
+                        "Shell exited"
+                    },
+                );
             });
         }
         // Closing the tab is what ends it; the close handler above takes
