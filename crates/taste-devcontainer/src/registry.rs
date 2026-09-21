@@ -64,6 +64,9 @@ pub struct DestroyReport {
     /// df` on the author's host for a day (David, 2026-09-17), which is
     /// how anyone found out this was silent.
     pub kept_volumes: Vec<String>,
+    /// A checkout in a VM that could not be removed from it, with the
+    /// reason. The peer and the record on this host are gone regardless.
+    pub kept_checkout: Option<String>,
     pub removed_clone: Option<PathBuf>,
     /// Issues this environment held a claim on, handed back to the queue
     /// with a comment saying why. Not "unsaved work" — nothing is lost —
@@ -90,6 +93,9 @@ impl DestroyReport {
         }
         if let Some(path) = &self.kept_clone {
             parts.push(format!("the clone is still at {}", path.display()));
+        }
+        if let Some(checkout) = &self.kept_checkout {
+            parts.push(format!("the checkout is still at {checkout}"));
         }
         if parts.is_empty() {
             return String::new();
@@ -842,16 +848,6 @@ impl EnvironmentRegistry {
         // about refs, and the dirty count is what the last snapshot holds
         // when the working copy is not here to ask.
         let repo = supervisor.peer().to_path_buf();
-        // A checkout in a VM goes too, through the files service, before
-        // the peer that could still name it does. Not fatal when the VM is
-        // gone — the peer and the record are what this host can remove.
-        if let Checkout::Remote { vm, path } = supervisor.checkout().clone() {
-            let files = supervisor.files();
-            let removed = tokio::task::spawn_blocking(move || files.remove(&path, true)).await;
-            if let Ok(Err(e)) = removed {
-                tracing::warn!("removing {id}'s checkout from VM {vm}: {e}");
-            }
-        }
 
         let mut report = DestroyReport::default();
         if repo.is_dir() {
@@ -880,6 +876,28 @@ impl EnvironmentRegistry {
 
         // Container next: a running container holds the clone's mount.
         let _ = supervisor.stop().await;
+        // A checkout in a VM goes after its container, through the files
+        // service. Not fatal when it cannot — the VM may be gone — but
+        // named in the report, for the reason on `kept_volumes`: the first
+        // live run left one behind and the only trace was a log line.
+        if let Checkout::Remote { vm, path } = supervisor.checkout().clone() {
+            let files = supervisor.files();
+            let target = path.clone();
+            let removed = tokio::task::spawn_blocking(move || files.remove(&target, true)).await;
+            match removed {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("removing {id}'s checkout from VM {vm}: {e}");
+                    report.kept_checkout = Some(format!("{} in VM {vm} ({e})", path.display()));
+                }
+                Err(e) => {
+                    report.kept_checkout = Some(format!(
+                        "{} in VM {vm} (the removal did not finish: {e})",
+                        path.display()
+                    ));
+                }
+            }
+        }
         for volume in supervisor.env_volumes() {
             match supervisor.remove_volume(&volume).await {
                 Ok(()) => report.removed_volumes.push(volume),

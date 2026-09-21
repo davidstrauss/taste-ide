@@ -281,6 +281,10 @@ pub fn domain_xml(spec: &DomainSpec) -> Result<String> {
         xml,
         "    <rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>"
     )?;
+    // No balloon, said to libvirt, which adds one otherwise: the memory
+    // is a commitment (module docs), and a balloon would only make the
+    // guest's RSS look reclaimable when it is not.
+    writeln!(xml, "    <memballoon model='none'/>")?;
     writeln!(xml, "  </devices>")?;
     writeln!(xml, "</domain>")?;
     Ok(xml)
@@ -455,13 +459,35 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
 fn egress_ruleset() -> String {
     let v4 = PRIVATE_NETWORKS.join(", ");
     let v6 = PRIVATE_NETWORKS_V6.join(", ");
+    // `ct state established,related accept` first, and it is load-bearing:
+    // passt gives the guest the host's own LAN address and sources every
+    // connection it forwards in — the IDE's ssh among them — from the
+    // LAN-side gateway. Without it the guest's replies to the IDE's own
+    // connection were rejected by the rule below, the TCP handshake
+    // completed on the host side and the SSH banner never came, and the
+    // first real boot sat at "defined" until the deadline (2026-09-21).
+    // What the rule then denies is exactly what it should: connections the
+    // guest INITIATES to the user's network — with one exception, DNS.
+    // passt maps the host's loopback resolver to the guest's LAN gateway
+    // address and intercepts what the guest sends there on port 53, so
+    // the guest's every lookup is a new connection to a 192.168 address
+    // that never actually reaches the LAN. Without the exception nothing
+    // in the guest resolved a name, and `podman pull` failed on the first
+    // real boot (2026-09-21, confirmed by inserting the rule live). What
+    // it lets through to a LAN host that is not the gateway is a DNS
+    // query, and no more.
     format!(
         "#!/usr/sbin/nft -f\n\
          # Written by taste-ide. The internet is allowed; the machine this\n\
-         # VM runs on, and everything else on its network, is not.\n\
+         # VM runs on, and everything else on its network, is not — except\n\
+         # in reply to a connection the machine opened to this VM, and for\n\
+         # DNS, which passt answers from the host's resolver at the gateway\n\
+         # address.\n\
          table inet taste_egress {{\n\
          \tchain output {{\n\
          \t\ttype filter hook output priority 0; policy accept;\n\
+         \t\tct state established,related accept\n\
+         \t\tmeta l4proto {{ tcp, udp }} th dport 53 accept\n\
          \t\tip daddr {{ {v4} }} reject\n\
          \t\tip6 daddr {{ {v6} }} reject\n\
          \t}}\n\
@@ -1196,6 +1222,10 @@ mod tests {
             xml.contains("host-passthrough"),
             "nested virt wants it:\n{xml}"
         );
+        assert!(
+            xml.contains("<memballoon model='none'/>"),
+            "no balloon:\n{xml}"
+        );
         assert!(xml.contains("<name>taste-799fd7acd369bf5c-k7m2qx</name>"));
         assert!(xml.contains("<memory unit='MiB'>10240</memory>"));
         assert!(xml.contains("<vcpu placement='static'>8</vcpu>"));
@@ -1387,6 +1417,18 @@ mod tests {
         for private in ["10.0.0.0%2F8", "192.168.0.0%2F16", "fe80%3A%3A%2F10"] {
             assert!(rules.contains(private), "{private} missing from {rules}");
         }
+        // Replies come before the denial, or the IDE's own ssh through
+        // passt never completes (the first boot found out).
+        let accept = rules
+            .find("established%2Crelated%20accept")
+            .expect("replies to inbound connections are accepted");
+        let reject = rules.find("reject").expect("the denial is there");
+        assert!(accept < reject, "the accept must come first: {rules}");
+        // ...and so does DNS, which passt answers at the gateway address.
+        let dns = rules
+            .find("dport%2053%20accept")
+            .expect("DNS is allowed through");
+        assert!(dns < reject, "DNS must come before the denial: {rules}");
         let units: Vec<&str> = parsed["systemd"]["units"]
             .as_array()
             .unwrap()

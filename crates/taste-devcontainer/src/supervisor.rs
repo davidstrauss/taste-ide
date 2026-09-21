@@ -605,10 +605,22 @@ const LABEL_USERNS_GENERATION: &str = "taste.userns-generation";
 /// than through the IDE, and "EROFS: read-only file system, mkdir
 /// .devcontainer" was the agent's whole experience of a project with no
 /// config (2026-09-16).
-fn workspace_bind_flags(authority: ConfigAuthority) -> &'static str {
-    match authority {
-        ConfigAuthority::Project => "Z",
-        ConfigAuthority::Baseline => "ro,Z",
+///
+/// **`Z` on this host, `z` in a VM.** `Z` gives the bind a label private to
+/// this one container, which on the host is what keeps one environment's
+/// checkout out of another container's reach. In a VM it broke the design:
+/// the keeper (`crate::keeper`) is a different container mounting the same
+/// checkout, and once the environment's container had relabelled the files
+/// for itself the keeper could neither read nor remove them (the first
+/// live run's `destroy` left the checkout behind, 2026-09-21). A VM serves
+/// one workspace, and every container in it is the same principal, so the
+/// shared label is the honest one there.
+fn workspace_bind_flags(authority: ConfigAuthority, shared_label: bool) -> &'static str {
+    match (authority, shared_label) {
+        (ConfigAuthority::Project, false) => "Z",
+        (ConfigAuthority::Baseline, false) => "ro,Z",
+        (ConfigAuthority::Project, true) => "z",
+        (ConfigAuthority::Baseline, true) => "ro,z",
     }
 }
 
@@ -864,6 +876,16 @@ impl Supervisor {
                 tokio::task::block_in_place(|| f(&files))
             }
             _ => f(&files),
+        }
+    }
+
+    /// The SELinux label flag a bind of this checkout carries: private on
+    /// this host, shared in a VM. See `workspace_bind_flags`.
+    fn label_flag(&self) -> &'static str {
+        if self.env.checkout.is_local() {
+            "Z"
+        } else {
+            "z"
         }
     }
 
@@ -2101,7 +2123,7 @@ impl Supervisor {
             mounts.push("-v".into());
             mounts.push(format!(
                 "{host_path}:{host_path}:{}",
-                workspace_bind_flags(authority)
+                workspace_bind_flags(authority, !self.env.checkout.is_local())
             ));
         }
 
@@ -2126,10 +2148,11 @@ impl Supervisor {
                 .display()
                 .to_string();
             mounts.push("-v".into());
-            mounts.push(format!("{source}:{workdir}/.devcontainer:Z"));
+            let label = self.label_flag();
+            mounts.push(format!("{source}:{workdir}/.devcontainer:{label}"));
             if host_path != workdir {
                 mounts.push("-v".into());
-                mounts.push(format!("{source}:{host_path}/.devcontainer:Z"));
+                mounts.push(format!("{source}:{host_path}/.devcontainer:{label}"));
             }
         }
 
@@ -2539,7 +2562,7 @@ impl Supervisor {
                 args.push("-v".into());
                 args.push(format!(
                     "{local_workspace_folder}:{workdir}:{}",
-                    workspace_bind_flags(authority)
+                    workspace_bind_flags(authority, !self.env.checkout.is_local())
                 ));
             }
         }
@@ -3946,6 +3969,36 @@ mod tests {
         let reason = resolved.reason.expect("a refusal is worth explaining");
         assert!(reason.contains("refused"), "{reason}");
         assert!(reason.contains("security-opt"), "{reason}");
+    }
+
+    /// In a VM the binds carry the shared label, so the keeper — another
+    /// container over the same files — can still read and remove them.
+    #[test]
+    fn a_checkout_in_a_vm_is_bound_with_the_shared_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = EnvironmentIdentity {
+            id: EnvironmentId::parse("i-0001").unwrap(),
+            workspace_root: dir.path().to_path_buf(),
+            checkout: Checkout::Remote {
+                vm: "taste-x".into(),
+                path: PathBuf::from("/var/home/core/taste/x/i-0001"),
+            },
+            peer: dir.path().to_path_buf(),
+        };
+        let remote = make_env(dir.path(), identity);
+        let config =
+            crate::baseline::ensure_baseline_config_in(&dir.path().join("baseline")).unwrap();
+        let mounts = remote
+            .ide_mounts(&config, ConfigAuthority::Baseline)
+            .join(" ");
+        assert!(
+            mounts.contains("/var/home/core/taste/x/i-0001:/var/home/core/taste/x/i-0001:ro,z"),
+            "{mounts}"
+        );
+        assert!(mounts.contains("/.devcontainer:z"), "{mounts}");
+        assert!(!mounts.contains(":Z"), "no private label in a VM: {mounts}");
+        assert_eq!(workspace_bind_flags(ConfigAuthority::Project, true), "z");
+        assert_eq!(workspace_bind_flags(ConfigAuthority::Project, false), "Z");
     }
 
     /// The clone is read-only in the baseline and writable under the

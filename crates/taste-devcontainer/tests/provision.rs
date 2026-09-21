@@ -61,6 +61,37 @@ struct Cleanup {
 impl Drop for Cleanup {
     fn drop(&mut self) {
         if let Some(vm) = self.vm.take() {
+            // A failed run must not destroy its evidence: the guest's
+            // serial console is the one record of a boot that did not
+            // reach sshd, so it is printed here before anything is removed.
+            if std::thread::panicking() {
+                match std::fs::read_to_string(vm.serial_log_path()) {
+                    Ok(text) => {
+                        let lines: Vec<&str> = text.lines().collect();
+                        let start = lines.len().saturating_sub(60);
+                        eprintln!(
+                            "--- serial console of {} (last {} lines) ---",
+                            vm.domain,
+                            lines.len() - start
+                        );
+                        for line in &lines[start..] {
+                            eprintln!("{line}");
+                        }
+                        eprintln!("--- end of serial console ---");
+                    }
+                    Err(e) => eprintln!("no serial console for {}: {e}", vm.domain),
+                }
+            }
+            // TASTE_PROVISION_KEEP=1 leaves the VM defined and running for
+            // a person to inspect: `virsh -c qemu:///session console`, or
+            // ssh with the workspace's key. Destroy it by hand afterwards.
+            if std::env::var("TASTE_PROVISION_KEEP").is_ok_and(|v| v == "1") {
+                eprintln!(
+                    "TASTE_PROVISION_KEEP=1: leaving {} (ssh 127.0.0.1:{}) for inspection",
+                    vm.domain, vm.ssh_port
+                );
+                return;
+            }
             let libvirt = self.libvirt.clone();
             let handle = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -408,10 +439,16 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
         "the environment's container is in the VM's podman: {containers}"
     );
 
-    registry
+    let destroyed = registry
         .destroy(&env_id)
         .await
         .expect("destroyed, checkout and container and peer");
+    eprintln!("destroy report:{}", destroyed.leftovers_clause());
+    assert!(
+        destroyed.kept_checkout.is_none(),
+        "the checkout in the VM could not be removed:{}",
+        destroyed.leftovers_clause()
+    );
     let gone = tokio::task::spawn_blocking(move || !files.exists(&checkout_path))
         .await
         .unwrap();
@@ -459,4 +496,6 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
         !String::from_utf8_lossy(&connections.stdout).contains(&vm.domain),
         "the connection is gone"
     );
+    // The test workspace's own state — its keys — goes with the workspace.
+    let _ = std::fs::remove_dir_all(taste_core::state::workspace_state_dir(root));
 }

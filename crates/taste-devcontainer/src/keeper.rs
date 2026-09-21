@@ -742,8 +742,11 @@ pub fn ensure_container(
             // user: the files the keeper writes are core's, which is what
             // every environment container in the guest expects to find.
             "--userns=keep-id:uid=1000,gid=1000".into(),
+            // The shared label, and every environment container in the
+            // guest binds its checkout with the same: two containers over
+            // one tree cannot each relabel it for themselves.
             "-v".into(),
-            format!("{}:{}:Z", mount.display(), mount.display()),
+            format!("{}:{}:z", mount.display(), mount.display()),
             image,
             "sleep".into(),
             "infinity".into(),

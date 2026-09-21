@@ -3327,6 +3327,24 @@ the panes is refused (the editor and tree land with the primary's move),
 and placement is the workspace's first VM; capacity across several is
 next.
 
+**Verified live, 2026-09-21, on this host.** The live test
+(`TASTE_PROVISION_TESTS=1`, `tests/provision.rs`) passes end to end in
+about a hundred seconds: a VM defined and reaching a podman that answers
+over its connection in 22 s from start, a container in it on a different
+kernel from the host's (7.1.10 against 7.2.5), rootless as `core`, the LAN
+refused from inside a container, the keeper's container up in 30–50 s (the
+baseline image built in the guest), an environment cloned into the VM,
+its config mirrored, its snapshot taken there and fetched home, its
+baseline started by the VM's podman, and everything destroyed with
+nothing left. Three things the first boot found, each now a fix with its
+reason beside it: the guest's egress rule has to accept
+`established,related` first, because passt sources the IDE's own ssh from
+the LAN-side gateway and the guest's replies were being rejected; DNS has
+to be allowed through, because passt answers it from the host's resolver
+at that same gateway address; and a checkout in a VM is bound with the
+**shared** SELinux label (`z`), because the keeper is a second container
+over the same files and a private label (`Z`) locked it out of them.
+
 **What of this exists, as of 2026-09-20.** The files service and the
 keeper, with the keeper's container brought up in a real VM and a file
 written and read back through it by the live test — which now also places
