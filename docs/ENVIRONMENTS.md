@@ -3313,12 +3313,19 @@ at its own path there. The snapshot runs **where the files are** —
 in git plumbing, run through the keeper — and the ref is fetched home to
 the peer with the branches, which is what review and publish read. An
 agent's `fs/read_text_file` and `fs/write_text_file` go through the files
-service its aim carries. Not yet: the MCP tools that walk files refuse a
-remote checkout by name, its forwarded ports are published on the VM's
-loopback and not yet tunnelled home, watching it in the panes is refused,
-and its config is rechecked on the IDE's cadence rather than on the
-keeper's watch. Placement is the workspace's first VM; capacity across
-several is next.
+service its aim carries, and the MCP tools that walk files — search,
+listing, find, conventions, git status — answer through it: `rg` and `git`
+run beside the files in the keeper's container and only their output
+comes here, which is why the baseline carries ripgrep. A remote container's
+forwarded ports are published on the VM's loopback and brought to this
+host's by one `ssh -N -L` per container, started when it runs and ended
+when it stops, so the port tab and the browser face dial the address they
+always did. The keeper's recursive watch on the checkout drives config
+rechecks in place of inotify — every edit under `.devcontainer/` is one
+recheck a quarter second later. Not yet: watching a remote environment in
+the panes is refused (the editor and tree land with the primary's move),
+and placement is the workspace's first VM; capacity across several is
+next.
 
 **What of this exists, as of 2026-09-20.** The files service and the
 keeper, with the keeper's container brought up in a real VM and a file

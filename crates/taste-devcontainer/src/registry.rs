@@ -617,8 +617,9 @@ impl EnvironmentRegistry {
         // files at once; one whose keeper is not is connected by
         // `reconcile`, and refuses reads by name until then.
         if let Checkout::Remote { vm, .. } = supervisor.checkout() {
-            if let Some(keeper) = self.keepers.lock().unwrap().get(vm) {
-                supervisor.set_files(Files::Remote(keeper.clone()));
+            let keeper = self.keepers.lock().unwrap().get(vm).cloned();
+            if let Some(keeper) = keeper {
+                supervisor.set_keeper(keeper);
             }
         }
         self.environments
@@ -993,7 +994,7 @@ impl EnvironmentRegistry {
                 match connected {
                     Ok(Ok(keeper)) => {
                         for supervisor in &remote {
-                            supervisor.set_files(Files::Remote(keeper.clone()));
+                            supervisor.set_keeper(keeper.clone());
                         }
                     }
                     Ok(Err(e)) => {

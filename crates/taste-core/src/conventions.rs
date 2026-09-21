@@ -33,19 +33,26 @@ pub struct Convention {
 /// no config exists anywhere, and the `Containerfile` while the config is
 /// missing or names a build file that is.
 pub fn conventions(root: &Path) -> Vec<Convention> {
+    conventions_via(&crate::files::Files::Local, root)
+}
+
+/// [`conventions`], wherever the checkout is: the same fixed places,
+/// asked of the files service that has the tree.
+pub fn conventions_via(files: &crate::files::Files, root: &Path) -> Vec<Convention> {
     // The CONFIG file decides existence: a leftover empty .devcontainer/
     // directory must not silence the suggestion to create the file in it.
     let dir = root.join(".devcontainer");
-    let has_devcontainer = dir.join("devcontainer.json").exists()
-        || root.join(".devcontainer.json").exists()
-        || std::fs::read_dir(&dir)
+    let has_devcontainer = files.exists(&dir.join("devcontainer.json"))
+        || files.exists(&root.join(".devcontainer.json"))
+        || files
+            .list(&dir)
             .map(|entries| {
                 entries
-                    .flatten()
-                    .any(|e| e.path().join("devcontainer.json").exists())
+                    .iter()
+                    .any(|e| files.exists(&dir.join(&e.name).join("devcontainer.json")))
             })
             .unwrap_or(false);
-    let dir_exists = dir.is_dir();
+    let dir_exists = files.is_dir(&dir);
     let mut list = vec![
         Convention {
             exists: dir_exists || has_devcontainer,
@@ -66,7 +73,7 @@ pub fn conventions(root: &Path) -> Vec<Convention> {
         },
     ];
     if dir_exists {
-        if let Some(build_file) = wanted_build_file(&dir) {
+        if let Some(build_file) = wanted_build_file(files, &dir) {
             list.push(Convention {
                 exists: false,
                 path: dir.join(build_file),
@@ -88,7 +95,7 @@ pub fn conventions(root: &Path) -> Vec<Convention> {
     ] {
         let path = root.join(name);
         list.push(Convention {
-            exists: path.exists(),
+            exists: files.exists(&path),
             path,
             purpose,
             ghost: true,
@@ -96,7 +103,7 @@ pub fn conventions(root: &Path) -> Vec<Convention> {
         });
     }
     list.push(Convention {
-        exists: root.join(".taste.yaml").exists(),
+        exists: files.exists(&root.join(".taste.yaml")),
         path: root.join(".taste.yaml"),
         purpose: "reserved for repo-level IDE configuration; currently \
                   nothing needs it — prefer the conventions above over \
@@ -112,16 +119,16 @@ pub fn conventions(root: &Path) -> Vec<Convention> {
 /// absent, or `Containerfile` when there is no config yet. `None` when a
 /// build file is present, or when the config pulls an image and names
 /// none — an image-based config wants no Containerfile ghost beside it.
-fn wanted_build_file(dir: &Path) -> Option<String> {
-    let config = std::fs::read_to_string(dir.join("devcontainer.json")).ok();
+fn wanted_build_file(files: &crate::files::Files, dir: &Path) -> Option<String> {
+    let config = files.read_to_string(&dir.join("devcontainer.json")).ok();
     let named = config.as_deref().and_then(build_dockerfile);
     match (config.is_some(), named) {
-        (true, Some(name)) => (!dir.join(&name).exists()).then_some(name),
+        (true, Some(name)) => (!files.exists(&dir.join(&name))).then_some(name),
         (true, None) => None,
         (false, _) => {
             let present = ["Containerfile", "Dockerfile"]
                 .iter()
-                .any(|name| dir.join(name).exists());
+                .any(|name| files.exists(&dir.join(name)));
             (!present).then(|| "Containerfile".to_string())
         }
     }

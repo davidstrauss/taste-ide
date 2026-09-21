@@ -218,6 +218,40 @@ impl Keys {
 }
 
 impl Keys {
+    /// `ssh -N` to the VM at `port`, forwarding each of `forwards` from
+    /// this host's loopback to the same number on the VM's — how a
+    /// container's published port in the guest is reached from here. One
+    /// process for all of a container's ports; `ExitOnForwardFailure` so a
+    /// port taken on either side is a dead process rather than a silent
+    /// gap.
+    pub fn ssh_tunnel_argv(&self, port: u16, forwards: &[u16]) -> (String, Vec<String>) {
+        let mut args: Vec<String> = vec![
+            "-N".into(),
+            "-o".into(),
+            "ExitOnForwardFailure=yes".into(),
+            "-i".into(),
+            self.identity().display().to_string(),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+            "-o".into(),
+            "IdentityAgent=none".into(),
+            "-o".into(),
+            format!("UserKnownHostsFile={}", self.known_hosts().display()),
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+        ];
+        for forward in forwards {
+            args.push("-L".into());
+            args.push(format!("127.0.0.1:{forward}:127.0.0.1:{forward}"));
+        }
+        args.push("-p".into());
+        args.push(port.to_string());
+        args.push(format!("{}@127.0.0.1", crate::provision::GUEST_USER));
+        taste_core::podman::host_argv(self.sandboxed, "ssh", args)
+    }
+
     /// The `GIT_SSH_COMMAND` for a git talking to this workspace's VMs:
     /// the same options as [`Self::ssh_argv`], without the host and port,
     /// which git supplies from the URL. Shell-quoted, because git runs it
@@ -327,6 +361,24 @@ mod tests {
             joined.ends_with("-p 40001 core@127.0.0.1 git init /x"),
             "{joined}"
         );
+
+        // A tunnel is the same trust with forwards and no command.
+        let (program, args) = keys.ssh_tunnel_argv(40001, &[8000, 3000]);
+        assert_eq!(program, "ssh");
+        let joined = args.join(" ");
+        assert!(
+            joined.starts_with("-N -o ExitOnForwardFailure=yes"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-L 127.0.0.1:8000:127.0.0.1:8000"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-L 127.0.0.1:3000:127.0.0.1:3000"),
+            "{joined}"
+        );
+        assert!(joined.ends_with("-p 40001 core@127.0.0.1"), "{joined}");
 
         // git gets the same trust, quoted for its shell, and no host or
         // port — those come from the URL.

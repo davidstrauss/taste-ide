@@ -22,29 +22,36 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 \
 ```
 
 **Builds are contended, and it is the HOST they contend for.** Every
-container the IDE runs is rootless podman on this machine — there is no VM
-between a build and the hardware. Verified 2026-09-17: no `podman machine`
-exists and none ever has, `podman info` reports the host's own hostname,
-kernel and graph root, and a container's
-`/proc/sys/kernel/random/boot_id` is byte-identical to the host's, which
-only one kernel can be. So a build that goes wrong still takes the machine
-down: two concurrent `cargo build`s power-cycled this host twice. **Never
-start a workspace-wide build while another environment is in one.** Cap
-each build with `CARGO_BUILD_JOBS=8` and the container's memory limit
+container the IDE runs is rootless podman on this machine's kernel, or in
+a VM that takes this machine's memory as a commitment — there is no third
+place. Verified 2026-09-17: no `podman machine` exists and none ever has,
+`podman info` reports the host's own hostname, kernel and graph root, and
+a container's `/proc/sys/kernel/random/boot_id` is byte-identical to the
+host's. So a build that goes wrong still takes the machine down: two
+concurrent `cargo build`s power-cycled this host twice. **Never start a
+workspace-wide build while another environment is in one.** Cap each
+build with `CARGO_BUILD_JOBS=8` and the container's memory limit
 (`--memory=16g --memory-swap=16g` on a bare `podman run`), and prefer
 `cargo check` and per-crate tests until the final gate.
 
-The VM is something the IDE can do and does not yet do, which is how this
-paragraph came to claim otherwise. `taste_devcontainer::substrate` adopts
-a `podman machine` named `taste-ide` **if one exists**, and nothing in the
-tree creates one — so the rung in force is local podman, and it is silent
-about it by design, because a rung that was never chosen is not a
-degradation to report. The relaxation this rule briefly carried — "Now
-that they are [in a VM], we can't crash the host that way but still need
-to care about overhead to have the envs operate" (David, 2026-09-16) —
-is true of the machine and not of what is running, so it waits on one
-being created. ENVIRONMENTS.md → "How the provider is chosen" has the
-ladder and what creating it takes.
+**Where the IDE's own containers run, as of 2026-09-20.** On a host with a
+user-session libvirt, opening a workspace provisions a Fedora CoreOS VM
+for it (`taste_devcontainer::provision`, `pool`; a pool per workspace,
+sized by `sizing`), and **agent environments' checkouts and containers
+live in that VM** — cloned into it over ssh, reached through the files
+service (`taste_core::files`, the keeper), snapshotted there. **The
+primary environment's checkout and container are still on the host**, on
+local podman: an environment's substrate follows its checkout
+(`EnvironmentRegistry::substrate_for`), and the primary's move is the
+next program. So the isolation standard in ENVIRONMENTS.md → "Isolation"
+is met for agent environments and not yet for the primary, and this
+paragraph is where that changes. A host without libvirt runs everything
+locally as before, quietly; a workspace whose VM will not come up is told
+so, loudly. The old `podman machine` rung is still in the ladder below the
+VM's and is retired with the primary's move. The first launch on a host
+after this does a one-time download of the guest image (about a
+gigabyte). `TASTE_PROVISION_TESTS=1` runs the live provisioning test,
+which boots a VM and is run by a person.
 
 A `podman build` goes silent after a big RUN's last line: that is the
 layer commit (every file read back through rootless fuse-overlayfs and

@@ -551,6 +551,16 @@ pub struct Supervisor {
     /// `None` until then, and always for a local checkout, whose files are
     /// simply this host's ([`Self::files`]).
     files: Mutex<Option<taste_core::files::Files>>,
+    /// The keeper's watch on a remote checkout's tree, which is what drives
+    /// config rechecks there in place of inotify. Dropped with the
+    /// supervisor.
+    remote_watch: Mutex<Option<crate::keeper::WatchHandle>>,
+    /// A recheck the watch has asked for and not yet run: several events
+    /// in a burst make one recheck.
+    recheck_pending: Arc<AtomicBool>,
+    /// The ssh process forwarding a remote container's published ports to
+    /// this host's loopback, while the container runs.
+    tunnel: Mutex<Option<std::process::Child>>,
     /// True when the IDE itself runs inside a container (self-hosting
     /// bootstrap): the environment is already up, and lifecycle operations
     /// on it must happen from the host IDE instead. No container runtime is
@@ -599,6 +609,16 @@ fn workspace_bind_flags(authority: ConfigAuthority) -> &'static str {
     match authority {
         ConfigAuthority::Project => "Z",
         ConfigAuthority::Baseline => "ro,Z",
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        // The ssh forwarding a remote container's ports has no other owner.
+        if let Some(mut child) = self.tunnel.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -655,6 +675,9 @@ impl Supervisor {
             lifecycle: tokio::sync::Mutex::new(()),
             substrate: Mutex::new(substrate),
             files: Mutex::new(None),
+            remote_watch: Mutex::new(None),
+            recheck_pending: Arc::new(AtomicBool::new(false)),
+            tunnel: Mutex::new(None),
             inside,
             disk: Mutex::new(None),
         })
@@ -713,9 +736,118 @@ impl Supervisor {
     }
 
     /// The registry's: connect this environment's files to its VM's
-    /// keeper.
+    /// keeper, and let the keeper's watch on the checkout drive config
+    /// rechecks — the job inotify does for a checkout on this host.
+    pub fn set_keeper(self: &Arc<Self>, keeper: Arc<crate::keeper::Keeper>) {
+        *self.files.lock().unwrap() = Some(taste_core::files::Files::Remote(keeper.clone()));
+        let Checkout::Remote { path, .. } = &self.env.checkout else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let pending = self.recheck_pending.clone();
+        let watch = keeper.watch(path, move |name| {
+            // Only the config: the agent's every edit is an event here, and
+            // the tree, the editor, and git status are somebody else's to
+            // refresh. A burst of edits under .devcontainer/ is one recheck,
+            // a quarter second after the first, on a thread of its own —
+            // never on the watch's, which must keep draining.
+            if !name.starts_with(".devcontainer") {
+                return;
+            }
+            if pending.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let weak = weak.clone();
+            let pending = pending.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                pending.store(false, Ordering::SeqCst);
+                if let Some(supervisor) = weak.upgrade() {
+                    if let Err(e) = supervisor.recheck() {
+                        tracing::warn!("recheck after a change in the VM failed: {e:#}");
+                    }
+                }
+            });
+        });
+        match watch {
+            Ok(handle) => *self.remote_watch.lock().unwrap() = Some(handle),
+            Err(e) => self.log(format!(
+                "the checkout in the VM cannot be watched ({e}); config changes there are \
+                 noticed on the IDE's own cadence"
+            )),
+        }
+    }
+
+    /// Test seam: the files without a keeper to watch with.
+    #[doc(hidden)]
     pub fn set_files(&self, files: taste_core::files::Files) {
         *self.files.lock().unwrap() = Some(files);
+    }
+
+    /// A remote container's published ports live on the VM's loopback;
+    /// this brings them to this host's, where the port tab, the browser
+    /// face, and the user's own tools expect them. One ssh per container,
+    /// started when it runs and ended when it stops; nothing for a local
+    /// checkout, whose ports were published here in the first place.
+    fn sync_tunnel(&self, state: &SupervisorState) {
+        if self.env.checkout.is_local() {
+            return;
+        }
+        if !matches!(state, SupervisorState::Running { .. }) {
+            self.stop_tunnel();
+            return;
+        }
+        let forwards: Vec<u16> = {
+            let mut hosts: Vec<u16> = self
+                .published_ports
+                .lock()
+                .unwrap()
+                .values()
+                .copied()
+                .collect();
+            hosts.sort_unstable();
+            hosts
+        };
+        self.stop_tunnel();
+        if forwards.is_empty() {
+            return;
+        }
+        let Some(vm) = self.substrate().vm_details().cloned() else {
+            return;
+        };
+        let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+        let (program, args) = keys.ssh_tunnel_argv(vm.ssh_port, &forwards);
+        match std::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                *self.tunnel.lock().unwrap() = Some(child);
+                self.log(format!(
+                    "forwarding localhost:{} from VM {}",
+                    forwards
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", localhost:"),
+                    vm.domain
+                ));
+            }
+            Err(e) => self.log(format!(
+                "the ports published in VM {} could not be forwarded here: {e}",
+                vm.domain
+            )),
+        }
+    }
+
+    fn stop_tunnel(&self) {
+        if let Some(mut child) = self.tunnel.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     /// Run a blocking files call from wherever this is. A local checkout's
@@ -1522,6 +1654,7 @@ impl Supervisor {
             state: state.to_event(),
         });
         self.sync_log_follower(&state);
+        self.sync_tunnel(&state);
     }
 
     /// Last `n` lines the container itself wrote — its main process's

@@ -144,6 +144,13 @@ pub fn strip_worktree(repo: &Path) -> Result<()> {
     repository
         .set_head(&format!("refs/heads/{PEER_HEAD_BRANCH}"))
         .context("parking HEAD on the peer's unborn branch")?;
+    // The index too: it still lists the files that were just removed, and
+    // against an unborn HEAD every one of them would read as a staged
+    // addition and a working-tree deletion — a "dirty" peer with nothing
+    // in it.
+    let mut index = repository.index().context("opening the peer's index")?;
+    index.clear().context("clearing the peer's index")?;
+    index.write().context("writing the peer's empty index")?;
     Ok(())
 }
 

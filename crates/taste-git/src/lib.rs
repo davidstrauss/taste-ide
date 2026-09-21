@@ -120,6 +120,43 @@ pub enum FileState {
     Ignored,
 }
 
+/// `git status --porcelain=v1 -z --untracked-files=all`, as the same map
+/// [`GitWorkspace::status`] gives — for a working copy this process cannot
+/// open, where `git` runs beside the files and only its output comes here.
+///
+/// The two-letter code: `??` untracked, `!!` ignored, the conflict pairs
+/// conflicted, anything staged in the index (`X`) staged whatever the
+/// working tree adds, and a working-tree change alone (`Y`) modified. A
+/// rename or copy carries the original path as the following record and it
+/// is skipped: the state belongs to the new path.
+pub fn status_from_porcelain(z_output: &str) -> HashMap<PathBuf, FileState> {
+    let mut out = HashMap::new();
+    let mut records = z_output.split('\0').filter(|r| !r.is_empty());
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let (code, path) = record.split_at(3);
+        let code = &code[..2];
+        let mut chars = code.chars();
+        let (x, y) = (chars.next().unwrap_or(' '), chars.next().unwrap_or(' '));
+        if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+            // The original path is the next record; the new one is here.
+            let _ = records.next();
+        }
+        let state = match code {
+            "??" => FileState::Untracked,
+            "!!" => FileState::Ignored,
+            "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU" => FileState::Conflicted,
+            _ if x != ' ' => FileState::Staged,
+            _ if y != ' ' => FileState::Modified,
+            _ => continue,
+        };
+        out.insert(PathBuf::from(path), state);
+    }
+    out
+}
+
 impl FileState {
     fn from_status(s: Status) -> Self {
         if s.is_conflicted() {
@@ -808,6 +845,27 @@ impl SyncStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every porcelain code lands on the state the library would give.
+    #[test]
+    fn porcelain_codes_map_to_file_states() {
+        let z = " M a.rs\0M  b.rs\0MM c.rs\0?? d.rs\0!! e.o\0UU f.rs\0R  new.rs\0old.rs\0A  g.rs\0 D h.rs\0";
+        let status = status_from_porcelain(z);
+        assert_eq!(status[Path::new("a.rs")], FileState::Modified);
+        assert_eq!(status[Path::new("b.rs")], FileState::Staged);
+        assert_eq!(status[Path::new("c.rs")], FileState::Staged);
+        assert_eq!(status[Path::new("d.rs")], FileState::Untracked);
+        assert_eq!(status[Path::new("e.o")], FileState::Ignored);
+        assert_eq!(status[Path::new("f.rs")], FileState::Conflicted);
+        assert_eq!(status[Path::new("new.rs")], FileState::Staged);
+        assert!(
+            !status.contains_key(Path::new("old.rs")),
+            "the rename's origin is not a file"
+        );
+        assert_eq!(status[Path::new("g.rs")], FileState::Staged);
+        assert_eq!(status[Path::new("h.rs")], FileState::Modified);
+        assert!(status_from_porcelain("").is_empty());
+    }
     use std::fs;
 
     fn temp_repo() -> (tempfile::TempDir, GitWorkspace) {

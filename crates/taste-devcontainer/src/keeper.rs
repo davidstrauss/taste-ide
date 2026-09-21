@@ -520,6 +520,55 @@ impl Keeper {
     }
 }
 
+/// A watch on a directory in the keeper's world. Dropping it ends the
+/// watch over there.
+#[derive(Debug)]
+pub struct WatchHandle {
+    id: u32,
+    keeper: std::sync::Weak<Keeper>,
+}
+
+impl Drop for WatchHandle {
+    fn drop(&mut self) {
+        if let Some(keeper) = self.keeper.upgrade() {
+            let _ = keeper.send(encode(self.id, 2, &[]));
+        }
+    }
+}
+
+impl Keeper {
+    /// Watch `path` recursively; `on_event` is called with each changed
+    /// name, relative to `path`, on a thread of the watch's own. What a
+    /// checkout in a VM has instead of inotify. Ends when the handle is
+    /// dropped or the keeper is gone.
+    pub fn watch(
+        self: &Arc<Self>,
+        path: &Path,
+        on_event: impl Fn(String) + Send + 'static,
+    ) -> io::Result<WatchHandle> {
+        let (id, rx) = self.request(serde_json::json!({ "op": "watch", "path": path }))?;
+        std::thread::Builder::new()
+            .name("taste-keeper-watch".into())
+            .spawn(move || {
+                while let Ok(reply) = rx.recv() {
+                    match reply {
+                        Reply::Event(event) => {
+                            if let Some(name) = event["name"].as_str() {
+                                on_event(name.to_string());
+                            }
+                        }
+                        Reply::Done(_) | Reply::Error { .. } => break,
+                        Reply::Data(_) | Reply::Stderr(_) => {}
+                    }
+                }
+            })?;
+        Ok(WatchHandle {
+            id,
+            keeper: Arc::downgrade(self),
+        })
+    }
+}
+
 /// The keeper's `errno` names, as `io::ErrorKind`s the callers already
 /// branch on: `textfile::load` treats `NotFound` as a new file, and must
 /// keep doing so for a file in a VM.
@@ -893,6 +942,45 @@ mod tests {
             assert_eq!(handle.join().unwrap(), format!("file {i}"));
         }
         assert!(keeper.alive());
+    }
+
+    /// A watch reports what changes under it, by name, and ends when its
+    /// handle is dropped.
+    #[test]
+    fn a_watch_reports_changes_and_ends_with_its_handle() {
+        if !node_present() {
+            eprintln!("SKIP: no node on this machine");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devcontainer")).unwrap();
+        let keeper = Keeper::local_node_for_tests().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        let handle = keeper
+            .watch(dir.path(), move |name| {
+                let _ = tx.send(name);
+            })
+            .unwrap();
+        // The watch is armed asynchronously over there; give it a moment.
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(dir.path().join(".devcontainer/devcontainer.json"), "{}").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut saw = Vec::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(name) = rx.recv_timeout(Duration::from_millis(200)) {
+                saw.push(name.clone());
+                if name.contains("devcontainer.json") {
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw.iter().any(|n| n.contains("devcontainer.json")),
+            "the change was reported: {saw:?}"
+        );
+        drop(handle);
+        // The keeper is still there for other requests.
+        keeper.ping().unwrap();
     }
 
     /// A keeper that dies fails every waiter at once, rather than leaving

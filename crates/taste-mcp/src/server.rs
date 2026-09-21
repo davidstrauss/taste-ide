@@ -1531,23 +1531,31 @@ impl McpServer {
                 // This environment's checkout: the conventional files the
                 // caller can actually create are the ones in the tree it
                 // works in.
-                let root = self.host_root(env)?;
-                let entries: Vec<_> = taste_core::conventions::conventions(&root)
-                    .into_iter()
-                    .map(|c| {
-                        json!({
-                            "path": c
-                                .path
-                                .strip_prefix(&root)
-                                .unwrap_or(&c.path)
-                                .display()
-                                .to_string(),
-                            "purpose": c.purpose,
-                            "exists": c.exists,
-                            "kind": if c.is_dir { "directory" } else { "file" },
-                        })
+                let root = self.checkout_path(env)?;
+                let files = self.supervisor(env)?.files();
+                let entries: Vec<_> = {
+                    let root = root.clone();
+                    tokio::task::spawn_blocking(move || {
+                        taste_core::conventions::conventions_via(&files, &root)
                     })
-                    .collect();
+                    .await
+                    .context("the conventions walk did not finish")?
+                }
+                .into_iter()
+                .map(|c| {
+                    json!({
+                        "path": c
+                            .path
+                            .strip_prefix(&root)
+                            .unwrap_or(&c.path)
+                            .display()
+                            .to_string(),
+                        "purpose": c.purpose,
+                        "exists": c.exists,
+                        "kind": if c.is_dir { "directory" } else { "file" },
+                    })
+                })
+                .collect();
                 Ok(json!({
                     "conventions": entries,
                     "note": "Convention over configuration over code: projects behave \
@@ -1820,19 +1828,23 @@ impl McpServer {
                 // how "more" is known without counting everything.
                 let (offset, limit) = paging(&args, FIND_DEFAULT_LIMIT, FIND_MAX_LIMIT);
                 let fetch = offset + limit + 1;
-                let root = self.host_root(env)?;
+                let root = self.checkout_path(env)?;
+                let peer = self.peer(env)?;
+                let service = self.supervisor(env)?.files();
                 let needle = query.clone();
                 // The files-and-repository half, off the async workers: a
-                // walk of the checkout and of HEAD's history.
+                // walk of the checkout — wherever it is — and of the
+                // peer's history.
                 let repository_half = tokio::task::spawn_blocking(move || {
                     let q = taste_core::search::Query::new(&needle);
-                    let files: Vec<Value> = taste_core::search::search(&root, &needle, fetch)
-                        .into_iter()
-                        .map(|hit| {
-                            json!({ "path": hit.path.display().to_string(), "line": hit.line, "text": hit.text })
-                        })
-                        .collect();
-                    let listed = taste_core::search::collect_files(&root, |_| {});
+                    let files: Vec<Value> =
+                        taste_core::search::search_via(&service, &root, &needle, fetch)
+                            .into_iter()
+                            .map(|hit| {
+                                json!({ "path": hit.path.display().to_string(), "line": hit.line, "text": hit.text })
+                            })
+                            .collect();
+                    let listed = taste_core::search::collect_files_via(&service, &root);
                     let never = std::sync::atomic::AtomicBool::new(false);
                     let definitions: Vec<Value> =
                         taste_core::search::symbols::index(&listed, &never)
@@ -1854,7 +1866,7 @@ impl McpServer {
                     let mut branches: Vec<Value> = Vec::new();
                     let mut commits: Vec<Value> = Vec::new();
                     let mut issues: Vec<Value> = Vec::new();
-                    if let Some(git) = taste_git::GitWorkspace::discover(&root) {
+                    if let Some(git) = taste_git::GitWorkspace::discover(&peer) {
                         branches = git
                             .local_branches()
                             .unwrap_or_default()
@@ -2067,10 +2079,11 @@ impl McpServer {
                     )?
                     .to_string();
                 let (offset, limit) = paging(&args, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT);
-                let root = self.host_root(env)?;
+                let root = self.checkout_path(env)?;
+                let files = self.supervisor(env)?.files();
                 // One past the page: how "more" is known without a full count.
                 let hits = tokio::task::spawn_blocking(move || {
-                    taste_core::search::search(&root, &query, offset + limit + 1)
+                    taste_core::search::search_via(&files, &root, &query, offset + limit + 1)
                 })
                 .await
                 .context("the search did not finish; call ide_search again")?;
@@ -2100,10 +2113,11 @@ impl McpServer {
                     .as_str()
                     .map(str::to_lowercase);
                 let (offset, limit) = paging(&args, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT);
-                let root = self.host_root(env)?;
+                let root = self.checkout_path(env)?;
+                let files = self.supervisor(env)?.files();
                 let start = if subdir.is_empty() {
                     root.clone()
-                } else {
+                } else if files.is_local() {
                     let candidate = root.join(&subdir);
                     let resolved = candidate.canonicalize().with_context(|| {
                         format!(
@@ -2119,9 +2133,40 @@ impl McpServer {
                         );
                     }
                     resolved
+                } else {
+                    // Nothing here can canonicalize a path in the VM: the
+                    // subdir is folded lexically, must stay under the root,
+                    // and must be a directory over there.
+                    let mut folded = root.clone();
+                    for component in std::path::Path::new(&subdir).components() {
+                        match component {
+                            std::path::Component::Normal(part) => folded.push(part),
+                            std::path::Component::ParentDir => {
+                                folded.pop();
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !folded.starts_with(&root) {
+                        anyhow::bail!(
+                            "subdir must be inside the workspace: pass a directory under {}",
+                            root.display()
+                        );
+                    }
+                    let (probe, is_dir) = (files.clone(), folded.clone());
+                    if !tokio::task::spawn_blocking(move || probe.is_dir(&is_dir))
+                        .await
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "{subdir} does not exist in the workspace; ide_list_files with no \
+                             subdir lists from the top"
+                        );
+                    }
+                    folded
                 };
                 let all = tokio::task::spawn_blocking(move || {
-                    taste_core::search::collect_files(&start, |_| {})
+                    taste_core::search::collect_files_via(&files, &start)
                 })
                 .await
                 .context("the listing did not finish; call ide_list_files again")?;
@@ -2152,10 +2197,46 @@ impl McpServer {
                 // environment that is its clone, whose branch and dirty
                 // state are the agent's own work in progress — not the
                 // user's.
-                let root = self.host_root(env)?;
-                let git = GitWorkspace::discover(&root)
-                    .context("this environment's checkout is not a git repository")?;
-                let status = git.status()?;
+                let root = self.checkout_path(env)?;
+                let service = self.supervisor(env)?.files();
+                let (status, branch) = if service.is_local() {
+                    let git = GitWorkspace::discover(&root)
+                        .context("this environment's checkout is not a git repository")?;
+                    (git.status()?, git.branch_name())
+                } else {
+                    // `git` beside the files, its porcelain read back here.
+                    let (service, at) = (service.clone(), root.clone());
+                    tokio::task::spawn_blocking(move || -> Result<_> {
+                        let status = service.exec(
+                            &at,
+                            &[
+                                "git",
+                                "status",
+                                "--porcelain=v1",
+                                "-z",
+                                "--untracked-files=all",
+                            ]
+                            .map(String::from),
+                        )?;
+                        if !status.success() {
+                            anyhow::bail!("git status in the VM: {}", status.stderr_utf8().trim());
+                        }
+                        let branch = service
+                            .exec(
+                                &at,
+                                &["git", "symbolic-ref", "--short", "-q", "HEAD"].map(String::from),
+                            )
+                            .ok()
+                            .filter(|out| out.success())
+                            .map(|out| out.stdout_utf8().trim().to_string());
+                        Ok((
+                            taste_git::status_from_porcelain(&status.stdout_utf8()),
+                            branch,
+                        ))
+                    })
+                    .await
+                    .context("git status did not finish")??
+                };
                 let files: Vec<Value> = status
                     .iter()
                     .map(|(path, state)| {
@@ -2165,7 +2246,7 @@ impl McpServer {
                 Ok(json!({
                     "environment": env.as_str(),
                     "root": root.display().to_string(),
-                    "branch": git.branch_name(),
+                    "branch": branch,
                     "files": files,
                 }))
             }

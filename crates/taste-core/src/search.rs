@@ -724,6 +724,102 @@ pub mod symbols {
     }
 }
 
+/// [`search`], wherever the checkout is. On this host it is the walk
+/// below; through a remote service it is `rg` run beside the files, with
+/// the same rules — case-insensitive, fixed string, `.gitignore` honoured,
+/// `.git` skipped, binaries and large files left out — read back off its
+/// output. `rg` is in the baseline image the keeper runs in, which is why
+/// it is there.
+pub fn search_via(
+    files: &crate::files::Files,
+    root: &Path,
+    query: &str,
+    max_hits: usize,
+) -> Vec<SearchHit> {
+    if files.is_local() {
+        return search(root, query, max_hits);
+    }
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let argv: Vec<String> = [
+        "rg",
+        "--no-heading",
+        "--line-number",
+        "--color",
+        "never",
+        "--fixed-strings",
+        "--ignore-case",
+        "--hidden",
+        "--glob",
+        "!.git",
+        "--max-filesize",
+        &MAX_FILE_SIZE.to_string(),
+        "--",
+        query,
+        ".",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    match files.exec(root, &argv) {
+        Ok(out) => parse_rg_hits(root, &out.stdout_utf8(), max_hits),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `rg --no-heading --line-number` output, as hits: `./path:line:text`.
+pub fn parse_rg_hits(root: &Path, stdout: &str, max_hits: usize) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    for line in stdout.lines() {
+        let Some((path, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((number, text)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(number) = number.parse::<u32>() else {
+            continue;
+        };
+        let mut display: String = text.trim().chars().take(MAX_LINE_DISPLAY).collect();
+        if text.trim().chars().count() > MAX_LINE_DISPLAY {
+            display.push('…');
+        }
+        hits.push(SearchHit {
+            path: root.join(path.strip_prefix("./").unwrap_or(path)),
+            line: number,
+            text: display,
+        });
+        if hits.len() >= max_hits {
+            break;
+        }
+    }
+    hits
+}
+
+/// [`collect_files`], wherever the checkout is: the walk on this host,
+/// `rg --files` beside the files otherwise, with the same rules.
+pub fn collect_files_via(files: &crate::files::Files, root: &Path) -> Vec<PathBuf> {
+    if files.is_local() {
+        return collect_files(root, |_| {});
+    }
+    let argv: Vec<String> = [
+        "rg", "--files", "--hidden", "--glob", "!.git", "--sort", "path", ".",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    match files.exec(root, &argv) {
+        Ok(out) => out
+            .stdout_utf8()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| root.join(l.strip_prefix("./").unwrap_or(l)))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Search the workspace by walking it. Returns at most `max_hits` hits.
 pub fn search(root: &Path, query: &str, max_hits: usize) -> Vec<SearchHit> {
     let query = query.to_lowercase();
@@ -795,6 +891,41 @@ pub fn search_files(files: &[PathBuf], query: &str, max_hits: usize) -> Vec<Sear
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rg`'s lines become the same hits the walk produces: paths under
+    /// the root, one-based lines, the text trimmed and clamped, the count
+    /// capped.
+    #[test]
+    fn rg_output_is_read_as_hits() {
+        let root = Path::new("/var/home/core/taste/x/i-1");
+        let out =
+            "./src/main.rs:12:    fn render() {}\n./README.md:1:# Title\nnot a hit\n./a:x:bad\n";
+        let hits = parse_rg_hits(root, out, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, root.join("src/main.rs"));
+        assert_eq!(hits[0].line, 12);
+        assert_eq!(hits[0].text, "fn render() {}");
+        assert_eq!(hits[1].path, root.join("README.md"));
+        assert_eq!(parse_rg_hits(root, out, 1).len(), 1, "capped");
+        let long = format!("./f:1:{}\n", "x".repeat(MAX_LINE_DISPLAY + 40));
+        assert!(parse_rg_hits(root, &long, 1)[0].text.ends_with('…'));
+    }
+
+    /// The local arm of the `_via` pair is the walk, byte for byte.
+    #[test]
+    fn the_local_arm_is_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle here\n").unwrap();
+        let files = crate::files::Files::Local;
+        let via = search_via(&files, dir.path(), "needle", 10);
+        let direct = search(dir.path(), "needle", 10);
+        assert_eq!(via, direct);
+        assert_eq!(via.len(), 1);
+        assert_eq!(
+            collect_files_via(&files, dir.path()),
+            collect_files(dir.path(), |_| {})
+        );
+    }
 
     #[test]
     fn the_query_is_smart_case_and_marks_its_matches() {
