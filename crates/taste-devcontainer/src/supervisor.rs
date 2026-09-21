@@ -640,6 +640,21 @@ const LABEL_USERNS_GENERATION: &str = "taste.userns-generation";
 /// live run's `destroy` left the checkout behind, 2026-09-21). A VM serves
 /// one workspace, and every container in it is the same principal, so the
 /// shared label is the honest one there.
+/// A repo-supplied `--mount` spec with its private SELinux label made
+/// shared: the bare `Z` option, or podman's long form `relabel=private`.
+/// Everything else in the spec is left as written.
+fn share_label_in_vm(mount: &str) -> String {
+    mount
+        .split(',')
+        .map(|option| match option.trim() {
+            "Z" => "z",
+            "relabel=private" => "relabel=shared",
+            _ => option,
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn workspace_bind_flags(authority: ConfigAuthority, shared_label: bool) -> &'static str {
     match (authority, shared_label) {
         (ConfigAuthority::Project, false) => "Z",
@@ -2861,12 +2876,26 @@ impl Supervisor {
         // conditional — and a checkout in a VM is bound at ITS path there,
         // since the podman doing the binding is the VM's.
         let local_workspace_folder = self.checkout().path().display().to_string();
+        // A repo's mount that asks for a private label (`Z`) is written for
+        // a host, where it keeps one environment's files from another
+        // container. In a VM the keeper is another container over the same
+        // files by design, and a private label locked it out: every `git`
+        // it ran in the checkout failed with EACCES the moment the
+        // project's container came up (2026-09-21). So the label is shared
+        // there, as `workspace_bind_flags` already makes the IDE's own.
+        let in_vm = !self.checkout().is_local();
+        let repo_mount = |mount: &str| -> String {
+            let expanded = mount.replace("${localWorkspaceFolder}", &local_workspace_folder);
+            if in_vm {
+                share_label_in_vm(&expanded)
+            } else {
+                expanded
+            }
+        };
         match &config.workspace_mount {
             Some(mount) => {
                 args.push("--mount".into());
-                args.push(self.namespaced_mount(
-                    &mount.replace("${localWorkspaceFolder}", &local_workspace_folder),
-                ));
+                args.push(self.namespaced_mount(&repo_mount(mount)));
             }
             None => {
                 args.push("-v".into());
@@ -2879,9 +2908,7 @@ impl Supervisor {
         for mount in &config.mounts {
             if let Some(m) = mount.as_str() {
                 args.push("--mount".into());
-                args.push(self.namespaced_mount(
-                    &m.replace("${localWorkspaceFolder}", &local_workspace_folder),
-                ));
+                args.push(self.namespaced_mount(&repo_mount(m)));
             }
         }
 
@@ -3787,6 +3814,24 @@ fn parse_ports_label(value: &str) -> Vec<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
+    /// A repo's private label is shared in a VM, and nothing else in the
+    /// mount changes.
+    #[test]
+    fn a_repo_mounts_private_label_is_shared_in_a_vm() {
+        assert_eq!(
+            super::share_label_in_vm("source=/w,target=/workspaces/x,type=bind,Z"),
+            "source=/w,target=/workspaces/x,type=bind,z"
+        );
+        assert_eq!(
+            super::share_label_in_vm("type=bind,source=/w,target=/x,relabel=private,ro"),
+            "type=bind,source=/w,target=/x,relabel=shared,ro"
+        );
+        assert_eq!(
+            super::share_label_in_vm("type=volume,source=cargo,target=/home/dev/.cargo"),
+            "type=volume,source=cargo,target=/home/dev/.cargo"
+        );
+    }
+
     /// The primary outranks agent environments on a contended VM: more CPU
     /// weight, a memory floor, and never the first the OOM killer takes.
     #[test]

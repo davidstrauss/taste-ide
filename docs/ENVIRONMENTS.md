@@ -2733,7 +2733,13 @@ directory. Anything the IDE would bind from this host — a path under
 failure mode but still a failure. `taste-devcontainer::security` refuses
 repo-supplied binds outside the checkout for the same reason it always
 did, and the live suite is the tripwire for anything new staged on the
-host.
+host. One more thing a VM reads differently: a repo's mount that asks for
+a **private** SELinux label (`Z`, or `relabel=private`) is bound
+**shared** there. On a host the private label is what keeps one
+environment's files from another container; in a VM the keeper is
+another container over the same files by design, and a private label
+locked it out — every `git` it ran in the checkout failed with EACCES the
+moment the project's container came up (2026-09-21).
 
 ### Remote substrate: what is proven, and the gate
 
