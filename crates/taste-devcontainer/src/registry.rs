@@ -1562,6 +1562,11 @@ impl EnvironmentRegistry {
         // a new environment's would — before its first check, so the check
         // finds it where it can run rather than refusing it.
         if substrate.vm_details().is_some() {
+            // One line for the lot: each move is in the app log, and a
+            // toast per environment is nine toasts on a launch (David,
+            // 2026-09-21: "Don't give me a toast with every env move").
+            let mut moved: Vec<String> = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
             for id in report.restored.clone() {
                 let Some(supervisor) = self.get(&id) else {
                     continue;
@@ -1570,30 +1575,58 @@ impl EnvironmentRegistry {
                     continue;
                 }
                 let registry = self.clone();
-                let moved = {
+                let outcome = {
                     let id = id.clone();
                     tokio::task::spawn_blocking(move || registry.migrate_environment(&id)).await
                 };
-                match moved {
+                match outcome {
                     Ok(Ok(vm)) => {
-                        let note = format!(
-                            "environment {id}'s checkout moved from this host into VM {vm}, \
-                             with its uncommitted work; the clone here is its peer now"
+                        taste_core::app_log::push(
+                            "info",
+                            "environments",
+                            &format!(
+                                "environment {id}'s checkout moved from this host into VM {vm}, \
+                                 with its uncommitted work; the clone here is its peer now"
+                            ),
                         );
-                        taste_core::app_log::push("info", "environments", &note);
-                        self.events.publish(Event::Toast(note));
+                        moved.push(id.to_string());
                     }
                     Ok(Err(e)) => {
-                        let note = format!(
-                            "environment {id}'s checkout is on this host, where nothing runs, \
-                             and moving it into the workspace's VM failed ({e:#}); it cannot \
-                             run until it is moved"
+                        taste_core::app_log::push(
+                            "warn",
+                            "environments",
+                            &format!(
+                                "environment {id}'s checkout is on this host, where nothing \
+                                 runs, and moving it into the workspace's VM failed ({e:#}); it \
+                                 cannot run until it is moved"
+                            ),
                         );
-                        taste_core::app_log::push("warn", "environments", &note);
-                        self.events.publish(Event::Toast(note));
+                        failed.push(id.to_string());
                     }
                     Err(e) => tracing::warn!("moving {id} into the VM did not finish: {e}"),
                 }
+            }
+            if !moved.is_empty() || !failed.is_empty() {
+                let mut note = String::new();
+                if !moved.is_empty() {
+                    note.push_str(&format!(
+                        "{} environment{} moved into the workspace's VM ({})",
+                        moved.len(),
+                        if moved.len() == 1 { "" } else { "s" },
+                        moved.join(", ")
+                    ));
+                }
+                if !failed.is_empty() {
+                    if !note.is_empty() {
+                        note.push_str("; ");
+                    }
+                    note.push_str(&format!(
+                        "{} could not be moved and cannot run ({}); the app log says why",
+                        failed.len(),
+                        failed.join(", ")
+                    ));
+                }
+                self.events.publish(Event::Toast(note));
             }
         }
 
