@@ -102,6 +102,10 @@ pub const NAME_ENTROPY: usize = 6;
 /// How long a guest gets from `start` to a podman that answers over ssh.
 /// A first boot runs Ignition and grows its root filesystem before sshd is
 /// up, and podman's user socket comes after login.
+/// How long a VM found "in shutdown" is given to finish stopping before
+/// the ladder gives up on it.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(90);
+
 pub const READY_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// `taste-<workspace-key>-` — what every VM of a workspace is named under.
@@ -1008,16 +1012,56 @@ impl LibvirtSession {
 
     /// Bring a VM up if it is not, and report what it costs.
     pub async fn ensure_running(&self, vm: &Vm) -> Result<VmFacts> {
-        match self.state(vm).await? {
-            DomainState::Running => {}
-            DomainState::ShutOff => self.start(vm).await?,
-            DomainState::Other(state) => bail!(
-                "{} is {state}, which is not a state the IDE brings a VM up from",
-                vm.domain
-            ),
+        self.bring_up(vm).await?;
+        if let Err(first) = self.wait_ready(vm, READY_TIMEOUT).await {
+            // A window closed a moment before this one opened sent the VM
+            // an ACPI shutdown that landed after our `domstate` read
+            // "running": the guest went down while we waited for it
+            // (2026-09-21: a relaunch thirty seconds after a close, and a
+            // ladder that gave up). Once more from the top, then the
+            // failure is real.
+            match self.state(vm).await? {
+                DomainState::Running => return Err(first),
+                _ => {
+                    tracing::info!(
+                        "{} went down while coming up; bringing it up again",
+                        vm.domain
+                    );
+                    self.bring_up(vm).await?;
+                    self.wait_ready(vm, READY_TIMEOUT).await?;
+                }
+            }
         }
-        self.wait_ready(vm, READY_TIMEOUT).await?;
         self.facts(vm).await
+    }
+
+    /// Start `vm` unless it is running. A VM still shutting down — the
+    /// previous window's ACPI signal in flight — is waited out first,
+    /// because "in shutdown" is a state a VM leaves on its own within
+    /// seconds, and a launch that met it used to give up on the whole
+    /// workspace.
+    async fn bring_up(&self, vm: &Vm) -> Result<()> {
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
+        loop {
+            match self.state(vm).await? {
+                DomainState::Running => return Ok(()),
+                DomainState::ShutOff => return self.start(vm).await,
+                DomainState::Other(state) if state == "in shutdown" => {
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "{} has been shutting down for over {}s and has not stopped",
+                            vm.domain,
+                            SHUTDOWN_WAIT.as_secs()
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                DomainState::Other(state) => bail!(
+                    "{} is {state}, which is not a state the IDE brings a VM up from",
+                    vm.domain
+                ),
+            }
+        }
     }
 
     /// ACPI shutdown, **spawned and not waited for** — for the window's

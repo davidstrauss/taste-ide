@@ -730,6 +730,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // A files service that stopped answering comes back here too:
             // Refresh is the one gesture that means "ask everything again".
             let environments = environments_for_refresh.clone();
+            // A ladder that never resolved — a VM caught mid-shutdown by a
+            // relaunch, libvirt asleep — is the other thing Refresh brings
+            // back: the whole reconcile again, which is idempotent.
+            if !environments.substrate().is_resolved() && !environments.substrate().is_pending() {
+                let environments = environments.clone();
+                crate::runtime::runtime().spawn(async move {
+                    let report = environments.reconcile().await;
+                    tracing::info!(
+                        "reconciled again on refresh; restored {}",
+                        report.restored.len()
+                    );
+                });
+            }
             crate::runtime::runtime().spawn_blocking(move || {
                 if let Err(e) = environments.revive_keepers() {
                     tracing::warn!("reconnecting the files services: {e:#}");

@@ -284,6 +284,8 @@ pub struct EnvironmentRegistry {
     /// Held while the primary is being placed: reconcile and a Rebuild
     /// pressed during the boot can both ask, and a checkout is made once.
     placing_primary: Mutex<()>,
+    /// Held for the length of a `reconcile`.
+    reconciling: tokio::sync::Mutex<()>,
     /// What the IDE serves down every environment channel, once the window
     /// has said. Held here as well as on each supervisor so an environment
     /// created later inherits it.
@@ -374,6 +376,7 @@ impl EnvironmentRegistry {
             keepers: Mutex::new(BTreeMap::new()),
             substrates: Mutex::new(BTreeMap::new()),
             placing_primary: Mutex::new(()),
+            reconciling: tokio::sync::Mutex::new(()),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -786,10 +789,15 @@ impl EnvironmentRegistry {
                     substrate.provider().describe()
                 );
             }
-            bail!(
-                "the workspace's VM is still coming up; the environment is placed in it and \
-                 started on its own once it is"
-            );
+            if substrate.is_pending() {
+                bail!(
+                    "the workspace's VM is still coming up; the environment is placed in it \
+                     and started on its own once it is"
+                );
+            }
+            // The ladder ran and supplied nothing: its own reason, not a
+            // promise about a VM that is not coming.
+            bail!("{}", substrate.refusal(&self.primary().checkout()));
         };
         self.place_primary(&vm)
     }
@@ -1526,6 +1534,10 @@ impl EnvironmentRegistry {
     /// left behind. The sweep reports itself once through the event bus and
     /// the app log — a reset the user is not told about looks like a bug.
     pub async fn reconcile(self: &Arc<Self>) -> ReconcileReport {
+        // One at a time: Refresh re-runs this when the ladder never resolved,
+        // and two reconciles placing the same checkouts would be two of
+        // everything.
+        let _one_at_a_time = self.reconciling.lock().await;
         // Where the containers live, before anything asks podman anything.
         // This is the first await of the workspace's life and the only
         // place a VM is allowed to cost a minute — or, once per machine,
