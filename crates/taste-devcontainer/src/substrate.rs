@@ -141,6 +141,9 @@ pub struct Substrate {
     /// there needs — its ssh port, its workspace — without asking libvirt
     /// again.
     vm_info: Option<Vm>,
+    /// The ladder has not run yet, and will: a start that finds this waits
+    /// rather than refusing ([`Self::is_pending`]).
+    pending: bool,
 }
 
 /// The environment variable that points the IDE at an already-registered
@@ -261,14 +264,36 @@ impl Substrate {
             provider: Provider::None,
             target: Self::unreachable_target(taste_core::podman::sandboxed()),
             note: None,
+            log: Some("the workspace's VM is not up yet".into()),
+            vm: None,
+            vm_info: None,
+            pending: true,
+        }
+    }
+
+    /// The substrate of a window that is not supervising the workspace:
+    /// another window is, and the containers are its. Nothing runs from
+    /// here, and nothing is waited for.
+    pub fn not_supervising() -> Self {
+        Self {
+            provider: Provider::None,
+            target: Self::unreachable_target(taste_core::podman::sandboxed()),
+            note: None,
             log: Some(
-                "no substrate has been resolved in this window; the workspace's \
-                 containers belong to the window supervising it"
+                "another window is supervising this workspace; its containers belong to \
+                 that window"
                     .into(),
             ),
             vm: None,
             vm_info: None,
+            pending: false,
         }
+    }
+
+    /// Whether the ladder is still to run — the state between a window
+    /// opening and its reconcile resolving. A start meeting this waits.
+    pub fn is_pending(&self) -> bool {
+        self.pending
     }
 
     /// No VM, reached by the given descents — which decide whether
@@ -284,6 +309,7 @@ impl Substrate {
             log: (!logged.is_empty()).then(|| logged.join("; ")),
             vm: None,
             vm_info: None,
+            pending: false,
         }
     }
 
@@ -298,6 +324,7 @@ impl Substrate {
             log: None,
             vm: Some(facts),
             vm_info: Some(vm.clone()),
+            pending: false,
         }
     }
 
@@ -311,6 +338,7 @@ impl Substrate {
             log: None,
             vm: None,
             vm_info: None,
+            pending: false,
         })
     }
 
@@ -325,6 +353,7 @@ impl Substrate {
             log: None,
             vm: None,
             vm_info: None,
+            pending: false,
         })
     }
 
@@ -365,6 +394,7 @@ impl Substrate {
                         log: None,
                         vm: None,
                         vm_info: None,
+                        pending: false,
                     },
                     Err(e) => Self::refused_after(
                         local.sandboxed(),
@@ -746,9 +776,12 @@ mod tests {
         assert_eq!(Substrate::refused_after(false, &[]).log(), None);
         let unresolved = Substrate::unresolved();
         assert!(!unresolved.is_resolved());
-        assert!(unresolved
+        assert!(unresolved.is_pending(), "a start waits for the ladder");
+        let elsewhere = Substrate::not_supervising();
+        assert!(!elsewhere.is_pending());
+        assert!(elsewhere
             .refusal(&local_checkout)
-            .contains("resolved in this window"));
+            .contains("another window"));
     }
 
     /// Every provider that runs anything reduces to one thing: a name.

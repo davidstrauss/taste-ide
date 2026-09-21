@@ -2719,6 +2719,23 @@ impl Supervisor {
         // rung, because there is none (docs/ENVIRONMENTS.md → "There is
         // no rung below VM isolation").
         if !self.substrate().can_host(&self.checkout()) {
+            // Before the ladder has run there is nothing to refuse and
+            // nothing to place into: the start waits. Reconcile places the
+            // checkout and checks the environment on its own once the VM is
+            // up, which is what starts it (2026-09-21: a start pressed for
+            // in the first seconds put the primary in Failed with "the
+            // workspace's VM is still coming up").
+            if self.substrate().is_pending() {
+                self.log(
+                    "the workspace's VM is not up yet; the environment starts on its own once \
+                     its checkout is placed there",
+                );
+                self.set_state(SupervisorState::Preparing {
+                    what: "waiting for the workspace's VM".into(),
+                });
+                self.set_pending(false);
+                return Ok(());
+            }
             // A checkout that can be put where it runs is put there first:
             // the primary's, pressed for before reconcile got to it.
             let placer = self.placer.lock().unwrap().clone();

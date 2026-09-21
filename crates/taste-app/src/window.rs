@@ -3987,6 +3987,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // frame; the config watch is on the fleet's one inotify instance, like
     // every other environment's (`taste_devcontainer::configwatch`).
     if !supervising {
+        // No reconcile here, so no ladder: say so, rather than leaving the
+        // registry's "not up yet", which a start would wait on for ever.
+        environments.set_substrate(std::sync::Arc::new(
+            taste_devcontainer::Substrate::not_supervising(),
+        ));
         if let Err(e) = supervisor.recheck() {
             tracing::warn!("devcontainer recheck failed: {e:#}");
         }
