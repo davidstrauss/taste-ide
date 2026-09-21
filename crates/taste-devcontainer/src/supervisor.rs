@@ -633,6 +633,34 @@ fn workspace_bind_flags(authority: ConfigAuthority, shared_label: bool) -> &'sta
     }
 }
 
+/// How a container stands in its VM's queue when the VM is contended
+/// (David, 2026-09-21: "My primary env should also get first priority
+/// for any resource access"). The primary weighs four times an agent
+/// environment for CPU (`cpu.weight`, through `--cpu-shares`) and has its
+/// whole grant as a soft floor for memory (`memory.low`, through
+/// `--memory-reservation`), so under pressure the agents' pages are
+/// reclaimed first; an agent environment is the first the guest's OOM
+/// killer reaches for. Each is a cgroup v2 knob rootless podman may set
+/// in the guest: raising a process's OOM score needs no privilege, and
+/// the cpu and memory controllers are delegated to `core`.
+fn priority_args(primary: bool, grant: crate::config::Grant) -> Vec<String> {
+    if primary {
+        vec![
+            "--cpu-shares".into(),
+            "1024".into(),
+            "--memory-reservation".into(),
+            format!("{}m", grant.memory_mib),
+        ]
+    } else {
+        vec![
+            "--cpu-shares".into(),
+            "256".into(),
+            "--oom-score-adj".into(),
+            "500".into(),
+        ]
+    }
+}
+
 /// The keeper's raw watch events for the primary's tree, turned into the
 /// bus events the panes already subscribe to, with a quarter second of
 /// debounce so a build writing a hundred files is one refresh.
@@ -2846,6 +2874,7 @@ impl Supervisor {
         args.push(format!("{}m", grant.memory_mib));
         args.push("--memory-swap".into());
         args.push(format!("{}m", grant.memory_mib));
+        args.extend(priority_args(self.env.id.is_primary(), grant));
         *self.applied_grant.lock().unwrap() = Some(grant);
         args.extend(self.ide_mounts(&config, authority));
         for (k, v) in &config.container_env {
@@ -3723,6 +3752,21 @@ fn parse_ports_label(value: &str) -> Vec<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
+    /// The primary outranks agent environments on a contended VM: more CPU
+    /// weight, a memory floor, and never the first the OOM killer takes.
+    #[test]
+    fn the_primary_outranks_agent_environments() {
+        let grant = crate::config::Grant::DEFAULT;
+        assert_eq!(
+            super::priority_args(true, grant),
+            ["--cpu-shares", "1024", "--memory-reservation", "4096m"]
+        );
+        assert_eq!(
+            super::priority_args(false, grant),
+            ["--cpu-shares", "256", "--oom-score-adj", "500"]
+        );
+    }
+
     /// A forwarded port whose number is taken on this machine is published
     /// on the nearest free number above it, said in the log, and
     /// remembered for the rows; a free one stays where the config put it.

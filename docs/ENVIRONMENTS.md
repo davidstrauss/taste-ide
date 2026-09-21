@@ -2649,7 +2649,13 @@ is shouted, but nothing runs either. The rows say what is missing, and
   capacity is why a workspace has several ("some aspects of capacity
   don't scale linearly"). A grant no VM of this host's size could hold is
   refused by name. The Resources row shows each container's grant beside
-  the VM's numbers. A VM serves one workspace only.
+  the VM's numbers. **The primary comes first** (David, 2026-09-21): its
+  grant is reserved on its VM whether or not it is running, so agents fill
+  what is left and never what is its; and on a contended VM its container
+  weighs four times an agent's for CPU (`--cpu-shares`), holds its whole
+  grant as a memory floor (`--memory-reservation`, cgroup `memory.low`),
+  and is never the first the OOM killer takes — agent containers carry
+  `--oom-score-adj 500`. A VM serves one workspace only.
 - **The substrate is per environment.** The registry keeps one substrate
   per VM it has brought up (`EnvironmentRegistry::substrate_for`), and an
   environment's is its VM's; the workspace's "resolved" substrate is the

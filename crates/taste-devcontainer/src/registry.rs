@@ -962,12 +962,18 @@ impl EnvironmentRegistry {
         let mut occupancy: std::collections::HashMap<String, Grant> =
             std::collections::HashMap::new();
         for supervisor in self.list() {
-            if !matches!(
-                supervisor.state(),
-                crate::supervisor::SupervisorState::Running { .. }
-                    | crate::supervisor::SupervisorState::Starting
-                    | crate::supervisor::SupervisorState::Building
-            ) {
+            // The primary's room is reserved whether or not it is running:
+            // the agents may fill what is left of its VM and never what is
+            // its (David, 2026-09-21: "first priority for any resource
+            // access").
+            let counts = supervisor.id().is_primary()
+                || matches!(
+                    supervisor.state(),
+                    crate::supervisor::SupervisorState::Running { .. }
+                        | crate::supervisor::SupervisorState::Starting
+                        | crate::supervisor::SupervisorState::Building
+                );
+            if !counts {
                 continue;
             }
             if let Some(vm) = supervisor.checkout().vm() {
