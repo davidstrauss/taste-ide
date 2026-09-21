@@ -275,7 +275,11 @@ pub fn sync_primary_peer(
 /// back to the new commits, clean, so the checkout is not found strewn
 /// with conflict markers nobody asked for (2026-09-21: a Conflicts row
 /// and a stash both, from one sync); `Ok(Some(..))` says so, for the
-/// note. A branch that is not a fast-forward is left alone, an error.
+/// note. A tree already carrying such leftovers from an earlier sync is
+/// cleaned the same way first; a conflict of the user's own — unmerged
+/// paths with no such stash, or a merge in progress — is refused by name,
+/// with what to do. A branch that is not a fast-forward is left alone, an
+/// error.
 fn push_ahead_into_checkout(
     peer: &Path,
     vm: &Vm,
@@ -302,6 +306,18 @@ if ! git merge-base --is-ancestor "refs/heads/$branch" "$staging"; then
 fi
 if [ "$(git symbolic-ref --short -q HEAD)" != "$branch" ]; then
   git update-ref "refs/heads/$branch" "$staging"; cleanup; exit 0
+fi
+if git ls-files -u | grep -q .; then
+  if git stash list | grep -q taste-ide-sync && ! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    # The leftovers of a taste-ide-sync stash that did not apply, from
+    # before the sync learned to leave the tree clean: the stash holds the
+    # changes, so the tree goes back to its commit.
+    git reset -q --hard
+  else
+    cleanup
+    echo "the checkout has unresolved conflicts in $(git ls-files -u | awk '{{print $4}}' | sort -u | tr '\n' ' ')- resolve or discard them in the file tree, and the folder's commits follow" >&2
+    exit 5
+  fi
 fi
 stashed=0
 if [ -n "$(git status --porcelain)" ]; then
