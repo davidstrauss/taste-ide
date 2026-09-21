@@ -183,7 +183,15 @@ pub enum Event {
     /// the agent: the auth proxy waking a private server before its turn
     /// (`taste_authproxy::wake`). Drawn as a note in that chat's
     /// transcript.
-    ChatNotice { env: EnvironmentId, text: String },
+    /// A note for one chat's transcript. With a `key`, a later notice
+    /// with the same key REPLACES the row rather than adding one: a wake-up
+    /// that is sent every retry is one line counting up, not a column of
+    /// identical lines (David, 2026-09-21).
+    ChatNotice {
+        env: EnvironmentId,
+        key: Option<String>,
+        text: String,
+    },
     /// A reload the environment's own agent asked for (devcontainer_reload,
     /// approved by the user) has finished: `ok` says whether the project's
     /// environment came up, `message` is the failure when it did not. The

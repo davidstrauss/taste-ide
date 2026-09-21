@@ -627,6 +627,10 @@ pub struct ChatPane {
     /// queue vocabulary — the send is accepted, the card goes into the
     /// transcript, and a badge says what it is waiting for.
     revive_queue: RefCell<std::collections::VecDeque<QueuedSend>>,
+    /// Notes that replace themselves: the label of the last note filed
+    /// under each key, so the next one with that key rewrites it in place
+    /// (the proxy's wake-up count, ticking up on one line).
+    keyed_notes: RefCell<HashMap<String, gtk::Label>>,
     client: RefCell<Option<AgentClient>>,
     pending_permission: RefCell<Option<PendingPermission>>,
     /// Context queued for the next prompt (files, selections, images).
@@ -2977,6 +2981,7 @@ impl ChatPane {
             revive_bar,
             revive_label,
             revive_queue: RefCell::new(std::collections::VecDeque::new()),
+            keyed_notes: RefCell::new(HashMap::new()),
             permission_answers: permission_answers.clone(),
             permission_scope,
             standing_group: standing_group.clone(),
@@ -3531,6 +3536,27 @@ impl ChatPane {
     /// noticed about it. Quiet, centred, like "stopped".
     pub fn note(&self, text: &str) {
         self.meta_row(text);
+    }
+
+    /// A note that REPLACES the last one filed under `key` rather than
+    /// adding a row: a step that repeats — a wake-up sent on every retry —
+    /// is one line counting up, not a column of identical lines (David,
+    /// 2026-09-21: "Aggregate these as they occur, incrementing a counter
+    /// and how long it's been"). The first under a key is an ordinary
+    /// note; each later one rewrites its label and the transcript keeps
+    /// only the row.
+    pub fn note_keyed(&self, key: &str, text: &str) {
+        let existing = self.keyed_notes.borrow().get(key).cloned();
+        match existing.filter(|label| label.parent().is_some()) {
+            Some(label) => {
+                label.set_label(text);
+                label.set_tooltip_text(Some(text));
+            }
+            None => {
+                let label = self.meta_row_label(text);
+                self.keyed_notes.borrow_mut().insert(key.to_string(), label);
+            }
+        }
     }
 
     /// This chat as the orchestration tools observe it.
@@ -6498,6 +6524,12 @@ impl ChatPane {
     }
 
     fn meta_row(&self, text: &str) {
+        self.meta_row_label(text);
+    }
+
+    /// [`Self::meta_row`], handing back the label, for a note that will be
+    /// rewritten in place ([`Self::note_keyed`]).
+    fn meta_row_label(&self, text: &str) -> gtk::Label {
         let label = gtk::Label::builder()
             .label(text)
             .xalign(0.0)
@@ -6527,7 +6559,7 @@ impl ChatPane {
         // everything that fits.
         if text.lines().count() <= 1 && text.chars().count() <= 80 {
             self.append_note(&label);
-            return;
+            return label;
         }
         let disclose = gtk::ToggleButton::builder()
             .icon_name("pan-down-symbolic")
@@ -6541,8 +6573,10 @@ impl ChatPane {
             .build();
         row.append(&label);
         row.append(&disclose);
+        let toggled = label.clone();
         disclose.connect_toggled(move |button| {
             let open = button.is_active();
+            let label = &toggled;
             label.set_ellipsize(if open {
                 gtk::pango::EllipsizeMode::None
             } else {
@@ -6562,6 +6596,7 @@ impl ChatPane {
             }));
         });
         self.append_note(&row);
+        label
     }
 
     fn user_card(&self, text: &str, attachments: &[(String, ContentBlock)]) -> gtk::Box {

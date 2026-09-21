@@ -67,7 +67,17 @@ impl Route {
 
 /// A sentence about a private server being woken, and which
 /// environment's turn it concerns (`None` for the settings form's test).
-pub type Notice = Arc<dyn Fn(Option<&str>, String) + Send + Sync>;
+/// `(environment, key, text)`: the environment whose chat the note goes
+/// to (`None` is nobody's turn, a toast), a key under which a later note
+/// replaces this one rather than adding a row, and the note.
+pub type Notice = Arc<dyn Fn(Option<&str>, Option<&str>, String) + Send + Sync>;
+
+/// One host's run of wake-ups that did not bring it up.
+#[derive(Debug, Clone, Copy)]
+struct WakeRun {
+    first: std::time::Instant,
+    attempts: u32,
+}
 
 /// Where the proxy says the account's model listing changed: the newest
 /// model above Opus the credential can run, or `None` when there is none
@@ -207,6 +217,10 @@ struct ProxyState {
     stream_idle: Mutex<Duration>,
     /// [`crate::wake::WAKE_WAIT`], unless a test shortened it.
     wake_wait: Mutex<Duration>,
+    /// Per host, the wake-ups sent since it last answered. What the one
+    /// counting line in the chat reads, and what decides when the IDE
+    /// stops trying (`crate::wake::GIVE_UP_AFTER`, `GIVE_UP_ATTEMPTS`).
+    wakes: Mutex<HashMap<String, WakeRun>>,
     /// Where the proxy says what it is doing about a sleeping private
     /// server: the app routes it into the chat of the environment named,
     /// or to a toast when none is ([`Handle::set_notice`]).
@@ -232,12 +246,59 @@ impl ProxyState {
         self.tokens.lock().ok()?.get(token).cloned()
     }
 
-    fn notify(&self, env: Option<&str>, text: String) {
+    fn notify(&self, env: Option<&str>, key: Option<&str>, text: String) {
         let notice = self.notice.lock().ok().and_then(|slot| slot.clone());
         match notice {
-            Some(notice) => notice(env, text),
+            Some(notice) => notice(env, key, text),
             None => tracing::info!("auth proxy: {text}"),
         }
+    }
+
+    /// Where `host`'s run of wake-ups stands before one more is sent:
+    /// `Err` with the give-up sentence when the run has gone on long
+    /// enough that the IDE stops trying, `Ok` with this attempt's number
+    /// and the time since the first otherwise.
+    fn wake_attempt(&self, host: &str) -> Result<crate::wake::Attempts, String> {
+        let now = std::time::Instant::now();
+        let runs = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
+        match runs.get(host) {
+            None => Ok(crate::wake::Attempts {
+                attempt: 1,
+                since: Duration::ZERO,
+            }),
+            Some(run) => {
+                let since = now.duration_since(run.first);
+                if since >= crate::wake::GIVE_UP_AFTER
+                    || run.attempts >= crate::wake::GIVE_UP_ATTEMPTS
+                {
+                    Err(crate::wake::gave_up_note(host, run.attempts, since))
+                } else {
+                    Ok(crate::wake::Attempts {
+                        attempt: run.attempts + 1,
+                        since,
+                    })
+                }
+            }
+        }
+    }
+
+    /// One more wake-up for `host` did not bring it up.
+    fn wake_failed(&self, host: &str) {
+        let mut runs = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
+        let run = runs.entry(host.to_string()).or_insert(WakeRun {
+            first: std::time::Instant::now(),
+            attempts: 0,
+        });
+        run.attempts += 1;
+    }
+
+    /// `host` answered, or the user asked for a fresh start: the run is
+    /// over.
+    fn wake_reset(&self, host: &str) {
+        self.wakes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(host);
     }
 
     fn wake_wait(&self) -> Duration {
@@ -780,6 +841,7 @@ impl AuthProxy {
             unprovisioned_told: Mutex::new(HashSet::new()),
             stream_idle: Mutex::new(STREAM_IDLE_TIMEOUT),
             wake_wait: Mutex::new(crate::wake::WAKE_WAIT),
+            wakes: Mutex::new(HashMap::new()),
             notice: Mutex::new(None),
             seed,
             counter: AtomicU64::new(0),
@@ -923,16 +985,28 @@ impl Handle {
         // where a sleeping machine is most often met, and "unreachable"
         // with no attempt behind it would send the user to check cables.
         let wake_path = crate::wake::wake_path(source.path());
+        let host = upstream
+            .uri
+            .host()
+            .unwrap_or("the private server")
+            .to_string();
+        // The user asked: a run the IDE had given up on starts over here.
+        self.state.wake_reset(&host);
         let state = self.state.clone();
         let woke = crate::wake::ensure_awake(
             &upstream.uri,
             &wake_path,
             self.state.wake_wait(),
-            &move |text| state.notify(None, text),
+            crate::wake::Attempts {
+                attempt: 1,
+                since: Duration::ZERO,
+            },
+            &move |text| state.notify(None, None, text),
         )
         .await;
-        let host = upstream.uri.host().unwrap_or("the private server");
+        let host = host.as_str();
         if !woke.reached() {
+            self.state.wake_failed(host);
             anyhow::bail!("{}", woke.note(host).unwrap_or_default());
         }
         let note = woke.note(host);
@@ -1084,6 +1158,7 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
                 if first {
                     state.notify(
                         Some(&env_id),
+                        None,
                         "This project has no Anthropic credential, so its Claude Code chats \
                          cannot reach the API. Add one under Settings → Anthropic account, \
                          then send again."
@@ -1136,18 +1211,36 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         .map(|source| crate::wake::wake_path(source.path()));
     if let Some(path) = &wake_path {
         let env = env_id.clone();
-        let outcome = crate::wake::ensure_awake(&target, path, state.wake_wait(), &|text| {
-            state.notify(Some(&env), text)
-        })
-        .await;
-        if !outcome.reached() {
-            let host = target.host().unwrap_or("the private server");
+        let host = target.host().unwrap_or("the private server").to_string();
+        // One row in the chat per host, counting up, rather than a row per
+        // retry the agent makes.
+        let key = format!("wake:{host}");
+        let attempts = match state.wake_attempt(&host) {
+            Ok(attempts) => attempts,
+            Err(gave_up) => {
+                state.notify(Some(&env), Some(&key), gave_up.clone());
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    &format!("taste-ide auth proxy: {gave_up}"),
+                );
+            }
+        };
+        let outcome =
+            crate::wake::ensure_awake(&target, path, state.wake_wait(), attempts, &|text| {
+                state.notify(Some(&env), Some(&key), text)
+            })
+            .await;
+        if outcome.reached() {
+            state.wake_reset(&host);
+        } else {
+            state.wake_failed(&host);
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 &format!(
                     "taste-ide auth proxy: {}",
-                    outcome.note(host).unwrap_or_default()
+                    outcome.note(&host).unwrap_or_default()
                 ),
             );
         }

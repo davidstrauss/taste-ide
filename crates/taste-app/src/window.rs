@@ -278,10 +278,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     if let Some(handle) = taste_acp::authproxy::handle() {
         let events = workspace.events.clone();
         handle.set_notice(std::sync::Arc::new(
-            move |env: Option<&str>, text: String| match env
+            move |env: Option<&str>, key: Option<&str>, text: String| match env
                 .and_then(|env| taste_core::environment::EnvironmentId::parse(env).ok())
             {
-                Some(env) => events.publish(Event::ChatNotice { env, text }),
+                Some(env) => events.publish(Event::ChatNotice {
+                    env,
+                    key: key.map(str::to_string),
+                    text,
+                }),
                 None => events.publish(Event::Toast(text)),
             },
         ));
@@ -3786,8 +3790,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // The proxy telling one chat what it is doing about a
                     // sleeping private server — a note in that transcript,
                     // where the turn it concerns is.
-                    Event::ChatNotice { env, text } => match chats.pane_for(&env) {
-                        Some(pane) => pane.note(&text),
+                    Event::ChatNotice { env, key, text } => match chats.pane_for(&env) {
+                        Some(pane) => match key {
+                            Some(key) => pane.note_keyed(&key, &text),
+                            None => pane.note(&text),
+                        },
                         None => toast_overlay.add_toast(plain_toast(&text)),
                     },
                     // A rebuild the agent asked for has finished: its chat

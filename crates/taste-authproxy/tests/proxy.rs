@@ -588,7 +588,7 @@ async fn an_unreachable_private_server_is_reported_with_the_wake_attempt() {
     handle.set_wake_wait(Duration::from_millis(10));
     let said = Arc::new(Mutex::new(Vec::<(Option<String>, String)>::new()));
     let recorder = said.clone();
-    handle.set_notice(Arc::new(move |env, text| {
+    handle.set_notice(Arc::new(move |env, _key, text| {
         recorder
             .lock()
             .unwrap()
@@ -1071,7 +1071,7 @@ async fn an_unprovisioned_project_is_told_once_in_its_chat() {
     let said = Arc::new(Mutex::new(Vec::<(Option<String>, String)>::new()));
     {
         let recorder = said.clone();
-        handle.set_notice(Arc::new(move |env, text| {
+        handle.set_notice(Arc::new(move |env, _key, text| {
             recorder
                 .lock()
                 .unwrap()

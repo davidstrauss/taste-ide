@@ -288,12 +288,55 @@ pub async fn send(neighbor: &Neighbor) -> Result<()> {
     Ok(())
 }
 
+/// How long a machine may go on not answering, counted from the first
+/// wake-up that did not bring it up, before the IDE stops sending them and
+/// fails every request at once (David, 2026-09-21: "It should fail,
+/// eventually"). Either bound ends it: the time, or the count.
+pub const GIVE_UP_AFTER: Duration = Duration::from_secs(10 * 60);
+pub const GIVE_UP_ATTEMPTS: u32 = 10;
+
+/// What one host's run of failed wake-ups looks like so far, for the one
+/// line that counts them up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Attempts {
+    /// This attempt's number, counting from one.
+    pub attempt: u32,
+    /// Since the first wake-up of this run.
+    pub since: Duration,
+}
+
+/// `6m 30s`, `45s`, `1h 02m`.
+pub fn humanize(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// The sentence that ends a run: the IDE has stopped trying.
+pub fn gave_up_note(host: &str, attempts: u32, since: Duration) -> String {
+    format!(
+        "{host} has not answered in {} despite {attempts} wake-up{}; the IDE has stopped \
+         sending them. Check that the machine is on and allows waking from the network, \
+         then test the connection under Settings to try again.",
+        humanize(since),
+        if attempts == 1 { "" } else { "s" }
+    )
+}
+
 /// Make sure the server is up before a request goes to it: reachable,
-/// or woken and waited for. `notice` is told each step as it happens.
+/// or woken and waited for. `notice` is told each step as it happens;
+/// `attempts` is how this run of wake-ups stands, so the step that sends
+/// one counts it rather than repeating itself.
 pub async fn ensure_awake(
     uri: &Uri,
     path: &Path,
     wait: Duration,
+    attempts: Attempts,
     notice: &(dyn Fn(String) + Sync),
 ) -> Wake {
     if reachable(uri).await {
@@ -317,11 +360,22 @@ pub async fn ensure_awake(
         }
         return outcome;
     }
-    notice(format!(
-        "{host} is not answering — sent a wake-up to {} and waiting up to {}s for it",
-        neighbor.mac_text(),
-        wait.as_secs()
-    ));
+    notice(if attempts.attempt <= 1 {
+        format!(
+            "{host} is not answering — sent a wake-up to {} and waiting up to {}s for it",
+            neighbor.mac_text(),
+            wait.as_secs()
+        )
+    } else {
+        format!(
+            "{host} is still not answering — wake-up {} sent to {}, {} since the first; \
+             waiting up to {}s",
+            attempts.attempt,
+            neighbor.mac_text(),
+            humanize(attempts.since),
+            wait.as_secs()
+        )
+    });
     let started = std::time::Instant::now();
     while started.elapsed() < wait {
         tokio::time::sleep(RETRY_EVERY.min(wait)).await;
@@ -612,6 +666,22 @@ fn now_seconds() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// The clock the counting line and the give-up read.
+    #[test]
+    fn durations_read_as_a_person_says_them() {
+        use super::{gave_up_note, humanize};
+        use std::time::Duration;
+        assert_eq!(humanize(Duration::from_secs(45)), "45s");
+        assert_eq!(humanize(Duration::from_secs(390)), "6m 30s");
+        assert_eq!(humanize(Duration::from_secs(3720)), "1h 02m");
+        let note = gave_up_note("192.168.86.193", 10, Duration::from_secs(600));
+        assert!(
+            note.contains("10 wake-ups") && note.contains("10m 00s"),
+            "{note}"
+        );
+        assert!(note.contains("stopped sending"), "{note}");
+    }
+
     use super::*;
 
     /// A netlink dump reply, both families: complete entries come out
@@ -735,9 +805,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = wake_path(&dir.path().join("private-model.json"));
         let said = std::sync::Mutex::new(Vec::new());
-        let outcome = ensure_awake(&uri, &path, Duration::from_millis(10), &|text| {
-            said.lock().unwrap().push(text)
-        })
+        let outcome = ensure_awake(
+            &uri,
+            &path,
+            Duration::from_millis(10),
+            Attempts {
+                attempt: 1,
+                since: Duration::ZERO,
+            },
+            &|text| said.lock().unwrap().push(text),
+        )
         .await;
         assert_eq!(outcome, Wake::NoNeighbor);
         assert!(!outcome.reached());
