@@ -3479,7 +3479,10 @@ REFS — log, branches, ahead and behind, review, issues, fetch and push
 with the user's keys — stay on the peer. **The folder's working tree is
 fast-forwarded when it is clean** (`peer::sync_primary_peer`): after
 every snapshot, and at once after every commit, switch, or rebase the
-tree makes in the VM, the checkout's branches are fetched into
+tree makes in the VM — and two seconds after any ref moves in the
+checkout by other hands, the agent's or a shell's, which the keeper's
+watch sees on `.git/HEAD`, `.git/refs/heads/`, and the packed refs: a
+snapshot, then the sync, for every environment in a VM — the checkout's branches are fetched into
 `refs/taste/vm/`, every branch not checked out here is moved to what the
 checkout has, the checked-out one is fast-forwarded when the folder is
 clean and left with a note when it is not, a folder that is AHEAD (the

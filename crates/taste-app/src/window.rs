@@ -159,6 +159,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let share = supervisor.clone();
         filetree.set_peer_hooks(
             std::sync::Arc::new(move || {
+                // The snapshot first, so the ref that restores the working
+                // copy is of the copy as it stands after the commit; then
+                // the sync, unconditionally, since a commit that left the
+                // tree clean writes no snapshot and still moves the branch.
+                if let Err(e) = sync.snapshot_blocking() {
+                    tracing::warn!("snapshotting the checkout in the VM after a commit: {e:#}");
+                }
                 if let Err(e) = sync.sync_peer_blocking() {
                     tracing::warn!("syncing the folder with the checkout in the VM: {e:#}");
                 }

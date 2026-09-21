@@ -583,6 +583,9 @@ pub struct Supervisor {
     /// A recheck the watch has asked for and not yet run: several events
     /// in a burst make one recheck.
     recheck_pending: Arc<AtomicBool>,
+    /// A ref moved in the checkout in the VM — a commit, by whoever made
+    /// it — and a snapshot is due once the writes settle.
+    snapshot_pending: Arc<AtomicBool>,
     /// The ssh process forwarding a remote container's published ports to
     /// this host's loopback, while the container runs.
     tunnel: Mutex<Option<std::process::Child>>,
@@ -833,6 +836,7 @@ impl Supervisor {
             files: Mutex::new(None),
             remote_watch: Mutex::new(None),
             recheck_pending: Arc::new(AtomicBool::new(false)),
+            snapshot_pending: Arc::new(AtomicBool::new(false)),
             tunnel: Mutex::new(None),
             inside,
             disk: Mutex::new(None),
@@ -966,6 +970,7 @@ impl Supervisor {
         };
         let weak = Arc::downgrade(self);
         let pending = self.recheck_pending.clone();
+        let snapshot_pending = self.snapshot_pending.clone();
         // The primary's tree is what the panes show, so its changes over
         // there become the events inotify would have raised here — the
         // editor reloads, the tree restyles, the dots move. Debounced the
@@ -979,6 +984,31 @@ impl Supervisor {
         let watch = keeper.watch(&path, move |event, name| {
             if let Some(tree) = &tree_events {
                 tree.saw(&event, &name);
+            }
+            // A ref moved — HEAD, a branch, the packed refs: a commit, a
+            // checkout, a reset, by the tree, the agent, or a shell. The
+            // snapshot and the peer sync follow two seconds later, once
+            // git has finished its several writes (David, 2026-09-21:
+            // "Snapshot on commit, too"), so the folder has the commit and
+            // the ref that restores the working copy as it stands after it.
+            let ref_moved = name == ".git/HEAD"
+                || name == ".git/packed-refs"
+                || name.starts_with(".git/refs/heads/");
+            if ref_moved && !snapshot_pending.swap(true, Ordering::SeqCst) {
+                let weak = weak.clone();
+                let snapshot_pending = snapshot_pending.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    snapshot_pending.store(false, Ordering::SeqCst);
+                    if let Some(supervisor) = weak.upgrade() {
+                        if let Err(e) = supervisor.snapshot_blocking() {
+                            tracing::warn!("snapshot after a ref moved in the VM: {e:#}");
+                        }
+                        if let Err(e) = supervisor.sync_peer_blocking() {
+                            tracing::warn!("peer sync after a ref moved in the VM: {e:#}");
+                        }
+                    }
+                });
             }
             // The config: a burst of edits under .devcontainer/ is one
             // recheck, a quarter second after the first, on a thread of
