@@ -55,6 +55,14 @@ pub enum PoolError {
     },
 }
 
+/// How many environments one VM hosts before the pool reaches for
+/// another. The v1 policy, stated so it can be argued with: a VM sized
+/// for a build holds a few containers well and a dozen badly, and the
+/// number that matters — live `domstats` — can replace this constant
+/// without re-plumbing, because placement already carries the VM per
+/// environment.
+pub const MAX_ENVIRONMENTS_PER_VM: usize = 3;
+
 /// One workspace's VMs.
 #[derive(Debug, Clone)]
 pub struct Pool {
@@ -120,6 +128,79 @@ impl Pool {
                         error,
                     })?
             }
+        };
+        let facts = self
+            .libvirt
+            .ensure_running(&vm)
+            .await
+            .map_err(|error| PoolError::Failed {
+                domain: Some(vm.domain.clone()),
+                error,
+            })?;
+        Ok((vm, facts))
+    }
+
+    /// A VM for one more environment, chosen by capacity.
+    ///
+    /// `occupancy` is how many environments each VM of the pool already
+    /// hosts (by domain; a VM absent from it hosts none). The least loaded
+    /// VM with room takes the environment; when every VM is full, a new
+    /// one is made if the host has room for it, and refused otherwise
+    /// (`PoolError::AtCapacity`) — never oversubscribed, because a VM's
+    /// capacity is why a workspace has several (David, 2026-09-20: "some
+    /// aspects of capacity don't scale linearly"). Brought up, with its
+    /// facts, like [`Self::ensure_one`].
+    pub async fn place(
+        &self,
+        occupancy: &std::collections::HashMap<String, usize>,
+        report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
+    ) -> std::result::Result<(Vm, VmFacts), PoolError> {
+        if !Self::provisioning_allowed() {
+            return Err(PoolError::Skipped);
+        }
+        self.libvirt
+            .available()
+            .await
+            .map_err(PoolError::Unavailable)?;
+        let mut vms = self.vms().await.map_err(PoolError::Unavailable)?;
+        vms.sort_by_key(|vm| occupancy.get(&vm.domain).copied().unwrap_or(0));
+        let vm = match vms
+            .into_iter()
+            .find(|vm| occupancy.get(&vm.domain).copied().unwrap_or(0) < MAX_ENVIRONMENTS_PER_VM)
+        {
+            Some(vm) => vm,
+            None => {
+                let sizing = Sizing::for_host();
+                self.check_room(&sizing).await?;
+                self.libvirt
+                    .create(&self.workspace_root, &sizing, report)
+                    .await
+                    .map_err(|error| PoolError::Failed {
+                        domain: None,
+                        error,
+                    })?
+            }
+        };
+        let facts = self
+            .libvirt
+            .ensure_running(&vm)
+            .await
+            .map_err(|error| PoolError::Failed {
+                domain: Some(vm.domain.clone()),
+                error,
+            })?;
+        Ok((vm, facts))
+    }
+
+    /// One VM of the pool by name, running, with its facts — for a VM that
+    /// holds restored environments and is not the workspace's first.
+    pub async fn ensure_vm(&self, domain: &str) -> std::result::Result<(Vm, VmFacts), PoolError> {
+        let vms = self.vms().await.map_err(PoolError::Unavailable)?;
+        let Some(vm) = vms.into_iter().find(|vm| vm.domain == domain) else {
+            return Err(PoolError::Failed {
+                domain: Some(domain.to_string()),
+                error: anyhow::anyhow!("this workspace's pool has no VM {domain}"),
+            });
         };
         let facts = self
             .libvirt
@@ -230,6 +311,42 @@ mod tests {
             Some(v) => std::env::set_var("TASTE_PROBE_CHECK", v),
             None => std::env::remove_var("TASTE_PROBE_CHECK"),
         }
+    }
+
+    /// The choice `place` makes, as the sort and the threshold it uses:
+    /// the least loaded VM with room, and none when every VM is full.
+    #[test]
+    fn placement_prefers_the_least_loaded_vm_with_room() {
+        let vm = |domain: &str| Vm {
+            domain: domain.into(),
+            ssh_port: 40001,
+            workspace_root: "/work/proj".into(),
+            state: DomainState::Running,
+        };
+        let mut vms = [vm("taste-a-x"), vm("taste-a-y"), vm("taste-a-z")];
+        let occupancy: std::collections::HashMap<String, usize> = [
+            ("taste-a-x".to_string(), MAX_ENVIRONMENTS_PER_VM),
+            ("taste-a-y".to_string(), 1),
+        ]
+        .into_iter()
+        .collect();
+        vms.sort_by_key(|vm| occupancy.get(&vm.domain).copied().unwrap_or(0));
+        let chosen = vms
+            .iter()
+            .find(|vm| occupancy.get(&vm.domain).copied().unwrap_or(0) < MAX_ENVIRONMENTS_PER_VM);
+        assert_eq!(
+            chosen.map(|vm| vm.domain.as_str()),
+            Some("taste-a-z"),
+            "the empty one"
+        );
+
+        let full: std::collections::HashMap<String, usize> = vms
+            .iter()
+            .map(|vm| (vm.domain.clone(), MAX_ENVIRONMENTS_PER_VM))
+            .collect();
+        assert!(vms
+            .iter()
+            .all(|vm| full.get(&vm.domain).copied().unwrap_or(0) >= MAX_ENVIRONMENTS_PER_VM));
     }
 
     /// A stale VM is one whose workspace folder is gone; a VM the IDE did

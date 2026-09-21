@@ -22,36 +22,35 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 \
 ```
 
 **Builds are contended, and it is the HOST they contend for.** Every
-container the IDE runs is rootless podman on this machine's kernel, or in
-a VM that takes this machine's memory as a commitment — there is no third
-place. Verified 2026-09-17: no `podman machine` exists and none ever has,
-`podman info` reports the host's own hostname, kernel and graph root, and
-a container's `/proc/sys/kernel/random/boot_id` is byte-identical to the
-host's. So a build that goes wrong still takes the machine down: two
-concurrent `cargo build`s power-cycled this host twice. **Never start a
-workspace-wide build while another environment is in one.** Cap each
-build with `CARGO_BUILD_JOBS=8` and the container's memory limit
-(`--memory=16g --memory-swap=16g` on a bare `podman run`), and prefer
-`cargo check` and per-crate tests until the final gate.
+container the IDE runs is in a VM that takes this machine's memory as a
+commitment (a VM's memory is committed, not shared — qemu's RSS climbs to
+the ceiling and stays), and this devcontainer, the one you build in, is
+rootless podman on this machine's kernel. So a build that goes wrong
+still takes the machine down: two concurrent `cargo build`s power-cycled
+this host twice. **Never start a workspace-wide build while another
+environment is in one.** Cap each build with `CARGO_BUILD_JOBS=8` and the
+container's memory limit (`--memory=16g --memory-swap=16g` on a bare
+`podman run`), and prefer `cargo check` and per-crate tests until the
+final gate.
 
-**Where the IDE's own containers run, as of 2026-09-20.** On a host with a
-user-session libvirt, opening a workspace provisions a Fedora CoreOS VM
-for it (`taste_devcontainer::provision`, `pool`; a pool per workspace,
-sized by `sizing`), and **agent environments' checkouts and containers
-live in that VM** — cloned into it over ssh, reached through the files
-service (`taste_core::files`, the keeper), snapshotted there. **The
-primary environment's checkout and container are still on the host**, on
-local podman: an environment's substrate follows its checkout
-(`EnvironmentRegistry::substrate_for`), and the primary's move is the
-next program. So the isolation standard in ENVIRONMENTS.md → "Isolation"
-is met for agent environments and not yet for the primary, and this
-paragraph is where that changes. A host without libvirt runs everything
-locally as before, quietly; a workspace whose VM will not come up is told
-so, loudly. The old `podman machine` rung is still in the ladder below the
-VM's and is retired with the primary's move. The first launch on a host
-after this does a one-time download of the guest image (about a
-gigabyte). `TASTE_PROVISION_TESTS=1` runs the live provisioning test,
-which boots a VM and is run by a person.
+**Where the IDE's own containers run, as of 2026-09-21.** In a Fedora
+CoreOS VM the IDE provisions per workspace through user-session libvirt
+(`taste_devcontainer::provision`, `pool`, `sizing`; a pool per workspace,
+environments placed across it by capacity), and **nowhere else**: every
+environment's checkout and container, the primary's included, live in a
+VM of the pool. The primary's checkout is placed there at reconcile from
+the folder you opened, which becomes its git **peer** (its refs, the
+fetch and push with your keys, the review surfaces); the panes read the
+checkout through the files service (`taste_core::files`, the keeper), and
+the folder's working tree fast-forwards when it is clean. A workspace
+whose provisioner cannot supply a VM has environments that **refuse to
+start** with the reason on their rows — there is no host rung and no
+`podman machine` (ENVIRONMENTS.md → "There is no rung below VM
+isolation"); the host's own podman is reached only by the test suites
+(`Substrate::host_for_tests`). The first launch on a host does a one-time
+download of the guest image (about a gigabyte), drawn in the backlog's
+header. `TASTE_PROVISION_TESTS=1` runs the live provisioning test, which
+boots a VM and is run by a person.
 
 A `podman build` goes silent after a big RUN's last line: that is the
 layer commit (every file read back through rootless fuse-overlayfs and
@@ -326,8 +325,8 @@ to.
   a relocated agent reaches it from inside its container.
 - `crates/taste-git` — status/stage/commit/push (libgit2).
 - `crates/taste-devcontainer` — config discovery/hashing, podman lifecycle,
-  and the substrate: which podman (host, `podman machine`, or a remote
-  connection) those containers actually run on.
+  and the substrate: which podman (a VM of the workspace's pool, or a
+  remote connection) those containers actually run on — never the host's.
 - `crates/taste-mcp` — IDE MCP server (unix socket).
 - `crates/taste-models` — the pinned local models: one fetcher, digest
   checked, for the speech and embedding models.

@@ -2872,7 +2872,6 @@ dependencies = [
  "git2",
  "json_comments",
  "notify",
- "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2882,7 +2881,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "webpki-roots",
 ]
 
 [[package]]

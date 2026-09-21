@@ -77,7 +77,7 @@ use taste_devcontainer::Substrate;
 fn substrate() -> Arc<Substrate> {
     match std::env::var("TASTE_PODMAN_CONNECTION") {
         Ok(name) if !name.trim().is_empty() => Substrate::connection_for_tests(name.trim()),
-        _ => Substrate::local_for_tests(),
+        _ => Substrate::host_for_tests(),
     }
 }
 

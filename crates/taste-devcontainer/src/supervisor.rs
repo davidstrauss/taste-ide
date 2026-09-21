@@ -254,13 +254,6 @@ pub(crate) fn walk_checkout(root: &Path, prune_ignored: bool) -> CheckoutWalk {
     walk
 }
 
-/// Apparent bytes under `dir`, ignoring nothing — the footprint the
-/// environments view has always shown, and the right answer for a
-/// directory that is not a checkout at all (a podman machine's image).
-pub(crate) fn dir_size(dir: &Path) -> u64 {
-    walk_checkout(dir, false).apparent_bytes
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorState {
     NoConfig,
@@ -2561,6 +2554,22 @@ impl Supervisor {
     /// a project config that resolved is set aside for the baseline — not
     /// passed over, just not built yet — so the banner offers its Rebuild.
     async fn reload_locked_with(&self, baseline_only: bool) -> Result<()> {
+        // Nowhere to run: no VM was supplied, or the checkout is somewhere
+        // this substrate cannot reach. Refused with the reason, in the
+        // state the row and the banner read — never started on a lesser
+        // rung, because there is none (docs/ENVIRONMENTS.md → "There is
+        // no rung below VM isolation").
+        let substrate = self.substrate();
+        let checkout = self.checkout();
+        if !substrate.can_host(&checkout) {
+            let message = substrate.refusal(&checkout);
+            self.log(format!("refusing to start: {message}"));
+            self.set_state(SupervisorState::Failed {
+                message: message.clone(),
+            });
+            self.set_pending(false);
+            bail!("{message}");
+        }
         // Pick the config: the project's when it is present and confined,
         // the IDE's baseline otherwise. Every early error must land in a
         // *state* — the banner and MCP read states, not Results — and the
@@ -3776,17 +3785,24 @@ mod tests {
         std::fs::write(dir.path().join("a"), vec![b'x'; 100]).unwrap();
         std::fs::create_dir_all(dir.path().join("nested/deep")).unwrap();
         std::fs::write(dir.path().join("nested/deep/b"), vec![b'y'; 250]).unwrap();
-        assert_eq!(dir_size(dir.path()), 350);
+        assert_eq!(walk_checkout(dir.path(), false).apparent_bytes, 350);
 
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();
             std::fs::write(outside.path().join("huge"), vec![b'z'; 10_000]).unwrap();
             std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
-            assert_eq!(dir_size(dir.path()), 350, "a link is not this env's disk");
+            assert_eq!(
+                walk_checkout(dir.path(), false).apparent_bytes,
+                350,
+                "a link is not this env's disk"
+            );
         }
         // An unreadable path is zero, not a panic and not a refusal.
-        assert_eq!(dir_size(&dir.path().join("no-such-dir")), 0);
+        assert_eq!(
+            walk_checkout(&dir.path().join("no-such-dir"), false).apparent_bytes,
+            0
+        );
     }
 
     /// The clone and its build output are one tree and two numbers, and the
@@ -3889,7 +3905,7 @@ mod tests {
             env,
             EventBus::new(),
             ExecContext::host_unsandboxed_for_tests(),
-            crate::substrate::Substrate::local_for_tests(),
+            crate::substrate::Substrate::host_for_tests(),
         )
     }
 
@@ -4651,7 +4667,7 @@ mod tests {
             EnvironmentIdentity::primary(dir.path()),
             EventBus::new(),
             ExecContext::host_unsandboxed_for_tests(),
-            crate::substrate::Substrate::local_for_tests(),
+            crate::substrate::Substrate::host_for_tests(),
             true,
         );
         let error = inside.reload().await.unwrap_err().to_string();

@@ -414,7 +414,7 @@ mod tests {
             ),
             EventBus::new(),
             ExecContext::host_unsandboxed_for_tests(),
-            crate::substrate::Substrate::local_for_tests(),
+            crate::substrate::Substrate::host_for_tests(),
         )
     }
 

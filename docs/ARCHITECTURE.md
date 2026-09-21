@@ -178,10 +178,11 @@ unnecessary.
 
 The ladder says *whose config* a container was built from. It deliberately
 says nothing about **where that container runs**, which is a separate axis:
-the user's host, a `podman machine` behind KVM, or a remote podman over an
-ssh connection. Every rung works on every substrate, because the substrate's
-whole output is a connection name that `taste_core::PodmanTarget` composes
-into each podman invocation. See ENVIRONMENTS.md → "The substrate".
+a VM of the workspace's pool, behind KVM, or a remote podman over an ssh
+connection — never the user's host, since 2026-09-21. Every rung works on
+every substrate, because the substrate's whole output is a connection name
+that `taste_core::PodmanTarget` composes into each podman invocation. See
+ENVIRONMENTS.md → "The substrate".
 
 `NoConfig` is therefore no longer a dead state: a repo with no devcontainer
 gets the baseline, so one environment is always usable. The IDE opens in
@@ -340,11 +341,11 @@ is the convention.
 
 Three things are shared on purpose, and each is safe for its own reason:
 
-- **The podman machine** (`taste-ide`) — one per user by design. Every
-  window's containers live inside it. Nothing stops or removes it outside an
-  explicit recreate, so there is no idle-stop to race; `ensure_running` is a
-  check-then-act that several windows can enter together, and it settles on
-  the world (*is it running now?*) rather than on any one command's exit.
+- **The workspace's VMs** (`taste-<workspace-key>-<slug>`) — a pool per
+  workspace, serving that workspace only. Only the supervising window
+  provisions, starts, and stops them; `ensure_running` is a check-then-act
+  that settles on the world (*is it running now?*) rather than on any one
+  command's exit, so a second window that merely looks does no harm.
 - **Images** (`taste-img-<hash>`) — content-addressed. Two projects with
   byte-identical devcontainer configs genuinely want one image, and nothing
   looks an image up by workspace. `podman rmi` without `-f` refuses while
@@ -591,6 +592,20 @@ changes, and neither does what the panes are *about*. Concretely —
 | Editor | which tab set is on screen (`Editor::aim_at`) |
 | Console | whose shells are in the strip, and whose podman objects Resources lists |
 | Chat | which conversation is on screen (`Chats::show`) |
+
+**A checkout is not a host path.** Since 2026-09-21 the primary's working
+copy, like every agent environment's, lives in the workspace's VM, and
+the folder the user opened is its git peer. So every pane that reads
+files does it through `taste_core::files::Files` — this host's filesystem
+or the VM's files service, one API — and every working-tree operation
+the tree offers goes through `taste_devcontainer::Worktree`, libgit2 here
+and `git` beside the files there. The git views that read refs (log,
+branches, ahead/behind, review, issues, and the fetch and push that carry
+the user's keys) read the peer. `Workspace::checkout_path()` is what the
+tree lists and the editor opens; `Workspace::root()` is the folder, and
+the two are the same path only until the registry places the primary
+(`Event::CheckoutMoved`). ENVIRONMENTS.md → "The plan" has the whole of
+it.
 
 The backlog itself is the one thing in the flank that is **not** the
 selected environment's: the issue queue lives on one ref for the whole

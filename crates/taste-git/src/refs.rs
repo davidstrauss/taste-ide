@@ -369,6 +369,16 @@ impl GitWorkspace {
         Ok(())
     }
 
+    /// The first parent of `commit`, or `None` for a root commit. A
+    /// snapshot commit's first parent is the HEAD it was taken on.
+    pub fn first_parent(&self, commit: Oid) -> Result<Option<Oid>> {
+        let commit = self
+            .repo
+            .find_commit(commit)
+            .with_context(|| format!("finding commit {commit}"))?;
+        Ok(commit.parent_id(0).ok())
+    }
+
     /// Every ref under `prefix` (a namespace such as `refs/taste/vm/`),
     /// with what it points at, sorted by name.
     pub fn refs_under(&self, prefix: &str) -> Result<Vec<(String, Oid)>> {

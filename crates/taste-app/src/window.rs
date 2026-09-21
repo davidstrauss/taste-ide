@@ -4090,16 +4090,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // containers do: two windows on one folder writing one file is
             // whichever closed last deciding what the other had open.
             if supervision.as_ref().is_none_or(|s| s.is_granted()) {
-                // The workspace's VM stops with its window: its memory is
-                // committed for as long as it runs, and nothing in it is
+                // The workspace's VMs stop with its window: their memory is
+                // committed for as long as they run, and nothing in them is
                 // lost to a warm boot next launch. Spawned detached, so the
                 // GTK thread does not wait and the exit that follows does
                 // not cut the signal short.
-                if let taste_devcontainer::Provider::Vm { domain } =
-                    environments.substrate().provider()
-                {
+                for domain in environments.vm_domains() {
                     if let Err(e) =
-                        taste_devcontainer::LibvirtSession::new().shutdown_detached(domain)
+                        taste_devcontainer::LibvirtSession::new().shutdown_detached(&domain)
                     {
                         tracing::warn!("shutting down {domain}: {e}");
                     }

@@ -262,6 +262,11 @@ pub struct EnvironmentRegistry {
     /// The files service for every environment on that VM; connected on
     /// first need and kept for as long as it answers.
     keepers: Mutex<BTreeMap<String, Arc<Keeper>>>,
+    /// One substrate per VM of the pool that hosts an environment, by
+    /// domain: the resolved one and every other the registry brought up
+    /// for a restored or newly placed environment. An environment's
+    /// substrate is its VM's (`substrate_for`).
+    substrates: Mutex<BTreeMap<String, Arc<Substrate>>>,
     /// What the IDE serves down every environment channel, once the window
     /// has said. Held here as well as on each supervisor so an environment
     /// created later inherits it.
@@ -300,7 +305,9 @@ impl EnvironmentRegistry {
             events,
             primary_exec,
             environment::environments_base(),
-            Arc::new(Substrate::local()),
+            // Nothing until reconcile resolves the ladder: no environment
+            // starts before its substrate is known.
+            Arc::new(Substrate::unresolved()),
             false,
         )
     }
@@ -317,7 +324,7 @@ impl EnvironmentRegistry {
             events,
             primary_exec,
             environments_base.into(),
-            Substrate::local_for_tests(),
+            Substrate::host_for_tests(),
             true,
         )
     }
@@ -348,6 +355,7 @@ impl EnvironmentRegistry {
             disk_meter_started: AtomicBool::new(false),
             free_disk_for_tests: Mutex::new(None),
             keepers: Mutex::new(BTreeMap::new()),
+            substrates: Mutex::new(BTreeMap::new()),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -423,19 +431,57 @@ impl EnvironmentRegistry {
         if resolved.can_host(checkout) {
             return resolved;
         }
-        match checkout {
-            // A VM resolved, a checkout still here: the host's own podman,
-            // sandboxed exactly as the resolved one is.
-            taste_core::environment::Checkout::Local(_) => {
-                Arc::new(Substrate::local_like(&resolved))
+        // A checkout in another VM of the pool: that VM's substrate, when
+        // the registry has brought it up.
+        if let taste_core::environment::Checkout::Remote { vm, .. } = checkout {
+            if let Some(substrate) = self.substrates.lock().unwrap().get(vm) {
+                return substrate.clone();
             }
-            // A checkout in a VM this workspace did not resolve to. Nothing
-            // can run it; the resolved substrate is returned so the
-            // container start fails loudly there rather than silently on
-            // the host, and placement (the next batch) is what prevents
-            // the situation.
-            taste_core::environment::Checkout::Remote { .. } => resolved,
         }
+        // Nothing can run it — a checkout still on this host beside a VM
+        // substrate, or one in a VM the pool no longer has. The resolved
+        // substrate is returned so the refusal names the real situation
+        // (`Substrate::refusal`); there is no host rung to fall to.
+        resolved
+    }
+
+    /// Every VM of the pool the registry has brought up, by domain: what
+    /// the window stops when it closes.
+    pub fn vm_domains(&self) -> Vec<String> {
+        let mut domains: Vec<String> = self.substrates.lock().unwrap().keys().cloned().collect();
+        if let Some(vm) = self.substrate().vm_details() {
+            if !domains.contains(&vm.domain) {
+                domains.push(vm.domain.clone());
+            }
+        }
+        domains
+    }
+
+    /// The substrate of one VM of the pool, when the registry has it.
+    pub fn substrate_of_vm(&self, domain: &str) -> Option<Arc<Substrate>> {
+        if let Some(vm) = self.substrate().vm_details() {
+            if vm.domain == domain {
+                return Some(self.substrate());
+            }
+        }
+        self.substrates.lock().unwrap().get(domain).cloned()
+    }
+
+    /// Record a VM of the pool as brought up, and point every environment
+    /// whose checkout is in it at it.
+    fn register_vm(&self, vm: &Vm, facts: crate::provision::VmFacts) -> Arc<Substrate> {
+        let sandboxed = self.substrate().target().sandboxed();
+        let substrate = Arc::new(Substrate::vm(vm, facts, sandboxed));
+        self.substrates
+            .lock()
+            .unwrap()
+            .insert(vm.domain.clone(), substrate.clone());
+        for supervisor in self.list() {
+            if supervisor.checkout().vm() == Some(vm.domain.as_str()) {
+                supervisor.set_substrate(substrate.clone());
+            }
+        }
+        substrate
     }
 
     /// Point the workspace at the substrate the ladder resolved.
@@ -444,6 +490,16 @@ impl EnvironmentRegistry {
     /// each at the substrate its own checkout can run on
     /// ([`Self::substrate_for`]).
     pub fn set_substrate(&self, substrate: Arc<Substrate>) {
+        if let (Some(vm), Some(facts)) = (substrate.vm_details(), substrate.vm_facts()) {
+            self.substrates.lock().unwrap().insert(
+                vm.domain.clone(),
+                Arc::new(Substrate::vm(
+                    vm,
+                    facts.clone(),
+                    substrate.target().sandboxed(),
+                )),
+            );
+        }
         *self.substrate.lock().unwrap() = substrate;
         for supervisor in self.environments.lock().unwrap().values() {
             supervisor.set_substrate(self.substrate_for(&supervisor.checkout()));
@@ -711,9 +767,18 @@ impl EnvironmentRegistry {
                 }
             }
             // Uncommitted work travels as a snapshot ref and is put back
-            // over there as exactly what it was.
+            // over there as exactly what it was. Whose: the folder's, when
+            // the folder has changes of its own — the user edited here, on
+            // purpose — and otherwise the peer's last snapshot, which is
+            // the checkout's own last state in the VM that is gone
+            // (docs/ENVIRONMENTS.md → "Uncommitted work, backups, and
+            // artifacts": moving is restore).
             let snapshot_ref = taste_git::snapshot_ref(EnvironmentId::primary().as_str());
-            let snapshot = host.snapshot_worktree(&snapshot_ref)?;
+            let previous = host.read_ref(&snapshot_ref)?;
+            let dirty = !host.status()?.is_empty();
+            if dirty {
+                host.snapshot_worktree(&snapshot_ref)?;
+            }
             crate::peer::push_to_guest(
                 &peer,
                 vm,
@@ -721,13 +786,17 @@ impl EnvironmentRegistry {
                 &path,
                 &crate::peer::PRIMARY_SEED_REFSPECS,
             )?;
-            if !host.status()?.is_empty() {
+            if dirty || previous.is_some() {
                 let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;
                 run(&path, &["sh", "-c", &restore])?;
                 tracing::info!(
-                    "restored the folder's uncommitted work in VM {} from {}",
-                    vm.domain,
-                    snapshot.commit
+                    "restored {} uncommitted work in VM {} from {snapshot_ref}",
+                    if dirty {
+                        "the folder's"
+                    } else {
+                        "the last snapshot's"
+                    },
+                    vm.domain
                 );
             }
             None
@@ -775,14 +844,13 @@ impl EnvironmentRegistry {
                 return Ok(keeper.clone());
             }
         }
-        let substrate = self.substrate();
-        if substrate.vm_details().map(|v| &v.domain) != Some(&vm.domain) {
+        let Some(substrate) = self.substrate_of_vm(&vm.domain) else {
             bail!(
-                "{} is not the VM this workspace resolved to ({})",
+                "{} is not a VM this workspace has brought up (its substrate is {})",
                 vm.domain,
-                substrate.provider().describe()
+                self.substrate().provider().describe()
             );
-        }
+        };
         let container = crate::keeper::ensure_container(&substrate, vm, &self.workspace_root)?;
         let keeper = Keeper::in_container(&substrate, &container, format!("VM {}", vm.domain))?;
         self.keepers
@@ -790,6 +858,172 @@ impl EnvironmentRegistry {
             .unwrap()
             .insert(vm.domain.clone(), keeper.clone());
         Ok(keeper)
+    }
+
+    /// How many environments each VM of the pool hosts now.
+    fn occupancy(&self) -> std::collections::HashMap<String, usize> {
+        let mut occupancy = std::collections::HashMap::new();
+        for supervisor in self.list() {
+            if let Some(vm) = supervisor.checkout().vm() {
+                *occupancy.entry(vm.to_string()).or_insert(0) += 1;
+            }
+        }
+        occupancy
+    }
+
+    /// The VM one more environment goes on: the pool's choice by capacity
+    /// (`Pool::place`), brought up and registered. Blocking, from the
+    /// runtime's blocking pool — creation runs there.
+    fn place_by_capacity(&self) -> Result<Vm> {
+        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let occupancy = self.occupancy();
+        let handle = tokio::runtime::Handle::try_current()
+            .context("placing an environment needs the runtime")?;
+        let placed =
+            handle.block_on(pool.place(&occupancy, Arc::new(crate::substrate::report_download)));
+        let (vm, facts) = match placed {
+            Ok(placed) => placed,
+            Err(crate::pool::PoolError::AtCapacity {
+                running,
+                committed_mib,
+                host_mib,
+            }) => bail!(
+                "every VM of this workspace hosts {} environments and the host has no room \
+                 for another ({running} running, {:.1} of {:.1} GiB committed)",
+                crate::pool::MAX_ENVIRONMENTS_PER_VM,
+                committed_mib as f64 / 1024.0,
+                host_mib as f64 / 1024.0
+            ),
+            Err(crate::pool::PoolError::Skipped) => bail!("a probe run provisions nothing"),
+            Err(crate::pool::PoolError::Unavailable(e)) => {
+                return Err(e).context("the workspace's provisioner is not available")
+            }
+            Err(crate::pool::PoolError::Failed { domain, error }) => {
+                return Err(error).with_context(|| match domain {
+                    Some(domain) => format!("bringing up VM {domain}"),
+                    None => "making a VM".to_string(),
+                })
+            }
+        };
+        self.register_vm(&vm, facts);
+        Ok(vm)
+    }
+
+    /// Place an environment whose VM is gone into a VM the pool has, from
+    /// what this host kept: the peer's refs and its last snapshot.
+    ///
+    /// The checkout is made the way a new one is (`place_in_vm`'s
+    /// transport, without the strip — the peer is already refs only), the
+    /// branch the snapshot was taken on is checked out (the branch whose
+    /// tip is the snapshot's parent; detached at that commit when no branch
+    /// names it), and the snapshot is restored over it
+    /// (`taste_git::snapshot::restore_script`). What the agent had is what
+    /// it has again, as `git status` shows it; the chat comes back from
+    /// this host's stash on its own. Blocking; returns the VM.
+    fn replace_environment(&self, id: &EnvironmentId) -> Result<String> {
+        let supervisor = self
+            .get(id)
+            .with_context(|| format!("no environment {id}"))?;
+        let peer = supervisor.peer().to_path_buf();
+        let git = taste_git::GitWorkspace::discover(&peer)
+            .with_context(|| format!("{} is not a git repository", peer.display()))?;
+        let vm = self.place_by_capacity()?;
+        let keeper = self.keeper_for(&vm)?;
+        let files = Files::Remote(keeper.clone());
+        let path = crate::provision::guest_checkout_path(&self.workspace_root, id);
+        let workspace_dir = crate::provision::guest_workspace_dir(&self.workspace_root);
+        let run = |cwd: &Path, argv: &[&str]| -> Result<String> {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let out = files
+                .exec(cwd, &argv)
+                .with_context(|| format!("running {} in VM {}", argv.join(" "), vm.domain))?;
+            if !out.success() {
+                bail!(
+                    "{} in VM {}: {}",
+                    argv.join(" "),
+                    vm.domain,
+                    out.stderr_utf8().trim()
+                );
+            }
+            Ok(out.stdout_utf8())
+        };
+        if files.exists(&path) {
+            bail!(
+                "{} already exists in VM {}; it is not this environment's",
+                path.display(),
+                vm.domain
+            );
+        }
+        files.mkdir_all(&workspace_dir)?;
+        run(
+            &workspace_dir,
+            &["git", "init", "-q", &path.display().to_string()],
+        )?;
+        run(
+            &path,
+            &[
+                "git",
+                "config",
+                "receive.denyCurrentBranch",
+                "updateInstead",
+            ],
+        )?;
+        let keys = crate::keys::Keys::for_workspace(&self.workspace_root);
+        crate::peer::push_to_guest(&peer, &vm, &keys, &path, &crate::peer::PEER_REFSPECS)?;
+        // Where HEAD was: the snapshot's first parent, and the branch that
+        // names it. Without a snapshot, the one branch the peer has.
+        let snapshot_ref = taste_git::snapshot_ref(id.as_str());
+        let base = git
+            .read_ref(&snapshot_ref)?
+            .and_then(|snapshot| git.first_parent(snapshot).ok().flatten());
+        let branches: Vec<_> = git
+            .refs_under("refs/heads/")?
+            .into_iter()
+            .filter(|(name, _)| {
+                name != &format!("refs/heads/{}", taste_git::clone::PEER_HEAD_BRANCH)
+            })
+            .collect();
+        let at = base.and_then(|base| {
+            branches
+                .iter()
+                .find(|(_, oid)| *oid == base)
+                .map(|(name, _)| name.trim_start_matches("refs/heads/").to_string())
+        });
+        match (at, base, branches.as_slice()) {
+            (Some(branch), _, _) => {
+                run(&path, &["git", "checkout", "-q", &branch])?;
+            }
+            (None, Some(base), _) => {
+                run(
+                    &path,
+                    &["git", "checkout", "-q", "--detach", &base.to_string()],
+                )?;
+            }
+            (None, None, [(name, _)]) => {
+                let branch = name.trim_start_matches("refs/heads/").to_string();
+                run(&path, &["git", "checkout", "-q", &branch])?;
+            }
+            (None, None, _) => {
+                bail!("environment {id}'s peer has no snapshot and no single branch to check out")
+            }
+        }
+        if base.is_some() {
+            let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;
+            run(&path, &["sh", "-c", &restore])?;
+        }
+        Placement {
+            vm: vm.domain.clone(),
+            path: path.clone(),
+        }
+        .write(&self.env_dir(id))?;
+        let checkout = Checkout::Remote {
+            vm: vm.domain.clone(),
+            path,
+        };
+        supervisor.set_checkout(checkout.clone());
+        supervisor.set_substrate(self.substrate_for(&checkout));
+        supervisor.set_keeper(keeper);
+        Ok(vm.domain)
     }
 
     /// Put a freshly cloned environment's checkout into `vm`, leaving the
@@ -909,11 +1143,15 @@ impl EnvironmentRegistry {
         }
         taste_git::clone_local(&self.workspace_root, &repo)
             .with_context(|| format!("creating environment {id}"))?;
-        // Where the checkout lives: in the workspace's VM when it has one,
-        // and this clone becomes the peer that holds the refs; on this
-        // host otherwise, and the clone is the checkout.
-        let identity = match self.substrate().vm_details().cloned() {
-            Some(vm) => match self.place_in_vm(&id, &repo, &vm) {
+        // Where the checkout lives: in a VM of the workspace's pool, chosen
+        // by capacity, and this clone becomes the peer that holds the
+        // refs. On this host only for the test suites' host substrate,
+        // where the clone is the checkout.
+        let identity = if self.substrate().vm_details().is_some() {
+            let placed = self
+                .place_by_capacity()
+                .and_then(|vm| self.place_in_vm(&id, &repo, &vm));
+            match placed {
                 Ok(identity) => identity,
                 Err(e) => {
                     // Half an environment is worse than none: the peer goes
@@ -921,8 +1159,15 @@ impl EnvironmentRegistry {
                     let _ = std::fs::remove_dir_all(self.env_dir(&id));
                     return Err(e).with_context(|| format!("placing environment {id} in a VM"));
                 }
-            },
-            None => EnvironmentIdentity::local_at(self.workspace_root.clone(), id.clone(), repo),
+            }
+        } else if self.substrate().can_host(&Checkout::Local(repo.clone())) {
+            EnvironmentIdentity::local_at(self.workspace_root.clone(), id.clone(), repo)
+        } else {
+            let _ = std::fs::remove_dir_all(self.env_dir(&id));
+            bail!(
+                "environment {id} has nowhere to run: {}",
+                self.substrate().refusal(&Checkout::Local(repo))
+            );
         };
         let supervisor = self.adopt_identity(identity);
         // Supervised for real from its first second, the way a restored
@@ -1123,7 +1368,7 @@ impl EnvironmentRegistry {
         // VMs whose workspaces have left this machine. Asked only where a
         // VM could have been made, so a host without libvirt is not asked
         // anything.
-        if !substrate.is_local() || crate::pool::Pool::provisioning_allowed() {
+        if substrate.vm_details().is_some() || crate::pool::Pool::provisioning_allowed() {
             if let Ok(stale) = pool.stale().await {
                 swept.stale_vms = stale.into_iter().map(|vm| vm.domain).collect();
             }
@@ -1134,33 +1379,66 @@ impl EnvironmentRegistry {
         };
         report.restored.sort();
 
-        // Checkouts in the VM get their files service now that the VM is
-        // up. Off the reactor: connecting a keeper may build an image.
-        if let Some(vm) = substrate.vm_details().cloned() {
-            let remote: Vec<Arc<Supervisor>> = self
+        // The pool's other VMs: every VM a restored environment's checkout
+        // is in is brought up and registered, so its environments have
+        // their substrate; a VM the pool no longer has leaves its
+        // environments to be placed anew below.
+        if substrate.vm_details().is_some() {
+            let wanted: std::collections::BTreeSet<String> = self
                 .list()
                 .into_iter()
-                .filter(|s| s.checkout().vm() == Some(vm.domain.as_str()))
+                .filter_map(|s| s.checkout().vm().map(str::to_string))
+                .filter(|vm| self.substrate_of_vm(vm).is_none())
                 .collect();
-            if !remote.is_empty() {
-                let registry = self.clone();
-                let connected = tokio::task::spawn_blocking(move || registry.keeper_for(&vm)).await;
-                match connected {
-                    Ok(Ok(keeper)) => {
-                        for supervisor in &remote {
-                            supervisor.set_keeper(keeper.clone());
-                        }
+            for domain in wanted {
+                match pool.ensure_vm(&domain).await {
+                    Ok((vm, facts)) => {
+                        self.register_vm(&vm, facts);
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         let note = format!(
-                            "the files service for this workspace's VM could not be connected \
-                             ({e:#}); environments whose checkouts are in it cannot be read"
+                            "VM {domain} holds environments of this workspace and could not \
+                             be brought up ({e:?})"
                         );
                         taste_core::app_log::push("warn", "environments", &note);
-                        self.events.publish(Event::Toast(note));
                     }
-                    Err(e) => tracing::warn!("connecting the keeper did not finish: {e}"),
                 }
+            }
+        }
+        // Checkouts in a VM get their files service now that the VM is
+        // up, one keeper per VM. Off the reactor: connecting a keeper may
+        // build an image.
+        let mut by_vm: std::collections::BTreeMap<String, Vec<Arc<Supervisor>>> =
+            std::collections::BTreeMap::new();
+        for supervisor in self.list() {
+            if let Some(vm) = supervisor.checkout().vm() {
+                by_vm.entry(vm.to_string()).or_default().push(supervisor);
+            }
+        }
+        for (domain, remote) in by_vm {
+            let Some(vm) = self
+                .substrate_of_vm(&domain)
+                .and_then(|s| s.vm_details().cloned())
+            else {
+                continue;
+            };
+            let registry = self.clone();
+            let connected = tokio::task::spawn_blocking(move || registry.keeper_for(&vm)).await;
+            match connected {
+                Ok(Ok(keeper)) => {
+                    for supervisor in &remote {
+                        supervisor.set_keeper(keeper.clone());
+                    }
+                }
+                Ok(Err(e)) => {
+                    let note = format!(
+                        "the files service for VM {domain} could not be connected ({e:#}); \
+                         environments whose checkouts are in it cannot be read"
+                    );
+                    taste_core::app_log::push("warn", "environments", &note);
+                    self.events.publish(Event::Toast(note));
+                }
+                Err(e) => tracing::warn!("connecting the keeper did not finish: {e}"),
             }
         }
         // The primary too. Its checkout moves into the VM — seeded from the
@@ -1188,15 +1466,46 @@ impl EnvironmentRegistry {
                 Err(e) => tracing::warn!("placing the primary did not finish: {e}"),
             }
         }
-        for supervisor in self.list() {
-            if let Checkout::Remote { vm, .. } = supervisor.checkout() {
-                if substrate.vm_details().map(|v| v.domain.as_str()) != Some(vm.as_str()) {
-                    let note = format!(
-                        "environment {}'s checkout is in VM {vm}, which this workspace no \
-                         longer has; it cannot run until it is moved to a fresh VM",
-                        supervisor.id()
-                    );
-                    taste_core::app_log::push("warn", "environments", &note);
+        // The restore path: an environment whose VM is gone — undefined by
+        // hand, lost with a disk, or left on another machine — is placed
+        // anew from its peer and its last snapshot (docs/ENVIRONMENTS.md →
+        // "Uncommitted work, backups, and artifacts"). Moving is restore.
+        if substrate.vm_details().is_some() {
+            let orphaned: Vec<Arc<Supervisor>> = self
+                .list()
+                .into_iter()
+                .filter(|s| !s.id().is_primary())
+                .filter(|s| {
+                    s.checkout()
+                        .vm()
+                        .is_some_and(|vm| self.substrate_of_vm(vm).is_none())
+                })
+                .collect();
+            for supervisor in orphaned {
+                let id = supervisor.id().clone();
+                let registry = self.clone();
+                let restored =
+                    tokio::task::spawn_blocking(move || registry.replace_environment(&id)).await;
+                match restored {
+                    Ok(Ok(vm)) => {
+                        let note = format!(
+                            "environment {} was placed anew in VM {vm} from its peer and its \
+                             last snapshot; the VM it was in is gone",
+                            supervisor.id()
+                        );
+                        taste_core::app_log::push("info", "environments", &note);
+                        self.events.publish(Event::Toast(note));
+                    }
+                    Ok(Err(e)) => {
+                        let note = format!(
+                            "environment {}'s checkout is in a VM this workspace no longer \
+                             has, and placing it anew failed ({e:#}); it cannot run until it is",
+                            supervisor.id()
+                        );
+                        taste_core::app_log::push("warn", "environments", &note);
+                        self.events.publish(Event::Toast(note));
+                    }
+                    Err(e) => tracing::warn!("placing an environment anew did not finish: {e}"),
                 }
             }
         }
@@ -1295,7 +1604,7 @@ impl EnvironmentRegistry {
             // ladder ended where it was always going to end. See
             // `substrate::Descent`.
             taste_core::app_log::push("info", "substrate", line);
-        } else if !substrate.is_local() {
+        } else if substrate.is_resolved() {
             taste_core::app_log::push(
                 "info",
                 "substrate",
@@ -1423,24 +1732,27 @@ mod tests {
         registry.set_substrate(Arc::new(Substrate::vm(&vm, facts, false)));
         // The workspace knows its VM...
         assert_eq!(registry.substrate().connection(), Some("taste-799f-k7m2qx"));
-        // ...and the primary, a local checkout, still runs on local podman,
-        // with its exec context aimed there too.
+        // ...and the primary, a checkout still on this host, has nowhere
+        // to run until it is placed there: no host rung. Its refusal names
+        // the folder and the VM, and nothing it composes reaches the host.
         let primary = registry.primary();
-        assert!(
-            primary.substrate().is_local(),
-            "{:?}",
-            primary.substrate().provider()
-        );
-        let (program, args) = primary.exec().podman_target().argv(["ps"]);
-        assert_eq!((program.as_str(), args), ("podman", vec!["ps".to_string()]));
-        // A new environment of a workspace with a VM is placed IN the VM —
-        // which this test has none of, so creation fails naming it, and
-        // leaves no half-made environment behind for a retry to trip on.
+        assert!(!primary.substrate().can_host(&primary.checkout()));
+        let refusal = primary.substrate().refusal(&primary.checkout());
+        assert!(refusal.contains("taste-799f-k7m2qx"), "{refusal}");
+        let (_, args) = primary.exec().podman_target().argv(["ps"]);
+        assert_eq!(args[0], "-c");
+        // A new environment of a workspace with a VM is placed IN a VM of
+        // the pool — which this test has none of (no runtime, no libvirt),
+        // so creation fails at placement, saying so, and leaves no
+        // half-made environment behind for a retry to trip on.
         let refused = match registry.create(env("review")) {
             Ok(_) => panic!("a workspace with a VM must not make a local checkout"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(refused.contains("taste-799f-k7m2qx"), "{refused}");
+        assert!(
+            refused.contains("placing environment review in a VM"),
+            "{refused}"
+        );
         assert!(registry.get(&env("review")).is_none());
         assert!(!registry.env_dir(&env("review")).exists());
     }

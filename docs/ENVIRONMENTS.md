@@ -2560,129 +2560,134 @@ numbers.
 abstraction.** The output of the whole subsystem is a
 `taste_core::PodmanTarget` — a name podman knows — and every podman
 invocation in the IDE composes against one. That choice is what makes
-the tiers below peers rather than special cases:
+the providers below peers rather than special cases:
 
 | Provider | Containers run | Reached by | Status |
 | --- | --- | --- | --- |
-| `Local` | the user's host | the local rootless service | the default, unchanged |
-| `Machine` | a local VM, behind KVM | the connection `podman machine` registered | shipped |
-| `Remote` | any host with podman | a connection over ssh | transport shipped, gated (below) |
-| cloud | a VM the IDE provisions | *a provisioner that returns a connection* | future |
+| `Vm` | a VM the IDE provisioned for this workspace, behind KVM | the connection the provisioner registered | **the default**, shipped 2026-09-21 |
+| `Remote` | a host with podman the IDE was pointed at | a connection over ssh | transport shipped, adopted not provisioned |
+| `None` | nowhere | nothing; every start is refused with the reason | what a host without a provisioner gets |
+| cloud | a VM the IDE provisions elsewhere | *a provisioner that returns a connection* | future |
 
 A cloud VM is not a fourth kind of thing. A provisioner authenticates to
-GCP/AWS/Azure, creates a host, registers a connection, and hands back
-`Remote`. Provisioning reduces to **produce a connection**, and nothing
+GCP/AWS/Azure, creates a host, registers a connection, and hands back a
+VM. Provisioning reduces to **produce a connection**, and nothing
 downstream learns a new word — which is the point of not adding a `--vm`
 flag. It is also what makes the end state David named reachable: the
 *coordinator* environment running persistently on a cloud VM is a
 coordinator whose substrate is a connection that outlives the IDE
 process.
 
+**Two providers this table used to have are gone** (2026-09-21). `Local`
+— the user's own rootless podman, where every container ran before any of
+this existed and where the ladder ended when nothing else answered — and
+`Machine`, a `podman machine` named `taste-ide` that the IDE adopted if
+one existed (the spike's candidate; `docs/spikes/vm-substrate.md` has the
+numbers and the `krun` disqualification). Both were rungs below VM
+isolation, and there is no rung below VM isolation once it runs (David,
+2026-09-17). What a `podman machine` withheld — a network backend the IDE
+controls, sizing it can change, a definition it can read back — is what
+user-session libvirt gives, so the machine had nothing left to be for.
+The host's own podman survives in one place: `Substrate::host_for_tests`,
+for the suites that exercise the container lifecycle without a
+hypervisor, and the ladder never resolves to it.
+
 ### How the provider is chosen — convention, not configuration
 
-1. the connection named by `TASTE_PODMAN_CONNECTION`, if set (the alpha
-   seam for a host you registered yourself with `podman system connection
-   add`, and how the remote tier is verified until a provisioner exists);
-2. otherwise the machine named `taste-ide`, **if one exists** — creating
-   it is a deliberate act, so its existence *is* the choice;
-3. otherwise local podman.
+1. the connection named by `TASTE_PODMAN_CONNECTION`, if set (a host you
+   registered yourself with `podman system connection add`, adopted
+   rather than provisioned, and the seam a remote provisioner terminates
+   at);
+2. otherwise a VM from this workspace's **pool** — one libvirt has for it,
+   brought up, or a new one made when it has none and the host has room.
+   Provisioning is automatic: configuring nothing is choosing the default
+   provisioner, user-session libvirt;
+3. otherwise **nothing**. The environments do not start, and each says
+   which provisioner is missing or failed and why.
 
-There is no substrate setting, no sizing knob and no per-project
-substrate. Machine sizing is IDE-decided and derived from the host:
-memory is a quarter of host RAM clamped to 4–12 GiB, vCPUs are half the
-host's capped at 8, disk ceiling 64 GiB.
+There is no substrate setting, no sizing knob, and no per-project
+substrate. VM sizing is IDE-decided and derived from the host
+(`taste_devcontainer::sizing`): vCPUs are half the host's capped at 12,
+memory a third of host RAM clamped to 4–16 GiB, the disk a sparse 64 GiB
+overlay on the shared base image, and a VM is refused when the disk has
+under 20 GiB free or when the running VMs plus this one would take the
+host past its reserve (`sizing::room_for`). The numbers are creation-time:
+a VM is never resized, because a VM is never updated — it is replaced,
+and its environments restored into the replacement (see "Uncommitted
+work, backups, and artifacts").
 
-**Those numbers are creation-time advice, not policy.** Capacity is a
-podman-level property of the machine, fixed by `podman machine init` and
-kept in podman's own state (`~/.config/containers/podman/machine/<provider>/
-<name>.json`) — outside the IDE entirely. The IDE supplies the numbers
-exactly once, when it creates the machine, and never reshapes one:
-nothing calls `podman machine set`. `MachineFacts` READS capacity back
-from `podman machine inspect`, and the constants above are only the
-fallback for when that read cannot be parsed, so the fleet reports the
-machine's real size rather than the size the IDE would have chosen.
+**Never degrade silently — and there is nothing to degrade to.** A VM
+that exists for this workspace and will not come up, a connection the
+user named that does not answer, a VM that could not be made, a host with
+no room: each is a note — toast and app log — because the user did not
+get what they chose, and each leaves the workspace's substrate at `None`,
+so every environment refuses to start with that reason on its row
+(`Supervisor::reload` → `SupervisorState::Failed`). A host with no libvirt
+at all is a log line and the same refusal: nothing was chosen, so nothing
+is shouted, but nothing runs either. The rows say what is missing, and
+"Host packaging, settled" below says how to supply it.
 
-Two things follow. A machine named `taste-ide` that already exists — made
-by hand, by the live test, or by an older IDE — is adopted at whatever
-size it was made, which is the escape hatch for sizing it yourself
-without waiting on these constants. And nothing checks that the adopted
-machine is big enough: rung 2 asks only whether it exists, so a
-hand-made 2 GiB `taste-ide` silently becomes the whole fleet's ceiling.
-Changing the constants does nothing to a machine that already exists —
-machines are cattle, so a resize is `remove` and `create`.
+### The pool, concretely
 
-**Creating the machine is the one affordance this batch does not ship.**
-`Machine::create` exists, sizes the machine and arranges the helper
-binaries; nothing in the UI calls it yet, because a button that commits
-several GiB of the user's RAM is a design decision, not a wiring task.
-Until it has one, a machine is created by the live test
-(`TASTE_MACHINE_TESTS=1 … --test machine`) or by hand with the IDE's own
-helper arrangement in force:
-
-```sh
-H=~/.local/share/taste-ide/helpers      # written by Helpers::arrange
-CONTAINERS_CONF_OVERRIDE=$H/containers.conf PATH="$H:$PATH" \
-  podman machine init --cpus 8 --memory 7936 --disk-size 64 taste-ide
-CONTAINERS_CONF_OVERRIDE=$H/containers.conf PATH="$H:$PATH" \
-  podman machine start taste-ide
-```
-
-From then on the IDE finds it by itself and says so in the app log. To go
-back to the host: `podman machine rm -f taste-ide` — the environments
-inside it go too, and the next reload rebuilds them locally.
-
-**Never degrade silently.** A machine that exists but will not start —
-no KVM, no helper binaries — falls back to local *with a reason*, which
-lands in the app log and a toast. An IDE that quietly ran on the host
-after the user asked for a VM would be telling them their agents are
-behind KVM when they are not.
-
-### The machine, concretely
-
-- **One machine hosts every environment**, not one per environment. It
-  costs ~1.35 GB idle and ~20 s to boot, and it hosts ordinary podman, so
-  N environments inside it are N containers exactly as before. One VM per
-  environment would multiply a fixed cost by the number the fleet exists
-  to grow.
-- **Helper binaries, arranged in user space.** `podman machine start`
-  needs `gvproxy` (absent from an immutable Fedora host) and `virtiofsd`
-  **on `$PATH`** (installed, but at `/usr/libexec`). The IDE fetches
-  gvproxy version-pinned and sha256-verified into its own data directory,
-  symlinks the system virtiofsd beside it, and points `[engine]
-  helper_binaries_dir` at that directory through `CONTAINERS_CONF_OVERRIDE`
-  — **scoped to the machine lifecycle commands only**, never exported,
-  never written into the user's own `containers.conf`. Nothing is
-  installed on the host and no `rpm-ostree` operation is ever run. The
-  hash is re-checked on every arrange, so a corrupted or substituted
-  helper is self-healing rather than sticky.
+- **A workspace has a pool of VMs, not one VM**, named
+  `taste-<workspace-key>-<six characters>` — entropy, not a counter
+  (David, 2026-09-20: "I don't want to deal with a counter") — and
+  enumerated from libvirt by that prefix, so there is no list to keep in
+  step with the hypervisor's. Environments are placed across the pool by
+  capacity (`Pool::place`): the least loaded VM with room takes the next
+  environment, a VM hosts at most three (`MAX_ENVIRONMENTS_PER_VM`, the
+  v1 policy, stated so it can be argued with), and when every VM is full
+  a new one is made if the host has room and refused otherwise — never
+  oversubscribed, because a VM's capacity is why a workspace has several
+  ("some aspects of capacity don't scale linearly"). A VM serves one
+  workspace only.
+- **The substrate is per environment.** The registry keeps one substrate
+  per VM it has brought up (`EnvironmentRegistry::substrate_for`), and an
+  environment's is its VM's; the workspace's "resolved" substrate is the
+  first VM, where the primary lands. At reconcile every VM a restored
+  environment's checkout is in is brought up and registered, and an
+  environment whose VM is gone is placed anew (below).
 - **Sizing is a commitment, not a ceiling.** qemu runs with a memfd
   backend and no balloon, so guest page cache ratchets host RSS to the
-  configured memory and never returns it (measured: 1.3 GB idle → 8.4 GB
-  after one image build and one cargo build). The machine therefore
-  appears as its own row in the environment Resources view — *"taste-ide
-  — running, 8 vCPU, 7.8 GiB committed, 4.3 GiB on disk of 64 GiB"* —
-  because no per-environment number can explain memory the VM took and
-  disk a sparse qcow2 will not give back.
-- **Machines are cattle.** The answer to a machine that is wrong is
-  remove and recreate, not repair: it holds nothing the IDE cannot
-  rebuild, since images rebuild from configs and clones live on the host.
-  What that costs is every container inside it, so
+  configured memory and never returns it (measured in the spike: 1.3 GB
+  idle → 8.4 GB after one image build and one cargo build). Each VM
+  therefore appears as its own row in the environment Resources view —
+  *"taste-799f-k7m2qx — running, 12 vCPU, 10.0 GiB committed, 4.3 GiB on
+  disk of 64 GiB"* — because no per-environment number can explain memory
+  the VM took and disk a sparse qcow2 will not give back.
+- **VMs are cattle, and they are never updated.** The guest does not
+  self-update (Zincati is off) and the IDE never reshapes one. The answer
+  to a VM that is wrong, old, or gone is a fresh one from the pinned base
+  image, with its environments restored into it from what this host kept:
+  each peer's refs and last snapshot. That is the restore path with its
+  first callers — `EnvironmentRegistry::replace_environment` for an
+  agent environment whose VM the pool no longer has, and `place_primary`
+  for the primary, which seeds a fresh checkout from the folder and
+  restores the peer's last snapshot when the folder is clean, or the
+  folder's own uncommitted work when it is not. What a replacement costs
+  is every container inside the old VM, so
   `Supervisor::reconcile_container_presence` asks whether the container
   an environment believes in still exists and reports the environment
-  *down* rather than phantom-running. Without it `ide_exec` would fail
-  with podman's "no such container" instead of the IDE's "this
-  environment is down", and chats would keep trying to relocate into
-  nothing.
-- **Idle-stop stops containers, never the machine.** A stopped machine
-  takes every environment down at once and costs ~20 s to come back.
+  *down* rather than phantom-running.
+- **The VMs stop with the window.** ACPI shutdown for every VM of the
+  pool, detached, when the supervising window closes; reconcile starts
+  them again next launch. Idle-stop stops containers, never a VM.
+- **What the guest is**: Fedora CoreOS, pinned by release and digest
+  (`taste_devcontainer::guest`), configured by Ignition
+  (`provision::ignition`): rootless podman as `core`, ssh in on a loopback
+  forward passt provides, the IDE-minted host key so the VM is known
+  before first boot, and nftables on the guest's own egress — internet
+  allowed, RFC1918 and link-local rejected — because host-side
+  enforcement needs root this design has nowhere (see "Egress policy" in
+  the plan).
 
 ### What did not change, and why that is the result
 
 Per-environment volumes were already the design, and the spike showed
 they are load-bearing rather than an optimization: moving `target/` off
 the shared filesystem into a VM-local named volume is worth 30% of a cold
-build (70.5 s vs 100.0 s), which is what keeps the machine within 7% of
-a CPU-matched host. The stdio-over-`podman exec` environment channel
+build (70.5 s vs 100.0 s), which is what keeps a VM within 7% of a
+CPU-matched host. The stdio-over-`podman exec` environment channel
 crosses the VM boundary transparently — one transport for SELinux hosts
 and VM substrates alike — and `AgentHosting` probes whatever the
 substrate actually is, unchanged. The relocated agent follows its
@@ -2693,25 +2698,27 @@ container onto the substrate because the connection rides on the
 (`taste_acp::sandbox`). It is the fallback for an environment with no
 container to relocate into, and it is built out of host sockets — the
 IDE's MCP socket, the URL bridge, `--network=host` for the OAuth
-callback. A unix socket bind-mounted through virtiofs is not connectable
-from inside a VM and the host's loopback is not the VM's, so moving that
-rung onto a machine would produce an agent with no tools and no way to
-log in. Its confinement is unchanged; what runs on the substrate is the
-topology the design actually wants, the agent beside the files in its
-environment's own container, which is where the isolation is for.
+callback. A unix socket is not connectable from inside a VM and the
+host's loopback is not the VM's, so moving that rung into a VM would
+produce an agent with no tools and no way to log in. Its confinement is
+unchanged; what runs on the substrate is the topology the design actually
+wants, the agent beside the files in its environment's own container,
+which is where the isolation is for. It sees no files: an environment
+whose container refused to start has nothing for an agent to read.
 
 ### The one compatibility rule the substrate imposes
 
-**Every host path the IDE binds into a container must be under the
-machine's shared set.** The default share is `$HOME:$HOME` and it can
-only be set at `init` — `podman machine set` has no `--volume`. `/tmp`
-cannot be shared at all; podman refuses that destination by name. Binding
-a path the VM does not have fails loudly (`statfs …: no such file or
-directory`) rather than mounting an empty directory, which is the good
-failure mode, but it is still a failure. Today's topology survives
-because checkouts, clones, the build-context staging directory and the
-baseline definition all live under `$HOME`/`$XDG_STATE_HOME`. Anything
-future staged in `/tmp` breaks this, and the live suites are the tripwire.
+**A VM shares no filesystem with the host, by decision** (see "The
+topology: remote by default"). So a container in a VM binds only paths
+that exist in the VM: the checkout at its own path there, the staged
+build context copied over, the keeper's mount of the workspace's
+directory. Anything the IDE would bind from this host — a path under
+`$HOME`, `/tmp`, a socket — is not there, and binding it fails loudly at
+`statfs` rather than mounting an empty directory, which is the good
+failure mode but still a failure. `taste-devcontainer::security` refuses
+repo-supplied binds outside the checkout for the same reason it always
+did, and the live suite is the tripwire for anything new staged on the
+host.
 
 ### Remote substrate: what is proven, and the gate
 
@@ -2719,20 +2726,20 @@ The remote provider is **proven end to end** against a real `ssh://`
 podman connection: environment lifecycle (image built and container
 started over there), `ide_exec` through `ExecContext`, and the
 environment channel — including the production `AgentHosting` reach probe
-— all round-trip through it. A running podman machine *is* an
-ssh-reachable podman host (`podman system connection list` shows its
-`ssh://core@127.0.0.1:PORT` endpoint), so pointing the remote provider at
-one exercises the whole path with nothing faked.
+— all round-trip through it. Every provisioned VM *is* such a host: its
+podman is reached over `ssh://core@127.0.0.1:PORT`, the connection the
+provisioner registered, so the whole path is exercised on every launch
+with nothing faked.
 
 **What a genuinely foreign host differs in is not the transport. It is
-the files.** A machine shares `$HOME` over virtiofs, so an environment's
-checkout exists at the same path on both sides and nothing moves. A
-foreign host has no such share, so the clone would have to live *there*,
-and mediated publish would have to cross the wire. That is **clone
-locality**, it is the gate the real remote and cloud tiers wait behind,
-and it is deliberately out of the substrate batch. Until it lands,
-`TASTE_PODMAN_CONNECTION` pointing at a host that does not share the
-user's `$HOME` will fail at the bind, loudly.
+the files** — and that gate, **clone locality**, is closed: a checkout
+lives where its containers run and the host keeps a peer (see "The
+topology" and "The plan"). What `TASTE_PODMAN_CONNECTION` still assumes
+is the old shape, a host whose podman sees this machine's files, because
+an adopted connection has no provisioner to place a checkout through; it
+is the seam a remote libvirt or cloud provisioner terminates at, and until
+one exists a connection to a host that does not share this machine's
+files fails at the bind, loudly.
 
 **Safe mode joins the same substrate — shipped, ahead of the VM work.**
 The IDE ships a **baseline environment definition** in-tree
@@ -3157,9 +3164,10 @@ listed because **provision versus adopt** belongs in the type rather than
 in a comment — the IDE may destroy a VM it created and may not destroy a
 host it was merely pointed at.
 
-This also retires `Provider::Machine`. `podman machine` exists to hide VM
-creation, and it needs qemu on the host exactly as libvirt does, so once
-the IDE provisions directly there is nothing left for it to buy.
+This retired `Provider::Machine` (gone since 2026-09-21). `podman machine`
+exists to hide VM creation, and it needs qemu on the host exactly as
+libvirt does, so once the IDE provisioned directly there was nothing left
+for it to buy.
 
 **A pool per workspace, not a VM per workspace** (David, 2026-09-20). A
 workspace needs at least one VM from its provisioners, and its environments
@@ -3254,22 +3262,22 @@ isolation, so from then on every failure to supply one falls in the first
 branch — the loud one. The silent branch only ever covered "nobody asked",
 and for environments that case is gone.
 
-What a user sees, then and now:
+What a user sees, before and since 2026-09-21:
 
-| Situation | Today | After |
+| Situation | Before | Since |
 | --- | --- | --- |
-| No VM configured | containers on the host, silently | does not arise; a provisioner is always configured |
-| Configured provisioner will not start | falls back to the host with a note | **the environment refuses to start, naming the provisioner and the reason** |
-| No local virtualisation on this host | falls back to the host | environments run on a remote or cloud provisioner, or not at all |
+| No VM configured | containers on the host, silently | does not arise; user-session libvirt is the default provisioner |
+| Configured provisioner will not start | fell back to the host with a note | **the environment refuses to start, naming the provisioner and the reason** (`SupervisorState::Failed`, the row's light, a toast) |
+| No local virtualisation on this host | fell back to the host | environments refuse to start, and the log says to install libvirt or point the IDE at a provisioner; a remote or cloud provisioner runs them elsewhere once one exists |
 
 The third row is the one that matters for packaging: a host without
 libvirt does not run environments with weaker isolation, it runs them
-somewhere else. Local virtualisation is one way to obtain a VM rather than
-a precondition for using the IDE, which is what keeps the packaging
-question below from deciding anyone's security posture.
+somewhere else or not at all. Local virtualisation is one way to obtain a
+VM rather than a precondition for using the IDE, which is what keeps the
+packaging question below from deciding anyone's security posture.
 
-Until this lands, "How the provider is chosen" above is what actually
-runs, local podman rung included.
+This is what runs: "How the provider is chosen" above has no host rung,
+and `taste_devcontainer::substrate` has no `Provider::Local`.
 
 ### The plan
 
@@ -3322,10 +3330,52 @@ host's by one `ssh -N -L` per container, started when it runs and ended
 when it stops, so the port tab and the browser face dial the address they
 always did. The keeper's recursive watch on the checkout drives config
 rechecks in place of inotify — every edit under `.devcontainer/` is one
-recheck a quarter second later. Not yet: watching a remote environment in
-the panes is refused (the editor and tree land with the primary's move),
-and placement is the workspace's first VM; capacity across several is
-next.
+recheck a quarter second later. Placement is by capacity across the
+workspace's pool (`Pool::place`, "The pool, concretely" above). Not yet:
+watching a remote agent environment in the panes is refused — the tree
+and editor read one remote checkout, the primary's, and aiming them at
+another environment's VM path is the next step of the files service.
+
+**The primary lives in the VM too** (as of 2026-09-21; David, 2026-09-20:
+"The primary env is on a VM, same as agent envs"). At reconcile, once the
+VM is up and its keeper connected, the registry places it
+(`EnvironmentRegistry::place_primary`): a checkout made in the guest by
+git's own transport, the folder's branches, tags, IDE refs, and
+remote-tracking refs pushed in, and its uncommitted work carried as a
+snapshot ref and restored over there as exactly what it was. From then on
+**the folder the user opened is the primary's peer**: the checkout in the
+VM is the working copy of record, and the panes read it —
+`Workspace::checkout_path()` and `Workspace::files()`, moved by
+`Event::CheckoutMoved`. The file tree lists it through the files service
+(`git check-ignore` beside the files answers what the walk here decided
+from `.gitignore`); status, stage, unstage, discard, commit, switch,
+stash, unstash, conflict sides, and rebase go through
+`taste_devcontainer::Worktree`, one call per operation, libgit2 here and
+`git` there; the editor opens, reloads, saves, reverts, and diffs against
+HEAD through the checkout's files, and reopens its clean tabs at the new
+place when the checkout moves; content search and the file index are
+`rg` beside the files; the semantic index is built over `Files`; Dispatch
+reads its attachments where the tree read them. The git views that read
+REFS — log, branches, ahead and behind, review, issues, fetch and push
+with the user's keys — stay on the peer. **The folder's working tree is
+fast-forwarded when it is clean** (`peer::sync_primary_peer`): after
+every snapshot, and at once after every commit, switch, or rebase the
+tree makes in the VM, the checkout's branches are fetched into
+`refs/taste/vm/`, every branch not checked out here is moved to what the
+checkout has, the checked-out one is fast-forwarded when the folder is
+clean and left with a note when it is not, a folder that is AHEAD (the
+user committed here with another tool) is pushed into the checkout, and
+two sides that both moved are named as a divergence and left for the
+person. Pull spans both: the fetch is the peer's with the user's keys,
+the peer's remote-tracking refs are pushed into the checkout, the rebase
+runs where the working tree is, and the peer is synced after. The primary
+is snapshotted on the same cadence as every other environment now, and
+the two early returns that kept it out are gone. The supervising window's
+first check of the primary runs from reconcile, after placement, because
+a container started before the move would bind the folder. A folder that
+is not a git repository has nothing to move: the primary stays on this
+host, and — there being no host rung — refuses to start until the folder
+is one; the tree's Initialize offers it.
 
 **The fetch is drawn where the environments' facts are** (David,
 2026-09-21). The guest image is fetched once per machine, at the first
@@ -3357,51 +3407,47 @@ at that same gateway address; and a checkout in a VM is bound with the
 **shared** SELinux label (`z`), because the keeper is a second container
 over the same files and a private label (`Z`) locked it out of them.
 
-**What of this exists, as of 2026-09-20.** The files service and the
-keeper, with the keeper's container brought up in a real VM and a file
-written and read back through it by the live test — which now also places
-an agent environment in the VM end to end: cloned, mirrored, snapshotted,
-its baseline started in the VM's podman, destroyed. `Checkout` and the
-peer, threaded through every host-path reader so the compiler names each
-one. The provisioner lifecycle
-(`LibvirtSession`: create, start, wait for podman over the registered
-connection, stop, destroy, facts), the workspace's pool (`Pool`), and
-**auto-provisioning**: the substrate ladder's second rung asks the pool for
-a running VM and the pool makes one when the workspace has none and the
-host has room, so on a host with a user-session libvirt every workspace
-gets a VM at reconcile without being asked. The VM is shown in the
-Resources view with what it commits, stopped with its window, and named in
-the startup sweep when its workspace has left the machine. Containers
-still run locally, because no checkout can yet live in a VM; that is the
-next batch's gate. Before this, three mechanisms, each tested and none of
-them then driven by policy:
-`GitWorkspace::snapshot_worktree` and `restore_snapshot`
-(`taste_git::snapshot`) — the working copy onto a ref and back off it,
-HEAD and index untouched in both directions; and
-`taste_core::chatarchive`, the host-side conversation stash, which IS
-wired: appended per turn, swept at launch, forgotten with its
-environment, and replayed onto the pane under a banner when the agent has
-no history and this machine does. What is deliberately absent is a
-**cadence**: nothing decides when to snapshot, because that writes refs
-into live repositories and the choice of when belongs to whoever owns
-them. Everything below is still prose.
+**What of this exists, as of 2026-09-21.** All of Phases 0 to 2 below,
+and the flip: the files service and the keeper; `Checkout` and the peer,
+threaded through every host-path reader so the compiler named each one;
+the provisioner lifecycle (`LibvirtSession`: create, start, wait for
+podman over the registered connection, stop, destroy, facts), the
+workspace's pool (`Pool`) with placement by capacity, and
+auto-provisioning at reconcile; agent environments and the primary alike
+placed in the VM, snapshotted there on the chat's cadence, their peers
+synced; the restore path with its callers (an environment whose VM is
+gone is placed anew from its peer and last snapshot; the primary's fresh
+checkout gets the peer's last snapshot, or the folder's own work); the
+VMs shown in the Resources view with what they commit, stopped with the
+window, and named in the startup sweep when their workspace has left the
+machine; and no rung below any of it — `Provider::Local` and
+`Provider::Machine` are gone, and an environment without a VM refuses to
+start with the reason. `taste_core::chatarchive`, the host-side
+conversation stash, is wired as before: appended per turn, swept at
+launch, forgotten with its environment, and replayed onto the pane under
+a banner when the agent has no history and this machine does. Still
+prose: Phase 3 (cloud provisioners) and Phase 4 (the WebKit residual),
+and host-side egress enforcement, which needs root this design has
+nowhere.
 
 **Phase 0 — the guest contract.** Fedora CoreOS configured by Ignition,
-podman inside, ssh in, self-updating. Portable by construction: the
+podman inside, ssh in, **never self-updating** (Zincati off; a guest is
+replaced, never updated, and its environments restored into the
+replacement). Portable by construction: the
 stream metadata carries a `sha256` and a `signature` for the local qcow2
 **and** the AWS, GCP and kubevirt image IDs for the same release, so one
 stream and one version resolve to either tier. **Guest images** — the
 qcow2 and the cloud image IDs, not to be confused with the VM
 provisioners below — are managed the way this project already manages
 fetched artifacts: pinned, digest checked, deliberate to move, which is
-`taste-models`' shape and `ensure_gvproxy`'s rather than a new one. Two update paths, kept distinct: a
-running guest updates itself, and the image cache updates what NEW
-machines are built from.
+`taste-models`' shape rather than a new one. One update path: the image
+cache updates what NEW VMs are built from, and a running guest never
+changes.
 
-**Phase 1 — clone locality.** The gate. A checkout that lives where the
-containers are, git as the transport, snapshot refs for what is not
-committed, and the file surfaces gated on `Checkout::Local` versus
-`Checkout::Remote` so the compiler enumerates what cannot work rather
+**Phase 1 — clone locality.** The gate, closed. A checkout that lives
+where the containers are, git as the transport, snapshot refs for what is
+not committed, and the file surfaces gated on `Checkout::Local` versus
+`Checkout::Remote` so the compiler enumerated what could not work rather
 than leaving it to be discovered.
 
 **Phase 2 — the provisioner, user-session libvirt first.**
@@ -3409,7 +3455,7 @@ than leaving it to be discovered.
 gives the IDE what `podman machine` withholds — a network backend it
 controls, sizing it can change, and a definition it can read back.
 Provisioning terminates where the substrate already expects it, at a
-registered podman connection arriving as `Provider::Remote`.
+registered podman connection, arriving as `Provider::Vm`.
 
 **Egress policy cannot live where it should, and this is the correction of
 a claim made here before it was checked.** The right place is the host,
