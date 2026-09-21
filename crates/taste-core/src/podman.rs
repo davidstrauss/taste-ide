@@ -68,6 +68,35 @@ pub struct PodmanTarget {
 /// The environment variable podman reads to pick a connection.
 pub const CONNECTION_ENV: &str = "CONTAINER_CONNECTION";
 
+/// Whether this process is inside a Flatpak sandbox, which is the one fact
+/// that decides how any host program is reached.
+pub fn sandboxed() -> bool {
+    std::path::Path::new("/.flatpak-info").exists()
+}
+
+/// A **host** command, wrapped for the sandbox when there is one.
+///
+/// podman is not the only program the IDE runs on the host: `virsh`,
+/// `qemu-img`, `xz`, `ssh`, and `ssh-keygen` all live there too, and every
+/// one of them has to be reached the same way podman is — through
+/// `flatpak-spawn --host` from inside the sandbox, directly otherwise.
+/// One wrapper, so the sandbox fact is decided in one place; the podman
+/// forms above compose on the same rule with the connection added.
+pub fn host_argv<I, S>(sandboxed: bool, program: &str, args: I) -> (String, Vec<String>)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let inner = args.into_iter().map(Into::into);
+    if sandboxed {
+        let mut argv = vec!["--host".to_string(), program.to_string()];
+        argv.extend(inner);
+        ("flatpak-spawn".to_string(), argv)
+    } else {
+        (program.to_string(), inner.collect())
+    }
+}
+
 impl PodmanTarget {
     /// The local rootless service, detecting the Flatpak sandbox the way
     /// every call site used to detect it for itself.
@@ -230,6 +259,24 @@ mod tests {
             vec![("CONTAINER_CONNECTION".to_string(), "taste-ide".to_string())]
         );
         assert_ne!(CONNECTION_ENV, "CONTAINERS_CONNECTION");
+    }
+
+    /// Every host program is reached by the one rule podman is.
+    #[test]
+    fn a_host_program_is_wrapped_exactly_as_podman_is() {
+        assert_eq!(
+            host_argv(false, "virsh", ["-c", "qemu:///session", "list"]),
+            (
+                "virsh".to_string(),
+                vec!["-c".to_string(), "qemu:///session".into(), "list".into()]
+            )
+        );
+        let (program, args) = host_argv(true, "virsh", ["list"]);
+        assert_eq!(program, "flatpak-spawn");
+        assert_eq!(args, vec!["--host", "virsh", "list"]);
+        // ...and podman's own local form is that rule with nothing added.
+        let (p, a) = PodmanTarget::local(true).argv(["ps"]);
+        assert_eq!((p, a), host_argv(true, "podman", ["ps"]));
     }
 
     #[test]

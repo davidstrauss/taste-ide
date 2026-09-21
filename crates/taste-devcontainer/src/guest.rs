@@ -51,9 +51,13 @@ pub const RELEASE: &str = "44.20260829.3.1";
 
 const QCOW_URL_X86_64: &str = "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20260829.3.1/x86_64/fedora-coreos-44.20260829.3.1-qemu.x86_64.qcow2.xz";
 const QCOW_SHA256_X86_64: &str = "a0aa13c4c88519c9c3ee6a16101f84c9f4184fc4eb1e687779b31177e540c12e";
+const QCOW_UNCOMPRESSED_SHA256_X86_64: &str =
+    "46d90f2b792b17ea3b9105326ee068c6a2756d804757ebb8e4ea3aaf9e7ac75c";
 const QCOW_URL_AARCH64: &str = "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20260829.3.1/aarch64/fedora-coreos-44.20260829.3.1-qemu.aarch64.qcow2.xz";
 const QCOW_SHA256_AARCH64: &str =
     "2451e271691faa49f6f7f3d9a87d5aabe8b52ffcbcd7cf8790d2b574c389c10a";
+const QCOW_UNCOMPRESSED_SHA256_AARCH64: &str =
+    "d526f511cd7bd48c6a369310d09f6e6598b7a1a90b5e6776e99f7cc223e1fcda";
 
 /// One architecture's pinned qemu image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +77,13 @@ pub struct GuestImage {
     /// progress for a gigabyte, and what lets presence be checked without
     /// rehashing one.
     pub bytes: u64,
+    /// Hex SHA-256 of the **decompressed** qcow2, as the release's own
+    /// `meta.json` states it. The file a VM actually boots from is this
+    /// one, so it is checked in its own right after `xz` has run, not
+    /// inferred from the compressed digest.
+    pub uncompressed_sha256: &'static str,
+    /// Size of the decompressed qcow2, for the presence check.
+    pub uncompressed_bytes: u64,
 }
 
 impl GuestImage {
@@ -94,6 +105,88 @@ impl GuestImage {
     /// process wrote and nothing else touches is its own record.
     pub fn is_present(&self) -> bool {
         std::fs::metadata(self.path()).is_ok_and(|meta| meta.len() == self.bytes)
+    }
+
+    /// The decompressed qcow2 every VM's disk overlays — the **base
+    /// image**, beside the compressed download and named without the
+    /// `.xz`, exactly as `xz -d` would name it.
+    pub fn base_path(&self) -> PathBuf {
+        images_dir().join(format!(
+            "fedora-coreos-{}-qemu.{}.qcow2",
+            self.release, self.arch
+        ))
+    }
+
+    /// Whether the base image is here, at the right size — the same
+    /// half-measure as [`Self::is_present`], for the same reason.
+    pub fn base_is_present(&self) -> bool {
+        std::fs::metadata(self.base_path()).is_ok_and(|meta| meta.len() == self.uncompressed_bytes)
+    }
+
+    /// The base image, fetched and decompressed if this host has never had
+    /// it, and verified against the pinned uncompressed digest before it is
+    /// given its name.
+    ///
+    /// `xz` runs on the host through the same wrapper every host program
+    /// is reached by; the sandbox's own `xz` would do, but the file it
+    /// writes is one qemu reads from the host, so the host writes it.
+    pub async fn ensure_base(
+        &self,
+        sandboxed: bool,
+        progress: impl Fn(u64, u64) + Send + Sync + 'static,
+    ) -> Result<PathBuf> {
+        let base = self.base_path();
+        if self.base_is_present() {
+            return Ok(base);
+        }
+        let compressed = if self.is_present() {
+            self.path()
+        } else {
+            self.fetch(progress).await?
+        };
+        // Decompress to a `.part` name and rename only once the digest
+        // matches, the way `fetch_pinned` does: a half-written or wrong
+        // base must never carry the name a VM boots from.
+        let part = base.with_extension("qcow2.part");
+        let _ = std::fs::remove_file(&part);
+        let (program, args) = taste_core::podman::host_argv(
+            sandboxed,
+            "sh",
+            [
+                "-c".to_string(),
+                "xz -dc -T0 -- \"$1\" > \"$2\"".into(),
+                "xz".into(),
+                compressed.display().to_string(),
+                part.display().to_string(),
+            ],
+        );
+        let output = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .context("running xz")?;
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&part);
+            bail!(
+                "decompressing {}: {}",
+                compressed.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let expected = self.uncompressed_sha256;
+        let hashed_part = part.clone();
+        let digest = tokio::task::spawn_blocking(move || sha256_file(&hashed_part))
+            .await
+            .context("hashing the base image")??;
+        if digest != expected {
+            let _ = std::fs::remove_file(&part);
+            bail!(
+                "the decompressed guest image does not match its pin: expected {expected}, got {digest}"
+            );
+        }
+        std::fs::rename(&part, &base).with_context(|| format!("installing {}", base.display()))?;
+        Ok(base)
     }
 
     /// Fetch it, verifying the pin before it takes its name.
@@ -130,6 +223,8 @@ pub fn image_for(arch: &str) -> Result<GuestImage> {
             url: QCOW_URL_X86_64,
             sha256: QCOW_SHA256_X86_64,
             bytes: 1_023_919_552,
+            uncompressed_sha256: QCOW_UNCOMPRESSED_SHA256_X86_64,
+            uncompressed_bytes: 2_100_494_336,
         }),
         "aarch64" => Ok(GuestImage {
             release: RELEASE,
@@ -137,6 +232,8 @@ pub fn image_for(arch: &str) -> Result<GuestImage> {
             url: QCOW_URL_AARCH64,
             sha256: QCOW_SHA256_AARCH64,
             bytes: 825_142_040,
+            uncompressed_sha256: QCOW_UNCOMPRESSED_SHA256_AARCH64,
+            uncompressed_bytes: 2_048_196_608,
         }),
         other => bail!("no pinned guest image for {other}; this project pins x86_64 and aarch64"),
     }
@@ -145,6 +242,28 @@ pub fn image_for(arch: &str) -> Result<GuestImage> {
 /// The pinned image for the architecture the IDE is running on.
 pub fn image() -> Result<GuestImage> {
     image_for(std::env::consts::ARCH)
+}
+
+/// Hex SHA-256 of a file, streamed: the base image is two gigabytes.
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// `$XDG_DATA_HOME/taste-ide/guests`, beside the models directory and
@@ -173,6 +292,9 @@ pub struct StreamRelease {
     pub release: String,
     pub url: String,
     pub sha256: String,
+    /// The decompressed qcow2's digest, which the stream states beside the
+    /// compressed one.
+    pub uncompressed_sha256: String,
     /// The same bits as a cloud image, where the stream names one. This is
     /// the portability the choice of FCOS is for, and it is why the check
     /// parses them even though nothing consumes them yet.
@@ -221,6 +343,11 @@ pub fn parse_stream(json: &str, arch: &str) -> Result<StreamRelease> {
         .and_then(|s| s.as_str())
         .context("the disk has no sha256")?
         .to_string();
+    let uncompressed_sha256 = disk
+        .get("uncompressed-sha256")
+        .and_then(|s| s.as_str())
+        .context("the disk has no uncompressed-sha256")?
+        .to_string();
     let cloud = arch_doc
         .get("images")
         .and_then(|i| i.as_object())
@@ -240,6 +367,7 @@ pub fn parse_stream(json: &str, arch: &str) -> Result<StreamRelease> {
         release,
         url,
         sha256,
+        uncompressed_sha256,
         cloud,
     })
 }
@@ -290,7 +418,7 @@ mod tests {
                     "location": "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20260829.3.1/x86_64/fedora-coreos-44.20260829.3.1-qemu.x86_64.qcow2.xz",
                     "signature": "https://example.invalid/sig",
                     "sha256": "a0aa13c4c88519c9c3ee6a16101f84c9f4184fc4eb1e687779b31177e540c12e",
-                    "uncompressed-sha256": "deadbeef"
+                    "uncompressed-sha256": "46d90f2b792b17ea3b9105326ee068c6a2756d804757ebb8e4ea3aaf9e7ac75c"
                   }
                 }
               }
@@ -344,6 +472,28 @@ mod tests {
         let pinned = image_for("x86_64").unwrap();
         assert_eq!(pinned.url, stream.url, "the pinned URL drifted");
         assert_eq!(pinned.sha256, stream.sha256, "the pinned digest drifted");
+        assert_eq!(
+            pinned.uncompressed_sha256, stream.uncompressed_sha256,
+            "the pinned uncompressed digest drifted"
+        );
+    }
+
+    /// The base image is the download with its `.xz` taken off, beside
+    /// it, and absent until it has been decompressed and checked.
+    #[test]
+    fn the_base_image_is_named_as_xz_would_name_it() {
+        let image = image_for("x86_64").unwrap();
+        let base = image.base_path();
+        assert_eq!(base.parent(), image.path().parent());
+        assert_eq!(
+            base.file_name().unwrap().to_str().unwrap(),
+            image.file_name().trim_end_matches(".xz")
+        );
+        assert_eq!(image.uncompressed_sha256.len(), 64);
+        assert!(
+            image.uncompressed_bytes > image.bytes,
+            "a qcow2 is larger than its xz"
+        );
     }
 
     /// A pin that is behind is reported, not acted on.

@@ -17,11 +17,13 @@ pub mod configwatch;
 pub mod fetch;
 pub mod guest;
 pub mod hash;
+pub mod keys;
 pub mod machine;
 pub mod provision;
 pub mod reconcile;
 pub mod registry;
 pub mod security;
+pub mod sizing;
 pub mod substrate;
 pub mod supervisor;
 
@@ -29,6 +31,7 @@ pub use channel::{ChannelPaths, ChannelServices, ChannelStream, EnvChannel, Serv
 pub use config::DevcontainerConfig;
 pub use hash::{build_hash, config_hash};
 pub use machine::{Machine, MachineFacts};
+pub use provision::{DomainState, LibvirtSession, Vm, VmFacts};
 pub use reconcile::SweepReport;
 pub use registry::{DestroyReport, DiskBudget, EnvironmentRegistry, FreeDisk, ReconcileReport};
 pub use substrate::{Provider, Substrate};

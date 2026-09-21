@@ -81,20 +81,32 @@ const ISSUE_ID_LEN: usize = 8;
 /// equally likely. Whether the ref already holds it is the caller's to
 /// check (`GitWorkspace::fresh_issue_id`).
 pub fn random_issue_id() -> Result<String> {
+    Ok(format!("i-{}", random_slug(ISSUE_ID_LEN - 2)?))
+}
+
+/// `len` characters of `[a-z0-9]`, drawn from the OS's randomness by
+/// rejection sampling so every character is equally likely.
+///
+/// The draw behind issue ids, and behind every other name the IDE mints
+/// that must not be a counter — a VM's, for one (David, 2026-09-20: "I
+/// don't want to deal with a counter"). A counter is a promise about
+/// ordering and reuse that nothing here keeps; a random slug promises only
+/// distinctness, which is all a name needs.
+pub fn random_slug(len: usize) -> Result<String> {
     const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut id = String::from("i-");
+    let mut slug = String::with_capacity(len);
     let mut bytes = [0u8; 16];
-    while id.len() < ISSUE_ID_LEN {
-        getrandom::fill(&mut bytes).context("drawing an issue id")?;
+    while slug.len() < len {
+        getrandom::fill(&mut bytes).context("drawing a random slug")?;
         for byte in bytes {
             // 252 = 7 × 36: the largest multiple of the alphabet that fits
             // in a byte, so `% 36` below is unbiased.
-            if byte < 252 && id.len() < ISSUE_ID_LEN {
-                id.push(ALPHABET[usize::from(byte % 36)] as char);
+            if byte < 252 && slug.len() < len {
+                slug.push(ALPHABET[usize::from(byte % 36)] as char);
             }
         }
     }
-    Ok(id)
+    Ok(slug)
 }
 
 /// Whether `id` is shaped like an issue id: `i-` and six of `[a-z0-9]`,

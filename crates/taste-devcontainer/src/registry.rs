@@ -717,7 +717,7 @@ impl EnvironmentRegistry {
         // Where the containers live, before anything asks podman anything.
         // This is the first await of the workspace's life and the only
         // place a VM is allowed to cost twenty seconds.
-        self.set_substrate(Substrate::resolve().await);
+        self.set_substrate(Substrate::resolve(&self.workspace_root).await);
 
         let substrate = self.substrate();
         let mut report = ReconcileReport {

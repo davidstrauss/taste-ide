@@ -363,20 +363,9 @@ impl ExecContext {
     /// A host command, wrapped for the sandbox if there is one. The podman
     /// target is irrelevant here — nothing is reaching podman.
     fn host_spec(&self, program: &str, args: &[&str]) -> CommandSpec {
-        let inner = std::iter::once(program.to_string()).chain(args.iter().map(|s| s.to_string()));
-        let full: Vec<String> = if self.sandboxed {
-            ["flatpak-spawn", "--host"]
-                .iter()
-                .map(|s| s.to_string())
-                .chain(inner)
-                .collect()
-        } else {
-            inner.collect()
-        };
-        CommandSpec {
-            program: full[0].clone(),
-            args: full[1..].to_vec(),
-        }
+        let (program, args) =
+            crate::podman::host_argv(self.sandboxed, program, args.iter().copied());
+        CommandSpec { program, args }
     }
 
     /// A podman command, composed against the service this context points

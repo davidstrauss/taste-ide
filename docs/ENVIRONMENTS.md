@@ -3024,7 +3024,12 @@ earlier intentions:
 
 - **No environment has a host-side working copy, the personal one
   included.** There is no "the primary is special" case left; it is an
-  environment whose VM happens to be nearby.
+  environment whose VM happens to be nearby. The folder the user opened is
+  the primary's **peer**: it receives branches and snapshot refs by fetch,
+  the IDE pushes to the user's remote from it with the user's keys, and
+  its own working tree is fast-forwarded when it is clean and on the same
+  branch — otherwise left alone, and the file tree says so (David,
+  2026-09-20).
 - **Clone locality is the gate for all of it**, not a remote-tier
   refinement. Until a checkout can live where the containers are, none of
   this runs.
@@ -3156,6 +3161,38 @@ This also retires `Provider::Machine`. `podman machine` exists to hide VM
 creation, and it needs qemu on the host exactly as libvirt does, so once
 the IDE provisions directly there is nothing left for it to buy.
 
+**A pool per workspace, not a VM per workspace** (David, 2026-09-20). A
+workspace needs at least one VM from its provisioners, and its environments
+are placed across as many as capacity calls for — a few smaller VMs are
+easier to obtain than one large one, and some capacity does not scale
+linearly. Clause 5 still decides the outer boundary: a VM serves one
+workspace only. Every domain is named `taste-<workspace-key>-<slug>`, the
+slug being six random characters from the same draw as issue ids and never
+a counter, so the pool is enumerated from libvirt by prefix and nothing has
+to be remembered about it. The ssh port a VM listens on is in its domain
+XML as the passt `<portForward>`, and the workspace it serves is in its
+`<metadata>`; both are read back with `virsh dumpxml`, never kept in a
+second file that could disagree.
+
+**The guest, concretely** (`taste_devcontainer::provision`). Fedora CoreOS
+from the pinned image (`guest`), as a sparse qcow2 overlay on a base image
+decompressed once per host and checked against the release's own
+uncompressed digest. Sized by `sizing`: half the host's CPUs capped at 12,
+a third of its memory clamped to 4–16 GiB, a 64 GiB disk ceiling, and no
+VM created with under 20 GiB free. Podman in the guest is **rootless, as
+`core`** — the shape the spike measured and `podman machine` uses — so the
+supervisor's `--userns=keep-id` mapping is unchanged when a checkout is
+over there; Ignition makes `core` linger and enables its user
+`podman.socket`. The IDE reaches the guest with a per-workspace ssh
+identity (`keys`, under the workspace's state directory beside
+`anthropic.json`), and installs a per-workspace **host key** through
+Ignition so the guest's identity is known before it boots and survives
+recreation. The one inbound door is that ssh forward, on the host's
+loopback; the podman connection is registered against it as
+`ssh://core@127.0.0.1:<port>/run/user/1000/podman/podman.sock`, named for
+the domain. The serial console goes to a file, so a guest that does not
+come up is read rather than guessed at.
+
 **Provisioner credentials are the PROJECT's, under the same rule as the
 Anthropic one** (David, 2026-09-17: "cloud provisioning keys are also
 project-specific. I want different providers depending on if it's work vs.
@@ -3222,8 +3259,14 @@ runs, local podman rung included.
 
 ### The plan
 
-**What of this exists, as of 2026-09-18.** Three mechanisms, each tested
-and none of them yet driven by policy:
+**What of this exists, as of 2026-09-20.** The provisioner lifecycle
+(`LibvirtSession`: create, start, wait for podman over the registered
+connection, stop, destroy, facts), with the live test
+`tests/provision.rs` as its first caller and the substrate ladder adopting
+a workspace's existing VMs by existence — brought up and shown in the
+Resources view while containers still run locally, because no checkout can
+yet live in a VM. Before it, three mechanisms, each tested and none of
+them then driven by policy:
 `GitWorkspace::snapshot_worktree` and `restore_snapshot`
 (`taste_git::snapshot`) — the working copy onto a ref and back off it,
 HEAD and index untouched in both directions; and

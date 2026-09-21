@@ -180,7 +180,10 @@ async fn the_machine_starts_and_reports_what_it_costs() {
 
     // ...and the substrate ladder finds it. This is the convention that
     // replaces a setting: the machine existing IS the choice.
-    let substrate = Substrate::resolve().await;
+    // Resolved for a workspace that has no provisioned VMs, so the rung
+    // above the machine's finds nothing and the machine is what is chosen.
+    let no_vms = tempfile::tempdir().unwrap();
+    let substrate = Substrate::resolve(no_vms.path()).await;
     assert!(
         !substrate.is_local(),
         "a running machine must be chosen: {:?}, note {:?}",

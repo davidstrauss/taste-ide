@@ -122,53 +122,10 @@ pub enum State {
     Running,
 }
 
-/// What the machine costs, as measured and as configured.
-///
-/// Two of these are configuration read back from podman and one is a walk
-/// of the host filesystem, and they are kept apart on purpose: the memory
-/// number is what the host *loses* (no balloon, so RSS climbs to it and
-/// stays), while the disk number is what the machine has *taken so far*.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachineFacts {
-    pub running: bool,
-    pub cpus: u64,
-    /// Configured memory. Per the spike this is also the host RSS ceiling,
-    /// which is why it is reported as a commitment.
-    pub memory_mib: u64,
-    pub disk_ceiling_gib: u64,
-    /// Bytes podman's machine storage occupies on the host — the qcow2 plus
-    /// the shared machine-image cache. `None` when it could not be walked,
-    /// never zero: a footprint that silently under-reports is worse than
-    /// one that says it could not see.
-    pub host_storage_bytes: Option<u64>,
-}
-
-impl MachineFacts {
-    /// One line for the Resources view.
-    pub fn summary(&self) -> String {
-        let mut parts = vec![
-            if self.running { "running" } else { "stopped" }.to_string(),
-            format!("{} vCPU", self.cpus),
-            format!("{} committed", gib(self.memory_mib * 1024 * 1024)),
-        ];
-        match self.host_storage_bytes {
-            Some(bytes) => parts.push(format!(
-                "{} on disk of {} GiB",
-                gib(bytes),
-                self.disk_ceiling_gib
-            )),
-            None => parts.push(format!(
-                "disk unmeasured, {} GiB ceiling",
-                self.disk_ceiling_gib
-            )),
-        }
-        parts.join(", ")
-    }
-}
-
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-}
+/// What the machine costs, as measured and as configured: the same facts
+/// a provisioned VM reports, because the Resources row does not care which
+/// hypervisor arrangement produced the guest.
+pub type MachineFacts = crate::provision::VmFacts;
 
 /// The IDE's podman machine, and the helper arrangement it needs to run.
 pub struct Machine {
@@ -415,10 +372,7 @@ fn cpus() -> u64 {
 }
 
 fn host_memory_mib() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib / 1024)
+    crate::sizing::host_memory_mib()
 }
 
 /// Bytes podman's machine storage occupies on the host.
