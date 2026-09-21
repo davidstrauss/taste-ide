@@ -110,7 +110,10 @@ effort slider — posed from what the pinned adapter advertises, which a
 probe otherwise never has, since that half of the shade needs a session);
 `TASTE_PROBE_DOC` (`edit`, `command`, `prompt`) opens that step of the
 seeded transcript whole in the editor's strip, the page a truncated block
-opens onto; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
+opens onto; `TASTE_PROBE_PREVIEW=README.md` (a markdown file, relative
+to where the probe was started) opens it on its preview face in front,
+which is how the preview's rendering — its pictures included — gets
+looked at; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
 the search's Tab stop on that section, for the lit lozenge and an empty
 section's lit banner — several, comma-separated, WALK them in order, which
 is how "press Tab a few times" gets posed (each section the stop passes

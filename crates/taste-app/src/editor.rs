@@ -2126,6 +2126,25 @@ impl Editor {
         self.open_with(path, line, false);
     }
 
+    /// TASTE_PROBE_CHECK only: open a markdown file and put it on its
+    /// preview face once it has loaded — the way to see the preview's
+    /// rendering, images included, in a shot (`TASTE_PROBE_PREVIEW`).
+    #[doc(hidden)]
+    pub fn open_preview_for_probe(self: &Rc<Self>, path: PathBuf) {
+        self.open_at(&path, None);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
+            let Some(editor) = weak.upgrade() else { return };
+            let Some(page) = editor.pages.borrow().get(&path).cloned() else {
+                return;
+            };
+            page.raw_source.set(false);
+            editor.set_changes_view(&path, &page, false);
+            editor.refresh_markdown_mode(&path, &page);
+            editor.sync_toggle_to_selection();
+        });
+    }
+
     /// The editor's answer to the one query (search.rs): the results
     /// listing at the pane's foot, filled from the tree's content search —
     /// definitions first, then files, then commits — with the open buffers'
@@ -2435,8 +2454,19 @@ impl Editor {
         // Third face: the full-quality markdown preview (rendered
         // widgets, not styled source).
         let preview_holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let preview_scroller = gtk::ScrolledWindow::builder()
+        // The preview scrolls its content's NATURAL height, not its
+        // minimum. A scrolled window's viewport allocates the minimum by
+        // default, which is the same thing for wrapped labels and nothing
+        // at all for a picture that can shrink — the preview's images
+        // measured 0/375 and were allocated the 0 (2026-09-21). Natural
+        // gives every child what it asked for and scrolls the rest.
+        let preview_viewport = gtk::Viewport::builder()
             .child(&preview_holder)
+            .vscroll_policy(gtk::ScrollablePolicy::Natural)
+            .scroll_to_focus(false)
+            .build();
+        let preview_scroller = gtk::ScrolledWindow::builder()
+            .child(&preview_viewport)
             .hexpand(true)
             .vexpand(true)
             .build();
@@ -3480,8 +3510,21 @@ impl Editor {
             let on_link: std::rc::Rc<dyn Fn(&str)> = std::rc::Rc::new(move |url: &str| {
                 events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
             });
+            // With its place, so its images are read from beside it —
+            // through this page's own files service, bounded by its own
+            // checkout.
+            let images = crate::markdown_view::ImageBase {
+                files: page.files.clone(),
+                dir: path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| page.origin_root.clone()),
+                root: page.origin_root.clone(),
+            };
             page.preview_holder
-                .append(&crate::markdown_view::render(&text, on_link));
+                .append(&crate::markdown_view::render_document(
+                    &text, on_link, images,
+                ));
         }
         if !page.changes_view.get() {
             page.stack

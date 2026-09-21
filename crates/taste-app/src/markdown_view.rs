@@ -1,18 +1,90 @@
 //! Full-quality markdown rendering: pulldown-cmark events → native GTK
-//! widgets (real heading sizes, bulleted lists, code cards). Inline code
-//! copies on click; code blocks carry a copy button. Read-only by design —
-//! editing happens in the source view.
+//! widgets (real heading sizes, bulleted lists, code cards, pictures).
+//! Inline code copies on click; code blocks carry a copy button.
+//! Read-only by design — editing happens in the source view.
+//!
+//! **Images** (David, 2026-09-21: "Markdown previews should support
+//! images") come in two kinds, told apart by their source. A relative
+//! path is a file beside the document, read through the same files
+//! service the document came through — which is the VM's keeper when the
+//! checkout is in a VM — decoded off the main thread, and shown as a
+//! picture scaled down to the column. An `http(s)` source is NOT fetched:
+//! the host contacting a URL a project chose is a host-side request on
+//! project-controlled input, which is the line ENVIRONMENTS.md draws, so
+//! it is drawn as a link the reader can open on purpose. A document with
+//! no base to resolve against (a chat message) keeps the alt text.
 
 use adw::prelude::*;
 use gtk::glib;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::cell::RefCell;
+use std::path::{Component, PathBuf};
 use std::rc::Rc;
+
+/// Where a document's relative image paths resolve: its directory, read
+/// through the files service the document itself came through, and the
+/// checkout that bounds them — a path that climbs out of the checkout is
+/// not an image, whatever it names.
+#[derive(Clone)]
+pub struct ImageBase {
+    pub files: taste_core::files::Files,
+    pub dir: PathBuf,
+    pub root: PathBuf,
+}
+
+impl ImageBase {
+    /// The file a markdown image source names, or `None` when it is not a
+    /// file of this checkout: a URL, or a path that leaves the root.
+    fn resolve(&self, source: &str) -> Option<PathBuf> {
+        if source.contains("://") || source.starts_with("data:") {
+            return None;
+        }
+        let source = percent_decode(source.split(['?', '#']).next().unwrap_or(source));
+        let joined = if source.starts_with('/') {
+            self.root.join(source.trim_start_matches('/'))
+        } else {
+            self.dir.join(&source)
+        };
+        // Lexically, since the path may be in a VM and cannot be
+        // canonicalized here; `..` is folded and a climb past the root is
+        // refused.
+        let mut normalized = PathBuf::new();
+        for component in joined.components() {
+            match component {
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                Component::CurDir => {}
+                other => normalized.push(other),
+            }
+        }
+        normalized.starts_with(&self.root).then_some(normalized)
+    }
+}
+
+/// `%20` and friends, as a markdown source spells a path with spaces.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() && text.is_char_boundary(i + 3) {
+            if let Ok(value) = u8::from_str_radix(&text[i + 1..i + 3], 16) {
+                out.push(value);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 /// Render `text` to a widget tree. `on_link` receives activated http(s)
 /// links (the caller decides how to open them).
 pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
-    render_with(text, on_link, None)
+    render_full(text, on_link, None, None)
 }
 
 /// [`render`], with issue references drawn as pills when an index is
@@ -22,6 +94,21 @@ pub fn render_with(
     text: &str,
     on_link: Rc<dyn Fn(&str)>,
     issues: Option<crate::issue_pill::SharedIssueIndex>,
+) -> gtk::Widget {
+    render_full(text, on_link, issues, None)
+}
+
+/// [`render`] for a document with a place: its relative images are read
+/// from beside it and shown (the editor's preview).
+pub fn render_document(text: &str, on_link: Rc<dyn Fn(&str)>, images: ImageBase) -> gtk::Widget {
+    render_full(text, on_link, None, Some(images))
+}
+
+fn render_full(
+    text: &str,
+    on_link: Rc<dyn Fn(&str)>,
+    issues: Option<crate::issue_pill::SharedIssueIndex>,
+    images: Option<ImageBase>,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root.set_margin_top(16);
@@ -47,6 +134,9 @@ pub fn render_with(
     // Inside a markdown link the text is the link's, and a pill there
     // would nest one <a> in another.
     let mut in_link = false;
+    // Inside an image: its source and the alt text accumulating, until
+    // the end decides what the image becomes.
+    let mut image: Option<(String, String)> = None;
 
     let flush = |markup: &mut String,
                  spans: &mut Vec<String>,
@@ -174,7 +264,7 @@ pub fn render_with(
                         glib::markup_escape_text(&dest_url)
                     ));
                 }
-                Tag::Image { .. } => markup.push_str("<i>[image: "),
+                Tag::Image { dest_url, .. } => image = Some((dest_url.to_string(), String::new())),
                 Tag::Table(_) => {
                     flush(
                         &mut markup,
@@ -235,7 +325,45 @@ pub fn render_with(
                     in_link = false;
                     markup.push_str("</a>");
                 }
-                TagEnd::Image => markup.push_str("]</i>"),
+                TagEnd::Image => {
+                    if let Some((source, alt)) = image.take() {
+                        let file = images.as_ref().and_then(|base| base.resolve(&source));
+                        match (file, images.as_ref()) {
+                            (Some(path), Some(base)) => {
+                                flush(
+                                    &mut markup,
+                                    &mut spans,
+                                    &mut heading,
+                                    quote_depth,
+                                    &root,
+                                    &on_link,
+                                );
+                                root.append(&picture(base, path, &alt));
+                            }
+                            _ if source.starts_with("http://")
+                                || source.starts_with("https://") =>
+                            {
+                                // A link the reader opens on purpose, never
+                                // a fetch the document makes for them.
+                                markup.push_str(&format!(
+                                    "<i>[image: <a href=\"{}\">{}</a>]</i>",
+                                    glib::markup_escape_text(&source),
+                                    glib::markup_escape_text(if alt.is_empty() {
+                                        &source
+                                    } else {
+                                        &alt
+                                    })
+                                ));
+                            }
+                            _ => {
+                                markup.push_str(&format!(
+                                    "<i>[image: {}]</i>",
+                                    glib::markup_escape_text(&alt)
+                                ));
+                            }
+                        }
+                    }
+                }
                 TagEnd::Table => {
                     if let Some(rows) = table.take() {
                         root.append(&table_card(&rows));
@@ -244,7 +372,9 @@ pub fn render_with(
                 _ => {}
             },
             Event::Text(text) => {
-                if let Some(code) = code_block.as_mut() {
+                if let Some((_, alt)) = image.as_mut() {
+                    alt.push_str(&text);
+                } else if let Some(code) = code_block.as_mut() {
                     code.push_str(&text);
                 } else if let Some(cell) = table
                     .as_mut()
@@ -336,6 +466,83 @@ pub fn render_with(
 /// A table may NOT: its columns ARE its meaning, and folding them makes
 /// rubble of the grid, so a table keeps its horizontal scroller and gets an
 /// honest one instead (see the caller).
+/// A document's image, as a picture that fills in: the file is read
+/// through the files service and decoded off the main thread, and the
+/// widget takes the texture when it lands. Scaled down to the column,
+/// never up; the alt text is the tooltip, and the whole caption when the
+/// file cannot be read or is not an image.
+fn picture(base: &ImageBase, path: PathBuf, alt: &str) -> gtk::Widget {
+    // The picture fills the column and scales down to it, never up: a
+    // 1440px screenshot in a 600px column is the column wide and keeps
+    // its aspect. Its minimum height is zero (it can shrink), so the
+    // preview's viewport has to allocate natural heights, and does
+    // (editor.rs, `preview_viewport`).
+    let holder = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    holder.set_hexpand(true);
+    let picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::ScaleDown)
+        .can_shrink(true)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .build();
+    if !alt.is_empty() {
+        picture.set_tooltip_text(Some(alt));
+        picture.update_property(&[gtk::accessible::Property::Label(alt)]);
+    }
+    holder.append(&picture);
+    let files = base.files.clone();
+    let alt = alt.to_string();
+    let weak = holder.downgrade();
+    let picture_weak = picture.downgrade();
+    glib::spawn_future_local(async move {
+        let read_path = path.clone();
+        let loaded = crate::runtime::runtime()
+            .spawn_blocking(move || -> Result<gtk::gdk::Texture, String> {
+                let bytes = files
+                    .read(&read_path)
+                    .map_err(|e| format!("could not be read: {e}"))?;
+                gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+                    .map_err(|e| format!("is not an image this build can decode: {e}"))
+            })
+            .await;
+        let (Some(holder), Some(picture)) = (weak.upgrade(), picture_weak.upgrade()) else {
+            return;
+        };
+        let loaded = match loaded {
+            Ok(inner) => inner,
+            Err(e) => Err(format!("could not be decoded: {e}")),
+        };
+        match loaded {
+            Ok(texture) => {
+                tracing::debug!(
+                    "markdown image {} loaded: {}x{}",
+                    path.display(),
+                    texture.width(),
+                    texture.height()
+                );
+                picture.set_paintable(Some(&texture));
+            }
+            Err(why) => {
+                tracing::info!("markdown image {} {why}", path.display());
+                holder.remove(&picture);
+                holder.append(
+                    &gtk::Label::builder()
+                        .label(format!(
+                            "[image: {}] — {} {why}",
+                            if alt.is_empty() { "untitled" } else { &alt },
+                            path.display()
+                        ))
+                        .css_classes(["dim-label"])
+                        .wrap(true)
+                        .xalign(0.0)
+                        .build(),
+                );
+            }
+        }
+    });
+    holder.upcast()
+}
+
 fn code_card(code: &str, reflow: bool) -> gtk::Widget {
     let label = gtk::Label::builder()
         .label(code)
@@ -444,4 +651,49 @@ fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverlay> {
         child = current.first_child();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> ImageBase {
+        ImageBase {
+            files: taste_core::files::Files::Local,
+            dir: PathBuf::from("/checkout/docs"),
+            root: PathBuf::from("/checkout"),
+        }
+    }
+
+    /// The decode the preview relies on, against a real screenshot of the
+    /// docs set: a PNG the size of the window comes back as a texture of
+    /// that size, off any thread.
+    #[test]
+    fn a_docs_screenshot_decodes_to_a_texture() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots/hero.png");
+        let bytes = std::fs::read(&path).expect("the docs set has a hero shot");
+        let texture =
+            gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).expect("a PNG decodes");
+        assert_eq!((texture.width(), texture.height()), (1440, 900));
+    }
+
+    #[test]
+    fn a_relative_source_resolves_beside_the_document_and_never_above_the_root() {
+        assert_eq!(
+            base().resolve("screenshots/hero.png"),
+            Some(PathBuf::from("/checkout/docs/screenshots/hero.png"))
+        );
+        assert_eq!(
+            base().resolve("../README%20art.png?raw=1"),
+            Some(PathBuf::from("/checkout/README art.png"))
+        );
+        assert_eq!(
+            base().resolve("/assets/logo.svg"),
+            Some(PathBuf::from("/checkout/assets/logo.svg"))
+        );
+        assert_eq!(base().resolve("../../etc/passwd"), None);
+        assert_eq!(base().resolve("https://example.org/a.png"), None);
+        assert_eq!(base().resolve("data:image/png;base64,AAAA"), None);
+    }
 }

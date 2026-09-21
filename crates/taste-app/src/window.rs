@@ -2849,6 +2849,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if let Some(path) = probe_open.filter(|_| view_for_open != "port") {
                     editor_for_probe.open_at(&path, Some(113));
                 }
+                // `TASTE_PROBE_PREVIEW=<markdown file>`: that file, on its
+                // preview face, in front — for the rendering a preview
+                // does, pictures included, which no other fixture poses.
+                // Relative to the directory the probe was started in.
+                if let Some(preview) = std::env::var_os("TASTE_PROBE_PREVIEW") {
+                    let path = std::env::current_dir().unwrap_or_default().join(preview);
+                    editor_for_probe.open_preview_for_probe(path);
+                }
                 if view_for_open == "port" {
                     editor_for_probe.select_port_for_probe(
                         &taste_core::environment::EnvironmentId::primary(),

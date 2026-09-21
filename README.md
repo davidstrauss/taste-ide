@@ -97,18 +97,49 @@ How Taste meets it:
 Compared with the IDEs most people are coming from, as they work by
 default and as their own documentation describes them:
 
-| | Taste | VS Code with Dev Containers | JetBrains, Cursor, and most others |
-| --- | --- | --- | --- |
-| Where project code runs | A VM per workspace, never the host kernel | A container on the host's Docker or Podman, sharing the host kernel | On the host, as you |
-| Where the checkout lives | In the VM; your folder is a git peer | On the host, bind-mounted into the container | On the host |
-| Credentials in the project's reach | None; a proxy holds the AI credential | Git credentials and the ssh agent are forwarded into the container by design | Everything you can reach |
-| Who applies a config change | You, after the IDE names what will run | The extension, on reopen; Workspace Trust gates the rest | Plugins and tasks run with your privileges |
-| Agent commands | In the VM only; a host fallback is refused, never taken | In the container, or on the host for host-side agents | On the host, behind an allowlist or a prompt |
-| What can still reach you | The residual list above, each item bounded and named | The kernel, the forwarded credentials, the host-side extension process | The process is you |
+| | Taste | VS Code with Dev Containers | GitHub Codespaces | JetBrains, Cursor, and most others |
+| --- | --- | --- | --- | --- |
+| Where project code runs | A VM per workspace on your machine, never the host kernel | A container on the host's Docker or Podman, sharing the host kernel | A VM per codespace in Microsoft's cloud | On the host, as you |
+| Where the checkout lives | In the VM; your folder is a git peer | On the host, bind-mounted into the container | In the cloud VM; your code and its history live on their servers | On the host |
+| Credentials in the project's reach | None; a proxy holds the AI credential | Git credentials and the ssh agent are forwarded into the container by design | A GitHub token with repository scope is injected into every codespace | Everything you can reach |
+| Who applies a config change | You, after the IDE names what will run | The extension, on reopen; Workspace Trust gates the rest | The service, on rebuild; prebuilds run it unattended | Plugins and tasks run with your privileges |
+| Agent commands | In the VM only; a host fallback is refused, never taken | In the container, or on the host for host-side agents | In the codespace | On the host, behind an allowlist or a prompt |
+| What can still reach you | The residual list above, each item bounded and named | The kernel, the forwarded credentials, the host-side extension process | Little of your machine; all of your code, on a proprietary service you do not run | The process is you |
+| Privacy and ownership | Local, free software, your hardware, your bill | Local; the editor is Microsoft's build of an open core | Your source, your terminal, and your agent's traffic on Microsoft's infrastructure, metered by the hour | Local, mostly proprietary |
+
+Codespaces is the closest in shape — a VM per workspace, the checkout
+inside it, nothing of your machine mounted in — and the difference is
+where that VM is and who owns it. Codespaces reaches its isolation by
+moving your project onto a proprietary service; Taste reaches the same
+isolation on your own hardware, with the same devcontainer.json, and
+nothing leaves the machine but what you push.
 
 None of this is a claim that the other tools are careless: they are
 built for trusting the project you open. Taste is built for not having
 to.
+
+### How agents work with the IDE
+
+A separate comparison, because it is a separate question: not what a
+project can do to you, but what shape the agent's work takes. The
+AI-first editors most people are using today, as they work by default:
+
+| | Taste | Cursor | Windsurf | VS Code with Copilot agent mode | Zed |
+| --- | --- | --- | --- | --- | --- |
+| Agent | Any [ACP](https://agentclientprotocol.com) agent; Claude Code is the pinned default | Cursor's own, over its models | Windsurf's own (Cascade), over its models | Copilot, over GitHub's model menu | Zed's own, plus external agents over ACP |
+| Where the agent process runs | Inside the environment's container, in the VM | On your machine, as you | On your machine, as you | On your machine, as you | On your machine, as you |
+| How it reads and writes files | Through the IDE: unsaved buffers on read, edits applied into your undo stack | Directly on disk, with diffs shown | Directly on disk, with diffs shown | Directly on disk, with diffs shown | Directly on disk, with diffs shown |
+| How it runs commands | In the container only, through one exec surface of record; a host fallback is refused | A host terminal, behind an allowlist or a prompt | A host terminal, behind an allowlist or a prompt | A host terminal, behind a prompt | A host terminal, behind a prompt |
+| Unit of work | An issue: its own clone, container, branch, and chat; a fleet of them, supervised from one orchestrator chat | One chat in one checkout, background agents as a paid tier | One chat in one checkout | One chat in one checkout | One chat in one checkout |
+| Review | Its branch, file by file in the tree, merged or rejected from the diff, fast-forward only | Accept or reject hunks in the editor | Accept or reject hunks in the editor | Accept or reject hunks in the editor | Accept or reject hunks in the editor |
+| Who applies a config the agent wrote | You; the IDE names what will run | The agent, or you, in the same session | The agent, or you | The agent, or you | The agent, or you |
+| The credential | The project's, held by a host proxy; the agent sees a placeholder | Your account, in the app | Your account, in the app | Your GitHub account | Your account or your keys, in the app |
+
+The shape Taste takes — an environment per issue, agents that live
+beside the files they change, an orchestrator that files and reviews
+work rather than a chat that types into your buffer — is the design
+commitment in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The other
+editors are a chat beside an editor, and are very good at that.
 
 ## Build and run
 
