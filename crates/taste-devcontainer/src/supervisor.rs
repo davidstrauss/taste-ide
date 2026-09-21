@@ -2588,6 +2588,25 @@ impl Supervisor {
     /// a project config that resolved is set aside for the baseline — not
     /// passed over, just not built yet — so the banner offers its Rebuild.
     async fn reload_locked_with(&self, baseline_only: bool) -> Result<()> {
+        // The first line of every lifecycle run says what asked for it and
+        // what it found: a baseline started under a running one is a
+        // container replaced under its agent, and the state at entry is
+        // what decided that (2026-09-21: two baseline starts fifty seconds
+        // apart, and nothing in the log to say why the second ran).
+        self.log(format!(
+            "{} requested; the environment was {}",
+            if baseline_only {
+                "baseline start"
+            } else {
+                "reload"
+            },
+            match self.state() {
+                SupervisorState::Running { container_id } => {
+                    format!("running ({container_id}), which this replaces")
+                }
+                other => format!("{other:?}").to_lowercase(),
+            }
+        ));
         // Nowhere to run: no VM was supplied, or the checkout is somewhere
         // this substrate cannot reach. Refused with the reason, in the
         // state the row and the banner read — never started on a lesser
