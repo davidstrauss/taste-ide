@@ -2861,7 +2861,9 @@ impl Console {
         // Non-devcontainer shells carry a red warning badge: they run on
         // the host (or the IDE's own barely-confined container), outside
         // the environment work is supposed to happen in.
-        let (title, icon) = if in_devcontainer {
+        // The badge's reason rides the tooltip: a red mark on a tab whose
+        // tooltip repeats the title explains nothing (David, 2026-09-21).
+        let (title, icon, warning): (String, &str, Option<&str>) = if in_devcontainer {
             (
                 if env.is_primary() {
                     "devcontainer".to_string()
@@ -2869,6 +2871,7 @@ impl Console {
                     env.to_string()
                 },
                 "package-x-generic-symbolic",
+                None,
             )
         } else if exec.is_inside_container() {
             // Self-hosting bootstrap: the IDE's own container IS the
@@ -2876,17 +2879,43 @@ impl Console {
             // its shells are confined — no warning. Warn only when the
             // surrounding container is not the devcontainer (safe mode).
             if exec.is_container() {
-                ("IDE container".to_string(), "package-x-generic-symbolic")
+                (
+                    "IDE container".to_string(),
+                    "package-x-generic-symbolic",
+                    None,
+                )
             } else {
-                ("IDE container".to_string(), "taste-container-warn")
+                (
+                    "IDE container".to_string(),
+                    "taste-container-warn",
+                    Some(
+                        "This shell runs in the IDE's own container, not the project's \
+                         environment: the project's devcontainer config is not in force \
+                         here, and its toolchain is not on this path.",
+                    ),
+                )
             }
         } else {
-            ("this machine".to_string(), "taste-host-warn")
+            (
+                "this machine".to_string(),
+                "taste-host-warn",
+                Some(
+                    "This shell runs on this machine, outside any environment: nothing here \
+                     is isolated, and the project's toolchain is not on it. It is open \
+                     because the environment has no container to open a shell in yet; a \
+                     shell in the container replaces it when one comes up.",
+                ),
+            )
+        };
+        let tooltip = move |title: &str| match warning {
+            Some(warning) => format!("{title}\n\n{warning}"),
+            None => title.to_string(),
         };
         // On the host rung the spawn carries the environment itself; in a
         // container the spec already did, and a host-side copy reaches
         // nothing.
         let (terminal, page) = self.spawn_tab(&title, icon, spec, &prompt_env, &cwd);
+        page.set_tooltip(&tooltip(&title));
         let sink = self
             .workspace
             .shells
@@ -2922,6 +2951,7 @@ impl Console {
                     .is_some_and(|(u, h)| !u.is_empty() && !h.is_empty());
                 if complete {
                     page_for_title.set_title(&title);
+                    page_for_title.set_tooltip(&tooltip(&title));
                 }
             });
         }
