@@ -375,6 +375,18 @@ impl Substrate {
         workspace_root: &Path,
         report: Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> Arc<Self> {
+        Self::resolve_in(&Pool::new(workspace_root), report).await
+    }
+
+    /// [`Self::resolve_with`] on a pool the caller made — the registry's,
+    /// whose provisioner tells its steps to the VM log, so the bring-up
+    /// the banner announces is the bring-up the log shows (David,
+    /// 2026-09-21: "I should see log activity for the VM at every
+    /// reasonable stage").
+    pub async fn resolve_in(
+        pool: &Pool,
+        report: Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
+    ) -> Arc<Self> {
         let local = PodmanTarget::detect_local();
         let mut quiet: Vec<Descent> = Vec::new();
 
@@ -410,7 +422,6 @@ impl Substrate {
         // Rung 2: a VM from this workspace's pool — brought up, or made
         // and brought up. The workspace's first; the registry places
         // environments across the rest (`Pool::place`).
-        let pool = Pool::new(workspace_root);
         match pool.ensure_one(report).await {
             Ok((vm, facts)) => return Arc::new(Self::vm(&vm, facts, local.sandboxed())),
             // A probe run: nothing asked, nothing said, nothing run.

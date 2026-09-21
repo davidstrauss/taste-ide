@@ -1023,12 +1023,12 @@ impl BacklogPanel {
         let destroy_button = crate::holdbutton::HoldButton::new(
             "taste-container-off-symbolic",
             "Remove the selected issue's environment — its clone, container, and volumes; \
-             the issue goes back to the queue. Hold to confirm.",
+             the issue goes back to the queue",
         );
         let delete_button = crate::holdbutton::HoldButton::new(
             "user-trash-symbolic",
             "Delete the selected issue for good. Closing is how work ends; deleting is how \
-             a mistake is unmade. Hold to confirm.",
+             a mistake is unmade",
         );
         destroy_button.widget.set_sensitive(false);
         delete_button.widget.set_sensitive(false);

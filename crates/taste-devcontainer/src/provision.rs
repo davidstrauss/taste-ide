@@ -1134,11 +1134,25 @@ impl LibvirtSession {
     /// workspace.
     async fn bring_up(&self, vm: &Vm) -> Result<()> {
         let deadline = Instant::now() + SHUTDOWN_WAIT;
+        let mut said_waiting = false;
         loop {
             match self.state(vm).await? {
-                DomainState::Running => return Ok(()),
+                DomainState::Running => {
+                    self.say(&vm.domain, "the domain is already running");
+                    return Ok(());
+                }
                 DomainState::ShutOff => return self.start(vm).await,
                 DomainState::Other(state) if state == "in shutdown" => {
+                    if !said_waiting {
+                        said_waiting = true;
+                        self.say(
+                            &vm.domain,
+                            format!(
+                                "still shutting down from the last window; waiting for it (up to {}s)",
+                                SHUTDOWN_WAIT.as_secs()
+                            ),
+                        );
+                    }
                     if Instant::now() >= deadline {
                         bail!(
                             "{} has been shutting down for over {}s and has not stopped",

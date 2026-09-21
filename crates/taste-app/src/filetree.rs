@@ -2684,7 +2684,7 @@ impl FileTree {
                 _ => 0,
             };
         }
-        self.set_log_activity(&[environment, container, vm, [0; BUCKETS]]);
+        self.set_log_activity(&[container, environment, vm, [0; BUCKETS]]);
     }
 
     /// TASTE_PROBE_CHECK only: two ports, one answering, so the section
@@ -3531,12 +3531,16 @@ impl FileTree {
                     Err(e) => {
                         // A checkout on this host that is not a repository
                         // says so quietly; one in a VM that cannot be read
-                        // is a files service that is down, and that is
-                        // worth a line in the terminal.
+                        // is a files service that is down — the VM
+                        // stopped, or its keeper gone — which is a
+                        // different fact, told differently
+                        // (`apply_unreachable`), and worth a line in the
+                        // terminal.
                         if !worktree.is_local() {
                             tracing::warn!("file tree: status of {} failed: {e:#}", root.display());
+                            return Err(true);
                         }
-                        return None;
+                        return Err(false);
                     }
                 };
                 let sync = if worktree.is_local() {
@@ -3544,7 +3548,7 @@ impl FileTree {
                 } else {
                     GitWorkspace::discover(&refs_root).and_then(|git| git.sync_status().ok())
                 };
-                Some(StatusSnapshot {
+                Ok(StatusSnapshot {
                     status,
                     stashed: worktree.stashed_paths().unwrap_or_default(),
                     ignore_rules: worktree
@@ -3566,8 +3570,11 @@ impl FileTree {
             });
             let snapshot = handle.await;
             let Some(tree) = weak.upgrade() else { return };
-            if let Ok(snapshot) = snapshot {
-                tree.apply_status(&root_for_apply, snapshot);
+            match snapshot {
+                Ok(Ok(snapshot)) => tree.apply_status(&root_for_apply, Some(snapshot)),
+                Ok(Err(false)) => tree.apply_status(&root_for_apply, None),
+                Ok(Err(true)) => tree.apply_unreachable(&root_for_apply),
+                Err(_) => {}
             }
             // Every exit from a query has to release the gate, or the tree
             // stops refreshing for the life of the window.
@@ -3575,6 +3582,35 @@ impl FileTree {
                 tree.refresh_status();
             }
         });
+    }
+
+    /// The checkout is in a VM that is not answering — stopped, or its
+    /// files service gone. Not "not a git repository": the repository is
+    /// there and so are its rows, which stay as last seen; what goes is
+    /// the branch and sync tools, and one insensitive line in their place
+    /// says why (David, 2026-09-21: "I shouldn't see 'initialize repo'
+    /// under these circumstances. I stopped the VM"). The next status
+    /// that succeeds puts everything back.
+    fn apply_unreachable(self: &Rc<Self>, root: &Path) {
+        if self.view_root() != root {
+            return;
+        }
+        self.init_button
+            .set_label("Checkout unreachable — its VM is not answering");
+        self.init_button.set_sensitive(false);
+        self.init_button.set_visible(true);
+        self.branch_label.set_visible(false);
+        self.pull_button.set_visible(false);
+        self.push_button.set_visible(false);
+        self.sync_button.set_visible(false);
+        for toggle in [
+            &self.stashed_toggle,
+            &self.dirty_toggle,
+            &self.staged_toggle,
+            &self.conflicts_toggle,
+        ] {
+            toggle.set_sensitive(false);
+        }
     }
 
     fn apply_status(self: &Rc<Self>, root: &Path, snapshot: Option<StatusSnapshot>) {

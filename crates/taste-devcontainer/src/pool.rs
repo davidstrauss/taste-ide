@@ -111,6 +111,10 @@ impl Pool {
         &self.libvirt
     }
 
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     /// Whether this process may provision at all. A probe run may not.
     pub fn provisioning_allowed() -> bool {
         std::env::var_os("TASTE_PROBE_CHECK").is_none()

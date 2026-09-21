@@ -298,7 +298,7 @@ impl VmGraphs {
         // the project's own (`data/icons`); the disk and the wire are the
         // platform's.
         let make = |what: &str, icon: &str| {
-            let pair = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+            let pair = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             pair.set_valign(gtk::Align::Center);
             let glyph = gtk::Image::builder()
                 .icon_name(icon)
@@ -407,6 +407,13 @@ pub struct Console {
     /// feed without redrawing the list (David, 2026-09-21: "The VM section
     /// should have graphs for resource usage").
     vm_graphs: RefCell<HashMap<String, VmGraphs>>,
+    /// The Resources rows' hold-to-confirm buttons, alive as long as the
+    /// rows are. A `HoldButton` is state beside a widget, and its gestures
+    /// hold that state weakly; one dropped at the end of a render leaves
+    /// a button that draws and does nothing — which is how the VM row's
+    /// ring never filled (David, 2026-09-21: "I should see the icon switch
+    /// to the pie filling up").
+    held_buttons: RefCell<Vec<Rc<crate::holdbutton::HoldButton>>>,
     /// The last readings per VM, so a list redrawn between ticks shows
     /// them at once rather than blank until the next.
     vm_usage_seed: RefCell<HashMap<String, taste_devcontainer::VmUsage>>,
@@ -609,6 +616,7 @@ impl Console {
             host_shells: RefCell::new(Vec::new()),
             dead_shells: RefCell::new(Vec::new()),
             vm_graphs: RefCell::new(HashMap::new()),
+            held_buttons: RefCell::new(Vec::new()),
             vm_usage_seed: RefCell::new(HashMap::new()),
             tab_bar: tab_bar.clone(),
             new_tab_button: new_tab_button.clone(),
@@ -2453,10 +2461,11 @@ impl Console {
         domain: &str,
     ) -> Rc<crate::holdbutton::HoldButton> {
         let button = crate::holdbutton::HoldButton::new(icon, tip);
-        // Flat, like the plain buttons on the row, so the three read as
-        // one set.
+        // Flat, like the plain buttons on the row, so the set reads as
+        // one; and kept, so the hold has something to happen to.
         button.widget.add_css_class("flat");
         button.widget.set_valign(gtk::Align::Center);
+        self.held_buttons.borrow_mut().push(button.clone());
         {
             let weak = Rc::downgrade(self);
             let domain = domain.to_string();
@@ -2491,6 +2500,7 @@ impl Console {
 
     fn render_resources(self: &Rc<Self>, resources: &[ResourceInfo]) {
         self.vm_graphs.borrow_mut().clear();
+        self.held_buttons.borrow_mut().clear();
         while let Some(child) = self.resources_list.first_child() {
             self.resources_list.remove(&child);
         }
@@ -2681,7 +2691,13 @@ impl Console {
                 // "Always show play and always show stop each row. Just
                 // disable them as appropriate"): a control that swaps its
                 // glyph moves the target under the pointer, and a greyed
-                // one says what the row is doing.
+                // one says what the row is doing. Stop, Rebuild, and
+                // Delete are all held to confirm — the ring fills, an
+                // early release explains itself in a toast — exactly as
+                // the backlog's destructive buttons are; the tooltips say
+                // what the button does and not how to press it (David:
+                // "The toast on insufficient holding + the pie are
+                // enough").
                 let start = action_button(
                     "media-playback-start-symbolic",
                     "Start the VM and bring its environments back",
@@ -2689,13 +2705,14 @@ impl Console {
                 );
                 start.set_sensitive(!running);
                 row.append(&start);
-                let stop = action_button(
+                let stop = self.vm_hold_button(
                     "media-playback-stop-symbolic",
                     "Shut the VM down — its containers stop, and come back when it starts",
                     "stop",
+                    &resource.name,
                 );
-                stop.set_sensitive(running);
-                row.append(&stop);
+                stop.widget.set_sensitive(running);
+                row.append(&stop.widget);
                 // Rebuild and Delete both discard the VM and its disk, so
                 // both are held to confirm, the way the backlog's destroy
                 // and delete are. They differ in what comes after: a
@@ -2706,7 +2723,7 @@ impl Console {
                     "media-record-symbolic",
                     "Rebuild the VM from the pinned image — its environments are placed \
                      anew in the fresh one from this machine's copies and their last \
-                     snapshots. Hold to confirm.",
+                     snapshots",
                     "rebuild",
                     &resource.name,
                 );
@@ -2715,7 +2732,7 @@ impl Console {
                     "user-trash-symbolic",
                     "Delete the VM and its disk — its environments move to the pool's \
                      other VMs from this machine's copies and their last snapshots, or \
-                     to a new one when nothing else has room. Hold to confirm.",
+                     to a new one when nothing else has room",
                     "delete",
                     &resource.name,
                 );
@@ -2730,10 +2747,11 @@ impl Console {
             if resource.kind == ResourceKind::Volume && resource.status == "present" {
                 let delete = crate::holdbutton::HoldButton::new(
                     "user-trash-symbolic",
-                    "Remove this volume — its cached contents are lost. Hold to confirm.",
+                    "Remove this volume — its cached contents are lost",
                 );
                 delete.widget.add_css_class("flat");
                 delete.widget.set_valign(gtk::Align::Center);
+                self.held_buttons.borrow_mut().push(delete.clone());
                 {
                     let events = self.workspace.events.clone();
                     delete.set_on_early_release(move |note| {

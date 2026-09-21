@@ -2165,7 +2165,7 @@ impl EnvironmentRegistry {
         if let Ok(vms) = pool.vms().await {
             self.follow_vm_consoles(&vms);
         }
-        self.set_substrate(Substrate::resolve_with(&self.workspace_root, reporter).await);
+        self.set_substrate(Substrate::resolve_in(&pool, reporter).await);
         if let Ok(vms) = pool.vms().await {
             self.follow_vm_consoles(&vms);
         }
