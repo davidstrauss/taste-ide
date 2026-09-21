@@ -620,6 +620,77 @@ pub fn env_dir(workspace_root: &Path, env: &EnvironmentId) -> PathBuf {
         .join(env.as_str())
 }
 
+/// Where an environment's **working copy** is, and therefore how its files
+/// are reached.
+///
+/// Every environment has one checkout and one **peer**. The checkout is the
+/// tree its container mounts and its agent edits; the peer is a repository
+/// on this host that holds the environment's refs — branches, snapshot
+/// refs, the review verdicts — and is what the review surfaces read.
+/// For a checkout on this host the two are the same directory. For a
+/// checkout in a VM (docs/ENVIRONMENTS.md → "The topology: remote by
+/// default"), they are not: the VM has the files and the host has the
+/// history, related by fetch and push over the VM's ssh forward, and
+/// nothing on the host can open the files directly.
+///
+/// The type is the enumeration. A caller that needs a path to *compose* —
+/// a bind mount, a cwd, a display string — takes [`Checkout::path`], which
+/// means the same thing in either world because the checkout is bound at
+/// its own path inside its container. A caller that needs to *open* the
+/// files on this host takes [`Checkout::local_path`], and the `None` it
+/// gets for a remote checkout is the compiler saying that read has to go
+/// through the environment's files service instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Checkout {
+    /// On this host, at a path this process can open.
+    Local(PathBuf),
+    /// In a VM, at a path only that VM's processes can open. `vm` is the
+    /// VM's domain, which is also its podman connection.
+    Remote { vm: String, path: PathBuf },
+}
+
+impl Checkout {
+    /// The checkout's path in its own world: the host's for a local one,
+    /// the VM's for a remote one. Right for composing container arguments,
+    /// working directories, and what an agent is told; wrong for opening
+    /// anything on this host.
+    pub fn path(&self) -> &Path {
+        match self {
+            Checkout::Local(path) => path,
+            Checkout::Remote { path, .. } => path,
+        }
+    }
+
+    /// The path, if this host can open it. `None` for a remote checkout —
+    /// the answer a host-side filesystem read has to take seriously.
+    pub fn local_path(&self) -> Option<&Path> {
+        match self {
+            Checkout::Local(path) => Some(path),
+            Checkout::Remote { .. } => None,
+        }
+    }
+
+    /// The VM this checkout is in, if it is in one.
+    pub fn vm(&self) -> Option<&str> {
+        match self {
+            Checkout::Local(_) => None,
+            Checkout::Remote { vm, .. } => Some(vm),
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Checkout::Local(_))
+    }
+
+    /// One phrase, for orientation text and the log.
+    pub fn describe(&self) -> String {
+        match self {
+            Checkout::Local(path) => format!("{} on this machine", path.display()),
+            Checkout::Remote { vm, path } => format!("{} in VM {vm}", path.display()),
+        }
+    }
+}
+
 /// Where an environment's checkout lives.
 ///
 /// The primary environment *is* the main checkout — no clone, no copy. Every
@@ -656,6 +727,31 @@ pub fn legacy_image_tag(workspace_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two accessors answer two different questions, and only one of
+    /// them is safe to hand to `std::fs`.
+    #[test]
+    fn a_remote_checkout_has_a_path_to_compose_and_none_to_open() {
+        let local = Checkout::Local(PathBuf::from("/home/me/proj"));
+        assert_eq!(local.path(), Path::new("/home/me/proj"));
+        assert_eq!(local.local_path(), Some(Path::new("/home/me/proj")));
+        assert_eq!(local.vm(), None);
+        assert!(local.is_local());
+
+        let remote = Checkout::Remote {
+            vm: "taste-799f-k7m2qx".into(),
+            path: PathBuf::from("/var/home/core/taste/799f/i-0001"),
+        };
+        assert_eq!(remote.path(), Path::new("/var/home/core/taste/799f/i-0001"));
+        assert_eq!(
+            remote.local_path(),
+            None,
+            "nothing on this host can open it"
+        );
+        assert_eq!(remote.vm(), Some("taste-799f-k7m2qx"));
+        assert!(!remote.is_local());
+        assert!(remote.describe().contains("in VM taste-799f-k7m2qx"));
+    }
 
     fn env(s: &str) -> EnvironmentId {
         EnvironmentId::parse(s).unwrap()

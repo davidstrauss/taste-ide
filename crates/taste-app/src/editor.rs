@@ -1318,7 +1318,7 @@ impl Editor {
                 .map(|supervisor| {
                     (
                         supervisor.id().clone(),
-                        supervisor.root().to_path_buf(),
+                        supervisor.checkout().path().to_path_buf(),
                         !supervisor.exec().is_container(),
                     )
                 })

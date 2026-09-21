@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use taste_core::environment::{
-    self, DiskBudgetScope, EnvironmentId, LABEL_AUTHORITY, LABEL_CONFIG_HASH, LABEL_ENV,
+    self, Checkout, DiskBudgetScope, EnvironmentId, LABEL_AUTHORITY, LABEL_CONFIG_HASH, LABEL_ENV,
     LABEL_PORTS, LABEL_WORKSPACE,
 };
 use taste_core::event::DevcontainerStateEvent;
@@ -323,7 +323,14 @@ pub fn stop_wanted(review: taste_core::ReviewState, state: &SupervisorState) -> 
 pub struct EnvironmentIdentity {
     pub id: EnvironmentId,
     pub workspace_root: PathBuf,
-    pub root: PathBuf,
+    /// Where the working copy is — the tree the container mounts and the
+    /// agent edits. See [`Checkout`] for the two worlds it can be in.
+    pub checkout: Checkout,
+    /// The repository on this host that holds the environment's refs: the
+    /// same directory as a local checkout, and the host-side half of a
+    /// remote one. Review, publish, and every other read of history goes
+    /// here, never to the checkout.
+    pub peer: PathBuf,
 }
 
 impl EnvironmentIdentity {
@@ -332,19 +339,36 @@ impl EnvironmentIdentity {
         let workspace_root = workspace_root.into();
         Self {
             id: EnvironmentId::primary(),
-            root: workspace_root.clone(),
+            checkout: Checkout::Local(workspace_root.clone()),
+            peer: workspace_root.clone(),
             workspace_root,
         }
     }
 
-    /// A non-primary environment, rooted at its clone.
+    /// A non-primary environment, rooted at its clone on this host.
     pub fn cloned(workspace_root: impl Into<PathBuf>, id: EnvironmentId) -> Self {
         let workspace_root = workspace_root.into();
+        Self::local_at(
+            workspace_root.clone(),
+            id.clone(),
+            environment::env_repo_root(&workspace_root, &id),
+        )
+    }
+
+    /// An environment whose checkout and peer are one directory on this
+    /// host.
+    pub fn local_at(workspace_root: impl Into<PathBuf>, id: EnvironmentId, root: PathBuf) -> Self {
         Self {
-            root: environment::env_repo_root(&workspace_root, &id),
-            workspace_root,
             id,
+            workspace_root: workspace_root.into(),
+            checkout: Checkout::Local(root.clone()),
+            peer: root,
         }
+    }
+
+    /// Whether this is the main checkout — by identity or by directory.
+    fn is_main_checkout(&self) -> bool {
+        self.id.is_primary() || self.checkout.path() == self.workspace_root
     }
 }
 
@@ -598,12 +622,84 @@ impl Supervisor {
         &self.env.id
     }
 
-    /// This environment's checkout — the main one for the primary, a clone
-    /// otherwise. Config discovery, security validation and the workspace
-    /// bind all key off this, which is what makes an environment portable
-    /// to a clone without a single conditional.
-    pub fn root(&self) -> &Path {
-        &self.env.root
+    /// This environment's working copy — the main checkout for the primary,
+    /// its clone otherwise, on this host or in a VM. Container arguments
+    /// and the agent's cwd compose from its path; nothing on this host
+    /// opens it without asking [`Checkout::local_path`] first.
+    pub fn checkout(&self) -> &Checkout {
+        &self.env.checkout
+    }
+
+    /// The repository on this host holding this environment's refs. What
+    /// review, publish, and history read. The same directory as the
+    /// checkout when that is local.
+    pub fn peer(&self) -> &Path {
+        &self.env.peer
+    }
+
+    /// Where `.devcontainer/` is read from on this host: the checkout
+    /// itself when it is here, and a host-side mirror of the config
+    /// directory when the checkout is in a VM. The supervisor's every
+    /// config read goes through this one path, so discovery, hashing and
+    /// staging never learn where the files really are.
+    pub fn config_root(&self) -> PathBuf {
+        match &self.env.checkout {
+            Checkout::Local(path) => path.clone(),
+            Checkout::Remote { .. } => {
+                environment::env_dir(&self.env.workspace_root, &self.env.id).join("config")
+            }
+        }
+    }
+
+    /// Make a directory inside the checkout, wherever the checkout is. On
+    /// this host that is `create_dir_all`; in a VM it is the files
+    /// service's job, and until that service exists the refusal says so
+    /// rather than creating a directory on the wrong machine.
+    fn make_dir_in_checkout(&self, dir: &Path) -> std::io::Result<()> {
+        match &self.env.checkout {
+            Checkout::Local(_) => std::fs::create_dir_all(dir),
+            Checkout::Remote { vm, .. } => Err(std::io::Error::other(format!(
+                "{} is in VM {vm}; directories there are made by the files service",
+                dir.display()
+            ))),
+        }
+    }
+
+    /// Walk the checkout for its footprint — on this host. A checkout in a
+    /// VM is not walked from here, and comes back as an empty walk, which
+    /// the fleet reports as unmeasured rather than as zero.
+    async fn walk(&self, prune_ignored: bool) -> CheckoutWalk {
+        let Some(checkout) = self.env.checkout.local_path().map(Path::to_path_buf) else {
+            return CheckoutWalk::default();
+        };
+        tokio::task::spawn_blocking(move || walk_checkout(&checkout, prune_ignored))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the working copy onto this environment's snapshot ref
+    /// (`taste_git::snapshot`), wherever the working copy is. `None` when
+    /// the checkout is not a repository. Blocking — the object database is
+    /// written — so it is called off the GTK thread.
+    ///
+    /// Here rather than in the chat pane because the pane knows when to
+    /// snapshot and the supervisor knows where the files are; a checkout in
+    /// a VM is snapshotted over there, and the pane must not have to know.
+    pub fn snapshot_blocking(&self) -> Result<Option<taste_git::Snapshot>> {
+        let name = taste_git::snapshot_ref(self.env.id.as_str());
+        match &self.env.checkout {
+            Checkout::Local(root) => {
+                let Some(git) = taste_git::GitWorkspace::discover(root) else {
+                    return Ok(None);
+                };
+                git.snapshot_worktree(&name).map(Some)
+            }
+            Checkout::Remote { vm, .. } => bail!(
+                "{}'s working copy is in VM {vm}; snapshotting it there lands with the files \
+                 service",
+                self.env.id
+            ),
+        }
     }
 
     /// The workspace this environment belongs to.
@@ -745,7 +841,7 @@ impl Supervisor {
         // itself as the bind source the agent writes into, so an empty one
         // is the ordinary state of a project with no config yet.
         let has_config = !matches!(state, SupervisorState::NoConfig)
-            && !matches!(DevcontainerConfig::discover(self.root()), Ok(None));
+            && !matches!(DevcontainerConfig::discover(&self.config_root()), Ok(None));
         let next = match &state {
             SupervisorState::Building | SupervisorState::Starting => {
                 "The environment is coming up. Wait a few seconds and call environment again."
@@ -882,7 +978,7 @@ impl Supervisor {
             })
         };
 
-        let config = match DevcontainerConfig::discover(&self.env.root) {
+        let config = match DevcontainerConfig::discover(&self.config_root()) {
             Ok(Some(config)) => config,
             // No config at all is the commonest reason to be here, and it is
             // not an error any more: a repo with no devcontainer gets the
@@ -902,7 +998,7 @@ impl Supervisor {
         if let Err(e) = config.validate() {
             return baseline(Some(format!("the project config is not usable: {e:#}")));
         }
-        if let Err(e) = crate::security::validate_security(&config, &self.env.root) {
+        if let Err(e) = crate::security::validate_security(&config, self.env.checkout.path()) {
             return baseline(Some(format!("the project config was refused: {e:#}")));
         }
         // A setup that would not build or pull last time, unchanged since:
@@ -926,7 +1022,7 @@ impl Supervisor {
     /// `None` for the primary, and for a clone whose main checkout has no
     /// config either.
     fn uncommitted_main_config(&self) -> Option<String> {
-        if self.env.id.is_primary() || self.env.root == self.env.workspace_root {
+        if self.env.is_main_checkout() {
             return None;
         }
         let main_has_config = !matches!(
@@ -1129,7 +1225,7 @@ impl Supervisor {
         // plainly when it is not so — the cause is a uid the mapping did
         // not cover, and the rebuild is the fix.
         if self.config_authority() == ConfigAuthority::Project {
-            let root = self.env.root.display().to_string();
+            let root = self.env.checkout.path().display().to_string();
             if self
                 .run_captured(sh(format!("test -w '{root}'")))
                 .await
@@ -1440,7 +1536,9 @@ impl Supervisor {
         // "Is there a project config at all" — the question that separates
         // NoConfig from ConfigDetected. Whether it is *usable* is
         // `resolve_config`'s business, not this one's.
-        let project = DevcontainerConfig::discover(&self.env.root).ok().flatten();
+        let project = DevcontainerConfig::discover(&self.config_root())
+            .ok()
+            .flatten();
         let current = self.state();
         match &current {
             SupervisorState::Running { .. } => {
@@ -1503,8 +1601,14 @@ impl Supervisor {
         // re-arm — the root watch is not on either. A supervisor reaches
         // that state exactly one way: built straight from a constructor,
         // which only the tests do.
-        if let Some(watch) = watch.as_ref().and_then(std::sync::Weak::upgrade) {
-            watch.arm_devcontainer_dir(&self.env.root);
+        // inotify watches host directories. A checkout in a VM has its
+        // config directory watched from over there, by the files service,
+        // which re-arms the mirror this supervisor reads.
+        if let (Some(watch), Some(root)) = (
+            watch.as_ref().and_then(std::sync::Weak::upgrade),
+            self.env.checkout.local_path(),
+        ) {
+            watch.arm_devcontainer_dir(root);
         }
     }
 
@@ -1710,7 +1814,7 @@ impl Supervisor {
         // safe mode reads the repo natively and writes nothing but its
         // config, through the IDE. Both binds must carry the same flags or
         // the second is a way around the first.
-        let host_path = self.env.root.display().to_string();
+        let host_path = self.env.checkout.path().display().to_string();
         if host_path != workdir {
             mounts.push("-v".into());
             mounts.push(format!(
@@ -1732,7 +1836,13 @@ impl Supervisor {
         // `.devcontainer/` is not a config (`DevcontainerConfig::discover`
         // reads files, not directories), so nothing else changes.
         if authority == ConfigAuthority::Baseline {
-            let source = self.env.root.join(".devcontainer").display().to_string();
+            let source = self
+                .env
+                .checkout
+                .path()
+                .join(".devcontainer")
+                .display()
+                .to_string();
             mounts.push("-v".into());
             mounts.push(format!("{source}:{workdir}/.devcontainer:Z"));
             if host_path != workdir {
@@ -1790,7 +1900,7 @@ impl Supervisor {
     /// `None` means "nothing for us to remove": no config, or a config that
     /// pulls a registry image rather than building.
     fn current_image_tag(&self) -> Option<String> {
-        let config = DevcontainerConfig::discover(&self.env.root)
+        let config = DevcontainerConfig::discover(&self.config_root())
             .ok()
             .flatten()?;
         config.dockerfile_path()?;
@@ -2171,9 +2281,11 @@ impl Supervisor {
         args.extend(self.resource_labels());
         // `${localWorkspaceFolder}` means THIS environment's checkout — the
         // clone, for a non-primary environment. The whole config is
-        // evaluated against `self.env.root`, which is what makes one config
-        // serve N environments without a single conditional.
-        let local_workspace_folder = self.env.root.display().to_string();
+        // evaluated against this environment's checkout, which is what
+        // makes one config serve N environments without a single
+        // conditional — and a checkout in a VM is bound at ITS path there,
+        // since the podman doing the binding is the VM's.
+        let local_workspace_folder = self.env.checkout.path().display().to_string();
         match &config.workspace_mount {
             Some(mount) => {
                 args.push("--mount".into());
@@ -2201,8 +2313,10 @@ impl Supervisor {
         // The bind source for the config the agent may write (`ide_mounts`):
         // a bind needs one, and a project with no config has none yet.
         if authority == ConfigAuthority::Baseline {
-            let config_dir = self.env.root.join(".devcontainer");
-            if let Err(e) = std::fs::create_dir_all(&config_dir) {
+            let config_dir = self.env.checkout.path().join(".devcontainer");
+            // On this host. A checkout in a VM has the directory made over
+            // there, by the files service, before the run.
+            if let Err(e) = self.make_dir_in_checkout(&config_dir) {
                 tracing::warn!(
                     "could not make {} for the agent to write its config into: {e}",
                     config_dir.display()
@@ -2263,11 +2377,11 @@ impl Supervisor {
         // such file or directory"), and a project that binds its vendor
         // folder has none until its first install (2026-09-16).
         if authority == ConfigAuthority::Project {
-            for source in crate::security::bind_sources(&config, &self.env.root) {
-                if source.exists() {
+            for source in crate::security::bind_sources(&config, self.env.checkout.path()) {
+                if self.env.checkout.is_local() && source.exists() {
                     continue;
                 }
-                match std::fs::create_dir_all(&source) {
+                match self.make_dir_in_checkout(&source) {
                     Ok(()) => self.log(format!(
                         "created {} for the config's bind mount",
                         source.display()
@@ -2573,7 +2687,7 @@ impl Supervisor {
             &self.env.workspace_root,
             &self.env.id,
         )];
-        if let Ok(Some(config)) = DevcontainerConfig::discover(&self.env.root) {
+        if let Ok(Some(config)) = DevcontainerConfig::discover(&self.config_root()) {
             volumes.extend(
                 config
                     .named_volumes()
@@ -2619,10 +2733,7 @@ impl Supervisor {
     /// under-reports is worse than one that says how much it could not see.
     pub async fn disk_usage(&self) -> DiskUsage {
         let mut usage = DiskUsage::default();
-        let checkout = self.env.root.clone();
-        let walk = tokio::task::spawn_blocking(move || walk_checkout(&checkout, false))
-            .await
-            .unwrap_or_default();
+        let walk = self.walk(false).await;
         usage.checkout_bytes = walk.apparent_bytes;
         let volumes = self.volume_usage().await;
         usage.volume_bytes = volumes.apparent_bytes;
@@ -2657,11 +2768,8 @@ impl Supervisor {
     /// included, and the cost of that is part of what choosing that scope
     /// chooses.
     pub async fn measure_disk(&self, scope: DiskBudgetScope) -> DiskSample {
-        let checkout = self.env.root.clone();
         let artifacts = scope.counts_build_artifacts();
-        let walk = tokio::task::spawn_blocking(move || walk_checkout(&checkout, !artifacts))
-            .await
-            .unwrap_or_default();
+        let walk = self.walk(!artifacts).await;
         let volumes = if artifacts {
             self.volume_usage().await
         } else {
@@ -3513,11 +3621,11 @@ mod tests {
         let clone_root = tempfile::tempdir().unwrap();
         let clone = make_env(
             main.path(),
-            EnvironmentIdentity {
-                id: EnvironmentId::parse("i-0001").unwrap(),
-                workspace_root: main.path().to_path_buf(),
-                root: clone_root.path().to_path_buf(),
-            },
+            EnvironmentIdentity::local_at(
+                main.path(),
+                EnvironmentId::parse("i-0001").unwrap(),
+                clone_root.path().to_path_buf(),
+            ),
         );
         let resolved = clone.resolve_config().unwrap();
         assert_eq!(resolved.authority, ConfigAuthority::Baseline);
@@ -4028,8 +4136,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let review = make_env(root, EnvironmentIdentity::cloned(root, env("review")));
-        assert_ne!(review.root(), root, "the clone, not the main checkout");
-        assert!(review.root().ends_with("review/repo"));
+        assert_ne!(
+            review.checkout().path(),
+            root,
+            "the clone, not the main checkout"
+        );
+        assert!(review.checkout().path().ends_with("review/repo"));
+        assert_eq!(review.peer(), review.checkout().path());
         assert_eq!(review.workspace_root(), root);
         assert_eq!(
             review.workspace_key(),

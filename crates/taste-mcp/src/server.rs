@@ -303,7 +303,7 @@ impl McpServer {
                      publish."
                 },
             },
-            "workspace": supervisor.root().display().to_string(),
+            "workspace": supervisor.checkout().path().display().to_string(),
             "main_checkout": self.workspace.root().display().to_string(),
             "mode": situation.mode,
             "authority": situation.authority,
@@ -387,10 +387,36 @@ impl McpServer {
         })
     }
 
-    /// This environment's checkout: the main one for the primary, its own
-    /// clone otherwise.
-    fn root(&self, env: &EnvironmentId) -> Result<PathBuf> {
-        Ok(self.supervisor(env)?.root().to_path_buf())
+    /// This environment's checkout path, in the checkout's own world — the
+    /// main one for the primary, its own clone otherwise, on this host or
+    /// in a VM. For composing what an agent is told and where its container
+    /// works; never for opening files on this host.
+    fn checkout_path(&self, env: &EnvironmentId) -> Result<PathBuf> {
+        Ok(self.supervisor(env)?.checkout().path().to_path_buf())
+    }
+
+    /// The checkout, when this host can open it. A checkout in a VM is
+    /// refused by name: the tools that walk files answer from the files
+    /// service once it exists, and until then they say where the files are
+    /// rather than reading a tree that is not there.
+    fn host_root(&self, env: &EnvironmentId) -> Result<PathBuf> {
+        let supervisor = self.supervisor(env)?;
+        supervisor
+            .checkout()
+            .local_path()
+            .map(std::path::Path::to_path_buf)
+            .with_context(|| {
+                format!(
+                    "{env}'s files are in VM {}; they cannot be read from the IDE's host",
+                    supervisor.checkout().vm().unwrap_or("?")
+                )
+            })
+    }
+
+    /// The repository on this host holding this environment's refs — what
+    /// publish, update, and every read of history go to.
+    fn peer(&self, env: &EnvironmentId) -> Result<PathBuf> {
+        Ok(self.supervisor(env)?.peer().to_path_buf())
     }
 
     /// Safe mode, evaluated per environment: no container of its own means
@@ -411,7 +437,7 @@ impl McpServer {
             // console beside its ACP terminals.
             jobs: crate::exec::Jobs::for_environment(self.workspace.shells.clone(), env.clone()),
             references: crate::lsp::RaServer::new(
-                supervisor.root().to_path_buf(),
+                supervisor.checkout().path().to_path_buf(),
                 supervisor.exec().clone(),
             ),
         });
@@ -1306,7 +1332,7 @@ impl McpServer {
                 // prompt about the wrong thing.
                 if let Some((title, body)) = reload_confirmation(
                     supervisor.pending_changes(),
-                    taste_devcontainer::DevcontainerConfig::discover(supervisor.root())
+                    taste_devcontainer::DevcontainerConfig::discover(&supervisor.config_root())
                         .ok()
                         .flatten()
                         .as_ref(),
@@ -1505,7 +1531,7 @@ impl McpServer {
                 // This environment's checkout: the conventional files the
                 // caller can actually create are the ones in the tree it
                 // works in.
-                let root = self.root(env)?;
+                let root = self.host_root(env)?;
                 let entries: Vec<_> = taste_core::conventions::conventions(&root)
                     .into_iter()
                     .map(|c| {
@@ -1534,7 +1560,7 @@ impl McpServer {
             }
             "ide_write_policy" => {
                 let safe_mode = self.safe_mode(env)?;
-                let root = self.root(env)?;
+                let root = self.checkout_path(env)?;
                 let writable: Vec<String> = if safe_mode {
                     taste_core::policy::safe_mode_scope(&root)
                         .iter()
@@ -1650,7 +1676,7 @@ impl McpServer {
                 // environment's checkout inside this environment's
                 // container.
                 let result = self.services(env)?.references.references(symbol).await?;
-                let root = self.root(env)?;
+                let root = self.checkout_path(env)?;
                 let rel = |path: &Path| {
                     path.strip_prefix(&root)
                         .unwrap_or(path)
@@ -1794,7 +1820,7 @@ impl McpServer {
                 // how "more" is known without counting everything.
                 let (offset, limit) = paging(&args, FIND_DEFAULT_LIMIT, FIND_MAX_LIMIT);
                 let fetch = offset + limit + 1;
-                let root = self.root(env)?;
+                let root = self.host_root(env)?;
                 let needle = query.clone();
                 // The files-and-repository half, off the async workers: a
                 // walk of the checkout and of HEAD's history.
@@ -1968,7 +1994,7 @@ impl McpServer {
                         "message": "this IDE has no semantic index; use ide_find or ide_search"
                     }));
                 };
-                let root = self.root(env)?;
+                let root = self.host_root(env)?;
                 let searched = {
                     let semantic = semantic.clone();
                     let root = root.clone();
@@ -2041,7 +2067,7 @@ impl McpServer {
                     )?
                     .to_string();
                 let (offset, limit) = paging(&args, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT);
-                let root = self.root(env)?;
+                let root = self.host_root(env)?;
                 // One past the page: how "more" is known without a full count.
                 let hits = tokio::task::spawn_blocking(move || {
                     taste_core::search::search(&root, &query, offset + limit + 1)
@@ -2074,7 +2100,7 @@ impl McpServer {
                     .as_str()
                     .map(str::to_lowercase);
                 let (offset, limit) = paging(&args, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT);
-                let root = self.root(env)?;
+                let root = self.host_root(env)?;
                 let start = if subdir.is_empty() {
                     root.clone()
                 } else {
@@ -2126,7 +2152,7 @@ impl McpServer {
                 // environment that is its clone, whose branch and dirty
                 // state are the agent's own work in progress — not the
                 // user's.
-                let root = self.root(env)?;
+                let root = self.host_root(env)?;
                 let git = GitWorkspace::discover(&root)
                     .context("this environment's checkout is not a git repository")?;
                 let status = git.status()?;
@@ -3319,7 +3345,7 @@ impl McpServer {
 
         // The enumeration, before a byte is removed and before the gate
         // below is asked anything. Off the reactor: two git walks.
-        let repo = supervisor.root().to_path_buf();
+        let repo = supervisor.peer().to_path_buf();
         let main = self.workspace.root().to_path_buf();
         let (unpublished, dirty) = tokio::task::spawn_blocking(move || {
             let unpublished = taste_git::unpublished_work(&repo, &main).unwrap_or_default();
@@ -3716,7 +3742,7 @@ impl McpServer {
                  already in the checkout the user is looking at."
             );
         }
-        self.root(env)
+        self.peer(env)
     }
 
     /// Ask the GTK side, bounded: a wedged main thread must come back as a
@@ -4855,7 +4881,8 @@ mod tests {
         let clone_root = environments
             .create(review.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
 
         let primary_socket =
@@ -5039,7 +5066,8 @@ mod tests {
         let clone_root = environments
             .create(review.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         commit_on_ref(
             &clone_root,
@@ -5105,7 +5133,8 @@ mod tests {
         let clone_root = environments
             .create(env.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         commit_on_ref(
             &clone_root,
@@ -5215,7 +5244,8 @@ mod tests {
         let clone_root = environments
             .create(env.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         commit_on_ref(
             &clone_root,
@@ -5411,7 +5441,8 @@ mod tests {
         let clone_root = environments
             .create(worker.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         commit_on_ref(
             &clone_root,
@@ -5667,7 +5698,8 @@ mod tests {
         let clone_root = environments
             .create(review.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         let base = GitWorkspace::discover(&clone_root)
             .unwrap()
@@ -5714,7 +5746,8 @@ mod tests {
         let clone_root = environments
             .create(review.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         let base = GitWorkspace::discover(&clone_root)
             .unwrap()
@@ -5761,7 +5794,8 @@ mod tests {
         let clone_root = environments
             .create(review.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         let base = GitWorkspace::discover(&clone_root)
             .unwrap()
@@ -5817,7 +5851,8 @@ mod tests {
         let clone_root = environments
             .create(review.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         // Work published by some other environment, plus a branch of the
         // user's own.
@@ -7387,7 +7422,8 @@ mod tests {
         let worker_root = environments
             .create(worker.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         let _strip = attach_fake_strip(&workspace, None);
 
@@ -7540,7 +7576,8 @@ mod tests {
         let clone_root = environments
             .create(worker.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         commit_on_ref(
             &clone_root,
@@ -7627,7 +7664,8 @@ mod tests {
         let clone_root = environments
             .create(worker.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         commit_on_ref(
             &clone_root,
@@ -7707,7 +7745,8 @@ mod tests {
         let clone_root = environments
             .create(finished.clone())
             .unwrap()
-            .root()
+            .checkout()
+            .path()
             .to_path_buf();
         // A UI that would say no to anything. Nothing may reach it.
         let seen = confirming_ui(&workspace, false);

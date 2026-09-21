@@ -126,7 +126,12 @@ impl ConfigWatch {
     /// Called by the registry, never from the event-loop thread, which is
     /// what makes the `watch()` calls in here safe.
     pub fn add(self: &Arc<Self>, supervisor: &Arc<Supervisor>) -> Result<()> {
-        let root = supervisor.root().to_path_buf();
+        // inotify watches this host's directories. A checkout in a VM is
+        // watched from over there, by the files service, which drives the
+        // same recheck; there is nothing here to arm for it.
+        let Some(root) = supervisor.checkout().local_path().map(Path::to_path_buf) else {
+            return Ok(());
+        };
         // Recorded BEFORE the watch is registered, and with no other lock
         // held: an event can arrive the instant the descriptor exists, and
         // one that arrives before the map knows who owns the path is an
@@ -346,7 +351,7 @@ fn spawn_recheck_thread(rx: Receiver<Arc<Supervisor>>, watch: Weak<ConfigWatch>)
                 // this recheck runs describes a change this recheck may
                 // not have seen, and must be able to queue the next one.
                 if let Some(watch) = watch.upgrade() {
-                    watch.clear_pending(supervisor.root());
+                    watch.clear_pending(supervisor.checkout().path());
                 }
                 if let Err(e) = supervisor.recheck() {
                     tracing::warn!("config recheck failed: {e:#}");
@@ -402,11 +407,11 @@ mod tests {
     fn supervisor(root: &Path, id: &str) -> Arc<Supervisor> {
         std::fs::create_dir_all(root).unwrap();
         Supervisor::new_outside_container_for_tests(
-            EnvironmentIdentity {
-                id: EnvironmentId::parse(id).unwrap(),
-                workspace_root: root.to_path_buf(),
-                root: root.to_path_buf(),
-            },
+            EnvironmentIdentity::local_at(
+                root,
+                EnvironmentId::parse(id).unwrap(),
+                root.to_path_buf(),
+            ),
             EventBus::new(),
             ExecContext::host_unsandboxed_for_tests(),
             crate::substrate::Substrate::local_for_tests(),
@@ -619,11 +624,11 @@ mod tests {
         watch.add(&two).unwrap();
         assert_eq!(instances(&watch), 1);
 
-        watch.forget(one.root());
+        watch.forget(one.checkout().path());
         assert_eq!(watch.watching(), 1);
         assert_eq!(instances(&watch), 1, "one environment left, one instance");
 
-        watch.forget(two.root());
+        watch.forget(two.checkout().path());
         assert_eq!(watch.watching(), 0);
         assert_eq!(instances(&watch), 0, "and none left holds none");
     }

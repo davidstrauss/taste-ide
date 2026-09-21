@@ -33,7 +33,7 @@ pub mod workspace;
 
 pub use activity::Activity;
 pub use capped::CappedOutput;
-pub use environment::EnvironmentId;
+pub use environment::{Checkout, EnvironmentId};
 pub use event::{ControllerButton, Event, EventBus};
 pub use exec::{CommandSpec, ConfigAuthority, ExecContext};
 pub use podman::PodmanTarget;

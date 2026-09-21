@@ -4355,7 +4355,7 @@ impl ChatPane {
             exec: supervisor.exec().clone(),
             // The environment's checkout at its host path, which relocation
             // made the container path too — no translation, by design.
-            cwd: supervisor.root().to_path_buf(),
+            cwd: supervisor.checkout().path().to_path_buf(),
             roster: self.workspace.shells.clone(),
         })
     }
@@ -5795,7 +5795,7 @@ impl ChatPane {
     fn orientation(&self) -> Option<(String, String)> {
         let supervisor = self.environments.get(&self.environment)?;
         let situation = supervisor.situation();
-        let root = supervisor.root().display();
+        let root = supervisor.checkout().path().display();
         let environment = if self.environment.is_primary() {
             format!(
                 "the primary environment, the user's own checkout at {root}. The editor \
@@ -9466,15 +9466,14 @@ impl ChatPane {
         let Some(supervisor) = self.environments.get(&self.environment) else {
             return;
         };
-        let root = supervisor.root().to_path_buf();
-        let name = taste_git::snapshot_ref(self.environment.as_str());
         let env = self.environment.clone();
         let busy = self.snapshotting.clone();
         busy.set(true);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let git = taste_git::GitWorkspace::discover(&root)?;
-                git.snapshot_worktree(&name).ok()
+                // Wherever the working copy is: the supervisor knows, and
+                // this pane does not have to.
+                supervisor.snapshot_blocking().ok().flatten()
             });
             match handle.await {
                 Ok(Some(snapshot)) if snapshot.wrote => {

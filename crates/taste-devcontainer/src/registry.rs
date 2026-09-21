@@ -535,11 +535,11 @@ impl EnvironmentRegistry {
     /// way, because a restored environment needs its MCP socket bound
     /// exactly as much as a new one does.
     fn adopt(&self, id: EnvironmentId) -> Arc<Supervisor> {
-        let identity = EnvironmentIdentity {
-            id: id.clone(),
-            workspace_root: self.workspace_root.clone(),
-            root: self.env_repo(&id),
-        };
+        let identity = EnvironmentIdentity::local_at(
+            self.workspace_root.clone(),
+            id.clone(),
+            self.env_repo(&id),
+        );
         // A fresh context per environment: each supervisor points its own
         // at its own container. There is no shared target to race over, and
         // a clone never inherits the self-hosting "the IDE's container is
@@ -622,7 +622,10 @@ impl EnvironmentRegistry {
         let Some(supervisor) = self.get(id) else {
             bail!("no environment {id}");
         };
-        let repo = supervisor.root().to_path_buf();
+        // The peer: what the main checkout has never seen is a question
+        // about refs, and the dirty count is what the last snapshot holds
+        // when the working copy is not here to ask.
+        let repo = supervisor.peer().to_path_buf();
 
         let mut report = DestroyReport::default();
         if repo.is_dir() {
@@ -765,9 +768,9 @@ impl EnvironmentRegistry {
             // Idempotent and cheap after the first pass — one `stat` per
             // file in `.git` — so it needs no marker on disk saying it has
             // run. Blocking: it copies the object store the first time.
-            let checkout = supervisor.root().to_path_buf();
+            let peer = supervisor.peer().to_path_buf();
             let unshared =
-                tokio::task::spawn_blocking(move || taste_git::unshare_inodes(&checkout)).await;
+                tokio::task::spawn_blocking(move || taste_git::unshare_inodes(&peer)).await;
             match unshared {
                 Ok(Ok(0)) => {}
                 Ok(Ok(broken)) => {
@@ -970,7 +973,8 @@ mod tests {
         let registry = fixture.registry();
         let primary = registry.primary();
         assert!(primary.id().is_primary());
-        assert_eq!(primary.root(), fixture.workspace.path());
+        assert_eq!(primary.checkout().path(), fixture.workspace.path());
+        assert_eq!(primary.peer(), fixture.workspace.path());
         assert_eq!(registry.ids(), vec![EnvironmentId::primary()]);
     }
 
@@ -988,9 +992,13 @@ mod tests {
         let registry = fixture.registry();
 
         let review = registry.create(env("review")).unwrap();
-        assert_eq!(review.root(), registry.env_repo(&env("review")));
-        assert!(review.root().join("base").is_file(), "checked out");
-        assert!(review.root().join(".git").exists());
+        assert_eq!(review.checkout().path(), registry.env_repo(&env("review")));
+        assert_eq!(review.peer(), review.checkout().path());
+        assert!(
+            review.checkout().path().join("base").is_file(),
+            "checked out"
+        );
+        assert!(review.checkout().path().join(".git").exists());
         assert_eq!(review.workspace_root(), fixture.workspace.path());
 
         // It is in the fleet, after the primary, with its own container.
@@ -1206,9 +1214,9 @@ mod tests {
         let registry = fixture.registry();
         let review = registry.create(env("review")).unwrap();
 
-        let clone = git2::Repository::open(review.root()).unwrap();
+        let clone = git2::Repository::open(review.peer()).unwrap();
         commit(&clone, "unreviewed-work");
-        std::fs::write(review.root().join("scratch.txt"), "wip").unwrap();
+        std::fs::write(review.checkout().path().join("scratch.txt"), "wip").unwrap();
 
         let report = registry.destroy(&env("review")).await.unwrap();
         assert!(report.had_unsaved_work());

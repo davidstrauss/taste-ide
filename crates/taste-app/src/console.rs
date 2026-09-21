@@ -1977,7 +1977,7 @@ impl Console {
             .environments
             .list()
             .iter()
-            .map(|supervisor| (supervisor.id().clone(), supervisor.root().to_path_buf()))
+            .map(|supervisor| (supervisor.id().clone(), supervisor.peer().to_path_buf()))
             .collect();
         // Which environments have left `Working`, so the merge-base
         // question is asked about those and no others. Asking it for every
@@ -2762,7 +2762,7 @@ impl Console {
                     return (
                         selected,
                         supervisor.exec().clone(),
-                        supervisor.root().to_path_buf(),
+                        supervisor.checkout().path().to_path_buf(),
                     );
                 }
             }

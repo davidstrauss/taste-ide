@@ -25,8 +25,14 @@ use crate::DevcontainerConfig;
 /// stable, comparable value.
 pub fn config_hash(config: &DevcontainerConfig, ide_mounts: &[String]) -> Result<String> {
     let mut hasher = Sha256::new();
-    for path in config.hash_inputs() {
-        hash_file(&mut hasher, &path);
+    // Paths RELATIVE to the checkout. The hash used to cover the absolute
+    // path, which made an image's tag depend on where the checkout sat on
+    // disk: two environments of one workspace share an image only because
+    // a clone's `.devcontainer/devcontainer.json` spells the same relative
+    // to its own root — and a checkout in a VM, whose config the IDE reads
+    // from a host-side mirror, would otherwise never share with anything.
+    for (relative, path) in config.hash_inputs_relative() {
+        hash_file(&mut hasher, &relative, &path);
     }
     // Domain-separated from the file bytes above, so a Containerfile whose
     // contents happen to look like a mount spec cannot collide with one.
@@ -53,8 +59,8 @@ pub fn build_hash(config: &DevcontainerConfig) -> Result<String> {
     config_hash(config, &[])
 }
 
-fn hash_file(hasher: &mut Sha256, path: &Path) {
-    hasher.update(path.to_string_lossy().as_bytes());
+fn hash_file(hasher: &mut Sha256, name: &Path, path: &Path) {
+    hasher.update(name.to_string_lossy().as_bytes());
     match std::fs::read(path) {
         Ok(bytes) => {
             hasher.update([1u8]);
@@ -83,6 +89,23 @@ mod tests {
         .unwrap();
         std::fs::write(dc.join("Containerfile"), containerfile).unwrap();
         DevcontainerConfig::discover(dir).unwrap().unwrap()
+    }
+
+    /// The same config in two places is one image. This is what lets a
+    /// clone share the primary's image, and a mirrored config share a
+    /// VM-side checkout's.
+    #[test]
+    fn the_hash_does_not_depend_on_where_the_checkout_sits() {
+        let here = tempfile::tempdir().unwrap();
+        let there = tempfile::tempdir().unwrap();
+        let a = write_config(here.path(), "FROM a\n");
+        let b = write_config(there.path(), "FROM a\n");
+        assert_ne!(a.config_path, b.config_path);
+        assert_eq!(build_hash(&a).unwrap(), build_hash(&b).unwrap());
+        // ...and a config loaded without discovery still knows its root.
+        let loaded = DevcontainerConfig::load(&a.config_path).unwrap();
+        assert_eq!(loaded.root, here.path());
+        assert_eq!(build_hash(&loaded).unwrap(), build_hash(&a).unwrap());
     }
 
     #[test]

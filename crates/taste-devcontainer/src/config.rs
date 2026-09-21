@@ -115,6 +115,12 @@ pub struct DevcontainerConfig {
     /// The config file itself (not part of the JSON).
     #[serde(skip)]
     pub config_path: PathBuf,
+    /// The checkout the config was discovered under (not part of the
+    /// JSON). What the hash's paths are taken relative to, so a config
+    /// hashes the same wherever the checkout — or a mirror of its
+    /// `.devcontainer/` — happens to sit on disk.
+    #[serde(skip)]
+    pub root: PathBuf,
 }
 
 /// Spec'd discovery locations, in priority order.
@@ -141,12 +147,17 @@ impl DevcontainerConfig {
     pub fn discover(workspace_root: &Path) -> Result<Option<Self>> {
         for path in candidate_paths(workspace_root) {
             if path.is_file() {
-                return Self::load(&path).map(Some);
+                let mut config = Self::load(&path)?;
+                config.root = workspace_root.to_path_buf();
+                return Ok(Some(config));
             }
         }
         Ok(None)
     }
 
+    /// Load one file. Its root is taken to be the directory above a
+    /// `.devcontainer/` directory, or the config's own directory otherwise
+    /// — [`Self::discover`] knows better and says so.
     pub fn load(path: &Path) -> Result<Self> {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -163,7 +174,29 @@ impl DevcontainerConfig {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        config.root = config
+            .config_dir
+            .ancestors()
+            .find(|dir| dir.file_name().is_some_and(|name| name == ".devcontainer"))
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| config.config_dir.clone());
         Ok(config)
+    }
+
+    /// [`Self::hash_inputs`], each relative to [`Self::root`] — the spelling
+    /// the hash uses, so two checkouts of one config hash alike.
+    pub fn hash_inputs_relative(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.hash_inputs()
+            .into_iter()
+            .map(|path| {
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|_| path.clone());
+                (relative, path)
+            })
+            .collect()
     }
 
     /// The Containerfile/Dockerfile this config builds from, if any,
