@@ -563,9 +563,9 @@ aimed at does, by explicit action only:
   **activity sparkline**, the last five minutes of that environment's
   event, output and turn traffic (`taste_core::activity`). A state cannot
   tell an environment that is up and hammering from one that is up and
-  idle; that is what the sparkline is for. Silence draws nothing rather
-  than a flat line, which would claim a measurement where there is only an
-  absence. A chat waiting on an answer gets a **mark of its own** beside
+  idle; that is what the sparkline is for. Silence draws an empty frame
+  rather than a flat line, which would claim a measurement where there is
+  only an absence; every sparkline in the app wears that frame. A chat waiting on an answer gets a **mark of its own** beside
   them, because amber is a steady state a fleet can sit in — baseline mode
   alone would keep half the lights amber — and a question nobody has
   answered must not drown in it.
@@ -2689,13 +2689,21 @@ is shouted, but nothing runs either. The rows say what is missing, and
   them again next launch. Idle-stop stops containers, never a VM. The
   Resources view's VM row has the VM's own lifecycle, in the backlog
   rows' scheme: **Stop** (its containers first, then the guest), **Start**
-  (the VM, then everything in it, by reconcile), and **Rebuild** behind
-  a confirmation — the restore path run on purpose: the domain and its
-  disk go, a fresh VM comes from the pinned image, the primary is seeded
-  from the folder with its last snapshot, and every environment that was
-  in it is placed anew from its peer and snapshot. The row also graphs
+  (the VM, then everything in it, by reconcile), **Rebuild**, held to
+  confirm — the restore path run on purpose: the domain and its disk go,
+  a fresh VM comes from the pinned image, the primary is seeded from the
+  folder with its last snapshot, and every environment that was in it is
+  placed anew from its peer and snapshot — and **Delete**, held to
+  confirm, which is the same teardown without the replacement: what
+  lived in the VM is placed across the pool's other VMs, and a new one
+  is made only when the primary, or an orphan, has room nowhere else.
+  The row also graphs
   the VM's CPU, memory, disk, and network over the last five minutes,
-  from one `virsh domstats` every five seconds.
+  each behind a glyph naming the resource, from one `virsh domstats`
+  every five seconds. The row is there from the moment the domain is —
+  a VM still booting is listed as booting while the banner says the
+  workspace's VM is coming up — and every VM of the pool is listed, the
+  environment's own first with its containers under it.
 - **What the guest is**: Fedora CoreOS, pinned by release and digest
   (`taste_devcontainer::guest`), configured by Ignition
   (`provision::ignition`): rootless podman as `core`, ssh in on a loopback

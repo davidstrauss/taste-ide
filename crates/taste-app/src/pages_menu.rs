@@ -37,9 +37,24 @@ pub fn pages_menu(view: &adw::TabView) -> gtk::MenuButton {
     // called, change between one look and the next, and a popover is
     // looked at for a second at a time.
     let view = view.clone();
-    popover.connect_show(move |popover| {
-        popover.set_child(Some(&build_list(&view, popover)));
-    });
+    {
+        let view = view.clone();
+        popover.connect_show(move |popover| {
+            popover.set_child(Some(&build_list(&view, popover)));
+        });
+    }
+    // Insensitive while the strip has no pages: a menu of nothing opens
+    // onto an empty popover with a heading over it, which is a button that
+    // does something and then does not (David, 2026-09-21: "Disable 'open
+    // pages' if there are none open"). Bound to the view's page count,
+    // which is the fact it is about, so it follows every open and close
+    // without a caller remembering to say so.
+    let follow = {
+        let button = button.clone();
+        move |view: &adw::TabView| button.set_sensitive(view.n_pages() > 0)
+    };
+    follow(&view);
+    view.connect_n_pages_notify(follow);
     button
 }
 

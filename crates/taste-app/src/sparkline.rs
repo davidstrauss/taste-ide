@@ -6,6 +6,10 @@
 //! only space a sidebar row has to spare, and without asking the reader to
 //! parse a number that would be stale by the time they did.
 //!
+//! Every one sits in a **low-contrast bounding box**, the same frame on
+//! silence as on a burst, so an empty chart is a chart and not a gap, and
+//! a row of four is four charts rather than four stray lines.
+//!
 //! **It draws in the theme's own foreground colour at reduced alpha**
 //! (`WidgetExt::color`, which resolves the CSS colour actually in force —
 //! including the selected row's, which differs). That is the whole of its
@@ -42,6 +46,16 @@ const HEIGHT: i32 = 14;
 /// strength, and the fill only has to give the line a body.
 const LINE_ALPHA: f64 = 0.55;
 const FILL_ALPHA: f64 = 0.18;
+/// The bounding box's share of the foreground: a frame that says "a chart
+/// is here" — and, on a silent one, "an empty chart is here", which no
+/// mark could — without competing with the line inside it (David,
+/// 2026-09-21: "every sparkline chart to have a low-contrast bounding
+/// box").
+const BOX_ALPHA: f64 = 0.14;
+/// The box's corner radius, and the room the line keeps from the box on
+/// each side so a peak does not run into the frame.
+const BOX_RADIUS: f64 = 2.0;
+const INSET: f64 = 2.5;
 
 /// How far one bucket's count is allowed to reach into its neighbours
 /// before anything is drawn, in buckets. See [`shaped`].
@@ -163,9 +177,11 @@ fn shaped(samples: &[Count; BUCKETS]) -> [f64; BUCKETS] {
     out
 }
 
-/// The whole render. Silence draws nothing at all: a flat line along the
-/// baseline would claim a measurement of zero, and an environment that has
-/// only just appeared has no history rather than a history of nothing.
+/// The whole render. Silence draws the box and nothing in it: a flat line
+/// along the baseline would claim a measurement of zero, and an
+/// environment that has only just appeared has no history rather than a
+/// history of nothing — but the frame still says a history will be drawn
+/// here.
 fn draw(
     area: &gtk::DrawingArea,
     cr: &gtk::cairo::Context,
@@ -173,49 +189,71 @@ fn draw(
     height: i32,
     samples: &[Count; BUCKETS],
 ) {
-    if width <= 1 || height <= 2 || activity::is_silent(samples) {
+    if width <= 1 || height <= 2 {
         return;
     }
     let colour = area.color();
+    let ink = |alpha: f64| {
+        cr.set_source_rgba(
+            f64::from(colour.red()),
+            f64::from(colour.green()),
+            f64::from(colour.blue()),
+            alpha * f64::from(colour.alpha()),
+        );
+    };
+    // The frame first, half a pixel in so its 1px stroke lands on one row
+    // of pixels, with a small radius so it reads as a card's edge rather
+    // than a table cell's.
+    {
+        let (l, t) = (0.5, 0.5);
+        let (r, b) = (f64::from(width) - 0.5, f64::from(height) - 0.5);
+        let rad = BOX_RADIUS;
+        let quarter = std::f64::consts::FRAC_PI_2;
+        cr.new_sub_path();
+        cr.arc(r - rad, t + rad, rad, -quarter, 0.0);
+        cr.arc(r - rad, b - rad, rad, 0.0, quarter);
+        cr.arc(l + rad, b - rad, rad, quarter, 2.0 * quarter);
+        cr.arc(l + rad, t + rad, rad, 2.0 * quarter, 3.0 * quarter);
+        cr.close_path();
+        ink(BOX_ALPHA);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+    }
+    if activity::is_silent(samples) {
+        return;
+    }
     // The scale is taken from the RAW counts, not the shaped ones: the
     // shaping never raises a peak, so both agree on a busy series — and
     // taking it from the raw ones keeps the floor ([`activity::MIN_SCALE`])
     // meaning what it has always meant.
     let scale = f64::from(activity::scale(samples));
     let shape = shaped(samples);
-    // Half a pixel in from each edge: a 1px stroke centred on an integer
-    // coordinate straddles two rows of pixels and renders grey.
-    let top = 1.5;
-    let bottom = f64::from(height) - 1.5;
+    // Inside the frame, on half-pixel coordinates: a 1px stroke centred
+    // on an integer coordinate straddles two rows of pixels and renders
+    // grey.
+    let left = INSET;
+    let right = f64::from(width) - INSET;
+    let top = INSET;
+    let bottom = f64::from(height) - INSET;
     let span = bottom - top;
-    let step = f64::from(width - 1) / (BUCKETS - 1) as f64;
+    let step = (right - left) / (BUCKETS - 1) as f64;
     let point = |index: usize| {
         let value = shape[index] / scale;
-        (index as f64 * step, bottom - value.min(1.0) * span)
+        (left + index as f64 * step, bottom - value.min(1.0) * span)
     };
 
     // The body first, so the line sits on top of its own fill.
-    cr.set_source_rgba(
-        f64::from(colour.red()),
-        f64::from(colour.green()),
-        f64::from(colour.blue()),
-        FILL_ALPHA * f64::from(colour.alpha()),
-    );
-    cr.move_to(0.0, bottom);
+    ink(FILL_ALPHA);
+    cr.move_to(left, bottom);
     for index in 0..BUCKETS {
         let (x, y) = point(index);
         cr.line_to(x, y);
     }
-    cr.line_to(f64::from(width - 1), bottom);
+    cr.line_to(right, bottom);
     cr.close_path();
     let _ = cr.fill();
 
-    cr.set_source_rgba(
-        f64::from(colour.red()),
-        f64::from(colour.green()),
-        f64::from(colour.blue()),
-        LINE_ALPHA * f64::from(colour.alpha()),
-    );
+    ink(LINE_ALPHA);
     cr.set_line_width(1.0);
     cr.set_line_join(gtk::cairo::LineJoin::Round);
     // Only where something happened. A polyline through the zeros draws a

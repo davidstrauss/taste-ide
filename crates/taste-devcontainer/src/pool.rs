@@ -146,17 +146,7 @@ impl Pool {
             .unwrap_or(0);
         let vm = match vms.into_iter().nth(preferred) {
             Some(vm) => vm,
-            None => {
-                let sizing = Sizing::for_host();
-                self.check_room(&sizing).await?;
-                self.libvirt
-                    .create(&self.workspace_root, &sizing, report)
-                    .await
-                    .map_err(|error| PoolError::Failed {
-                        domain: None,
-                        error,
-                    })?
-            }
+            None => self.make_one(report).await?,
         };
         let facts = self
             .libvirt
@@ -167,6 +157,26 @@ impl Pool {
                 error,
             })?;
         Ok((vm, facts))
+    }
+
+    /// One more VM for the pool, whatever the pool holds: sized for the
+    /// host, refused when the host has no room for it, defined and
+    /// started. What a Rebuild makes before it places anything, so a
+    /// rebuild always ends with a replacement; the other callers make one
+    /// only when nothing in the pool has room.
+    pub async fn make_one(
+        &self,
+        report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
+    ) -> std::result::Result<Vm, PoolError> {
+        let sizing = Sizing::for_host();
+        self.check_room(&sizing).await?;
+        self.libvirt
+            .create(&self.workspace_root, &sizing, report)
+            .await
+            .map_err(|error| PoolError::Failed {
+                domain: None,
+                error,
+            })
     }
 
     /// A VM for one more environment, chosen by fit.

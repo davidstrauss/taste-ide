@@ -615,12 +615,42 @@ impl EnvironmentRegistry {
     /// Replace a VM of the pool with a fresh one from the pinned image,
     /// and put its environments back into it: the Resources row's Rebuild,
     /// and the restore path run on purpose (docs/ENVIRONMENTS.md →
-    /// "VMs are cattle"). The containers in it stop, the domain and its
-    /// disk go, its keeper and substrate are forgotten, and `reconcile`
-    /// makes a new VM, seeds the primary from the folder (its last snapshot
-    /// restored when the folder is clean), and places every orphaned
-    /// environment anew from its peer and snapshot.
+    /// "VMs are cattle"). The VM goes ([`Self::delete_vm`]'s teardown), a
+    /// new one is made before anything is placed — so a rebuild always
+    /// ends with a replacement, where a delete ends with one only when
+    /// what lived in the old VM has nowhere else to go — and `reconcile`
+    /// seeds the primary from the folder (its last snapshot restored when
+    /// the folder is clean) and places every orphaned environment anew
+    /// from its peer and snapshot.
     pub async fn rebuild_vm(self: &Arc<Self>, domain: &str) -> Result<()> {
+        let pool = self.tear_down_vm(domain).await?;
+        // The image is on this host already — a VM just ran from it — so
+        // the fetch report has nothing to say and goes nowhere.
+        if let Err(e) = pool.make_one(Arc::new(|_| {})).await {
+            tracing::warn!("the replacement VM was not made: {e:?}; reconcile places what it can");
+        }
+        self.reconcile().await;
+        Ok(())
+    }
+
+    /// Remove a VM of the pool for good: the Resources row's Delete
+    /// (David, 2026-09-21: "give me deletion for the VM, too"). The
+    /// containers in it stop, the domain and its disk go, and `reconcile`
+    /// places what lived in it across the pool's other VMs — making a new
+    /// one only when the primary, or an orphan, has no room anywhere else,
+    /// since the primary always lives somewhere.
+    pub async fn delete_vm(self: &Arc<Self>, domain: &str) -> Result<()> {
+        self.tear_down_vm(domain).await?;
+        self.reconcile().await;
+        Ok(())
+    }
+
+    /// The teardown Rebuild and Delete share: the containers in the VM
+    /// stop, the domain and its disk go, its keeper and substrate are
+    /// forgotten, and the primary's pin is cleared when it named this VM,
+    /// so the ladder picks afresh and the placement pins the new one.
+    /// Returns the pool, for whatever the caller makes next.
+    async fn tear_down_vm(self: &Arc<Self>, domain: &str) -> Result<crate::pool::Pool> {
         for supervisor in self.list() {
             if supervisor.checkout().vm() == Some(domain) {
                 let _ = supervisor.stop().await;
@@ -641,15 +671,12 @@ impl EnvironmentRegistry {
         if self.substrate().vm_details().map(|v| v.domain.as_str()) == Some(domain) {
             *self.substrate.lock().unwrap() = Arc::new(Substrate::unresolved());
         }
-        // The primary's pin named the VM that is gone; the ladder picks
-        // afresh and the placement pins the new one.
         if pinned_primary_vm(&self.workspace_root).as_deref() == Some(domain) {
             let pin = environment::env_dir(&self.workspace_root, &EnvironmentId::primary())
                 .join(Placement::FILE);
             let _ = std::fs::remove_file(pin);
         }
-        self.reconcile().await;
-        Ok(())
+        Ok(pool)
     }
 
     /// Every VM of the pool the registry has brought up, by domain: what
@@ -662,6 +689,47 @@ impl EnvironmentRegistry {
             }
         }
         domains
+    }
+
+    /// Every VM of the pool as a Resources row, whether or not the ladder
+    /// has resolved onto it. The row exists from the moment the domain
+    /// does, so a VM that is still booting is on the list while the banner
+    /// says it is (David, 2026-09-21: "I should already see the VM in
+    /// resources at this stage"). A VM the registry has brought up says
+    /// what it costs, in `VmFacts::summary`'s words; one it has not says
+    /// where libvirt has it. The words matter: the console reads the
+    /// row's state from them (`stopped`, `shut off`) because a render on
+    /// the main thread cannot ask libvirt.
+    pub async fn pool_resources(&self) -> Vec<crate::supervisor::ResourceInfo> {
+        use crate::provision::DomainState;
+        use crate::supervisor::{ResourceInfo, ResourceKind};
+        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let Ok(vms) = pool.vms().await else {
+            return Vec::new();
+        };
+        vms.into_iter()
+            .map(|vm| {
+                let brought_up = self
+                    .substrate_of_vm(&vm.domain)
+                    .and_then(|substrate| substrate.vm_facts().cloned())
+                    // The facts are the registry's memory of the VM; when
+                    // libvirt disagrees about whether it runs, libvirt is
+                    // right and the memory is stale.
+                    .filter(|facts| facts.running == (vm.state == DomainState::Running));
+                let status = match (brought_up, &vm.state) {
+                    (Some(facts), _) => facts.summary(),
+                    (None, DomainState::Running) => "booting — not answering yet".into(),
+                    (None, DomainState::ShutOff) => "shut off".into(),
+                    (None, DomainState::Other(state)) => state.clone(),
+                };
+                ResourceInfo {
+                    kind: ResourceKind::Substrate,
+                    name: vm.domain.clone(),
+                    id: vm.domain,
+                    status,
+                }
+            })
+            .collect()
     }
 
     /// Reconnect every files service that has died: a new keeper for each

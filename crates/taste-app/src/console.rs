@@ -291,18 +291,34 @@ impl VmGraphs {
     fn new() -> Self {
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         widget.set_valign(gtk::Align::Center);
-        let make = |what: &str| {
+        // Each graph behind a glyph saying which resource it is (David,
+        // 2026-09-21: "precede each one with an icon representing the
+        // resource"): four boxed lines in a row are four boxed lines, and
+        // a tooltip is not a legend. The chip and the memory module are
+        // the project's own (`data/icons`); the disk and the wire are the
+        // platform's.
+        let make = |what: &str, icon: &str| {
+            let pair = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+            pair.set_valign(gtk::Align::Center);
+            let glyph = gtk::Image::builder()
+                .icon_name(icon)
+                .pixel_size(12)
+                .css_classes(["dim-label"])
+                .valign(gtk::Align::Center)
+                .build();
+            pair.append(&glyph);
             let sparkline = crate::sparkline::Sparkline::new();
             sparkline.widget.set_can_target(true);
             sparkline.widget.set_tooltip_text(Some(what));
-            widget.append(&sparkline.widget);
+            pair.append(&sparkline.widget);
+            widget.append(&pair);
             sparkline
         };
         Self {
-            cpu: make("CPU"),
-            memory: make("Memory"),
-            disk: make("Disk"),
-            network: make("Network"),
+            cpu: make("CPU", "taste-cpu-symbolic"),
+            memory: make("Memory", "taste-memory-symbolic"),
+            disk: make("Disk", "drive-harddisk-symbolic"),
+            network: make("Network", "network-wired-symbolic"),
             widget,
         }
     }
@@ -2288,10 +2304,28 @@ impl Console {
             return;
         };
         let weak = Rc::downgrade(self);
+        let registry = self.environments.clone();
         glib::spawn_future_local(async move {
-            let handle =
-                crate::runtime::runtime().spawn(async move { supervisor.list_resources().await });
-            let Ok(resources) = handle.await else { return };
+            let handle = crate::runtime::runtime().spawn(async move {
+                let own = supervisor.list_resources().await;
+                let pool = registry.pool_resources().await;
+                (own, pool)
+            });
+            let Ok((mut resources, pool)) = handle.await else {
+                return;
+            };
+            // The pool's VMs the environment's own listing did not name:
+            // the ones it is not on, and every one of them while the
+            // ladder is still resolving — which is when the user most
+            // wants to see the VM that the banner says is coming up.
+            for vm in pool {
+                let named = resources
+                    .iter()
+                    .any(|r| r.kind == ResourceKind::Substrate && r.name == vm.name);
+                if !named {
+                    resources.push(vm);
+                }
+            }
             let Some(console) = weak.upgrade() else {
                 return;
             };
@@ -2363,14 +2397,14 @@ impl Console {
         self.host().set_selected_page(&self.resources_page);
     }
 
-    /// A VM row's button: start and stop run at once, rebuild behind the
-    /// same confirmation the rows' destructive actions use. Each ends in a
-    /// refresh, so the row's state and buttons follow.
+    /// A VM row's button: start and stop run at once; rebuild and delete
+    /// run once their hold has completed, which is the confirmation the
+    /// backlog's destructive actions use, and never a dialog. Each ends in
+    /// a refresh, so the row's state and buttons follow.
     fn run_vm_action(self: &Rc<Self>, action: &str, domain: &str) {
         let registry = self.environments.clone();
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
-        let title = format!("Rebuild {domain}?");
         let domain = domain.to_string();
         let run = move |what: &'static str| {
             let registry = registry.clone();
@@ -2381,6 +2415,7 @@ impl Console {
                 match what {
                     "start" => registry.start_vm(&domain).await,
                     "stop" => registry.stop_vm(&domain).await,
+                    "delete" => registry.delete_vm(&domain).await,
                     _ => registry.rebuild_vm(&domain).await,
                 }
             });
@@ -2402,15 +2437,42 @@ impl Console {
         match action {
             "start" => run("start"),
             "stop" => run("stop"),
-            _ => self.clone().confirm_destructive(
-                &title,
-                "Discards the VM and its disk and makes a fresh one from the pinned image. \
-                 Every environment in it is placed anew from this machine's copy and its \
-                 last snapshot; their containers stop and rebuild.",
-                "Rebuild",
-                move || run("rebuild"),
-            ),
+            "delete" => run("delete"),
+            _ => run("rebuild"),
         }
+    }
+
+    /// A VM row's hold-to-confirm button, wired to one of its actions: the
+    /// completed hold runs it, an early release explains itself in a
+    /// toast, as the backlog's do.
+    fn vm_hold_button(
+        self: &Rc<Self>,
+        icon: &str,
+        tip: &str,
+        action: &'static str,
+        domain: &str,
+    ) -> Rc<crate::holdbutton::HoldButton> {
+        let button = crate::holdbutton::HoldButton::new(icon, tip);
+        // Flat, like the plain buttons on the row, so the three read as
+        // one set.
+        button.widget.add_css_class("flat");
+        button.widget.set_valign(gtk::Align::Center);
+        {
+            let weak = Rc::downgrade(self);
+            let domain = domain.to_string();
+            button.set_on_confirm(move || {
+                if let Some(console) = weak.upgrade() {
+                    console.run_vm_action(action, &domain);
+                }
+            });
+        }
+        {
+            let events = self.workspace.events.clone();
+            button.set_on_early_release(move |note| {
+                events.publish(taste_core::Event::Toast(note));
+            });
+        }
+        button
     }
 
     /// The tick's: every metered VM's last five minutes, onto its row's
@@ -2460,10 +2522,13 @@ impl Console {
                 }
             }
         };
-        let mut ordered: Vec<&ResourceInfo> = resources
+        // The first VM is this environment's — its own listing names it
+        // first — and what it runs stands under it; the pool's other VMs
+        // are roots of their own, after.
+        let mut substrates = resources
             .iter()
-            .filter(|r| r.kind == ResourceKind::Substrate)
-            .collect();
+            .filter(|r| r.kind == ResourceKind::Substrate);
+        let mut ordered: Vec<&ResourceInfo> = substrates.next().into_iter().collect();
         for container in resources
             .iter()
             .filter(|r| r.kind == ResourceKind::Container)
@@ -2474,6 +2539,7 @@ impl Console {
             ordered.extend(resources.iter().filter(|r| r.kind == ResourceKind::Image));
             ordered.extend(resources.iter().filter(|r| r.kind == ResourceKind::Volume));
         }
+        ordered.extend(substrates);
         // Anything not claimed above (base images; everything, when no
         // container runs).
         let claimed: Vec<(ResourceKind, String)> =
@@ -2498,11 +2564,30 @@ impl Console {
                 ResourceKind::Volume => "folder-symbolic",
                 ResourceKind::Substrate => "computer-symbolic",
             });
+            // The glyph names its kind on hover: four glyphs in a tree are
+            // a legend nobody was given (David, 2026-09-21: "every type in
+            // resources should have the icon provide a tooltip with the
+            // actual resource type name").
+            icon.set_tooltip_text(Some(match resource.kind {
+                ResourceKind::Container => "Container",
+                ResourceKind::Image => "Image",
+                ResourceKind::Volume => "Volume",
+                ResourceKind::Substrate => "Virtual machine",
+            }));
+            // The name takes what is left, and asks for little: a VM's
+            // row carries four graphs and three buttons, and at the
+            // strip's narrowest rung a fourteen-character floor pushed the
+            // list past the pane and clipped the buttons off its edge. The
+            // whole name is on hover.
             let name = gtk::Label::builder()
                 .label(&resource.name)
                 .xalign(0.0)
                 .hexpand(true)
-                .width_chars(14)
+                .width_chars(if resource.kind == ResourceKind::Substrate {
+                    6
+                } else {
+                    14
+                })
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .build()
                 .full_text_on_hover();
@@ -2555,11 +2640,36 @@ impl Console {
             // (David, 2026-09-21: "start/stop/rebuild buttons on the VM
             // resource, too").
             if resource.kind == ResourceKind::Substrate {
-                let running = self
-                    .environments
-                    .substrate_of_vm(&resource.name)
-                    .and_then(|s| s.vm_facts().map(|facts| facts.running))
-                    .unwrap_or(true);
+                // From the row's own words, not from libvirt: this is the
+                // main thread, and the words are ours
+                // (`VmFacts::summary`, `EnvironmentRegistry::pool_resources`).
+                let running = !(resource.status.starts_with("stopped")
+                    || resource.status.starts_with("shut off"));
+                // The backlog's transport controls, to the glyph and the
+                // size: play, stop, and record for rebuild, each a
+                // fourteen-pixel dimmed glyph in a flat button of the
+                // toolbar's normal size — the intervention bar's, not the
+                // header's 20px tuck — so it stands level with the held
+                // buttons beside it (David, 2026-09-21: "the same
+                // play/stop/'record' scheme as the backlog"; "I'd like
+                // this to line up"). Not `view-refresh-symbolic` for the
+                // rebuild — backlog.rs says why: it is Refresh's glyph,
+                // and one glyph for "re-read" and "rebuild" is worse than
+                // none.
+                let action_button = |icon: &str, tip: &str| {
+                    gtk::Button::builder()
+                        .child(
+                            &gtk::Image::builder()
+                                .icon_name(icon)
+                                .css_classes(["dim-label"])
+                                .pixel_size(14)
+                                .build(),
+                        )
+                        .css_classes(["flat"])
+                        .tooltip_text(tip)
+                        .valign(gtk::Align::Center)
+                        .build()
+                };
                 let (icon, tip, action) = if running {
                     (
                         "media-playback-stop-symbolic",
@@ -2573,11 +2683,7 @@ impl Console {
                         "start",
                     )
                 };
-                let toggle = gtk::Button::builder()
-                    .icon_name(icon)
-                    .tooltip_text(tip)
-                    .css_classes(["flat"])
-                    .build();
+                let toggle = action_button(icon, tip);
                 {
                     let weak = Rc::downgrade(self);
                     let domain = resource.name.clone();
@@ -2588,36 +2694,53 @@ impl Console {
                     });
                 }
                 row.append(&toggle);
-                let rebuild = gtk::Button::builder()
-                    .icon_name("view-refresh-symbolic")
-                    .tooltip_text(
-                        "Rebuild the VM from the pinned image — its environments are placed \
-                         anew from this machine's copies and their last snapshots",
-                    )
-                    .css_classes(["flat"])
-                    .build();
-                {
-                    let weak = Rc::downgrade(self);
-                    let domain = resource.name.clone();
-                    rebuild.connect_clicked(move |_| {
-                        if let Some(console) = weak.upgrade() {
-                            console.run_vm_action("rebuild", &domain);
-                        }
-                    });
-                }
-                row.append(&rebuild);
+                // Rebuild and Delete both discard the VM and its disk, so
+                // both are held to confirm, the way the backlog's destroy
+                // and delete are. They differ in what comes after: a
+                // rebuild makes a fresh VM before placing anything, a
+                // delete places what lived here across the pool's other
+                // VMs and makes one only when nothing else has room.
+                let rebuild = self.vm_hold_button(
+                    "media-record-symbolic",
+                    "Rebuild the VM from the pinned image — its environments are placed \
+                     anew in the fresh one from this machine's copies and their last \
+                     snapshots. Hold to confirm.",
+                    "rebuild",
+                    &resource.name,
+                );
+                row.append(&rebuild.widget);
+                let delete = self.vm_hold_button(
+                    "user-trash-symbolic",
+                    "Delete the VM and its disk — its environments move to the pool's \
+                     other VMs from this machine's copies and their last snapshots, or \
+                     to a new one when nothing else has room. Hold to confirm.",
+                    "delete",
+                    &resource.name,
+                );
+                row.append(&delete.widget);
             }
 
-            // Volumes are caches with their own (guarded) removal.
+            // Volumes are caches with their own removal, held to confirm
+            // like every destructive button here and on the backlog — the
+            // ring fills, an early release explains itself in a toast, and
+            // no dialog (David, 2026-09-21: "all the deletion buttons under
+            // resources use the 'hold to confirm' model").
             if resource.kind == ResourceKind::Volume && resource.status == "present" {
-                let delete = gtk::Button::builder()
-                    .icon_name("user-trash-symbolic")
-                    .tooltip_text("Remove this volume (cache contents are lost)")
-                    .css_classes(["flat"])
-                    .build();
+                let delete = crate::holdbutton::HoldButton::new(
+                    "user-trash-symbolic",
+                    "Remove this volume — its cached contents are lost. Hold to confirm.",
+                );
+                delete.widget.add_css_class("flat");
+                delete.widget.set_valign(gtk::Align::Center);
+                {
+                    let events = self.workspace.events.clone();
+                    delete.set_on_early_release(move |note| {
+                        events.publish(taste_core::Event::Toast(note));
+                    });
+                }
                 let weak = Rc::downgrade(self);
                 let volume = resource.name.clone();
-                delete.connect_clicked(move |_| {
+                delete.set_on_confirm(move || {
                     let Some(console) = weak.upgrade() else {
                         return;
                     };
@@ -2626,32 +2749,22 @@ impl Console {
                     };
                     let volume = volume.clone();
                     let weak_refresh = Rc::downgrade(&console);
-                    console.clone().confirm_destructive(
-                        "Remove volume?",
-                        &format!("Volume “{volume}” and its cached contents will be deleted."),
-                        "Delete",
-                        move || {
-                            let supervisor = supervisor.clone();
-                            let volume = volume.clone();
-                            let weak_refresh = weak_refresh.clone();
-                            let events = console.workspace.events.clone();
-                            let handle = crate::runtime::runtime().spawn(async move {
-                                if let Err(e) = supervisor.remove_volume(&volume).await {
-                                    events.publish(taste_core::Event::Toast(format!(
-                                        "Volume removal failed: {e}"
-                                    )));
-                                }
-                            });
-                            glib::spawn_future_local(async move {
-                                let _ = handle.await;
-                                if let Some(console) = weak_refresh.upgrade() {
-                                    console.refresh_resources();
-                                }
-                            });
-                        },
-                    );
+                    let events = console.workspace.events.clone();
+                    let handle = crate::runtime::runtime().spawn(async move {
+                        if let Err(e) = supervisor.remove_volume(&volume).await {
+                            events.publish(taste_core::Event::Toast(format!(
+                                "Volume removal failed: {e}"
+                            )));
+                        }
+                    });
+                    glib::spawn_future_local(async move {
+                        let _ = handle.await;
+                        if let Some(console) = weak_refresh.upgrade() {
+                            console.refresh_resources();
+                        }
+                    });
                 });
-                row.append(&delete);
+                row.append(&delete.widget);
             }
             self.resources_list.append(&row);
         }

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A memory module, for the VM row's memory graph: a stick with three
+     chips on it and a comb of pins along its lower edge. The chips are
+     holes in the stick (even-odd) so the glyph is one colour; the pins
+     are the part that says "memory" rather than "a box with squares". -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="#241f31">
+    <path fill-rule="evenodd" d="M1.5 4 A0.75 0.75 0 0 0 0.75 4.75 V10.25 A0.75 0.75 0 0 0 1.5 11 H14.5 A0.75 0.75 0 0 0 15.25 10.25 V4.75 A0.75 0.75 0 0 0 14.5 4 Z M2.5 6 H5.5 V9 H2.5 Z M6.5 6 H9.5 V9 H6.5 Z M10.5 6 H13.5 V9 H10.5 Z"/>
+    <path d="M2 11 H3 V12.5 H2 Z M4 11 H5 V12.5 H4 Z M6 11 H7 V12.5 H6 Z M8 11 H9 V12.5 H8 Z M10 11 H11 V12.5 H10 Z M12 11 H13 V12.5 H12 Z M14 11 H15 V12.5 H14 Z"/>
+  </g>
+</svg>
