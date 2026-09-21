@@ -72,11 +72,27 @@ impl Route {
 /// replaces this one rather than adding a row, and the note.
 pub type Notice = Arc<dyn Fn(Option<&str>, Option<&str>, String) + Send + Sync>;
 
-/// One host's run of wake-ups that did not bring it up.
+/// One host's run of wake-ups that did not bring it up. `first` is when
+/// the first attempt STARTED, so the run's length counts the waiting; and
+/// one attempt is in flight at a time, so the agent's parallel retries
+/// share it rather than each sending a packet and each counting (a run
+/// that read "has not answered in 1s despite 14 wake-ups" was fourteen
+/// requests waiting side by side, 2026-09-21).
 #[derive(Debug, Clone, Copy)]
 struct WakeRun {
     first: std::time::Instant,
     attempts: u32,
+    in_flight: bool,
+}
+
+/// Where a request stands before it would wake a host.
+enum WakeVerdict {
+    /// Send one more wake-up: this attempt's number and the run's length.
+    Try(crate::wake::Attempts),
+    /// Another request's wake-up is under way; wait for its outcome.
+    InFlight,
+    /// The run is over; the sentence that ends it.
+    GaveUp(String),
 }
 
 /// Where the proxy says the account's model listing changed: the newest
@@ -258,38 +274,44 @@ impl ProxyState {
     /// `Err` with the give-up sentence when the run has gone on long
     /// enough that the IDE stops trying, `Ok` with this attempt's number
     /// and the time since the first otherwise.
-    fn wake_attempt(&self, host: &str) -> Result<crate::wake::Attempts, String> {
+    fn wake_attempt(&self, host: &str) -> WakeVerdict {
         let now = std::time::Instant::now();
-        let runs = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.get(host) {
-            None => Ok(crate::wake::Attempts {
-                attempt: 1,
-                since: Duration::ZERO,
-            }),
-            Some(run) => {
-                let since = now.duration_since(run.first);
-                if since >= crate::wake::GIVE_UP_AFTER
-                    || run.attempts >= crate::wake::GIVE_UP_ATTEMPTS
-                {
-                    Err(crate::wake::gave_up_note(host, run.attempts, since))
-                } else {
-                    Ok(crate::wake::Attempts {
-                        attempt: run.attempts + 1,
-                        since,
-                    })
-                }
-            }
+        let mut runs = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
+        let run = runs.entry(host.to_string()).or_insert(WakeRun {
+            first: now,
+            attempts: 0,
+            in_flight: false,
+        });
+        let since = now.duration_since(run.first);
+        if since >= crate::wake::GIVE_UP_AFTER || run.attempts >= crate::wake::GIVE_UP_ATTEMPTS {
+            return WakeVerdict::GaveUp(crate::wake::gave_up_note(host, run.attempts, since));
+        }
+        if run.in_flight {
+            return WakeVerdict::InFlight;
+        }
+        run.in_flight = true;
+        WakeVerdict::Try(crate::wake::Attempts {
+            attempt: run.attempts + 1,
+            since,
+        })
+    }
+
+    /// The wake-up in flight for `host` did not bring it up.
+    fn wake_failed(&self, host: &str) {
+        let mut runs = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(run) = runs.get_mut(host) {
+            run.attempts += 1;
+            run.in_flight = false;
         }
     }
 
-    /// One more wake-up for `host` did not bring it up.
-    fn wake_failed(&self, host: &str) {
-        let mut runs = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
-        let run = runs.entry(host.to_string()).or_insert(WakeRun {
-            first: std::time::Instant::now(),
-            attempts: 0,
-        });
-        run.attempts += 1;
+    /// Whether a wake-up for `host` is under way.
+    fn wake_in_flight(&self, host: &str) -> bool {
+        self.wakes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(host)
+            .is_some_and(|run| run.in_flight)
     }
 
     /// `host` answered, or the user asked for a fresh start: the run is
@@ -1215,34 +1237,57 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         // One row in the chat per host, counting up, rather than a row per
         // retry the agent makes.
         let key = format!("wake:{host}");
-        let attempts = match state.wake_attempt(&host) {
-            Ok(attempts) => attempts,
-            Err(gave_up) => {
-                state.notify(Some(&env), Some(&key), gave_up.clone());
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    &format!("taste-ide auth proxy: {gave_up}"),
-                );
+        // A host that answers needs none of this; one that does not gets
+        // one wake-up at a time, whatever the agent's retries do in
+        // parallel — the others wait on the same attempt and read the
+        // same outcome.
+        if !crate::wake::reachable(&target).await {
+            loop {
+                match state.wake_attempt(&host) {
+                    WakeVerdict::GaveUp(gave_up) => {
+                        state.notify(Some(&env), Some(&key), gave_up.clone());
+                        return error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "api_error",
+                            &format!("taste-ide auth proxy: {gave_up}"),
+                        );
+                    }
+                    WakeVerdict::InFlight => {
+                        while state.wake_in_flight(&host) {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        if crate::wake::reachable(&target).await {
+                            break;
+                        }
+                        // The shared attempt failed: this request reads the
+                        // run's verdict rather than sending its own.
+                        continue;
+                    }
+                    WakeVerdict::Try(attempts) => {
+                        let outcome = crate::wake::ensure_awake(
+                            &target,
+                            path,
+                            state.wake_wait(),
+                            attempts,
+                            &|text| state.notify(Some(&env), Some(&key), text),
+                        )
+                        .await;
+                        if outcome.reached() {
+                            state.wake_reset(&host);
+                            break;
+                        }
+                        state.wake_failed(&host);
+                        return error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "api_error",
+                            &format!(
+                                "taste-ide auth proxy: {}",
+                                outcome.note(&host).unwrap_or_default()
+                            ),
+                        );
+                    }
+                }
             }
-        };
-        let outcome =
-            crate::wake::ensure_awake(&target, path, state.wake_wait(), attempts, &|text| {
-                state.notify(Some(&env), Some(&key), text)
-            })
-            .await;
-        if outcome.reached() {
-            state.wake_reset(&host);
-        } else {
-            state.wake_failed(&host);
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                &format!(
-                    "taste-ide auth proxy: {}",
-                    outcome.note(&host).unwrap_or_default()
-                ),
-            );
         }
     }
 
