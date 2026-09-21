@@ -656,7 +656,14 @@ impl DevcontainerBanner {
                 // The baseline itself did not come up (a project image that
                 // fails hands over to the baseline instead): the message is
                 // the log's, and the strip stays short.
-                tracing::warn!("environment failed: {message}");
+                // An environment that will not start is an error, not a
+                // warning (David, 2026-09-21: "That's not just a warning").
+                tracing::error!("environment failed: {message}");
+                taste_core::app_log::push(
+                    "error",
+                    "environments",
+                    &format!("environment failed: {message}"),
+                );
                 // The one failed-build face, whichever rung failed: the
                 // log, and the agent handed the repair (David, 2026-09-16:
                 // "use the same banner as the other failure to minimize

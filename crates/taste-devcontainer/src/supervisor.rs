@@ -2303,9 +2303,12 @@ impl Supervisor {
         // `.devcontainer/` is not a config (`DevcontainerConfig::discover`
         // reads files, not directories), so nothing else changes.
         if authority == ConfigAuthority::Baseline {
+            // The checkout where it is NOW — the identity's is where it
+            // started, which for a placed primary is a folder the VM does
+            // not have (the first launch after the move failed here with
+            // `statfs …/.devcontainer: no such file or directory`).
             let source = self
-                .env
-                .checkout
+                .checkout()
                 .path()
                 .join(".devcontainer")
                 .display()
