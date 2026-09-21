@@ -820,7 +820,9 @@ impl EnvironmentRegistry {
         let path = crate::provision::guest_checkout_path(&peer, &EnvironmentId::primary());
         let keys = crate::keys::Keys::for_workspace(&peer);
         let sync = if files.exists(&path.join(".git")) {
-            Some(crate::peer::sync_primary_peer(&peer, vm, &keys, &path)?)
+            Some(crate::peer::sync_primary_peer(
+                &peer, vm, &keys, &files, &path,
+            )?)
         } else {
             let branch = host.branch_name().unwrap_or_else(|| "main".to_string());
             let workspace_dir = crate::provision::guest_workspace_dir(&peer);

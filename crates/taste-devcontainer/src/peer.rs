@@ -29,6 +29,8 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use taste_core::podman::host_argv;
 
+use taste_core::files::Files;
+
 use crate::keys::Keys;
 use crate::provision::{Vm, GUEST_USER};
 
@@ -122,12 +124,17 @@ pub const VM_BRANCH_NAMESPACE: &str = "refs/taste/vm/";
 /// had already synced once carried `refs/taste/vm/*` of its own, and the
 /// fetch refused to put both a branch and that ref on one name
 /// (2026-09-21: "Cannot fetch both refs/heads/X and refs/taste/vm/X").
-pub const PRIMARY_SYNC_REFSPECS: [&str; 4] = [
+pub const PRIMARY_SYNC_REFSPECS: [&str; 5] = [
     "+refs/heads/*:refs/taste/vm/*",
     "+refs/tags/*:refs/tags/*",
     "+refs/taste/*:refs/taste/*",
     "^refs/taste/vm/*",
+    "^refs/taste/peer/*",
 ];
+
+/// Where the folder's branch lands in the checkout while the checkout
+/// fast-forwards to it (`push_ahead_into_checkout`); deleted after.
+const PEER_STAGING: &str = "refs/taste/peer";
 
 /// The refspecs that seed a checkout in the VM from the user's folder:
 /// branches, tags, the IDE's refs (never the peer's own comparison
@@ -176,7 +183,13 @@ pub struct PeerSync {
 /// pushed into the checkout, which `receive.denyCurrentBranch=updateInstead`
 /// lets land when the checkout's tree is clean. Two sides that both moved
 /// are an ordinary divergence: named, and left for the person.
-pub fn sync_primary_peer(peer: &Path, vm: &Vm, keys: &Keys, path: &Path) -> Result<PeerSync> {
+pub fn sync_primary_peer(
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+) -> Result<PeerSync> {
     fetch_from_guest(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS)?;
     let git = taste_git::GitWorkspace::discover(peer)
         .with_context(|| format!("{} is not a git working tree", peer.display()))?;
@@ -215,14 +228,13 @@ pub fn sync_primary_peer(peer: &Path, vm: &Vm, keys: &Keys, path: &Path) -> Resu
                 }
             }
             (ahead, 0) if ahead > 0 => {
-                let refspec = format!("{local}:{local}");
-                match push_to_guest(peer, vm, keys, path, &[&refspec]) {
+                match push_ahead_into_checkout(peer, vm, keys, files, path, branch) {
                     Ok(()) => sync.pushed = true,
                     Err(e) => {
                         sync.host_ahead = ahead;
                         sync.note = Some(format!(
                             "this folder is {ahead} commit(s) ahead of the checkout in the VM, \
-                             which would not take them ({e:#})"
+                             which would not take them: {e:#}"
                         ));
                     }
                 }
@@ -238,6 +250,70 @@ pub fn sync_primary_peer(peer: &Path, vm: &Vm, keys: &Keys, path: &Path) -> Resu
         }
     }
     Ok(sync)
+}
+
+/// Bring the checkout in the VM up to the folder's `branch`, which is
+/// ahead of it: the user committed here with another tool.
+///
+/// A plain push into the checked-out branch is what
+/// `receive.denyCurrentBranch=updateInstead` allows only when the
+/// checkout's working tree is clean, and a checkout in use is seldom
+/// clean — so the first launch after nine host-side commits refused with
+/// "would not take them" (2026-09-21). Instead the branch is pushed to a
+/// staging ref and the checkout fast-forwards to it ITSELF, its
+/// uncommitted work stashed around the move and put back after, the way
+/// `git pull --autostash` does. A stash that does not apply over the new
+/// commits is kept, and the note says so; a branch that is not a
+/// fast-forward is left alone, likewise.
+fn push_ahead_into_checkout(
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+    branch: &str,
+) -> Result<()> {
+    let staging = format!("{PEER_STAGING}/{branch}");
+    push_to_guest(
+        peer,
+        vm,
+        keys,
+        path,
+        &[&format!("+refs/heads/{branch}:{staging}")],
+    )?;
+    let script = format!(
+        r#"set -e
+staging='{staging}'
+branch='{branch}'
+cleanup() {{ git update-ref -d "$staging" 2>/dev/null || true; }}
+if ! git merge-base --is-ancestor "refs/heads/$branch" "$staging"; then
+  cleanup; echo "the checkout's $branch is not behind the folder's" >&2; exit 2
+fi
+if [ "$(git symbolic-ref --short -q HEAD)" != "$branch" ]; then
+  git update-ref "refs/heads/$branch" "$staging"; cleanup; exit 0
+fi
+stashed=0
+if [ -n "$(git status --porcelain)" ]; then
+  git stash push --include-untracked -q -m taste-ide-sync && stashed=1
+fi
+if ! git merge --ff-only -q "$staging"; then
+  [ "$stashed" = 1 ] && git stash pop -q || true
+  cleanup; echo "the checkout would not fast-forward to the folder's $branch" >&2; exit 3
+fi
+cleanup
+if [ "$stashed" = 1 ] && ! git stash pop -q; then
+  echo "the checkout's uncommitted changes do not apply over the folder's commits; they are kept in its stash (taste-ide-sync)" >&2
+  exit 4
+fi
+"#
+    );
+    let out = files
+        .exec(path, &["sh".into(), "-c".into(), script])
+        .with_context(|| format!("fast-forwarding {branch} in VM {}", vm.domain))?;
+    if !out.success() {
+        bail!("{}", out.stderr_utf8().trim());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

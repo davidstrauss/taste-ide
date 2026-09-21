@@ -1225,7 +1225,7 @@ impl Supervisor {
         // its own; an agent environment's is refs only, and takes the
         // checkout's word whole.
         if self.env.id.is_primary() {
-            crate::peer::sync_primary_peer(&self.env.peer, &vm_info, &keys, &path)?;
+            crate::peer::sync_primary_peer(&self.env.peer, &vm_info, &keys, &self.files(), &path)?;
         } else {
             crate::peer::fetch_from_guest(
                 &self.env.peer,
