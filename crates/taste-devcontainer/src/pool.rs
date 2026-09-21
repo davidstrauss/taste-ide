@@ -123,8 +123,10 @@ impl Pool {
         self.libvirt.list(&self.workspace_root).await
     }
 
-    /// A running VM for this workspace: the first of the pool, brought up,
-    /// or a new one when the pool is empty and the host has room.
+    /// A running VM for this workspace: the one the primary's checkout is
+    /// in when that is known (`registry::pinned_primary_vm`), else the
+    /// first of the pool, brought up, or a new one when the pool is empty
+    /// and the host has room.
     pub async fn ensure_one(
         &self,
         report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
@@ -137,7 +139,12 @@ impl Pool {
             .await
             .map_err(PoolError::Unavailable)?;
         let vms = self.vms().await.map_err(PoolError::Unavailable)?;
-        let vm = match vms.into_iter().next() {
+        let pinned = crate::registry::pinned_primary_vm(&self.workspace_root);
+        let preferred = vms
+            .iter()
+            .position(|vm| pinned.as_deref() == Some(vm.domain.as_str()))
+            .unwrap_or(0);
+        let vm = match vms.into_iter().nth(preferred) {
             Some(vm) => vm,
             None => {
                 let sizing = Sizing::for_host();

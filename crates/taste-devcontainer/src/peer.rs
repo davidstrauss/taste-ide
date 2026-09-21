@@ -116,20 +116,28 @@ pub const VM_BRANCH_NAMESPACE: &str = "refs/taste/vm/";
 
 /// The refspecs that bring a checkout's state home to a peer that is the
 /// user's own folder: branches into the comparison namespace (the folder
-/// has branches of its own), everything else in place.
-pub const PRIMARY_SYNC_REFSPECS: [&str; 3] = [
+/// has branches of its own), everything else in place — except the
+/// comparison namespace itself, which is the peer's and never the
+/// checkout's. Without that exclusion a checkout seeded from a peer that
+/// had already synced once carried `refs/taste/vm/*` of its own, and the
+/// fetch refused to put both a branch and that ref on one name
+/// (2026-09-21: "Cannot fetch both refs/heads/X and refs/taste/vm/X").
+pub const PRIMARY_SYNC_REFSPECS: [&str; 4] = [
     "+refs/heads/*:refs/taste/vm/*",
     "+refs/tags/*:refs/tags/*",
     "+refs/taste/*:refs/taste/*",
+    "^refs/taste/vm/*",
 ];
 
 /// The refspecs that seed a checkout in the VM from the user's folder:
-/// branches, tags, the IDE's refs, and the remote-tracking refs the sync
-/// flow rebases onto over there.
-pub const PRIMARY_SEED_REFSPECS: [&str; 4] = [
+/// branches, tags, the IDE's refs (never the peer's own comparison
+/// namespace), and the remote-tracking refs the sync flow rebases onto
+/// over there.
+pub const PRIMARY_SEED_REFSPECS: [&str; 5] = [
     "+refs/heads/*:refs/heads/*",
     "+refs/tags/*:refs/tags/*",
     "+refs/taste/*:refs/taste/*",
+    "^refs/taste/vm/*",
     "+refs/remotes/*:refs/remotes/*",
 ];
 
@@ -248,6 +256,16 @@ mod tests {
             guest_url(&vm, Path::new("/var/home/core/taste/799f/i-0001")),
             "ssh://core@127.0.0.1:40022/var/home/core/taste/799f/i-0001"
         );
+    }
+
+    /// The primary's refspecs keep the comparison namespace on the peer's
+    /// side only: it is neither seeded into the checkout nor fetched back
+    /// as an IDE ref, or a branch and its mirror would land on one name.
+    #[test]
+    fn the_comparison_namespace_never_crosses() {
+        assert!(PRIMARY_SEED_REFSPECS.contains(&"^refs/taste/vm/*"));
+        assert!(PRIMARY_SYNC_REFSPECS.contains(&"^refs/taste/vm/*"));
+        assert!(PRIMARY_SYNC_REFSPECS.contains(&"+refs/heads/*:refs/taste/vm/*"));
     }
 
     /// The refspecs are forced and cover branches, tags, and the IDE's own

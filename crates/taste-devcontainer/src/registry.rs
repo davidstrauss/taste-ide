@@ -231,6 +231,19 @@ impl Placement {
     }
 }
 
+/// The VM the primary's checkout was placed in, as recorded beside its
+/// environment directory — what the ladder prefers when the pool has
+/// several, so the primary stays where its checkout is rather than
+/// following whichever VM sorts first (2026-09-21: a second VM made for
+/// idle environments sorted first, and the primary was seeded anew there).
+pub fn pinned_primary_vm(workspace_root: &Path) -> Option<String> {
+    Placement::read(&environment::env_dir(
+        workspace_root,
+        &EnvironmentId::primary(),
+    ))
+    .map(|placement| placement.vm)
+}
+
 pub struct EnvironmentRegistry {
     workspace_root: PathBuf,
     events: EventBus,
@@ -894,6 +907,19 @@ impl EnvironmentRegistry {
             vm: vm.domain.clone(),
             path: path.clone(),
         };
+        // Pinned, so the next launch's ladder brings THIS VM up for the
+        // primary (`pinned_primary_vm`).
+        let pin_dir = environment::env_dir(&self.workspace_root, &EnvironmentId::primary());
+        if let Err(e) = std::fs::create_dir_all(&pin_dir).and_then(|()| {
+            Placement {
+                vm: vm.domain.clone(),
+                path: path.clone(),
+            }
+            .write(&pin_dir)
+            .map_err(std::io::Error::other)
+        }) {
+            tracing::warn!("recording the primary's placement: {e}");
+        }
         primary.set_checkout(checkout.clone());
         primary.set_substrate(self.substrate_for(&checkout));
         primary.set_keeper(keeper);
