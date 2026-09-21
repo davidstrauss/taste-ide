@@ -31,10 +31,12 @@ pub enum LogKind {
     /// The environment's build and lifecycle stream — the supervisor's
     /// ring, the same lines the console streamed while a build ran.
     Environment,
-    /// What the container itself writes: its main process's stdout and
-    /// stderr, followed with `podman logs` while it runs. The devcontainer
-    /// spec has no notion of a log to discover; this stream is the one
-    /// thing a container formally has.
+    /// What happens in the container: its main process's output, followed
+    /// with `podman logs` while it runs; podman's events about it — started,
+    /// died and how, OOM; and the commands agents run in it, with their
+    /// exits. The main process alone is `sleep infinity` for nearly every
+    /// devcontainer and says nothing, which is why the other two are here
+    /// (`Supervisor::sync_log_follower`).
     Container,
     /// The VM the environment runs in: the provisioner's steps as the IDE
     /// takes them, and the guest's own serial console as it boots
@@ -47,10 +49,15 @@ pub enum LogKind {
 }
 
 impl LogKind {
-    /// Every log, in the order the tree lists them.
+    /// Every log, in the order the tree lists them: from the deepest
+    /// layer under the desktop running the IDE to the shallowest — what
+    /// the container's own process writes, then the container's build and
+    /// lifecycle, then the VM the container is in, then the IDE itself
+    /// (David, 2026-09-21: "The order will be from deepest to shallowest
+    /// from the desktop system running the IDE").
     pub const ALL: [LogKind; 4] = [
-        LogKind::Environment,
         LogKind::Container,
+        LogKind::Environment,
         LogKind::Vm,
         LogKind::Ide,
     ];
@@ -69,7 +76,7 @@ impl LogKind {
     pub fn subtitle(self) -> &'static str {
         match self {
             LogKind::Environment => "Container build and lifecycle",
-            LogKind::Container => "What the container itself writes",
+            LogKind::Container => "What happens in the container",
             LogKind::Vm => "The VM's provisioning and boot console",
             LogKind::Ide => "The app's own warnings and tracing",
         }

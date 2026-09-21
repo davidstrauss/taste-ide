@@ -535,7 +535,9 @@ pub struct Supervisor {
     container_logs: Arc<Mutex<VecDeque<String>>>,
     /// The `podman logs --follow` task, alive exactly while the state is
     /// `Running`. Aborting it drops the child, which is killed with it.
-    log_follower: Mutex<Option<tokio::task::AbortHandle>>,
+    /// The runtime log's followers while the container runs: `podman logs`
+    /// and `podman events`, aborted together when it stops.
+    log_follower: Mutex<Vec<tokio::task::AbortHandle>>,
     /// Where to ask for this environment's `.devcontainer/` watch to be
     /// re-armed: the FLEET's one watcher, not this environment's.
     ///
@@ -826,7 +828,7 @@ impl Supervisor {
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
-            log_follower: Mutex::new(None),
+            log_follower: Mutex::new(Vec::new()),
             config_watch: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
             checkout: Mutex::new(checkout),
@@ -2004,32 +2006,42 @@ impl Supervisor {
         logs.iter().rev().take(n).rev().cloned().collect()
     }
 
-    /// Keep one `podman logs --follow` alive while the container runs, and
-    /// none otherwise. The devcontainer spec has no notion of a log to
-    /// discover; a container's main process's output is the one stream it
-    /// formally has, so that is what is followed — for a systemd image it
-    /// is the journal's console, for `sleep infinity` nothing at all, and
-    /// either is the truth about the container.
+    /// Keep the runtime log's followers alive while the container runs,
+    /// and none otherwise. Two streams, because the one the devcontainer
+    /// spec formally gives a container — its main process's output,
+    /// `podman logs --follow` — is empty for nearly every devcontainer:
+    /// `overrideCommand` is on by default and PID 1 is `sleep infinity`,
+    /// which writes nothing, ever (David, 2026-09-21: "I never see
+    /// anything in runtime logs"). So podman's own events about the
+    /// container are followed beside it — started, died with its exit
+    /// code, OOM-killed, an exec session that ended badly — and the
+    /// commands agents run in it are told here by the MCP server
+    /// (`ide_exec`). For a systemd image the first stream is the
+    /// journal's console, and it carries the rest of the story.
     fn sync_log_follower(&self, state: &SupervisorState) {
         let running = matches!(state, SupervisorState::Running { .. });
         let mut slot = self.log_follower.lock().unwrap();
         if !running {
-            if let Some(follower) = slot.take() {
+            for follower in slot.drain(..) {
                 follower.abort();
             }
             return;
         }
-        if slot
-            .as_ref()
-            .is_some_and(|follower| !follower.is_finished())
-        {
+        if slot.iter().any(|follower| !follower.is_finished()) {
             return;
         }
+        slot.clear();
         // Only where there is a runtime to follow on: a state set from a
         // test's thread has nobody to read the stream for it.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        self.push_container_output(
+            "[taste-ide] following the container: its main process's output, podman's events \
+             about it, and the commands agents run in it"
+                .to_string(),
+        );
+        slot.push(self.spawn_events_follower(&runtime));
         let args: Vec<String> = vec![
             "logs".into(),
             "--follow".into(),
@@ -2092,7 +2104,81 @@ impl Supervisor {
             tokio::join!(read(stdout, out), read_err(stderr, err));
             let _ = child.wait().await;
         });
-        *slot = Some(task.abort_handle());
+        slot.push(task.abort_handle());
+    }
+
+    /// One line into the runtime log's ring and onto the bus, from the
+    /// IDE's side of the container.
+    pub fn push_container_output(&self, line: String) {
+        {
+            let mut ring = self.container_logs.lock().unwrap();
+            if ring.len() >= LOG_RING_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(line.clone());
+        }
+        self.events.publish(Event::ContainerOutput {
+            env: self.env.id.clone(),
+            line,
+        });
+    }
+
+    /// `podman events --stream` for this container, into the runtime log:
+    /// the lifecycle podman sees — start, died with its exit code, oom,
+    /// kill, stop, restart, pause, health — and an exec session that ended
+    /// with a non-zero exit. Not every `exec` and `exec_died`: the IDE
+    /// itself execs into the container constantly (the files service, a
+    /// recheck, a probe), and a log of those is a log of the IDE.
+    fn spawn_events_follower(&self, runtime: &tokio::runtime::Handle) -> tokio::task::AbortHandle {
+        let args: Vec<String> = vec![
+            "events".into(),
+            "--stream".into(),
+            "--filter".into(),
+            format!("container={}", self.container_name()),
+            "--format".into(),
+            "json".into(),
+        ];
+        let mut command = self.podman(&args);
+        let ring = self.container_logs.clone();
+        let events = self.events.clone();
+        let env = self.env.id.clone();
+        let task = runtime.spawn(async move {
+            let mut child = match command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    tracing::debug!("{env}: podman events --stream did not start: {e}");
+                    return;
+                }
+            };
+            let Some(stdout) = child.stdout.take() else {
+                return;
+            };
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Some(line) = podman_event_line(&raw) else {
+                    continue;
+                };
+                {
+                    let mut ring = ring.lock().unwrap();
+                    if ring.len() >= LOG_RING_CAPACITY {
+                        ring.pop_front();
+                    }
+                    ring.push_back(line.clone());
+                }
+                events.publish(Event::ContainerOutput {
+                    env: env.clone(),
+                    line,
+                });
+            }
+            let _ = child.wait().await;
+        });
+        task.abort_handle()
     }
 
     fn set_pending(&self, pending: bool) {
@@ -3912,8 +3998,64 @@ fn parse_ports_label(value: &str) -> Vec<(u16, u16)> {
         .collect()
 }
 
+/// One `podman events --format json` record as a runtime-log line, or
+/// nothing for the statuses that are the IDE's own doing or say nothing:
+/// `exec` (every files-service call is one), `exec_died` that exited
+/// zero, `cleanup`, `attach`, and everything not about a container.
+fn podman_event_line(raw: &str) -> Option<String> {
+    let event: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if event.get("Type").and_then(|t| t.as_str()) != Some("container") {
+        return None;
+    }
+    let status = event.get("Status").and_then(|s| s.as_str())?;
+    let exit = event.get("ContainerExitCode").and_then(|c| c.as_i64());
+    let line = match status {
+        "start" => "[podman] container started".to_string(),
+        "died" => match exit {
+            Some(code) => format!("[podman] container died — exit {code}"),
+            None => "[podman] container died".to_string(),
+        },
+        "oom" => "[podman] container hit its memory limit (OOM)".to_string(),
+        "kill" => "[podman] container was sent a signal".to_string(),
+        "stop" => "[podman] container stopped".to_string(),
+        "restart" => "[podman] container restarted".to_string(),
+        "pause" => "[podman] container paused".to_string(),
+        "unpause" => "[podman] container unpaused".to_string(),
+        "health_status" => format!(
+            "[podman] health: {}",
+            event
+                .get("HealthStatus")
+                .and_then(|h| h.as_str())
+                .unwrap_or("reported")
+        ),
+        "exec_died" => match exit {
+            Some(code) if code != 0 => format!("[podman] an exec session ended with exit {code}"),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(line)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn podman_events_become_lines_only_when_they_say_something() {
+        let died = r#"{"ContainerExitCode":137,"Name":"x","Status":"died","Type":"container"}"#;
+        assert_eq!(
+            super::podman_event_line(died).as_deref(),
+            Some("[podman] container died — exit 137")
+        );
+        let exec = r#"{"Name":"x","Status":"exec","Type":"container"}"#;
+        assert_eq!(super::podman_event_line(exec), None);
+        let exec_ok = r#"{"ContainerExitCode":0,"Status":"exec_died","Type":"container"}"#;
+        assert_eq!(super::podman_event_line(exec_ok), None);
+        let exec_bad = r#"{"ContainerExitCode":2,"Status":"exec_died","Type":"container"}"#;
+        assert!(super::podman_event_line(exec_bad).is_some());
+        let system = r#"{"Status":"refresh","Type":"system"}"#;
+        assert_eq!(super::podman_event_line(system), None);
+    }
+
     /// A repo's private label is shared in a VM, and nothing else in the
     /// mount changes.
     #[test]

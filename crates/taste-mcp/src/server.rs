@@ -1757,6 +1757,19 @@ impl McpServer {
                 let snapshot = jobs
                     .wait(handle, std::time::Duration::from_secs(timeout))
                     .await?;
+                // Into the environment's runtime log: what ran in the
+                // container and how it ended is the container's story,
+                // and its main process (`sleep infinity`) tells none.
+                if let Some(code) = snapshot.exit_code {
+                    supervisor.push_container_output(format!(
+                        "[agent] {display} — exit {code}{}",
+                        snapshot
+                            .failure
+                            .as_deref()
+                            .map(|f| format!(" ({f})"))
+                            .unwrap_or_default()
+                    ));
+                }
                 Ok(exec_result(handle, snapshot))
             }
             "ide_exec_output" => {
