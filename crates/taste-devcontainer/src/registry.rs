@@ -949,11 +949,27 @@ impl EnvironmentRegistry {
         Ok(keeper)
     }
 
-    /// What each VM of the pool has granted to the environments on it.
+    /// What each VM of the pool has granted to the environments RUNNING on
+    /// it. An idle environment holds a checkout and nothing else — no
+    /// container, so no CPU and no memory — and counting its grant would
+    /// have a workspace of nine mostly idle environments boot a second and
+    /// third VM for containers that do not exist (which is what the first
+    /// launch with grants did). Environments therefore pack onto the VMs
+    /// they have; the ceilings on each container still hold, so a VM whose
+    /// idle environments all wake at once contends within itself rather
+    /// than taking the host.
     fn occupancy(&self) -> std::collections::HashMap<String, Grant> {
         let mut occupancy: std::collections::HashMap<String, Grant> =
             std::collections::HashMap::new();
         for supervisor in self.list() {
+            if !matches!(
+                supervisor.state(),
+                crate::supervisor::SupervisorState::Running { .. }
+                    | crate::supervisor::SupervisorState::Starting
+                    | crate::supervisor::SupervisorState::Building
+            ) {
+                continue;
+            }
             if let Some(vm) = supervisor.checkout().vm() {
                 let entry = occupancy.entry(vm.to_string()).or_insert(Grant {
                     cpus: 0,

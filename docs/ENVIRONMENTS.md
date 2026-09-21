@@ -2641,9 +2641,11 @@ is shouted, but nothing runs either. The rows say what is missing, and
   grant is real: `podman run` carries it as `--cpus`, `--memory`, and
   `--memory-swap`, so what the pool plans by is what the container runs
   under. A VM's capacity is its size less a reserve for the guest and its
-  keeper; the fullest VM the grant still fits in takes the environment,
-  so environments pack; when it fits nowhere a new VM is made if the host
-  has room, and refused otherwise — never oversubscribed, because a VM's
+  keeper, and what is placed on it counts only while it RUNS — an idle
+  environment is a checkout and nothing else, so nine mostly idle
+  environments pack onto one VM rather than booting three; the fullest VM
+  the grant still fits in takes the environment; when it fits nowhere a
+  new VM is made if the host has room, and refused otherwise — never oversubscribed, because a VM's
   capacity is why a workspace has several ("some aspects of capacity
   don't scale linearly"). A grant no VM of this host's size could hold is
   refused by name. The Resources row shows each container's grant beside
