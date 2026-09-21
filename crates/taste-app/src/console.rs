@@ -314,6 +314,12 @@ pub struct Console {
     /// Shell tabs running on the machine/IDE-container — retired when the
     /// devcontainer attaches (work belongs inside it).
     host_shells: RefCell<Vec<adw::TabPage>>,
+    /// Shell tabs whose container went away under them — stopped, or
+    /// replaced by a rebuild — waiting for their environment to run again,
+    /// when each is reopened as a fresh shell in the new container (David,
+    /// 2026-09-21: "I should have a valid shell after rebuilding my
+    /// devcontainer").
+    dead_shells: RefCell<Vec<(EnvironmentId, adw::TabPage)>>,
     /// The tab bar this pane owns, so the New Terminal button can be put
     /// back on it when the window grows out of the consolidated rung.
     tab_bar: adw::TabBar,
@@ -511,6 +517,7 @@ impl Console {
             tab_glyphs: RefCell::new(HashMap::new()),
             search_terminals: RefCell::new(Vec::new()),
             host_shells: RefCell::new(Vec::new()),
+            dead_shells: RefCell::new(Vec::new()),
             tab_bar: tab_bar.clone(),
             new_tab_button: new_tab_button.clone(),
             rows: RefCell::new(Vec::new()),
@@ -2134,6 +2141,27 @@ impl Console {
 
     /// An environment's container moved. Live in the row, immediately.
     pub fn on_environment_state(self: &Rc<Self>, env: &EnvironmentId, running: bool) {
+        if running {
+            // Shells the old container took with it come back in the new
+            // one: the dead tab closes, a fresh shell opens in its place.
+            let revive: Vec<adw::TabPage> = {
+                let mut dead = self.dead_shells.borrow_mut();
+                let (ours, others): (Vec<_>, Vec<_>) =
+                    dead.drain(..).partition(|(owner, _)| owner == env);
+                *dead = others;
+                ours.into_iter().map(|(_, page)| page).collect()
+            };
+            let mut reopened = 0;
+            for page in revive {
+                if self.tab_is_open(&page) {
+                    self.host().close_page(&page);
+                    reopened += 1;
+                }
+            }
+            for _ in 0..reopened {
+                self.add_terminal_tab_in(env);
+            }
+        }
         if env.is_primary() && running {
             // Attached: host consoles retire; work happens inside. Open a
             // devcontainer shell in their place if any were up.
@@ -2770,7 +2798,9 @@ impl Console {
         (
             EnvironmentId::primary(),
             self.workspace.exec.clone(),
-            self.workspace.root().to_path_buf(),
+            // The checkout wherever it is: the folder until the primary is
+            // placed in the VM, the checkout over there after.
+            self.workspace.checkout_path(),
         )
     }
 
@@ -2780,8 +2810,43 @@ impl Console {
     /// terminals are part of what an environment is running, and the fleet
     /// says so. Interactive, and deliberately **not** killable from the
     /// roster — it is the user's, and closing its tab is how it ends.
+    /// Whether `page` is still in the strip: a tab the user closed must
+    /// not be closed again.
+    fn tab_is_open(&self, page: &adw::TabPage) -> bool {
+        let host = self.host();
+        (0..host.n_pages()).any(|i| host.nth_page(i) == *page)
+    }
+
+    /// A shell in `env`'s container, whichever environment is selected —
+    /// the shell a rebuild took reopens in the environment it belonged
+    /// to. Falls back to `add_terminal_tab`'s target when `env` has no
+    /// container to spawn into.
+    pub fn add_terminal_tab_in(self: &Rc<Self>, env: &EnvironmentId) {
+        let target = self
+            .environments
+            .get(env)
+            .filter(|supervisor| supervisor.exec().has_exec_target())
+            .map(|supervisor| {
+                (
+                    env.clone(),
+                    supervisor.exec().clone(),
+                    supervisor.checkout().path().to_path_buf(),
+                )
+            })
+            .unwrap_or_else(|| self.terminal_target());
+        self.add_terminal_tab_at(target);
+    }
+
     pub fn add_terminal_tab(self: &Rc<Self>) {
-        let (env, exec, cwd) = self.terminal_target();
+        let target = self.terminal_target();
+        self.add_terminal_tab_at(target);
+    }
+
+    fn add_terminal_tab_at(
+        self: &Rc<Self>,
+        target: (EnvironmentId, taste_core::ExecContext, PathBuf),
+    ) {
+        let (env, exec, cwd) = target;
         // The prompt names what the tab names — `user@host`, which in a
         // container is the user and the container's short id — and then
         // the directory; an image with no rc files left bash at its bare
@@ -2877,6 +2942,8 @@ impl Console {
         {
             let page = page.clone();
             let sink = sink.clone();
+            let weak = Rc::downgrade(self);
+            let env = env.clone();
             terminal.connect_child_exited(move |terminal, status| {
                 // A shell whose container was stopped or rebuilt under it
                 // ends with podman's own last words — "no such exec
@@ -2897,8 +2964,14 @@ impl Console {
                 if container_gone {
                     terminal.feed(
                         b"\r\n\x1b[2mThe container this shell was in is gone: it was stopped \
-                          or rebuilt. Open a new shell.\x1b[0m\r\n",
+                          or rebuilt. A shell opens in the new one when it is up.\x1b[0m\r\n",
                     );
+                    if let Some(console) = weak.upgrade() {
+                        console
+                            .dead_shells
+                            .borrow_mut()
+                            .push((env.clone(), page.clone()));
+                    }
                 }
                 sink.finish(taste_core::ShellState::Exited {
                     code: Some(status),
