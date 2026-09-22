@@ -154,7 +154,8 @@ the two it is; otherwise it needs a container running a server bound
 the wrong way;
 `TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
 safe-mode banner's running-baseline face;
-`TASTE_PROBE_STARTUP=vm` (or `build`, `failed`, `noconfig`, `ready`)
+`TASTE_PROBE_STARTUP=vm` (or `place` — the checkout's seed partway,
+git's progress as its detail —, `build`, `failed`, `noconfig`, `ready`)
 poses the environment's startup page — the checklist over the stripes,
 the log below, the safe-mode note and Prompt Agent on the fallback faces
 — pinned in front of the editor's strip as a real start puts it, which

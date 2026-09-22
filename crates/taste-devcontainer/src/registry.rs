@@ -788,6 +788,15 @@ impl EnvironmentRegistry {
         );
     }
 
+    /// How far the step the VM's story is at has got: the startup
+    /// page's detail for it, and not a line of the log.
+    pub fn progress_vm(&self, domain: &str, line: impl Into<String>) {
+        self.events.publish(Event::VmProgress {
+            domain: domain.to_string(),
+            line: line.into(),
+        });
+    }
+
     /// The last `n` lines of a VM's story.
     pub fn vm_log_tail(&self, domain: &str, n: usize) -> Vec<String> {
         let logs = self.vm_logs.lock().unwrap();
@@ -1560,12 +1569,35 @@ impl EnvironmentRegistry {
                 "seeding the checkout from the folder: branches, tags, snapshots, and the \
                  issues over ssh",
             );
-            crate::peer::push_to_guest(
+            // The whole repository crosses here, so git's own progress is
+            // the step's detail as it goes, and each phase's end is a line
+            // of the log.
+            let mut pace = crate::peer::ProgressPace::default();
+            crate::peer::push_to_guest_with_progress(
                 &peer,
                 vm,
                 &keys,
                 &path,
                 &crate::peer::PRIMARY_SEED_REFSPECS,
+                &mut |p| {
+                    if !pace.due(p) {
+                        return;
+                    }
+                    let said = format!("seeding the checkout: {}", p.words());
+                    if p.done {
+                        self.note_vm(&vm.domain, said);
+                        if p.remote {
+                            // What receive-pack does next says nothing: the
+                            // branch checked out into the working tree.
+                            self.progress_vm(
+                                &vm.domain,
+                                "seeding the checkout: writing its files in the VM",
+                            );
+                        }
+                    } else {
+                        self.progress_vm(&vm.domain, said);
+                    }
+                },
             )?;
             if dirty || previous.is_some() {
                 let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;

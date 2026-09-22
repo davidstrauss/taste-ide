@@ -1165,7 +1165,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // The environment's startup page (startup.rs): the checklist and the
     // log that take the editor's strip over while a start runs.
     let startup = crate::startup::StartupPage::new();
-    // `TASTE_PROBE_STARTUP=vm|build|failed|noconfig|ready`: the page at
+    // `TASTE_PROBE_STARTUP=vm|place|build|failed|noconfig|ready`: the page at
     // that stage, in front, which otherwise needs a start under way.
     if let Ok(kind) = std::env::var("TASTE_PROBE_STARTUP") {
         startup.pose_for_probe(&kind);
@@ -3884,6 +3884,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                 crate::logview::LogKind::Vm,
                                 std::slice::from_ref(&line),
                             );
+                        }
+                    }
+                    Event::VmProgress { domain, line } => {
+                        if environments_for_events
+                            .vm_log_domain_for(&primary_env)
+                            .as_deref()
+                            == Some(&domain)
+                        {
+                            startup.on_vm_progress(&line);
                         }
                     }
                     Event::FlatpakLog(line) => console.append_flatpak_log(&line),

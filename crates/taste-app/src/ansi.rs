@@ -143,9 +143,13 @@ pub fn spans(line: &str) -> Vec<(String, Style)> {
 }
 
 /// The line with every escape removed.
-#[cfg(test)]
-pub fn strip(line: &str) -> String {
+pub fn strip_escapes(line: &str) -> String {
     spans(line).into_iter().map(|(text, _)| text).collect()
+}
+
+#[cfg(test)]
+fn strip(line: &str) -> String {
+    strip_escapes(line)
 }
 
 fn apply_sgr(style: &mut Style, params: &str) {

@@ -95,6 +95,11 @@ pub enum Event {
     /// domain, since a VM hosts several environments; the Logs section's
     /// Virtual Machine row shows it for each of them.
     VmLog { domain: String, line: String },
+    /// How far the step a VM's story is at has got — "seeding the
+    /// checkout: sending objects, 45%" — said at most once a second and
+    /// never written to the log, since each one replaces the last. The
+    /// startup page shows it as the step's detail.
+    VmProgress { domain: String, line: String },
     /// A line the container itself wrote — its main process's stdout or
     /// stderr, as `podman logs --follow` hands it on. The devcontainer spec
     /// has no notion of a log; this stream is the one thing a container
@@ -357,6 +362,7 @@ impl Event {
             | Event::RevealIssueRequested(_)
             | Event::ChatNotice { .. }
             | Event::VmLog { .. }
+            | Event::VmProgress { .. }
             | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }

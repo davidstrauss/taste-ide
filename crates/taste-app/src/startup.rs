@@ -164,7 +164,10 @@ impl StepRow {
         let detail = gtk::Label::builder()
             .xalign(0.0)
             .wrap(true)
-            .css_classes(["caption", "dim-label"])
+            // Tabular figures: a detail carrying a percentage or a count
+            // redraws each second, and proportional digits would shuffle
+            // the words after them at every one.
+            .css_classes(["caption", "dim-label", "numeric"])
             .visible(false)
             .build();
         words.append(&title);
@@ -211,13 +214,18 @@ impl StepRow {
                 mark.set_visible_child_name("icon");
             }
         }
+        // Only the active step says what it is doing, and what it says is
+        // its current substep — "Step 2 of 9: RUN dnf install" — never a
+        // description; a checked or pending step is its title alone
+        // (David, 2026-09-22: "Hide the descriptions below checklist items
+        // that aren't actively being worked on").
         match (status, detail) {
-            (_, Some(text)) if !text.is_empty() => {
+            (Status::Active, Some(text)) if !text.is_empty() => {
                 self.detail.set_label(text);
                 self.detail.set_visible(true);
             }
-            (Status::Active | Status::Done, None) => {
-                // Keep whatever the step said while it ran.
+            (Status::Active, None) => {
+                // Keep the last substep until the next one arrives.
             }
             _ => self.detail.set_visible(false),
         }
@@ -506,7 +514,7 @@ impl StartupPage {
     pub fn on_state(self: &Rc<Self>, state: &DevcontainerStateEvent, baseline: bool) {
         match state {
             DevcontainerStateEvent::Preparing { what } => {
-                self.activate(Step::for_preparing(what), Some(what));
+                self.activate(Step::for_preparing(what), None);
             }
             DevcontainerStateEvent::Building => self.activate(Step::Build, None),
             DevcontainerStateEvent::Starting => self.activate(Step::Start, None),
@@ -591,26 +599,68 @@ impl StartupPage {
         self.activate(Step::GuestImage, Some(&detail));
     }
 
-    /// A line of the environment's build log: appended, and the image
-    /// build's `STEP n/m` becomes the build step's detail.
+    /// A line of the environment's build log: appended, and made the
+    /// active step's substep — the image build's `STEP n/m: …` as "Step n
+    /// of m: …", the container's start as the line itself.
     pub fn on_build_line(&self, line: &str) {
         self.build_log
             .append(std::slice::from_ref(&line.to_string()));
-        if let Some((n, of)) = build_step(line) {
-            let row = self.row(Step::Build);
+        let clean = crate::ansi::strip_escapes(line);
+        let clean = clean.trim();
+        if clean.is_empty() {
+            return;
+        }
+        match self.current.get() {
+            Some(Step::Build) => {
+                if let Some((n, of, rest)) = build_step_words(clean) {
+                    self.row(Step::Build).set(
+                        Status::Active,
+                        Some(&format!("Step {n} of {of}: {}", substep_words(rest))),
+                    );
+                }
+            }
+            Some(Step::Start) => {
+                self.row(Step::Start)
+                    .set(Status::Active, Some(&substep_words(clean)));
+            }
+            _ => {}
+        }
+    }
+
+    /// A line of the VM's story: appended, and — when it is the IDE's own
+    /// step line rather than the guest's console — made the active step's
+    /// substep.
+    pub fn on_vm_line(&self, line: &str) {
+        self.vm_log.append(std::slice::from_ref(&line.to_string()));
+        let Some(step) = self.current.get() else {
+            return;
+        };
+        if step.log() != LogKind::Vm {
+            return;
+        }
+        if let Some(said) = line.strip_prefix("[taste-ide] ") {
+            let row = self.row(step);
             if row.status.get() == Status::Active {
-                row.set(Status::Active, Some(&format!("step {n} of {of}")));
+                row.set(Status::Active, Some(&substep_words(said)));
             }
         }
     }
 
-    /// A line of the VM's story.
-    pub fn on_vm_line(&self, line: &str) {
-        self.vm_log.append(std::slice::from_ref(&line.to_string()));
+    /// How far the active step has got — git's progress through the
+    /// checkout's seed — as its detail, in place of the last; the log
+    /// below is not written, since each of these replaces the one before.
+    pub fn on_vm_progress(&self, line: &str) {
+        let Some(step) = self.current.get() else {
+            return;
+        };
+        let row = self.row(step);
+        if step.log() == LogKind::Vm && row.status.get() == Status::Active {
+            row.set(Status::Active, Some(&substep_words(line)));
+        }
     }
 
     /// TASTE_PROBE_CHECK only: pose the page at a stage —
-    /// `TASTE_PROBE_STARTUP=vm|build|failed|noconfig|ready` — with a few
+    /// `TASTE_PROBE_STARTUP=vm|place|build|failed|noconfig|ready` — with a few
     /// lines in its log, since a start is a minute of a machine's life and
     /// a shot has none of it.
     #[doc(hidden)]
@@ -661,6 +711,15 @@ impl StartupPage {
                 self.on_state(&DevcontainerStateEvent::NoConfig, false);
                 self.activate(Step::Build, Some("the safe-mode environment"));
             }
+            "place" => {
+                self.activate(Step::Vm, None);
+                self.activate(Step::Files, None);
+                self.activate(Step::Place, None);
+                self.on_vm_line("[taste-ide] seeding the checkout: counting objects, done");
+                self.on_vm_progress(
+                    "seeding the checkout: sending objects, 45% (1364 of 3031), 40.20 MiB",
+                );
+            }
             "ready" => {
                 self.activate(Step::Vm, None);
                 self.activate(Step::Files, None);
@@ -676,11 +735,38 @@ impl StartupPage {
 
 /// `STEP 3/9: RUN …`, as podman prints an image build's steps, read as
 /// (3, 9); anything else is not a step.
+#[cfg(test)]
 fn build_step(line: &str) -> Option<(u32, u32)> {
+    build_step_words(line).map(|(n, of, _)| (n, of))
+}
+
+/// [`build_step`] with the step's own words — what follows the colon.
+fn build_step_words(line: &str) -> Option<(u32, u32, &str)> {
     let rest = line.strip_prefix("STEP ")?;
-    let (n, of) = rest.split_once('/')?;
-    let of = of.split(|c: char| !c.is_ascii_digit()).next()?;
-    Some((n.trim().parse().ok()?, of.parse().ok()?))
+    let (n, after) = rest.split_once('/')?;
+    let digits = after
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .map(|(i, c)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let words = after[digits..].trim_start_matches(':').trim();
+    Some((n.trim().parse().ok()?, after[..digits].parse().ok()?, words))
+}
+
+/// A substep as one short line: the first line, its first letter up,
+/// cut with an ellipsis where a log line runs on.
+fn substep_words(text: &str) -> String {
+    let first = text.lines().next().unwrap_or(text).trim();
+    let mut chars = first.chars();
+    let mut out: String = match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    };
+    if out.chars().count() > 96 {
+        out = out.chars().take(95).collect::<String>() + "…";
+    }
+    out
 }
 
 #[cfg(test)]
@@ -711,6 +797,14 @@ mod tests {
         );
         assert_eq!(build_step("STEP 3/9: RUN dnf install -y gcc"), Some((3, 9)));
         assert_eq!(build_step("Successfully tagged"), None);
+        assert_eq!(
+            build_step_words("STEP 3/9: RUN dnf install -y gcc"),
+            Some((3, 9, "RUN dnf install -y gcc"))
+        );
+        assert_eq!(
+            substep_words("waiting for the guest's sshd on 127.0.0.1:35551"),
+            "Waiting for the guest's sshd on 127.0.0.1:35551"
+        );
         assert!(Step::Sweep < Step::Vm && Step::Vm < Step::Build && Step::Build < Step::Ready);
     }
 }

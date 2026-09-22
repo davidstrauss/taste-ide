@@ -83,10 +83,221 @@ pub fn push_to_guest(
     path: &Path,
     refspecs: &[&str],
 ) -> Result<()> {
-    let mut args = vec!["push".to_string(), "--quiet".into(), guest_url(vm, path)];
+    push_to_guest_with_progress(peer, vm, keys, path, refspecs, &mut |_| {})
+}
+
+/// [`push_to_guest`], handing each of git's progress lines to
+/// `progress` as it is printed — the seed of a fresh checkout is the
+/// whole repository over the VM's ssh forward, which is minutes of
+/// silence without them (David, 2026-09-22: "It still seems to hang a
+/// long time without feedback on checking out the workspace").
+pub fn push_to_guest_with_progress(
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    path: &Path,
+    refspecs: &[&str],
+    progress: &mut dyn FnMut(&GitProgress),
+) -> Result<()> {
+    let mut args = vec!["push".to_string(), "--progress".into(), guest_url(vm, path)];
     args.extend(refspecs.iter().map(|s| s.to_string()));
-    git(peer, keys, &args)
-        .with_context(|| format!("pushing to {} in {}", path.display(), vm.domain))?;
+    git_streaming(peer, keys, &args, progress)
+        .with_context(|| format!("pushing to {} in {}", path.display(), vm.domain))
+}
+
+/// One of git's progress lines — `Writing objects:  45% (1364/3031),
+/// 40.20 MiB | 12.00 MiB/s`, or `remote: Resolving deltas: 100%
+/// (800/800), done.` — read into its parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitProgress {
+    /// Git's own name for the phase: `Writing objects`.
+    pub phase: String,
+    /// The phase runs at the other end (`remote: `) — in the VM.
+    pub remote: bool,
+    pub percent: Option<u8>,
+    /// Done of total, where git counts.
+    pub count: Option<(u64, u64)>,
+    /// How much has crossed so far, as git words it (`40.20 MiB`); the
+    /// rate is left off, since it changes at every print.
+    pub bytes: Option<String>,
+    /// The phase's last print.
+    pub done: bool,
+}
+
+impl GitProgress {
+    /// The line read as a progress print, or `None` for anything else —
+    /// `Total …`, `Delta compression using …`, an error.
+    pub fn parse(line: &str) -> Option<Self> {
+        let line = line.replace("\x1b[K", "");
+        let line = line.trim();
+        let (remote, line) = match line.strip_prefix("remote:") {
+            Some(rest) => (true, rest.trim_start()),
+            None => (false, line),
+        };
+        let (phase, rest) = line.split_once(':')?;
+        if phase.is_empty() || !phase.chars().all(|c| c.is_ascii_alphabetic() || c == ' ') {
+            return None;
+        }
+        let rest = rest.trim();
+        let done = rest.ends_with("done.");
+        let percent = rest
+            .split_once('%')
+            .and_then(|(n, _)| n.trim().parse::<u8>().ok());
+        let count = rest
+            .split_once('(')
+            .and_then(|(_, after)| after.split_once(')'))
+            .and_then(|(inside, _)| inside.split_once('/'))
+            .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)));
+        let bytes = rest
+            .split_once("), ")
+            .map(|(_, after)| after.split('|').next().unwrap_or(after))
+            .map(|b| {
+                b.trim_end_matches("done.")
+                    .trim()
+                    .trim_end_matches(',')
+                    .trim()
+            })
+            .filter(|b| b.ends_with("iB") || b.ends_with(" bytes"))
+            .map(str::to_string);
+        // A phase with none of these is not progress: `Enumerating
+        // objects: 3031, done.` has its done, anything without is words.
+        if percent.is_none() && !done {
+            return None;
+        }
+        Some(Self {
+            phase: phase.to_string(),
+            remote,
+            percent,
+            count,
+            bytes,
+            done,
+        })
+    }
+}
+
+impl GitProgress {
+    /// The print as a person reads it: `sending objects, 45% (1364 of
+    /// 3031), 40.20 MiB`. The phase in plain words, the measures git gave,
+    /// and nothing that changes faster than the percentage does.
+    pub fn words(&self) -> String {
+        let phase = match (self.remote, self.phase.as_str()) {
+            (false, "Enumerating objects" | "Counting objects") => "counting objects".to_string(),
+            (false, "Writing objects") => "sending objects".to_string(),
+            (true, "Resolving deltas") => "indexing them in the VM".to_string(),
+            (true, "Unpacking objects") => "unpacking them in the VM".to_string(),
+            (true, other) => format!("{} in the VM", other.to_lowercase()),
+            (false, other) => other.to_lowercase(),
+        };
+        let mut out = phase;
+        if let Some(percent) = self.percent {
+            out.push_str(&format!(", {percent}%"));
+        }
+        if let Some((done, total)) = self.count.filter(|(_, total)| *total > 0) {
+            out.push_str(&format!(" ({done} of {total})"));
+        }
+        if let Some(bytes) = &self.bytes {
+            out.push_str(&format!(", {bytes}"));
+        }
+        if self.done {
+            out.push_str(", done");
+        }
+        out
+    }
+}
+
+/// Paces progress prints to what a person can read: a new phase and a
+/// phase's end at once, and otherwise one a second — a percentage that
+/// moves every frame is flicker, not information.
+#[derive(Debug, Default)]
+pub struct ProgressPace {
+    last: Option<std::time::Instant>,
+    phase: Option<(bool, String)>,
+}
+
+impl ProgressPace {
+    pub fn due(&mut self, p: &GitProgress) -> bool {
+        let phase = (p.remote, p.phase.clone());
+        let now = std::time::Instant::now();
+        let due = p.done
+            || self.phase.as_ref() != Some(&phase)
+            || self
+                .last
+                .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(1));
+        if due {
+            self.last = Some(now);
+            self.phase = Some(phase);
+        }
+        due
+    }
+}
+
+/// [`git`] for a transfer: stdout discarded, stderr read as it is
+/// written, each progress print (git redraws with `\r`) handed to
+/// `progress`, and the rest kept for the error.
+fn git_streaming(
+    peer: &Path,
+    keys: &Keys,
+    args: &[String],
+    progress: &mut dyn FnMut(&GitProgress),
+) -> Result<()> {
+    use std::io::Read;
+    let mut argv = vec!["-C".to_string(), peer.display().to_string()];
+    argv.extend(args.iter().cloned());
+    let (program, argv) = host_argv(taste_core::podman::sandboxed(), "git", argv);
+    let mut child = std::process::Command::new(&program)
+        .args(&argv)
+        .env("GIT_SSH_COMMAND", keys.git_ssh_command())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {program}"))?;
+    let mut stderr = child.stderr.take().context("git's stderr")?;
+    let mut said: Vec<String> = Vec::new();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut take = |segment: &[u8], said: &mut Vec<String>| {
+        let text = String::from_utf8_lossy(segment);
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        match GitProgress::parse(text) {
+            Some(p) => progress(&p),
+            None => {
+                if said.len() >= 40 {
+                    said.remove(0);
+                }
+                said.push(text.to_string());
+            }
+        }
+    };
+    loop {
+        let n = match stderr.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("reading git's stderr"),
+        };
+        pending.extend_from_slice(&buf[..n]);
+        while let Some(at) = pending.iter().position(|b| *b == b'\r' || *b == b'\n') {
+            let segment: Vec<u8> = pending.drain(..=at).collect();
+            take(&segment, &mut said);
+        }
+    }
+    take(&pending, &mut said);
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for {program}"))?;
+    if !status.success() {
+        bail!(
+            "git {}: {}",
+            args.first().map(String::as_str).unwrap_or_default(),
+            said.join("\n")
+        );
+    }
     Ok(())
 }
 
@@ -372,6 +583,69 @@ mod tests {
         assert!(PRIMARY_SEED_REFSPECS.contains(&"^refs/taste/vm/*"));
         assert!(PRIMARY_SYNC_REFSPECS.contains(&"^refs/taste/vm/*"));
         assert!(PRIMARY_SYNC_REFSPECS.contains(&"+refs/heads/*:refs/taste/vm/*"));
+    }
+
+    #[test]
+    fn progress_prints_are_read_and_other_lines_are_not() {
+        let p = GitProgress::parse("Writing objects:  45% (1364/3031), 40.20 MiB | 12.00 MiB/s")
+            .unwrap();
+        assert_eq!(p.phase, "Writing objects");
+        assert!(!p.remote && !p.done);
+        assert_eq!(p.percent, Some(45));
+        assert_eq!(p.count, Some((1364, 3031)));
+        assert_eq!(p.bytes.as_deref(), Some("40.20 MiB"));
+
+        let p =
+            GitProgress::parse("Writing objects: 100% (3031/3031), 90.01 MiB | 30.00 MiB/s, done.")
+                .unwrap();
+        assert!(p.done);
+        assert_eq!(p.bytes.as_deref(), Some("90.01 MiB"));
+
+        let p =
+            GitProgress::parse("remote: Resolving deltas: 100% (800/800), done.\x1b[K").unwrap();
+        assert!(p.remote && p.done);
+        assert_eq!(p.phase, "Resolving deltas");
+        assert_eq!(p.bytes, None);
+
+        let p = GitProgress::parse("Enumerating objects: 3031, done.").unwrap();
+        assert!(p.done && p.percent.is_none());
+
+        assert_eq!(
+            GitProgress::parse("Delta compression using up to 8 threads"),
+            None
+        );
+        assert_eq!(
+            GitProgress::parse("Total 3031 (delta 800), reused 0 (delta 0), pack-reused 0"),
+            None
+        );
+        assert_eq!(
+            GitProgress::parse("fatal: the remote end hung up unexpectedly"),
+            None
+        );
+        assert_eq!(GitProgress::parse("To ssh://core@127.0.0.1:1/x"), None);
+    }
+
+    #[test]
+    fn progress_is_worded_for_a_person() {
+        let p = GitProgress::parse("Writing objects:  45% (1364/3031), 40.20 MiB | 12.00 MiB/s")
+            .unwrap();
+        assert_eq!(p.words(), "sending objects, 45% (1364 of 3031), 40.20 MiB");
+        let p = GitProgress::parse("remote: Resolving deltas:  30% (240/800)").unwrap();
+        assert_eq!(p.words(), "indexing them in the VM, 30% (240 of 800)");
+    }
+
+    /// A phase's first print and its last are due at once; the ones
+    /// between wait their second.
+    #[test]
+    fn the_pace_lets_phases_through_and_holds_the_prints_between() {
+        let mut pace = ProgressPace::default();
+        let at = |pct: u8| {
+            GitProgress::parse(&format!("Writing objects: {pct:>3}% ({pct}/100)")).unwrap()
+        };
+        assert!(pace.due(&at(1)));
+        assert!(!pace.due(&at(2)));
+        assert!(pace.due(&GitProgress::parse("Writing objects: 100% (100/100), done.").unwrap()));
+        assert!(pace.due(&GitProgress::parse("remote: Resolving deltas:   0% (0/9)").unwrap()));
     }
 
     /// The refspecs are forced and cover branches, tags, and the IDE's own
