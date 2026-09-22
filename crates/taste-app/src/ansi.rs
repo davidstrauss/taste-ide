@@ -213,7 +213,15 @@ fn apply_sgr(style: &mut Style, params: &str) {
 /// colour it earns: ERROR red, WARN yellow, INFO none, DEBUG and TRACE
 /// dim. `Some((start, end, style))` names the word's byte range.
 pub fn level_span(line: &str) -> Option<(usize, usize, Style)> {
-    let head = &line[..line.len().min(80)];
+    // The first eighty bytes, cut at a character boundary: a line whose
+    // eightieth byte is inside an arrow panicked the main thread (David,
+    // 2026-09-22: "end byte index 80 is not a char boundary; it is inside
+    // '→'").
+    let mut end = line.len().min(80);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &line[..end];
     for (word, style) in [
         (
             "ERROR",
@@ -282,6 +290,16 @@ mod tests {
         assert_eq!(spans[1].1.fg, Some(Color::Rgb(10, 20, 30)));
         assert_eq!(Color::Index(196).rgb(), (255, 0, 0));
         assert_eq!(Color::Index(232).rgb(), (8, 8, 8));
+    }
+
+    #[test]
+    fn a_multibyte_character_at_the_cut_does_not_panic() {
+        // Seventy-eight ASCII bytes, then a three-byte arrow straddling
+        // byte eighty.
+        let line = format!("{}→ WARN after the arrow", "x".repeat(78));
+        assert!(level_span(&line).is_none());
+        let line = format!("WARN {}→ tail", "y".repeat(73));
+        assert_eq!(level_span(&line).map(|(s, e, _)| (s, e)), Some((0, 4)));
     }
 
     #[test]
