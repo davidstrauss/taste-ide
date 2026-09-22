@@ -177,7 +177,7 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
     // Version pinned deliberately: the adapter runs next to the agent's
     // auth dir, so "@latest" would be a standing supply-chain exposure.
     // Bump explicitly — once, here, for both Claude Codes.
-    const CLAUDE_CODE_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@0.73.0";
+    const CLAUDE_CODE_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@0.81.0";
     // .npm is npx's package cache; .claude/.claude.json hold auth.
     const CLAUDE_CODE_HOME: &[&str] = &[".claude", ".claude.json", ".npm"];
     // `claude setup-token` is Claude Code's documented way to mint the
