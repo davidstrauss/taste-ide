@@ -350,15 +350,19 @@ fn main() -> glib::ExitCode {
                    background-color: transparent; }\n\
                  progressbar.index-bar > trough > progress { \
                    background-color: @accent_color; }\n\
-                 /* The banner's operation bar while the container is being \
-                    (re)built: hazard stripes, yellow on dark, as a site \
-                    under construction wears (David, 2026-09-21). Tall \
-                    enough for the stripes to be stripes; the same yellow \
-                    in both schemes, since it is the colour of the sign \
-                    and not of the theme, over the theme's own dark. */\n\
+                 /* The banner's operation bar — the VM coming up, the \
+                    image (re)built, the container started: hazard \
+                    stripes, yellow on dark, as a site under construction \
+                    wears (David, 2026-09-21). Tall enough for the stripes \
+                    to be stripes, over a track dark enough to show how \
+                    far there is to go; the same yellow in both schemes, \
+                    since it is the colour of the sign and not of the \
+                    theme. */\n\
                  progressbar.construction > trough, \
                  progressbar.construction > trough > progress { \
-                   min-height: 6px; border-radius: 0; }\n\
+                   min-height: 8px; border-radius: 0; }\n\
+                 progressbar.construction > trough { \
+                   background-color: alpha(#241f31, 0.55); }\n\
                  progressbar.construction > trough > progress { \
                    background-color: transparent; \
                    background-image: repeating-linear-gradient(-45deg, \

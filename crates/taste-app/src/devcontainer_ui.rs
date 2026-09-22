@@ -642,6 +642,15 @@ impl DevcontainerBanner {
                 self.on_state(&DevcontainerStateEvent::Building);
                 self.posed.set(true);
             }
+            // The operation's first face: the VM coming up, the bar just
+            // begun.
+            "vm" => {
+                self.posed.set(false);
+                self.on_state(&DevcontainerStateEvent::Preparing {
+                    what: "bringing up the workspace's VM".into(),
+                });
+                self.posed.set(true);
+            }
             "failed" => self.show_baseline_face(BaselineFace::BuildFailed),
             "passed" => self.show_baseline_face(BaselineFace::ConfigRefused),
             _ => self.show_baseline_face(BaselineFace::NoConfig),
@@ -676,18 +685,12 @@ impl DevcontainerBanner {
             }
             _ => self.set_progress(None),
         }
-        // Hazard stripes while the container itself is being (re)built —
-        // the image and its start — and the plain bar while the VM and the
-        // checkout are being readied ahead of it.
-        let constructing = matches!(
-            state,
-            DevcontainerStateEvent::Building | DevcontainerStateEvent::Starting
-        );
-        if constructing {
-            self.progress.add_css_class("construction");
-        } else {
-            self.progress.remove_css_class("construction");
-        }
+        // Hazard stripes for the whole operation, the VM's boot included:
+        // one operation, one bar, one look (David, 2026-09-21: "I don't
+        // see any progress bar or yellow 'construction' striping" — the
+        // plain 3px sliver the VM phase drew was invisible). The class
+        // rides on the bar permanently; visibility is the state's.
+        self.progress.add_css_class("construction");
         match state {
             DevcontainerStateEvent::ConfigDetected => {
                 self.set_face("system-run-symbolic", false);

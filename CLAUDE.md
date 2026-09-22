@@ -151,8 +151,8 @@ the two it is; otherwise it needs a container running a server bound
 the wrong way;
 `TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
 safe-mode banner's running-baseline face; `=building` poses the
-operation bar mid-build, hazard stripes and step count, which otherwise
-needs a real image build under way; — the project's config ready to
+operation bar mid-build with its step count, and `=vm` at the VM's boot,
+which otherwise need a real bring-up under way; — the project's config ready to
 rebuild into, its image failed to build (View Log, Prompt Agent),
 refused, or absent — which otherwise needs a checkout in that state
 under a running baseline; `=ask` poses git's
