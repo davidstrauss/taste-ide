@@ -2205,6 +2205,13 @@ impl EnvironmentRegistry {
                 }
             })
         };
+        // Other projects' VMs that no window owns go first: they hold the
+        // host's memory for nothing, and possibly the room this one needs.
+        // Announced as its own step, so it comes BEFORE the boot's
+        // announcement — the banner read "stopping other projects' VMs"
+        // over a guest already booting when the order was the other way
+        // (David, 2026-09-22).
+        self.stop_unowned_vms(&pool).await;
         self.primary()
             .announce_preparing("bringing up the workspace's VM");
         // The VMs' consoles, followed from before the boot so the story
@@ -2213,9 +2220,6 @@ impl EnvironmentRegistry {
         if let Ok(vms) = pool.vms().await {
             self.follow_vm_consoles(&vms);
         }
-        // Other projects' VMs that no window owns go first: they hold the
-        // host's memory for nothing, and possibly the room this one needs.
-        self.stop_unowned_vms(&pool).await;
         self.set_substrate(Substrate::resolve_in(&pool, reporter).await);
         if let Ok(vms) = pool.vms().await {
             self.follow_vm_consoles(&vms);
