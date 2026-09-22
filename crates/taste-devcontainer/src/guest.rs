@@ -131,6 +131,28 @@ impl GuestImage {
         std::fs::metadata(self.base_path()).is_ok_and(|meta| meta.len() == self.uncompressed_bytes)
     }
 
+    /// The day the release was built, as its version names it:
+    /// `44.20260829.3.1` is 2026-08-29.
+    pub fn release_date(&self) -> Option<String> {
+        let stamp = self.release.split('.').nth(1)?;
+        if stamp.len() != 8 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(format!("{}-{}-{}", &stamp[..4], &stamp[4..6], &stamp[6..]))
+    }
+
+    /// The day the base image was checked against the pin: the file takes
+    /// its name only once its digest matches, and nothing writes it again,
+    /// so its modification time is that moment.
+    pub fn verified_on(&self) -> Option<String> {
+        let modified = std::fs::metadata(self.base_path()).ok()?.modified().ok()?;
+        let secs = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(civil_date(secs))
+    }
+
     /// Where the image stands, read off the disk: what a header asking
     /// "is anything being fetched, and how far along" gets when no fetch
     /// is reporting to it. The download's part file is the measure while
@@ -297,6 +319,20 @@ impl GuestImage {
         )
         .await
     }
+}
+
+/// `YYYY-MM-DD` of a Unix time, in UTC (Hinnant's days-to-civil).
+fn civil_date(secs: u64) -> String {
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// The pinned image for an architecture, or an error naming the ones there
@@ -487,6 +523,14 @@ pub fn check_stream(path: &Path, arch: &str) -> Result<StreamRelease> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_release_names_its_day_and_a_unix_time_its_date() {
+        let image = image_for("x86_64").unwrap();
+        assert_eq!(image.release_date().as_deref(), Some("2026-08-29"));
+        assert_eq!(civil_date(0), "1970-01-01");
+        assert_eq!(civil_date(1_789_000_000), "2026-09-10");
+    }
+
     use super::*;
 
     /// A real stream document, trimmed to the shape this parses. Kept as a

@@ -901,10 +901,10 @@ impl EnvironmentRegistry {
     /// ones just stopped are waited for, up to a minute, so the bring-up
     /// that follows finds the room they held. Said once, in a toast and
     /// the app log, naming the projects by folder.
-    async fn stop_unowned_vms(&self, pool: &crate::pool::Pool) {
+    async fn stop_unowned_vms(&self, pool: &crate::pool::Pool) -> usize {
         let unowned = match pool.unowned_vms().await {
             Ok(unowned) if !unowned.is_empty() => unowned,
-            _ => return,
+            _ => return 0,
         };
         // A step of the operation the banner's bar draws, ahead of the
         // VM's boot (David, 2026-09-22: "Shutting down unsupervised VMs
@@ -923,7 +923,7 @@ impl EnvironmentRegistry {
             }
         }
         if stopped.is_empty() {
-            return;
+            return 0;
         }
         let note = unowned_note(&stopped);
         taste_core::app_log::push("info", "substrate", &note);
@@ -941,6 +941,77 @@ impl EnvironmentRegistry {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
+        }
+        stopped.len()
+    }
+
+    /// What a startup step came to, for the startup page's row: said once
+    /// the step is done, as what is now true.
+    pub fn conclude(&self, stage: taste_core::StartupStage, summary: impl Into<String>) {
+        let summary = summary.into();
+        tracing::info!("startup {stage:?}: {summary}");
+        self.events
+            .publish(Event::StartupConcluded { stage, summary });
+    }
+
+    /// The sweep's conclusion: how many VMs it stopped, and the memory
+    /// the room check now sees for this IDE's VMs.
+    async fn conclude_sweep(&self, pool: &crate::pool::Pool, stopped: usize) {
+        let stopped = match stopped {
+            0 => "No unused VMs were running.".to_string(),
+            1 => "Stopped 1 unused VM.".to_string(),
+            n => format!("Stopped {n} unused VMs."),
+        };
+        let summary = match pool.memory_room().await {
+            Ok(room) => format!("{stopped} {}", room_words(&room)),
+            Err(_) => stopped,
+        };
+        self.conclude(taste_core::StartupStage::Sweep, summary);
+    }
+
+    /// The guest image's and the VM's conclusions, once the ladder has
+    /// resolved onto the workspace's VM. `fetched` says the image came
+    /// down in this start; `was_running` that the VM was already up
+    /// before it; `took` how long the bring-up was.
+    fn conclude_vm(&self, fetched: bool, was_running: bool, took: std::time::Duration) {
+        let substrate = self.substrate();
+        if substrate.vm_details().is_none() {
+            return;
+        }
+        if let Ok(image) = crate::guest::image() {
+            // "976 MiB, released 2026-08-29 (44.20260829.3.1), verified
+            // just now": the size, the release, and when its digest was
+            // last checked against the pin — which is when it was
+            // downloaded, since a present image is not rehashed.
+            let mut words = format!("{} MiB", image.bytes / (1024 * 1024));
+            match image.release_date() {
+                Some(date) => words.push_str(&format!(", released {date} ({})", image.release)),
+                None => words.push_str(&format!(", release {}", image.release)),
+            }
+            if fetched {
+                words.push_str(", downloaded and verified just now");
+            } else if let Some(date) = image.verified_on() {
+                words.push_str(&format!(", verified {date}"));
+            }
+            self.conclude(taste_core::StartupStage::GuestImage, words);
+        }
+        if let Some(facts) = substrate.vm_facts() {
+            let size = format!(
+                "{} vCPUs, {:.1} GiB",
+                facts.cpus,
+                facts.memory_mib as f64 / 1024.0
+            );
+            let words = if was_running {
+                format!("Already running: {size}.")
+            } else if fetched {
+                format!("Booted: {size}.")
+            } else {
+                format!(
+                    "Booted in {}: {size}.",
+                    crate::registry::duration_words(took)
+                )
+            };
+            self.conclude(taste_core::StartupStage::Vm, words);
         }
     }
 
@@ -1492,6 +1563,22 @@ impl EnvironmentRegistry {
                     None => "checkout and folder in step".to_string(),
                 },
             );
+            let branch = sync.branch.as_deref().unwrap_or("its branch");
+            self.conclude(
+                taste_core::StartupStage::Place,
+                match (&sync.note, sync.fast_forwarded, sync.pushed) {
+                    (Some(note), _, _) => format!("Already in the VM, on {branch}; {note}."),
+                    (None, true, _) => format!(
+                        "Already in the VM, on {branch}; the folder was fast-forwarded to it."
+                    ),
+                    (None, _, true) => {
+                        format!("Already in the VM, on {branch}; it took the folder's new commits.")
+                    }
+                    (None, false, false) => {
+                        format!("Already in the VM, on {branch}, in step with the folder.")
+                    }
+                },
+            );
             Some(sync)
         } else {
             let branch = host.branch_name().unwrap_or_else(|| "main".to_string());
@@ -1573,6 +1660,9 @@ impl EnvironmentRegistry {
             // the step's detail as it goes, and each phase's end is a line
             // of the log.
             let mut pace = crate::peer::ProgressPace::default();
+            // The sending phase's last print: what crossed, for the
+            // conclusion.
+            let mut sent: Option<crate::peer::GitProgress> = None;
             crate::peer::push_to_guest_with_progress(
                 &peer,
                 vm,
@@ -1580,6 +1670,9 @@ impl EnvironmentRegistry {
                 &path,
                 &crate::peer::PRIMARY_SEED_REFSPECS,
                 &mut |p| {
+                    if !p.remote && p.phase == "Writing objects" {
+                        sent = Some(p.clone());
+                    }
                     if !pace.due(p) {
                         return;
                     }
@@ -1617,6 +1710,23 @@ impl EnvironmentRegistry {
                 );
             }
             self.note_vm(&vm.domain, "the checkout is placed");
+            let mut words = format!("Placed fresh on {branch}");
+            if let Some(sent) = &sent {
+                if let Some((_, objects)) = sent.count {
+                    words.push_str(&format!(": {objects} objects"));
+                    if let Some(bytes) = &sent.bytes {
+                        words.push_str(&format!(", {bytes}"));
+                    }
+                }
+            }
+            words.push_str(if dirty {
+                "; the folder's uncommitted work carried over."
+            } else if previous.is_some() {
+                "; the last snapshot's uncommitted work restored."
+            } else {
+                "."
+            });
+            self.conclude(taste_core::StartupStage::Place, words);
             None
         };
         let checkout = Checkout::Remote {
@@ -1703,6 +1813,13 @@ impl EnvironmentRegistry {
             );
         }
         let domain = vm.domain.clone();
+        // The primary's VM is the one the startup page is about.
+        let primarys = self
+            .substrate()
+            .vm_details()
+            .map(|v| v.domain.as_str() == vm.domain)
+            == Some(true);
+        let started = std::time::Instant::now();
         let container =
             crate::keeper::ensure_container(&substrate, vm, &self.workspace_root, &|line| {
                 push_vm_log(&self.vm_logs, &self.events, &domain, line)
@@ -1710,7 +1827,27 @@ impl EnvironmentRegistry {
         if building {
             self.note_vm(&vm.domain, "the files service image is built");
         }
+        if primarys {
+            self.conclude(
+                taste_core::StartupStage::ServiceImage,
+                if building {
+                    format!("Built in {}.", duration_words(started.elapsed()))
+                } else {
+                    "Already built in this VM.".to_string()
+                },
+            );
+        }
+        let connecting = std::time::Instant::now();
         let keeper = Keeper::in_container(&substrate, &container, format!("VM {}", vm.domain))?;
+        if primarys {
+            self.conclude(
+                taste_core::StartupStage::Files,
+                format!(
+                    "Connected in {} ms, over ssh to the VM.",
+                    connecting.elapsed().as_millis().max(1)
+                ),
+            );
+        }
         self.keepers
             .lock()
             .unwrap()
@@ -2313,16 +2450,24 @@ impl EnvironmentRegistry {
         // announcement — the banner read "stopping other projects' VMs"
         // over a guest already booting when the order was the other way
         // (David, 2026-09-22).
-        self.stop_unowned_vms(&pool).await;
+        let stopped = self.stop_unowned_vms(&pool).await;
+        self.conclude_sweep(&pool, stopped).await;
         self.primary()
             .announce_preparing("bringing up the workspace's VM");
         // The VMs' consoles, followed from before the boot so the story
         // has its first lines; again after, for a VM that was made just
         // now.
+        let fetching = pool.will_download();
+        let mut was_running = false;
         if let Ok(vms) = pool.vms().await {
+            was_running = vms
+                .iter()
+                .any(|vm| vm.state == crate::provision::DomainState::Running);
             self.follow_vm_consoles(&vms);
         }
+        let bringing_up = std::time::Instant::now();
         self.set_substrate(Substrate::resolve_in(&pool, reporter).await);
+        self.conclude_vm(fetching, was_running, bringing_up.elapsed());
         if let Ok(vms) = pool.vms().await {
             self.follow_vm_consoles(&vms);
         }
@@ -2785,6 +2930,26 @@ fn unowned_note(stopped: &[Vm]) -> String {
 const VM_LOG_CAPACITY: usize = 4000;
 
 /// One line into a VM's story, and onto the bus.
+/// The memory the room check sees, as the sweep's conclusion says it.
+fn room_words(room: &crate::pool::MemoryRoom) -> String {
+    let gib = |mib: u64| mib as f64 / 1024.0;
+    format!(
+        "{:.1} GiB of memory available for IDE VMs; one takes {:.1} GiB.",
+        gib(room.available_mib()),
+        gib(room.vm_mib)
+    )
+}
+
+/// A duration as a conclusion says it: `41 s`, `3 min 2 s`.
+pub(crate) fn duration_words(took: std::time::Duration) -> String {
+    let secs = took.as_secs().max(1);
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s} s"),
+        (m, 0) => format!("{m} min"),
+        (m, s) => format!("{m} min {s} s"),
+    }
+}
+
 fn push_vm_log(
     logs: &Mutex<BTreeMap<String, VecDeque<String>>>,
     events: &EventBus,

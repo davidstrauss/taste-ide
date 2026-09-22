@@ -3886,6 +3886,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             );
                         }
                     }
+                    Event::StartupConcluded { stage, summary } => {
+                        startup.on_concluded(stage, &summary);
+                    }
                     Event::VmProgress { domain, line } => {
                         if environments_for_events
                             .vm_log_domain_for(&primary_env)

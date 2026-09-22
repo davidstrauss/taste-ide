@@ -136,6 +136,8 @@ struct StepRow {
     title: gtk::Label,
     detail: gtk::Label,
     status: Cell<Status>,
+    /// What the step came to, once it is done — shown under its check.
+    conclusion: RefCell<Option<String>>,
 }
 
 impl StepRow {
@@ -181,6 +183,7 @@ impl StepRow {
             title,
             detail,
             status: Cell::new(Status::Pending),
+            conclusion: RefCell::new(None),
         };
         this.set(Status::Pending, None);
         this
@@ -214,19 +217,26 @@ impl StepRow {
                 mark.set_visible_child_name("icon");
             }
         }
-        // Only the active step says what it is doing, and what it says is
-        // its current substep — "Step 2 of 9: RUN dnf install" — never a
-        // description; a checked or pending step is its title alone
-        // (David, 2026-09-22: "Hide the descriptions below checklist items
-        // that aren't actively being worked on").
+        // The active step says what it is doing — its current substep,
+        // "Step 2 of 9: RUN dnf install" — and a checked one what it came
+        // to — "Stopped 2 unused VMs. 12.0 GiB of memory available for IDE
+        // VMs." A pending step is its title alone, and so is a checked one
+        // with no conclusion to give (David, 2026-09-22: "I would like
+        // descriptions under the completed env rebuild steps, but I want
+        // them to state the summary/conclusion"). A failed one says why.
+        let show = |text: &str| {
+            self.detail.set_label(text);
+            self.detail.set_visible(true);
+        };
         match (status, detail) {
-            (Status::Active, Some(text)) if !text.is_empty() => {
-                self.detail.set_label(text);
-                self.detail.set_visible(true);
-            }
+            (Status::Active | Status::Failed, Some(text)) if !text.is_empty() => show(text),
             (Status::Active, None) => {
                 // Keep the last substep until the next one arrives.
             }
+            (Status::Done, _) => match self.conclusion.borrow().as_deref() {
+                Some(text) => show(text),
+                None => self.detail.set_visible(false),
+            },
             _ => self.detail.set_visible(false),
         }
         if status == Status::Active {
@@ -247,6 +257,12 @@ pub struct StartupPage {
     vm_log: Rc<LogPage>,
     build_log: Rc<LogPage>,
     current: Cell<Option<Step>>,
+    /// When the current step became current, for the conclusions the
+    /// page works out itself — the build's and the container's.
+    since: Cell<Option<std::time::Instant>>,
+    /// The image build's step count and how many of them the cache
+    /// answered, read off its log.
+    build_steps: Cell<(u32, u32)>,
     /// Whether a start is under way: set by the first transitional state,
     /// cleared when the page is reset for the next start.
     underway: Cell<bool>,
@@ -365,6 +381,8 @@ impl StartupPage {
             vm_log,
             build_log,
             current: Cell::new(None),
+            since: Cell::new(None),
+            build_steps: Cell::new((0, 0)),
             underway: Cell::new(false),
             settled: Cell::new(false),
             area,
@@ -433,7 +451,10 @@ impl StartupPage {
         self.heading.set_label("Environment starting");
         self.note.set_visible(false);
         self.prompt.set_visible(false);
+        self.since.set(None);
+        self.build_steps.set((0, 0));
         for row in &self.rows {
+            row.conclusion.replace(None);
             row.set(Status::Pending, None);
             row.detail.set_visible(false);
         }
@@ -496,6 +517,9 @@ impl StartupPage {
         }
         for earlier in Step::ALL.iter().filter(|s| **s < step) {
             let row = self.row(*earlier);
+            if row.status.get() == Status::Active {
+                self.conclude_own(*earlier);
+            }
             if matches!(row.status.get(), Status::Pending | Status::Active) {
                 row.set(Status::Done, None);
             }
@@ -504,6 +528,9 @@ impl StartupPage {
         if row.status.get() != Status::Failed {
             row.set(Status::Active, detail);
         }
+        if self.current.get() != Some(step) {
+            self.since.set(Some(std::time::Instant::now()));
+        }
         self.current.set(Some(step));
         self.logs.set_visible_child_name(match step.log() {
             LogKind::Environment => "build",
@@ -511,8 +538,66 @@ impl StartupPage {
         });
     }
 
+    /// The conclusions the page works out from what it watched, for the
+    /// steps that happen in the environment's own build rather than in
+    /// the registry: how long, and — for the image — how much of it the
+    /// cache already had.
+    fn conclude_own(&self, step: Step) {
+        let row = self.row(step);
+        if row.conclusion.borrow().is_some() {
+            return;
+        }
+        let Some(took) = self.since.get().map(|since| since.elapsed()) else {
+            return;
+        };
+        let took = duration_words(took);
+        let words = match step {
+            Step::Build => match self.build_steps.get() {
+                (0, _) => format!("Image ready in {took}."),
+                // A FROM step never says "Using cache": the rest all did.
+                (of, cached) if cached + 1 >= of => {
+                    format!("Up to date: all {of} steps from the cache, in {took}.")
+                }
+                (of, 0) => format!("Built in {took}: {of} steps."),
+                (of, cached) => format!("Built in {took}: {of} steps, {cached} from the cache."),
+            },
+            Step::Start => format!("Container up in {took}."),
+            _ => return,
+        };
+        row.conclusion.replace(Some(words));
+    }
+
+    /// A step's conclusion as the registry says it, shown under its check
+    /// once the step is done — now, when it already is.
+    pub fn on_concluded(&self, stage: taste_core::StartupStage, summary: &str) {
+        use taste_core::StartupStage as S;
+        if !self.underway.get() {
+            return;
+        }
+        let step = match stage {
+            S::Sweep => Step::Sweep,
+            S::GuestImage => Step::GuestImage,
+            S::Vm => Step::Vm,
+            S::ServiceImage => Step::ServiceImage,
+            S::Files => Step::Files,
+            S::Place => Step::Place,
+        };
+        let row = self.row(step);
+        // Whole, and wrapped if it must: a conclusion is read once and
+        // does not move, so there is nothing to keep to one line.
+        row.conclusion.replace(Some(summary.trim().to_string()));
+        if row.status.get() == Status::Done {
+            row.set(Status::Done, None);
+        }
+    }
+
     /// Every step done; the heading says so.
     fn finish(self: &Rc<Self>) {
+        if let Some(step) = self.current.get() {
+            if self.row(step).status.get() == Status::Active {
+                self.conclude_own(step);
+            }
+        }
         for step in Step::ALL {
             let row = self.row(step);
             if row.status.get() != Status::Failed {
@@ -628,7 +713,12 @@ impl StartupPage {
         }
         match self.current.get() {
             Some(Step::Build) => {
+                let (of, cached) = self.build_steps.get();
+                if clean.starts_with("--> Using cache") {
+                    self.build_steps.set((of, cached + 1));
+                }
                 if let Some((n, of, rest)) = build_step_words(clean) {
+                    self.build_steps.set((of, self.build_steps.get().1));
                     self.row(Step::Build).set(
                         Status::Active,
                         Some(&format!("Step {n} of {of}: {}", substep_words(rest))),
@@ -690,6 +780,27 @@ impl StartupPage {
             "[taste-ide] podman in the guest answers; the VM is ready",
         ] {
             self.on_vm_line(line);
+        }
+        use taste_core::StartupStage as S;
+        for (stage, words) in [
+            (
+                S::Sweep,
+                "Stopped 2 unused VMs. 12.4 GiB of memory available for IDE VMs; one takes \
+                 10.7 GiB.",
+            ),
+            (
+                S::GuestImage,
+                "976 MiB, released 2026-08-29 (44.20260829.3.1), verified 2026-09-20",
+            ),
+            (S::Vm, "Booted in 41 s: 8 vCPUs, 10.7 GiB."),
+            (S::ServiceImage, "Already built in this VM."),
+            (S::Files, "Connected in 38 ms, over ssh to the VM."),
+            (
+                S::Place,
+                "Already in the VM, on main, in step with the folder.",
+            ),
+        ] {
+            self.on_concluded(stage, words);
         }
         match kind {
             "build" => {
@@ -768,6 +879,16 @@ fn build_step_words(line: &str) -> Option<(u32, u32, &str)> {
         .unwrap_or(0);
     let words = after[digits..].trim_start_matches(':').trim();
     Some((n.trim().parse().ok()?, after[..digits].parse().ok()?, words))
+}
+
+/// A duration as a conclusion says it: `41 s`, `3 min 2 s`.
+fn duration_words(took: std::time::Duration) -> String {
+    let secs = took.as_secs().max(1);
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s} s"),
+        (m, 0) => format!("{m} min"),
+        (m, s) => format!("{m} min {s} s"),
+    }
 }
 
 /// A substep as one short line: the first line, its first letter up,

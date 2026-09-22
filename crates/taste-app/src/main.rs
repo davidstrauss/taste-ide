@@ -342,6 +342,9 @@ fn main() -> glib::ExitCode {
                  .startup-log { background-color: @view_bg_color; \
                    border-radius: 12px; }\n\
                  .startup-step-done { color: @success_color; }\n\
+                 /* What a checked step came to reads as text, not as \
+                    more of the check's green. */\n\
+                 .startup-step-done .caption { color: @card_fg_color; }\n\
                  .startup-step-failed { color: @error_color; }\n\
                  .startup-step-pending { opacity: 0.7; }\n\
                  tabbar.startup-locked tab:not(:selected) { opacity: 0.45; }\n\

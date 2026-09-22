@@ -57,6 +57,24 @@ pub enum PoolError {
     },
 }
 
+/// The host's memory against the VMs it holds ([`Pool::memory_room`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryRoom {
+    pub committed_mib: u64,
+    pub host_mib: u64,
+    /// What one more VM of this host's size commits.
+    pub vm_mib: u64,
+}
+
+impl MemoryRoom {
+    /// What is left for VMs once the host keeps its reserve.
+    pub fn available_mib(&self) -> u64 {
+        self.host_mib
+            .saturating_sub(sizing::HOST_RESERVE_MIB)
+            .saturating_sub(self.committed_mib)
+    }
+}
+
 /// What one VM can still take: its size less the guest's own reserve and
 /// the grants already placed on it. The pure half of placement, so the
 /// choice can be tested without a hypervisor.
@@ -323,6 +341,33 @@ impl Pool {
                 host_mib,
             })
         }
+    }
+
+    /// The host's memory as the room check counts it: what the running
+    /// VMs — every workspace's — commit, what the host has, and what one
+    /// more VM would take.
+    pub async fn memory_room(&self) -> Result<MemoryRoom> {
+        let sizing = Sizing::for_host();
+        let host_mib = sizing::host_memory_mib().unwrap_or(0);
+        let mut committed_mib = 0u64;
+        for vm in self
+            .libvirt
+            .list_all()
+            .await?
+            .iter()
+            .filter(|vm| vm.state == DomainState::Running)
+        {
+            committed_mib += self
+                .libvirt
+                .facts(vm)
+                .await
+                .map_or(sizing.memory_mib, |facts| facts.memory_mib);
+        }
+        Ok(MemoryRoom {
+            committed_mib,
+            host_mib,
+            vm_mib: sizing.memory_mib,
+        })
     }
 
     /// Whether the host has room for one more VM of the size it gives.

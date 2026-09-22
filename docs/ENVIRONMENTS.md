@@ -3432,8 +3432,13 @@ description: "Step 2 of 9: RUN dnf install", the IDE's own line from the
 VM's story, or a measure where there is one — the guest image's MiB of
 MiB, git's percentage, objects, and bytes as the checkout's seed crosses
 (`Event::VmProgress`, paced to once a second, in tabular figures, and
-kept out of the log). A checked or pending step is its title alone. The
-page says why
+kept out of the log). A checked step says what it came to instead, as
+what is now true — "Stopped 2 unused VMs. 12.4 GiB of memory available
+for IDE VMs; one takes 10.7 GiB.", "976 MiB, released 2026-08-29
+(44.20260829.3.1), verified 2026-09-20", "Built in 3 min 2 s: 9 steps, 7
+from the cache." — the registry's steps through `Event::StartupConcluded`,
+the build's and the container's worked out by the page from the log it
+watched. A pending step is its title alone. The page says why
 when the safe-mode environment is what is coming up — the project's
 devcontainer is missing, or it failed, with the failure — and offers
 Prompt Agent for the repair. The safe-mode environment itself failing is

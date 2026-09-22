@@ -69,6 +69,19 @@ impl GuestImageFetch {
     }
 }
 
+/// A step of the primary's startup that happens once for the workspace
+/// rather than inside the environment's own build — the startup page's
+/// rows, for a step's conclusion to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupStage {
+    Sweep,
+    GuestImage,
+    Vm,
+    ServiceImage,
+    Files,
+    Place,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Git working-tree status changed (files staged, modified, committed…).
@@ -100,6 +113,14 @@ pub enum Event {
     /// never written to the log, since each one replaces the last. The
     /// startup page shows it as the step's detail.
     VmProgress { domain: String, line: String },
+    /// What a startup step came to, once it is done: "Stopped 2 unused
+    /// VMs. 12.0 GiB of memory available for IDE VMs." The startup page
+    /// shows it under the step's check, so a finished list reads as what
+    /// is now true rather than as a row of ticks.
+    StartupConcluded {
+        stage: StartupStage,
+        summary: String,
+    },
     /// A line the container itself wrote — its main process's stdout or
     /// stderr, as `podman logs --follow` hands it on. The devcontainer spec
     /// has no notion of a log; this stream is the one thing a container
@@ -363,6 +384,7 @@ impl Event {
             | Event::ChatNotice { .. }
             | Event::VmLog { .. }
             | Event::VmProgress { .. }
+            | Event::StartupConcluded { .. }
             | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }
