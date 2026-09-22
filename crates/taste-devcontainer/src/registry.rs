@@ -378,6 +378,20 @@ pub struct EnvironmentRegistry {
     /// per workspace: a second would double the filesystem work and agree
     /// with the first about every number it produced.
     disk_meter_started: AtomicBool,
+    /// Environments in a VM behind the stream, and where each one's move
+    /// stands (`crate::migration`); mirrored in each environment's
+    /// directory so the clock survives a restart.
+    migrations: Mutex<BTreeMap<EnvironmentId, crate::migration::Migration>>,
+    /// Whether the migration clock is running. One per workspace.
+    migration_clock_started: AtomicBool,
+    /// Moves under way, so the clock does not start a second of one.
+    relocations_in_flight: Mutex<std::collections::BTreeSet<EnvironmentId>>,
+    /// One move at a time: each is a container stopped and a checkout
+    /// re-seeded, and two at once contend for one host.
+    relocating: tokio::sync::Mutex<()>,
+    /// Whether the new release's base image is being fetched ahead of the
+    /// moves that need it.
+    prefetching_guest: AtomicBool,
     /// Test seam: what `statvfs` would have said about the environments'
     /// volume. The floor is the one ceiling whose input the suite has to
     /// substitute for — a unit test cannot fill a disk, and a test that
@@ -452,6 +466,11 @@ impl EnvironmentRegistry {
             channel_services: Mutex::new(None),
             config_watch: crate::configwatch::ConfigWatch::new(),
             disk_meter_started: AtomicBool::new(false),
+            migrations: Mutex::new(BTreeMap::new()),
+            migration_clock_started: AtomicBool::new(false),
+            relocations_in_flight: Mutex::new(std::collections::BTreeSet::new()),
+            relocating: tokio::sync::Mutex::new(()),
+            prefetching_guest: AtomicBool::new(false),
             free_disk_for_tests: Mutex::new(None),
             keepers: Mutex::new(BTreeMap::new()),
             substrates: Mutex::new(BTreeMap::new()),
@@ -2067,11 +2086,22 @@ impl EnvironmentRegistry {
         let supervisor = self
             .get(id)
             .with_context(|| format!("no environment {id}"))?;
+        let vm = self.place_by_capacity(supervisor.grant())?;
+        self.place_env_in(id, &vm)?;
+        Ok(vm.domain)
+    }
+
+    /// [`Self::replace_environment`]'s placement, in a VM already chosen:
+    /// the checkout made in `vm` from the peer's refs and its last
+    /// snapshot, and the environment pointed at it.
+    fn place_env_in(&self, id: &EnvironmentId, vm: &Vm) -> Result<()> {
+        let supervisor = self
+            .get(id)
+            .with_context(|| format!("no environment {id}"))?;
         let peer = supervisor.peer().to_path_buf();
         let git = taste_git::GitWorkspace::discover(&peer)
             .with_context(|| format!("{} is not a git repository", peer.display()))?;
-        let vm = self.place_by_capacity(supervisor.grant())?;
-        let keeper = self.keeper_for(&vm)?;
+        let keeper = self.keeper_for(vm)?;
         let files = Files::Remote(keeper.clone());
         let path = crate::provision::guest_checkout_path(&self.workspace_root, id);
         let workspace_dir = crate::provision::guest_workspace_dir(&self.workspace_root);
@@ -2112,7 +2142,7 @@ impl EnvironmentRegistry {
             ],
         )?;
         let keys = crate::keys::Keys::for_workspace(&self.workspace_root);
-        crate::peer::push_to_guest(&peer, &vm, &keys, &path, &crate::peer::PEER_REFSPECS)?;
+        crate::peer::push_to_guest(&peer, vm, &keys, &path, &crate::peer::PEER_REFSPECS)?;
         // Where HEAD was: the snapshot's first parent, and the branch that
         // names it. Without a snapshot, the one branch the peer has.
         let snapshot_ref = taste_git::snapshot_ref(id.as_str());
@@ -2165,8 +2195,13 @@ impl EnvironmentRegistry {
         };
         supervisor.set_checkout(checkout.clone());
         supervisor.set_substrate(self.substrate_for(&checkout));
-        supervisor.set_keeper(keeper);
-        Ok(vm.domain)
+        supervisor.set_keeper(keeper.clone());
+        self.events.publish(Event::CheckoutMoved {
+            env: id.clone(),
+            checkout,
+            files: Files::Remote(keeper),
+        });
+        Ok(())
     }
 
     /// Put a freshly cloned environment's checkout into `vm`, leaving the
@@ -2942,6 +2977,7 @@ impl EnvironmentRegistry {
         // spawned off the main thread has nowhere to go.
         self.start_disk_meter();
         self.start_vm_meter();
+        self.start_migration_clock();
 
         if !report.swept.is_empty() {
             let message = report.swept.summary();
@@ -3004,6 +3040,593 @@ fn unowned_note(stopped: &[Vm]) -> String {
 const VM_LOG_CAPACITY: usize = 4000;
 
 /// One line into a VM's story, and onto the bus.
+use crate::supervisor::SupervisorState;
+
+/// Migrations: environments in a VM behind the stream, moved to a VM on the
+/// current release (`crate::migration` has the rules and the clock).
+impl EnvironmentRegistry {
+    /// The pending move of `env`, if its VM is behind the stream.
+    pub fn migration_of(&self, env: &EnvironmentId) -> Option<crate::migration::Migration> {
+        self.migrations.lock().unwrap().get(env).cloned()
+    }
+
+    /// Every minute: the stream read again every few hours, the
+    /// environments' VMs judged against it, the new release's base image
+    /// fetched ahead of the moves, and whatever the clock says is due.
+    /// Started once, at the end of the first reconcile — the first moment
+    /// the pool is known.
+    pub fn start_migration_clock(self: &Arc<Self>) {
+        if self.migration_clock_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        const TICK: std::time::Duration = std::time::Duration::from_secs(60);
+        const STREAM_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut stream_read = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(TICK).await;
+                let Some(registry) = weak.upgrade() else {
+                    break;
+                };
+                if stream_read.elapsed() >= STREAM_EVERY {
+                    if let Err(e) = crate::guest::refresh_from_stream().await {
+                        tracing::warn!("reading the {} stream: {e:#}", crate::guest::STREAM);
+                    }
+                    stream_read = std::time::Instant::now();
+                }
+                registry.detect_migrations().await;
+                registry.prefetch_guest_image();
+                registry.tick_migrations();
+            }
+        });
+    }
+
+    /// Judge each environment's VM against the stream: a move recorded for
+    /// one that is behind — picked back up from its directory after a
+    /// restart — and cleared for one that is not. An environment other
+    /// than the primary with nothing running has nobody to ask, and moves
+    /// at once.
+    pub async fn detect_migrations(self: &Arc<Self>) {
+        if self.substrate().vm_details().is_none() {
+            return;
+        }
+        let Ok(image) = crate::guest::image() else {
+            return;
+        };
+        let pool = self.pool();
+        let Ok(vms) = pool.vms().await else {
+            return;
+        };
+        let mut releases: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for vm in &vms {
+            releases.insert(vm.domain.clone(), pool.libvirt().release_of(vm).await);
+        }
+        let now = now_secs();
+        let mut idle = Vec::new();
+        for supervisor in self.list() {
+            let id = supervisor.id().clone();
+            let Some(domain) = supervisor.checkout().vm().map(str::to_string) else {
+                continue;
+            };
+            let dir = self.env_dir(&id);
+            let release = releases.get(&domain).cloned().flatten();
+            let behind = release
+                .as_deref()
+                .is_some_and(|r| crate::guest::release_is_behind(r, &image.release));
+            let Some(release) = release.filter(|_| behind) else {
+                if self.migrations.lock().unwrap().remove(&id).is_some() {
+                    crate::migration::Migration::clear(&dir);
+                }
+                continue;
+            };
+            let known = self.migrations.lock().unwrap().get(&id).cloned();
+            let migration = match known
+                .or_else(|| crate::migration::Migration::read(&dir).filter(|m| m.from_vm == domain))
+            {
+                Some(mut m) => {
+                    m.to_release = image.release.clone();
+                    m
+                }
+                None => {
+                    let note = format!(
+                        "environment {id} is in VM {domain} on {release}, behind stable's {}; \
+                         it moves to a VM on {}",
+                        image.release, image.release
+                    );
+                    taste_core::app_log::push("info", "environments", &note);
+                    crate::migration::Migration::new(&domain, &release, &image.release, now)
+                }
+            };
+            if let Err(e) = migration.write(&dir) {
+                tracing::warn!("recording {id}'s move: {e:#}");
+            }
+            self.migrations
+                .lock()
+                .unwrap()
+                .insert(id.clone(), migration);
+            let running = matches!(
+                supervisor.state(),
+                SupervisorState::Running { .. }
+                    | SupervisorState::Starting
+                    | SupervisorState::Building
+                    | SupervisorState::Preparing { .. }
+            );
+            if !running && !id.is_primary() {
+                idle.push(id);
+            }
+        }
+        for id in idle {
+            self.spawn_relocate(id, "nothing was running in it".to_string());
+        }
+    }
+
+    /// The new release's base image, fetched in the background once a move
+    /// needs it, so the move itself does not wait a gigabyte.
+    fn prefetch_guest_image(self: &Arc<Self>) {
+        if self.migrations.lock().unwrap().is_empty() {
+            return;
+        }
+        let Ok(image) = crate::guest::image() else {
+            return;
+        };
+        if image.base_is_present() || self.prefetching_guest.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sandboxed = self.substrate().target().sandboxed();
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let outcome = image
+                .ensure_base(sandboxed, Arc::new(crate::substrate::report_download))
+                .await;
+            if let Err(e) = outcome {
+                tracing::warn!(
+                    "fetching guest release {} ahead of the moves: {e:#}",
+                    image.release
+                );
+            }
+            if let Some(registry) = weak.upgrade() {
+                registry.prefetching_guest.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+
+    /// What the clock says is due for each pending move: its agent told,
+    /// the coordinator told, or the move forced.
+    fn tick_migrations(self: &Arc<Self>) {
+        use crate::migration::Due;
+        let now = now_secs();
+        let pending: Vec<(EnvironmentId, crate::migration::Migration)> = self
+            .migrations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, m)| (id.clone(), m.clone()))
+            .collect();
+        for (id, mut migration) in pending {
+            let due = migration.due(now);
+            if due.is_empty() {
+                continue;
+            }
+            for due in due {
+                match due {
+                    Due::Nudge => {
+                        self.events.publish(Event::MigrationNotice {
+                            env: id.clone(),
+                            audience: taste_core::MigrationAudience::Agent,
+                            text: migration.nudge_text(id.as_str(), now),
+                        });
+                        migration.last_nudge = Some(now);
+                    }
+                    Due::TellCoordinator => {
+                        self.events.publish(Event::MigrationNotice {
+                            env: id.clone(),
+                            audience: taste_core::MigrationAudience::Coordinator,
+                            text: migration.coordinator_text(id.as_str(), now),
+                        });
+                        migration.coordinator_told = true;
+                    }
+                    Due::Force => self.spawn_relocate(
+                        id.clone(),
+                        "forced two hours after it became pending".to_string(),
+                    ),
+                }
+            }
+            let _ = migration.write(&self.env_dir(&id));
+            if let Some(slot) = self.migrations.lock().unwrap().get_mut(&id) {
+                *slot = migration;
+            }
+        }
+    }
+
+    /// The environment's agent asks for its move. Recorded, and the
+    /// coordinator asked to approve it — except for the primary, whose
+    /// agent IS the coordinator, so asking is approving and it moves now.
+    pub fn request_migration(self: &Arc<Self>, env: &EnvironmentId) -> Result<String> {
+        let mut migration = self.migration_of(env).with_context(|| {
+            format!("{env} has no move pending: its VM runs the current guest release")
+        })?;
+        if env.is_primary() {
+            self.spawn_relocate(env.clone(), "the coordinator asked for it".to_string());
+            return Ok(format!(
+                "Moving now to a VM on {}. Your container stops and this conversation resumes \
+                 in the new VM in a few minutes.",
+                migration.to_release
+            ));
+        }
+        let now = now_secs();
+        migration.requested_at.get_or_insert(now);
+        migration.write(&self.env_dir(env))?;
+        self.migrations
+            .lock()
+            .unwrap()
+            .insert(env.clone(), migration.clone());
+        let left = migration.forced_at().saturating_sub(now) / 60;
+        self.events.publish(Event::MigrationNotice {
+            env: env.clone(),
+            audience: taste_core::MigrationAudience::Coordinator,
+            text: format!(
+                "Environment {env}'s agent asks to move it now: it is in VM {} on Fedora CoreOS \
+                 {}, behind the stable release {}. The move stops its container for a few \
+                 minutes and brings its checkout, uncommitted work, and conversation back in a \
+                 VM on {}. Approve it with environment_migrate {{\"environment\": \"{env}\"}}. \
+                 It is forced in {left} minutes if you do not.",
+                migration.from_vm,
+                migration.from_release,
+                migration.to_release,
+                migration.to_release
+            ),
+        });
+        Ok(format!(
+            "Asked. The coordinator approves the move; until then keep working or wait. It \
+             happens by itself in {left} minutes if it is not approved."
+        ))
+    }
+
+    /// The coordinator approves `env`'s move: it starts now.
+    pub fn approve_migration(self: &Arc<Self>, env: &EnvironmentId) -> Result<String> {
+        let migration = self.migration_of(env).with_context(|| {
+            format!("{env} has no move pending: its VM runs the current guest release")
+        })?;
+        self.spawn_relocate(env.clone(), "the coordinator approved it".to_string());
+        Ok(format!(
+            "Moving {env} to a VM on {} now. Its container stops for a few minutes; its agent \
+             resumes in the new VM and is told when it is there.",
+            migration.to_release
+        ))
+    }
+
+    fn spawn_relocate(self: &Arc<Self>, env: EnvironmentId, why: String) {
+        if !self
+            .relocations_in_flight
+            .lock()
+            .unwrap()
+            .insert(env.clone())
+        {
+            return;
+        }
+        let registry = self.clone();
+        tokio::spawn(async move {
+            registry.relocate(&env, &why).await;
+            registry.relocations_in_flight.lock().unwrap().remove(&env);
+        });
+    }
+
+    /// Move `env` to a VM on the current release, and say how it went: to
+    /// its agent and the user when it is done, and to the coordinator and
+    /// the user when it failed — the move then tried again later.
+    async fn relocate(self: &Arc<Self>, env: &EnvironmentId, why: &str) {
+        let _one_at_a_time = self.relocating.lock().await;
+        let Some(migration) = self.migration_of(env) else {
+            return;
+        };
+        match self.relocate_inner(env).await {
+            Ok(domain) => {
+                self.migrations.lock().unwrap().remove(env);
+                crate::migration::Migration::clear(&self.env_dir(env));
+                let note = format!(
+                    "environment {env} moved from VM {} ({}) to VM {domain} on {} — {why}",
+                    migration.from_vm, migration.from_release, migration.to_release
+                );
+                taste_core::app_log::push("info", "environments", &note);
+                self.events.publish(Event::Toast(format!(
+                    "{env} moved to a VM on {}",
+                    migration.to_release
+                )));
+                self.events.publish(Event::MigrationNotice {
+                    env: env.clone(),
+                    audience: taste_core::MigrationAudience::Moved,
+                    text: format!(
+                        "The move is done: environment {env} is in VM {domain} on Fedora CoreOS \
+                         {}, with its checkout and uncommitted work as they were. Continue where \
+                         you left off.",
+                        migration.to_release
+                    ),
+                });
+            }
+            Err(e) => {
+                let mut failed = migration.clone();
+                failed.failed_at = Some(now_secs());
+                let _ = failed.write(&self.env_dir(env));
+                if let Some(slot) = self.migrations.lock().unwrap().get_mut(env) {
+                    slot.failed_at = failed.failed_at;
+                }
+                let note = format!(
+                    "moving environment {env} to a VM on {} failed: {e:#}",
+                    migration.to_release
+                );
+                taste_core::app_log::push("warn", "environments", &note);
+                self.events.publish(Event::Toast(format!(
+                    "{env} could not be moved to a VM on {}; the app log says why",
+                    migration.to_release
+                )));
+                self.events.publish(Event::MigrationNotice {
+                    env: env.clone(),
+                    audience: taste_core::MigrationAudience::Coordinator,
+                    text: format!(
+                        "Moving environment {env} to a VM on {} failed: {e:#}. It is tried again \
+                         in {} minutes. Its container may be stopped until then; \
+                         devcontainer_reload does not move it.",
+                        migration.to_release,
+                        crate::migration::RETRY_AFTER.as_secs() / 60
+                    ),
+                });
+            }
+        }
+    }
+
+    /// The move itself: snapshot and stop, the agent's home volume carried
+    /// out, a VM on the current release chosen or made, the volume and the
+    /// checkout put there, the old copy removed — and the old VM with it
+    /// once nothing of this workspace is left in it — then the container
+    /// started again if it was running.
+    async fn relocate_inner(self: &Arc<Self>, env: &EnvironmentId) -> Result<String> {
+        let supervisor = self
+            .get(env)
+            .with_context(|| format!("no environment {env}"))?;
+        let Checkout::Remote {
+            vm: old_domain,
+            path: old_path,
+        } = supervisor.checkout()
+        else {
+            bail!("{env}'s checkout is not in a VM");
+        };
+        let was_running = matches!(supervisor.state(), SupervisorState::Running { .. });
+        let old_substrate = self
+            .substrate_of_vm(&old_domain)
+            .with_context(|| format!("VM {old_domain} is not brought up"))?;
+        self.note_vm(
+            &old_domain,
+            format!("{env}: moving to a VM on the current release"),
+        );
+
+        // Nothing moves without a fresh snapshot: it is what carries the
+        // uncommitted work.
+        let for_snapshot = supervisor.clone();
+        tokio::task::spawn_blocking(move || {
+            for_snapshot.snapshot_blocking()?;
+            for_snapshot.sync_peer_blocking()
+        })
+        .await
+        .context("the snapshot did not finish")?
+        .context("snapshotting before the move")?;
+        if let Err(e) = supervisor.stop_orderly().await {
+            self.note_vm(&old_domain, format!("{env}: stopping its container: {e:#}"));
+        }
+        // Everything up to the checkout's placement leaves the environment
+        // where it was: a failure there puts it back as it stood — its
+        // substrate the old VM's, its container started again — rather than
+        // stopped and pointed at a VM it is not in.
+        match self.carry_and_place(env, &supervisor, &old_substrate).await {
+            Ok(target) => {
+                self.finish_move(
+                    env,
+                    &supervisor,
+                    &old_domain,
+                    &old_path,
+                    was_running,
+                    target,
+                )
+                .await
+            }
+            Err(e) => {
+                if env.is_primary() {
+                    self.set_substrate(old_substrate.clone());
+                }
+                if was_running {
+                    if let Err(again) = supervisor.reload().await {
+                        tracing::warn!("{env} did not start again in VM {old_domain}: {again:#}");
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The volume carried and the checkout placed in a VM on the current
+    /// release: the part of a move that can still be undone.
+    async fn carry_and_place(
+        self: &Arc<Self>,
+        env: &EnvironmentId,
+        supervisor: &Arc<Supervisor>,
+        old_substrate: &Arc<Substrate>,
+    ) -> Result<Vm> {
+        let old_domain = old_substrate
+            .vm_details()
+            .map(|vm| vm.domain.clone())
+            .unwrap_or_default();
+        // The agent's home — its conversation — carried in a file on this
+        // host between the two VMs' podmans.
+        let volume = environment::env_home_volume(&self.workspace_root, env);
+        let tar = self.env_dir(env).join("home-volume.tar");
+        let exported = {
+            let (substrate, volume, tar) = (old_substrate.clone(), volume.clone(), tar.clone());
+            tokio::task::spawn_blocking(move || export_volume(&substrate, &volume, &tar))
+                .await
+                .context("exporting the home volume did not finish")??
+        };
+
+        let target = {
+            let registry = self.clone();
+            let grant = supervisor.grant();
+            tokio::task::spawn_blocking(move || registry.place_by_capacity(grant))
+                .await
+                .context("choosing a VM did not finish")??
+        };
+        let target_substrate = self
+            .substrate_of_vm(&target.domain)
+            .with_context(|| format!("VM {} is not brought up", target.domain))?;
+        self.note_vm(
+            &target.domain,
+            format!("{env}: moving in from VM {old_domain}"),
+        );
+        if exported {
+            let (substrate, volume, from) = (target_substrate.clone(), volume.clone(), tar.clone());
+            tokio::task::spawn_blocking(move || import_volume(&substrate, &volume, &from))
+                .await
+                .context("importing the home volume did not finish")??;
+        }
+        let _ = std::fs::remove_file(&tar);
+
+        if env.is_primary() {
+            self.set_substrate(target_substrate.clone());
+            let (registry, vm) = (self.clone(), target.clone());
+            tokio::task::spawn_blocking(move || registry.place_primary(&vm))
+                .await
+                .context("placing the checkout did not finish")??;
+        } else {
+            let (registry, id, vm) = (self.clone(), env.clone(), target.clone());
+            tokio::task::spawn_blocking(move || registry.place_env_in(&id, &vm))
+                .await
+                .context("placing the checkout did not finish")??;
+        }
+        Ok(target)
+    }
+
+    /// After the checkout is placed: the old copy and — once nothing of
+    /// this workspace is left in it — the old VM removed, and the
+    /// container started again if it was running.
+    async fn finish_move(
+        self: &Arc<Self>,
+        env: &EnvironmentId,
+        supervisor: &Arc<Supervisor>,
+        old_domain: &str,
+        old_path: &Path,
+        was_running: bool,
+        target: Vm,
+    ) -> Result<String> {
+        let old_domain = old_domain.to_string();
+        let old_path = old_path.to_path_buf();
+        // The old copy, through the old VM's files service; best effort,
+        // since the VM may go entirely below.
+        let old_keeper = self.keepers.lock().unwrap().get(&old_domain).cloned();
+        if let Some(keeper) = old_keeper {
+            let files = Files::Remote(keeper);
+            let removed = tokio::task::spawn_blocking(move || files.remove(&old_path, true)).await;
+            if !matches!(removed, Ok(Ok(()))) {
+                self.note_vm(
+                    &old_domain,
+                    format!("{env}: its old checkout stays in this VM"),
+                );
+            }
+        }
+        let still_used = self
+            .list()
+            .iter()
+            .any(|s| s.checkout().vm() == Some(old_domain.as_str()));
+        if !still_used {
+            let pool = self.pool();
+            if let Some(vm) = pool
+                .vms()
+                .await
+                .ok()
+                .and_then(|vms| vms.into_iter().find(|vm| vm.domain == old_domain))
+            {
+                match pool.libvirt().destroy(&vm).await {
+                    Ok(()) => {
+                        self.keepers.lock().unwrap().remove(&old_domain);
+                        self.substrates.lock().unwrap().remove(&old_domain);
+                        taste_core::app_log::push(
+                            "info",
+                            "environments",
+                            &format!("VM {old_domain} held nothing more of this workspace and was removed"),
+                        );
+                    }
+                    Err(e) => tracing::warn!("removing VM {old_domain}: {e:#}"),
+                }
+            }
+        }
+
+        if was_running {
+            if let Err(e) = supervisor.reload().await {
+                tracing::warn!("{env} did not start again after its move: {e:#}");
+            }
+        } else if env.is_primary() {
+            let _ = supervisor.recheck();
+        }
+        Ok(target.domain)
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// A podman volume out of `substrate` into a tar file on this host;
+/// `false` when there is no such volume to carry.
+fn export_volume(substrate: &Substrate, volume: &str, to: &Path) -> Result<bool> {
+    let exists = substrate
+        .std_command(&[])
+        .args(["volume", "exists", volume])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .context("asking podman for the volume")?
+        .success();
+    if !exists {
+        return Ok(false);
+    }
+    let file = std::fs::File::create(to).with_context(|| format!("creating {}", to.display()))?;
+    let out = substrate
+        .std_command(&[])
+        .args(["volume", "export", volume])
+        .stdin(std::process::Stdio::null())
+        .stdout(file)
+        .output()
+        .context("running podman volume export")?;
+    if !out.status.success() {
+        bail!(
+            "podman volume export {volume}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(true)
+}
+
+/// A tar file on this host into a podman volume of `substrate`, made for it.
+fn import_volume(substrate: &Substrate, volume: &str, from: &Path) -> Result<()> {
+    let _ = substrate
+        .std_command(&[])
+        .args(["volume", "create", "--ignore", volume])
+        .stdin(std::process::Stdio::null())
+        .output();
+    let file = std::fs::File::open(from).with_context(|| format!("opening {}", from.display()))?;
+    let out = substrate
+        .std_command(&[])
+        .args(["volume", "import", volume, "-"])
+        .stdin(file)
+        .output()
+        .context("running podman volume import")?;
+    if !out.status.success() {
+        bail!(
+            "podman volume import {volume}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// The memory the room check sees, as the sweep's conclusion says it.
 fn room_words(room: &crate::pool::MemoryRoom) -> String {
     let gib = |mib: u64| mib as f64 / 1024.0;

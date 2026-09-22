@@ -63,7 +63,12 @@ pub(crate) const TRANSCRIPT_MAX_LINES: usize = 200;
 pub(crate) fn is_write(tool: &str) -> bool {
     matches!(
         tool,
-        "issue_start" | "issue_reorder" | "chat_send" | "environment_destroy" | "issue_delete"
+        "issue_start"
+            | "issue_reorder"
+            | "chat_send"
+            | "environment_destroy"
+            | "environment_migrate"
+            | "issue_delete"
     )
 }
 
@@ -148,6 +153,25 @@ pub(crate) fn tools() -> Vec<Value> {
                     "force": {
                         "type": "boolean",
                         "description": "you read the list of what is lost and mean it; asks the user to approve"
+                    }
+                },
+                "required": ["environment"]
+            }),
+        ),
+        crate::protocol::tool(
+            "environment_migrate",
+            "Approve an environment's move to a VM on the current guest release: it starts \
+             now. You are told when one waits on you; an environment whose VM is behind \
+             reports migration.pending in the environment tool. The move snapshots its checkout and uncommitted work, stops \
+             its container for a few minutes, and restores both with its agent's \
+             conversation in the new VM. Approve at a stopping point in its work; unapproved \
+             moves are forced two hours after they became pending.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "environment": {
+                        "type": "string",
+                        "description": "environment id, which is its issue's id (e.g. i-0007); primary for your own"
                     }
                 },
                 "required": ["environment"]

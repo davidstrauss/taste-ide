@@ -4040,6 +4040,7 @@ mod tests {
             state,
             authority: taste_core::ConfigAuthority::Project,
             pending_rebuild: false,
+            migrating_to: None,
             config_reason: None,
             hook_failure: None,
             chat: None,

@@ -2684,8 +2684,8 @@ is shouted, but nothing runs either. The rows say what is missing, and
   host's memory committed for nothing.
 - **VMs are cattle, and they are never updated.** The guest does not
   self-update (Zincati is off) and the IDE never reshapes one. The answer
-  to a VM that is wrong, old, or gone is a fresh one from the pinned base
-  image, with its environments restored into it from what this host kept:
+  to a VM that is wrong, old, or gone is a fresh one from the stream's
+  current base image, with its environments restored into it from what this host kept:
   each peer's refs and last snapshot. That is the restore path with its
   first callers — `EnvironmentRegistry::replace_environment` for an
   agent environment whose VM the pool no longer has, and `place_primary`
@@ -3351,13 +3351,35 @@ restore to move envs to new hosts"). Fedora CoreOS would update itself
 through zincati, and zincati reboots the guest to apply an update — every
 container in it killed at a moment nobody chose — so Ignition switches
 auto-updates off, and a VM runs the release it was built from for its
-whole life. The pin decides what new VMs boot. When it moves, an
+whole life. **New VMs follow the stable stream** (David, 2026-09-22):
+each reconcile, and every six hours after, reads Fedora CoreOS's stream
+document and records the release it names (`guest::refresh_from_stream`);
+that record is what a new VM is built from, checked against the digests
+the stream states, and the release compiled into the IDE is only the
+fallback for a machine that has never reached the stream. Each VM records
+the release it was built from beside its disk (`LibvirtSession::
+release_of`, which reads an older VM's off its disk's backing file). A VM
+behind the stream takes no new environments, and the ones in it move: an
 environment gets the newer guest the way it gets a new laptop or a new
-provisioner: its snapshot ref, its config, and its agent's home volume are
-carried to a VM built from the new pin, and the old VM is destroyed.
-Moving is therefore one operation with four reasons, and "the guest image
-is behind" is a fact the fleet states — `check_stream` knows it — with the
-move as the act it offers, never a reboot it schedules.
+provisioner — a fresh snapshot, its container stopped, its agent's home
+volume exported and imported so the conversation comes along, its checkout
+restored from its peer in a VM on the current release, the old copy
+removed, the old VM destroyed once nothing of the workspace is left in it,
+and the container started again.
+
+**Who times a move** (`crate::migration`, David, 2026-09-22): it restarts
+the container under the agent, so the environment's agent is told as soon
+as a move is pending and every ten minutes after until it calls
+`environment_migrate_request`; the coordinator approves with
+`environment_migrate` — asked the moment the agent asks, and told once
+when a move has waited an hour on it — and at two hours from pending the
+move happens anyway, since what is ageing is the kernel isolation rests
+on. The primary's agent is the coordinator, so its asking is approving.
+An environment with nothing running has nobody to ask and moves at once.
+A move that fails says so to the coordinator and is tried again fifteen
+minutes later; the fleet row reads "moving to a VM on <release>" while one
+is pending. Moving is one operation with four reasons, never a reboot the
+IDE schedules.
 
 **Staleness is per kind, and must be said before it is needed.** A cloud
 credential expires or is revoked and its quota moves; a remote libvirt

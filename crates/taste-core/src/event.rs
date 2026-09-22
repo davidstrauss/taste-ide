@@ -82,6 +82,20 @@ pub enum StartupStage {
     Place,
 }
 
+/// Who a migration notice is for (`taste_devcontainer::migration`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationAudience {
+    /// The moving environment's own agent, told a move is pending — said
+    /// again every ten minutes, so a notice to a chat mid-turn may wait
+    /// for the next.
+    Agent,
+    /// The moved environment's agent, told its move is done — said once,
+    /// so it is queued behind a running turn rather than dropped.
+    Moved,
+    /// The coordinator, who approves moves.
+    Coordinator,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Git working-tree status changed (files staged, modified, committed…).
@@ -120,6 +134,15 @@ pub enum Event {
     StartupConcluded {
         stage: StartupStage,
         summary: String,
+    },
+    /// Words for an agent about an environment's move to a VM on the
+    /// current guest release: its own agent told the move is pending, or
+    /// that it is done; the coordinator told one waits on its approval.
+    /// The window delivers them as a prompt to that chat.
+    MigrationNotice {
+        env: crate::environment::EnvironmentId,
+        audience: MigrationAudience,
+        text: String,
     },
     /// A line the container itself wrote — its main process's stdout or
     /// stderr, as `podman logs --follow` hands it on. The devcontainer spec
@@ -385,6 +408,7 @@ impl Event {
             | Event::VmLog { .. }
             | Event::VmProgress { .. }
             | Event::StartupConcluded { .. }
+            | Event::MigrationNotice { .. }
             | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }

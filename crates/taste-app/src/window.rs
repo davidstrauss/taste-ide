@@ -3907,6 +3907,45 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::StartupConcluded { stage, summary } => {
                         startup.on_concluded(stage, &summary);
                     }
+                    // A move to a VM on the current guest release: the
+                    // environment's own agent told as a prompt — only when
+                    // it is between turns, since the clock tells it again
+                    // in ten minutes and a queue of the same words is noise
+                    // — and the coordinator woken as for any errand.
+                    Event::MigrationNotice {
+                        env,
+                        audience,
+                        text,
+                    } => match audience {
+                        taste_core::MigrationAudience::Agent => {
+                            if let Some(pane) = chats.pane_for(&env) {
+                                if pane.is_busy() {
+                                    tracing::info!("{env}'s agent is mid-turn; its migration notice waits for the next");
+                                } else if let Err(e) = pane.submit_prompt(text) {
+                                    tracing::info!(
+                                        "{env}'s migration notice was not delivered: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        taste_core::MigrationAudience::Moved => {
+                            if let Some(pane) = chats.pane_for(&env) {
+                                if let Err(e) = pane.submit_prompt(text) {
+                                    tracing::info!(
+                                        "{env}'s move-done notice was not delivered: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        taste_core::MigrationAudience::Coordinator => {
+                            crate::coordinator::wake_for_migration(
+                                &chats,
+                                &toast_overlay,
+                                &env,
+                                text,
+                            );
+                        }
+                    },
                     Event::VmProgress { domain, line } => {
                         if environments_for_events
                             .vm_log_domain_for(&primary_env)

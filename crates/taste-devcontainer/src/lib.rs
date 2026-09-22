@@ -20,6 +20,7 @@ pub mod hash;
 pub mod image;
 pub mod keeper;
 pub mod keys;
+pub mod migration;
 pub mod peer;
 pub mod pool;
 pub mod ports;

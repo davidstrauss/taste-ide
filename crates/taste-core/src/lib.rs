@@ -36,7 +36,8 @@ pub use activity::Activity;
 pub use capped::CappedOutput;
 pub use environment::{Checkout, EnvironmentId};
 pub use event::{
-    ControllerButton, Event, EventBus, GuestImageFetch, GuestImagePhase, StartupStage,
+    ControllerButton, Event, EventBus, GuestImageFetch, GuestImagePhase, MigrationAudience,
+    StartupStage,
 };
 pub use exec::{CommandSpec, ConfigAuthority, ExecContext};
 pub use files::Files;

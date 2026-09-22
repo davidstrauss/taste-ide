@@ -189,6 +189,9 @@ pub fn effect(tool: &str) -> Effect {
         // It was `Destructive` and asked by name while a config's hooks ran
         // on the host kernel; that is the gap the VM closed.
         "devcontainer_reload" => Effect::Write,
+        // A move restarts a container and loses nothing — the snapshot
+        // carries the uncommitted work and the volume the conversation.
+        "environment_migrate_request" | "environment_migrate" => Effect::Write,
         // The two removals (i-0022). A clone can be the only copy of an
         // agent's unreviewed work and an issue is the only record of why
         // something was wanted; neither comes back. Both refuse on the
@@ -289,8 +292,15 @@ pub fn is_ide_tool(tool: &str) -> bool {
 /// final success/failure of the rebuild"). Narrow on purpose: it is not
 /// "every write", because a write the user might want to see coming —
 /// filing an issue in their backlog — is still theirs to allow or settle.
+/// The two migration tools are here because the approval they carry IS
+/// the coordinator's (David, 2026-09-22: "Allow the orchestrator to
+/// approve relocations"); a card would put the user back in the loop the
+/// design took them out of, and the move is forced at two hours anyway.
 pub fn asks_nobody(tool: &str) -> bool {
-    matches!(tool, "devcontainer_reload")
+    matches!(
+        tool,
+        "devcontainer_reload" | "environment_migrate_request" | "environment_migrate"
+    )
 }
 
 /// Whether the IDE may remember a standing **allow** for this tool.

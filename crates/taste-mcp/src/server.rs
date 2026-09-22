@@ -329,6 +329,30 @@ impl McpServer {
                 while it answers this call. This connection speaks for exactly one \
                 environment. $TASTE_IDE_CONFINEMENT says how your own process is confined.",
         });
+        // A move to a VM on the current guest release, when one is
+        // pending: what, since when, whether it was asked for, and when it
+        // happens regardless (`taste_devcontainer::migration`).
+        if let Some(m) = self.environments.migration_of(env) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            out["migration"] = json!({
+                "pending": true,
+                "from_vm": m.from_vm,
+                "from_release": m.from_release,
+                "to_release": m.to_release,
+                "requested": m.requested_at.is_some(),
+                "forced_in_minutes": m.forced_at().saturating_sub(now) / 60,
+                "next": if env.is_primary() {
+                    "call environment_migrate_request at a stopping point: for the primary, \
+                     asking is approving, and the move starts at once"
+                } else if m.requested_at.is_some() {
+                    "asked; the coordinator approves it"
+                } else {
+                    "call environment_migrate_request at your next stopping point"
+                },
+            });
+        }
         if include.iter().any(|item| item == "log" || item == "logs") {
             out["log"] = json!(supervisor.logs_tail(lines_arg(args)));
         }
@@ -1177,6 +1201,15 @@ impl McpServer {
                 empty.clone(),
             ));
         }
+        tools.push(tool(
+            "environment_migrate_request",
+            "Ask to move this environment to a VM on the current guest release, when the \
+             environment tool reports migration.pending. Call it at a stopping point: the \
+             move snapshots your checkout and uncommitted work, stops your container for a \
+             few minutes, and restores both with this conversation in the new VM. The \
+             coordinator approves it; it is forced two hours after it became pending.",
+            empty.clone(),
+        ));
         // ...and orchestration: the reads on every socket, the writes on
         // the orchestrator's alone, because the writes spawn agents. See
         // `crate::orchestration`.
@@ -2748,6 +2781,21 @@ impl McpServer {
             "environment_destroy" => {
                 self.require_orchestrator(env, "environment_destroy")?;
                 self.environment_destroy(env, args).await
+            }
+            "environment_migrate_request" => {
+                let said = self.environments.request_migration(env)?;
+                Ok(json!({ "state": "requested", "next": said }))
+            }
+            "environment_migrate" => {
+                self.require_orchestrator(env, "environment_migrate")?;
+                let target = args
+                    .get("environment")
+                    .and_then(Value::as_str)
+                    .context("environment_migrate needs `environment`")?;
+                let target = EnvironmentId::parse(target)
+                    .map_err(|e| anyhow::anyhow!("{target} is not an environment id: {e}"))?;
+                let said = self.environments.approve_migration(&target)?;
+                Ok(json!({ "state": "moving", "next": said }))
             }
             "issue_delete" => {
                 self.require_orchestrator(env, "issue_delete")?;

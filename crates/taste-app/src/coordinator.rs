@@ -64,6 +64,10 @@ pub enum Errand {
     Review(EnvironmentId),
     /// A new item on the backlog, for triage.
     Filed { id: String, title: String },
+    /// An environment's move to a VM on the current guest release waits
+    /// on the coordinator's approval, or failed; the words are the
+    /// registry's (`taste_devcontainer::migration`), evidence included.
+    Migration { env: EnvironmentId, text: String },
 }
 
 impl Errand {
@@ -73,6 +77,7 @@ impl Errand {
         match self {
             Errand::Review(env) => format!("the review of {env}"),
             Errand::Filed { id, .. } => format!("issue {id}"),
+            Errand::Migration { env, .. } => format!("the move of {env}"),
         }
     }
 
@@ -102,6 +107,7 @@ impl Errand {
                  why — including when the answer was to leave it alone. Do not file \
                  anything in reply."
             ),
+            Errand::Migration { text, .. } => text.clone(),
         }
     }
 
@@ -122,6 +128,7 @@ impl Errand {
         let what = match self {
             Errand::Review(env) => format!("{env} is ready for review"),
             Errand::Filed { id, title } => format!("{id} was filed (\"{title}\")"),
+            Errand::Migration { env, .. } => format!("{env}'s move to a new VM waits on approval"),
         };
         format!(
             "{what}, but the session allowance is exhausted (reopens {reopens}) — the \
@@ -159,6 +166,24 @@ pub fn wake_for_filed(
         Errand::Filed {
             id: id.to_string(),
             title: title.to_string(),
+        },
+    );
+}
+
+/// An environment's move waits on the coordinator, or failed: wake it
+/// with the registry's words.
+pub fn wake_for_migration(
+    chats: &Rc<Chats>,
+    toasts: &adw::ToastOverlay,
+    env: &EnvironmentId,
+    text: String,
+) {
+    wake_for(
+        chats,
+        toasts,
+        Errand::Migration {
+            env: env.clone(),
+            text,
         },
     );
 }

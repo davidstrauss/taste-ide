@@ -1627,6 +1627,10 @@ impl Console {
             state: supervisor.state(),
             authority: supervisor.config_authority(),
             pending_rebuild: supervisor.pending_changes(),
+            migrating_to: self
+                .environments
+                .migration_of(&env)
+                .map(|migration| migration.to_release),
             config_reason: supervisor.config_passed_over(),
             hook_failure: supervisor.hook_failure(),
             chat,
@@ -3702,6 +3706,7 @@ impl Console {
             state,
             authority: taste_core::ConfigAuthority::Project,
             pending_rebuild: false,
+            migrating_to: None,
             config_reason: None,
             hook_failure: None,
             chat: chat.map(|(label, busy, awaits_user, orchestrator)| ChatBinding {
@@ -4181,6 +4186,7 @@ mod tests {
             state,
             authority,
             pending_rebuild: false,
+            migrating_to: None,
             config_reason: None,
             hook_failure: None,
             chat: None,

@@ -11069,6 +11069,9 @@ enum ActKind {
     Moved,
     /// `chat_send`
     Prompted,
+    /// `environment_migrate` — a move to a VM on the current guest
+    /// release, approved.
+    Migrated,
 }
 
 /// The IDE tool this title IS, if it is one — in whichever dress the agent
@@ -11110,6 +11113,7 @@ fn act_kind(title: &str) -> Option<ActKind> {
         "issue_update" => Some(ActKind::Updated),
         "issue_reorder" => Some(ActKind::Moved),
         "chat_send" => Some(ActKind::Prompted),
+        "environment_migrate" => Some(ActKind::Migrated),
         _ => None,
     }
 }
@@ -11124,7 +11128,7 @@ fn act_kind(title: &str) -> Option<ActKind> {
 /// mean; anybody else's keeps whatever title its adapter gave it, which is
 /// the only honest thing to do with a tool we did not define.
 ///
-/// The five the coordinator ACTS with are not here — they are cards of
+/// The ones the coordinator ACTS with are not here — they are cards of
 /// their own (`act_kind`, `act_headline`), and they say more than a name.
 fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<String> {
     let name = mcp_tool_name(title)?;
@@ -11188,6 +11192,7 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "devcontainer_reload" => "Rebuild the container".into(),
         "update_from_main" => "Take the user's latest work".into(),
         "publish" => "Publish this work for review".into(),
+        "environment_migrate_request" => "Ask to move to a VM on the current release".into(),
         "flatpak_status" => "Read the Flatpak build's state".into(),
         "flatpak_logs" => "Read the Flatpak build's log".into(),
         _ => return None,
@@ -11347,6 +11352,10 @@ fn act_headline(
                 None => format!("Moved {issue}"),
             }
         }
+        ActKind::Migrated => {
+            let env = field(input, "environment").unwrap_or_else(|| "an environment".into());
+            format!("Moved {env} to a VM on the current release")
+        }
         ActKind::Prompted => {
             let chat = field(input, "chat").unwrap_or_else(|| "a chat".into());
             match field(input, "text") {
@@ -11377,6 +11386,7 @@ fn act_icon(
         },
         ActKind::Moved => ("view-sort-ascending-symbolic", None),
         ActKind::Prompted => ("mail-send-symbolic", None),
+        ActKind::Migrated => ("send-to-symbolic", None),
     }
 }
 

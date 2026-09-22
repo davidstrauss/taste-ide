@@ -233,7 +233,18 @@ impl Pool {
             .await
             .map_err(PoolError::Unavailable)?;
         let mut candidates: Vec<(Vm, VmFacts, Grant)> = Vec::new();
+        // Nothing is placed in a VM behind the stream: its environments are
+        // on their way out of it (`crate::migration`), and a new one would
+        // only join them.
+        let current = crate::guest::image().ok().map(|image| image.release);
         for vm in self.vms().await.map_err(PoolError::Unavailable)? {
+            if let (Some(current), Some(release)) =
+                (current.as_deref(), self.libvirt.release_of(&vm).await)
+            {
+                if crate::guest::release_is_behind(&release, current) {
+                    continue;
+                }
+            }
             let facts = self
                 .libvirt
                 .facts(&vm)
