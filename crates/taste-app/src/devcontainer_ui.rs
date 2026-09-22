@@ -694,6 +694,32 @@ fn touch_countdown(base: &str, elapsed_secs: u64) -> String {
     }
 }
 
+/// The prompt that asks the agent to write a devcontainer definition for
+/// a project that has none — set-up, not repair: nothing failed, so there
+/// is no log to attach and no cause to find.
+pub(crate) fn author_prompt() -> String {
+    "Write this project's devcontainer definition.\n\n\
+     WHAT IS TRUE\n\
+     The project has no .devcontainer/ yet. The IDE is running its own baseline environment \
+     (safe mode) so that one can be written: .devcontainer/ is writable, and the rest of the \
+     checkout is read-only until the project's own environment builds.\n\n\
+     HOW TO WORK\n\
+     1. Learn what the project needs with your file tools: its README, build files, \
+     lockfiles, and CI configuration name the languages, tools, and versions.\n\
+     2. Write .devcontainer/Containerfile that installs them, and \
+     .devcontainer/devcontainer.json that builds it with \
+     \"build\": {\"dockerfile\": \"Containerfile\"}. Keep it usable by VS Code and \
+     Codespaces. This IDE does not apply devcontainer features: install tools in the \
+     Containerfile instead.\n\
+     3. Do not run podman, docker, or the build yourself. When the files are ready, call the \
+     devcontainer_reload tool once.\n\
+     4. Then call the environment tool with include [\"log\"]. If it reports a failure, read \
+     the log, fix the files, and reload again. Stop after three attempts and report what you \
+     tried.\n\
+     5. Finish with one short paragraph: what the environment provides, and why."
+        .to_string()
+}
+
 /// The prompt Prompt Agent sends for `supervisor`'s environment, and the
 /// log it attaches: what happened, the evidence, the exact steps, the
 /// walls it will meet, and when to stop. Written to the house rule on

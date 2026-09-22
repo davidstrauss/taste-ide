@@ -121,6 +121,14 @@ impl Step {
     }
 }
 
+/// What the page's button asks the agent for: the repair of a definition
+/// that failed, or a definition for a project that has none yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    Repair,
+    Author,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Pending,
@@ -272,7 +280,9 @@ pub struct StartupPage {
     area: gtk::DrawingArea,
     offset: Cell<f64>,
     tick: RefCell<Option<gtk::TickCallbackId>>,
-    on_prompt: RefCell<Option<Rc<dyn Fn()>>>,
+    on_prompt: RefCell<Option<Rc<dyn Fn(PromptKind)>>>,
+    /// What the button asks the agent for, as the note last said.
+    prompt_kind: Cell<PromptKind>,
 }
 
 impl StartupPage {
@@ -389,6 +399,7 @@ impl StartupPage {
             offset: Cell::new(0.0),
             tick: RefCell::new(None),
             on_prompt: RefCell::new(None),
+            prompt_kind: Cell::new(PromptKind::Repair),
         });
         {
             let weak = Rc::downgrade(&this);
@@ -410,15 +421,16 @@ impl StartupPage {
                 let Some(this) = weak.upgrade() else { return };
                 let hook = this.on_prompt.borrow().clone();
                 if let Some(hook) = hook {
-                    hook();
+                    hook(this.prompt_kind.get());
                 }
             });
         }
         this
     }
 
-    /// Where Prompt Agent goes: the primary's chat, with the repair.
-    pub fn set_on_prompt_agent(&self, hook: impl Fn() + 'static) {
+    /// Where the button goes: the primary's chat, with the repair or the
+    /// authoring the note offered.
+    pub fn set_on_prompt_agent(&self, hook: impl Fn(PromptKind) + 'static) {
         *self.on_prompt.borrow_mut() = Some(Rc::new(hook));
     }
 
@@ -642,7 +654,7 @@ impl StartupPage {
                              not the project's configuration — it is this machine's setup, the \
                              VM provider, or a bug in the IDE. The Taste IDE log has the detail."
                         ),
-                        false,
+                        None,
                     );
                 } else {
                     self.heading.set_label("Falling back to safe mode");
@@ -652,29 +664,53 @@ impl StartupPage {
                              is coming up instead, with the tools to fix the definition and \
                              rebuild; the agent can be handed the repair."
                         ),
-                        true,
+                        Some(PromptKind::Repair),
                     );
                 }
             }
+            // Not a failure, and never worded as one: a project with no
+            // definition yet is one to set up, and safe mode is where that
+            // is done (David, 2026-09-22: "No devcontainer definition
+            // should send us towards safe mode, but just to get the
+            // devcontainer configured, not due to a failure").
             DevcontainerStateEvent::NoConfig => {
                 if self.underway.get() || self.note.is_visible() {
-                    self.heading.set_label("Starting in safe mode");
+                    self.heading
+                        .set_label("Setting up this project's environment");
                 }
                 self.set_note(
-                    "This project has no devcontainer definition. The safe-mode environment is \
-                     coming up: a generic container with the tools to write one and rebuild into \
-                     it; the agent can be asked to author it.",
-                    true,
+                    "This project has no devcontainer definition yet. Safe mode is where one \
+                     gets written: a generic container with .devcontainer/ writable, and a \
+                     rebuild into the project's own environment once it exists. The agent can \
+                     write it for you.",
+                    Some(PromptKind::Author),
                 );
             }
             DevcontainerStateEvent::ConfigDetected | DevcontainerStateEvent::Stopped => {}
         }
     }
 
-    fn set_note(&self, text: &str, prompt: bool) {
+    fn set_note(&self, text: &str, prompt: Option<PromptKind>) {
         self.note.set_label(text);
         self.note.set_visible(true);
-        self.prompt.set_visible(prompt);
+        self.prompt.set_visible(prompt.is_some());
+        if let Some(kind) = prompt {
+            self.prompt_kind.set(kind);
+            let (label, tooltip) = match kind {
+                PromptKind::Repair => (
+                    "Prompt Agent",
+                    "Hand the agent what failed and the log's tail, and ask it to diagnose and \
+                     repair the devcontainer",
+                ),
+                PromptKind::Author => (
+                    "Ask Agent to Write It",
+                    "Ask the agent to look at the project and write its devcontainer \
+                     definition, then rebuild into it",
+                ),
+            };
+            self.prompt.set_label(label);
+            self.prompt.set_tooltip_text(Some(tooltip));
+        }
     }
 
     /// The guest image's fetch, unpack, or check: the first step, once per

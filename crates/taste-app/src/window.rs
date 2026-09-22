@@ -1208,12 +1208,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
     }
     {
-        // The startup page's Prompt Agent: the same repair the banner
-        // sends, from the page that says why the fallback happened.
+        // The startup page's button: the same repair the banner sends,
+        // from the page that says why the fallback happened — or, for a
+        // project with no definition yet, the authoring of one.
         let prompt_agent = prompt_agent.clone();
         let supervisor = supervisor.clone();
-        startup.set_on_prompt_agent(move || {
-            let (prompt, log) = crate::devcontainer_ui::repair_prompt(&supervisor);
+        startup.set_on_prompt_agent(move |kind| {
+            let (prompt, log) = match kind {
+                crate::startup::PromptKind::Repair => {
+                    crate::devcontainer_ui::repair_prompt(&supervisor)
+                }
+                crate::startup::PromptKind::Author => {
+                    (crate::devcontainer_ui::author_prompt(), None)
+                }
+            };
             prompt_agent(
                 &taste_core::environment::EnvironmentId::primary(),
                 prompt,
@@ -3597,9 +3605,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let environments_for_events = environments.clone();
         let bus_for_events = workspace.events.clone();
         let prompt_agent = prompt_agent.clone();
+        let window_for_pad = window.downgrade();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
                 match event {
+                    // The pad is read off evdev, which has no idea which
+                    // window has the keyboard — or whether any of this
+                    // app's does — so a press is this window's only while
+                    // it is the active one (David, 2026-09-22: "Ignore
+                    // gamepad input if not focused"). Releases always
+                    // pass: a hold begun while focused — the reveal, a
+                    // held send — has to be able to end.
+                    Event::Controller { pressed: true, .. }
+                        if !window_for_pad.upgrade().is_some_and(|w| w.is_active()) => {}
                     Event::Controller { button, pressed } => {
                         use taste_core::ControllerButton as B;
                         // The search's buttons first: the shoulders step the
