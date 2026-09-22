@@ -114,6 +114,82 @@ impl LogKind {
     }
 }
 
+/// One line into the buffer, in colour: its ANSI escapes read as styled
+/// spans (`crate::ansi`), and a tracing line's level word tinted when the
+/// line carries no colour of its own (David, 2026-09-21: "Logs should be
+/// in color"). Tags are made on first use and named for their style, so
+/// a buffer holds one tag per style rather than one per span.
+fn insert_line(buffer: &gtk::TextBuffer, end: &mut gtk::TextIter, line: &str) {
+    let spans = crate::ansi::spans(line);
+    let plain = spans.iter().all(|(_, style)| style.is_plain());
+    if plain {
+        let text: String = spans.into_iter().map(|(t, _)| t).collect();
+        match crate::ansi::level_span(&text) {
+            Some((start, stop, style)) => {
+                buffer.insert(end, &text[..start]);
+                insert_styled(buffer, end, &text[start..stop], &style);
+                buffer.insert(end, &text[stop..]);
+            }
+            None => buffer.insert(end, &text),
+        }
+    } else {
+        for (text, style) in spans {
+            if style.is_plain() {
+                buffer.insert(end, &text);
+            } else {
+                insert_styled(buffer, end, &text, &style);
+            }
+        }
+    }
+    buffer.insert(end, "\n");
+}
+
+fn insert_styled(
+    buffer: &gtk::TextBuffer,
+    end: &mut gtk::TextIter,
+    text: &str,
+    style: &crate::ansi::Style,
+) {
+    let name = style.tag_name();
+    let table = buffer.tag_table();
+    let tag = match table.lookup(&name) {
+        Some(tag) => tag,
+        None => {
+            let tag = gtk::TextTag::new(Some(&name));
+            if let Some(colour) = style.fg {
+                let (r, g, b) = colour.rgb();
+                tag.set_foreground_rgba(Some(&gtk::gdk::RGBA::new(
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
+                    if style.dim { 0.7 } else { 1.0 },
+                )));
+            } else if style.dim {
+                // No colour of its own: the theme's foreground, thinned.
+                let (r, g, b) = crate::ansi::Color::Index(8).rgb();
+                tag.set_foreground_rgba(Some(&gtk::gdk::RGBA::new(
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
+                    1.0,
+                )));
+            }
+            if style.bold {
+                tag.set_weight(700);
+            }
+            if style.italic {
+                tag.set_style(gtk::pango::Style::Italic);
+            }
+            if style.underline {
+                tag.set_underline(gtk::pango::Underline::Single);
+            }
+            table.add(&tag);
+            tag
+        }
+    };
+    buffer.insert_with_tags(end, text, &[&tag]);
+}
+
 /// How much each log has been saying lately — one series per environment
 /// and log, in the backlog's own buckets (`taste_core::activity`), so the
 /// Logs rows carry the same sparkline the environment rows do (David,
@@ -240,7 +316,11 @@ impl LogPage {
             .bottom_margin(6)
             .build();
         if !seed.is_empty() {
-            view.buffer().set_text(&format!("{}\n", seed.join("\n")));
+            let buffer = view.buffer();
+            let mut end = buffer.end_iter();
+            for line in seed {
+                insert_line(&buffer, &mut end, line);
+            }
         }
         let scroller = gtk::ScrolledWindow::builder()
             .child(&view)
@@ -323,7 +403,9 @@ impl LogPage {
         }
         let buffer = self.view.buffer();
         let mut end = buffer.end_iter();
-        buffer.insert(&mut end, &format!("{}\n", lines.join("\n")));
+        for line in lines {
+            insert_line(&buffer, &mut end, line);
+        }
         let extra = buffer.line_count() - MAX_LINES;
         if extra > 0 {
             let mut start = buffer.start_iter();

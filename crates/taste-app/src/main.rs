@@ -10,6 +10,7 @@
 // have the alias. The judgement is ours.
 #![allow(clippy::type_complexity)]
 
+mod ansi;
 mod askpass;
 mod backlog;
 mod chat;

@@ -2641,9 +2641,11 @@ fn read_console_from(path: &Path, cursor: u64) -> std::io::Result<Option<(u64, V
     Ok(Some((from + bytes.len() as u64, bytes)))
 }
 
-/// A console line as text: carriage returns and terminal escapes — the
-/// colours and cursor moves systemd and the kernel write for a screen —
-/// dropped, since the page is not one.
+/// A console line as text: carriage returns and the terminal escapes
+/// that move a cursor or set a title dropped, since the page is not a
+/// screen — but the colour escapes (SGR, `ESC[…m`) kept, because the
+/// log page reads them (`taste-app`'s `ansi`) and systemd's green OK and
+/// red FAILED are worth having.
 fn clean_console_line(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -2652,12 +2654,18 @@ fn clean_console_line(raw: &str) -> String {
             '\r' => {}
             '\u{1b}' => match chars.peek() {
                 // CSI: `ESC [`, parameters, then one final byte in @..~.
+                // Kept whole when the final byte is `m`.
                 Some('[') => {
                     chars.next();
+                    let mut sequence = String::from("\u{1b}[");
                     for c in chars.by_ref() {
+                        sequence.push(c);
                         if ('@'..='~').contains(&c) {
                             break;
                         }
+                    }
+                    if sequence.ends_with('m') {
+                        out.push_str(&sequence);
                     }
                 }
                 // OSC: `ESC ]` up to BEL or `ESC \\`.
@@ -2689,11 +2697,11 @@ fn clean_console_line(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_console_line_loses_its_escapes_and_keeps_its_words() {
-        let raw = "\u{1b}[0;32m  OK  \u{1b}[0m] Reached target \u{1b}[0;1;39mMulti-User System\u{1b}[0m.\r";
+    fn a_console_line_keeps_its_colours_and_loses_the_rest() {
+        let raw = "\u{1b}[2K\u{1b}[0;32m  OK  \u{1b}[0m] Reached target \u{1b}]0;x\u{7}\u{1b}[0;1;39mMulti-User System\u{1b}[0m.\r";
         assert_eq!(
             super::clean_console_line(raw),
-            "  OK  ] Reached target Multi-User System."
+            "\u{1b}[0;32m  OK  \u{1b}[0m] Reached target \u{1b}[0;1;39mMulti-User System\u{1b}[0m."
         );
         assert_eq!(super::clean_console_line("plain\ttabbed"), "plain\ttabbed");
     }
