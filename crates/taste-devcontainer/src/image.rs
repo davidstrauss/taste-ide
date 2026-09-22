@@ -92,6 +92,41 @@ pub fn ensure_image(
     config: &DevcontainerConfig,
     workspace_key: &str,
 ) -> Result<String> {
+    ensure_image_with(substrate, config, workspace_key, &|_| {})
+}
+
+/// Whether the image `config` builds to is already on `substrate`: what
+/// decides whether `ensure_image_with` will be a moment or minutes, and
+/// so whether a stage is worth announcing.
+pub fn image_exists(substrate: &Substrate, config: &DevcontainerConfig) -> bool {
+    match config.dockerfile_path() {
+        None => true,
+        Some(_) => match crate::hash::build_hash(config) {
+            Ok(hash) => run(
+                substrate,
+                vec![
+                    "image".into(),
+                    "exists".into(),
+                    taste_core::environment::env_image_tag(&hash),
+                ],
+            )
+            .is_ok(),
+            Err(_) => false,
+        },
+    }
+}
+
+/// [`ensure_image`], telling `on_line` every line the build prints as it
+/// prints it — podman's `STEP n/m`, the layer commit's silence, the
+/// error — so a build that takes minutes in a VM is not minutes of
+/// nothing (David, 2026-09-22: a first launch "hanging" on the stage
+/// before it while the files service's image built).
+pub fn ensure_image_with(
+    substrate: &Substrate,
+    config: &DevcontainerConfig,
+    workspace_key: &str,
+    on_line: &dyn Fn(String),
+) -> Result<String> {
     let Some(dockerfile) = config.dockerfile_path() else {
         let image = config
             .image
@@ -115,8 +150,70 @@ pub fn ensure_image(
         .map(|f| staged.join(f))
         .unwrap_or_else(|| staged.join("Containerfile"));
     let args = build_args(config, &tag, &staged_dockerfile, &staged, workspace_key);
-    run(substrate, args).context("building the image")?;
+    run_streaming(substrate, args, on_line).context("building the image")?;
     Ok(tag)
+}
+
+/// `run`, with every line of the command's output handed on as it comes.
+/// Both streams: podman's build steps go to stdout and its complaints to
+/// stderr, and a reader wants them in one story.
+fn run_streaming(substrate: &Substrate, args: Vec<String>, on_line: &dyn Fn(String)) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    let mut child = substrate
+        .std_command(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running podman")?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut readers = Vec::new();
+    for stream in [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(tx);
+    let mut last = String::new();
+    for line in rx {
+        if !line.trim().is_empty() {
+            last = line.clone();
+        }
+        on_line(line);
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let status = child.wait().context("waiting for podman")?;
+    if !status.success() {
+        bail!(
+            "podman {}: {}",
+            args.first().map(String::as_str).unwrap_or_default(),
+            if last.is_empty() {
+                "podman gave no reason"
+            } else {
+                &last
+            }
+        );
+    }
+    Ok(())
 }
 
 fn run(substrate: &Substrate, args: Vec<String>) -> Result<()> {

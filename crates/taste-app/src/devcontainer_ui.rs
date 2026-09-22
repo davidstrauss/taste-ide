@@ -1042,6 +1042,10 @@ fn operation_fraction(state: &DevcontainerStateEvent, build_step: Option<(u32, u
                 // Other projects' unowned VMs stopped for the room: the
                 // step before this workspace's own VM comes up.
                 0.05
+            } else if what.contains("service image") {
+                // The files service's image built in a VM that never had
+                // it: after the boot, before the service connects.
+                0.20
             } else if what.contains("files service") {
                 0.25
             } else if what.contains("checkout") {

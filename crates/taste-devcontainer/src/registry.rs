@@ -1455,6 +1455,9 @@ impl EnvironmentRegistry {
             return Ok(None);
         };
         let keeper = self.keeper_for(vm)?;
+        // Back to this stage's own words if the keeper's image had to be
+        // built on the way.
+        primary.announce_preparing("placing the checkout in the VM");
         let files = Files::Remote(keeper.clone());
         let path = crate::provision::guest_checkout_path(&peer, &EnvironmentId::primary());
         let keys = crate::keys::Keys::for_workspace(&peer);
@@ -1651,7 +1654,30 @@ impl EnvironmentRegistry {
                 self.substrate().provider().describe()
             );
         };
-        let container = crate::keeper::ensure_container(&substrate, vm, &self.workspace_root)?;
+        // The files service runs from the baseline image, and a VM that
+        // has never built it builds it now — minutes, in the guest. Its
+        // own stage on the banner and every line of it in the VM log,
+        // where before it was silence under the previous stage's words
+        // (David, 2026-09-22: "hanging on placing the checkout into the
+        // VM").
+        let baseline = crate::baseline::ensure_baseline_config()?;
+        let building = !crate::image::image_exists(&substrate, &baseline);
+        if building {
+            self.primary()
+                .announce_preparing("building the files service image (once per VM)");
+            self.note_vm(
+                &vm.domain,
+                "building the files service image in the guest — once per VM, minutes the first time",
+            );
+        }
+        let domain = vm.domain.clone();
+        let container =
+            crate::keeper::ensure_container(&substrate, vm, &self.workspace_root, &|line| {
+                push_vm_log(&self.vm_logs, &self.events, &domain, line)
+            })?;
+        if building {
+            self.note_vm(&vm.domain, "the files service image is built");
+        }
         let keeper = Keeper::in_container(&substrate, &container, format!("VM {}", vm.domain))?;
         self.keepers
             .lock()

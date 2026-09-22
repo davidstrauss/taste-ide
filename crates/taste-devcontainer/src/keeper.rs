@@ -675,6 +675,7 @@ pub fn ensure_container(
     substrate: &crate::substrate::Substrate,
     vm: &crate::provision::Vm,
     workspace_root: &Path,
+    on_build_line: &dyn Fn(String),
 ) -> Result<String> {
     let mount = crate::provision::guest_workspace_dir(workspace_root);
     // The directory in the guest, made as core over ssh: podman refuses a
@@ -728,7 +729,7 @@ pub fn ensure_container(
 
     let config = crate::baseline::ensure_baseline_config()?;
     let key = taste_core::environment::workspace_key(workspace_root);
-    let image = crate::image::ensure_image(substrate, &config, &key)?;
+    let image = crate::image::ensure_image_with(substrate, &config, &key, on_build_line)?;
     podman_capture(
         substrate,
         &[

@@ -285,7 +285,11 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
         let vm_substrate = vm_substrate.clone();
         let vm = vm.clone();
         let root = root.to_path_buf();
-        move || taste_devcontainer::keeper::ensure_container(&vm_substrate, &vm, &root)
+        move || {
+            taste_devcontainer::keeper::ensure_container(&vm_substrate, &vm, &root, &|line| {
+                println!("keeper build: {line}")
+            })
+        }
     })
     .await
     .unwrap()
