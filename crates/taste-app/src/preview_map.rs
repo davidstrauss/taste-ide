@@ -36,15 +36,28 @@ pub fn preview_map(content: &gtk::Widget, scroller: &gtk::ScrolledWindow) -> gtk
         .halign(gtk::Align::Fill)
         .valign(gtk::Align::Fill)
         .build();
-    picture.set_size_request(WIDTH, -1);
     let frame = gtk::DrawingArea::builder()
         .can_target(false)
         .hexpand(true)
         .vexpand(true)
         .build();
-    let overlay = gtk::Overlay::builder().child(&picture).build();
+    // The strip's size is a spacer's, and the picture is laid OVER it and
+    // clipped to it, so the picture's own natural size — the document's
+    // width and height, read back from the paintable — never reaches the
+    // layout. Laid in as the overlay's own child, a short document's
+    // picture fed its size back into the preview's width, the width into
+    // the document's height, and the window stopped painting (2026-09-22:
+    // every frame of a two-block document came out blank).
+    let spacer = gtk::Box::builder()
+        .width_request(WIDTH)
+        .hexpand(false)
+        .vexpand(true)
+        .build();
+    let overlay = gtk::Overlay::builder().child(&spacer).build();
+    overlay.add_overlay(&picture);
+    overlay.set_clip_overlay(&picture, true);
     overlay.add_overlay(&frame);
-    overlay.set_size_request(WIDTH, -1);
+    overlay.set_clip_overlay(&frame, true);
     overlay.add_css_class("preview-map");
 
     // Where the document's picture sits inside the strip: `Contain`

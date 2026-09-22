@@ -2465,8 +2465,12 @@ impl Editor {
             .vscroll_policy(gtk::ScrollablePolicy::Natural)
             .scroll_to_focus(false)
             .build();
+        // Never sideways: the preview's blocks wrap to the column, and a
+        // horizontal scrollbar appearing and vanishing as they do is a
+        // layout that never settles.
         let preview_scroller = gtk::ScrolledWindow::builder()
             .child(&preview_viewport)
+            .hscrollbar_policy(gtk::PolicyType::Never)
             .hexpand(true)
             .vexpand(true)
             .build();
@@ -3521,13 +3525,17 @@ impl Editor {
             // With its place, so its images are read from beside it —
             // through this page's own files service, bounded by its own
             // checkout.
-            let images = crate::markdown_view::ImageBase {
+            let open_events = self.workspace.events.clone();
+            let images = crate::markdown_view::DocumentBase {
                 files: page.files.clone(),
                 dir: path
                     .parent()
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| page.origin_root.clone()),
                 root: page.origin_root.clone(),
+                open_file: std::rc::Rc::new(move |path, line| {
+                    open_events.publish(taste_core::Event::OpenFileRequested { path, line });
+                }),
             };
             page.preview_holder
                 .append(&crate::markdown_view::render_document(

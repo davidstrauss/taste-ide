@@ -351,6 +351,13 @@ fn main() -> glib::ExitCode {
                    background-color: transparent; }\n\
                  progressbar.index-bar > trough > progress { \
                    background-color: @accent_color; }\n\
+                 /* A markdown table: a hairline frame, a rule under the \
+                    head, alternate rows tinted a shade. */\n\
+                 .markdown-table { border: 1px solid alpha(currentColor, 0.15); \
+                   border-radius: 6px; }\n\
+                 .markdown-table-cell { padding: 5px 10px; }\n\
+                 .markdown-table-head { font-weight: bold; }\n\
+                 .markdown-table-alt { background-color: alpha(currentColor, 0.04); }\n\
                  /* The pinned prompt floats OVER the transcript, so it \
                     needs a surface of its own: Adwaita's .card colour is \
                     a translucent overlay and the scrolling text reads \

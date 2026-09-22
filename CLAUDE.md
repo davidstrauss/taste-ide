@@ -112,8 +112,11 @@ probe otherwise never has, since that half of the shade needs a session);
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_PREVIEW=README.md` (a markdown file, relative
 to where the probe was started) opens it on its preview face in front,
-which is how the preview's rendering — its pictures included — gets
-looked at; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
+which is how the preview's rendering — its pictures, its tables, its
+path links — gets looked at; `build-aux/headless/fixtures/markdown-table.md`
+is a short document with a table and path links for exactly that, and
+a SHORT document is the case to shoot, since a two-block preview once
+came out as a blank window while a long one rendered; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
 the search's Tab stop on that section, for the lit lozenge and an empty
 section's lit banner — several, comma-separated, WALK them in order, which
 is how "press Tab a few times" gets posed (each section the stop passes

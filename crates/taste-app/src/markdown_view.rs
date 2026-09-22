@@ -21,18 +21,53 @@ use std::cell::RefCell;
 use std::path::{Component, PathBuf};
 use std::rc::Rc;
 
-/// Where a document's relative image paths resolve: its directory, read
-/// through the files service the document itself came through, and the
-/// checkout that bounds them — a path that climbs out of the checkout is
-/// not an image, whatever it names.
+/// Where a document stands: its directory, read through the files
+/// service the document itself came through, and the checkout that
+/// bounds it. Relative image paths resolve against it, and so do links
+/// to files — `[the tree](crates/taste-app/src/filetree.rs)`, or
+/// `../README.md#L20` — which open in the editor through `open_file`
+/// instead of going nowhere (David, 2026-09-22: "links that map to file
+/// paths (relative to project root or current file directly) should open
+/// the files rather than copy the string"). A path that climbs out of the
+/// checkout is neither an image nor a file to open, whatever it names.
 #[derive(Clone)]
-pub struct ImageBase {
+pub struct DocumentBase {
     pub files: taste_core::files::Files,
     pub dir: PathBuf,
     pub root: PathBuf,
+    /// Open a file of this checkout in the editor, at a line when given.
+    pub open_file: Rc<dyn Fn(PathBuf, Option<u32>)>,
 }
 
-impl ImageBase {
+impl DocumentBase {
+    /// A link's target as a file of this checkout and a line, when the
+    /// link is a path and not a URL: `path`, `path#L12`, `path#12`, or
+    /// `path:12`. Resolved like an image source, against the document's
+    /// directory or the root for a leading slash.
+    fn resolve_link(&self, href: &str) -> Option<(PathBuf, Option<u32>)> {
+        if href.contains("://") || href.starts_with("mailto:") || href.starts_with("copy:") {
+            return None;
+        }
+        if href.starts_with(crate::issue_pill::SCHEME) || href.starts_with('#') {
+            return None;
+        }
+        let (path_part, line) = match href.split_once('#') {
+            Some((path, fragment)) => (path, fragment.trim_start_matches('L').parse::<u32>().ok()),
+            None => match href.rsplit_once(':') {
+                Some((path, digits))
+                    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    (path, digits.parse::<u32>().ok())
+                }
+                _ => (href, None),
+            },
+        };
+        if path_part.is_empty() {
+            return None;
+        }
+        self.resolve(path_part).map(|path| (path, line))
+    }
+
     /// The file a markdown image source names, or `None` when it is not a
     /// file of this checkout: a URL, or a path that leaves the root.
     fn resolve(&self, source: &str) -> Option<PathBuf> {
@@ -87,28 +122,31 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
     render_full(text, on_link, None, None)
 }
 
-/// [`render`], with issue references drawn as pills when an index is
-/// given (`crate::issue_pill`): the chat's transcript passes its window's
-/// index, and a pill's click reaches `on_link` as `taste-issue:<id>`.
-pub fn render_with(
+/// [`render`] for a document with a place: its relative images are read
+/// from beside it and shown (the editor's preview).
+pub fn render_document(text: &str, on_link: Rc<dyn Fn(&str)>, images: DocumentBase) -> gtk::Widget {
+    render_full(text, on_link, None, Some(images))
+}
+
+/// [`render`] with issue references drawn as pills when an index is
+/// given (`crate::issue_pill`) — the chat's transcript passes its window's
+/// index, and a pill's click reaches `on_link` as `taste-issue:<id>` —
+/// and with a place when the document has one, so its paths open and its
+/// images show.
+pub fn render_in(
     text: &str,
     on_link: Rc<dyn Fn(&str)>,
     issues: Option<crate::issue_pill::SharedIssueIndex>,
+    base: Option<DocumentBase>,
 ) -> gtk::Widget {
-    render_full(text, on_link, issues, None)
-}
-
-/// [`render`] for a document with a place: its relative images are read
-/// from beside it and shown (the editor's preview).
-pub fn render_document(text: &str, on_link: Rc<dyn Fn(&str)>, images: ImageBase) -> gtk::Widget {
-    render_full(text, on_link, None, Some(images))
+    render_full(text, on_link, issues, base)
 }
 
 fn render_full(
     text: &str,
     on_link: Rc<dyn Fn(&str)>,
     issues: Option<crate::issue_pill::SharedIssueIndex>,
-    images: Option<ImageBase>,
+    images: Option<DocumentBase>,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root.set_margin_top(16);
@@ -129,8 +167,9 @@ fn render_full(
     let mut code_block: Option<String> = None;
     let mut list_stack: Vec<Option<u64>> = Vec::new();
     let mut quote_depth: usize = 0;
-    // Tables render as a monospace grid (plain but faithful).
-    let mut table: Option<Vec<Vec<String>>> = None;
+    // Tables: the column alignments and the rows, the first row the head,
+    // rendered as a grid of labels (`table_card`).
+    let mut table: Option<(Vec<pulldown_cmark::Alignment>, Vec<Vec<String>>)> = None;
     // Inside a markdown link the text is the link's, and a pill there
     // would nest one <a> in another.
     let mut in_link = false;
@@ -174,6 +213,7 @@ fn render_full(
         }
         let span_texts = std::mem::take(spans);
         let on_link = on_link.clone();
+        let base = images.clone();
         label.connect_activate_link(move |label, href| {
             if let Some(index) = href.strip_prefix("copy:") {
                 if let Some(text) = index.parse::<usize>().ok().and_then(|i| span_texts.get(i)) {
@@ -193,7 +233,13 @@ fn render_full(
                 on_link(href);
                 return glib::Propagation::Stop;
             }
-            glib::Propagation::Stop // unknown schemes go nowhere
+            // A path of this checkout: the file, in the editor.
+            if let Some(base) = &base {
+                if let Some((path, line)) = base.resolve_link(href) {
+                    (base.open_file)(path, line);
+                }
+            }
+            glib::Propagation::Stop // anything else goes nowhere
         });
         // In its frame, which paints the pills' capsules under the text
         // (`issue_pill::PillText`); the label itself is still the thing
@@ -265,7 +311,7 @@ fn render_full(
                     ));
                 }
                 Tag::Image { dest_url, .. } => image = Some((dest_url.to_string(), String::new())),
-                Tag::Table(_) => {
+                Tag::Table(alignments) => {
                     flush(
                         &mut markup,
                         &mut spans,
@@ -274,15 +320,15 @@ fn render_full(
                         &root,
                         &on_link,
                     );
-                    table = Some(Vec::new());
+                    table = Some((alignments, Vec::new()));
                 }
                 Tag::TableRow | Tag::TableHead => {
-                    if let Some(rows) = table.as_mut() {
+                    if let Some((_, rows)) = table.as_mut() {
                         rows.push(Vec::new());
                     }
                 }
                 Tag::TableCell => {
-                    if let Some(row) = table.as_mut().and_then(|r| r.last_mut()) {
+                    if let Some(row) = table.as_mut().and_then(|(_, r)| r.last_mut()) {
                         row.push(String::new());
                     }
                 }
@@ -365,8 +411,8 @@ fn render_full(
                     }
                 }
                 TagEnd::Table => {
-                    if let Some(rows) = table.take() {
-                        root.append(&table_card(&rows));
+                    if let Some((alignments, rows)) = table.take() {
+                        root.append(&table_card(&alignments, &rows));
                     }
                 }
                 _ => {}
@@ -378,7 +424,7 @@ fn render_full(
                     code.push_str(&text);
                 } else if let Some(cell) = table
                     .as_mut()
-                    .and_then(|r| r.last_mut())
+                    .and_then(|(_, r)| r.last_mut())
                     .and_then(|r| r.last_mut())
                 {
                     cell.push_str(&text);
@@ -396,7 +442,7 @@ fn render_full(
                 // while the cells lost them.
                 if let Some(cell) = table
                     .as_mut()
-                    .and_then(|r| r.last_mut())
+                    .and_then(|(_, r)| r.last_mut())
                     .and_then(|r| r.last_mut())
                 {
                     cell.push_str(&code);
@@ -471,7 +517,7 @@ fn render_full(
 /// widget takes the texture when it lands. Scaled down to the column,
 /// never up; the alt text is the tooltip, and the whole caption when the
 /// file cannot be read or is not an image.
-fn picture(base: &ImageBase, path: PathBuf, alt: &str) -> gtk::Widget {
+fn picture(base: &DocumentBase, path: PathBuf, alt: &str) -> gtk::Widget {
     // The picture fills the column and scales down to it, never up: a
     // 1440px screenshot in a 600px column is the column wide and keeps
     // its aspect. Its minimum height is zero (it can shrink), so the
@@ -612,34 +658,53 @@ fn code_card(code: &str, reflow: bool) -> gtk::Widget {
 
 /// Tables: a faithful monospace grid (native GtkGrid styling can come
 /// later; alignment correctness comes first).
-fn table_card(rows: &[Vec<String>]) -> gtk::Widget {
-    let mut widths: Vec<usize> = Vec::new();
-    for row in rows {
-        for (index, cell) in row.iter().enumerate() {
-            let len = cell.chars().count();
-            if index >= widths.len() {
-                widths.push(len);
-            } else if widths[index] < len {
-                widths[index] = len;
-            }
+/// A table as a table: a grid of labels, the head row bold over a rule,
+/// each column aligned as the markdown said, cells wrapping in place of
+/// scrolling (David, 2026-09-22: "use a real table" — it was a monospace
+/// grid in a code card). Plain text in the cells, as the parser hands
+/// them over.
+fn table_card(alignments: &[pulldown_cmark::Alignment], rows: &[Vec<String>]) -> gtk::Widget {
+    let grid = gtk::Grid::builder()
+        .css_classes(["markdown-table"])
+        .column_spacing(0)
+        .row_spacing(0)
+        .build();
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0) as i32;
+    let mut grid_row = 0;
+    for (index, row) in rows.iter().enumerate() {
+        for column in 0..columns {
+            let text = row.get(column as usize).map(String::as_str).unwrap_or("");
+            let xalign = match alignments.get(column as usize) {
+                Some(pulldown_cmark::Alignment::Center) => 0.5,
+                Some(pulldown_cmark::Alignment::Right) => 1.0,
+                _ => 0.0,
+            };
+            let label = gtk::Label::builder()
+                .label(text)
+                .xalign(xalign)
+                .yalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .max_width_chars(32)
+                .selectable(true)
+                .css_classes(if index == 0 {
+                    vec!["markdown-table-cell", "markdown-table-head"]
+                } else if index % 2 == 0 {
+                    vec!["markdown-table-cell", "markdown-table-alt"]
+                } else {
+                    vec!["markdown-table-cell"]
+                })
+                .build();
+            grid.attach(&label, column, grid_row, 1, 1);
+        }
+        grid_row += 1;
+        if index == 0 {
+            let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
+            grid.attach(&rule, 0, grid_row, columns.max(1), 1);
+            grid_row += 1;
         }
     }
-    let mut text = String::new();
-    for (row_index, row) in rows.iter().enumerate() {
-        for (index, cell) in row.iter().enumerate() {
-            let pad = widths.get(index).copied().unwrap_or(0);
-            text.push_str(&format!("{cell:<pad$}  "));
-        }
-        text.push('\n');
-        if row_index == 0 {
-            for width in &widths {
-                text.push_str(&"─".repeat(*width));
-                text.push_str("  ");
-            }
-            text.push('\n');
-        }
-    }
-    code_card(text.trim_end(), false)
+    grid.upcast()
 }
 
 fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverlay> {
@@ -657,12 +722,36 @@ fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverlay> {
 mod tests {
     use super::*;
 
-    fn base() -> ImageBase {
-        ImageBase {
+    fn base() -> DocumentBase {
+        DocumentBase {
             files: taste_core::files::Files::Local,
             dir: PathBuf::from("/checkout/docs"),
             root: PathBuf::from("/checkout"),
+            open_file: Rc::new(|_, _| {}),
         }
+    }
+
+    #[test]
+    fn a_path_link_names_a_file_and_maybe_a_line_and_a_url_does_not() {
+        assert_eq!(
+            base().resolve_link("../crates/taste-app/src/filetree.rs#L4136"),
+            Some((
+                PathBuf::from("/checkout/crates/taste-app/src/filetree.rs"),
+                Some(4136)
+            ))
+        );
+        assert_eq!(
+            base().resolve_link("ENVIRONMENTS.md:20"),
+            Some((PathBuf::from("/checkout/docs/ENVIRONMENTS.md"), Some(20)))
+        );
+        assert_eq!(
+            base().resolve_link("/README.md"),
+            Some((PathBuf::from("/checkout/README.md"), None))
+        );
+        assert_eq!(base().resolve_link("https://example.org/a.md"), None);
+        assert_eq!(base().resolve_link("#heading"), None);
+        assert_eq!(base().resolve_link("copy:3"), None);
+        assert_eq!(base().resolve_link("../../etc/passwd"), None);
     }
 
     /// The decode the preview relies on, against a real screenshot of the

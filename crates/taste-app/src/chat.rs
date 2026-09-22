@@ -6936,8 +6936,26 @@ impl ChatPane {
                 // click away in the editor.
                 let (head, hidden) =
                     crate::chatdoc::clip_prose(&text, PROSE_CLIP_LINES, PROSE_CLIP_CHARS);
-                let rendered =
-                    crate::markdown_view::render_with(&head, on_link, Some(self.issues.clone()));
+                // The environment's checkout is where a path in the answer
+                // points, and where its images are.
+                let base = self.environments.get(&self.environment).map(|supervisor| {
+                    let root = supervisor.checkout().path().to_path_buf();
+                    let events = self.workspace.events.clone();
+                    crate::markdown_view::DocumentBase {
+                        files: supervisor.files(),
+                        dir: root.clone(),
+                        root,
+                        open_file: Rc::new(move |path, line| {
+                            events.publish(taste_core::Event::OpenFileRequested { path, line });
+                        }),
+                    }
+                });
+                let rendered = crate::markdown_view::render_in(
+                    &head,
+                    on_link,
+                    Some(self.issues.clone()),
+                    base,
+                );
                 // The renderer is the markdown PREVIEW's, and it arrives
                 // wearing a document's inset — 16 on every side. In the
                 // transcript it is one more step, and the rail is the
