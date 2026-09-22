@@ -477,6 +477,10 @@ pub struct Supervisor {
     /// (`devcontainer_reload`, approved): when it finishes, the outcome is
     /// published as `Event::ReloadReport` for that agent's chat to hand it.
     agent_reload: AtomicBool,
+    /// The next image build is from nothing — base image pulled, no layer
+    /// cache — which is how an image's packages are refreshed
+    /// (`crate::migration`, `Kind::Packages`). Consumed by that build.
+    fresh_build: AtomicBool,
     /// This environment's live channel to its container, if it has one. The
     /// helper on the far end binds the sockets a relocated agent dials, so
     /// this is what makes relocation reachable at all — see
@@ -817,6 +821,7 @@ impl Supervisor {
             authority: Mutex::new(ConfigAuthority::Project),
             hosting: Mutex::new(AgentHosting::Unknown),
             agent_reload: AtomicBool::new(false),
+            fresh_build: AtomicBool::new(false),
             channel: tokio::sync::Mutex::new(None),
             channel_services: Mutex::new(None),
             running_hash: Mutex::new(None),
@@ -2776,6 +2781,17 @@ impl Supervisor {
         self.agent_reload.store(true, Ordering::SeqCst);
     }
 
+    /// Rebuild this environment's image from nothing and start its
+    /// container on it: the base image pulled, no layer cached, so every
+    /// package step installs what is current. What the weekly package
+    /// refresh does (`crate::migration`).
+    pub async fn refresh_packages(&self) -> Result<()> {
+        self.fresh_build.store(true, Ordering::SeqCst);
+        let result = self.reload().await;
+        self.fresh_build.store(false, Ordering::SeqCst);
+        result
+    }
+
     pub async fn reload(&self) -> Result<()> {
         let result = self.reload_reporting().await;
         if self.agent_reload.swap(false, Ordering::SeqCst) {
@@ -3027,13 +3043,17 @@ impl Supervisor {
             // the keeper's build of the baseline in a VM: the decisions in
             // it — what a build is denied, the memory ceiling, the label —
             // live in one place and this is not it.
-            let args = crate::image::build_args(
+            let mut args = crate::image::build_args(
                 &config,
                 &tag,
                 &staged_dockerfile,
                 &staged,
                 &self.workspace_key(),
             );
+            if self.fresh_build.swap(false, Ordering::SeqCst) {
+                self.log("building from nothing: the base image pulled, no layer cached, so every package is current".to_string());
+                args.splice(1..1, ["--no-cache".to_string(), "--pull=newer".to_string()]);
+            }
             self.run_logged(args).await.inspect_err(|e| {
                 if authority == ConfigAuthority::Project {
                     self.remember_build_failure(&config, e);

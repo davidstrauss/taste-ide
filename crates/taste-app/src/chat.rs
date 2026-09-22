@@ -11069,8 +11069,8 @@ enum ActKind {
     Moved,
     /// `chat_send`
     Prompted,
-    /// `environment_migrate` — a move to a VM on the current guest
-    /// release, approved.
+    /// `environment_reinstantiate` — a move to a VM on the current guest
+    /// release, or a rebuild on updated packages, approved.
     Migrated,
 }
 
@@ -11113,7 +11113,7 @@ fn act_kind(title: &str) -> Option<ActKind> {
         "issue_update" => Some(ActKind::Updated),
         "issue_reorder" => Some(ActKind::Moved),
         "chat_send" => Some(ActKind::Prompted),
-        "environment_migrate" => Some(ActKind::Migrated),
+        "environment_reinstantiate" => Some(ActKind::Migrated),
         _ => None,
     }
 }
@@ -11192,7 +11192,9 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "devcontainer_reload" => "Rebuild the container".into(),
         "update_from_main" => "Take the user's latest work".into(),
         "publish" => "Publish this work for review".into(),
-        "environment_migrate_request" => "Ask to move to a VM on the current release".into(),
+        "environment_reinstantiate_request" => {
+            "Ask to be reinstantiated on updated versions".into()
+        }
         "flatpak_status" => "Read the Flatpak build's state".into(),
         "flatpak_logs" => "Read the Flatpak build's log".into(),
         _ => return None,
@@ -11354,7 +11356,7 @@ fn act_headline(
         }
         ActKind::Migrated => {
             let env = field(input, "environment").unwrap_or_else(|| "an environment".into());
-            format!("Moved {env} to a VM on the current release")
+            format!("Reinstantiated {env} on updated versions")
         }
         ActKind::Prompted => {
             let chat = field(input, "chat").unwrap_or_else(|| "a chat".into());

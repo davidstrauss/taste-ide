@@ -113,9 +113,11 @@ pub struct EnvFacts {
     /// safe mode is a container too now.
     pub authority: ConfigAuthority,
     pub pending_rebuild: bool,
-    /// The guest release this environment is to move to, while its VM is
-    /// behind the stream (`taste_devcontainer::migration`).
-    pub migrating_to: Option<String>,
+    /// What reinstating this environment on updated versions does, while
+    /// one is pending — "moving to a VM on <release>" for a VM behind the
+    /// stream, "rebuilding with updated packages" for a week-old image
+    /// (`taste_devcontainer::migration`).
+    pub reinstating: Option<String>,
     /// Why the project's config is passed over, when a config exists and
     /// is: the one fact that separates "safe mode because there is no
     /// devcontainer.json" from "safe mode because the one there is refused".
@@ -264,7 +266,7 @@ pub struct FleetRow {
     pub state: SupervisorState,
     pub authority: ConfigAuthority,
     pub pending_rebuild: bool,
-    pub migrating_to: Option<String>,
+    pub reinstating: Option<String>,
     pub config_reason: Option<String>,
     pub hook_failure: Option<String>,
     pub chat: Option<ChatBinding>,
@@ -363,7 +365,7 @@ impl FleetRow {
                 // written yet. Green would claim the project's environment
                 // is up when what is up is the IDE's stand-in.
                 if self.pending_rebuild
-                    || self.migrating_to.is_some()
+                    || self.reinstating.is_some()
                     || self.awaits_user()
                     || self.baseline()
                     || self.hook_failure.is_some()
@@ -388,10 +390,10 @@ impl FleetRow {
             SupervisorState::Running { .. } => {
                 if self.pending_rebuild {
                     "running · needs rebuild".to_string()
-                } else if let Some(release) = &self.migrating_to {
-                    // Its VM is behind the stream: the move is pending,
-                    // its agent asked, and the coordinator approves.
-                    format!("running · moving to a VM on {release}")
+                } else if let Some(words) = &self.reinstating {
+                    // A move to a newer VM or a package refresh is
+                    // pending: its agent asks, and the coordinator approves.
+                    format!("running · {words}")
                 } else if let Some(reason) = &self.config_reason {
                     // The baseline beside a refused config: the row says
                     // the config is the blocker, and names the fault.
@@ -599,7 +601,7 @@ pub fn assemble(
                 state: facts.state,
                 authority: facts.authority,
                 pending_rebuild: facts.pending_rebuild,
-                migrating_to: facts.migrating_to,
+                reinstating: facts.reinstating,
                 config_reason: facts.config_reason,
                 hook_failure: facts.hook_failure,
                 chat: facts.chat,
@@ -755,7 +757,7 @@ mod tests {
             state,
             authority: ConfigAuthority::Project,
             pending_rebuild: false,
-            migrating_to: None,
+            reinstating: None,
             config_reason: None,
             hook_failure: None,
             chat: None,

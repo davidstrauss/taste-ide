@@ -1,24 +1,35 @@
-//! **Moving an environment to a VM on the current guest release.**
+//! **Reinstantiating an environment on updated versions.**
 //!
-//! A VM keeps the release it was built from for its whole life
-//! (`crate::guest`), so when the stable stream moves on, the environments
-//! in an older VM have to move to a newer one — through snapshot and
-//! restore, their conversation carried in their home volume. That move
-//! restarts the environment's container under its agent, so it is the
-//! agent's to time and the coordinator's to approve (David, 2026-09-22):
+//! Two things age under an environment that nothing updates in place, and
+//! each is fixed by making the environment again rather than patching it
+//! (David, 2026-09-22):
 //!
-//! - the environment's agent is told when a move is pending, and again
-//!   every [`NUDGE_EVERY`] until it asks for it
-//!   (`environment_migrate_request`);
-//! - the coordinator approves (`environment_migrate`), and is told once
-//!   when an environment has waited [`TELL_COORDINATOR_AFTER`] on it;
-//! - at [`FORCE_AFTER`] from when the move became pending it happens
-//!   anyway, since a VM behind the stream is the kernel isolation depends
-//!   on, ageing.
+//! - **the guest** ([`Kind::Guest`]): a VM keeps the release it was built
+//!   from for its whole life (`crate::guest`), so when the stable stream
+//!   moves on, the environments in an older VM move to a newer one —
+//!   through snapshot and restore, their conversation carried in their
+//!   home volume;
+//! - **the packages** ([`Kind::Packages`]): an image's layers are cached,
+//!   so its packages are what they were the first time it was built;
+//!   a week after its last build from nothing ([`PACKAGES_STALE_AFTER`]),
+//!   the image is rebuilt from nothing — base image pulled, no cache — and
+//!   the container started again on it.
 //!
-//! An environment with nothing running has nobody to ask and moves at
-//! once. This module is the clock and the record; the move itself is the
-//! registry's (`EnvironmentRegistry::relocate`).
+//! Either restarts the environment's container under its agent, so it is
+//! the agent's to time and the coordinator's to approve, with the same
+//! rules for both ("with the same notifications and constraints"):
+//!
+//! - the environment's agent is told when one is pending, and again every
+//!   [`NUDGE_EVERY`] until it asks (`environment_reinstantiate_request`);
+//! - the coordinator approves (`environment_reinstantiate`), and is told
+//!   once when an environment has waited [`TELL_COORDINATOR_AFTER`] on it;
+//! - at [`FORCE_AFTER`] from when it became pending it happens anyway.
+//!
+//! A pending move takes the place of a package refresh, since a new VM
+//! holds no cache and builds the image from nothing anyway. An environment
+//! with nothing running has nobody to ask and moves at once. This module is
+//! the clock and the record; the work is the registry's
+//! (`EnvironmentRegistry::relocate`).
 
 use std::path::Path;
 use std::time::Duration;
@@ -34,10 +45,28 @@ pub const TELL_COORDINATOR_AFTER: Duration = Duration::from_secs(60 * 60);
 pub const FORCE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long a move that failed waits before it is tried again.
 pub const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
+/// How old an image's last build from nothing may get before its packages
+/// are refreshed.
+pub const PACKAGES_STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// What is out of date, and so what reinstantiating does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// The VM is behind the stream: move to a VM on the current release.
+    #[default]
+    Guest,
+    /// The image's packages are a week old: rebuild it from nothing.
+    Packages,
+}
 
 /// One environment's pending move, as recorded beside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Migration {
+    /// What is out of date. Records from before package refreshes are
+    /// guest moves.
+    #[serde(default)]
+    pub kind: Kind,
     /// The VM it is in, and the release that VM runs.
     pub from_vm: String,
     pub from_release: String,
@@ -76,6 +105,7 @@ impl Migration {
 
     pub fn new(from_vm: &str, from_release: &str, to_release: &str, now: u64) -> Self {
         Self {
+            kind: Kind::Guest,
             from_vm: from_vm.to_string(),
             from_release: from_release.to_string(),
             to_release: to_release.to_string(),
@@ -84,6 +114,47 @@ impl Migration {
             last_nudge: None,
             coordinator_told: false,
             failed_at: None,
+        }
+    }
+
+    /// A package refresh for an environment in `vm`, whose image was last
+    /// built from nothing `days` ago.
+    pub fn packages(vm: &str, release: &str, days: u64, now: u64) -> Self {
+        Self {
+            kind: Kind::Packages,
+            // For a refresh, `to_release` carries the age, which is what
+            // the words about it say.
+            to_release: format!("{days} days"),
+            ..Self::new(vm, release, release, now)
+        }
+    }
+
+    /// What reinstantiating does, as a fleet row says it.
+    pub fn row_words(&self) -> String {
+        match self.kind {
+            Kind::Guest => format!("moving to a VM on {}", self.to_release),
+            Kind::Packages => "rebuilding with updated packages".to_string(),
+        }
+    }
+
+    /// What is out of date and what fixing it does, in a sentence — the
+    /// part of every message that differs by kind.
+    fn situation(&self, env: &str) -> String {
+        match self.kind {
+            Kind::Guest => format!(
+                "Environment {env} runs in VM {} on Fedora CoreOS {}; the stable release is now \
+                 {}. It must be reinstantiated in a VM on {}: the checkout is snapshotted with \
+                 its uncommitted work, the container stops, and both come back in the new VM \
+                 with this conversation, in a few minutes.",
+                self.from_vm, self.from_release, self.to_release, self.to_release
+            ),
+            Kind::Packages => format!(
+                "Environment {env}'s image was last built from nothing {} ago, so its packages \
+                 are that old. It must be reinstantiated on updated packages: the image is \
+                 rebuilt without the cache and the container restarts on it, in a few minutes; \
+                 the checkout, uncommitted work, and this conversation stay as they are.",
+                self.to_release
+            ),
         }
     }
 
@@ -146,14 +217,11 @@ impl Migration {
     pub fn nudge_text(&self, env: &str, now: u64) -> String {
         let left = self.forced_at().saturating_sub(now) / 60;
         format!(
-            "Environment {env} runs in VM {} on Fedora CoreOS {}; the stable release is now {}. \
-             The environment must move to a VM on {}. The move snapshots the checkout with its \
-             uncommitted work, stops the container, and restores both in the new VM with this \
-             conversation; it takes a few minutes, and you resume here afterwards.\n\
+            "{} You resume here afterwards.\n\
              At your next stopping point — nothing half-written, no command running — call \
-             environment_migrate_request. The coordinator approves it. If it has not happened \
-             in {left} minutes, it happens anyway, wherever you are.",
-            self.from_vm, self.from_release, self.to_release, self.to_release
+             environment_reinstantiate_request. The coordinator approves it. If it has not \
+             happened in {left} minutes, it happens anyway, wherever you are.",
+            self.situation(env)
         )
     }
 
@@ -162,17 +230,27 @@ impl Migration {
         let left = self.forced_at().saturating_sub(now) / 60;
         let asked = match self.requested_at {
             Some(at) => format!(
-                "Its agent asked for the move {} minutes ago and is waiting on your approval.",
+                "Its agent asked {} minutes ago and is waiting on your approval.",
                 now.saturating_sub(at) / 60
             ),
             None => "Its agent has been told every 10 minutes and has not asked yet.".to_string(),
         };
         format!(
-            "Environment {env} is in VM {} on Fedora CoreOS {}, behind the stable release {}, and \
-             has to move to a VM on {}. {asked} Approve it with environment_migrate \
+            "{} {asked} Approve it with environment_reinstantiate \
              {{\"environment\": \"{env}\"}} when its work is at a stopping point (the \
              environment tool shows its state). It is forced in {left} minutes if you do not.",
-            self.from_vm, self.from_release, self.to_release, self.to_release
+            self.situation(env)
+        )
+    }
+
+    /// What the coordinator is told when an agent asks.
+    pub fn request_text(&self, env: &str, now: u64) -> String {
+        let left = self.forced_at().saturating_sub(now) / 60;
+        format!(
+            "Environment {env}'s agent asks to be reinstantiated now. {} Approve it with \
+             environment_reinstantiate {{\"environment\": \"{env}\"}}. It is forced in {left} \
+             minutes if you do not.",
+            self.situation(env)
         )
     }
 }
@@ -245,12 +323,31 @@ mod tests {
     fn the_words_name_the_releases_the_tool_and_the_deadline() {
         let m = pending();
         let nudge = m.nudge_text("i-0007", m.pending_since + 20 * MIN);
-        assert!(nudge.contains("44.20260912.3.0") && nudge.contains("environment_migrate_request"));
+        assert!(
+            nudge.contains("44.20260912.3.0")
+                && nudge.contains("environment_reinstantiate_request")
+        );
         assert!(nudge.contains("100 minutes"), "{nudge}");
         let told = m.coordinator_text("i-0007", m.pending_since + 60 * MIN);
         assert!(
-            told.contains("environment_migrate") && told.contains("60 minutes"),
+            told.contains("environment_reinstantiate") && told.contains("60 minutes"),
             "{told}"
         );
+        let refresh = Migration::packages("taste-a", "44.20260829.3.1", 9, m.pending_since);
+        let nudge = refresh.nudge_text("i-0007", refresh.pending_since);
+        assert!(
+            nudge.contains("9 days") && nudge.contains("without the cache"),
+            "{nudge}"
+        );
+        assert_eq!(refresh.row_words(), "rebuilding with updated packages");
+    }
+
+    /// A record written before package refreshes reads as a guest move.
+    #[test]
+    fn an_older_record_is_a_guest_move() {
+        let text =
+            r#"{"from_vm":"taste-a","from_release":"44.1","to_release":"44.2","pending_since":5}"#;
+        let m: Migration = serde_json::from_str(text).unwrap();
+        assert_eq!(m.kind, Kind::Guest);
     }
 }

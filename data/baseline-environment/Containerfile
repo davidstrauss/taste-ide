@@ -24,11 +24,15 @@
 #
 # The base is pinned by digest, not by tag: the baseline is the rung that
 # is supposed to always work, so it must not change under the user
-# because a tag moved.
+# because a tag moved. Its packages still move — the upgrade below takes
+# the base's own to what the repositories have now — and the weekly
+# refresh, a build without the cache, is when that happens
+# (taste_devcontainer::migration).
 
 FROM registry.fedoraproject.org/fedora-minimal@sha256:df76793c3a7152c653dc9715f6926f4a12fa85018b1fc315288cff6f755c4bb6
 
-RUN microdnf install -y --setopt=install_weak_deps=0 --nodocs \
+RUN microdnf upgrade -y --setopt=install_weak_deps=0 --nodocs \
+    && microdnf install -y --setopt=install_weak_deps=0 --nodocs \
         nodejs npm \
         git \
         coreutils findutils grep sed gawk diffutils ripgrep \

@@ -338,18 +338,23 @@ impl McpServer {
                 .map_or(0, |d| d.as_secs());
             out["migration"] = json!({
                 "pending": true,
+                "kind": match m.kind {
+                    taste_devcontainer::migration::Kind::Guest => "guest",
+                    taste_devcontainer::migration::Kind::Packages => "packages",
+                },
+                "does": m.row_words(),
                 "from_vm": m.from_vm,
                 "from_release": m.from_release,
-                "to_release": m.to_release,
+                "to_release": (m.kind == taste_devcontainer::migration::Kind::Guest).then_some(&m.to_release),
                 "requested": m.requested_at.is_some(),
                 "forced_in_minutes": m.forced_at().saturating_sub(now) / 60,
                 "next": if env.is_primary() {
-                    "call environment_migrate_request at a stopping point: for the primary, \
+                    "call environment_reinstantiate_request at a stopping point: for the primary, \
                      asking is approving, and the move starts at once"
                 } else if m.requested_at.is_some() {
                     "asked; the coordinator approves it"
                 } else {
-                    "call environment_migrate_request at your next stopping point"
+                    "call environment_reinstantiate_request at your next stopping point"
                 },
             });
         }
@@ -1202,12 +1207,13 @@ impl McpServer {
             ));
         }
         tools.push(tool(
-            "environment_migrate_request",
-            "Ask to move this environment to a VM on the current guest release, when the \
-             environment tool reports migration.pending. Call it at a stopping point: the \
-             move snapshots your checkout and uncommitted work, stops your container for a \
-             few minutes, and restores both with this conversation in the new VM. The \
-             coordinator approves it; it is forced two hours after it became pending.",
+            "environment_reinstantiate_request",
+            "Ask to be reinstantiated on updated versions, when the environment tool reports \
+             migration.pending: a move to a VM on the current guest release, or an image \
+             rebuilt without the cache for current packages. Call it at a stopping point: \
+             your container stops for a few minutes, and your checkout, uncommitted work, and \
+             this conversation come back. The coordinator approves it; it is forced two hours \
+             after it became pending.",
             empty.clone(),
         ));
         // ...and orchestration: the reads on every socket, the writes on
@@ -2782,16 +2788,16 @@ impl McpServer {
                 self.require_orchestrator(env, "environment_destroy")?;
                 self.environment_destroy(env, args).await
             }
-            "environment_migrate_request" => {
+            "environment_reinstantiate_request" => {
                 let said = self.environments.request_migration(env)?;
                 Ok(json!({ "state": "requested", "next": said }))
             }
-            "environment_migrate" => {
-                self.require_orchestrator(env, "environment_migrate")?;
+            "environment_reinstantiate" => {
+                self.require_orchestrator(env, "environment_reinstantiate")?;
                 let target = args
                     .get("environment")
                     .and_then(Value::as_str)
-                    .context("environment_migrate needs `environment`")?;
+                    .context("environment_reinstantiate needs `environment`")?;
                 let target = EnvironmentId::parse(target)
                     .map_err(|e| anyhow::anyhow!("{target} is not an environment id: {e}"))?;
                 let said = self.environments.approve_migration(&target)?;

@@ -3114,16 +3114,23 @@ impl EnvironmentRegistry {
             let behind = release
                 .as_deref()
                 .is_some_and(|r| crate::guest::release_is_behind(r, &image.release));
-            let Some(release) = release.filter(|_| behind) else {
-                if self.migrations.lock().unwrap().remove(&id).is_some() {
-                    crate::migration::Migration::clear(&dir);
-                }
+            let Some(release) = release.clone().filter(|_| behind) else {
+                // Not behind: what is left to age is the packages.
+                self.detect_package_refresh(&supervisor, &domain, release.as_deref(), now)
+                    .await;
                 continue;
             };
-            let known = self.migrations.lock().unwrap().get(&id).cloned();
-            let migration = match known
-                .or_else(|| crate::migration::Migration::read(&dir).filter(|m| m.from_vm == domain))
-            {
+            let known = self
+                .migrations
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .filter(|m| m.kind == crate::migration::Kind::Guest);
+            let migration = match known.or_else(|| {
+                crate::migration::Migration::read(&dir)
+                    .filter(|m| m.from_vm == domain && m.kind == crate::migration::Kind::Guest)
+            }) {
                 Some(mut m) => {
                     m.to_release = image.release.clone();
                     m
@@ -3161,10 +3168,119 @@ impl EnvironmentRegistry {
         }
     }
 
+    /// A package refresh recorded for `supervisor` when its image was last
+    /// built from nothing a week or more ago, and cleared when it was not.
+    /// Only for a running container, since one that is not has no image
+    /// in use to age.
+    async fn detect_package_refresh(
+        self: &Arc<Self>,
+        supervisor: &Arc<Supervisor>,
+        domain: &str,
+        release: Option<&str>,
+        now: u64,
+    ) {
+        let id = supervisor.id().clone();
+        let dir = self.env_dir(&id);
+        let clear = || {
+            if self.migrations.lock().unwrap().remove(&id).is_some() {
+                crate::migration::Migration::clear(&dir);
+            }
+        };
+        if !matches!(supervisor.state(), SupervisorState::Running { .. }) {
+            // Kept while it is starting again after its own refresh;
+            // dropped for one that stopped.
+            if !matches!(
+                supervisor.state(),
+                SupervisorState::Starting | SupervisorState::Building
+            ) {
+                clear();
+            }
+            return;
+        }
+        let Some(built) = self.packages_built_at(supervisor).await else {
+            return;
+        };
+        let age = now.saturating_sub(built);
+        if age < crate::migration::PACKAGES_STALE_AFTER.as_secs() {
+            clear();
+            return;
+        }
+        let days = age / 86_400;
+        let known = self.migrations.lock().unwrap().get(&id).cloned();
+        let migration = match known.or_else(|| crate::migration::Migration::read(&dir)) {
+            Some(mut m) if m.kind == crate::migration::Kind::Packages => {
+                m.to_release = format!("{days} days");
+                m
+            }
+            _ => {
+                taste_core::app_log::push(
+                    "info",
+                    "environments",
+                    &format!(
+                        "environment {id}'s image was last built from nothing {days} days ago; \
+                         its packages are refreshed"
+                    ),
+                );
+                crate::migration::Migration::packages(domain, release.unwrap_or("?"), days, now)
+            }
+        };
+        if let Err(e) = migration.write(&dir) {
+            tracing::warn!("recording {id}'s package refresh: {e:#}");
+        }
+        self.migrations.lock().unwrap().insert(id, migration);
+    }
+
+    /// Where the last build from nothing of an environment's image is
+    /// recorded.
+    fn packages_record(&self, env: &EnvironmentId) -> PathBuf {
+        self.env_dir(env).join("packages-built-at")
+    }
+
+    /// When `supervisor`'s image was last built from nothing: the record
+    /// the refresh writes, or — before there is one — when podman says its
+    /// running container's image was made, which is the oldest its
+    /// packages can be.
+    async fn packages_built_at(&self, supervisor: &Arc<Supervisor>) -> Option<u64> {
+        if let Ok(text) = std::fs::read_to_string(self.packages_record(supervisor.id())) {
+            if let Ok(at) = text.trim().parse() {
+                return Some(at);
+            }
+        }
+        let substrate = supervisor.substrate();
+        let name = supervisor.container_name();
+        tokio::task::spawn_blocking(move || -> Option<u64> {
+            let image = substrate
+                .std_command(&[])
+                .args(["container", "inspect", "--format", "{{.Image}}", &name])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|out| out.status.success())?;
+            let image = String::from_utf8_lossy(&image.stdout).trim().to_string();
+            let created = substrate
+                .std_command(&[])
+                .args(["image", "inspect", "--format", "{{.Created.Unix}}", &image])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|out| out.status.success())?;
+            String::from_utf8_lossy(&created.stdout).trim().parse().ok()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// The new release's base image, fetched in the background once a move
     /// needs it, so the move itself does not wait a gigabyte.
     fn prefetch_guest_image(self: &Arc<Self>) {
-        if self.migrations.lock().unwrap().is_empty() {
+        let moving = self
+            .migrations
+            .lock()
+            .unwrap()
+            .values()
+            .any(|m| m.kind == crate::migration::Kind::Guest);
+        if !moving {
             return;
         }
         let Ok(image) = crate::guest::image() else {
@@ -3244,15 +3360,18 @@ impl EnvironmentRegistry {
     /// agent IS the coordinator, so asking is approving and it moves now.
     pub fn request_migration(self: &Arc<Self>, env: &EnvironmentId) -> Result<String> {
         let mut migration = self.migration_of(env).with_context(|| {
-            format!("{env} has no move pending: its VM runs the current guest release")
+            format!(
+                "{env} has nothing to reinstantiate: its VM runs the current guest release and \
+                 its image's packages are less than a week old"
+            )
         })?;
         if env.is_primary() {
             self.spawn_relocate(env.clone(), "the coordinator asked for it".to_string());
-            return Ok(format!(
-                "Moving now to a VM on {}. Your container stops and this conversation resumes \
-                 in the new VM in a few minutes.",
-                migration.to_release
-            ));
+            return Ok(
+                "Reinstantiating now. Your container stops and this conversation resumes in a \
+                 few minutes."
+                    .to_string(),
+            );
         }
         let now = now_secs();
         migration.requested_at.get_or_insert(now);
@@ -3265,34 +3384,24 @@ impl EnvironmentRegistry {
         self.events.publish(Event::MigrationNotice {
             env: env.clone(),
             audience: taste_core::MigrationAudience::Coordinator,
-            text: format!(
-                "Environment {env}'s agent asks to move it now: it is in VM {} on Fedora CoreOS \
-                 {}, behind the stable release {}. The move stops its container for a few \
-                 minutes and brings its checkout, uncommitted work, and conversation back in a \
-                 VM on {}. Approve it with environment_migrate {{\"environment\": \"{env}\"}}. \
-                 It is forced in {left} minutes if you do not.",
-                migration.from_vm,
-                migration.from_release,
-                migration.to_release,
-                migration.to_release
-            ),
+            text: migration.request_text(env.as_str(), now),
         });
         Ok(format!(
-            "Asked. The coordinator approves the move; until then keep working or wait. It \
-             happens by itself in {left} minutes if it is not approved."
+            "Asked. The coordinator approves it; until then keep working or wait. It happens \
+             by itself in {left} minutes if it is not approved."
         ))
     }
 
     /// The coordinator approves `env`'s move: it starts now.
     pub fn approve_migration(self: &Arc<Self>, env: &EnvironmentId) -> Result<String> {
         let migration = self.migration_of(env).with_context(|| {
-            format!("{env} has no move pending: its VM runs the current guest release")
+            format!("{env} has nothing to reinstantiate: it is on the current versions")
         })?;
         self.spawn_relocate(env.clone(), "the coordinator approved it".to_string());
         Ok(format!(
-            "Moving {env} to a VM on {} now. Its container stops for a few minutes; its agent \
-             resumes in the new VM and is told when it is there.",
-            migration.to_release
+            "Reinstantiating {env} now: {}. Its container stops for a few minutes; its agent \
+             resumes and is told when it is done.",
+            migration.row_words()
         ))
     }
 
@@ -3320,28 +3429,53 @@ impl EnvironmentRegistry {
         let Some(migration) = self.migration_of(env) else {
             return;
         };
-        match self.relocate_inner(env).await {
+        let outcome = match migration.kind {
+            crate::migration::Kind::Guest => self.relocate_inner(env).await,
+            crate::migration::Kind::Packages => match self.get(env) {
+                Some(supervisor) => supervisor
+                    .refresh_packages()
+                    .await
+                    .map(|()| migration.from_vm.clone()),
+                None => Err(anyhow::anyhow!("no environment {env}")),
+            },
+        };
+        match outcome {
             Ok(domain) => {
                 self.migrations.lock().unwrap().remove(env);
                 crate::migration::Migration::clear(&self.env_dir(env));
-                let note = format!(
-                    "environment {env} moved from VM {} ({}) to VM {domain} on {} — {why}",
-                    migration.from_vm, migration.from_release, migration.to_release
-                );
+                // Either way its image was just built from nothing: a new
+                // VM holds no cache, and a refresh used none.
+                let _ = std::fs::write(self.packages_record(env), format!("{}\n", now_secs()));
+                let (note, toast, told) = match migration.kind {
+                    crate::migration::Kind::Guest => (
+                        format!(
+                            "environment {env} moved from VM {} ({}) to VM {domain} on {} — {why}",
+                            migration.from_vm, migration.from_release, migration.to_release
+                        ),
+                        format!("{env} moved to a VM on {}", migration.to_release),
+                        format!(
+                            "The move is done: environment {env} is in VM {domain} on Fedora \
+                             CoreOS {}, with its checkout and uncommitted work as they were. \
+                             Continue where you left off.",
+                            migration.to_release
+                        ),
+                    ),
+                    crate::migration::Kind::Packages => (
+                        format!("environment {env}'s image was rebuilt from nothing — {why}"),
+                        format!("{env} was rebuilt with updated packages"),
+                        format!(
+                            "The refresh is done: environment {env}'s image was rebuilt without \
+                             the cache and its container restarted on it; the checkout and \
+                             uncommitted work are as they were. Continue where you left off."
+                        ),
+                    ),
+                };
                 taste_core::app_log::push("info", "environments", &note);
-                self.events.publish(Event::Toast(format!(
-                    "{env} moved to a VM on {}",
-                    migration.to_release
-                )));
+                self.events.publish(Event::Toast(toast));
                 self.events.publish(Event::MigrationNotice {
                     env: env.clone(),
                     audience: taste_core::MigrationAudience::Moved,
-                    text: format!(
-                        "The move is done: environment {env} is in VM {domain} on Fedora CoreOS \
-                         {}, with its checkout and uncommitted work as they were. Continue where \
-                         you left off.",
-                        migration.to_release
-                    ),
+                    text: told,
                 });
             }
             Err(e) => {
@@ -3352,22 +3486,21 @@ impl EnvironmentRegistry {
                     slot.failed_at = failed.failed_at;
                 }
                 let note = format!(
-                    "moving environment {env} to a VM on {} failed: {e:#}",
-                    migration.to_release
+                    "reinstantiating environment {env} ({}) failed: {e:#}",
+                    migration.row_words()
                 );
                 taste_core::app_log::push("warn", "environments", &note);
                 self.events.publish(Event::Toast(format!(
-                    "{env} could not be moved to a VM on {}; the app log says why",
-                    migration.to_release
+                    "{env} could not be reinstantiated ({}); the app log says why",
+                    migration.row_words()
                 )));
                 self.events.publish(Event::MigrationNotice {
                     env: env.clone(),
                     audience: taste_core::MigrationAudience::Coordinator,
                     text: format!(
-                        "Moving environment {env} to a VM on {} failed: {e:#}. It is tried again \
-                         in {} minutes. Its container may be stopped until then; \
-                         devcontainer_reload does not move it.",
-                        migration.to_release,
+                        "Reinstantiating environment {env} ({}) failed: {e:#}. It is tried again \
+                         in {} minutes.",
+                        migration.row_words(),
                         crate::migration::RETRY_AFTER.as_secs() / 60
                     ),
                 });

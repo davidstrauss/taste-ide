@@ -67,7 +67,7 @@ pub(crate) fn is_write(tool: &str) -> bool {
             | "issue_reorder"
             | "chat_send"
             | "environment_destroy"
-            | "environment_migrate"
+            | "environment_reinstantiate"
             | "issue_delete"
     )
 }
@@ -159,13 +159,14 @@ pub(crate) fn tools() -> Vec<Value> {
             }),
         ),
         crate::protocol::tool(
-            "environment_migrate",
-            "Approve an environment's move to a VM on the current guest release: it starts \
-             now. You are told when one waits on you; an environment whose VM is behind \
-             reports migration.pending in the environment tool. The move snapshots its checkout and uncommitted work, stops \
-             its container for a few minutes, and restores both with its agent's \
-             conversation in the new VM. Approve at a stopping point in its work; unapproved \
-             moves are forced two hours after they became pending.",
+            "environment_reinstantiate",
+            "Approve an environment's reinstantiation on updated versions: it starts now. \
+             Either it moves to a VM on the current guest release, or its image is rebuilt \
+             without the cache for current packages; either stops its container for a few \
+             minutes and keeps its checkout, uncommitted work, and agent's conversation. You \
+             are told when one waits on you; the environment tool reports migration.pending. \
+             Approve at a stopping point in its work; unapproved ones are forced two hours \
+             after they became pending.",
             json!({
                 "type": "object",
                 "properties": {

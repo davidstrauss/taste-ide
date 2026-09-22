@@ -191,7 +191,7 @@ pub fn effect(tool: &str) -> Effect {
         "devcontainer_reload" => Effect::Write,
         // A move restarts a container and loses nothing — the snapshot
         // carries the uncommitted work and the volume the conversation.
-        "environment_migrate_request" | "environment_migrate" => Effect::Write,
+        "environment_reinstantiate_request" | "environment_reinstantiate" => Effect::Write,
         // The two removals (i-0022). A clone can be the only copy of an
         // agent's unreviewed work and an issue is the only record of why
         // something was wanted; neither comes back. Both refuse on the
@@ -299,7 +299,7 @@ pub fn is_ide_tool(tool: &str) -> bool {
 pub fn asks_nobody(tool: &str) -> bool {
     matches!(
         tool,
-        "devcontainer_reload" | "environment_migrate_request" | "environment_migrate"
+        "devcontainer_reload" | "environment_reinstantiate_request" | "environment_reinstantiate"
     )
 }
 

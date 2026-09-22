@@ -3367,18 +3367,30 @@ restored from its peer in a VM on the current release, the old copy
 removed, the old VM destroyed once nothing of the workspace is left in it,
 and the container started again.
 
-**Who times a move** (`crate::migration`, David, 2026-09-22): it restarts
-the container under the agent, so the environment's agent is told as soon
-as a move is pending and every ten minutes after until it calls
-`environment_migrate_request`; the coordinator approves with
-`environment_migrate` — asked the moment the agent asks, and told once
+**Packages age too, and are refreshed the same way** (David, 2026-09-22:
+"that too — and with the same notifications and constraints"). An image's
+layers are cached, so its packages are what they were the first time it
+was built; a week after an environment's image was last built from
+nothing, it is rebuilt with `--no-cache --pull=newer` and its container
+restarted on it — the checkout, the uncommitted work, and the
+conversation untouched. The safe-mode baseline keeps its base pinned by
+digest and upgrades the base's packages in its first step, so a build
+from nothing brings those current too. A pending move takes the place of a
+refresh, since a new VM holds no cache and builds from nothing anyway.
+
+**Who times a reinstantiation** (`crate::migration`, David, 2026-09-22) —
+a move or a refresh, by the same rules: it restarts the container under
+the agent, so the environment's agent is told as soon as one is pending
+and every ten minutes after until it calls
+`environment_reinstantiate_request`; the coordinator approves with
+`environment_reinstantiate` — asked the moment the agent asks, and told once
 when a move has waited an hour on it — and at two hours from pending the
 move happens anyway, since what is ageing is the kernel isolation rests
 on. The primary's agent is the coordinator, so its asking is approving.
 An environment with nothing running has nobody to ask and moves at once.
 A move that fails says so to the coordinator and is tried again fifteen
-minutes later; the fleet row reads "moving to a VM on <release>" while one
-is pending. Moving is one operation with four reasons, never a reboot the
+minutes later; the fleet row reads "moving to a VM on <release>" or
+"rebuilding with updated packages" while one is pending. Moving is one operation with four reasons, never a reboot the
 IDE schedules.
 
 **Staleness is per kind, and must be said before it is needed.** A cloud
