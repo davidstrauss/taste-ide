@@ -847,14 +847,16 @@ impl DevcontainerBanner {
 /// the bar reads as working without drawing the eye from the words on
 /// it.
 const STRIPE_PERIOD: f64 = 28.0;
-const STRIPE_SPEED: f64 = 36.0;
+const STRIPE_SPEED: f64 = 12.0;
 
-/// The operation's stripes, filling the row from the left to `fraction`
-/// of its width: hazard bands at 45°, phase-shifted by `offset`, in a
-/// yellow and a dark that stay under the text — fairly dark over the dark
-/// scheme, fairly light over the light one — so the words on them keep
-/// their contrast (David, 2026-09-21). Nothing is drawn at zero; the
-/// banner's own colour is the track.
+/// The operation's bar as the row's whole background: the part done in
+/// hazard bands at 45°, phase-shifted by `offset`, the part to come in a
+/// flat grey. Both opaque, and both kept well away from the text's
+/// colour — dark bands and a dark grey under the dark scheme's light
+/// text, pale bands and a light grey under the light scheme's dark text
+/// (David, 2026-09-21: "much higher contrast versus the text ... Make the
+/// incomplete portion of the bar dark gray (or light gray in light
+/// mode)"). Nothing is drawn at zero; the banner's own colour shows.
 fn draw_stripes(
     cr: &gtk::cairo::Context,
     width: i32,
@@ -868,14 +870,25 @@ fn draw_stripes(
         return;
     }
     let h = f64::from(height);
+    let (yellow, other, remainder) = if dark {
+        (
+            (0.33, 0.27, 0.05, 1.0),
+            (0.13, 0.13, 0.13, 1.0),
+            (0.20, 0.20, 0.20, 1.0),
+        )
+    } else {
+        (
+            (0.99, 0.93, 0.68, 1.0),
+            (0.97, 0.97, 0.96, 1.0),
+            (0.87, 0.87, 0.86, 1.0),
+        )
+    };
+    cr.set_source_rgba(remainder.0, remainder.1, remainder.2, remainder.3);
+    cr.rectangle(0.0, 0.0, f64::from(width), h);
+    let _ = cr.fill();
     cr.save().ok();
     cr.rectangle(0.0, 0.0, filled, h);
     cr.clip();
-    let (yellow, other) = if dark {
-        ((0.96, 0.76, 0.07, 0.26), (0.0, 0.0, 0.0, 0.34))
-    } else {
-        ((0.96, 0.76, 0.07, 0.42), (1.0, 1.0, 1.0, 0.60))
-    };
     let half = STRIPE_PERIOD / 2.0;
     // Each band is a parallelogram leaning left: its top edge `half` wide
     // at `x`, its bottom edge shifted by the height, so the bands run at
