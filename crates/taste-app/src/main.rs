@@ -343,7 +343,6 @@ fn main() -> glib::ExitCode {
                    border-radius: 12px; }\n\
                  .startup-step-done { color: @success_color; }\n\
                  .startup-step-failed { color: @error_color; }\n\
-                 .startup-step-skipped { opacity: 0.55; }\n\
                  .startup-step-pending { opacity: 0.7; }\n\
                  tabbar.startup-locked tab:not(:selected) { opacity: 0.45; }\n\
                  .composer-action, .composer-action > button, \

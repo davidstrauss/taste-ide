@@ -3424,8 +3424,9 @@ other tabs dimmed in place — as a checklist of these steps over the
 construction stripes, slowed to a crawl at that size, with the log the
 current step is writing beneath it: the Virtual Machine log until the
 container's build begins, the Environment Build log from there
-(`crates/taste-app/src/startup.rs`). Steps a start did not need read
-"not needed this time" rather than staying pending. The page says why
+(`crates/taste-app/src/startup.rs`). Each step is worded as a state to
+be in — "Have the guest image on this machine" — so a step a start did
+not need is simply checked, since it was already true. The page says why
 when the safe-mode environment is what is coming up — the project's
 devcontainer is missing, or it failed, with the failure — and offers
 Prompt Agent for the repair. The safe-mode environment itself failing is

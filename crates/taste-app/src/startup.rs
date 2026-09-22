@@ -38,10 +38,13 @@ const STRIPE_SPEED: f64 = 2.0;
 /// How long "Environment ready" stays on the page before it goes.
 pub const READY_LINGER: std::time::Duration = std::time::Duration::from_millis(2000);
 
-/// The steps, in the order they happen. Not every start takes every step:
-/// the ones a start did not need are marked so rather than left pending,
-/// and a step that never announces itself is skipped when a later one
-/// begins.
+/// The steps, in the order they happen. Not every start does work at
+/// every step — the guest image is fetched once per machine, the files
+/// service's image built once per VM — so each is worded as a state to
+/// be in rather than a thing to do, and a step a start did not need is
+/// simply checked: it was already true (David, 2026-09-22: "Word steps so
+/// that, if unnecessary, it's idempotently correct to show them as
+/// checked").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
     /// Other projects' VMs that no window owns, stopped for the room.
@@ -79,14 +82,14 @@ impl Step {
 
     fn title(self) -> &'static str {
         match self {
-            Step::Sweep => "Stop other projects' VMs that no window owns",
-            Step::GuestImage => "Fetch the guest image (once per machine)",
-            Step::Vm => "Bring up the workspace's VM",
-            Step::ServiceImage => "Build the files service image (once per VM)",
-            Step::Files => "Connect the files service",
-            Step::Place => "Place the checkout in the VM",
-            Step::Build => "Build the environment's image",
-            Step::Start => "Start the container and run its setup commands",
+            Step::Sweep => "Stop unused VMs and verify capacity",
+            Step::GuestImage => "Have the guest image on this machine",
+            Step::Vm => "Have the workspace's VM up",
+            Step::ServiceImage => "Have the files service image in the VM",
+            Step::Files => "Have the files service connected",
+            Step::Place => "Have the checkout in the VM, in step with the folder",
+            Step::Build => "Have the environment's image built",
+            Step::Start => "Have the container running with its setup done",
             Step::Ready => "Environment ready",
         }
     }
@@ -123,7 +126,6 @@ enum Status {
     Pending,
     Active,
     Done,
-    Skipped,
     Failed,
 }
 
@@ -188,7 +190,6 @@ impl StepRow {
             "startup-step-pending",
             "startup-step-active",
             "startup-step-done",
-            "startup-step-skipped",
             "startup-step-failed",
         ] {
             self.row.remove_css_class(class);
@@ -197,7 +198,6 @@ impl StepRow {
             Status::Pending => ("radio-symbolic", "startup-step-pending"),
             Status::Active => ("radio-symbolic", "startup-step-active"),
             Status::Done => ("object-select-symbolic", "startup-step-done"),
-            Status::Skipped => ("radio-mixed-symbolic", "startup-step-skipped"),
             Status::Failed => ("dialog-error-symbolic", "startup-step-failed"),
         };
         self.row.add_css_class(class);
@@ -212,10 +212,6 @@ impl StepRow {
             }
         }
         match (status, detail) {
-            (Status::Skipped, None) => {
-                self.detail.set_label("not needed this time");
-                self.detail.set_visible(true);
-            }
             (_, Some(text)) if !text.is_empty() => {
                 self.detail.set_label(text);
                 self.detail.set_visible(true);
@@ -466,19 +462,18 @@ impl StartupPage {
         &self.rows[Step::ALL.iter().position(|s| *s == step).unwrap_or(0)]
     }
 
-    /// `step` is happening now: the steps before it that never happened
-    /// are marked not needed, the one that was active is done, and the
-    /// log below switches to the one this step writes.
+    /// `step` is happening now: every step before it is checked — the
+    /// one that was active is done, and the ones that never announced
+    /// themselves were already true — and the log below switches to the
+    /// one this step writes.
     fn activate(self: &Rc<Self>, step: Step, detail: Option<&str>) {
         if !self.underway.get() || self.settled.get() {
             self.begin();
         }
         for earlier in Step::ALL.iter().filter(|s| **s < step) {
             let row = self.row(*earlier);
-            match row.status.get() {
-                Status::Pending => row.set(Status::Skipped, None),
-                Status::Active => row.set(Status::Done, None),
-                _ => {}
+            if matches!(row.status.get(), Status::Pending | Status::Active) {
+                row.set(Status::Done, None);
             }
         }
         let row = self.row(step);
@@ -496,10 +491,8 @@ impl StartupPage {
     fn finish(self: &Rc<Self>) {
         for step in Step::ALL {
             let row = self.row(step);
-            match row.status.get() {
-                Status::Pending if step != Step::Ready => row.set(Status::Skipped, None),
-                Status::Failed => {}
-                _ => row.set(Status::Done, None),
+            if row.status.get() != Status::Failed {
+                row.set(Status::Done, None);
             }
         }
         self.row(Step::Ready).set(Status::Done, None);
