@@ -64,6 +64,8 @@ pub const PRIMARY_TITLE: &str = "Personal";
 /// Rows the list shows before it scrolls. Six two-line rows is the height
 /// the two panels this replaced took together, and still a glance.
 pub const VISIBLE_ROWS: i32 = 6;
+/// The rows the list is owed when the window is short (`size_list`).
+const MIN_ROWS: i32 = 2;
 
 /// One row: the 40px two-line `.backlog-list > row` plus 2px of margin
 /// either side.
@@ -2070,18 +2072,25 @@ impl BacklogPanel {
         self.draw_activity();
     }
 
-    /// The list's height: its rows, up to `VISIBLE_ROWS`, and no less than
-    /// it has — until the slot opens, when the floor drops to one row and
-    /// the ceiling to half, so the panel takes its height from the list
-    /// and not from the window. The column's minimums must never exceed
-    /// the window's height: GTK clips what does not fit, and the composer's
-    /// Create pill was the first thing to go.
+    /// The list's height: its rows, up to `VISIBLE_ROWS`, as its natural
+    /// height, and a floor of two — until the slot opens, when the floor
+    /// drops to one row and the ceiling to half, so the panel takes its
+    /// height from the list and not from the window. The column's minimums
+    /// must never exceed the window's height: GTK clips what does not fit,
+    /// and the composer's Create pill was the first thing to go. The floor
+    /// used to be every row up to six, and with a fourth Logs row above it
+    /// the flank's minimum passed the window's 900px ("AdwToastOverlay
+    /// exceeds AdwApplicationWindow height: requested 954 px", David,
+    /// 2026-09-22). The flank's other sections are fixed rows, and the
+    /// chrome above and below it is 186px, so at a 900px window the flank
+    /// has about 700px to be owed: two rows here is what fits, and the
+    /// rest is natural height the list takes where there is room.
     fn size_list(&self) {
         let rows = self.list_rows.get();
         let (floor, ceiling) = if self.slot.is_open() {
             (1, (VISIBLE_ROWS / 2).max(1))
         } else {
-            (rows, VISIBLE_ROWS)
+            (rows.min(MIN_ROWS), VISIBLE_ROWS)
         };
         self.scroller.set_max_content_height(-1);
         self.scroller.set_min_content_height(floor * ROW_HEIGHT);

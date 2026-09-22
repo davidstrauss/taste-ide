@@ -169,6 +169,10 @@ impl DevcontainerBanner {
         // The row itself is transparent, its padding carried as margins:
         // the banner's colour is the surface's below, so the bar can draw
         // between the colour and the words.
+        // As tall as a button from the start, so a face that gains one
+        // (View Log, Rebuild) does not grow the banner (David, 2026-09-22:
+        // "The bar should be big enough for the buttons without getting
+        // taller when the buttons appear").
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(12)
@@ -176,6 +180,7 @@ impl DevcontainerBanner {
             .margin_bottom(6)
             .margin_start(12)
             .margin_end(12)
+            .height_request(34)
             .build();
         row.append(&icon);
         row.append(&title);
@@ -872,15 +877,15 @@ fn draw_stripes(
     let h = f64::from(height);
     let (yellow, other, remainder) = if dark {
         (
-            (0.33, 0.27, 0.05, 1.0),
-            (0.13, 0.13, 0.13, 1.0),
-            (0.20, 0.20, 0.20, 1.0),
+            (0.22, 0.18, 0.03, 1.0),
+            (0.08, 0.08, 0.08, 1.0),
+            (0.14, 0.14, 0.14, 1.0),
         )
     } else {
         (
-            (0.99, 0.93, 0.68, 1.0),
-            (0.97, 0.97, 0.96, 1.0),
-            (0.87, 0.87, 0.86, 1.0),
+            (1.0, 0.96, 0.80, 1.0),
+            (0.99, 0.99, 0.99, 1.0),
+            (0.92, 0.92, 0.91, 1.0),
         )
     };
     cr.set_source_rgba(remainder.0, remainder.1, remainder.2, remainder.3);

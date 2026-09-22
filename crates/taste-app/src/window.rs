@@ -2138,10 +2138,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 .ok()
                 .and_then(|d| d.parse().ok())
                 .unwrap_or(400);
+            // TASTE_MEASURE_AXIS=height measures the other axis: a window
+            // whose content asks for more height than the screen has
+            // ("AdwToastOverlay exceeds AdwApplicationWindow height") is
+            // this same audit, turned ninety degrees.
+            let axis = match std::env::var("TASTE_MEASURE_AXIS").as_deref() {
+                Ok("height") => gtk::Orientation::Vertical,
+                _ => gtk::Orientation::Horizontal,
+            };
+            let axis_word = if axis == gtk::Orientation::Vertical {
+                "min-height"
+            } else {
+                "min-width"
+            };
             glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
                 for (name, widget) in &report {
-                    let (min, natural, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
-                    println!("min-width {name}: min={min} nat={natural}");
+                    let (min, natural, _, _) = widget.measure(axis, -1);
+                    println!("{axis_word} {name}: min={min} nat={natural}");
                 }
                 // ...and where each pane's number comes FROM. A pane's
                 // minimum is a sum of somebody's floor plus a label that
@@ -2160,8 +2173,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // width, so a wrapping label that reports its unwrapped
                 // text as natural is what makes a fresh window 2000px wide.
                 let natural = std::env::var("TASTE_MEASURE_NAT").is_ok();
-                fn walk(widget: &gtk::Widget, depth: usize, floor: i32, natural: bool) {
-                    let (min, nat, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                fn walk(
+                    widget: &gtk::Widget,
+                    depth: usize,
+                    floor: i32,
+                    natural: bool,
+                    axis: gtk::Orientation,
+                ) {
+                    let (min, nat, _, _) = widget.measure(axis, -1);
                     let reported = if natural { nat } else { min };
                     if reported >= floor {
                         let name = widget.widget_name();
@@ -2180,7 +2199,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     if depth < 14 {
                         let mut child = widget.first_child();
                         while let Some(current) = child {
-                            walk(&current, depth + 1, floor, natural);
+                            walk(&current, depth + 1, floor, natural, axis);
                             child = current.next_sibling();
                         }
                     }
@@ -2190,7 +2209,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         continue;
                     }
                     println!("--- {name}");
-                    walk(widget, 0, floor, natural);
+                    walk(widget, 0, floor, natural, axis);
                 }
                 app.quit();
             });

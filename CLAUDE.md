@@ -206,6 +206,8 @@ which is the gesture bugs get reported from), prints each rung's verdict
 with the layout's own minimum and the thresholds in force, and exits
 non-zero on any width where a pane leaves the frame — the gate for the
 responsive ladder. `TASTE_MEASURE_MIN=1` prints each pane's minimum width
+(`TASTE_MEASURE_AXIS=height` its minimum height, which is the audit for
+"AdwToastOverlay exceeds AdwApplicationWindow height")
 and attributes it down the widget tree (`TASTE_MEASURE_FLOOR` moves the
 reporting cutoff; `TASTE_MEASURE_DELAY_MS` moves the moment, since a
 minimum that grows only after a view has posed itself is invisible at the
