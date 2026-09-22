@@ -105,6 +105,31 @@ pub fn attach(
                         }),
                     );
                 }
+                // A stranded start's second half: the environment exists,
+                // so only its chat is opened.
+                OrchestrationRequest::FinishIssue { env, model } => {
+                    if let Some(reopens) = chats.allowance_exhausted() {
+                        let _ = reply
+                            .send(OrchestrationReply::Error(exhausted(&reopens)))
+                            .await;
+                        continue;
+                    }
+                    let reply = reply.clone();
+                    chats.create_orchestrated(
+                        env,
+                        None,
+                        model,
+                        Box::new(move |outcome| {
+                            let answer = match outcome {
+                                Ok(created) => OrchestrationReply::Created(created),
+                                Err(message) => OrchestrationReply::Error(message),
+                            };
+                            glib::spawn_future_local(async move {
+                                let _ = reply.send(answer).await;
+                            });
+                        }),
+                    );
+                }
                 OrchestrationRequest::ChatSend { chat, text } => {
                     if let Some(reopens) = chats.allowance_exhausted() {
                         let _ = reply

@@ -95,7 +95,9 @@ pub(crate) fn tools() -> Vec<Value> {
             "Start an issue: clone the user's checkout into an environment named by the \
              issue's id, open a chat there, and hand it the issue as its first prompt. \
              The container starts first and the prompt waits for it; chat_status says \
-             when it has gone. Needs an issue: issue_create first.",
+             when it has gone. Needs an issue: issue_create first. Safe to call again \
+             for an issue whose environment exists but never got its chat: that \
+             finishes the start.",
             json!({
                 "type": "object",
                 "properties": {
@@ -105,11 +107,12 @@ pub(crate) fn tools() -> Vec<Value> {
                     },
                     "agent": {
                         "type": "string",
-                        "description": "agent registry id (default: the IDE's default agent)"
+                        "enum": taste_core::orchestration::AGENT_IDS,
+                        "description": "one of the IDE's agents; omit to use the user's choice"
                     },
                     "model": {
                         "type": "string",
-                        "description": "an exact model id from the agent's own list (e.g. opus[1m]), not a family name; chat_status reports what actually runs"
+                        "description": "omit to follow the user's choice; otherwise an exact model id the agent advertises, not a family name — chat_status reports what actually runs"
                     }
                 },
                 "required": ["issue"]

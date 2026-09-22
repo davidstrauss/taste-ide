@@ -231,6 +231,9 @@ fn attach_strip(
                         held_prompts: 0,
                     })
                 }
+                OrchestrationRequest::FinishIssue { .. } => {
+                    OrchestrationReply::Error("this strip strands nothing".into())
+                }
                 OrchestrationRequest::ChatTranscript { .. } => {
                     OrchestrationReply::Transcript(TranscriptTail::default())
                 }

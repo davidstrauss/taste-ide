@@ -3078,6 +3078,18 @@ impl McpServer {
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_string);
+        // The agent, checked before anything is made: a clone that was
+        // made and a chat that failed on an unknown agent id is how a
+        // start stranded (David, 2026-09-22).
+        if let Some(agent) = &agent {
+            if !taste_core::orchestration::AGENT_IDS.contains(&agent.as_str()) {
+                anyhow::bail!(
+                    "no agent {agent:?} — this IDE ships {:?}. Omit `agent` to use the \
+                     user's choice. Nothing was created.",
+                    taste_core::orchestration::AGENT_IDS
+                );
+            }
+        }
 
         // 1. The issue, and whether it can be started.
         let wanted = issue_id.clone();
@@ -3103,11 +3115,10 @@ impl McpServer {
         }
         let env = EnvironmentId::parse(&issue.id)
             .with_context(|| format!("{} is not usable as an environment id", issue.id))?;
-        if self.environments.get(&env).is_some() {
-            anyhow::bail!(
-                "{env} already exists as an environment here; chat_send reaches its chat"
-            );
-        }
+        // An environment for an issue nobody started: an earlier start
+        // made the clone and stranded before its chat. This call finishes
+        // it — the chat, the record, the brief — and clones nothing.
+        let finishing = self.environments.get(&env).is_some();
 
         // 2. The two ceilings, in the two units an environment is spent in.
         //
@@ -3146,7 +3157,7 @@ impl McpServer {
         //    the registry's own cadence, and a `du` on a tool call's
         //    request path is what that cadence exists to avoid.
         let disk = self.environments.disk_budget();
-        if disk.spent() {
+        if !finishing && disk.spent() {
             anyhow::bail!(
                 "this workspace's agent environments already hold {} on disk, and the \
                  budget is {} ({}) — so nothing was cloned. Destroy one to get its space \
@@ -3176,7 +3187,7 @@ impl McpServer {
         //    not refuse — `below_floor` is false on `None` — for the same
         //    reason the budget does not refuse on nothing measured.
         let free = self.environments.free_disk();
-        if free.below_floor() {
+        if !finishing && free.below_floor() {
             anyhow::bail!(
                 "the disk these environments are written to has {} free, and {} is the \
                  floor this IDE will not take it below — so nothing was cloned. This is \
@@ -3204,15 +3215,20 @@ impl McpServer {
         }
 
         // 3. The environment and its chat, from the strip.
+        let request = if finishing {
+            OrchestrationRequest::FinishIssue {
+                env: env.clone(),
+                model: model.clone(),
+            }
+        } else {
+            OrchestrationRequest::StartIssue {
+                env: env.clone(),
+                agent: agent.clone(),
+                model: model.clone(),
+            }
+        };
         let reply = self
-            .orchestrate(
-                OrchestrationRequest::StartIssue {
-                    env: env.clone(),
-                    agent: agent.clone(),
-                    model: model.clone(),
-                },
-                ORCHESTRATION_CREATE_TIMEOUT,
-            )
+            .orchestrate(request, ORCHESTRATION_CREATE_TIMEOUT)
             .await?;
         let OrchestrationReply::Created(created) = reply else {
             anyhow::bail!("the chat strip answered issue_start with something else");
@@ -6426,6 +6442,19 @@ mod tests {
                             }),
                             None => OrchestrationReply::Error("no strip in this test".into()),
                         }
+                    }
+                    OrchestrationRequest::FinishIssue { env, model } => {
+                        recorder
+                            .lock()
+                            .unwrap()
+                            .push(format!("finish {env} model={model:?}"));
+                        OrchestrationReply::Created(CreatedChat {
+                            chat: env.clone(),
+                            agent: "claude-code".into(),
+                            model: None,
+                            model_pending: model.clone(),
+                            note: "Its container is NOT running".into(),
+                        })
                     }
                     OrchestrationRequest::ChatSend { chat, text } => {
                         recorder

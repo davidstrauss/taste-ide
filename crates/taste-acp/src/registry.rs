@@ -271,6 +271,23 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
 
 #[cfg(test)]
 mod tests {
+    /// The server's schema lists the agents by id from `taste_core`, since
+    /// it cannot depend on this crate; the two lists are one list.
+    #[test]
+    fn the_shipped_agents_are_the_ones_the_server_lists() {
+        let mut here: Vec<String> = super::builtin_agents()
+            .into_iter()
+            .map(|spec| spec.id)
+            .collect();
+        here.sort_unstable();
+        let mut listed: Vec<String> = taste_core::orchestration::AGENT_IDS
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(here, listed);
+    }
+
     use super::*;
 
     /// A login hint is the same pinned package as the adapter, or a bump

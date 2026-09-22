@@ -82,6 +82,13 @@ pub fn issue_brief(id: &str, title: &str, body: &str) -> String {
 /// absent until David stated them by hand (2026-09-10), and rewording
 /// either one should be a deliberate act with a test to change, not a
 /// silent loss.
+/// The agents this IDE ships, by registry id — the values `issue_start`
+/// accepts for `agent`, spelled out in its schema so a caller cannot
+/// invent one. Mirrors `taste_acp::registry::builtin_agents`, which a test
+/// there holds to this list; it lives here because the MCP server cannot
+/// depend on the ACP crate.
+pub const AGENT_IDS: &[&str] = &["claude-code", "claude-code-private", "copilot", "gemini"];
+
 pub fn coordinator_brief() -> String {
     String::from(
         "YOU ARE THE COORDINATOR: the user's own environment's chat, the one with \
@@ -114,7 +121,12 @@ pub fn coordinator_brief() -> String {
          builds the \
          environment's container and opens an agent in it. There is a cap on how many \
          run at once, so start the top items first, and never start what depends on \
-         unfinished work. Choose the agent and the model per issue: the strongest model \
+         unfinished work. A refusal from issue_start is a fact, not a retry: it names \
+         the next step, and the same call again gets the same answer — except one \
+         case, which it also names: a start that stranded (an environment with no \
+         chat) is finished by calling issue_start once more. You do not invent \
+         agents: `agent` takes only the ids its schema lists, and omitting it takes \
+         the user's choice. Choose the model per issue: the strongest model \
          with the largest context for design-heavy, cross-cutting or unknown-mechanism \
          work; a lighter one for a scoped fix, a document, a rename. The models a session \
          advertises are the values issue_start accepts, and they are exact ids rather \
@@ -203,6 +215,16 @@ pub enum OrchestrationRequest {
         /// request has been answered, since the container starts first.
         /// The answer says so ([`CreatedChat::model_pending`]) and
         /// [`ChatFacts`] carries the verdict.
+        model: Option<String>,
+    },
+    /// Finish a start that stranded: the environment exists — its clone
+    /// was made by an earlier `StartIssue` — but its chat never opened,
+    /// so the issue was never recorded as started and `StartIssue` would
+    /// refuse to clone again. Opens the chat as `StartIssue` would have
+    /// and creates nothing else, so a second `issue_start` completes the
+    /// first instead of looping on a refusal (David, 2026-09-22).
+    FinishIssue {
+        env: EnvironmentId,
         model: Option<String>,
     },
     /// Prompt a chat. Mid-turn sends queue, as they do from the composer.
