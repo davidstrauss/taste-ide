@@ -2452,6 +2452,26 @@ impl EnvironmentRegistry {
                 Err(e) => tracing::warn!("placing the primary did not finish: {e}"),
             }
         }
+
+        // The primary is not in `restored` (it is not a clone). Its first
+        // check waits for its checkout to be placed rather than running
+        // with the window's first frame: a container started before that
+        // would bind the folder on this host, and the one started now binds
+        // the checkout in the VM. It does NOT wait for the fleet below:
+        // moving, restoring, and rechecking every other environment one at
+        // a time is minutes on a restored fleet, and the primary's startup
+        // page sat on "the container comes next" through all of it (David,
+        // 2026-09-22: "This is not enough progress info for such a slow
+        // step"). Nothing the fleet does is anything the primary's check
+        // reads.
+        let primary = self.primary();
+        if let Err(e) = primary.recheck() {
+            tracing::warn!("the primary environment's recheck failed: {e:#}");
+        }
+        if let Err(e) = self.watch_config(&primary) {
+            tracing::warn!("the primary environment's watcher failed: {e:#}");
+        }
+        primary.probe_agent_hosting().await;
         // Environments made before the flip have their checkouts on this
         // host, where nothing runs any more. Each is moved into a VM of the
         // pool with its uncommitted work — the clone becomes its peer, as
@@ -2663,22 +2683,6 @@ impl EnvironmentRegistry {
             // the outside-confined topology until something restarted it.
             supervisor.probe_agent_hosting().await;
         }
-
-        // The primary is not in `restored` (it is not a clone). Its first
-        // check waits for here rather than running with the window's first
-        // frame, because its checkout has just been placed: a container
-        // started before that would bind the folder on this host, and the
-        // one started now binds the checkout in the VM. The window's banner
-        // says NoConfig until then, which is what is true — the primary has
-        // nowhere to run before the VM is up.
-        let primary = self.primary();
-        if let Err(e) = primary.recheck() {
-            tracing::warn!("the primary environment's recheck failed: {e:#}");
-        }
-        if let Err(e) = self.watch_config(&primary) {
-            tracing::warn!("the primary environment's watcher failed: {e:#}");
-        }
-        primary.probe_agent_hosting().await;
 
         // Anything that adopted a container now confirms it is really
         // there, on the substrate that was just resolved. Usually a no-op
