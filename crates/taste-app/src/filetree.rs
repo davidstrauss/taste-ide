@@ -248,7 +248,7 @@ pub struct FileTree {
     /// **read, never edit**, by explicit action only: no chat-tab switch and
     /// no event ever moves it, and it is not persisted — a fresh IDE opens
     /// on the user's checkout.
-    watching: RefCell<Option<(taste_core::environment::EnvironmentId, PathBuf)>>,
+    watching: RefCell<Option<Aim>>,
     /// The environment panel, pinned to the bottom of this pane: the one
     /// indicator of where the panes are aimed, and the way to aim them
     /// somewhere else — one row per environment, always visible (see
@@ -281,6 +281,10 @@ pub struct FileTree {
     /// widen this pane (see the construction site).
     branch_child: gtk::Label,
     init_button: gtk::Button,
+    /// The push and pull buttons' faces — their counts — behind the
+    /// spinner pages (`sync_button_with_label`).
+    push_face: gtk::Label,
+    pull_face: gtk::Label,
     branch_popover: gtk::Popover,
     sync_label: gtk::Label,
     sync_button: gtk::Button,
@@ -517,6 +521,18 @@ pub(crate) const REFRESH_COALESCE: std::time::Duration = std::time::Duration::fr
 /// Shared with the editor, which paints the same status onto its tabs off
 /// the same events: two panes coalescing the same burst differently is how
 /// one of them ends up running a `git status` per changed path.
+/// Where the panes are aimed when it is not home: one environment, its
+/// checkout wherever it is, the files service that reads it, and the
+/// repository on this host holding its refs (its peer, or the clone
+/// itself while a checkout is local).
+#[derive(Clone, PartialEq)]
+pub struct Aim {
+    pub env: taste_core::environment::EnvironmentId,
+    pub checkout: taste_core::environment::Checkout,
+    pub files: taste_core::files::Files,
+    pub peer: PathBuf,
+}
+
 #[derive(Default)]
 pub(crate) struct RefreshGate {
     armed: std::cell::Cell<bool>,
@@ -670,23 +686,66 @@ pub(crate) fn relative_age(unix_seconds: i64) -> String {
     }
 }
 
-/// Swap a button's content for a running spinner until the operation ends
-/// (set_label replaces the child).
+/// A sync-row button whose content is a stack of its face and a spinner,
+/// homogeneous both ways, so the two pages are one size and swapping them
+/// moves nothing (David, 2026-09-21: "The spinner should simply swap in
+/// for the button content"). The earlier scheme replaced the child and
+/// froze the button's size request, which held the button but let the
+/// row settle around it.
+fn sync_button_stack(face: &impl IsA<gtk::Widget>) -> gtk::Stack {
+    let stack = gtk::Stack::builder()
+        .hhomogeneous(true)
+        .vhomogeneous(true)
+        .transition_type(gtk::StackTransitionType::None)
+        .build();
+    stack.add_named(face, Some("face"));
+    let spinner = gtk::Spinner::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    stack.add_named(&spinner, Some("busy"));
+    stack.set_visible_child_name("face");
+    stack
+}
+
+fn sync_button_with_label(text: &str, tooltip: &str) -> (gtk::Button, gtk::Label) {
+    let face = gtk::Label::new(Some(text));
+    let button = gtk::Button::builder()
+        .child(&sync_button_stack(&face))
+        .tooltip_text(tooltip)
+        .css_classes(["flat"])
+        .build();
+    (button, face)
+}
+
+fn sync_button_with_icon(icon: &str, tooltip: &str) -> gtk::Button {
+    let face = gtk::Image::from_icon_name(icon);
+    gtk::Button::builder()
+        .child(&sync_button_stack(&face))
+        .tooltip_text(tooltip)
+        .css_classes(["flat"])
+        .build()
+}
+
+/// Show a button's spinner page until the operation ends.
 fn button_busy(button: &gtk::Button) {
-    // Freeze the geometry it HAS first, both axes. The spinner is a
-    // different shape from the `↑ 9` it replaces, and a button that
-    // changes size takes the whole sync row with it — the counts beside
-    // it slide, and on the taller of the two states so does everything
-    // below (David, 2026-09-08: "clicking 'push' and seeing the spinner
-    // shouldn't shift things around"). Width alone was frozen here, which
-    // left the vertical half of exactly that. The requests are minimums,
-    // so they hold the button where it was and are given back by the
-    // refresh that repaints the counts (`set_size_request(-1, -1)`).
-    button.set_size_request(button.width(), button.height());
-    let spinner = gtk::Spinner::new();
-    spinner.start();
-    button.set_child(Some(&spinner));
+    if let Some(stack) = button.child().and_downcast::<gtk::Stack>() {
+        if let Some(spinner) = stack.child_by_name("busy").and_downcast::<gtk::Spinner>() {
+            spinner.start();
+        }
+        stack.set_visible_child_name("busy");
+    }
     button.set_sensitive(false);
+}
+
+/// Show a button's face again.
+fn button_idle(button: &gtk::Button) {
+    if let Some(stack) = button.child().and_downcast::<gtk::Stack>() {
+        stack.set_visible_child_name("face");
+        if let Some(spinner) = stack.child_by_name("busy").and_downcast::<gtk::Spinner>() {
+            spinner.stop();
+        }
+    }
 }
 
 impl FileTree {
@@ -743,18 +802,16 @@ impl FileTree {
             .direction(gtk::ArrowType::Down)
             .child(&branch_face)
             .build();
-        let push_button = gtk::Button::builder()
-            .label("↑ 0")
-            .tooltip_text("Push commits to the remote")
-            .css_classes(["flat"])
-            .sensitive(false)
-            .build();
-        let pull_button = gtk::Button::builder()
-            .label("↓ 0")
-            .tooltip_text("Pull: fetch, then rebase onto the remote tip")
-            .css_classes(["flat"])
-            .sensitive(false)
-            .build();
+        // Each sync button's content is a two-page stack, its face and a
+        // spinner, sized to the larger of the two: a running operation
+        // swaps the page and nothing around it moves (David, 2026-09-21:
+        // "When I press to push or pull and it turns into a spinner, no
+        // positions of anything should change").
+        let (push_button, push_face) = sync_button_with_label("↑ 0", "Push commits to the remote");
+        push_button.set_sensitive(false);
+        let (pull_button, pull_face) =
+            sync_button_with_label("↓ 0", "Pull: fetch, then rebase onto the remote tip");
+        pull_button.set_sensitive(false);
         let ignored_toggle = gtk::ToggleButton::builder()
             .icon_name("view-conceal-symbolic")
             .tooltip_text("Show ignored files")
@@ -867,11 +924,10 @@ impl FileTree {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build()
             .full_text_on_hover();
-        let sync_button = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Fetch the remote (refreshes the counts)")
-            .css_classes(["flat"])
-            .build();
+        let sync_button = sync_button_with_icon(
+            "view-refresh-symbolic",
+            "Fetch the remote (refreshes the counts)",
+        );
         let abort_button = gtk::Button::builder()
             .label("Abort Rebase")
             .tooltip_text("Give up: put everything back the way it was before the sync")
@@ -1122,6 +1178,8 @@ impl FileTree {
             branch_label,
             branch_child,
             init_button: init_button.clone(),
+            push_face,
+            pull_face,
             branch_popover: branch_popover.clone(),
             sync_label,
             sync_button: sync_button.clone(),
@@ -1435,7 +1493,7 @@ impl FileTree {
     /// once the registry has placed it there.
     fn view_root(&self) -> PathBuf {
         match self.watching.borrow().as_ref() {
-            Some((_, root)) => root.clone(),
+            Some(aim) => aim.checkout.path().to_path_buf(),
             None => self.workspace.checkout_path(),
         }
     }
@@ -1446,7 +1504,7 @@ impl FileTree {
     /// opened, which is the primary's peer once its checkout has moved.
     fn refs_root(&self) -> PathBuf {
         match self.watching.borrow().as_ref() {
-            Some((_, root)) => root.clone(),
+            Some(aim) => aim.peer.clone(),
             None => self.workspace.root().to_path_buf(),
         }
     }
@@ -1457,7 +1515,11 @@ impl FileTree {
     /// after every ref it moves.
     fn worktree(&self) -> Worktree {
         match self.watching.borrow().as_ref() {
-            Some((_, root)) => Worktree::Local(root.clone()),
+            // The watched environment's checkout wherever it is, read
+            // through its own files service — the VM's keeper, when it is
+            // in one (David, 2026-09-21: "But they should be browsable
+            // now?"). Read-only here, so no ref hook.
+            Some(aim) => Worktree::for_checkout(&aim.checkout, aim.files.clone()),
             None => {
                 let tree =
                     Worktree::for_checkout(&self.workspace.checkout(), self.workspace.files());
@@ -1473,13 +1535,21 @@ impl FileTree {
     /// repository's workdir on this host — the folder may sit inside a
     /// larger repository — and the checkout's own root in the VM.
     fn worktree_root(&self) -> Option<PathBuf> {
-        if self.watching.borrow().is_some() || self.workspace.checkout().is_local() {
+        let watched = self.watching.borrow();
+        let local = match watched.as_ref() {
+            Some(aim) => aim.checkout.is_local(),
+            None => self.workspace.checkout().is_local(),
+        };
+        if local {
             self.git
                 .borrow()
                 .as_ref()
                 .map(|g| g.workdir().to_path_buf())
         } else {
-            Some(self.workspace.checkout_path())
+            Some(match watched.as_ref() {
+                Some(aim) => aim.checkout.path().to_path_buf(),
+                None => self.workspace.checkout_path(),
+            })
         }
     }
 
@@ -1541,10 +1611,7 @@ impl FileTree {
     /// reset on arrival would be the opposite of what watching is for. The
     /// search, the selections and any open panel do go — they were about
     /// the other checkout.
-    pub fn aim_at(
-        self: &Rc<Self>,
-        target: Option<(taste_core::environment::EnvironmentId, PathBuf)>,
-    ) {
+    pub fn aim_at(self: &Rc<Self>, target: Option<Aim>) {
         if *self.watching.borrow() == target {
             return;
         }
@@ -1635,7 +1702,7 @@ impl FileTree {
 
     /// Which environment the panes are aimed at (`None` = the primary).
     pub fn watching(&self) -> Option<taste_core::environment::EnvironmentId> {
-        self.watching.borrow().as_ref().map(|(env, _)| env.clone())
+        self.watching.borrow().as_ref().map(|aim| aim.env.clone())
     }
 
     /// Aim the git views at one environment's branch of record: its
@@ -1944,7 +2011,7 @@ impl FileTree {
 
     /// The refusal a read-only view gives, naming the environment.
     fn refuse_read_only(&self) -> bool {
-        let Some((env, _)) = self.watching.borrow().clone() else {
+        let Some(Aim { env, .. }) = self.watching.borrow().clone() else {
             return false;
         };
         self.workspace.events.publish(Event::Toast(format!(
@@ -3708,8 +3775,9 @@ impl FileTree {
                 // applying it would paint the pre-operation counts over
                 // the spinner, then correct them a moment later.
                 if !self.sync_busy.get() {
-                    self.sync_button.set_icon_name("view-refresh-symbolic");
-                    self.sync_button.set_size_request(-1, -1);
+                    for button in [&self.sync_button, &self.push_button, &self.pull_button] {
+                        button_idle(button);
+                    }
                     self.sync_button.set_sensitive(!snapshot.rebasing);
                     if snapshot.rebasing {
                         self.set_sync_label("rebase paused — resolve, mark, Continue");
@@ -3720,16 +3788,14 @@ impl FileTree {
                                     // The upstream name lives in the button
                                     // tooltips; the label is for exceptions.
                                     self.set_sync_label("");
-                                    self.push_button.set_size_request(-1, -1);
-                                    self.push_button.set_label(&format!("↑ {}", sync.ahead));
+                                    self.push_face.set_label(&format!("↑ {}", sync.ahead));
                                     self.push_button.set_sensitive(sync.ahead > 0);
                                     self.push_button.set_tooltip_text(Some(&format!(
                                         "Push {} commit{} to {upstream}",
                                         sync.ahead,
                                         if sync.ahead == 1 { "" } else { "s" }
                                     )));
-                                    self.pull_button.set_size_request(-1, -1);
-                                    self.pull_button.set_label(&format!("↓ {}", sync.behind));
+                                    self.pull_face.set_label(&format!("↓ {}", sync.behind));
                                     self.pull_button.set_sensitive(sync.behind > 0);
                                     let held = self
                                         .fetch_hold
@@ -5795,7 +5861,7 @@ impl FileTree {
         //
         // Watching wins where both apply: "this is calm-1's file" is the
         // more useful answer than "the devcontainer is down".
-        let watched = self.watching.borrow().as_ref().map(|(env, _)| env.clone());
+        let watched = self.watching.borrow().as_ref().map(|aim| aim.env.clone());
         let safe_mode = !self.workspace.exec.is_container();
         let lock_reason = match watched {
             Some(env) => Some(format!(
@@ -6147,7 +6213,12 @@ impl FileTree {
             return;
         };
         let root = self.workspace.root().to_path_buf();
-        self.aim_at(Some((env, root)));
+        self.aim_at(Some(Aim {
+            env,
+            checkout: taste_core::environment::Checkout::Local(root.clone()),
+            files: taste_core::files::Files::Local,
+            peer: root,
+        }));
     }
 
     pub fn on_git_status_changed(self: &Rc<Self>) {

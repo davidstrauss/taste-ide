@@ -382,31 +382,24 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let chats = chats.clone();
         let environments = environments.clone();
         let watch_slot = watch_slot.clone();
-        let events = workspace.events.clone();
         std::rc::Rc::new(move |env: Option<taste_core::environment::EnvironmentId>| {
             let env = env.unwrap_or_else(taste_core::environment::EnvironmentId::primary);
             let target = if env.is_primary() {
                 None
             } else {
                 match environments.get(&env) {
-                    // Watching aims the file tree, the editor, and a
-                    // watcher at the checkout — all of which open files on
-                    // this host. A checkout in a VM cannot be browsed from
-                    // here until the files service lands, so the panes stay
-                    // where they are and the refusal says where the files
-                    // went, rather than showing an empty tree as if the
-                    // environment had none.
-                    Some(supervisor) => match supervisor.checkout().local_path() {
-                        Some(root) => Some((env.clone(), root.to_path_buf())),
-                        None => {
-                            events.publish(Event::Toast(format!(
-                                "{env}'s files are in VM {}; browsing them from here is \
-                                 not possible yet",
-                                supervisor.checkout().vm().unwrap_or("?")
-                            )));
-                            return;
-                        }
-                    },
+                    // Watching aims the file tree and the editor at the
+                    // checkout wherever it is — a VM's, through that
+                    // environment's own files service — and the refs views
+                    // at its peer on this host. A checkout on this host
+                    // also gets a watcher; one in a VM is re-read on the
+                    // tree's own cadence.
+                    Some(supervisor) => Some(crate::filetree::Aim {
+                        env: env.clone(),
+                        checkout: supervisor.checkout(),
+                        files: supervisor.files(),
+                        peer: supervisor.peer().to_path_buf(),
+                    }),
                     // An environment with no supervisor is one that does not
                     // exist. Refuse rather than quietly aiming at the
                     // primary: there is no fallback environment anywhere in
@@ -424,9 +417,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // refresh git state, exactly as the user's own do — and going
             // back drops the watcher rather than accumulating one per
             // environment ever opened.
-            watch_slot
-                .borrow_mut()
-                .aim(target.as_ref().map(|(_, root)| root.clone()));
+            watch_slot.borrow_mut().aim(
+                target
+                    .as_ref()
+                    .and_then(|aim| aim.checkout.local_path().map(std::path::Path::to_path_buf)),
+            );
             filetree.aim_at(target);
             // Each environment owns its editor tabs: switching stows the
             // ones on screen and brings back the ones this environment had,
