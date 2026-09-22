@@ -332,12 +332,28 @@ impl StartupPage {
         logs.add_named(&build_log.widget, Some("build"));
         logs.set_visible_child_name("vm");
 
+        // The log gives way first: it fills whatever the checklist leaves
+        // and shrinks with the pane down to five lines, and below that the
+        // page scrolls as one — checklist, note, and log — rather than
+        // running off the bottom of the pane, clipped (David, 2026-09-22:
+        // "If you can't even show 5 lines, then the env rebuild panel
+        // should be scrollable").
+        vm_log.set_min_lines(5);
+        build_log.set_min_lines(5);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&clamp);
         content.append(&logs);
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            // The page's natural height is still its content's, so the
+            // editor's split is set as it was; only its minimum is the
+            // scroller's.
+            .propagate_natural_height(true)
+            .child(&content)
+            .build();
         let overlay = gtk::Overlay::builder().child(&area).build();
-        overlay.add_overlay(&content);
-        overlay.set_measure_overlay(&content, true);
+        overlay.add_overlay(&scroller);
 
         let this = Rc::new(Self {
             widget: overlay.upcast(),

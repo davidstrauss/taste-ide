@@ -453,6 +453,22 @@ impl LogPage {
         self.view.scroll_to_iter(&mut start, 0.2, false, 0.0, 0.0);
     }
 
+    /// Never shorter than `lines` of text, measured in the view's own
+    /// font once it has one — the floor a page that holds this log beside
+    /// other things shrinks it to before it scrolls itself instead.
+    pub fn set_min_lines(&self, lines: u32) {
+        let apply = {
+            let scroller = self.scroller.clone();
+            move |view: &gtk::TextView| {
+                let text = vec!["X"; lines.max(1) as usize].join("\n");
+                let (_, height) = view.create_pango_layout(Some(&text)).pixel_size();
+                scroller.set_min_content_height(height + view.top_margin() + view.bottom_margin());
+            }
+        };
+        apply(&self.view);
+        self.view.connect_realize(move |view| apply(view));
+    }
+
     pub fn is_following(&self) -> bool {
         self.follow.get()
     }
