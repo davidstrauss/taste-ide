@@ -3426,7 +3426,14 @@ current step is writing beneath it: the Virtual Machine log until the
 container's build begins, the Environment Build log from there
 (`crates/taste-app/src/startup.rs`). Each step is worded as a state to
 be in — "Have the guest image on this machine" — so a step a start did
-not need is simply checked, since it was already true. The page says why
+not need is simply checked, since it was already true. Only the active
+step carries a detail, and it is that step's current substep, never a
+description: "Step 2 of 9: RUN dnf install", the IDE's own line from the
+VM's story, or a measure where there is one — the guest image's MiB of
+MiB, git's percentage, objects, and bytes as the checkout's seed crosses
+(`Event::VmProgress`, paced to once a second, in tabular figures, and
+kept out of the log). A checked or pending step is its title alone. The
+page says why
 when the safe-mode environment is what is coming up — the project's
 devcontainer is missing, or it failed, with the failure — and offers
 Prompt Agent for the repair. The safe-mode environment itself failing is
