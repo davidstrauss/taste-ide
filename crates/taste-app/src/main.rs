@@ -53,6 +53,8 @@ mod runtime;
 mod search;
 mod semantic;
 mod sparkline;
+mod startup;
+mod stripes;
 mod tabfamily;
 mod textline;
 mod ui_probe;
@@ -330,6 +332,20 @@ fn main() -> glib::ExitCode {
                  /* The markdown preview's map draws its own slider in its \
                     `color`, at the source map's alpha (preview_map.rs). */\n\
                  .preview-map { color: @accent_bg_color; }\n\
+                 /* The environment's startup page (startup.rs): a card for \
+                    the checklist over the construction stripes, the log in \
+                    a card of its own below; the strip's other tabs dimmed \
+                    while it holds the selection. */\n\
+                 .startup-card { background-color: @card_bg_color; \
+                   border-radius: 12px; padding: 18px 24px; \
+                   box-shadow: 0 1px 3px alpha(black, 0.25); }\n\
+                 .startup-log { background-color: @view_bg_color; \
+                   border-radius: 12px; }\n\
+                 .startup-step-done { color: @success_color; }\n\
+                 .startup-step-failed { color: @error_color; }\n\
+                 .startup-step-skipped { opacity: 0.55; }\n\
+                 .startup-step-pending { opacity: 0.7; }\n\
+                 tabbar.startup-locked tab:not(:selected) { opacity: 0.45; }\n\
                  .composer-action, .composer-action > button, \
                  button.composer-action, button.composer-action.circular { \
                    min-width: 26px; min-height: 26px; padding: 2px; \

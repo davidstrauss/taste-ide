@@ -3418,6 +3418,23 @@ with what may act on the primary at each step (audited 2026-09-21; the
 code is `window.rs` → `EnvironmentRegistry::reconcile`, and the
 supervisor's `reload_locked_with`).
 
+**How it is shown** (2026-09-22): the startup takes the editor's strip
+over for as long as it runs — a pinned tab, first and held current, the
+other tabs dimmed in place — as a checklist of these steps over the
+construction stripes, slowed to a crawl at that size, with the log the
+current step is writing beneath it: the Virtual Machine log until the
+container's build begins, the Environment Build log from there
+(`crates/taste-app/src/startup.rs`). Steps a start did not need read
+"not needed this time" rather than staying pending. The page says why
+when the safe-mode environment is what is coming up — the project's
+devcontainer is missing, or it failed, with the failure — and offers
+Prompt Agent for the repair. The safe-mode environment itself failing is
+said apart: that is the machine's setup, the VM provider, or a bug in the
+IDE, and no agent is offered, since there is none to hand it to. The
+banner above the strip says nothing during a start; its faces are the
+settled states — safe mode's Rebuild, a failed build's repair, git's
+questions.
+
 1. **The window.** `EnvironmentRegistry::new` builds the registry with
    `Substrate::unresolved()` — nothing runs against it; its target is a
    podman connection that does not exist — and the primary's supervisor

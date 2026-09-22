@@ -179,6 +179,10 @@ struct SurfaceEntry {
 
 enum SurfaceKind {
     Log(Rc<crate::logview::LogPage>, crate::logview::LogKind),
+    /// The environment's startup (startup.rs): pinned first and held
+    /// current while a start runs, since nothing else in the strip can be
+    /// acted on before at least the safe-mode container is up.
+    Startup(Rc<crate::startup::StartupPage>),
     Port(Rc<crate::portview::PortPage>),
     /// Something a chat step showed in brief, whole: a prompt, a response,
     /// a command with its output, an edit (chatdoc.rs) — and the step's
@@ -206,6 +210,10 @@ pub enum Focused {
     Doc(taste_core::environment::EnvironmentId, String),
     Other,
 }
+
+/// The startup page's tab glyph and its key among the surfaces.
+const STARTUP_ICON: &str = "emblem-synchronizing-symbolic";
+const STARTUP_KEY: &str = "startup:primary";
 
 /// `log:<env>/<kind>` — one tab per environment per log; the IDE's own log
 /// is one for the window and keys under `log:ide`.
@@ -470,6 +478,9 @@ pub struct Editor {
     pages: RefCell<HashMap<PathBuf, Rc<EditorPage>>>,
     /// The tabs that are not files: logs and ports (see [`SurfaceEntry`]).
     surfaces: RefCell<HashMap<PathBuf, Rc<SurfaceEntry>>>,
+    /// The startup page's tab while a start is on screen: the one the
+    /// selection is held to (`show_startup`).
+    startup_tab: RefCell<Option<adw::TabPage>>,
     /// Files the agent holds that the user has not opened.
     headless: RefCell<HashMap<PathBuf, HeadlessBuffer>>,
     /// Guards toggle updates driven by page switches from re-triggering.
@@ -649,6 +660,7 @@ impl Editor {
             mode_popover: mode_popover.clone(),
             pages: RefCell::new(HashMap::new()),
             surfaces: RefCell::new(HashMap::new()),
+            startup_tab: RefCell::new(None),
             headless: RefCell::new(HashMap::new()),
             git_dirty: RefCell::new(HashMap::new()),
             git_refresh: crate::filetree::RefreshGate::default(),
@@ -695,8 +707,18 @@ impl Editor {
         // Keep the toggles reflecting the selected page; every selection
         // is a visit for back/forward.
         let weak = Rc::downgrade(&editor);
-        editor.tabs.connect_selected_page_notify(move |_| {
+        editor.tabs.connect_selected_page_notify(move |tabs| {
             let Some(editor) = weak.upgrade() else { return };
+            // While a start is on screen it is the current tab, whatever
+            // was clicked: the other tabs stay, dimmed, and take the
+            // selection back when the start is over.
+            let held = editor.startup_tab.borrow().clone();
+            if let Some(held) = held {
+                if tabs.selected_page().is_some_and(|page| page != held) {
+                    tabs.set_selected_page(&held);
+                    return;
+                }
+            }
             editor.sync_toggle_to_selection();
             if let Some((path, _)) = editor.selected() {
                 editor.record_visit(path);
@@ -1509,6 +1531,7 @@ impl Editor {
                 ),
                 SurfaceKind::Port(_) => (0, crate::portview::PORT_ICON),
                 SurfaceKind::Doc(page, _) => (0, page.icon),
+                SurfaceKind::Startup(_) => (0, STARTUP_ICON),
             };
             if count > 0 {
                 surface
@@ -1729,6 +1752,7 @@ impl Editor {
                         SurfaceKind::Log(_, kind) => Focused::Log(surface.env.clone(), *kind),
                         SurfaceKind::Port(page) => Focused::Port(surface.env.clone(), page.port),
                         SurfaceKind::Doc(_, key) => Focused::Doc(surface.env.clone(), key.clone()),
+                        SurfaceKind::Startup(_) => Focused::Other,
                     }
                 } else {
                     Focused::Other
@@ -1755,6 +1779,15 @@ impl Editor {
             self.mode_menu.set_icon_name(match &surface.kind {
                 SurfaceKind::Log(page, _) => {
                     if page.is_following() {
+                        "go-bottom-symbolic"
+                    } else {
+                        crate::logview::LOG_ICON
+                    }
+                }
+                // The startup page's toggle is its log's: the one on
+                // screen under the checklist.
+                SurfaceKind::Startup(page) => {
+                    if page.current_log().is_following() {
                         "go-bottom-symbolic"
                     } else {
                         crate::logview::LOG_ICON
@@ -1897,6 +1930,16 @@ impl Editor {
                     Box::new(move || page.set_follow(!following)),
                 ));
             }
+            SurfaceKind::Startup(startup) => {
+                let log = startup.current_log();
+                let following = log.is_following();
+                rows.push((
+                    "Follow".to_string(),
+                    "go-bottom-symbolic",
+                    following,
+                    Box::new(move || log.set_follow(!following)),
+                ));
+            }
             SurfaceKind::Doc(..) => {}
         }
         for (label, icon, current, act) in rows {
@@ -1939,6 +1982,60 @@ impl Editor {
     /// Open (or focus) a log as a tab: read-only, at its end, following.
     /// `seed` is what the log holds now; new lines arrive through
     /// [`Editor::append_log`].
+    /// Put the environment's startup in front: a pinned tab, first in the
+    /// strip and held current until `hide_startup`, the other tabs dimmed
+    /// but in place (David, 2026-09-22: "Take over the main code
+    /// view/editing panel/region, disabling but not hiding the tab bar").
+    pub fn show_startup(self: &Rc<Self>, page: Rc<crate::startup::StartupPage>) {
+        if let Some(tab) = self.startup_tab.borrow().clone() {
+            self.tabs.set_selected_page(&tab);
+            return;
+        }
+        let tab = self.tabs.append(&page.widget);
+        tab.set_title("Environment");
+        tab.set_icon(Some(&gtk::gio::ThemedIcon::new(STARTUP_ICON)));
+        tab.set_tooltip("The environment's startup: what is done and what is still to do");
+        self.tabs.set_page_pinned(&tab, true);
+        self.tabs.reorder_first(&tab);
+        {
+            let (vm_log, build_log) = page.logs();
+            for log in [vm_log, build_log] {
+                let weak = Rc::downgrade(self);
+                log.set_on_follow_changed(move |_| {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.sync_toggle_to_selection();
+                    }
+                });
+            }
+        }
+        self.surfaces.borrow_mut().insert(
+            PathBuf::from(STARTUP_KEY),
+            Rc::new(SurfaceEntry {
+                tab: tab.clone(),
+                env: taste_core::environment::EnvironmentId::primary(),
+                kind: SurfaceKind::Startup(page),
+            }),
+        );
+        *self.startup_tab.borrow_mut() = Some(tab.clone());
+        self.tab_bar.add_css_class("startup-locked");
+        self.tabs.set_selected_page(&tab);
+        self.sync_toggle_to_selection();
+    }
+
+    /// The start is over: the tab goes and the strip is the user's again.
+    pub fn hide_startup(self: &Rc<Self>) {
+        let Some(tab) = self.startup_tab.borrow_mut().take() else {
+            return;
+        };
+        self.tab_bar.remove_css_class("startup-locked");
+        self.surfaces
+            .borrow_mut()
+            .remove(&PathBuf::from(STARTUP_KEY));
+        self.tabs.set_page_pinned(&tab, false);
+        self.tabs.close_page(&tab);
+        self.sync_toggle_to_selection();
+    }
+
     pub fn open_log(
         self: &Rc<Self>,
         env: &taste_core::environment::EnvironmentId,

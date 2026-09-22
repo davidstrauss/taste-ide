@@ -1,0 +1,723 @@
+//! The environment's startup, as a page: the ordered checklist of what
+//! has to happen before the environment can be used, the log those steps
+//! are writing, and the reason when the safe-mode environment is what is
+//! coming up instead of the project's own.
+//!
+//! It takes the editor's strip over while it exists — a pinned tab, the
+//! current one, ahead of every file — because almost nothing can be done
+//! before at least a safe-mode container is up, and a banner's one line
+//! over a strip of files the user cannot act on told them less than the
+//! whole story would (David, 2026-09-22: "Take over the main code
+//! view/editing panel/region ... an ordered checklist of what's done and
+//! needs to be done before the env is available for use"). Under it, the
+//! construction stripes the banner's bar wore, slowed right down: a
+//! pattern this large moving at a walk would be the only thing in the
+//! window anyone could look at.
+//!
+//! Two kinds of fallback are told apart, because they mean different
+//! things for the person reading (David, same day). A project whose
+//! devcontainer is missing or broken gets the safe-mode environment and
+//! a button that hands the agent the repair: that is the case this page
+//! exists to make ordinary. The safe-mode environment itself failing is
+//! the machine's setup, the VM provider, or a bug in the IDE — said so,
+//! with no agent to prompt, since there is none.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use adw::prelude::*;
+use gtk::glib;
+use taste_core::event::DevcontainerStateEvent;
+
+use crate::logview::{LogKind, LogPage};
+
+/// How fast the stripes slide, in pixels per second: a page-sized pattern
+/// wants to be seen moving only by someone who watches for it.
+const STRIPE_SPEED: f64 = 2.0;
+
+/// How long "Environment ready" stays on the page before it goes.
+pub const READY_LINGER: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// The steps, in the order they happen. Not every start takes every step:
+/// the ones a start did not need are marked so rather than left pending,
+/// and a step that never announces itself is skipped when a later one
+/// begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Step {
+    /// Other projects' VMs that no window owns, stopped for the room.
+    Sweep,
+    /// The guest image fetched, unpacked, and verified — once per machine.
+    GuestImage,
+    /// The workspace's VM booted and answering.
+    Vm,
+    /// The files service's image built in the VM — once per VM.
+    ServiceImage,
+    /// The files service connected.
+    Files,
+    /// The checkout placed in the VM and synced with the folder.
+    Place,
+    /// The environment's image built.
+    Build,
+    /// The container started and its setup commands run.
+    Start,
+    /// The environment is up.
+    Ready,
+}
+
+impl Step {
+    pub const ALL: [Step; 9] = [
+        Step::Sweep,
+        Step::GuestImage,
+        Step::Vm,
+        Step::ServiceImage,
+        Step::Files,
+        Step::Place,
+        Step::Build,
+        Step::Start,
+        Step::Ready,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Step::Sweep => "Stop other projects' VMs that no window owns",
+            Step::GuestImage => "Fetch the guest image (once per machine)",
+            Step::Vm => "Bring up the workspace's VM",
+            Step::ServiceImage => "Build the files service image (once per VM)",
+            Step::Files => "Connect the files service",
+            Step::Place => "Place the checkout in the VM",
+            Step::Build => "Build the environment's image",
+            Step::Start => "Start the container and run its setup commands",
+            Step::Ready => "Environment ready",
+        }
+    }
+
+    /// Which log tells this step's story.
+    fn log(self) -> LogKind {
+        match self {
+            Step::Build | Step::Start | Step::Ready => LogKind::Environment,
+            _ => LogKind::Vm,
+        }
+    }
+
+    /// The step a `Preparing` state's words name.
+    fn for_preparing(what: &str) -> Step {
+        let what = what.to_lowercase();
+        if what.contains("no window owns") {
+            Step::Sweep
+        } else if what.contains("guest image") {
+            Step::GuestImage
+        } else if what.contains("service image") {
+            Step::ServiceImage
+        } else if what.contains("files service") {
+            Step::Files
+        } else if what.contains("checkout") {
+            Step::Place
+        } else {
+            Step::Vm
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Pending,
+    Active,
+    Done,
+    Skipped,
+    Failed,
+}
+
+struct StepRow {
+    row: gtk::Box,
+    icon: gtk::Image,
+    spinner: gtk::Spinner,
+    title: gtk::Label,
+    detail: gtk::Label,
+    status: Cell<Status>,
+}
+
+impl StepRow {
+    fn new(step: Step) -> Self {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let mark = gtk::Stack::builder()
+            .hhomogeneous(true)
+            .vhomogeneous(true)
+            .valign(gtk::Align::Start)
+            .build();
+        let icon = gtk::Image::builder()
+            .icon_name("radio-symbolic")
+            .pixel_size(16)
+            .build();
+        let spinner = gtk::Spinner::new();
+        mark.add_named(&icon, Some("icon"));
+        mark.add_named(&spinner, Some("spinner"));
+        mark.set_visible_child_name("icon");
+        let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let title = gtk::Label::builder()
+            .label(step.title())
+            .xalign(0.0)
+            .wrap(true)
+            .hexpand(true)
+            .build();
+        let detail = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["caption", "dim-label"])
+            .visible(false)
+            .build();
+        words.append(&title);
+        words.append(&detail);
+        row.append(&mark);
+        row.append(&words);
+        let this = Self {
+            row,
+            icon,
+            spinner,
+            title,
+            detail,
+            status: Cell::new(Status::Pending),
+        };
+        this.set(Status::Pending, None);
+        this
+    }
+
+    fn set(&self, status: Status, detail: Option<&str>) {
+        self.status.set(status);
+        let mark = self.icon.parent().and_downcast::<gtk::Stack>();
+        for class in [
+            "startup-step-pending",
+            "startup-step-active",
+            "startup-step-done",
+            "startup-step-skipped",
+            "startup-step-failed",
+        ] {
+            self.row.remove_css_class(class);
+        }
+        let (icon, class) = match status {
+            Status::Pending => ("radio-symbolic", "startup-step-pending"),
+            Status::Active => ("radio-symbolic", "startup-step-active"),
+            Status::Done => ("object-select-symbolic", "startup-step-done"),
+            Status::Skipped => ("radio-mixed-symbolic", "startup-step-skipped"),
+            Status::Failed => ("dialog-error-symbolic", "startup-step-failed"),
+        };
+        self.row.add_css_class(class);
+        self.icon.set_icon_name(Some(icon));
+        if let Some(mark) = mark {
+            if status == Status::Active {
+                self.spinner.start();
+                mark.set_visible_child_name("spinner");
+            } else {
+                self.spinner.stop();
+                mark.set_visible_child_name("icon");
+            }
+        }
+        match (status, detail) {
+            (Status::Skipped, None) => {
+                self.detail.set_label("not needed this time");
+                self.detail.set_visible(true);
+            }
+            (_, Some(text)) if !text.is_empty() => {
+                self.detail.set_label(text);
+                self.detail.set_visible(true);
+            }
+            (Status::Active | Status::Done, None) => {
+                // Keep whatever the step said while it ran.
+            }
+            _ => self.detail.set_visible(false),
+        }
+        if status == Status::Active {
+            self.title.add_css_class("heading");
+        } else {
+            self.title.remove_css_class("heading");
+        }
+    }
+}
+
+pub struct StartupPage {
+    pub widget: gtk::Widget,
+    heading: gtk::Label,
+    note: gtk::Label,
+    prompt: gtk::Button,
+    rows: Vec<StepRow>,
+    logs: gtk::Stack,
+    vm_log: Rc<LogPage>,
+    build_log: Rc<LogPage>,
+    current: Cell<Option<Step>>,
+    /// Whether a start is under way: set by the first transitional state,
+    /// cleared when the page is reset for the next start.
+    underway: Cell<bool>,
+    /// The start reached Running and is lingering on "ready"; a new
+    /// transitional state clears it (`begin`).
+    settled: Cell<bool>,
+    area: gtk::DrawingArea,
+    offset: Cell<f64>,
+    tick: RefCell<Option<gtk::TickCallbackId>>,
+    on_prompt: RefCell<Option<Rc<dyn Fn()>>>,
+}
+
+impl StartupPage {
+    pub fn new() -> Rc<Self> {
+        let area = gtk::DrawingArea::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .can_target(false)
+            .build();
+
+        let heading = gtk::Label::builder()
+            .label("Environment starting")
+            .css_classes(["title-2"])
+            .xalign(0.0)
+            .build();
+        let note = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .visible(false)
+            .build();
+        let prompt = gtk::Button::builder()
+            .label("Prompt Agent")
+            .tooltip_text(
+                "Hand the agent what failed and the log's tail, and ask it to diagnose and \
+                 repair the devcontainer",
+            )
+            .css_classes(["suggested-action"])
+            .halign(gtk::Align::Start)
+            .visible(false)
+            .build();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let rows: Vec<StepRow> = Step::ALL
+            .iter()
+            .map(|step| {
+                let row = StepRow::new(*step);
+                list.append(&row.row);
+                row
+            })
+            .collect();
+        let card = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(14)
+            .css_classes(["startup-card"])
+            .build();
+        card.append(&heading);
+        card.append(&note);
+        card.append(&list);
+        card.append(&prompt);
+        let clamp = adw::Clamp::builder()
+            .maximum_size(640)
+            .tightening_threshold(480)
+            .child(&card)
+            .margin_top(24)
+            .margin_bottom(12)
+            .margin_start(24)
+            .margin_end(24)
+            .build();
+
+        // The log the current step is writing, below the checklist: the
+        // VM's story until the container's build begins, the environment's
+        // build log from there.
+        let vm_log = LogPage::new(LogKind::Vm, "primary", &[]);
+        let build_log = LogPage::new(LogKind::Environment, "primary", &[]);
+        let logs = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .vexpand(true)
+            .css_classes(["startup-log"])
+            .margin_start(24)
+            .margin_end(24)
+            .margin_bottom(24)
+            .build();
+        logs.add_named(&vm_log.widget, Some("vm"));
+        logs.add_named(&build_log.widget, Some("build"));
+        logs.set_visible_child_name("vm");
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&clamp);
+        content.append(&logs);
+        let overlay = gtk::Overlay::builder().child(&area).build();
+        overlay.add_overlay(&content);
+        overlay.set_measure_overlay(&content, true);
+
+        let this = Rc::new(Self {
+            widget: overlay.upcast(),
+            heading,
+            note,
+            prompt,
+            rows,
+            logs,
+            vm_log,
+            build_log,
+            current: Cell::new(None),
+            underway: Cell::new(false),
+            settled: Cell::new(false),
+            area,
+            offset: Cell::new(0.0),
+            tick: RefCell::new(None),
+            on_prompt: RefCell::new(None),
+        });
+        {
+            let weak = Rc::downgrade(&this);
+            this.area.set_draw_func(move |_, cr, width, height| {
+                let Some(this) = weak.upgrade() else { return };
+                crate::stripes::draw(
+                    cr,
+                    width,
+                    height,
+                    1.0,
+                    this.offset.get(),
+                    adw::StyleManager::default().is_dark(),
+                );
+            });
+        }
+        {
+            let weak = Rc::downgrade(&this);
+            this.prompt.connect_clicked(move |_| {
+                let Some(this) = weak.upgrade() else { return };
+                let hook = this.on_prompt.borrow().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            });
+        }
+        this
+    }
+
+    /// Where Prompt Agent goes: the primary's chat, with the repair.
+    pub fn set_on_prompt_agent(&self, hook: impl Fn() + 'static) {
+        *self.on_prompt.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// The two logs, for the editor to wire their follow state to its
+    /// toggle.
+    pub fn logs(&self) -> (Rc<LogPage>, Rc<LogPage>) {
+        (self.vm_log.clone(), self.build_log.clone())
+    }
+
+    /// The log on screen now — what the strip's follow toggle acts on.
+    pub fn current_log(&self) -> Rc<LogPage> {
+        if self.logs.visible_child_name().as_deref() == Some("build") {
+            self.build_log.clone()
+        } else {
+            self.vm_log.clone()
+        }
+    }
+
+    /// Whether a start is being drawn.
+    pub fn underway(&self) -> bool {
+        self.underway.get()
+    }
+
+    /// A fresh start: every step pending, the note gone, the stripes
+    /// moving.
+    fn begin(self: &Rc<Self>) {
+        self.underway.set(true);
+        self.settled.set(false);
+        self.current.set(None);
+        self.heading.set_label("Environment starting");
+        self.note.set_visible(false);
+        self.prompt.set_visible(false);
+        for row in &self.rows {
+            row.set(Status::Pending, None);
+            row.detail.set_visible(false);
+        }
+        self.logs.set_visible_child_name("vm");
+        self.start_animation();
+    }
+
+    /// The environment is ready and the page is lingering on the fact.
+    pub fn mark_settled(&self) {
+        self.settled.set(true);
+    }
+
+    pub fn settled(&self) -> bool {
+        self.settled.get()
+    }
+
+    /// The start is over, one way or another: the stripes rest.
+    pub fn end(&self) {
+        self.underway.set(false);
+        self.settled.set(false);
+        if let Some(tick) = self.tick.borrow_mut().take() {
+            tick.remove();
+        }
+    }
+
+    fn start_animation(self: &Rc<Self>) {
+        if self.tick.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let last: Cell<Option<i64>> = Cell::new(None);
+        let id = self.area.add_tick_callback(move |area, clock| {
+            let Some(this) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let now = clock.frame_time();
+            if let Some(before) = last.get() {
+                let dt = (now - before) as f64 / 1_000_000.0;
+                this.offset
+                    .set((this.offset.get() - STRIPE_SPEED * dt) % crate::stripes::PERIOD);
+            }
+            last.set(Some(now));
+            area.queue_draw();
+            glib::ControlFlow::Continue
+        });
+        *self.tick.borrow_mut() = Some(id);
+    }
+
+    fn row(&self, step: Step) -> &StepRow {
+        &self.rows[Step::ALL.iter().position(|s| *s == step).unwrap_or(0)]
+    }
+
+    /// `step` is happening now: the steps before it that never happened
+    /// are marked not needed, the one that was active is done, and the
+    /// log below switches to the one this step writes.
+    fn activate(self: &Rc<Self>, step: Step, detail: Option<&str>) {
+        if !self.underway.get() || self.settled.get() {
+            self.begin();
+        }
+        for earlier in Step::ALL.iter().filter(|s| **s < step) {
+            let row = self.row(*earlier);
+            match row.status.get() {
+                Status::Pending => row.set(Status::Skipped, None),
+                Status::Active => row.set(Status::Done, None),
+                _ => {}
+            }
+        }
+        let row = self.row(step);
+        if row.status.get() != Status::Failed {
+            row.set(Status::Active, detail);
+        }
+        self.current.set(Some(step));
+        self.logs.set_visible_child_name(match step.log() {
+            LogKind::Environment => "build",
+            _ => "vm",
+        });
+    }
+
+    /// Every step done; the heading says so.
+    fn finish(self: &Rc<Self>) {
+        for step in Step::ALL {
+            let row = self.row(step);
+            match row.status.get() {
+                Status::Pending if step != Step::Ready => row.set(Status::Skipped, None),
+                Status::Failed => {}
+                _ => row.set(Status::Done, None),
+            }
+        }
+        self.row(Step::Ready).set(Status::Done, None);
+        self.current.set(Some(Step::Ready));
+        self.heading.set_label("Environment ready");
+    }
+
+    /// The state, as the supervisor tells it. `baseline` says whose
+    /// container the state is about — the project's own, or the safe-mode
+    /// environment's — which is what decides how a failure is read.
+    pub fn on_state(self: &Rc<Self>, state: &DevcontainerStateEvent, baseline: bool) {
+        match state {
+            DevcontainerStateEvent::Preparing { what } => {
+                self.activate(Step::for_preparing(what), Some(what));
+            }
+            DevcontainerStateEvent::Building => self.activate(Step::Build, None),
+            DevcontainerStateEvent::Starting => self.activate(Step::Start, None),
+            DevcontainerStateEvent::Running { .. } => {
+                if self.underway.get() {
+                    self.finish();
+                }
+            }
+            DevcontainerStateEvent::Failed { message } => {
+                if !self.underway.get() {
+                    self.begin();
+                }
+                let first = message.lines().next().unwrap_or(message).trim().to_string();
+                let current = self.current.get().unwrap_or(Step::Build);
+                self.row(current).set(Status::Failed, Some(&first));
+                if baseline {
+                    // Not the project's doing: the safe-mode environment is
+                    // the IDE's own, so this is the machine, the VM
+                    // provider, or a bug in the IDE. No agent to hand it to.
+                    self.heading.set_label("Environment failed");
+                    self.set_note(
+                        &format!(
+                            "The safe-mode environment itself could not start: {first}. This is \
+                             not the project's configuration — it is this machine's setup, the \
+                             VM provider, or a bug in the IDE. The Taste IDE log has the detail."
+                        ),
+                        false,
+                    );
+                } else {
+                    self.heading.set_label("Falling back to safe mode");
+                    self.set_note(
+                        &format!(
+                            "The project's devcontainer failed: {first}. The safe-mode environment \
+                             is coming up instead, with the tools to fix the definition and \
+                             rebuild; the agent can be handed the repair."
+                        ),
+                        true,
+                    );
+                }
+            }
+            DevcontainerStateEvent::NoConfig => {
+                if self.underway.get() || self.note.is_visible() {
+                    self.heading.set_label("Starting in safe mode");
+                }
+                self.set_note(
+                    "This project has no devcontainer definition. The safe-mode environment is \
+                     coming up: a generic container with the tools to write one and rebuild into \
+                     it; the agent can be asked to author it.",
+                    true,
+                );
+            }
+            DevcontainerStateEvent::ConfigDetected | DevcontainerStateEvent::Stopped => {}
+        }
+    }
+
+    fn set_note(&self, text: &str, prompt: bool) {
+        self.note.set_label(text);
+        self.note.set_visible(true);
+        self.prompt.set_visible(prompt);
+    }
+
+    /// The guest image's fetch, unpack, or check: the first step, once per
+    /// machine.
+    pub fn on_guest_image(self: &Rc<Self>, fetch: &taste_core::GuestImageFetch) {
+        use taste_core::GuestImagePhase as P;
+        if !fetch.phase.active() {
+            if self.row(Step::GuestImage).status.get() == Status::Active {
+                self.row(Step::GuestImage)
+                    .set(Status::Done, Some("fetched and verified"));
+            }
+            return;
+        }
+        let mib = |bytes: u64| bytes / (1024 * 1024);
+        let detail = match fetch.phase {
+            P::Fetching if fetch.total > 0 => {
+                format!("{} of {} MiB", mib(fetch.done), mib(fetch.total))
+            }
+            P::Fetching => "downloading".to_string(),
+            P::Decompressing => "unpacking".to_string(),
+            _ => "verifying".to_string(),
+        };
+        self.activate(Step::GuestImage, Some(&detail));
+    }
+
+    /// A line of the environment's build log: appended, and the image
+    /// build's `STEP n/m` becomes the build step's detail.
+    pub fn on_build_line(&self, line: &str) {
+        self.build_log
+            .append(std::slice::from_ref(&line.to_string()));
+        if let Some((n, of)) = build_step(line) {
+            let row = self.row(Step::Build);
+            if row.status.get() == Status::Active {
+                row.set(Status::Active, Some(&format!("step {n} of {of}")));
+            }
+        }
+    }
+
+    /// A line of the VM's story.
+    pub fn on_vm_line(&self, line: &str) {
+        self.vm_log.append(std::slice::from_ref(&line.to_string()));
+    }
+
+    /// TASTE_PROBE_CHECK only: pose the page at a stage —
+    /// `TASTE_PROBE_STARTUP=vm|build|failed|noconfig|ready` — with a few
+    /// lines in its log, since a start is a minute of a machine's life and
+    /// a shot has none of it.
+    #[doc(hidden)]
+    pub fn pose_for_probe(self: &Rc<Self>, kind: &str) {
+        self.begin();
+        for line in [
+            "[taste-ide] the domain is already running",
+            "[taste-ide] waiting for the guest's sshd on 127.0.0.1:35551 (up to 240s)",
+            "[  OK  ] Started sshd.service - OpenSSH server daemon.",
+            "[taste-ide] sshd answers; registering the podman connection and waiting for podman in the guest",
+            "[taste-ide] podman in the guest answers; the VM is ready",
+        ] {
+            self.on_vm_line(line);
+        }
+        match kind {
+            "build" => {
+                self.activate(Step::Vm, None);
+                self.activate(Step::Files, None);
+                self.activate(Step::Place, None);
+                self.activate(Step::Build, None);
+                for line in [
+                    "STEP 1/9: FROM registry.fedoraproject.org/fedora:44",
+                    "STEP 2/9: RUN dnf install -y gcc git",
+                    "STEP 3/9: RUN useradd -m dev",
+                    "STEP 4/9: COPY . /workspaces/taste-ide",
+                ] {
+                    self.on_build_line(line);
+                }
+            }
+            "failed" => {
+                self.activate(Step::Vm, None);
+                self.activate(Step::Files, None);
+                self.activate(Step::Place, None);
+                self.activate(Step::Build, None);
+                self.on_build_line("STEP 2/9: RUN dnf install -y gcc gti");
+                self.on_build_line("Error: Unable to find a match: gti");
+                self.on_state(
+                    &DevcontainerStateEvent::Failed {
+                        message: "podman build: Error: Unable to find a match: gti".into(),
+                    },
+                    false,
+                );
+            }
+            "noconfig" => {
+                self.activate(Step::Vm, None);
+                self.activate(Step::Files, None);
+                self.activate(Step::Place, None);
+                self.on_state(&DevcontainerStateEvent::NoConfig, false);
+                self.activate(Step::Build, Some("the safe-mode environment"));
+            }
+            "ready" => {
+                self.activate(Step::Vm, None);
+                self.activate(Step::Files, None);
+                self.activate(Step::Place, None);
+                self.activate(Step::Build, None);
+                self.activate(Step::Start, None);
+                self.finish();
+            }
+            _ => self.activate(Step::Vm, Some("bringing up the workspace's VM")),
+        }
+    }
+}
+
+/// `STEP 3/9: RUN …`, as podman prints an image build's steps, read as
+/// (3, 9); anything else is not a step.
+fn build_step(line: &str) -> Option<(u32, u32)> {
+    let rest = line.strip_prefix("STEP ")?;
+    let (n, of) = rest.split_once('/')?;
+    let of = of.split(|c: char| !c.is_ascii_digit()).next()?;
+    Some((n.trim().parse().ok()?, of.parse().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preparing_words_name_their_step_and_build_lines_their_number() {
+        assert_eq!(
+            Step::for_preparing("stopping other projects' VMs that no window owns"),
+            Step::Sweep
+        );
+        assert_eq!(
+            Step::for_preparing("building the files service image (once per VM)"),
+            Step::ServiceImage
+        );
+        assert_eq!(
+            Step::for_preparing("connecting the files service"),
+            Step::Files
+        );
+        assert_eq!(
+            Step::for_preparing("placing the checkout in the VM"),
+            Step::Place
+        );
+        assert_eq!(
+            Step::for_preparing("bringing up the workspace's VM"),
+            Step::Vm
+        );
+        assert_eq!(build_step("STEP 3/9: RUN dnf install -y gcc"), Some((3, 9)));
+        assert_eq!(build_step("Successfully tagged"), None);
+        assert!(Step::Sweep < Step::Vm && Step::Vm < Step::Build && Step::Build < Step::Ready);
+    }
+}

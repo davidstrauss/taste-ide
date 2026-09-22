@@ -1162,6 +1162,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     if let Ok(kind) = std::env::var("TASTE_PROBE_BANNER") {
         banner.pose_for_probe(&kind);
     }
+    // The environment's startup page (startup.rs): the checklist and the
+    // log that take the editor's strip over while a start runs.
+    let startup = crate::startup::StartupPage::new();
+    // `TASTE_PROBE_STARTUP=vm|build|failed|noconfig|ready`: the page at
+    // that stage, in front, which otherwise needs a start under way.
+    if let Ok(kind) = std::env::var("TASTE_PROBE_STARTUP") {
+        startup.pose_for_probe(&kind);
+        editor.show_startup(startup.clone());
+    }
     // Where git's and ssh's askpass reaches this window, for a Pull or
     // Push the user pressed: the question lands on the banner's strip.
     crate::askpass::serve(workspace.root(), workspace.events.clone());
@@ -1191,6 +1200,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     {
         let prompt_agent = prompt_agent.clone();
         banner.set_on_prompt_agent(move |prompt, log| {
+            prompt_agent(
+                &taste_core::environment::EnvironmentId::primary(),
+                prompt,
+                log,
+            )
+        });
+    }
+    {
+        // The startup page's Prompt Agent: the same repair the banner
+        // sends, from the page that says why the fallback happened.
+        let prompt_agent = prompt_agent.clone();
+        let supervisor = supervisor.clone();
+        startup.set_on_prompt_agent(move || {
+            let (prompt, log) = crate::devcontainer_ui::repair_prompt(&supervisor);
             prompt_agent(
                 &taste_core::environment::EnvironmentId::primary(),
                 prompt,
@@ -3564,6 +3587,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let filetree = filetree.clone();
         let console = console.clone();
         let banner = banner.clone();
+        let startup = startup.clone();
+        let startup_supervisor = supervisor.clone();
         let editor = editor.clone();
         let chats = chats.clone();
         let aim_panes = aim_panes.clone();
@@ -3662,9 +3687,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
                     Event::GuestImage(fetch) => {
                         filetree.backlog().set_guest_image(&fetch);
-                        // The download is the operation's first stage; the
-                        // banner's bar begins with it.
-                        banner.on_guest_image(&fetch);
+                        // The download is a start's first step; the page
+                        // shows it, and comes forward for it.
+                        if fetch.phase.active() && !probe_mode {
+                            startup.on_guest_image(&fetch);
+                            editor.show_startup(startup.clone());
+                        } else {
+                            startup.on_guest_image(&fetch);
+                        }
                     }
                     Event::ShowVmLog => open_log(primary_env.clone(), crate::logview::LogKind::Vm),
                     // The primary's working copy is in the VM now: the
@@ -3728,6 +3758,52 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             continue;
                         }
                         banner.on_state(&state);
+                        // The startup page: forward for every stage of a
+                        // start, told the outcome, and gone two seconds
+                        // after the environment is ready (startup.rs).
+                        // Not under a probe, which poses the page itself and
+                        // whose primary reports states no start produced.
+                        if !probe_mode {
+                            use taste_core::event::DevcontainerStateEvent as S;
+                            let baseline = startup_supervisor.config_authority()
+                                == taste_core::ConfigAuthority::Baseline;
+                            startup.on_state(&state, baseline);
+                            match &state {
+                                S::Preparing { .. } | S::Building | S::Starting => {
+                                    editor.show_startup(startup.clone());
+                                }
+                                S::Failed { .. } => {
+                                    // Shown with the reason; the fallback
+                                    // that follows keeps it up.
+                                    editor.show_startup(startup.clone());
+                                }
+                                S::Running { .. } => {
+                                    if startup.underway() {
+                                        startup.mark_settled();
+                                        let startup = startup.clone();
+                                        let editor = editor.clone();
+                                        glib::timeout_add_local_once(
+                                            crate::startup::READY_LINGER,
+                                            move || {
+                                                // Unless another start
+                                                // began in the meantime.
+                                                if matches!(startup_state_now(&startup), Some(true))
+                                                {
+                                                    return;
+                                                }
+                                                startup.end();
+                                                editor.hide_startup();
+                                            },
+                                        );
+                                    }
+                                }
+                                S::Stopped => {
+                                    startup.end();
+                                    editor.hide_startup();
+                                }
+                                S::NoConfig | S::ConfigDetected => {}
+                            }
+                        }
                         // Mode may have flipped (safe ↔ container): restyle
                         // the tree's read-only locks.
                         filetree.on_git_status_changed();
@@ -3762,9 +3838,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // buffer and its own lifecycle roster row; the panel
                     // shows whichever environment is selected.
                     Event::DevcontainerLog { env, line } => {
-                        // The primary's build steps move the banner's bar.
+                        // The primary's build log is the startup page's
+                        // too, and its STEP lines the build step's count.
                         if env == primary_env {
-                            banner.on_log_line(&line);
+                            startup.on_build_line(&line);
                         }
                         console.append_env_log(&env, &line);
                         log_activity.record(&env, crate::logview::LogKind::Environment, 1);
@@ -3785,6 +3862,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // A VM's story is every environment's in it — and the
                     // primary's while it waits to be placed there.
                     Event::VmLog { domain, line } => {
+                        // The primary's VM story is the startup page's log
+                        // through the stages before a container exists.
+                        if environments_for_events
+                            .vm_log_domain_for(&primary_env)
+                            .as_deref()
+                            == Some(&domain)
+                        {
+                            startup.on_vm_line(&line);
+                        }
                         for supervisor in environments_for_events.list() {
                             let env = supervisor.id();
                             if environments_for_events.vm_log_domain_for(env).as_deref()
@@ -4785,4 +4871,11 @@ fn plain_toast(text: &str) -> adw::Toast {
 /// A message's first line, for a toast that has room for one.
 fn first_line_of(text: &str) -> &str {
     text.lines().next().unwrap_or(text).trim()
+}
+
+/// Whether the startup page has begun a NEW start since it settled —
+/// `Some(true)` when it has — so a Ready that lingered does not hide a
+/// page that is drawing the next start.
+fn startup_state_now(startup: &crate::startup::StartupPage) -> Option<bool> {
+    Some(startup.underway() && !startup.settled())
 }

@@ -49,10 +49,6 @@ const TOUCH_WINDOW_SECS: u64 = 30;
 enum ButtonAction {
     Reload,
     ViewLog,
-    /// The Virtual Machine log: the stages before a container exists —
-    /// the image fetched, the VM booted, the files service, the placement
-    /// — are its story, not the build log's.
-    ViewVmLog,
     CreateConfig,
     /// Send what is in the entry (or "yes") to the question being asked.
     Answer,
@@ -103,24 +99,6 @@ pub struct DevcontainerBanner {
     /// is, in the clear. One shown at a time, and neither outside a question.
     secret: gtk::PasswordEntry,
     text: gtk::Entry,
-    /// The operation's bar, drawn UNDER the row as its background: hazard
-    /// stripes filling the row from the left to how far the operation has
-    /// come, sliding left while it runs (David, 2026-09-21: "make it the
-    /// background of the text ... Animate the bar moving to the left").
-    bar: gtk::DrawingArea,
-    /// How far the operation in progress has come, 0–1, never moving
-    /// backwards within one operation; and the build step the log last
-    /// named, which is the bar's fine grain while the image builds.
-    progress_value: Cell<f64>,
-    build_step: Cell<Option<(u32, u32)>>,
-    /// The stripes' phase, in pixels, and the frame-clock tick that
-    /// advances it while an operation runs.
-    bar_offset: Cell<f64>,
-    bar_tick: RefCell<Option<gtk::TickCallbackId>>,
-    /// An operation has been drawn and has not ended: the next Running is
-    /// its end, and gets the Done face for a moment before the banner
-    /// goes.
-    operation_underway: Cell<bool>,
     supervisor: Arc<Supervisor>,
     events: EventBus,
     action: Cell<ButtonAction>,
@@ -203,13 +181,7 @@ impl DevcontainerBanner {
         // row's height and the text sits on them. (An overlay was tried
         // and allocated the row its minimum, wrapping the title to a
         // column.)
-        let bar = gtk::DrawingArea::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .can_target(false)
-            .build();
         let underlay = gtk::Grid::builder().css_classes(["taste-banner"]).build();
-        underlay.attach(&bar, 0, 0, 1, 1);
         underlay.attach(&row, 0, 0, 1, 1);
         let revealer = gtk::Revealer::builder()
             .child(&underlay)
@@ -230,12 +202,6 @@ impl DevcontainerBanner {
             on_prompt_agent: RefCell::new(None),
             secret: secret.clone(),
             text: text.clone(),
-            bar,
-            progress_value: Cell::new(0.0),
-            build_step: Cell::new(None),
-            bar_offset: Cell::new(0.0),
-            bar_tick: RefCell::new(None),
-            operation_underway: Cell::new(false),
             supervisor,
             events,
             action: Cell::new(ButtonAction::Reload),
@@ -244,7 +210,6 @@ impl DevcontainerBanner {
             notice_since: Cell::new(None),
             posed: Cell::new(false),
         });
-        this.install_bar();
 
         // A question's answer: the button, Enter in either entry, or the
         // second button for a cancel.
@@ -310,9 +275,6 @@ impl DevcontainerBanner {
                 }
                 ButtonAction::ViewLog => {
                     this.events.publish(taste_core::Event::ShowDevcontainerLog);
-                }
-                ButtonAction::ViewVmLog => {
-                    this.events.publish(taste_core::Event::ShowVmLog);
                 }
                 ButtonAction::CreateConfig => {
                     this.events
@@ -510,142 +472,6 @@ impl DevcontainerBanner {
         self.revealer.set_reveal_child(revealed);
     }
 
-    /// The bar under the banner: one operation — the VM coming up, the
-    /// checkout placed, the image built, the container started — as one
-    /// bar that reaches full exactly when the environment is ready
-    /// (David, 2026-09-21: "show a progress bar encompassing the entire
-    /// operation ... once it reaches full, my env should be entirely
-    /// ready"). `None` ends the operation and hides the bar; a fraction
-    /// only ever moves it forward, since the steps come in order and a
-    /// bar that drops back reads as a second operation.
-    fn set_progress(self: &Rc<Self>, fraction: Option<f64>) {
-        match fraction {
-            None => {
-                self.progress_value.set(0.0);
-                self.build_step.set(None);
-                if let Some(tick) = self.bar_tick.borrow_mut().take() {
-                    tick.remove();
-                }
-                self.bar.queue_draw();
-            }
-            Some(fraction) => {
-                let fraction = fraction.clamp(0.0, 1.0).max(self.progress_value.get());
-                self.progress_value.set(fraction);
-                self.bar.queue_draw();
-                if self.bar_tick.borrow().is_some() {
-                    return;
-                }
-                // The stripes slide left on the frame clock, a steady
-                // pace in pixels per second whatever the frame rate.
-                let weak = Rc::downgrade(self);
-                let last: Cell<Option<i64>> = Cell::new(None);
-                let id = self.bar.add_tick_callback(move |bar, clock| {
-                    let Some(this) = weak.upgrade() else {
-                        return glib::ControlFlow::Break;
-                    };
-                    let now = clock.frame_time();
-                    if let Some(before) = last.get() {
-                        let dt = (now - before) as f64 / 1_000_000.0;
-                        let offset = (this.bar_offset.get() - STRIPE_SPEED * dt) % STRIPE_PERIOD;
-                        this.bar_offset.set(offset);
-                    }
-                    last.set(Some(now));
-                    bar.queue_draw();
-                    glib::ControlFlow::Continue
-                });
-                *self.bar_tick.borrow_mut() = Some(id);
-            }
-        }
-    }
-
-    /// Wire the bar's drawing to this banner's state, once it exists.
-    fn install_bar(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.bar.set_draw_func(move |_, cr, width, height| {
-            let Some(this) = weak.upgrade() else { return };
-            draw_stripes(
-                cr,
-                width,
-                height,
-                this.progress_value.get(),
-                this.bar_offset.get(),
-                adw::StyleManager::default().is_dark(),
-            );
-        });
-    }
-
-    /// The guest image's fetch, decompression, or verification: the
-    /// operation's first stage, once per machine, ahead of the VM's boot
-    /// (David, 2026-09-22: "include downloading the VM image -- if
-    /// necessary -- from the internet as the first step of the
-    /// 'construction'"). Drawn only while the environment is being
-    /// readied, never over a running one.
-    pub fn on_guest_image(self: &Rc<Self>, fetch: &taste_core::GuestImageFetch) {
-        use taste_core::GuestImagePhase as P;
-        if !fetch.phase.active() {
-            return;
-        }
-        let settled = matches!(
-            self.last_state.borrow().as_ref(),
-            Some(
-                DevcontainerStateEvent::Running { .. }
-                    | DevcontainerStateEvent::Building
-                    | DevcontainerStateEvent::Starting
-            )
-        );
-        if settled || self.posed.get() || self.question.borrow().is_some() {
-            return;
-        }
-        let mib = |bytes: u64| bytes / (1024 * 1024);
-        let (title, fraction) = match fetch.phase {
-            P::Fetching if fetch.total > 0 => (
-                format!(
-                    "Getting ready — fetching the guest image ({} of {} MiB)",
-                    mib(fetch.done),
-                    mib(fetch.total)
-                ),
-                0.01 + 0.06 * (fetch.done as f64 / fetch.total as f64),
-            ),
-            P::Fetching => ("Getting ready — fetching the guest image".to_string(), 0.01),
-            P::Decompressing => (
-                "Getting ready — unpacking the guest image".to_string(),
-                0.075,
-            ),
-            _ => (
-                "Getting ready — verifying the guest image".to_string(),
-                0.09,
-            ),
-        };
-        self.set_face("emblem-synchronizing-symbolic", true);
-        self.set_title(&title);
-        self.action.set(ButtonAction::ViewVmLog);
-        self.set_button(Some("View Log"));
-        self.set_revealed(true);
-        self.set_progress(Some(fraction));
-    }
-
-    /// A line of the environment's build log: the image build's `STEP
-    /// n/m` moves the bar through the build's share of the operation.
-    pub fn on_log_line(self: &Rc<Self>, line: &str) {
-        let Some(step) = build_step(line) else {
-            return;
-        };
-        self.build_step.set(Some(step));
-        if matches!(
-            self.last_state.borrow().as_ref(),
-            Some(DevcontainerStateEvent::Building)
-        ) {
-            self.set_progress(Some(operation_fraction(
-                &DevcontainerStateEvent::Building,
-                Some(step),
-            )));
-            self.set_title(&format!(
-                "Getting ready — building the image (step {} of {})",
-                step.0, step.1
-            ));
-        }
-    }
-
     /// Drift under the project's own config is not the banner's to
     /// announce: the fleet row carries it. Under the baseline it is the
     /// news this banner exists for — the config on disk just resolved to
@@ -769,32 +595,6 @@ impl DevcontainerBanner {
                 AskKind::Notice,
             ),
             "ready" => self.show_baseline_face(BaselineFace::Ready),
-            // Mid-operation: the image build at its fourth step of nine,
-            // the bar in its hazard stripes that far along.
-            "building" => {
-                self.posed.set(false);
-                self.build_step.set(Some((4, 9)));
-                self.on_state(&DevcontainerStateEvent::Building);
-                self.posed.set(true);
-            }
-            // The operation's last face: the bar full behind Done.
-            "done" => {
-                self.posed.set(false);
-                self.operation_underway.set(true);
-                self.on_state(&DevcontainerStateEvent::Running {
-                    container_id: "posed".into(),
-                });
-                self.posed.set(true);
-            }
-            // The operation's first face: the VM coming up, the bar just
-            // begun.
-            "vm" => {
-                self.posed.set(false);
-                self.on_state(&DevcontainerStateEvent::Preparing {
-                    what: "bringing up the workspace's VM".into(),
-                });
-                self.posed.set(true);
-            }
             "failed" => self.show_baseline_face(BaselineFace::BuildFailed),
             "passed" => self.show_baseline_face(BaselineFace::ConfigRefused),
             _ => self.show_baseline_face(BaselineFace::NoConfig),
@@ -816,55 +616,6 @@ impl DevcontainerBanner {
         if !matches!(state, DevcontainerStateEvent::Failed { .. }) {
             self.set_secondary(None, ButtonAction::PromptAgent);
         }
-        // The operation's bar: a transitional state moves it, a settled
-        // one ends it. Every transitional face wears the same glyph and
-        // the same "Getting ready —" so the sequence reads as one thing
-        // happening (David, 2026-09-21: "a consistent presentation in the
-        // header banner").
-        match state {
-            DevcontainerStateEvent::Preparing { .. }
-            | DevcontainerStateEvent::Building
-            | DevcontainerStateEvent::Starting => {
-                self.operation_underway.set(true);
-                self.set_progress(Some(operation_fraction(state, self.build_step.get())));
-            }
-            // The end of an operation: the bar full behind "Done" for a
-            // moment, then the running face (David, 2026-09-22: "end with
-            // a 'Done -- environment ready' state for a second or two at
-            // the end of the process. The whole bar should be filled").
-            DevcontainerStateEvent::Running { .. } if self.operation_underway.get() => {
-                self.operation_underway.set(false);
-                self.set_progress(Some(1.0));
-                self.set_face("emblem-ok-symbolic", true);
-                self.set_title("Done — environment ready");
-                self.set_button(None);
-                self.set_revealed(true);
-                let weak = Rc::downgrade(self);
-                glib::timeout_add_local_once(DONE_LINGER, move || {
-                    let Some(this) = weak.upgrade() else { return };
-                    // A posed banner is a still: it keeps the face.
-                    if this.posed.get() {
-                        return;
-                    }
-                    // Still running, and nothing else has taken the banner
-                    // since: end the bar and draw the running face.
-                    if matches!(
-                        this.last_state.borrow().as_ref(),
-                        Some(DevcontainerStateEvent::Running { .. })
-                    ) && !this.operation_underway.get()
-                    {
-                        this.set_progress(None);
-                        this.sync_running();
-                    }
-                });
-                return;
-            }
-            _ => {
-                self.operation_underway.set(false);
-                self.set_progress(None);
-            }
-        }
-
         match state {
             DevcontainerStateEvent::ConfigDetected => {
                 self.set_face("system-run-symbolic", false);
@@ -873,24 +624,13 @@ impl DevcontainerBanner {
                 self.set_button(Some("Start"));
                 self.set_revealed(true);
             }
-            DevcontainerStateEvent::Building => {
-                self.set_face("emblem-synchronizing-symbolic", true);
-                self.set_title(&match self.build_step.get() {
-                    Some((n, of)) => {
-                        format!("Getting ready — building the image (step {n} of {of})")
-                    }
-                    None => "Getting ready — building the image".to_string(),
-                });
-                self.action.set(ButtonAction::ViewLog);
-                self.set_button(Some("View Log"));
-                self.set_revealed(true);
-            }
-            DevcontainerStateEvent::Starting => {
-                self.set_face("emblem-synchronizing-symbolic", true);
-                self.set_title("Getting ready — starting the container and its setup commands");
-                self.action.set(ButtonAction::ViewLog);
-                self.set_button(Some("View Log"));
-                self.set_revealed(true);
+            // A start's stages are the startup page's (startup.rs), which
+            // takes the editor's strip over while they run; the banner
+            // says nothing during them.
+            DevcontainerStateEvent::Building
+            | DevcontainerStateEvent::Starting
+            | DevcontainerStateEvent::Preparing { .. } => {
+                self.set_revealed(false);
             }
             DevcontainerStateEvent::Running { .. } => {
                 // Under the project's config, running is running, drifted
@@ -915,19 +655,6 @@ impl DevcontainerBanner {
                 // "use the same banner as the other failure to minimize
                 // divergence").
                 self.show_baseline_face(BaselineFace::BuildFailed);
-            }
-            DevcontainerStateEvent::Preparing { what } => {
-                // What the IDE is doing to get the environment somewhere it
-                // can run, with the log that tells it one press away
-                // (David, 2026-09-22: "Each of the stages should have a
-                // button to 'View Logs', whenever possible").
-                self.set_face("emblem-synchronizing-symbolic", true);
-                // One line at the window's narrowest: a title that wraps
-                // grows the window past its minimum height.
-                self.set_title(&format!("Getting ready — {what}"));
-                self.action.set(ButtonAction::ViewVmLog);
-                self.set_button(Some("View Log"));
-                self.set_revealed(true);
             }
             DevcontainerStateEvent::NoConfig => {
                 // State + one action: Create opens the blank config, the
@@ -954,125 +681,6 @@ impl DevcontainerBanner {
         use taste_devcontainer::SupervisorState as S;
         !matches!(self.supervisor.state(), S::Running { .. })
     }
-}
-
-/// The stripes' pitch — one yellow band and one dark, in pixels — and
-/// how fast they slide left, in pixels per second: a walking pace, so
-/// the bar reads as working without drawing the eye from the words on
-/// it.
-const STRIPE_PERIOD: f64 = 28.0;
-const STRIPE_SPEED: f64 = 12.0;
-/// How long the full bar and "Done" stay before the running face.
-const DONE_LINGER: std::time::Duration = std::time::Duration::from_millis(2000);
-
-/// The operation's bar as the row's whole background: the part done in
-/// hazard bands at 45°, phase-shifted by `offset`, the part to come in a
-/// flat grey. Both opaque, and both kept well away from the text's
-/// colour — dark bands and a dark grey under the dark scheme's light
-/// text, pale bands and a light grey under the light scheme's dark text
-/// (David, 2026-09-21: "much higher contrast versus the text ... Make the
-/// incomplete portion of the bar dark gray (or light gray in light
-/// mode)"). Nothing is drawn at zero; the banner's own colour shows.
-fn draw_stripes(
-    cr: &gtk::cairo::Context,
-    width: i32,
-    height: i32,
-    fraction: f64,
-    offset: f64,
-    dark: bool,
-) {
-    let filled = f64::from(width) * fraction.clamp(0.0, 1.0);
-    if filled <= 0.5 || height <= 0 {
-        return;
-    }
-    let h = f64::from(height);
-    let (yellow, other, remainder) = if dark {
-        (
-            (0.22, 0.18, 0.03, 1.0),
-            (0.08, 0.08, 0.08, 1.0),
-            (0.14, 0.14, 0.14, 1.0),
-        )
-    } else {
-        (
-            (1.0, 0.96, 0.80, 1.0),
-            (0.99, 0.99, 0.99, 1.0),
-            (0.92, 0.92, 0.91, 1.0),
-        )
-    };
-    cr.set_source_rgba(remainder.0, remainder.1, remainder.2, remainder.3);
-    cr.rectangle(0.0, 0.0, f64::from(width), h);
-    let _ = cr.fill();
-    cr.save().ok();
-    cr.rectangle(0.0, 0.0, filled, h);
-    cr.clip();
-    let half = STRIPE_PERIOD / 2.0;
-    // Each band is a parallelogram leaning left: its top edge `half` wide
-    // at `x`, its bottom edge shifted by the height, so the bands run at
-    // 45° and a leftward slide of the phase reads as leftward motion.
-    let mut x = (offset % STRIPE_PERIOD) - STRIPE_PERIOD - h;
-    let mut yellow_band = true;
-    while x < filled + h {
-        let (r, g, b, a) = if yellow_band { yellow } else { other };
-        cr.set_source_rgba(r, g, b, a);
-        cr.move_to(x, 0.0);
-        cr.line_to(x + half, 0.0);
-        cr.line_to(x + half - h, h);
-        cr.line_to(x - h, h);
-        cr.close_path();
-        let _ = cr.fill();
-        x += half;
-        yellow_band = !yellow_band;
-    }
-    cr.restore().ok();
-}
-
-/// Where one operation stands, 0–1, from the state it is in and the
-/// build step the log last named. The shares are the time each phase
-/// takes on this machine, roughly: the VM's boot and the files service
-/// are the first quarter, placing the checkout a little more, the image
-/// build the middle half — it is the only phase with a grain of its own,
-/// podman's `STEP n/m` — and the container's start and setup commands
-/// the last stretch. Running is 1.0 and is not asked of this: the bar is
-/// gone by then.
-fn operation_fraction(state: &DevcontainerStateEvent, build_step: Option<(u32, u32)>) -> f64 {
-    match state {
-        DevcontainerStateEvent::Preparing { what } => {
-            let what = what.to_lowercase();
-            if what.contains("no window owns") {
-                // Other projects' unowned VMs stopped for the room: the
-                // step before this workspace's own VM comes up.
-                0.05
-            } else if what.contains("service image") {
-                // The files service's image built in a VM that never had
-                // it: after the boot, before the service connects.
-                0.20
-            } else if what.contains("files service") {
-                0.25
-            } else if what.contains("checkout") {
-                0.32
-            } else if what.contains("vm") {
-                0.10
-            } else {
-                0.15
-            }
-        }
-        DevcontainerStateEvent::Building => match build_step {
-            Some((n, of)) if of > 0 => 0.40 + 0.40 * (f64::from(n.min(of)) / f64::from(of)),
-            _ => 0.40,
-        },
-        DevcontainerStateEvent::Starting => 0.85,
-        DevcontainerStateEvent::Running { .. } => 1.0,
-        _ => 0.0,
-    }
-}
-
-/// `STEP 3/9: RUN …`, as podman prints an image build's steps, read as
-/// (3, 9); anything else is not a step.
-fn build_step(line: &str) -> Option<(u32, u32)> {
-    let rest = line.strip_prefix("STEP ")?;
-    let (n, of) = rest.split_once('/')?;
-    let of = of.split(|c: char| !c.is_ascii_digit()).next()?;
-    Some((n.trim().parse().ok()?, of.parse().ok()?))
 }
 
 /// The touch notice with its countdown: "about N s to touch" while the
@@ -1199,43 +807,6 @@ pub(crate) fn repair_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_operation_bar_only_moves_forward_and_reads_the_build_steps() {
-        use taste_core::event::DevcontainerStateEvent as S;
-        assert_eq!(build_step("STEP 3/9: RUN dnf install -y gcc"), Some((3, 9)));
-        assert_eq!(build_step("STEP 12/12: COMMIT localhost/x"), Some((12, 12)));
-        assert_eq!(build_step("Successfully tagged"), None);
-        let sweep = operation_fraction(
-            &S::Preparing {
-                what: "stopping other projects' VMs that no window owns".into(),
-            },
-            None,
-        );
-        let vm = operation_fraction(
-            &S::Preparing {
-                what: "bringing up the workspace's VM".into(),
-            },
-            None,
-        );
-        assert!(sweep < vm, "{sweep} {vm}");
-        let files = operation_fraction(
-            &S::Preparing {
-                what: "connecting the files service".into(),
-            },
-            None,
-        );
-        let build_start = operation_fraction(&S::Building, None);
-        let build_mid = operation_fraction(&S::Building, Some((5, 10)));
-        let build_end = operation_fraction(&S::Building, Some((10, 10)));
-        let start = operation_fraction(&S::Starting, None);
-        assert!(
-            vm < files && files < build_start,
-            "{vm} {files} {build_start}"
-        );
-        assert!(build_start < build_mid && build_mid < build_end && build_end <= start);
-        assert!(start < 1.0);
-    }
 
     #[test]
     fn the_touch_countdown_counts_down_and_then_waits() {
