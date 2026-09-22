@@ -1038,7 +1038,11 @@ fn operation_fraction(state: &DevcontainerStateEvent, build_step: Option<(u32, u
     match state {
         DevcontainerStateEvent::Preparing { what } => {
             let what = what.to_lowercase();
-            if what.contains("files service") {
+            if what.contains("no window owns") {
+                // Other projects' unowned VMs stopped for the room: the
+                // step before this workspace's own VM comes up.
+                0.05
+            } else if what.contains("files service") {
                 0.25
             } else if what.contains("checkout") {
                 0.32
@@ -1198,12 +1202,19 @@ mod tests {
         assert_eq!(build_step("STEP 3/9: RUN dnf install -y gcc"), Some((3, 9)));
         assert_eq!(build_step("STEP 12/12: COMMIT localhost/x"), Some((12, 12)));
         assert_eq!(build_step("Successfully tagged"), None);
+        let sweep = operation_fraction(
+            &S::Preparing {
+                what: "stopping other projects' VMs that no window owns".into(),
+            },
+            None,
+        );
         let vm = operation_fraction(
             &S::Preparing {
                 what: "bringing up the workspace's VM".into(),
             },
             None,
         );
+        assert!(sweep < vm, "{sweep} {vm}");
         let files = operation_fraction(
             &S::Preparing {
                 what: "connecting the files service".into(),

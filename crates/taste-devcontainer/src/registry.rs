@@ -897,6 +897,11 @@ impl EnvironmentRegistry {
             Ok(unowned) if !unowned.is_empty() => unowned,
             _ => return,
         };
+        // A step of the operation the banner's bar draws, ahead of the
+        // VM's boot (David, 2026-09-22: "Shutting down unsupervised VMs
+        // should be shown as a step in the progress bar banner").
+        self.primary()
+            .announce_preparing("stopping other projects' VMs that no window owns");
         let full = matches!(
             pool.room_for_one().await,
             Err(crate::pool::PoolError::AtCapacity { .. })
