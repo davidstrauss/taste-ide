@@ -2686,16 +2686,22 @@ is shouted, but nothing runs either. The rows say what is missing, and
   `Supervisor::reconcile_container_presence` asks whether the container
   an environment believes in still exists and reports the environment
   *down* rather than phantom-running.
-- **The VMs stop with the window — two minutes after it.** The window
-  leaves a sleeper behind that sends each VM its ACPI shutdown after a
-  grace (`CLOSE_SHUTDOWN_GRACE`), and a relaunch inside the grace kills
-  the sleeper and finds the VM up; before, a relaunch met a VM half-way
-  down and paid for the whole shutdown and the boot after it (David,
-  2026-09-22: "A ton of time gets wasted waiting on this"). The guest
-  itself stops in seconds: Ignition sets systemd's stop timeouts to ten
-  seconds per unit and fifteen for the user manager, and a VM that
-  predates those drop-ins gets them over ssh at bring-up, since a podman
-  exec session that ignored SIGTERM once held the shutdown for ninety.
+- **The VMs stop with the window — two minutes after it, and on their
+  own when the window never says so.** The window leaves one sleeper
+  behind per workspace that, after a grace (`CLOSE_SHUTDOWN_GRACE`),
+  lists the workspace's domains and sends each its ACPI shutdown — the
+  list is taken when it fires, so a VM the registry never registered is
+  stopped too — and a relaunch inside the grace kills the sleeper and
+  finds the VMs up; before, a relaunch met a VM half-way down and paid
+  for the whole shutdown and the boot after it (David, 2026-09-22: "A
+  ton of time gets wasted waiting on this"). The guest carries a dead
+  man's switch as well: a timer that powers it off once no ssh session
+  has been established for five minutes, the IDE holding one for as long
+  as it lives, so a crash, a kill, or a logout that ran no close handler
+  still ends in a stopped VM ("How can we ensure the VMs shut down when
+  closing the IDE"). The guest stops in seconds: Ignition sets systemd's
+  stop timeouts to ten seconds per unit and fifteen for the user manager;
+  a VM that predates any of this gets the files over ssh at bring-up.
   Reconcile starts the VMs again next launch, and a guest that goes down
   while the IDE waits for its sshd is said and brought back at once, not
   at the four-minute deadline. Idle-stop stops containers, never a VM. The

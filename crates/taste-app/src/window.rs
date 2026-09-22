@@ -4210,7 +4210,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let chats = chats.clone();
         let root = root.clone();
         let supervision = supervision;
-        let environments = environments.clone();
         window.connect_close_request(move |_| {
             // Restore state has one owner too, for the same reason the
             // containers do: two windows on one folder writing one file is
@@ -4223,15 +4222,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // not cut the signal short.
                 // ...after a grace, which a relaunch inside it cancels
                 // (`shutdown_deferred`), so closing and reopening does
-                // not cost a shutdown and a boot.
-                for domain in environments.vm_domains() {
-                    if let Err(e) = taste_devcontainer::LibvirtSession::new().shutdown_deferred(
-                        &root,
-                        &domain,
-                        taste_devcontainer::provision::CLOSE_SHUTDOWN_GRACE,
-                    ) {
-                        tracing::warn!("deferring the shutdown of {domain}: {e}");
-                    }
+                // not cost a shutdown and a boot. One sleeper for the
+                // workspace, which lists its VMs itself when it fires.
+                if let Err(e) = taste_devcontainer::LibvirtSession::new()
+                    .shutdown_deferred(&root, taste_devcontainer::provision::CLOSE_SHUTDOWN_GRACE)
+                {
+                    tracing::warn!("deferring the workspace's VM shutdown: {e}");
                 }
                 let open = workspace.ide.open_files();
                 // Update in place: fields owned elsewhere survive untouched.

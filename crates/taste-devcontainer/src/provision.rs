@@ -370,6 +370,39 @@ pub const GUEST_STOP_DROPINS: [(&str, &str); 3] = [
     ),
 ];
 
+/// The guest's dead man's switch: a timer that powers the VM off once no
+/// ssh session has been established for a while. The IDE holds one for
+/// as long as it lives — the keeper's `podman exec` rides it — so the
+/// connection is the liveness signal, and a window that ended without
+/// running its close handler (a crash, a kill, a logout) still costs the
+/// host its VM's memory for minutes rather than for good (David,
+/// 2026-09-22: "How can we ensure the VMs shut down when closing the
+/// IDE"). Written by Ignition for a new VM, and into one that predates it
+/// at bring-up ([`LibvirtSession::tune_guest_shutdown`]).
+pub const GUEST_IDLE_OFF_SCRIPT_PATH: &str = "/usr/local/bin/taste-idle-off";
+pub const GUEST_IDLE_OFF_SCRIPT: &str = r#"#!/bin/sh
+# Power off when no ssh session has been established for a while: the IDE
+# that made this VM keeps one open for as long as it runs. Written by the
+# IDE (taste_devcontainer::provision); a change here is a change there.
+state=/run/taste-idle-since
+if ss -Htn state established '( sport = :22 )' | grep -q .; then
+    rm -f "$state"
+    exit 0
+fi
+now=$(date +%s)
+if [ ! -f "$state" ]; then
+    echo "$now" > "$state"
+    exit 0
+fi
+since=$(cat "$state")
+if [ $((now - since)) -ge 300 ]; then
+    logger -t taste-idle-off "no ssh session for five minutes; powering off"
+    systemctl poweroff
+fi
+"#;
+pub const GUEST_IDLE_OFF_SERVICE: &str = "[Unit]\nDescription=Power off when the IDE has been gone a while\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/taste-idle-off\n";
+pub const GUEST_IDLE_OFF_TIMER: &str = "[Unit]\nDescription=Check every minute whether the IDE is still here\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=1min\n\n[Install]\nWantedBy=timers.target\n";
+
 /// How long a closed window's VM keeps running before its shutdown is
 /// sent: a relaunch inside this cancels it and finds the VM up
 /// (`LibvirtSession::shutdown_deferred`, `cancel_deferred_shutdown`),
@@ -476,6 +509,22 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
             "contents": { "source": data_url(contents) },
         }));
     }
+    // ...and stops on its own when the IDE is gone (`GUEST_IDLE_OFF_*`).
+    files.push(serde_json::json!({
+        "path": GUEST_IDLE_OFF_SCRIPT_PATH,
+        "mode": 493,
+        "overwrite": true,
+        "contents": { "source": data_url(GUEST_IDLE_OFF_SCRIPT) },
+    }));
+    units.push(serde_json::json!({
+        "name": "taste-idle-off.service",
+        "contents": GUEST_IDLE_OFF_SERVICE,
+    }));
+    units.push(serde_json::json!({
+        "name": "taste-idle-off.timer",
+        "enabled": true,
+        "contents": GUEST_IDLE_OFF_TIMER,
+    }));
     let config = serde_json::json!({
         "ignition": { "version": "3.4.0" },
         "passwd": {
@@ -1197,7 +1246,7 @@ impl LibvirtSession {
     /// seconds, and a launch that met it used to give up on the whole
     /// workspace.
     async fn bring_up(&self, vm: &Vm) -> Result<()> {
-        if self.cancel_deferred_shutdown(vm) {
+        if self.cancel_deferred_shutdown(&vm.workspace_root) {
             self.say(
                 &vm.domain,
                 "a shutdown was pending from the last window; cancelled, the VM stays up",
@@ -1263,43 +1312,54 @@ impl LibvirtSession {
     /// signal is sent; a detached child outlives this process, so the
     /// guest gets its signal whether or not the IDE is still there to hear
     /// the answer.
-    /// Send the VM its ACPI shutdown after `grace`, from a process that
-    /// outlives this one — the window is closing — and remember that
-    /// process, so a relaunch inside the grace can cancel it
-    /// ([`Self::cancel_deferred_shutdown`]) and find the VM up. A VM's
-    /// memory is committed while it runs, so it does stop; a relaunch
-    /// within two minutes, the common case while working on the IDE
-    /// itself, no longer costs a whole shutdown and a whole boot.
-    pub fn shutdown_deferred(
-        &self,
-        workspace_root: &Path,
-        domain: &str,
-        grace: Duration,
-    ) -> std::io::Result<()> {
+    /// Send every VM of this workspace its ACPI shutdown after `grace`,
+    /// from a process that outlives this one — the window is closing —
+    /// and remember that process, so a relaunch inside the grace can
+    /// cancel it ([`Self::cancel_deferred_shutdown`]) and find the VMs up.
+    /// A VM's memory is committed while it runs, so they do stop; a
+    /// relaunch within two minutes, the common case while working on the
+    /// IDE itself, no longer costs a whole shutdown and a whole boot.
+    ///
+    /// The sleeper lists the workspace's domains itself when it fires,
+    /// rather than being handed a list at close: a VM the registry never
+    /// registered this session, or one made after the close began, is
+    /// stopped all the same (David, 2026-09-22). One sleeper per
+    /// workspace, and it writes its own pid, so the pid is the host
+    /// process's even when the IDE reached it through `flatpak-spawn`.
+    pub fn shutdown_deferred(&self, workspace_root: &Path, grace: Duration) -> std::io::Result<()> {
+        let pin = deferred_shutdown_pin(workspace_root);
+        if let Some(dir) = pin.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         // `setsid`, so the sleeper is in its own session and a terminal
         // the IDE was launched from closing does not take it along.
         let script = format!(
-            "sleep {}; exec virsh -c {SESSION_URI} shutdown \"$0\"",
+            "echo $$ > \"$2\"; sleep {}; for d in $(virsh -c {SESSION_URI} list --name); do \
+             case \"$d\" in \"$1\"*) virsh -c {SESSION_URI} shutdown \"$d\" >/dev/null 2>&1;; esac; \
+             done; rm -f \"$2\"",
             grace.as_secs()
         );
-        let (program, args) = host_argv(self.sandboxed, "setsid", ["sh", "-c", &script, domain]);
-        let child = std::process::Command::new(program)
+        let prefix = domain_prefix(workspace_root);
+        let pin_text = pin.display().to_string();
+        let (program, args) = host_argv(
+            self.sandboxed,
+            "setsid",
+            ["sh", "-c", &script, "taste-shutdown", &prefix, &pin_text],
+        );
+        std::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()?;
-        let pin = deferred_shutdown_pin(workspace_root, domain);
-        if let Some(dir) = pin.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(pin, child.id().to_string())
+            .spawn()
+            .map(|_| ())
     }
 
-    /// Cancel a shutdown [`Self::shutdown_deferred`] left pending, if one
-    /// is: kill its sleeper and forget it. `true` when one was pending.
-    pub fn cancel_deferred_shutdown(&self, vm: &Vm) -> bool {
-        let pin = deferred_shutdown_pin(&vm.workspace_root, &vm.domain);
+    /// Cancel a shutdown [`Self::shutdown_deferred`] left pending for this
+    /// workspace, if one is: kill its sleeper and forget it. `true` when
+    /// one was pending.
+    pub fn cancel_deferred_shutdown(&self, workspace_root: &Path) -> bool {
+        let pin = deferred_shutdown_pin(workspace_root);
         let Ok(text) = std::fs::read_to_string(&pin) else {
             return false;
         };
@@ -1307,14 +1367,16 @@ impl LibvirtSession {
         let Ok(pid) = text.trim().parse::<u32>() else {
             return false;
         };
-        // Alive and ours: the sleeper is a `sh` we started. A pid that has
-        // been reused by now belongs to something else, so check the
-        // command before the signal.
+        // Alive and ours: the sleeper is a `sh` we started, with the
+        // workspace's prefix among its arguments. A pid that has been
+        // reused by now belongs to something else, so check the command
+        // before the signal.
+        let prefix = domain_prefix(workspace_root);
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
         let ours = cmdline
             .split(|b| *b == 0)
-            .any(|arg| arg == vm.domain.as_bytes())
-            && cmdline.windows(5).any(|w| w == b"sleep");
+            .any(|arg| arg == prefix.as_bytes())
+            && cmdline.windows(14).any(|w| w == b"taste-shutdown");
         if !ours {
             return false;
         }
@@ -1332,16 +1394,7 @@ impl LibvirtSession {
     /// running VM that predates them, and reload systemd when anything
     /// changed. Idempotent, and run at every bring-up.
     pub async fn tune_guest_shutdown(&self, vm: &Vm) -> Result<()> {
-        let mut script = String::from(
-            "set -e\nchanged=0\nwrite() { if [ ! -f \"$1\" ] || [ \"$(cat \"$1\")\" != \"$2\" ]; \
-             then mkdir -p \"$(dirname \"$1\")\"; printf '%s\\n' \"$2\" > \"$1\"; changed=1; fi; }\n",
-        );
-        for (path, contents) in GUEST_STOP_DROPINS {
-            let one_line = contents.trim_end_matches('\n').replace('\n', "\\n");
-            script.push_str(&format!("write {path} \"$(printf '{one_line}')\"\n"));
-        }
-        script
-            .push_str("if [ \"$changed\" = 1 ]; then systemctl daemon-reload; echo changed; fi\n");
+        let script = guest_tuning_script();
         let keys = Keys::for_workspace(&vm.workspace_root);
         let (program, argv) = keys.ssh_argv(vm.ssh_port, ["sudo", "-n", "sh", "-s"]);
         let mut child = tokio::process::Command::new(&program)
@@ -1362,7 +1415,8 @@ impl LibvirtSession {
         if String::from_utf8_lossy(&output.stdout).contains("changed") {
             self.say(
                 &vm.domain,
-                "guest stop timeouts set: 10s per unit, 15s for the user manager (they were 90s)",
+                "guest tuned: stop timeouts of 10s per unit and 15s for the user manager, and a \
+                 power-off five minutes after the last ssh session",
             );
         }
         Ok(())
@@ -1453,11 +1507,48 @@ fn free_loopback_port() -> Result<u16> {
 }
 
 /// Where a deferred shutdown's sleeper pid is kept: beside the guest's
-/// keys, per domain.
-fn deferred_shutdown_pin(workspace_root: &Path, domain: &str) -> PathBuf {
+/// keys, one per workspace.
+fn deferred_shutdown_pin(workspace_root: &Path) -> PathBuf {
     Keys::for_workspace(workspace_root)
         .dir()
-        .join(format!("{domain}.shutdown.pid"))
+        .join("shutdown.pid")
+}
+
+/// The script `tune_guest_shutdown` runs as root in the guest: every
+/// file the Ignition would have written — the stop timeouts, the idle
+/// power-off script and its units — written where it differs, then
+/// systemd reloaded and the timer enabled. Each file travels in a quoted
+/// heredoc, so its quotes and dollars reach the guest as written.
+fn guest_tuning_script() -> String {
+    let mut script = String::from(
+        "set -e\nchanged=0\nput() { if ! cmp -s \"$1\" \"$2\"; then mkdir -p \"$(dirname \"$2\")\"; \
+         cp \"$1\" \"$2\"; chmod \"$3\" \"$2\"; changed=1; fi; rm -f \"$1\"; }\n",
+    );
+    let mut files: Vec<(&str, &str, &str)> = GUEST_STOP_DROPINS
+        .iter()
+        .map(|(path, contents)| (*path, *contents, "644"))
+        .collect();
+    files.push((GUEST_IDLE_OFF_SCRIPT_PATH, GUEST_IDLE_OFF_SCRIPT, "755"));
+    files.push((
+        "/etc/systemd/system/taste-idle-off.service",
+        GUEST_IDLE_OFF_SERVICE,
+        "644",
+    ));
+    files.push((
+        "/etc/systemd/system/taste-idle-off.timer",
+        GUEST_IDLE_OFF_TIMER,
+        "644",
+    ));
+    for (index, (path, contents, mode)) in files.iter().enumerate() {
+        script.push_str(&format!(
+            "cat > /tmp/taste-tune-{index} <<'TASTE_EOF'\n{contents}TASTE_EOF\nput /tmp/taste-tune-{index} {path} {mode}\n"
+        ));
+    }
+    script.push_str(
+        "if [ \"$changed\" = 1 ]; then systemctl daemon-reload; \
+         systemctl enable --now taste-idle-off.timer >/dev/null 2>&1 || true; echo changed; fi\n",
+    );
+    script
 }
 
 /// The last `lines` of the serial console, or a note that there is none.
@@ -1509,6 +1600,13 @@ mod tests {
         for (path, _) in super::GUEST_STOP_DROPINS {
             assert!(text.contains(path), "{path} missing from the Ignition");
         }
+        // ...and the dead man's switch, script and enabled timer.
+        assert!(text.contains(super::GUEST_IDLE_OFF_SCRIPT_PATH));
+        assert!(text.contains("taste-idle-off.timer"));
+        let tuning = super::guest_tuning_script();
+        assert!(tuning.contains("taste-idle-off.timer"));
+        assert!(tuning.contains("sport = :22"));
+        assert!(tuning.contains("enable --now taste-idle-off.timer"));
         assert!(
             text.contains("DefaultTimeoutStopSec%3D10s")
                 || text.contains("DefaultTimeoutStopSec=10s")
