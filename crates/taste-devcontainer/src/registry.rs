@@ -854,6 +854,8 @@ impl EnvironmentRegistry {
                 let mut cursor: u64 = 0;
                 let mut carry = String::new();
                 let mut seen = false;
+                // systemd's two lines per event made one (`crate::console`).
+                let mut fold = crate::console::ConsoleFold::default();
                 loop {
                     let read_path = path.clone();
                     let read =
@@ -873,11 +875,21 @@ impl EnvironmentRegistry {
                                 );
                             }
                             cursor = next;
+                            // Quiet for a poll: a kernel line held for the
+                            // status line that never came is said now.
+                            if bytes.is_empty() {
+                                if let Some(line) = fold.flush() {
+                                    push_vm_log(&logs, &events, &domain, line);
+                                }
+                            }
                             carry.push_str(&String::from_utf8_lossy(&bytes));
                             while let Some(end) = carry.find('\n') {
                                 let line = clean_console_line(&carry[..end]);
                                 carry.drain(..=end);
-                                if !line.trim().is_empty() {
+                                if line.trim().is_empty() {
+                                    continue;
+                                }
+                                for line in fold.push(&line) {
                                     push_vm_log(&logs, &events, &domain, line);
                                 }
                             }

@@ -14,6 +14,7 @@ pub mod baseline;
 pub mod channel;
 pub mod config;
 pub mod configwatch;
+pub mod console;
 pub mod guest;
 pub mod hash;
 pub mod image;
