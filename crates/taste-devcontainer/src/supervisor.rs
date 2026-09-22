@@ -2392,11 +2392,22 @@ impl Supervisor {
         // Resolve against the same ladder a reload would take, so the drift
         // comparison is like-for-like.
         let resolved = self.resolve_config().ok()?;
-        // The adopted container's own workspace folder is not recoverable
-        // from a label, so the resolved config's is used. When the two rungs
-        // disagree the drift flag below is already set, and the rebuild the
-        // user is being asked for is what settles it.
-        let workdir = resolved.config.workspace_folder().to_string();
+        // The adopted container's working directory is the one its OWN
+        // config gave it, which its authority label names: the baseline's
+        // `/workspace` for a baseline container, the project's
+        // `workspaceFolder` for a project one. It used to be the resolved
+        // config's regardless, and while the project image built in a new
+        // VM the baseline ran with the project's workdir on the exec
+        // target — every shell and agent exec died on `crun: chdir to
+        // /workspaces/taste-ide: No such file or directory` (David,
+        // 2026-09-22). The drift flag below still says the two rungs
+        // disagree; the workdir just stops lying about the container.
+        let workdir = match authority {
+            ConfigAuthority::Baseline => crate::baseline::ensure_baseline_config()
+                .map(|config| config.workspace_folder().to_string())
+                .unwrap_or_else(|_| resolved.config.workspace_folder().to_string()),
+            ConfigAuthority::Project => resolved.config.workspace_folder().to_string(),
+        };
         self.exec.set_container(name.clone(), workdir, authority);
         *self.authority.lock().unwrap() = authority;
         *self.running_hash.lock().unwrap() = Some(started_hash.clone());
