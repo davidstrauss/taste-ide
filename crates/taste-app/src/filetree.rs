@@ -5302,6 +5302,10 @@ impl FileTree {
                 steps.push(("rebase", rebase_command));
             }
             let mut failed = false;
+            // How far behind the branch was once the fetch had landed — the
+            // commits the rebase is about to take — for the toast at the
+            // end (David, 2026-09-22: "Same for pull").
+            let mut behind: Option<(usize, Option<String>)> = None;
             for (label, (program, args)) in steps {
                 let handle =
                     crate::runtime::runtime().spawn(run_git_step(program, args, envs.clone()));
@@ -5314,6 +5318,19 @@ impl FileTree {
                     events.publish(Event::Toast(format!("{label} failed: {reason}")));
                     failed = true;
                     break;
+                }
+                if label == "fetch" {
+                    let measure_root = root.clone();
+                    let measured = crate::runtime::runtime()
+                        .spawn_blocking(move || {
+                            taste_git::GitWorkspace::discover(&measure_root)
+                                .and_then(|git| git.sync_status().ok())
+                                .map(|sync| (sync.behind, sync.upstream))
+                        })
+                        .await;
+                    if let Ok(Some(measured)) = measured {
+                        behind = Some(measured);
+                    }
                 }
             }
             if !failed && !worktree.is_local() {
@@ -5330,10 +5347,26 @@ impl FileTree {
                 match handle.await {
                     Ok(Ok(())) => {}
                     Ok(Err(reason)) => {
+                        failed = true;
                         events.publish(Event::Toast(format!("rebase failed: {reason}")))
                     }
-                    Err(_) => events.publish(Event::Toast("rebase failed: interrupted".into())),
+                    Err(_) => {
+                        failed = true;
+                        events.publish(Event::Toast("rebase failed: interrupted".into()))
+                    }
                 }
+            }
+            if !failed {
+                let (count, upstream) = behind.unwrap_or((0, None));
+                let upstream = upstream.unwrap_or_else(|| "the remote".to_string());
+                events.publish(Event::Toast(if count == 0 {
+                    format!("Already up to date with {upstream}")
+                } else {
+                    format!(
+                        "Pulled {count} commit{} from {upstream}",
+                        if count == 1 { "" } else { "s" }
+                    )
+                }));
             }
             // The issues ref, second and quietly. A remote that has never
             // seen an issue makes this fail, which is the normal case
@@ -6151,11 +6184,30 @@ impl FileTree {
         // to the plain push until the ref exists, so a workspace that has
         // never filed an issue pushes exactly what it always did — and the
         // queue reaches a remote on the USER's action, never an agent's.
-        let Some((program, args, remote)) = self.git.borrow().as_ref().map(|git| {
+        let Some((program, args, remote, sync)) = self.git.borrow().as_ref().map(|git| {
             let (program, args) = git.push_command_including_issues();
-            (program, args, git.upstream_remote_url())
+            (
+                program,
+                args,
+                git.upstream_remote_url(),
+                git.sync_status().ok(),
+            )
         }) else {
             return;
+        };
+        // What the toast will say: the count and the upstream, read before
+        // the push moves them (David, 2026-09-22: "Should say 'Pushed <x>
+        // commits to <remote>'").
+        let pushed = {
+            let ahead = sync.as_ref().map_or(0, |s| s.ahead);
+            let upstream = sync
+                .as_ref()
+                .and_then(|s| s.upstream.clone())
+                .unwrap_or_else(|| "the remote".to_string());
+            format!(
+                "Pushed {ahead} commit{} to {upstream}",
+                if ahead == 1 { "" } else { "s" }
+            )
         };
         let events = self.workspace.events.clone();
         // Push runs on the host with the user's own credential helpers.
@@ -6174,7 +6226,7 @@ impl FileTree {
                 crate::askpass::env_for(&root),
             ));
             match handle.await {
-                Ok(Ok(_)) => events.publish(Event::Toast("Pushed".into())),
+                Ok(Ok(_)) => events.publish(Event::Toast(pushed)),
                 Ok(Err(reason)) => {
                     events.publish(Event::Toast(format!("Push failed: {reason}")));
                 }
