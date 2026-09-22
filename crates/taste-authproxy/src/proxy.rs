@@ -315,12 +315,34 @@ impl ProxyState {
     }
 
     /// `host` answered, or the user asked for a fresh start: the run is
-    /// over.
-    fn wake_reset(&self, host: &str) {
-        self.wakes
+    /// over. Returns what the run was — how many wake-ups it sent, the one
+    /// in flight included, and how long since the first — when there was
+    /// one, so the caller can say that the host is back after it.
+    fn wake_reset(&self, host: &str) -> Option<(u32, Duration)> {
+        let run = self
+            .wakes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(host);
+            .remove(host)?;
+        let attempts = run.attempts + u32::from(run.in_flight);
+        (attempts > 0).then(|| (attempts, run.first.elapsed()))
+    }
+
+    /// `host` is answering after a run of wake-ups: the row that counted
+    /// them ends on the news, in the same place (David, 2026-09-22: "There
+    /// should be a new event in the chat upon successful connection ...
+    /// the user only sees the badge on the settings go green").
+    fn notify_awake(&self, env: &str, key: &str, host: &str, run: (u32, Duration)) {
+        let (attempts, since) = run;
+        self.notify(
+            Some(env),
+            Some(key),
+            format!(
+                "{host} is answering — it came up after {attempts} wake-up{}, {} after the first",
+                if attempts == 1 { "" } else { "s" },
+                crate::wake::humanize(since)
+            ),
+        );
     }
 
     fn wake_wait(&self) -> Duration {
@@ -1013,7 +1035,7 @@ impl Handle {
             .unwrap_or("the private server")
             .to_string();
         // The user asked: a run the IDE had given up on starts over here.
-        self.state.wake_reset(&host);
+        let _ = self.state.wake_reset(&host);
         let state = self.state.clone();
         let woke = crate::wake::ensure_awake(
             &upstream.uri,
@@ -1241,7 +1263,13 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         // one wake-up at a time, whatever the agent's retries do in
         // parallel — the others wait on the same attempt and read the
         // same outcome.
-        if !crate::wake::reachable(&target).await {
+        if crate::wake::reachable(&target).await {
+            // Up — and if an earlier run was still counting wake-ups for
+            // it, this is the news that run was waiting for.
+            if let Some(run) = state.wake_reset(&host) {
+                state.notify_awake(&env, &key, &host, run);
+            }
+        } else {
             loop {
                 match state.wake_attempt(&host) {
                     WakeVerdict::GaveUp(gave_up) => {
@@ -1257,6 +1285,9 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
                             tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                         if crate::wake::reachable(&target).await {
+                            if let Some(run) = state.wake_reset(&host) {
+                                state.notify_awake(&env, &key, &host, run);
+                            }
                             break;
                         }
                         // The shared attempt failed: this request reads the
@@ -1273,7 +1304,15 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
                         )
                         .await;
                         if outcome.reached() {
-                            state.wake_reset(&host);
+                            // `Woke` has already said so in its own words;
+                            // a host found up by the probe before this
+                            // attempt's wake-up went is told here.
+                            let run = state.wake_reset(&host);
+                            if let (Some(run), false) =
+                                (run, matches!(outcome, crate::wake::Wake::Woke { .. }))
+                            {
+                                state.notify_awake(&env, &key, &host, run);
+                            }
                             break;
                         }
                         state.wake_failed(&host);
