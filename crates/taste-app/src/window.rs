@@ -3662,7 +3662,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
                     Event::GuestImage(fetch) => {
                         filetree.backlog().set_guest_image(&fetch);
+                        // The download is the operation's first stage; the
+                        // banner's bar begins with it.
+                        banner.on_guest_image(&fetch);
                     }
+                    Event::ShowVmLog => open_log(primary_env.clone(), crate::logview::LogKind::Vm),
                     // The primary's working copy is in the VM now: the
                     // workspace's view root moves, and every pane that
                     // reads files re-aims at it (C2-b wires the panes).
@@ -4217,11 +4221,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // lost to a warm boot next launch. Spawned detached, so the
                 // GTK thread does not wait and the exit that follows does
                 // not cut the signal short.
+                // ...after a grace, which a relaunch inside it cancels
+                // (`shutdown_deferred`), so closing and reopening does
+                // not cost a shutdown and a boot.
                 for domain in environments.vm_domains() {
-                    if let Err(e) =
-                        taste_devcontainer::LibvirtSession::new().shutdown_detached(&domain)
-                    {
-                        tracing::warn!("shutting down {domain}: {e}");
+                    if let Err(e) = taste_devcontainer::LibvirtSession::new().shutdown_deferred(
+                        &root,
+                        &domain,
+                        taste_devcontainer::provision::CLOSE_SHUTDOWN_GRACE,
+                    ) {
+                        tracing::warn!("deferring the shutdown of {domain}: {e}");
                     }
                 }
                 let open = workspace.ide.open_files();

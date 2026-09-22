@@ -2686,9 +2686,19 @@ is shouted, but nothing runs either. The rows say what is missing, and
   `Supervisor::reconcile_container_presence` asks whether the container
   an environment believes in still exists and reports the environment
   *down* rather than phantom-running.
-- **The VMs stop with the window.** ACPI shutdown for every VM of the
-  pool, detached, when the supervising window closes; reconcile starts
-  them again next launch. Idle-stop stops containers, never a VM. The
+- **The VMs stop with the window — two minutes after it.** The window
+  leaves a sleeper behind that sends each VM its ACPI shutdown after a
+  grace (`CLOSE_SHUTDOWN_GRACE`), and a relaunch inside the grace kills
+  the sleeper and finds the VM up; before, a relaunch met a VM half-way
+  down and paid for the whole shutdown and the boot after it (David,
+  2026-09-22: "A ton of time gets wasted waiting on this"). The guest
+  itself stops in seconds: Ignition sets systemd's stop timeouts to ten
+  seconds per unit and fifteen for the user manager, and a VM that
+  predates those drop-ins gets them over ssh at bring-up, since a podman
+  exec session that ignored SIGTERM once held the shutdown for ninety.
+  Reconcile starts the VMs again next launch, and a guest that goes down
+  while the IDE waits for its sshd is said and brought back at once, not
+  at the four-minute deadline. Idle-stop stops containers, never a VM. The
   Resources view's VM row has the VM's own lifecycle, in the backlog
   rows' scheme: **Stop** (its containers first, then the guest), **Start**
   (the VM, then everything in it, by reconcile), **Rebuild**, held to

@@ -49,6 +49,10 @@ const TOUCH_WINDOW_SECS: u64 = 30;
 enum ButtonAction {
     Reload,
     ViewLog,
+    /// The Virtual Machine log: the stages before a container exists —
+    /// the image fetched, the VM booted, the files service, the placement
+    /// — are its story, not the build log's.
+    ViewVmLog,
     CreateConfig,
     /// Send what is in the entry (or "yes") to the question being asked.
     Answer,
@@ -301,6 +305,9 @@ impl DevcontainerBanner {
                 }
                 ButtonAction::ViewLog => {
                     this.events.publish(taste_core::Event::ShowDevcontainerLog);
+                }
+                ButtonAction::ViewVmLog => {
+                    this.events.publish(taste_core::Event::ShowVmLog);
                 }
                 ButtonAction::CreateConfig => {
                     this.events
@@ -562,6 +569,56 @@ impl DevcontainerBanner {
         });
     }
 
+    /// The guest image's fetch, decompression, or verification: the
+    /// operation's first stage, once per machine, ahead of the VM's boot
+    /// (David, 2026-09-22: "include downloading the VM image -- if
+    /// necessary -- from the internet as the first step of the
+    /// 'construction'"). Drawn only while the environment is being
+    /// readied, never over a running one.
+    pub fn on_guest_image(self: &Rc<Self>, fetch: &taste_core::GuestImageFetch) {
+        use taste_core::GuestImagePhase as P;
+        if !fetch.phase.active() {
+            return;
+        }
+        let settled = matches!(
+            self.last_state.borrow().as_ref(),
+            Some(
+                DevcontainerStateEvent::Running { .. }
+                    | DevcontainerStateEvent::Building
+                    | DevcontainerStateEvent::Starting
+            )
+        );
+        if settled || self.posed.get() || self.question.borrow().is_some() {
+            return;
+        }
+        let mib = |bytes: u64| bytes / (1024 * 1024);
+        let (title, fraction) = match fetch.phase {
+            P::Fetching if fetch.total > 0 => (
+                format!(
+                    "Getting ready — fetching the guest image ({} of {} MiB)",
+                    mib(fetch.done),
+                    mib(fetch.total)
+                ),
+                0.01 + 0.06 * (fetch.done as f64 / fetch.total as f64),
+            ),
+            P::Fetching => ("Getting ready — fetching the guest image".to_string(), 0.01),
+            P::Decompressing => (
+                "Getting ready — unpacking the guest image".to_string(),
+                0.075,
+            ),
+            _ => (
+                "Getting ready — verifying the guest image".to_string(),
+                0.09,
+            ),
+        };
+        self.set_face("emblem-synchronizing-symbolic", true);
+        self.set_title(&title);
+        self.action.set(ButtonAction::ViewVmLog);
+        self.set_button(Some("View Log"));
+        self.set_revealed(true);
+        self.set_progress(Some(fraction));
+    }
+
     /// A line of the environment's build log: the image build's `STEP
     /// n/m` moves the bar through the build's share of the operation.
     pub fn on_log_line(self: &Rc<Self>, line: &str) {
@@ -812,12 +869,15 @@ impl DevcontainerBanner {
             }
             DevcontainerStateEvent::Preparing { what } => {
                 // What the IDE is doing to get the environment somewhere it
-                // can run; nothing to press, since it is doing it.
+                // can run, with the log that tells it one press away
+                // (David, 2026-09-22: "Each of the stages should have a
+                // button to 'View Logs', whenever possible").
                 self.set_face("emblem-synchronizing-symbolic", true);
                 // One line at the window's narrowest: a title that wraps
                 // grows the window past its minimum height.
                 self.set_title(&format!("Getting ready — {what}"));
-                self.set_button(None);
+                self.action.set(ButtonAction::ViewVmLog);
+                self.set_button(Some("View Log"));
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::NoConfig => {

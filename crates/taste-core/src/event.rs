@@ -166,6 +166,9 @@ pub enum Event {
     OpenFileRequested { path: PathBuf, line: Option<u32> },
     /// Bring the console's Devcontainer log tab to the front.
     ShowDevcontainerLog,
+    /// Open the primary's Virtual Machine log: the banner's View Log while
+    /// the VM is the stage in progress.
+    ShowVmLog,
     /// A command console tab's process ended (e.g. a sign-in TUI). `tail`
     /// is the last screenful the tab showed, for the one flow that reads
     /// its output: `claude setup-token` prints the token the settings
@@ -347,6 +350,7 @@ impl Event {
             | Event::FileTreeChanged
             | Event::OpenFileRequested { .. }
             | Event::ShowDevcontainerLog
+            | Event::ShowVmLog
             | Event::CommandTabExited { .. }
             | Event::QuitRequested
             | Event::OpenUrlRequested(_)

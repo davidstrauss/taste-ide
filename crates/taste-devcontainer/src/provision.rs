@@ -352,6 +352,31 @@ pub struct GuestSpec {
 /// called, that `core` runs podman rootless and reachable, and what the
 /// guest may not talk to. Every additional thing here is a thing that has
 /// to keep working across a guest release.
+/// The systemd drop-ins that make the guest stop in seconds rather than
+/// in minutes: written by Ignition for a new VM, and by
+/// [`LibvirtSession::tune_guest_shutdown`] into one that predates them.
+pub const GUEST_STOP_DROPINS: [(&str, &str); 3] = [
+    (
+        "/etc/systemd/system.conf.d/10-taste-stop.conf",
+        "[Manager]\nDefaultTimeoutStopSec=10s\n",
+    ),
+    (
+        "/etc/systemd/user.conf.d/10-taste-stop.conf",
+        "[Manager]\nDefaultTimeoutStopSec=10s\n",
+    ),
+    (
+        "/etc/systemd/system/user@.service.d/10-taste-stop.conf",
+        "[Service]\nTimeoutStopSec=15s\n",
+    ),
+];
+
+/// How long a closed window's VM keeps running before its shutdown is
+/// sent: a relaunch inside this cancels it and finds the VM up
+/// (`LibvirtSession::shutdown_deferred`, `cancel_deferred_shutdown`),
+/// where before it found the VM half-way down and waited for the whole
+/// shutdown and the boot after it.
+pub const CLOSE_SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
+
 pub fn ignition(spec: &GuestSpec) -> Result<String> {
     if spec.ssh_public_key.trim().is_empty() {
         bail!("a guest with no ssh key is a guest the IDE cannot reach");
@@ -435,6 +460,20 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
         units.push(serde_json::json!({
             "name": "nftables.service",
             "enabled": true,
+        }));
+    }
+    // The guest stops quickly. systemd's defaults give every unit and
+    // scope ninety seconds to die, and a podman exec session that ignores
+    // SIGTERM held the whole shutdown for that long, with the IDE waiting
+    // on the other side (David, 2026-09-22: "A ton of time gets wasted
+    // waiting on this"). Ten seconds for a unit, fifteen for the user
+    // manager that holds the containers.
+    for (path, contents) in GUEST_STOP_DROPINS {
+        files.push(serde_json::json!({
+            "path": path,
+            "mode": 420,
+            "overwrite": true,
+            "contents": { "source": data_url(contents) },
         }));
     }
     let config = serde_json::json!({
@@ -1031,6 +1070,19 @@ impl LibvirtSession {
             {
                 break;
             }
+            // A guest that is going down while we wait for it to come up —
+            // the last window's shutdown landing — is not going to answer;
+            // say so at once rather than at the deadline, and let the
+            // caller bring it back (`ensure_running`).
+            if let Ok(state) = self.state(vm).await {
+                if state != DomainState::Running {
+                    self.say(
+                        &vm.domain,
+                        format!("the guest went down while we waited for sshd (it is {state:?})"),
+                    );
+                    bail!("{} went down while coming up", vm.domain);
+                }
+            }
             if Instant::now() > deadline {
                 bail!(
                     "{} did not open ssh on 127.0.0.1:{} within {}s\n{}",
@@ -1052,7 +1104,19 @@ impl LibvirtSession {
             match crate::substrate::probe(&target).await {
                 Ok(()) => {
                     self.say(&vm.domain, "podman in the guest answers; the VM is ready");
+                    if let Err(e) = self.tune_guest_shutdown(vm).await {
+                        tracing::debug!("{}: guest stop timeouts not set: {e:#}", vm.domain);
+                    }
                     return Ok(());
+                }
+                Err(_)
+                    if self
+                        .state(vm)
+                        .await
+                        .is_ok_and(|state| state != DomainState::Running) =>
+                {
+                    self.say(&vm.domain, "the guest went down while we waited for podman");
+                    bail!("{} went down while coming up", vm.domain);
                 }
                 Err(e) if Instant::now() > deadline => bail!(
                     "podman in {} did not answer over connection {} within {}s ({e})\n{}",
@@ -1133,6 +1197,12 @@ impl LibvirtSession {
     /// seconds, and a launch that met it used to give up on the whole
     /// workspace.
     async fn bring_up(&self, vm: &Vm) -> Result<()> {
+        if self.cancel_deferred_shutdown(vm) {
+            self.say(
+                &vm.domain,
+                "a shutdown was pending from the last window; cancelled, the VM stays up",
+            );
+        }
         let deadline = Instant::now() + SHUTDOWN_WAIT;
         let mut said_waiting = false;
         loop {
@@ -1193,19 +1263,109 @@ impl LibvirtSession {
     /// signal is sent; a detached child outlives this process, so the
     /// guest gets its signal whether or not the IDE is still there to hear
     /// the answer.
-    pub fn shutdown_detached(&self, domain: &str) -> std::io::Result<()> {
-        let (program, args) = host_argv(
-            self.sandboxed,
-            "virsh",
-            ["-c", SESSION_URI, "shutdown", domain],
+    /// Send the VM its ACPI shutdown after `grace`, from a process that
+    /// outlives this one — the window is closing — and remember that
+    /// process, so a relaunch inside the grace can cancel it
+    /// ([`Self::cancel_deferred_shutdown`]) and find the VM up. A VM's
+    /// memory is committed while it runs, so it does stop; a relaunch
+    /// within two minutes, the common case while working on the IDE
+    /// itself, no longer costs a whole shutdown and a whole boot.
+    pub fn shutdown_deferred(
+        &self,
+        workspace_root: &Path,
+        domain: &str,
+        grace: Duration,
+    ) -> std::io::Result<()> {
+        // `setsid`, so the sleeper is in its own session and a terminal
+        // the IDE was launched from closing does not take it along.
+        let script = format!(
+            "sleep {}; exec virsh -c {SESSION_URI} shutdown \"$0\"",
+            grace.as_secs()
         );
+        let (program, args) = host_argv(self.sandboxed, "setsid", ["sh", "-c", &script, domain]);
+        let child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let pin = deferred_shutdown_pin(workspace_root, domain);
+        if let Some(dir) = pin.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(pin, child.id().to_string())
+    }
+
+    /// Cancel a shutdown [`Self::shutdown_deferred`] left pending, if one
+    /// is: kill its sleeper and forget it. `true` when one was pending.
+    pub fn cancel_deferred_shutdown(&self, vm: &Vm) -> bool {
+        let pin = deferred_shutdown_pin(&vm.workspace_root, &vm.domain);
+        let Ok(text) = std::fs::read_to_string(&pin) else {
+            return false;
+        };
+        let _ = std::fs::remove_file(&pin);
+        let Ok(pid) = text.trim().parse::<u32>() else {
+            return false;
+        };
+        // Alive and ours: the sleeper is a `sh` we started. A pid that has
+        // been reused by now belongs to something else, so check the
+        // command before the signal.
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let ours = cmdline
+            .split(|b| *b == 0)
+            .any(|arg| arg == vm.domain.as_bytes())
+            && cmdline.windows(5).any(|w| w == b"sleep");
+        if !ours {
+            return false;
+        }
+        let (program, args) = host_argv(self.sandboxed, "kill", [pid.to_string()]);
         std::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Write the guest's stop timeouts ([`GUEST_STOP_DROPINS`]) into a
+    /// running VM that predates them, and reload systemd when anything
+    /// changed. Idempotent, and run at every bring-up.
+    pub async fn tune_guest_shutdown(&self, vm: &Vm) -> Result<()> {
+        let mut script = String::from(
+            "set -e\nchanged=0\nwrite() { if [ ! -f \"$1\" ] || [ \"$(cat \"$1\")\" != \"$2\" ]; \
+             then mkdir -p \"$(dirname \"$1\")\"; printf '%s\\n' \"$2\" > \"$1\"; changed=1; fi; }\n",
+        );
+        for (path, contents) in GUEST_STOP_DROPINS {
+            let one_line = contents.trim_end_matches('\n').replace('\n', "\\n");
+            script.push_str(&format!("write {path} \"$(printf '{one_line}')\"\n"));
+        }
+        script
+            .push_str("if [ \"$changed\" = 1 ]; then systemctl daemon-reload; echo changed; fi\n");
+        let keys = Keys::for_workspace(&vm.workspace_root);
+        let (program, argv) = keys.ssh_argv(vm.ssh_port, ["sudo", "-n", "sh", "-s"]);
+        let mut child = tokio::process::Command::new(&program)
+            .args(&argv)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
-            .map(|_| ())
+            .context("running sh in the guest")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(script.as_bytes()).await?;
+        }
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        if String::from_utf8_lossy(&output.stdout).contains("changed") {
+            self.say(
+                &vm.domain,
+                "guest stop timeouts set: 10s per unit, 15s for the user manager (they were 90s)",
+            );
+        }
+        Ok(())
     }
 
     /// ACPI shutdown. The guest stops cleanly and keeps its disk; the next
@@ -1292,6 +1452,14 @@ fn free_loopback_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Where a deferred shutdown's sleeper pid is kept: beside the guest's
+/// keys, per domain.
+fn deferred_shutdown_pin(workspace_root: &Path, domain: &str) -> PathBuf {
+    Keys::for_workspace(workspace_root)
+        .dir()
+        .join(format!("{domain}.shutdown.pid"))
+}
+
 /// The last `lines` of the serial console, or a note that there is none.
 fn serial_tail(path: &Path, lines: usize) -> String {
     match std::fs::read_to_string(path) {
@@ -1329,6 +1497,24 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_guest_is_told_to_stop_in_seconds() {
+        let text = super::ignition(&super::GuestSpec {
+            ssh_public_key: "ssh-ed25519 AAAA test".into(),
+            hostname: "taste-x".into(),
+            deny_private_networks: true,
+            host_key: None,
+        })
+        .unwrap();
+        for (path, _) in super::GUEST_STOP_DROPINS {
+            assert!(text.contains(path), "{path} missing from the Ignition");
+        }
+        assert!(
+            text.contains("DefaultTimeoutStopSec%3D10s")
+                || text.contains("DefaultTimeoutStopSec=10s")
+        );
+    }
+
     use super::*;
 
     /// `domstats` as libvirt prints it, summed across two disks and an
