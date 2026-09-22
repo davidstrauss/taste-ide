@@ -17,12 +17,27 @@
 use gtk::prelude::*;
 
 /// GNOME Console's ANSI palette, for a terminal's sixteen colours and
-/// everything drawn to match one. Legible on both the light and the dark
-/// terminal background below — these are the terminal's own choices, not
-/// the theme's. Index 0 is the black, 3 the yellow, 11 the bright yellow.
+/// everything drawn to match one — on the DARK terminal background below;
+/// the light one has [`ANSI_TERMINAL_LIGHT`]. These are the terminal's own
+/// choices, not the theme's. Index 0 is the black, 3 the yellow, 11 the
+/// bright yellow.
 pub const ANSI_TERMINAL: [&str; 16] = [
     "#241f31", "#c01c28", "#2ec27e", "#f5c211", "#1e78e4", "#9841bb", "#0ab9dc", "#c0bfbc",
     "#5e5c64", "#ed333b", "#57e389", "#f8e45c", "#51a1ff", "#c061cb", "#4fd2fd", "#f6f5f4",
+];
+
+/// The terminal's sixteen colours on its LIGHT background. GNOME Console's
+/// palette is a dark terminal's: on white, its yellow is 1.7:1, its bright
+/// yellow 1.3:1, its white and bright white all but invisible — so a CLI's
+/// token printed in bright yellow and its notes in white could not be read
+/// (David, 2026-09-22: "This is not high contrast in light mode"). Each
+/// colour here is the same hue taken dark enough for 4.5:1 or better on
+/// `TERMINAL_LIGHT`'s white (the test measures them), and the two whites
+/// become greys, since on a light terminal "white" can only mean "the
+/// quiet text colour".
+pub const ANSI_TERMINAL_LIGHT: [&str; 16] = [
+    "#241f31", "#c01c28", "#1c7a4c", "#8f6500", "#1a5fb4", "#8b35a8", "#0e6f7d", "#5e5c64",
+    "#6f6d75", "#a51d2d", "#26844f", "#7d5a00", "#1c63c2", "#7d3894", "#0b6474", "#3d3846",
 ];
 
 /// GNOME Console's ANSI palette as *text* colours on the theme's own
@@ -212,5 +227,34 @@ pub fn highlight_range(buffer: &gtk::TextBuffer, start: &gtk::TextIter, end: &gt
 pub fn clear_highlight(buffer: &gtk::TextBuffer) {
     if let Some(tag) = buffer.tag_table().lookup(HIT_TAG) {
         buffer.remove_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
+    }
+}
+
+#[cfg(test)]
+mod light_terminal_tests {
+    use super::*;
+
+    fn luminance(hex: &str) -> f64 {
+        let hex = hex.trim_start_matches('#');
+        let channel = |i: usize| {
+            let c = f64::from(u8::from_str_radix(&hex[i..i + 2], 16).unwrap()) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+    }
+
+    /// Every colour of the light terminal reads as text on its background.
+    #[test]
+    fn the_light_terminal_palette_is_legible_on_its_background() {
+        let bg = luminance(TERMINAL_LIGHT.1);
+        for (i, color) in ANSI_TERMINAL_LIGHT.iter().enumerate() {
+            let fg = luminance(color);
+            let ratio = (bg.max(fg) + 0.05) / (bg.min(fg) + 0.05);
+            assert!(ratio >= 4.5, "colour {i} ({color}) is {ratio:.2}:1");
+        }
     }
 }

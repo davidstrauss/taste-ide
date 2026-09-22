@@ -43,10 +43,12 @@ fn apply_terminal_theme(terminal: &vte4::Terminal) {
     } else {
         crate::palette::TERMINAL_LIGHT
     };
-    let palette: Vec<gtk::gdk::RGBA> = crate::palette::ANSI_TERMINAL
-        .iter()
-        .map(|c| crate::palette::rgba(c))
-        .collect();
+    let colors = if dark {
+        &crate::palette::ANSI_TERMINAL
+    } else {
+        &crate::palette::ANSI_TERMINAL_LIGHT
+    };
+    let palette: Vec<gtk::gdk::RGBA> = colors.iter().map(|c| crate::palette::rgba(c)).collect();
     let palette_refs: Vec<&gtk::gdk::RGBA> = palette.iter().collect();
     terminal.set_colors(
         Some(&crate::palette::rgba(fg)),
