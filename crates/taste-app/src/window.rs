@@ -3953,28 +3953,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                 prompt_agent(env, prompt, log);
                             });
                         }
-                        if action == "stop-idle-vms" {
-                            // Other projects' VMs whose windows are gone,
-                            // stopped for the room, and this workspace's
-                            // bring-up run again once they are down.
-                            let registry = environments_for_events.clone();
-                            let events = bus_for_events.clone();
-                            toast.connect_button_clicked(move |_| {
-                                let registry = registry.clone();
-                                let events = events.clone();
-                                crate::runtime::runtime().spawn(async move {
-                                    match registry.stop_idle_foreign_vms().await {
-                                        Ok(n) => events.publish(Event::Toast(format!(
-                                            "Stopped {n} VM{} of other projects",
-                                            if n == 1 { "" } else { "s" }
-                                        ))),
-                                        Err(e) => events.publish(Event::Toast(format!(
-                                            "Stopping other projects' VMs failed: {e:#}"
-                                        ))),
-                                    }
-                                });
-                            });
-                        }
                         if action == "chat-destroy-session" {
                             // Raised only by the selected chat (chat.rs
                             // holds that line), and answered by the

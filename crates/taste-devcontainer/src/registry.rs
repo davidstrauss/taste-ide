@@ -886,31 +886,48 @@ impl EnvironmentRegistry {
         }
     }
 
-    /// Stop the running VMs of other workspaces whose IDE is gone
-    /// (`Pool::idle_foreign_vms`), wait for them to be down, and reconcile
-    /// — which is the bring-up this workspace was refused for want of
-    /// room. The toast's "Stop them". Returns how many were stopped.
-    pub async fn stop_idle_foreign_vms(self: &Arc<Self>) -> Result<usize> {
-        let pool = self.pool();
-        let idle = pool.idle_foreign_vms().await?;
-        for vm in &idle {
-            pool.libvirt()
-                .stop(vm)
-                .await
-                .with_context(|| format!("stopping {}", vm.domain))?;
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        for vm in &idle {
-            while pool.libvirt().state(vm).await? == crate::provision::DomainState::Running
-                && std::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    /// Stop every running Taste VM that no IDE owns (`Pool::unowned_vms`)
+    /// — run at the top of every reconcile, before this workspace asks the
+    /// host for room. When the host had no room for one more VM, the
+    /// ones just stopped are waited for, up to a minute, so the bring-up
+    /// that follows finds the room they held. Said once, in a toast and
+    /// the app log, naming the projects by folder.
+    async fn stop_unowned_vms(&self, pool: &crate::pool::Pool) {
+        let unowned = match pool.unowned_vms().await {
+            Ok(unowned) if !unowned.is_empty() => unowned,
+            _ => return,
+        };
+        let full = matches!(
+            pool.room_for_one().await,
+            Err(crate::pool::PoolError::AtCapacity { .. })
+        );
+        let mut stopped = Vec::new();
+        for vm in &unowned {
+            match pool.libvirt().stop(vm).await {
+                Ok(()) => stopped.push(vm.clone()),
+                Err(e) => tracing::warn!("stopping unowned VM {}: {e:#}", vm.domain),
             }
         }
-        if !idle.is_empty() {
-            self.reconcile().await;
+        if stopped.is_empty() {
+            return;
         }
-        Ok(idle.len())
+        let note = unowned_note(&stopped);
+        taste_core::app_log::push("info", "substrate", &note);
+        self.events.publish(Event::Toast(note));
+        if full {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            for vm in &stopped {
+                while std::time::Instant::now() < deadline
+                    && pool
+                        .libvirt()
+                        .state(vm)
+                        .await
+                        .is_ok_and(|state| state == crate::provision::DomainState::Running)
+                {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 
     /// Every VM of the pool as a Resources row, whether or not the ladder
@@ -2191,6 +2208,9 @@ impl EnvironmentRegistry {
         if let Ok(vms) = pool.vms().await {
             self.follow_vm_consoles(&vms);
         }
+        // Other projects' VMs that no window owns go first: they hold the
+        // host's memory for nothing, and possibly the room this one needs.
+        self.stop_unowned_vms(&pool).await;
         self.set_substrate(Substrate::resolve_in(&pool, reporter).await);
         if let Ok(vms) = pool.vms().await {
             self.follow_vm_consoles(&vms);
@@ -2565,26 +2585,6 @@ impl EnvironmentRegistry {
         if let Some(note) = substrate.note() {
             taste_core::app_log::push("warn", "substrate", note);
             self.events.publish(Event::Toast(note.to_string()));
-            // No VM, and the host full of other projects' VMs whose windows
-            // are gone: offer to stop them, since they are what holds the
-            // room this workspace needs (David, 2026-09-22).
-            if !substrate.is_resolved()
-                && matches!(
-                    pool.room_for_one().await,
-                    Err(crate::pool::PoolError::AtCapacity { .. })
-                )
-            {
-                if let Ok(idle) = pool.idle_foreign_vms().await {
-                    if !idle.is_empty() {
-                        self.events.publish(Event::ToastAction {
-                            message: idle_foreign_note(&idle),
-                            label: "Stop them".into(),
-                            action: "stop-idle-vms".into(),
-                            timeout_seconds: 0,
-                        });
-                    }
-                }
-            }
         } else if let Some(line) = substrate.log() {
             // Something to record, nothing to interrupt anyone for: the
             // ladder ended where it was always going to end. See
@@ -2645,10 +2645,10 @@ impl EnvironmentRegistry {
     }
 }
 
-/// The offer's sentence: which other projects' VMs are running with no
-/// window open, by the folder each VM's XML names.
-fn idle_foreign_note(idle: &[Vm]) -> String {
-    let names: Vec<String> = idle
+/// The sentence for the VMs stopped: which other projects' VMs were
+/// running with no window open, by the folder each VM's XML names.
+fn unowned_note(stopped: &[Vm]) -> String {
+    let names: Vec<String> = stopped
         .iter()
         .map(|vm| {
             vm.workspace_root
@@ -2658,13 +2658,10 @@ fn idle_foreign_note(idle: &[Vm]) -> String {
         })
         .collect();
     format!(
-        "{} VM{} of other projects {} running with no IDE window open ({}); stopping {} \
-         frees the room this workspace needs",
-        idle.len(),
-        if idle.len() == 1 { "" } else { "s" },
-        if idle.len() == 1 { "is" } else { "are" },
-        names.join(", "),
-        if idle.len() == 1 { "it" } else { "them" }
+        "Stopped {} VM{} of other projects that had no IDE window open ({})",
+        stopped.len(),
+        if stopped.len() == 1 { "" } else { "s" },
+        names.join(", ")
     )
 }
 

@@ -330,15 +330,15 @@ impl Pool {
         self.check_room(&Sizing::for_host()).await
     }
 
-    /// Running VMs of OTHER workspaces whose IDE is gone: the domain wears
-    /// another workspace's prefix, its XML names a folder, and no window
-    /// holds that folder's supervision lock. These are what a launch at
-    /// capacity offers to stop (David, 2026-09-22: "offer to let me stop
-    /// any VMs launched by other instances of the IDE if they're no
-    /// longer running"). Each would stop on its own within minutes — the
-    /// closed window's sleeper, the guest's own timer — but a launch that
-    /// has no room now wants the room now.
-    pub async fn idle_foreign_vms(&self) -> Result<Vec<Vm>> {
+    /// Running Taste VMs that no IDE owns: the domain wears another
+    /// workspace's prefix, and either its XML names no folder or nobody
+    /// holds that folder's supervision lock. A launch stops these outright
+    /// (David, 2026-09-22: "simply stop any local Taste IDE VMs that lack
+    /// an active owning IDE"). Each would stop on its own within minutes —
+    /// the closed window's sleeper, the guest's own timer — but a launch
+    /// wants its room now, and a VM nobody is using is a commitment of the
+    /// host's memory for nothing.
+    pub async fn unowned_vms(&self) -> Result<Vec<Vm>> {
         let mine = crate::provision::domain_prefix(&self.workspace_root);
         Ok(self
             .libvirt
@@ -347,8 +347,10 @@ impl Pool {
             .into_iter()
             .filter(|vm| vm.state == DomainState::Running)
             .filter(|vm| !vm.domain.starts_with(&mine))
-            .filter(|vm| !vm.workspace_root.as_os_str().is_empty())
-            .filter(|vm| !taste_core::instance::held_elsewhere(&vm.workspace_root))
+            .filter(|vm| {
+                vm.workspace_root.as_os_str().is_empty()
+                    || !taste_core::instance::held_elsewhere(&vm.workspace_root)
+            })
             .collect())
     }
 
