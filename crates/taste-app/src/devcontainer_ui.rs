@@ -117,6 +117,10 @@ pub struct DevcontainerBanner {
     /// advances it while an operation runs.
     bar_offset: Cell<f64>,
     bar_tick: RefCell<Option<gtk::TickCallbackId>>,
+    /// An operation has been drawn and has not ended: the next Running is
+    /// its end, and gets the Done face for a moment before the banner
+    /// goes.
+    operation_underway: Cell<bool>,
     supervisor: Arc<Supervisor>,
     events: EventBus,
     action: Cell<ButtonAction>,
@@ -231,6 +235,7 @@ impl DevcontainerBanner {
             build_step: Cell::new(None),
             bar_offset: Cell::new(0.0),
             bar_tick: RefCell::new(None),
+            operation_underway: Cell::new(false),
             supervisor,
             events,
             action: Cell::new(ButtonAction::Reload),
@@ -772,6 +777,15 @@ impl DevcontainerBanner {
                 self.on_state(&DevcontainerStateEvent::Building);
                 self.posed.set(true);
             }
+            // The operation's last face: the bar full behind Done.
+            "done" => {
+                self.posed.set(false);
+                self.operation_underway.set(true);
+                self.on_state(&DevcontainerStateEvent::Running {
+                    container_id: "posed".into(),
+                });
+                self.posed.set(true);
+            }
             // The operation's first face: the VM coming up, the bar just
             // begun.
             "vm" => {
@@ -811,9 +825,44 @@ impl DevcontainerBanner {
             DevcontainerStateEvent::Preparing { .. }
             | DevcontainerStateEvent::Building
             | DevcontainerStateEvent::Starting => {
+                self.operation_underway.set(true);
                 self.set_progress(Some(operation_fraction(state, self.build_step.get())));
             }
-            _ => self.set_progress(None),
+            // The end of an operation: the bar full behind "Done" for a
+            // moment, then the running face (David, 2026-09-22: "end with
+            // a 'Done -- environment ready' state for a second or two at
+            // the end of the process. The whole bar should be filled").
+            DevcontainerStateEvent::Running { .. } if self.operation_underway.get() => {
+                self.operation_underway.set(false);
+                self.set_progress(Some(1.0));
+                self.set_face("emblem-ok-symbolic", true);
+                self.set_title("Done — environment ready");
+                self.set_button(None);
+                self.set_revealed(true);
+                let weak = Rc::downgrade(self);
+                glib::timeout_add_local_once(DONE_LINGER, move || {
+                    let Some(this) = weak.upgrade() else { return };
+                    // A posed banner is a still: it keeps the face.
+                    if this.posed.get() {
+                        return;
+                    }
+                    // Still running, and nothing else has taken the banner
+                    // since: end the bar and draw the running face.
+                    if matches!(
+                        this.last_state.borrow().as_ref(),
+                        Some(DevcontainerStateEvent::Running { .. })
+                    ) && !this.operation_underway.get()
+                    {
+                        this.set_progress(None);
+                        this.sync_running();
+                    }
+                });
+                return;
+            }
+            _ => {
+                self.operation_underway.set(false);
+                self.set_progress(None);
+            }
         }
 
         match state {
@@ -913,6 +962,8 @@ impl DevcontainerBanner {
 /// it.
 const STRIPE_PERIOD: f64 = 28.0;
 const STRIPE_SPEED: f64 = 12.0;
+/// How long the full bar and "Done" stay before the running face.
+const DONE_LINGER: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// The operation's bar as the row's whole background: the part done in
 /// hazard bands at 45°, phase-shifted by `offset`, the part to come in a

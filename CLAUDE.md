@@ -154,7 +154,8 @@ the two it is; otherwise it needs a container running a server bound
 the wrong way;
 `TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
 safe-mode banner's running-baseline face; `=building` poses the
-operation bar mid-build with its step count, and `=vm` at the VM's boot,
+operation bar mid-build with its step count, `=vm` at the VM's boot, and
+`=done` at its end — the bar full behind "Done — environment ready" —
 which otherwise need a real bring-up under way; — the project's config ready to
 rebuild into, its image failed to build (View Log, Prompt Agent),
 refused, or absent — which otherwise needs a checkout in that state
