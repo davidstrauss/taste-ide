@@ -188,6 +188,20 @@ pub fn claim_in(base: &Path, workspace_root: &Path) -> Supervision {
 
 /// The degraded grant: supervision with no lock behind it, because the
 /// state directory would not cooperate.
+/// Whether some IDE holds `workspace_root`'s supervision — another window
+/// on another folder, alive. A probe, not a claim: the file is opened
+/// and its lock tried and let go at once, and nothing is written, so the
+/// holder is not disturbed and a folder nobody supervises is not left
+/// looking claimed. `false` when there is no lock file: no IDE ever
+/// supervised that folder on this machine.
+pub fn held_elsewhere(workspace_root: &Path) -> bool {
+    let path = lock_path(&supervision_dir(), workspace_root);
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
 fn unlocked(path: PathBuf) -> SupervisionLock {
     // An anonymous handle so `Drop` has something to close. `/dev/null` is
     // openable wherever the IDE runs at all.

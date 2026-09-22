@@ -2672,6 +2672,14 @@ is shouted, but nothing runs either. The rows say what is missing, and
   *"taste-799f-k7m2qx — running, 12 vCPU, 10.0 GiB committed, 4.3 GiB on
   disk of 64 GiB"* — because no per-environment number can explain memory
   the VM took and disk a sparse qcow2 will not give back.
+- **A launch refused for want of room offers to make some.** When the
+  host is at capacity and the VMs holding it belong to other workspaces
+  whose windows are gone — the domain wears another prefix, its XML names
+  a folder, and nobody holds that folder's supervision lock — the toast
+  that says so carries "Stop them": those VMs get their ACPI shutdown,
+  and this workspace's bring-up runs again once they are down (David,
+  2026-09-22). Each would have stopped on its own within minutes; a
+  launch with no room now wants it now.
 - **VMs are cattle, and they are never updated.** The guest does not
   self-update (Zincati is off) and the IDE never reshapes one. The answer
   to a VM that is wrong, old, or gone is a fresh one from the pinned base

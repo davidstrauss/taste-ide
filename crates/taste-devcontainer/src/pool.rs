@@ -325,6 +325,33 @@ impl Pool {
         }
     }
 
+    /// Whether the host has room for one more VM of the size it gives.
+    pub async fn room_for_one(&self) -> std::result::Result<(), PoolError> {
+        self.check_room(&Sizing::for_host()).await
+    }
+
+    /// Running VMs of OTHER workspaces whose IDE is gone: the domain wears
+    /// another workspace's prefix, its XML names a folder, and no window
+    /// holds that folder's supervision lock. These are what a launch at
+    /// capacity offers to stop (David, 2026-09-22: "offer to let me stop
+    /// any VMs launched by other instances of the IDE if they're no
+    /// longer running"). Each would stop on its own within minutes — the
+    /// closed window's sleeper, the guest's own timer — but a launch that
+    /// has no room now wants the room now.
+    pub async fn idle_foreign_vms(&self) -> Result<Vec<Vm>> {
+        let mine = crate::provision::domain_prefix(&self.workspace_root);
+        Ok(self
+            .libvirt
+            .list_all()
+            .await?
+            .into_iter()
+            .filter(|vm| vm.state == DomainState::Running)
+            .filter(|vm| !vm.domain.starts_with(&mine))
+            .filter(|vm| !vm.workspace_root.as_os_str().is_empty())
+            .filter(|vm| !taste_core::instance::held_elsewhere(&vm.workspace_root))
+            .collect())
+    }
+
     /// ACPI shutdown for every VM of the pool that is running.
     pub async fn stop_all(&self) -> Result<usize> {
         let mut stopped = 0;

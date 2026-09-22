@@ -886,6 +886,33 @@ impl EnvironmentRegistry {
         }
     }
 
+    /// Stop the running VMs of other workspaces whose IDE is gone
+    /// (`Pool::idle_foreign_vms`), wait for them to be down, and reconcile
+    /// — which is the bring-up this workspace was refused for want of
+    /// room. The toast's "Stop them". Returns how many were stopped.
+    pub async fn stop_idle_foreign_vms(self: &Arc<Self>) -> Result<usize> {
+        let pool = self.pool();
+        let idle = pool.idle_foreign_vms().await?;
+        for vm in &idle {
+            pool.libvirt()
+                .stop(vm)
+                .await
+                .with_context(|| format!("stopping {}", vm.domain))?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for vm in &idle {
+            while pool.libvirt().state(vm).await? == crate::provision::DomainState::Running
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        if !idle.is_empty() {
+            self.reconcile().await;
+        }
+        Ok(idle.len())
+    }
+
     /// Every VM of the pool as a Resources row, whether or not the ladder
     /// has resolved onto it. The row exists from the moment the domain
     /// does, so a VM that is still booting is on the list while the banner
@@ -2538,6 +2565,26 @@ impl EnvironmentRegistry {
         if let Some(note) = substrate.note() {
             taste_core::app_log::push("warn", "substrate", note);
             self.events.publish(Event::Toast(note.to_string()));
+            // No VM, and the host full of other projects' VMs whose windows
+            // are gone: offer to stop them, since they are what holds the
+            // room this workspace needs (David, 2026-09-22).
+            if !substrate.is_resolved()
+                && matches!(
+                    pool.room_for_one().await,
+                    Err(crate::pool::PoolError::AtCapacity { .. })
+                )
+            {
+                if let Ok(idle) = pool.idle_foreign_vms().await {
+                    if !idle.is_empty() {
+                        self.events.publish(Event::ToastAction {
+                            message: idle_foreign_note(&idle),
+                            label: "Stop them".into(),
+                            action: "stop-idle-vms".into(),
+                            timeout_seconds: 0,
+                        });
+                    }
+                }
+            }
         } else if let Some(line) = substrate.log() {
             // Something to record, nothing to interrupt anyone for: the
             // ladder ended where it was always going to end. See
@@ -2596,6 +2643,29 @@ impl EnvironmentRegistry {
         }
         restored
     }
+}
+
+/// The offer's sentence: which other projects' VMs are running with no
+/// window open, by the folder each VM's XML names.
+fn idle_foreign_note(idle: &[Vm]) -> String {
+    let names: Vec<String> = idle
+        .iter()
+        .map(|vm| {
+            vm.workspace_root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| vm.domain.clone())
+        })
+        .collect();
+    format!(
+        "{} VM{} of other projects {} running with no IDE window open ({}); stopping {} \
+         frees the room this workspace needs",
+        idle.len(),
+        if idle.len() == 1 { "" } else { "s" },
+        if idle.len() == 1 { "is" } else { "are" },
+        names.join(", "),
+        if idle.len() == 1 { "it" } else { "them" }
+    )
 }
 
 /// How many lines of a VM's story are kept. A CoreOS boot is several
