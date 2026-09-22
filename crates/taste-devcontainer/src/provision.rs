@@ -761,6 +761,13 @@ impl Vm {
         disks_dir().join(format!("{}.qcow2", self.domain))
     }
 
+    /// Where the guest release this VM was built from is recorded, beside
+    /// its disk: a VM keeps that release for its whole life, and one
+    /// behind the stream is flagged for its environments to migrate.
+    pub fn release_path(&self) -> PathBuf {
+        disks_dir().join(format!("{}.release", self.domain))
+    }
+
     fn guest_dir(&self) -> PathBuf {
         Keys::for_workspace(&self.workspace_root)
             .dir()
@@ -915,6 +922,35 @@ impl LibvirtSession {
         "local libvirt (qemu:///session)"
     }
 
+    /// The guest release `vm` was built from: its record beside the disk,
+    /// or — for a VM made before the record — the release its disk's
+    /// backing file is named for, as `qemu-img` reads it, recorded then.
+    pub async fn release_of(&self, vm: &Vm) -> Option<String> {
+        if let Ok(text) = std::fs::read_to_string(vm.release_path()) {
+            let release = text.trim();
+            if !release.is_empty() {
+                return Some(release.to_string());
+            }
+        }
+        let info = self
+            .run(
+                "qemu-img",
+                vec![
+                    "info".into(),
+                    "--force-share".into(),
+                    "--output=json".into(),
+                    vm.disk_path().display().to_string(),
+                ],
+            )
+            .await
+            .ok()?;
+        let info: serde_json::Value = serde_json::from_str(&info).ok()?;
+        let backing = info.get("backing-filename")?.as_str()?;
+        let release = release_from_base_name(backing)?;
+        let _ = std::fs::write(vm.release_path(), format!("{release}\n"));
+        Some(release)
+    }
+
     async fn run(&self, program: &str, args: Vec<String>) -> Result<String> {
         let (program, args) = host_argv(self.sandboxed, program, args);
         let output = tokio::process::Command::new(&program)
@@ -1046,6 +1082,8 @@ impl LibvirtSession {
         )
         .await
         .context("creating the VM's disk")?;
+        std::fs::write(vm.release_path(), format!("{}\n", image.release))
+            .with_context(|| format!("writing {}", vm.release_path().display()))?;
 
         let xml = domain_xml(&DomainSpec {
             name: domain.clone(),
@@ -1586,8 +1624,29 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// `44.20260829.3.1` of a base image's path,
+/// `…/fedora-coreos-44.20260829.3.1-qemu.x86_64.qcow2`.
+pub fn release_from_base_name(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next()?;
+    let rest = name.strip_prefix("fedora-coreos-")?;
+    let (release, _) = rest.split_once("-qemu.")?;
+    Some(release.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_base_image_path_names_its_release() {
+        assert_eq!(
+            super::release_from_base_name(
+                "/home/u/.local/share/taste-ide/guests/fedora-coreos-44.20260829.3.1-qemu.x86_64.qcow2"
+            )
+            .as_deref(),
+            Some("44.20260829.3.1")
+        );
+        assert_eq!(super::release_from_base_name("/tmp/other.qcow2"), None);
+    }
+
     #[test]
     fn the_guest_is_told_to_stop_in_seconds() {
         let text = super::ignition(&super::GuestSpec {

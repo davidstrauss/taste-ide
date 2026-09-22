@@ -14,31 +14,33 @@
 //! isolation depends on from ageing in place — through the pin and fresh
 //! VMs, never through a guest updating itself (below).
 //!
-//! # Pinned, not followed
+//! # The stream, followed — for new VMs only
 //!
-//! The release below is a constant, and moving it is a commit. That is the
-//! rule every fetched artifact in this tree follows — `ensure_gvproxy`,
-//! `taste_models` — and it matters more here than anywhere: this file is
-//! booted as a virtual machine, and an image that changed under the IDE
-//! would change what every environment runs without anyone having asked.
-//! [`check_stream`] exists so the pin can be *known* to be behind without
-//! being moved automatically; it reports, it does not act.
+//! New VMs are built from the stream's current release (David,
+//! 2026-09-22: "New VMs follow the stable stream, get updated, and old
+//! ones get flagged"). Each reconcile reads the stream document
+//! ([`refresh_from_stream`]) and records what it names beside the images;
+//! [`image`] is that record, and the release compiled in below is only
+//! the fallback for a machine that has never reached the stream. The
+//! download is still checked — against the digests the stream document
+//! states, fetched over HTTPS from Fedora's build host, where it used to
+//! be against digests a commit wrote in — so what changed is who vouches
+//! for the bits, not whether anything does.
 //!
 //! The download and the digest check are [`taste_models::fetch_pinned`],
 //! reused rather than reimplemented: a second downloader would be a second
 //! place to get the verification subtly wrong.
 //!
-//! # One update path: the pin, and fresh VMs
+//! # A running guest never changes
 //!
 //! A running guest does **not** update itself. FCOS would, through
 //! zincati, and it reboots to do so — every container in the guest killed
 //! at a moment nobody chose — so `crate::provision` switches auto-updates
-//! off in Ignition. The pin here decides what new VMs are built from, and
-//! an environment gets a newer guest by moving to a fresh VM through backup
-//! and restore, never by the VM changing under it (David, 2026-09-20).
-//! What that asks of the pin is that it be *known* to be behind, which is
-//! [`check_stream`]'s job: it reports, so the fleet can offer the move, and
-//! it never acts.
+//! off in Ignition. A VM keeps the release it was built from for its whole
+//! life; an environment gets a newer guest by moving to a fresh VM through
+//! backup and restore, never by the VM changing under it (David,
+//! 2026-09-20). A VM whose release is behind the stream is flagged, and its
+//! environments migrate (`crate::registry` → migrations).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,8 +55,10 @@ pub const STREAM: &str = "stable";
 /// Where [`check_stream`] reads the current release from.
 pub const STREAM_URL: &str = "https://builds.coreos.fedoraproject.org/streams/stable.json";
 
-/// The pinned release. Moving this means moving the digests below with it,
-/// in the same commit, from the same stream document.
+/// The compiled-in release: what a machine that has never read the stream
+/// builds its first VM from. Moving it means moving the digests below with
+/// it, in the same commit, from the same stream document — and it needs
+/// moving only so that a fresh machine offline does not start far behind.
 pub const RELEASE: &str = "44.20260829.3.1";
 
 const QCOW_URL_X86_64: &str = "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20260829.3.1/x86_64/fedora-coreos-44.20260829.3.1-qemu.x86_64.qcow2.xz";
@@ -67,31 +71,29 @@ const QCOW_SHA256_AARCH64: &str =
 const QCOW_UNCOMPRESSED_SHA256_AARCH64: &str =
     "d526f511cd7bd48c6a369310d09f6e6598b7a1a90b5e6776e99f7cc223e1fcda";
 
-/// One architecture's pinned qemu image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One architecture's qemu image: the stream's current release, or the
+/// release compiled in when the stream has never been read.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestImage {
-    pub release: &'static str,
+    pub release: String,
     pub arch: &'static str,
-    pub url: &'static str,
+    pub url: String,
     /// Hex SHA-256 of the compressed artifact, as the stream document
     /// states it.
-    pub sha256: &'static str,
-    /// Size of the compressed artifact.
-    ///
-    /// Measured from the published file rather than stated by the stream,
-    /// which gives only a digest — so it is a second check that can fail
-    /// only when the digest would have failed anyway. It earns its place
-    /// twice over regardless: it is what makes a download report honest
-    /// progress for a gigabyte, and what lets presence be checked without
-    /// rehashing one.
-    pub bytes: u64,
+    pub sha256: String,
+    /// Size of the compressed artifact, where it is known. The compiled-in
+    /// release states it, measured from the published file; a release
+    /// taken from the stream does not — the stream gives digests only —
+    /// and its download's progress takes the server's Content-Length.
+    pub bytes: Option<u64>,
     /// Hex SHA-256 of the **decompressed** qcow2, as the release's own
-    /// `meta.json` states it. The file a VM actually boots from is this
+    /// stream entry states it. The file a VM actually boots from is this
     /// one, so it is checked in its own right after `xz` has run, not
     /// inferred from the compressed digest.
-    pub uncompressed_sha256: &'static str,
-    /// Size of the decompressed qcow2, for the presence check.
-    pub uncompressed_bytes: u64,
+    pub uncompressed_sha256: String,
+    /// Size of the decompressed qcow2, where known, for the presence check
+    /// of a base image made before the digest marker existed.
+    pub uncompressed_bytes: Option<u64>,
 }
 
 impl GuestImage {
@@ -112,7 +114,11 @@ impl GuestImage {
     /// applies to a model, and the same half-measure, since a file this
     /// process wrote and nothing else touches is its own record.
     pub fn is_present(&self) -> bool {
-        std::fs::metadata(self.path()).is_ok_and(|meta| meta.len() == self.bytes)
+        // The name lands only once the digest matched (`fetch_pinned`), so
+        // a file under it is the verified download; the size, where known,
+        // is the second check it always was.
+        std::fs::metadata(self.path())
+            .is_ok_and(|meta| self.bytes.is_none_or(|bytes| meta.len() == bytes))
     }
 
     /// The decompressed qcow2 every VM's disk overlays — the **base
@@ -125,10 +131,23 @@ impl GuestImage {
         ))
     }
 
-    /// Whether the base image is here, at the right size — the same
-    /// half-measure as [`Self::is_present`], for the same reason.
+    /// Whether the base image is here and was verified: its digest marker
+    /// names this release's uncompressed digest — written only once the
+    /// hash matched, so nothing rehashes two gigabytes on a launch — or,
+    /// for a base made before markers, it is the size the compiled-in
+    /// release states.
     pub fn base_is_present(&self) -> bool {
-        std::fs::metadata(self.base_path()).is_ok_and(|meta| meta.len() == self.uncompressed_bytes)
+        let Ok(meta) = std::fs::metadata(self.base_path()) else {
+            return false;
+        };
+        let marked = std::fs::read_to_string(self.base_marker_path())
+            .is_ok_and(|digest| digest.trim() == self.uncompressed_sha256);
+        marked || self.uncompressed_bytes == Some(meta.len())
+    }
+
+    /// Where the base image's verified digest is written.
+    fn base_marker_path(&self) -> PathBuf {
+        self.base_path().with_extension("qcow2.sha256")
     }
 
     /// The day the release was built, as its version names it:
@@ -159,27 +178,24 @@ impl GuestImage {
     /// it exists, the decompression's while that one does, and a base
     /// image at the right size is ready.
     pub fn status(&self) -> GuestImageFetch {
+        let unpacked = self.uncompressed_bytes.unwrap_or(0);
         let (phase, done, total) = if self.base_is_present() {
-            (
-                GuestImagePhase::Ready,
-                self.uncompressed_bytes,
-                self.uncompressed_bytes,
-            )
+            (GuestImagePhase::Ready, unpacked, unpacked)
         } else if let Ok(part) = std::fs::metadata(self.base_path().with_extension("qcow2.part")) {
-            (
-                GuestImagePhase::Decompressing,
-                part.len(),
-                self.uncompressed_bytes,
-            )
+            (GuestImagePhase::Decompressing, part.len(), unpacked)
         } else if self.is_present() {
-            (GuestImagePhase::Decompressing, 0, self.uncompressed_bytes)
+            (GuestImagePhase::Decompressing, 0, unpacked)
         } else if let Ok(part) = std::fs::metadata(self.path().with_extension("part")) {
-            (GuestImagePhase::Fetching, part.len(), self.bytes)
+            (
+                GuestImagePhase::Fetching,
+                part.len(),
+                self.bytes.unwrap_or(0),
+            )
         } else {
             (GuestImagePhase::Absent, 0, 0)
         };
         GuestImageFetch {
-            release: self.release.to_string(),
+            release: self.release.clone(),
             phase,
             done,
             total,
@@ -194,7 +210,7 @@ impl GuestImage {
         total: u64,
     ) {
         report(GuestImageFetch {
-            release: self.release.to_string(),
+            release: self.release.clone(),
             phase,
             done,
             total,
@@ -215,37 +231,27 @@ impl GuestImage {
         report: Arc<dyn Fn(GuestImageFetch) + Send + Sync>,
     ) -> Result<PathBuf> {
         let base = self.base_path();
+        let unpacked = self.uncompressed_bytes.unwrap_or(0);
         if self.base_is_present() {
-            self.report(
-                &*report,
-                GuestImagePhase::Ready,
-                self.uncompressed_bytes,
-                self.uncompressed_bytes,
-            );
+            self.report(&*report, GuestImagePhase::Ready, unpacked, unpacked);
             return Ok(base);
         }
         let compressed = if self.is_present() {
             self.path()
         } else {
-            let (release, total, fetch_report) =
-                (self.release.to_string(), self.bytes, report.clone());
-            self.report(&*report, GuestImagePhase::Fetching, 0, total);
-            self.fetch(move |done, _| {
+            let (release, known, fetch_report) = (self.release.clone(), self.bytes, report.clone());
+            self.report(&*report, GuestImagePhase::Fetching, 0, known.unwrap_or(0));
+            self.fetch(move |done, total| {
                 fetch_report(GuestImageFetch {
                     release: release.clone(),
                     phase: GuestImagePhase::Fetching,
                     done,
-                    total,
+                    total: known.unwrap_or(total),
                 })
             })
             .await?
         };
-        self.report(
-            &*report,
-            GuestImagePhase::Decompressing,
-            0,
-            self.uncompressed_bytes,
-        );
+        self.report(&*report, GuestImagePhase::Decompressing, 0, unpacked);
         // Decompress to a `.part` name and rename only once the digest
         // matches, the way `fetch_pinned` does: a half-written or wrong
         // base must never carry the name a VM boots from.
@@ -277,7 +283,7 @@ impl GuestImage {
             );
         }
         self.report(&*report, GuestImagePhase::Verifying, 0, 0);
-        let expected = self.uncompressed_sha256;
+        let expected = self.uncompressed_sha256.clone();
         let hashed_part = part.clone();
         let digest = tokio::task::spawn_blocking(move || sha256_file(&hashed_part))
             .await
@@ -289,12 +295,10 @@ impl GuestImage {
             );
         }
         std::fs::rename(&part, &base).with_context(|| format!("installing {}", base.display()))?;
-        self.report(
-            &*report,
-            GuestImagePhase::Ready,
-            self.uncompressed_bytes,
-            self.uncompressed_bytes,
-        );
+        std::fs::write(self.base_marker_path(), format!("{expected}\n"))
+            .with_context(|| format!("marking {} verified", base.display()))?;
+        let size = std::fs::metadata(&base).map_or(unpacked, |meta| meta.len());
+        self.report(&*report, GuestImagePhase::Ready, size, size);
         Ok(base)
     }
 
@@ -311,14 +315,19 @@ impl GuestImage {
         }
         taste_models::fetch_pinned(
             "the guest image",
-            self.url,
-            self.sha256,
-            Some(self.bytes),
+            &self.url,
+            &self.sha256,
+            self.bytes,
             &target,
             progress,
         )
         .await
     }
+}
+
+/// `YYYY-MM-DD` of a Unix time, in UTC.
+pub fn date_of(secs: u64) -> String {
+    civil_date(secs)
 }
 
 /// `YYYY-MM-DD` of a Unix time, in UTC (Hinnant's days-to-civil).
@@ -335,36 +344,134 @@ fn civil_date(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// The pinned image for an architecture, or an error naming the ones there
-/// are — a refusal a person can act on, rather than a silent fall back to
-/// the wrong machine's bits.
-pub fn image_for(arch: &str) -> Result<GuestImage> {
+/// The compiled-in release for an architecture, or an error naming the
+/// ones there are — a refusal a person can act on, rather than a silent
+/// fall back to the wrong machine's bits.
+pub fn pinned_for(arch: &str) -> Result<GuestImage> {
+    let image =
+        |arch, url: &str, sha256: &str, bytes, uncompressed_sha256: &str, unpacked| GuestImage {
+            release: RELEASE.to_string(),
+            arch,
+            url: url.to_string(),
+            sha256: sha256.to_string(),
+            bytes: Some(bytes),
+            uncompressed_sha256: uncompressed_sha256.to_string(),
+            uncompressed_bytes: Some(unpacked),
+        };
     match arch {
-        "x86_64" => Ok(GuestImage {
-            release: RELEASE,
-            arch: "x86_64",
-            url: QCOW_URL_X86_64,
-            sha256: QCOW_SHA256_X86_64,
-            bytes: 1_023_919_552,
-            uncompressed_sha256: QCOW_UNCOMPRESSED_SHA256_X86_64,
-            uncompressed_bytes: 2_100_494_336,
-        }),
-        "aarch64" => Ok(GuestImage {
-            release: RELEASE,
-            arch: "aarch64",
-            url: QCOW_URL_AARCH64,
-            sha256: QCOW_SHA256_AARCH64,
-            bytes: 825_142_040,
-            uncompressed_sha256: QCOW_UNCOMPRESSED_SHA256_AARCH64,
-            uncompressed_bytes: 2_048_196_608,
-        }),
-        other => bail!("no pinned guest image for {other}; this project pins x86_64 and aarch64"),
+        "x86_64" => Ok(image(
+            "x86_64",
+            QCOW_URL_X86_64,
+            QCOW_SHA256_X86_64,
+            1_023_919_552,
+            QCOW_UNCOMPRESSED_SHA256_X86_64,
+            2_100_494_336,
+        )),
+        "aarch64" => Ok(image(
+            "aarch64",
+            QCOW_URL_AARCH64,
+            QCOW_SHA256_AARCH64,
+            825_142_040,
+            QCOW_UNCOMPRESSED_SHA256_AARCH64,
+            2_048_196_608,
+        )),
+        other => bail!("no guest image for {other}; this project runs on x86_64 and aarch64"),
     }
 }
 
-/// The pinned image for the architecture the IDE is running on.
+/// The image new VMs are built from on `arch`: the stream's release as
+/// last read ([`refresh_from_stream`]), else the compiled-in one. The
+/// compiled-in release's own sizes are kept when the stream names it too.
+pub fn image_for(arch: &str) -> Result<GuestImage> {
+    let pinned = pinned_for(arch)?;
+    match read_stream_record(arch) {
+        Some(record) if record.release == pinned.release => Ok(pinned),
+        Some(record) => Ok(GuestImage {
+            release: record.release,
+            arch: pinned.arch,
+            url: record.url,
+            sha256: record.sha256,
+            bytes: None,
+            uncompressed_sha256: record.uncompressed_sha256,
+            uncompressed_bytes: None,
+        }),
+        None => Ok(pinned),
+    }
+}
+
+/// The image new VMs are built from on this machine's architecture.
 pub fn image() -> Result<GuestImage> {
     image_for(std::env::consts::ARCH)
+}
+
+/// What the stream said when it was last read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StreamRecord {
+    pub release: String,
+    pub url: String,
+    pub sha256: String,
+    pub uncompressed_sha256: String,
+    /// Unix seconds.
+    pub checked_at: u64,
+}
+
+fn stream_record_path(arch: &str) -> PathBuf {
+    images_dir().join(format!("{STREAM}-{arch}.json"))
+}
+
+fn read_stream_record(arch: &str) -> Option<StreamRecord> {
+    let text = std::fs::read_to_string(stream_record_path(arch)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The last reading of the stream on this machine's architecture.
+pub fn last_stream_check() -> Option<StreamRecord> {
+    read_stream_record(std::env::consts::ARCH)
+}
+
+/// Where the stream's releases are published, and so the only host an
+/// artifact URL it names may point at.
+const RELEASE_HOST: &str = "https://builds.coreos.fedoraproject.org/";
+
+/// Read the stream document and record its current release for this
+/// machine's architecture, which is what new VMs are built from from then
+/// on. Refuses a document whose artifact is not on Fedora's build host.
+/// Each reconcile calls it; failing — offline, the host down — leaves the
+/// last record, or the compiled-in release, in force.
+pub async fn refresh_from_stream() -> Result<StreamRecord> {
+    let arch = std::env::consts::ARCH;
+    let text =
+        taste_models::fetch_text(STREAM_URL, 4 << 20, std::time::Duration::from_secs(15)).await?;
+    let stream = parse_stream(&text, arch)?;
+    if !stream.url.starts_with(RELEASE_HOST) {
+        bail!(
+            "the stream names its image at {}, which is not Fedora's build host",
+            stream.url
+        );
+    }
+    let checked_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let record = StreamRecord {
+        release: stream.release,
+        url: stream.url,
+        sha256: stream.sha256,
+        uncompressed_sha256: stream.uncompressed_sha256,
+        checked_at,
+    };
+    std::fs::create_dir_all(images_dir())?;
+    let path = stream_record_path(arch);
+    let part = path.with_extension("json.part");
+    std::fs::write(&part, serde_json::to_string_pretty(&record)?)?;
+    std::fs::rename(&part, &path)?;
+    Ok(record)
+}
+
+/// Whether `release` is behind `current`. Fedora CoreOS versions are
+/// `<major>.<yyyymmdd>.<stream>.<n>`, compared numerically field by field.
+pub fn release_is_behind(release: &str, current: &str) -> bool {
+    let fields = |r: &str| -> Vec<u64> { r.split('.').map(|f| f.parse().unwrap_or(0)).collect() };
+    fields(release) < fields(current)
 }
 
 /// Hex SHA-256 of a file, streamed: the base image is two gigabytes.
@@ -507,14 +614,13 @@ fn cloud_image_name(value: &serde_json::Value) -> String {
     "unnamed".to_string()
 }
 
-/// Whether the pin is the stream's current release.
+/// Whether the compiled-in release is the stream's current one.
 pub fn pin_is_current(stream: &StreamRelease) -> bool {
     stream.release == RELEASE
 }
 
-/// Read a stream document from a file. The fetch is the caller's — this
-/// crate does no network of its own, and a check that ran on every launch
-/// would be a phone home nobody asked for.
+/// Read a stream document from a file — the offline half of
+/// [`refresh_from_stream`], for a document already on disk.
 pub fn check_stream(path: &Path, arch: &str) -> Result<StreamRelease> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading the stream document {}", path.display()))?;
@@ -524,8 +630,17 @@ pub fn check_stream(path: &Path, arch: &str) -> Result<StreamRelease> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_release_is_behind_by_its_fields_numerically() {
+        assert!(release_is_behind("44.20260829.3.1", "44.20260912.3.0"));
+        assert!(release_is_behind("43.20261230.3.1", "44.20260105.3.0"));
+        assert!(!release_is_behind("44.20260829.3.1", "44.20260829.3.1"));
+        assert!(!release_is_behind("44.20260912.3.0", "44.20260829.3.1"));
+        assert!(release_is_behind("44.20260829.3.9", "44.20260829.3.10"));
+    }
+
+    #[test]
     fn the_release_names_its_day_and_a_unix_time_its_date() {
-        let image = image_for("x86_64").unwrap();
+        let image = pinned_for("x86_64").unwrap();
         assert_eq!(image.release_date().as_deref(), Some("2026-08-29"));
         assert_eq!(civil_date(0), "1970-01-01");
         assert_eq!(civil_date(1_789_000_000), "2026-09-10");
@@ -600,7 +715,7 @@ mod tests {
     fn the_pin_matches_the_document_it_was_taken_from() {
         let stream = parse_stream(STREAM_FIXTURE, "x86_64").unwrap();
         assert!(pin_is_current(&stream));
-        let pinned = image_for("x86_64").unwrap();
+        let pinned = pinned_for("x86_64").unwrap();
         assert_eq!(pinned.url, stream.url, "the pinned URL drifted");
         assert_eq!(pinned.sha256, stream.sha256, "the pinned digest drifted");
         assert_eq!(
@@ -634,7 +749,7 @@ mod tests {
         );
         // The disk's answer for the pinned image names the release either
         // way, whatever this machine has of it.
-        let status = image_for("x86_64").unwrap().status();
+        let status = pinned_for("x86_64").unwrap().status();
         assert_eq!(status.release, RELEASE);
     }
 
@@ -642,7 +757,7 @@ mod tests {
     /// it, and absent until it has been decompressed and checked.
     #[test]
     fn the_base_image_is_named_as_xz_would_name_it() {
-        let image = image_for("x86_64").unwrap();
+        let image = pinned_for("x86_64").unwrap();
         let base = image.base_path();
         assert_eq!(base.parent(), image.path().parent());
         assert_eq!(
@@ -670,18 +785,18 @@ mod tests {
     #[test]
     fn both_pinned_architectures_resolve_and_others_refuse() {
         for arch in ["x86_64", "aarch64"] {
-            let image = image_for(arch).unwrap();
+            let image = pinned_for(arch).unwrap();
             assert_eq!(image.release, RELEASE);
             assert!(image.url.contains(arch), "{}", image.url);
             assert!(image.file_name().contains(arch));
             assert_eq!(image.sha256.len(), 64, "a sha256 is 64 hex characters");
             assert!(
-                image.bytes > 500_000_000,
-                "a CoreOS qcow2 is most of a gigabyte; {} looks wrong",
+                image.bytes.unwrap() > 500_000_000,
+                "a CoreOS qcow2 is most of a gigabyte; {:?} looks wrong",
                 image.bytes
             );
         }
-        let refused = image_for("riscv64").unwrap_err();
+        let refused = pinned_for("riscv64").unwrap_err();
         assert!(
             format!("{refused:#}").contains("riscv64"),
             "the refusal should name what was asked for"

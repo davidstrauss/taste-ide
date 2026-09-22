@@ -201,6 +201,48 @@ pub async fn fetch_pinned(
     Ok(target)
 }
 
+/// A small document over HTTPS, whole, as text: what a stream document
+/// is (`taste_devcontainer::guest::refresh_from_stream`). Refused past
+/// `limit` bytes, since a document that size is not what was asked for,
+/// and after `timeout`, since the caller has a start to get on with.
+pub async fn fetch_text(url: &str, limit: usize, timeout: std::time::Duration) -> Result<String> {
+    tokio::time::timeout(timeout, fetch_text_inner(url, limit))
+        .await
+        .with_context(|| format!("{url} did not answer within {}s", timeout.as_secs()))?
+}
+
+async fn fetch_text_inner(url: &str, limit: usize) -> Result<String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_only()
+        .enable_http1()
+        .wrap_connector(http);
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+    let uri: http::Uri = url.parse().with_context(|| format!("bad URL {url}"))?;
+    let response = client
+        .get(uri)
+        .await
+        .with_context(|| format!("fetching {url}"))?;
+    if !response.status().is_success() {
+        bail!("{url} answered {}", response.status());
+    }
+    let mut body = response.into_body();
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.with_context(|| format!("reading {url}"))?;
+        if let Some(chunk) = frame.data_ref() {
+            bytes.extend_from_slice(chunk);
+            if bytes.len() > limit {
+                bail!("{url} is larger than the {limit} bytes asked for");
+            }
+        }
+    }
+    String::from_utf8(bytes).with_context(|| format!("{url} is not UTF-8"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

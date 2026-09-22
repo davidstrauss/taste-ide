@@ -982,47 +982,91 @@ impl EnvironmentRegistry {
     }
 
     /// The guest image's and the VM's conclusions, once the ladder has
-    /// resolved onto the workspace's VM. `fetched` says the image came
-    /// down in this start; `was_running` that the VM was already up
-    /// before it; `took` how long the bring-up was.
-    fn conclude_vm(&self, fetched: bool, was_running: bool, took: std::time::Duration) {
+    /// resolved onto the workspace's VM. `stream` is this reconcile's
+    /// reading of the stream; `fetched` says the image came down in this
+    /// start; `was_running` that the VM was already up before it; `took`
+    /// how long the bring-up was.
+    async fn conclude_vm(
+        &self,
+        pool: &crate::pool::Pool,
+        stream: &std::result::Result<crate::guest::StreamRecord, String>,
+        fetched: bool,
+        was_running: bool,
+        took: std::time::Duration,
+    ) {
         let substrate = self.substrate();
-        if substrate.vm_details().is_none() {
+        let Some(vm) = substrate.vm_details().cloned() else {
             return;
+        };
+        let Ok(image) = crate::guest::image() else {
+            return;
+        };
+        // "44.20260912.3.0 (released 2026-09-12), the latest stable as of
+        // just now; 983 MiB, verified 2026-09-22": which release, whether
+        // it is the stream's current one and how that is known, and when
+        // its digest was checked.
+        let mut words = image.release.clone();
+        if let Some(date) = image.release_date() {
+            words.push_str(&format!(" (released {date})"));
         }
-        if let Ok(image) = crate::guest::image() {
-            // "976 MiB, released 2026-08-29 (44.20260829.3.1), verified
-            // just now": the size, the release, and when its digest was
-            // last checked against the pin — which is when it was
-            // downloaded, since a present image is not rehashed.
-            let mut words = format!("{} MiB", image.bytes / (1024 * 1024));
-            match image.release_date() {
-                Some(date) => words.push_str(&format!(", released {date} ({})", image.release)),
-                None => words.push_str(&format!(", release {}", image.release)),
+        match stream {
+            Ok(_) => words.push_str(", the latest stable as of just now"),
+            Err(e) => {
+                let last = crate::guest::last_stream_check()
+                    .map(|record| {
+                        format!("; last read {}", crate::guest::date_of(record.checked_at))
+                    })
+                    .unwrap_or_default();
+                words.push_str(&format!(
+                    "; the stable stream could not be read ({}){last}",
+                    e.lines().next().unwrap_or(e)
+                ));
             }
-            if fetched {
-                words.push_str(", downloaded and verified just now");
-            } else if let Some(date) = image.verified_on() {
-                words.push_str(&format!(", verified {date}"));
-            }
-            self.conclude(taste_core::StartupStage::GuestImage, words);
         }
+        let size = image
+            .bytes
+            .or_else(|| std::fs::metadata(image.path()).ok().map(|meta| meta.len()));
+        let mut facts: Vec<String> = Vec::new();
+        if let Some(bytes) = size {
+            facts.push(format!("{} MiB", bytes / (1024 * 1024)));
+        }
+        if fetched {
+            facts.push("downloaded and verified just now".to_string());
+        } else if !image.base_is_present() {
+            facts.push("downloads when a VM is next made".to_string());
+        } else if let Some(date) = image.verified_on() {
+            facts.push(format!("verified {date}"));
+        }
+        if !facts.is_empty() {
+            words.push_str(&format!("; {}", facts.join(", ")));
+        }
+        self.conclude(taste_core::StartupStage::GuestImage, words);
+
         if let Some(facts) = substrate.vm_facts() {
             let size = format!(
                 "{} vCPUs, {:.1} GiB",
                 facts.cpus,
                 facts.memory_mib as f64 / 1024.0
             );
-            let words = if was_running {
-                format!("Already running: {size}.")
+            let mut words = if was_running {
+                format!("Already running: {size}")
             } else if fetched {
-                format!("Booted: {size}.")
+                format!("Booted: {size}")
             } else {
-                format!(
-                    "Booted in {}: {size}.",
-                    crate::registry::duration_words(took)
-                )
+                format!("Booted in {}: {size}", duration_words(took))
             };
+            match pool.libvirt().release_of(&vm).await {
+                Some(release) if crate::guest::release_is_behind(&release, &image.release) => {
+                    words.push_str(&format!(
+                        ", on {release} — behind stable's {}; its environments move to a VM \
+                         on the new release",
+                        image.release
+                    ));
+                }
+                Some(release) => words.push_str(&format!(", on {release}")),
+                None => {}
+            }
+            words.push('.');
             self.conclude(taste_core::StartupStage::Vm, words);
         }
     }
@@ -2425,8 +2469,26 @@ impl EnvironmentRegistry {
         // place a VM is allowed to cost a minute — or, once per machine,
         // the guest image's download, which is said before it starts
         // because a gigabyte with no explanation is a hang.
+        // The stream first: what it names is what a VM made in this
+        // reconcile is built from, and what every VM's release is judged
+        // against (`crate::guest` → the stream, followed).
+        let stream = crate::guest::refresh_from_stream()
+            .await
+            .map_err(|e| format!("{e:#}"));
+        match &stream {
+            Ok(record) => tracing::info!(
+                "the {} stream is at {}",
+                crate::guest::STREAM,
+                record.release
+            ),
+            Err(e) => tracing::warn!("the {} stream could not be read: {e}", crate::guest::STREAM),
+        }
         let pool = self.pool();
-        if pool.will_download() {
+        // A download happens only for a VM that has to be made: a stream
+        // that moved while this workspace's VM exists downloads nothing
+        // now, since that VM keeps its release.
+        let fetching = pool.will_download() && pool.vms().await.map_or(true, |vms| vms.is_empty());
+        if fetching {
             let notice = "Fetching the guest image for this machine's VMs (about 1 GiB, once)";
             taste_core::app_log::push("info", "substrate", notice);
             self.events.publish(Event::Toast(notice.to_string()));
@@ -2469,7 +2531,6 @@ impl EnvironmentRegistry {
         // The VMs' consoles, followed from before the boot so the story
         // has its first lines; again after, for a VM that was made just
         // now.
-        let fetching = pool.will_download();
         let mut was_running = false;
         if let Ok(vms) = pool.vms().await {
             was_running = vms
@@ -2479,7 +2540,8 @@ impl EnvironmentRegistry {
         }
         let bringing_up = std::time::Instant::now();
         self.set_substrate(Substrate::resolve_in(&pool, reporter).await);
-        self.conclude_vm(fetching, was_running, bringing_up.elapsed());
+        self.conclude_vm(&pool, &stream, fetching, was_running, bringing_up.elapsed())
+            .await;
         if let Ok(vms) = pool.vms().await {
             self.follow_vm_consoles(&vms);
         }
