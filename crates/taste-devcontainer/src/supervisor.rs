@@ -2283,9 +2283,17 @@ impl Supervisor {
                     self.set_state(SupervisorState::ConfigDetected);
                     self.set_pending(false);
                 } else {
-                    // Stay in NoConfig — which is no longer a dead end. It
-                    // is the state a workspace with no devcontainer starts
-                    // in, and `reload` will bring the baseline up from here.
+                    // NoConfig — which is no longer a dead end. It is the
+                    // state a workspace with no devcontainer starts in, and
+                    // `reload` will bring the baseline up from here. Said
+                    // when the stages left it in Preparing: the window
+                    // brings the baseline up on the NoConfig it is TOLD,
+                    // and a primary left in "placing the checkout" never
+                    // told it anything — the startup sat on "the container
+                    // comes next" for an hour (2026-09-22).
+                    if matches!(current, SupervisorState::Preparing { .. }) {
+                        self.set_state(SupervisorState::NoConfig);
+                    }
                     self.set_pending(false);
                 }
             }
@@ -4836,6 +4844,20 @@ mod tests {
         sup.recheck().unwrap();
         assert_eq!(sup.state(), SupervisorState::ConfigDetected);
         assert!(!sup.pending_changes());
+    }
+
+    /// A checkout with no config, left in Preparing by the startup's
+    /// stages, is checked back to NoConfig — the state the window brings
+    /// the baseline up on — rather than staying in "placing the checkout"
+    /// with nothing ever told.
+    #[test]
+    fn recheck_ends_the_stages_when_there_is_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        sup.announce_preparing("placing the checkout in the VM");
+        assert!(matches!(sup.state(), SupervisorState::Preparing { .. }));
+        sup.recheck().unwrap();
+        assert_eq!(sup.state(), SupervisorState::NoConfig);
     }
 
     /// Staging is what makes the context ours: a directory validated at
