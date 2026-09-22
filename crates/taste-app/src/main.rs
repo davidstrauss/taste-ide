@@ -305,7 +305,7 @@ fn main() -> glib::ExitCode {
                     weight would claim something happened. */\n\
                  .review-bar { padding: 4px 10px; background-color: \
                    color-mix(in srgb, currentColor 5%, transparent); }\n\
-                 .taste-banner { padding: 6px 12px; background-color: \
+                 .taste-banner { background-color: \
                    color-mix(in srgb, var(--banner-color) 30%, \
                    var(--window-bg-color)); }\n\
                  /* The one face that wants a hand rather than a reading — a \
@@ -350,23 +350,6 @@ fn main() -> glib::ExitCode {
                    background-color: transparent; }\n\
                  progressbar.index-bar > trough > progress { \
                    background-color: @accent_color; }\n\
-                 /* The banner's operation bar — the VM coming up, the \
-                    image (re)built, the container started: hazard \
-                    stripes, yellow on dark, as a site under construction \
-                    wears (David, 2026-09-21). Tall enough for the stripes \
-                    to be stripes, over a track dark enough to show how \
-                    far there is to go; the same yellow in both schemes, \
-                    since it is the colour of the sign and not of the \
-                    theme. */\n\
-                 progressbar.construction > trough, \
-                 progressbar.construction > trough > progress { \
-                   min-height: 8px; border-radius: 0; }\n\
-                 progressbar.construction > trough { \
-                   background-color: alpha(#241f31, 0.55); }\n\
-                 progressbar.construction > trough > progress { \
-                   background-color: transparent; \
-                   background-image: repeating-linear-gradient(-45deg, \
-                     #f5c211 0px, #f5c211 8px, #241f31 8px, #241f31 16px); }\n\
                  /* The pinned prompt floats OVER the transcript, so it \
                     needs a surface of its own: Adwaita's .card colour is \
                     a translucent overlay and the scrolling text reads \

@@ -278,13 +278,17 @@ pub type OpenInterventionHook = Box<dyn Fn(&str) -> gtk::Box>;
 /// What the Resources tab is for, before podman has said how big it is.
 const RESOURCES_TOOLTIP: &str = "This environment's containers, volumes, and images";
 
-/// A VM row's four sparklines and their readings.
+/// A VM row's four sparklines and their readings. Each graph and its
+/// glyph share one box, and the reading is that box's tooltip, so the
+/// glyph says what the graph says (David, 2026-09-21: "The icons next to
+/// the sparklines for VM resources should have the same tooltips as the
+/// graphs").
 struct VmGraphs {
     widget: gtk::Box,
-    cpu: crate::sparkline::Sparkline,
-    memory: crate::sparkline::Sparkline,
-    disk: crate::sparkline::Sparkline,
-    network: crate::sparkline::Sparkline,
+    cpu: (gtk::Box, crate::sparkline::Sparkline),
+    memory: (gtk::Box, crate::sparkline::Sparkline),
+    disk: (gtk::Box, crate::sparkline::Sparkline),
+    network: (gtk::Box, crate::sparkline::Sparkline),
 }
 
 impl VmGraphs {
@@ -308,11 +312,10 @@ impl VmGraphs {
                 .build();
             pair.append(&glyph);
             let sparkline = crate::sparkline::Sparkline::new();
-            sparkline.widget.set_can_target(true);
-            sparkline.widget.set_tooltip_text(Some(what));
+            pair.set_tooltip_text(Some(what));
             pair.append(&sparkline.widget);
             widget.append(&pair);
-            sparkline
+            (pair, sparkline)
         };
         Self {
             cpu: make("CPU", "taste-cpu-symbolic"),
@@ -324,27 +327,27 @@ impl VmGraphs {
     }
 
     fn set(&self, usage: &taste_devcontainer::VmUsage) {
-        self.cpu.set_samples(&usage.cpu);
-        self.memory.set_samples(&usage.memory);
-        self.disk.set_samples(&usage.disk);
-        self.network.set_samples(&usage.network);
+        self.cpu.1.set_samples(&usage.cpu);
+        self.memory.1.set_samples(&usage.memory);
+        self.disk.1.set_samples(&usage.disk);
+        self.network.1.set_samples(&usage.network);
         let peak = |series: &[u16]| series.iter().copied().max().unwrap_or(0);
-        self.cpu.widget.set_tooltip_text(Some(&format!(
+        self.cpu.0.set_tooltip_text(Some(&format!(
             "CPU — {}% now, {}% at the peak of the last five minutes",
             usage.cpu_now,
             peak(&usage.cpu)
         )));
-        self.memory.widget.set_tooltip_text(Some(&format!(
+        self.memory.0.set_tooltip_text(Some(&format!(
             "Memory — {:.1} GiB resident now, {:.1} GiB at the peak of the last five minutes",
             f64::from(usage.memory_now_mib) / 1024.0,
             f64::from(peak(&usage.memory)) / 1024.0
         )));
-        self.disk.widget.set_tooltip_text(Some(&format!(
+        self.disk.0.set_tooltip_text(Some(&format!(
             "Disk — {} now, {} at the peak of the last five minutes",
             rate(usage.disk_now_kib_s),
             rate(u32::from(peak(&usage.disk)))
         )));
-        self.network.widget.set_tooltip_text(Some(&format!(
+        self.network.0.set_tooltip_text(Some(&format!(
             "Network — {} now, {} at the peak of the last five minutes",
             rate(usage.network_now_kib_s),
             rate(u32::from(peak(&usage.network)))
@@ -2566,7 +2569,11 @@ impl Console {
             row.set_height_request(34);
             row.set_margin_top(2);
             row.set_margin_bottom(2);
-            row.set_margin_start(8 + depth_of(resource) * 22);
+            // One level of depth is one icon and one gap (16 + 8): a
+            // nested row's icon sits exactly under its parent's name, so
+            // the tree's insets match instead of missing by two (David,
+            // 2026-09-21: "Make these inner margins match").
+            row.set_margin_start(8 + depth_of(resource) * 24);
             row.set_margin_end(8);
             let icon = gtk::Image::from_icon_name(match resource.kind {
                 ResourceKind::Container => "utilities-terminal-symbolic",

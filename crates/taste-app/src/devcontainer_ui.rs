@@ -80,7 +80,10 @@ pub struct DevcontainerBanner {
     /// of banner should have a nice icon").
     icon: gtk::Image,
     /// The strip itself, whose colour a face may change.
-    row: gtk::Box,
+    /// The banner's coloured surface — the grid the bar and the row share
+    /// — which wears `taste-banner` and `attention`, since a row painting
+    /// its own colour would paint over the bar beneath it.
+    surface: gtk::Grid,
     title: gtk::Label,
     button: gtk::Button,
     /// The second button a question has: Cancel, or No.
@@ -96,12 +99,20 @@ pub struct DevcontainerBanner {
     /// is, in the clear. One shown at a time, and neither outside a question.
     secret: gtk::PasswordEntry,
     text: gtk::Entry,
-    progress: gtk::ProgressBar,
+    /// The operation's bar, drawn UNDER the row as its background: hazard
+    /// stripes filling the row from the left to how far the operation has
+    /// come, sliding left while it runs (David, 2026-09-21: "make it the
+    /// background of the text ... Animate the bar moving to the left").
+    bar: gtk::DrawingArea,
     /// How far the operation in progress has come, 0–1, never moving
     /// backwards within one operation; and the build step the log last
     /// named, which is the bar's fine grain while the image builds.
     progress_value: Cell<f64>,
     build_step: Cell<Option<(u32, u32)>>,
+    /// The stripes' phase, in pixels, and the frame-clock tick that
+    /// advances it while an operation runs.
+    bar_offset: Cell<f64>,
+    bar_tick: RefCell<Option<gtk::TickCallbackId>>,
     supervisor: Arc<Supervisor>,
     events: EventBus,
     action: Cell<ButtonAction>,
@@ -155,10 +166,16 @@ impl DevcontainerBanner {
             .pixel_size(16)
             .valign(gtk::Align::Center)
             .build();
+        // The row itself is transparent, its padding carried as margins:
+        // the banner's colour is the surface's below, so the bar can draw
+        // between the colour and the words.
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(12)
-            .css_classes(["taste-banner"])
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(12)
+            .margin_end(12)
             .build();
         row.append(&icon);
         row.append(&title);
@@ -167,22 +184,31 @@ impl DevcontainerBanner {
         row.append(&button);
         row.append(&secondary);
         row.append(&cancel);
-        let revealer = gtk::Revealer::builder()
-            .child(&row)
-            .transition_type(gtk::RevealerTransitionType::SlideDown)
+        // The bar under the row: both in one cell of a grid, which sizes
+        // the cell by the row and paints its children in order — the
+        // drawing first, the row over it — so the stripes are exactly the
+        // row's height and the text sits on them. (An overlay was tried
+        // and allocated the row its minimum, wrapping the title to a
+        // column.)
+        let bar = gtk::DrawingArea::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .can_target(false)
             .build();
-        let progress = gtk::ProgressBar::builder()
-            .visible(false)
-            .css_classes(["osd"])
+        let underlay = gtk::Grid::builder().css_classes(["taste-banner"]).build();
+        underlay.attach(&bar, 0, 0, 1, 1);
+        underlay.attach(&row, 0, 0, 1, 1);
+        let revealer = gtk::Revealer::builder()
+            .child(&underlay)
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
             .build();
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&revealer);
-        widget.append(&progress);
         let this = Rc::new(Self {
             widget,
             revealer,
             icon,
-            row,
+            surface: underlay.clone(),
             title,
             button: button.clone(),
             cancel: cancel.clone(),
@@ -191,9 +217,11 @@ impl DevcontainerBanner {
             on_prompt_agent: RefCell::new(None),
             secret: secret.clone(),
             text: text.clone(),
-            progress,
+            bar,
             progress_value: Cell::new(0.0),
             build_step: Cell::new(None),
+            bar_offset: Cell::new(0.0),
+            bar_tick: RefCell::new(None),
             supervisor,
             events,
             action: Cell::new(ButtonAction::Reload),
@@ -202,6 +230,7 @@ impl DevcontainerBanner {
             notice_since: Cell::new(None),
             posed: Cell::new(false),
         });
+        this.install_bar();
 
         // A question's answer: the button, Enter in either entry, or the
         // second button for a cancel.
@@ -322,9 +351,9 @@ impl DevcontainerBanner {
     fn set_face(&self, icon: &str, attention: bool) {
         self.icon.set_icon_name(Some(icon));
         if attention {
-            self.row.add_css_class("attention");
+            self.surface.add_css_class("attention");
         } else {
-            self.row.remove_css_class("attention");
+            self.surface.remove_css_class("attention");
         }
     }
 
@@ -472,21 +501,60 @@ impl DevcontainerBanner {
     /// ready"). `None` ends the operation and hides the bar; a fraction
     /// only ever moves it forward, since the steps come in order and a
     /// bar that drops back reads as a second operation.
-    fn set_progress(&self, fraction: Option<f64>) {
+    fn set_progress(self: &Rc<Self>, fraction: Option<f64>) {
         match fraction {
             None => {
-                self.progress.set_visible(false);
-                self.progress.set_fraction(0.0);
                 self.progress_value.set(0.0);
                 self.build_step.set(None);
+                if let Some(tick) = self.bar_tick.borrow_mut().take() {
+                    tick.remove();
+                }
+                self.bar.queue_draw();
             }
             Some(fraction) => {
                 let fraction = fraction.clamp(0.0, 1.0).max(self.progress_value.get());
                 self.progress_value.set(fraction);
-                self.progress.set_fraction(fraction);
-                self.progress.set_visible(true);
+                self.bar.queue_draw();
+                if self.bar_tick.borrow().is_some() {
+                    return;
+                }
+                // The stripes slide left on the frame clock, a steady
+                // pace in pixels per second whatever the frame rate.
+                let weak = Rc::downgrade(self);
+                let last: Cell<Option<i64>> = Cell::new(None);
+                let id = self.bar.add_tick_callback(move |bar, clock| {
+                    let Some(this) = weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let now = clock.frame_time();
+                    if let Some(before) = last.get() {
+                        let dt = (now - before) as f64 / 1_000_000.0;
+                        let offset = (this.bar_offset.get() - STRIPE_SPEED * dt) % STRIPE_PERIOD;
+                        this.bar_offset.set(offset);
+                    }
+                    last.set(Some(now));
+                    bar.queue_draw();
+                    glib::ControlFlow::Continue
+                });
+                *self.bar_tick.borrow_mut() = Some(id);
             }
         }
+    }
+
+    /// Wire the bar's drawing to this banner's state, once it exists.
+    fn install_bar(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.bar.set_draw_func(move |_, cr, width, height| {
+            let Some(this) = weak.upgrade() else { return };
+            draw_stripes(
+                cr,
+                width,
+                height,
+                this.progress_value.get(),
+                this.bar_offset.get(),
+                adw::StyleManager::default().is_dark(),
+            );
+        });
     }
 
     /// A line of the environment's build log: the image build's `STEP
@@ -685,12 +753,7 @@ impl DevcontainerBanner {
             }
             _ => self.set_progress(None),
         }
-        // Hazard stripes for the whole operation, the VM's boot included:
-        // one operation, one bar, one look (David, 2026-09-21: "I don't
-        // see any progress bar or yellow 'construction' striping" — the
-        // plain 3px sliver the VM phase drew was invisible). The class
-        // rides on the bar permanently; visibility is the state's.
-        self.progress.add_css_class("construction");
+
         match state {
             DevcontainerStateEvent::ConfigDetected => {
                 self.set_face("system-run-symbolic", false);
@@ -777,6 +840,61 @@ impl DevcontainerBanner {
         use taste_devcontainer::SupervisorState as S;
         !matches!(self.supervisor.state(), S::Running { .. })
     }
+}
+
+/// The stripes' pitch — one yellow band and one dark, in pixels — and
+/// how fast they slide left, in pixels per second: a walking pace, so
+/// the bar reads as working without drawing the eye from the words on
+/// it.
+const STRIPE_PERIOD: f64 = 28.0;
+const STRIPE_SPEED: f64 = 36.0;
+
+/// The operation's stripes, filling the row from the left to `fraction`
+/// of its width: hazard bands at 45°, phase-shifted by `offset`, in a
+/// yellow and a dark that stay under the text — fairly dark over the dark
+/// scheme, fairly light over the light one — so the words on them keep
+/// their contrast (David, 2026-09-21). Nothing is drawn at zero; the
+/// banner's own colour is the track.
+fn draw_stripes(
+    cr: &gtk::cairo::Context,
+    width: i32,
+    height: i32,
+    fraction: f64,
+    offset: f64,
+    dark: bool,
+) {
+    let filled = f64::from(width) * fraction.clamp(0.0, 1.0);
+    if filled <= 0.5 || height <= 0 {
+        return;
+    }
+    let h = f64::from(height);
+    cr.save().ok();
+    cr.rectangle(0.0, 0.0, filled, h);
+    cr.clip();
+    let (yellow, other) = if dark {
+        ((0.96, 0.76, 0.07, 0.26), (0.0, 0.0, 0.0, 0.34))
+    } else {
+        ((0.96, 0.76, 0.07, 0.42), (1.0, 1.0, 1.0, 0.60))
+    };
+    let half = STRIPE_PERIOD / 2.0;
+    // Each band is a parallelogram leaning left: its top edge `half` wide
+    // at `x`, its bottom edge shifted by the height, so the bands run at
+    // 45° and a leftward slide of the phase reads as leftward motion.
+    let mut x = (offset % STRIPE_PERIOD) - STRIPE_PERIOD - h;
+    let mut yellow_band = true;
+    while x < filled + h {
+        let (r, g, b, a) = if yellow_band { yellow } else { other };
+        cr.set_source_rgba(r, g, b, a);
+        cr.move_to(x, 0.0);
+        cr.line_to(x + half, 0.0);
+        cr.line_to(x + half - h, h);
+        cr.line_to(x - h, h);
+        cr.close_path();
+        let _ = cr.fill();
+        x += half;
+        yellow_band = !yellow_band;
+    }
+    cr.restore().ok();
 }
 
 /// Where one operation stands, 0–1, from the state it is in and the
