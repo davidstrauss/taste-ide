@@ -2478,9 +2478,16 @@ impl Editor {
         // its map (`crate::preview_map`).
         let preview_body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         preview_body.append(&preview_scroller);
+        // ...as wide as the source view's map, read from the map itself,
+        // so the two faces' strips stand in one place.
+        let map_width = match map.measure(gtk::Orientation::Horizontal, -1) {
+            (_, natural, _, _) if natural > 0 => natural,
+            _ => crate::preview_map::WIDTH,
+        };
         preview_body.append(&crate::preview_map::preview_map(
             preview_holder.upcast_ref(),
             &preview_scroller,
+            map_width,
         ));
         // A review tab says what it is comparing, because nothing else in
         // the frame can: the tab looks like every other diff, and the one

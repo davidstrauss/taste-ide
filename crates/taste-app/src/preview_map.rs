@@ -1,163 +1,251 @@
 //! The markdown preview's overview strip: the rendered document, scaled
-//! to a narrow column beside it, with the visible part framed and a
+//! to a narrow column beside it, with the visible part marked and a
 //! click or a drag jumping there — the same bar the source view has
 //! (GtkSourceView's map), for the face that is widgets rather than text
 //! (David, 2026-09-21: "I want markdown previews to have the same sort of
 //! 'zoomed out' bar on the side as code").
 //!
-//! The picture is a [`gtk::WidgetPaintable`] of the preview's content box,
-//! which GTK re-snapshots as the content repaints, so an image landing or
-//! a theme flip shows up here without a hook. It is scaled to fit the
-//! strip's width and height both, so the whole document is always in the
-//! strip: a long document is a thin one, which is what an overview is for.
-//! The frame is drawn over it from the scroller's own adjustment, and a
-//! press anywhere puts that point of the document at the middle of the
-//! view, as the source map's slider does.
+//! It is drawn the way the source map is drawn: the document scaled to
+//! the strip's WIDTH and anchored at the top, a document taller than the
+//! strip scrolling within it in step with the view, and the visible part
+//! a translucent accent block — the same width, the same alignment, the
+//! same slider (David, 2026-09-22). The strip is a widget of its own
+//! with its own `snapshot`, because painting a paintable scaled and
+//! offset is something no closure adapter offers: a `GtkPicture` fits or
+//! centres, and a `GtkDrawingArea` paints with cairo, which a
+//! `GtkWidgetPaintable` cannot be drawn into.
 
 use adw::prelude::*;
+use adw::subclass::prelude::*;
+use gtk::glib;
 
-/// The strip's width. GtkSourceMap's is its one-pixel font times the
-/// right margin, about this; the two stand side by side across the
-/// display-mode switch and should not jump.
-const WIDTH: i32 = 96;
+/// The strip's width when the source map's cannot be read: GtkSourceMap
+/// at its one-pixel font is about this.
+pub const WIDTH: i32 = 96;
 
-/// How much of the foreground the frame around the visible part takes,
-/// and its fill.
-const FRAME_ALPHA: f64 = 0.55;
-const FILL_ALPHA: f64 = 0.08;
+/// The slider's share of the accent colour, as the source map's CSS has
+/// it (`textview.GtkSourceMap > slider`).
+const SLIDER_ALPHA: f32 = 0.25;
 
-/// Build the strip for `content`, the widget the scroller scrolls.
-pub fn preview_map(content: &gtk::Widget, scroller: &gtk::ScrolledWindow) -> gtk::Widget {
-    let paintable = gtk::WidgetPaintable::new(Some(content));
-    let picture = gtk::Picture::builder()
-        .paintable(&paintable)
-        .content_fit(gtk::ContentFit::Contain)
-        .can_shrink(true)
-        .halign(gtk::Align::Fill)
-        .valign(gtk::Align::Fill)
-        .build();
-    let frame = gtk::DrawingArea::builder()
-        .can_target(false)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    // The strip's size is a spacer's, and the picture is laid OVER it and
-    // clipped to it, so the picture's own natural size — the document's
-    // width and height, read back from the paintable — never reaches the
-    // layout. Laid in as the overlay's own child, a short document's
-    // picture fed its size back into the preview's width, the width into
-    // the document's height, and the window stopped painting (2026-09-22:
-    // every frame of a two-block document came out blank).
-    let spacer = gtk::Box::builder()
-        .width_request(WIDTH)
-        .hexpand(false)
-        .vexpand(true)
-        .build();
-    let overlay = gtk::Overlay::builder().child(&spacer).build();
-    overlay.add_overlay(&picture);
-    overlay.set_clip_overlay(&picture, true);
-    overlay.add_overlay(&frame);
-    overlay.set_clip_overlay(&frame, true);
-    overlay.add_css_class("preview-map");
+mod imp {
+    use super::*;
+    use std::cell::{Cell, RefCell};
 
-    // Where the document's picture sits inside the strip: `Contain`
-    // centres it, so the drawn extent and its offset follow from the
-    // paintable's intrinsic size and the strip's allocation.
-    let extent = {
-        let paintable = paintable.clone();
-        move |width: i32, height: i32| -> Option<(f64, f64, f64, f64)> {
-            let (iw, ih) = (
+    #[derive(Default)]
+    pub struct PreviewMap {
+        pub(super) paintable: RefCell<Option<gtk::WidgetPaintable>>,
+        pub(super) adjustment: RefCell<Option<gtk::Adjustment>>,
+        pub(super) width: Cell<i32>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PreviewMap {
+        const NAME: &'static str = "TastePreviewMap";
+        type Type = super::PreviewMap;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for PreviewMap {
+        fn constructed(&self) {
+            self.parent_constructed();
+            self.obj().set_overflow(gtk::Overflow::Hidden);
+            self.obj().add_css_class("preview-map");
+            self.obj().set_vexpand(true);
+        }
+    }
+
+    impl WidgetImpl for PreviewMap {
+        fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
+            match orientation {
+                gtk::Orientation::Horizontal => (self.width.get(), self.width.get(), -1, -1),
+                _ => (0, 0, -1, -1),
+            }
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            let obj = self.obj();
+            let Some(geometry) = obj.geometry() else {
+                return;
+            };
+            let Some(paintable) = self.paintable.borrow().clone() else {
+                return;
+            };
+            // The document, scaled to the strip and scrolled within it.
+            snapshot.save();
+            snapshot.translate(&gtk::graphene::Point::new(0.0, -geometry.offset as f32));
+            snapshot.scale(geometry.scale as f32, geometry.scale as f32);
+            paintable.snapshot(
+                snapshot.upcast_ref::<gtk::gdk::Snapshot>(),
                 f64::from(paintable.intrinsic_width()),
                 f64::from(paintable.intrinsic_height()),
             );
-            if iw <= 0.0 || ih <= 0.0 || width <= 0 || height <= 0 {
-                return None;
-            }
-            let scale = (f64::from(width) / iw).min(f64::from(height) / ih);
-            let (dw, dh) = (iw * scale, ih * scale);
-            let x = (f64::from(width) - dw) / 2.0;
-            let y = (f64::from(height) - dh) / 2.0;
-            Some((x, y, dw, dh))
-        }
-    };
-
-    let adjustment = scroller.vadjustment();
-    {
-        let adjustment = adjustment.clone();
-        let extent = extent.clone();
-        frame.set_draw_func(move |area, cr, width, height| {
-            let Some((x, y, dw, dh)) = extent(width, height) else {
-                return;
-            };
-            let upper = adjustment.upper();
-            if upper <= 0.0 {
-                return;
-            }
-            let top = y + dh * (adjustment.value() / upper);
-            let visible = dh * (adjustment.page_size() / upper).min(1.0);
-            let colour = area.color();
-            let ink = |alpha: f64| {
-                cr.set_source_rgba(
-                    f64::from(colour.red()),
-                    f64::from(colour.green()),
-                    f64::from(colour.blue()),
-                    alpha * f64::from(colour.alpha()),
+            snapshot.restore();
+            // The visible part, as the source map's slider: the accent,
+            // translucent, over what is on screen.
+            if let Some((top, height)) = obj.slider(&geometry) {
+                let colour = obj.color();
+                let rgba = gtk::gdk::RGBA::new(
+                    colour.red(),
+                    colour.green(),
+                    colour.blue(),
+                    colour.alpha() * SLIDER_ALPHA,
                 );
-            };
-            ink(FILL_ALPHA);
-            cr.rectangle(x, top, dw, visible);
-            let _ = cr.fill();
-            ink(FRAME_ALPHA);
-            cr.set_line_width(1.0);
-            cr.rectangle(x + 0.5, top + 0.5, dw - 1.0, (visible - 1.0).max(1.0));
-            let _ = cr.stroke();
-        });
+                snapshot.append_color(
+                    &rgba,
+                    &gtk::graphene::Rect::new(0.0, top as f32, obj.width() as f32, height as f32),
+                );
+            }
+        }
     }
-    {
-        let frame = frame.clone();
-        adjustment.connect_value_changed(move |_| frame.queue_draw());
-    }
-    {
-        let frame = frame.clone();
-        adjustment.connect_changed(move |_| frame.queue_draw());
+}
+
+glib::wrapper! {
+    pub struct PreviewMap(ObjectSubclass<imp::PreviewMap>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+/// How the document sits in the strip: the scale that makes it the
+/// strip's width, its drawn height, and how far it is scrolled up so the
+/// visible part stays in the strip.
+#[derive(Clone, Copy)]
+struct Geometry {
+    scale: f64,
+    drawn_height: f64,
+    offset: f64,
+}
+
+impl PreviewMap {
+    /// The strip for `content`, the widget `scroller` scrolls, `width`
+    /// wide — the source map's width, so the two faces' strips match.
+    pub fn new(content: &gtk::Widget, scroller: &gtk::ScrolledWindow, width: i32) -> Self {
+        let this: Self = glib::Object::new();
+        let imp = this.imp();
+        imp.width.set(width.max(1));
+        let paintable = gtk::WidgetPaintable::new(Some(content));
+        {
+            let weak = this.downgrade();
+            paintable.connect_invalidate_contents(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.queue_draw();
+                }
+            });
+            let weak = this.downgrade();
+            paintable.connect_invalidate_size(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.queue_draw();
+                }
+            });
+        }
+        *imp.paintable.borrow_mut() = Some(paintable);
+        let adjustment = scroller.vadjustment();
+        {
+            let weak = this.downgrade();
+            adjustment.connect_value_changed(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.queue_draw();
+                }
+            });
+            let weak = this.downgrade();
+            adjustment.connect_changed(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.queue_draw();
+                }
+            });
+        }
+        *imp.adjustment.borrow_mut() = Some(adjustment);
+
+        // A press puts that point of the document at the middle of the
+        // view; a drag keeps doing so, as the source map's slider does.
+        let drag = gtk::GestureDrag::new();
+        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let weak = this.downgrade();
+            drag.connect_drag_begin(move |gesture, _x, y| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                if let Some(this) = weak.upgrade() {
+                    this.jump(y);
+                }
+            });
+            let weak = this.downgrade();
+            drag.connect_drag_update(move |gesture, _dx, dy| {
+                if let (Some(this), Some((_, y0))) = (weak.upgrade(), gesture.start_point()) {
+                    this.jump(y0 + dy);
+                }
+            });
+        }
+        this.add_controller(drag);
+        this
     }
 
-    // A press puts that point of the document at the middle of the view;
-    // a drag keeps doing so.
-    let jump = {
-        let adjustment = adjustment.clone();
-        let overlay = overlay.clone();
-        std::rc::Rc::new(move |y: f64| {
-            let Some((_, top, _, dh)) = extent(overlay.width(), overlay.height()) else {
-                return;
-            };
-            if dh <= 0.0 {
-                return;
-            }
-            let fraction = ((y - top) / dh).clamp(0.0, 1.0);
-            let upper = adjustment.upper();
-            let page = adjustment.page_size();
-            let value = (fraction * upper - page / 2.0).clamp(0.0, (upper - page).max(0.0));
-            adjustment.set_value(value);
+    fn geometry(&self) -> Option<Geometry> {
+        let imp = self.imp();
+        let paintable = imp.paintable.borrow().clone()?;
+        let adjustment = imp.adjustment.borrow().clone()?;
+        let (iw, ih) = (
+            f64::from(paintable.intrinsic_width()),
+            f64::from(paintable.intrinsic_height()),
+        );
+        let (w, h) = (f64::from(self.width()), f64::from(self.height()));
+        if iw <= 0.0 || ih <= 0.0 || w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let scale = w / iw;
+        let drawn_height = ih * scale;
+        // A document taller than the strip scrolls within it in step
+        // with the view: at the top of the document the strip shows the
+        // top, at the bottom the bottom.
+        let (value, upper, page) = (
+            adjustment.value(),
+            adjustment.upper(),
+            adjustment.page_size(),
+        );
+        let offset = if drawn_height > h && upper > page {
+            (drawn_height - h) * (value / (upper - page)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        Some(Geometry {
+            scale,
+            drawn_height,
+            offset,
         })
-    };
-    let drag = gtk::GestureDrag::new();
-    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
-    {
-        let jump = jump.clone();
-        drag.connect_drag_begin(move |gesture, _x, y| {
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            jump(y);
-        });
     }
-    {
-        let jump = jump.clone();
-        drag.connect_drag_update(move |gesture, _dx, dy| {
-            if let Some((_, y0)) = gesture.start_point() {
-                jump(y0 + dy);
-            }
-        });
+
+    /// The slider: where the visible part of the document falls in the
+    /// strip, as (top, height).
+    fn slider(&self, geometry: &Geometry) -> Option<(f64, f64)> {
+        let adjustment = self.imp().adjustment.borrow().clone()?;
+        let upper = adjustment.upper();
+        if upper <= 0.0 {
+            return None;
+        }
+        let top = geometry.drawn_height * (adjustment.value() / upper) - geometry.offset;
+        let height = (geometry.drawn_height * (adjustment.page_size() / upper).min(1.0)).max(2.0);
+        Some((top, height))
     }
-    overlay.add_controller(drag);
-    overlay.upcast()
+
+    fn jump(&self, y: f64) {
+        let Some(geometry) = self.geometry() else {
+            return;
+        };
+        let Some(adjustment) = self.imp().adjustment.borrow().clone() else {
+            return;
+        };
+        let fraction = ((y + geometry.offset) / geometry.drawn_height).clamp(0.0, 1.0);
+        let upper = adjustment.upper();
+        let page = adjustment.page_size();
+        let value = (fraction * upper - page / 2.0).clamp(0.0, (upper - page).max(0.0));
+        adjustment.set_value(value);
+    }
+}
+
+/// Build the strip for `content`, the widget the scroller scrolls, as
+/// wide as `width`.
+pub fn preview_map(
+    content: &gtk::Widget,
+    scroller: &gtk::ScrolledWindow,
+    width: i32,
+) -> gtk::Widget {
+    PreviewMap::new(content, scroller, width).upcast()
 }

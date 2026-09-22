@@ -327,6 +327,9 @@ fn main() -> glib::ExitCode {
                    border-radius: 2px; }\n\
                  textview.GtkSourceMap > slider:hover { \
                    background-color: alpha(@accent_bg_color, 0.4); }\n\
+                 /* The markdown preview's map draws its own slider in its \
+                    `color`, at the source map's alpha (preview_map.rs). */\n\
+                 .preview-map { color: @accent_bg_color; }\n\
                  .composer-action, .composer-action > button, \
                  button.composer-action, button.composer-action.circular { \
                    min-width: 26px; min-height: 26px; padding: 2px; \
