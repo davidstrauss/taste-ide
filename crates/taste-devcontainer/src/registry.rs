@@ -1458,13 +1458,39 @@ impl EnvironmentRegistry {
         let files = Files::Remote(keeper.clone());
         let path = crate::provision::guest_checkout_path(&peer, &EnvironmentId::primary());
         let keys = crate::keys::Keys::for_workspace(&peer);
+        // Each step into the VM's story, since "placing the checkout" is
+        // a stage of the banner's bar with View Log beside it, and a stage
+        // that writes nothing reads as a stall (David, 2026-09-22).
         let sync = if files.exists(&path.join(".git")) {
-            Some(crate::peer::sync_primary_peer(
-                &peer, vm, &keys, &files, &path,
-            )?)
+            self.note_vm(
+                &vm.domain,
+                format!(
+                    "the primary's checkout is already at {}; syncing it with the folder",
+                    path.display()
+                ),
+            );
+            let sync = crate::peer::sync_primary_peer(&peer, vm, &keys, &files, &path)?;
+            self.note_vm(
+                &vm.domain,
+                match &sync.note {
+                    Some(note) => format!("checkout and folder in step: {note}"),
+                    None if sync.fast_forwarded => {
+                        "checkout and folder in step; the folder was fast-forwarded".to_string()
+                    }
+                    None => "checkout and folder in step".to_string(),
+                },
+            );
+            Some(sync)
         } else {
             let branch = host.branch_name().unwrap_or_else(|| "main".to_string());
             let workspace_dir = crate::provision::guest_workspace_dir(&peer);
+            self.note_vm(
+                &vm.domain,
+                format!(
+                    "placing the primary's checkout at {} — a fresh repository on {branch}",
+                    path.display()
+                ),
+            );
             let run = |cwd: &Path, argv: &[&str]| -> Result<()> {
                 let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
                 let out = files
@@ -1521,7 +1547,16 @@ impl EnvironmentRegistry {
             let dirty = !host.status()?.is_empty();
             if dirty {
                 host.snapshot_worktree(&snapshot_ref)?;
+                self.note_vm(
+                    &vm.domain,
+                    "the folder has uncommitted work; snapshotted it to carry over",
+                );
             }
+            self.note_vm(
+                &vm.domain,
+                "seeding the checkout from the folder: branches, tags, snapshots, and the \
+                 issues over ssh",
+            );
             crate::peer::push_to_guest(
                 &peer,
                 vm,
@@ -1532,16 +1567,21 @@ impl EnvironmentRegistry {
             if dirty || previous.is_some() {
                 let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;
                 run(&path, &["sh", "-c", &restore])?;
+                let what = if dirty {
+                    "the folder's"
+                } else {
+                    "the last snapshot's"
+                };
                 tracing::info!(
-                    "restored {} uncommitted work in VM {} from {snapshot_ref}",
-                    if dirty {
-                        "the folder's"
-                    } else {
-                        "the last snapshot's"
-                    },
+                    "restored {what} uncommitted work in VM {} from {snapshot_ref}",
                     vm.domain
                 );
+                self.note_vm(
+                    &vm.domain,
+                    format!("restored {what} uncommitted work into the checkout"),
+                );
             }
+            self.note_vm(&vm.domain, "the checkout is placed");
             None
         };
         let checkout = Checkout::Remote {
@@ -1564,6 +1604,10 @@ impl EnvironmentRegistry {
         primary.set_checkout(checkout.clone());
         primary.set_substrate(self.substrate_for(&checkout));
         primary.set_keeper(keeper);
+        self.note_vm(
+            &vm.domain,
+            "the panes now read the checkout through the files service; the container comes next",
+        );
         self.events.publish(Event::CheckoutMoved {
             env: EnvironmentId::primary(),
             checkout,
