@@ -1012,6 +1012,7 @@ impl Supervisor {
         let pending = self.recheck_pending.clone();
         let snapshot_pending = self.snapshot_pending.clone();
         let primary = self.env.id.is_primary();
+        let folder_events = self.events.clone();
         if primary {
             self.watch_folder();
         }
@@ -1047,6 +1048,9 @@ impl Supervisor {
             // without being anything git would show.
             let worktree_changed =
                 primary && !name.starts_with(".git/") && name != ".git" && !churn_path(&name);
+            if worktree_changed && !snapshot_pending.load(Ordering::SeqCst) {
+                folder_events.publish(Event::FolderSync(taste_core::FolderSync::Pending));
+            }
             if (ref_moved || worktree_changed) && !snapshot_pending.swap(true, Ordering::SeqCst) {
                 let weak = weak.clone();
                 let snapshot_pending = snapshot_pending.clone();
@@ -1351,6 +1355,22 @@ impl Supervisor {
         force: bool,
         depth: u8,
     ) -> Result<()> {
+        let events = self.events.clone();
+        events.publish(Event::FolderSync(taste_core::FolderSync::Running {
+            step: "Comparing your folder with Personal".into(),
+            done: 0,
+            total: 0,
+        }));
+        let on_send = {
+            let events = events.clone();
+            move |done: usize, total: usize, next: &Path| {
+                events.publish(Event::FolderSync(taste_core::FolderSync::Running {
+                    step: format!("Sending {} to Personal", next.display()),
+                    done,
+                    total,
+                }));
+            }
+        };
         let sync = crate::peer::sync_primary_peer_with(
             &self.env.peer,
             vm,
@@ -1358,7 +1378,13 @@ impl Supervisor {
             &self.files(),
             path,
             force,
+            &on_send,
         );
+        if let Err(e) = &sync {
+            events.publish(Event::FolderSync(taste_core::FolderSync::Failed {
+                reason: format!("{e:#}"),
+            }));
+        }
         // The mirror's own writes into the folder are not the user's: the
         // folder watch ignores them for a moment.
         *self.folder_quiet_until.lock().unwrap() =
@@ -1371,6 +1397,9 @@ impl Supervisor {
             });
         }
         *self.folder_conflicts.lock().unwrap() = sync.conflicts.clone();
+        events.publish(Event::FolderSync(taste_core::FolderSync::Done {
+            summary: folder_sync_summary(&sync),
+        }));
         if sync.sent > 0 && depth < 2 {
             self.log(format!(
                 "sent {} change(s) from your folder to the checkout in the VM",
@@ -1404,6 +1433,7 @@ impl Supervisor {
         let pending = Arc::new(AtomicBool::new(false));
         let quiet = self.folder_quiet_until.clone();
         let root = folder.clone();
+        let events = self.events.clone();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else { return };
             if matches!(event.kind, notify::EventKind::Access(_)) {
@@ -1424,6 +1454,7 @@ impl Supervisor {
             if pending.swap(true, Ordering::SeqCst) {
                 return;
             }
+            events.publish(Event::FolderSync(taste_core::FolderSync::Pending));
             let weak = weak.clone();
             let pending = pending.clone();
             std::thread::spawn(move || {
@@ -4344,6 +4375,38 @@ fn first_line(text: &str) -> &str {
 
 /// `--userns=keep-id:uid=U,gid=G` for a non-root container user when the
 /// config has not chosen a user namespace itself; nothing otherwise.
+/// What a sync pass moved, in the words the title bar's status lists it
+/// with; `None` when nothing moved.
+fn folder_sync_summary(sync: &crate::peer::PeerSync) -> Option<String> {
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts = Vec::new();
+    if sync.sent > 0 {
+        parts.push(format!(
+            "Sent {} to Personal",
+            plural(sync.sent, "change", "changes")
+        ));
+    }
+    if sync.switched {
+        if let Some(branch) = &sync.branch {
+            parts.push(format!("Switched your folder to {branch}"));
+        }
+    }
+    if sync.received > 0 {
+        parts.push(format!(
+            "Brought {} into your folder",
+            plural(sync.received, "change", "changes")
+        ));
+    }
+    if !sync.conflicts.is_empty() {
+        parts.push(format!(
+            "{} changed on both sides",
+            plural(sync.conflicts.len(), "file", "files")
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// A path a build or a package manager churns, which the mirror's
 /// watches do not react to: none of it is anything git would show in a
 /// project that ignores its build output, and reacting to it would

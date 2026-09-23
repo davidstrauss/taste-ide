@@ -389,6 +389,10 @@ pub struct PeerSync {
     /// Paths changed on both sides since the last mirror, to different
     /// content: nothing was written, and the user is asked.
     pub conflicts: Vec<PathBuf>,
+    /// The checkout's changes written into the folder this pass.
+    pub received: usize,
+    /// The folder was switched onto the checkout's branch this pass.
+    pub switched: bool,
 }
 
 /// Bring the user's folder — the primary's peer — up to date with the
@@ -411,8 +415,12 @@ pub fn sync_primary_peer(
     files: &Files,
     path: &Path,
 ) -> Result<PeerSync> {
-    sync_primary_peer_with(peer, vm, keys, files, path, false)
+    sync_primary_peer_with(peer, vm, keys, files, path, false, &|_, _, _| {})
 }
+
+/// Told of each of the folder's changes as it is sent to the checkout:
+/// how many are done, of how many, and which is next.
+pub type OnSend<'a> = &'a dyn Fn(usize, usize, &Path);
 
 /// [`sync_primary_peer`], with `force` to write the checkout's side over
 /// paths both sides changed — the user's answer to a conflict.
@@ -431,6 +439,7 @@ pub fn sync_primary_peer_with(
     files: &Files,
     path: &Path,
     force: bool,
+    on_send: OnSend,
 ) -> Result<PeerSync> {
     fetch_from_guest(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS)?;
     let git = taste_git::GitWorkspace::discover(peer)
@@ -518,7 +527,7 @@ pub fn sync_primary_peer_with(
         }
     }
     if let (Some(branch), false) = (checkout_branch, commits_unsettled) {
-        mirror_into_folder(&git, &branch, files, path, force, &mut sync)?;
+        mirror_into_folder(&git, &branch, files, path, force, on_send, &mut sync)?;
     }
     Ok(sync)
 }
@@ -532,6 +541,7 @@ fn mirror_into_folder(
     files: &Files,
     path: &Path,
     force: bool,
+    on_send: OnSend,
     sync: &mut PeerSync,
 ) -> Result<()> {
     use taste_git::mirror::Mirror;
@@ -545,7 +555,9 @@ fn mirror_into_folder(
         .mirror_from(branch, tip, snapshot, force)
         .context("mirroring the checkout into this folder")?
     {
-        Mirror::Applied { .. } => {
+        Mirror::Applied { changed, switched } => {
+            sync.received = changed;
+            sync.switched = switched;
             sync.mirrored = true;
             sync.branch = Some(branch.to_string());
             sync.note = None;
@@ -553,7 +565,8 @@ fn mirror_into_folder(
         Mirror::Unchanged => sync.mirrored = true,
         Mirror::Stale => {}
         Mirror::Outgoing { changes } => {
-            for change in &changes {
+            for (done, change) in changes.iter().enumerate() {
+                on_send(done, changes.len(), &change.path);
                 send_change(files, path, change).with_context(|| {
                     format!("sending {} to the checkout", change.path.display())
                 })?;

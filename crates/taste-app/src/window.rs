@@ -1241,6 +1241,47 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .tooltip_text("Main menu")
         .build();
     header.pack_end(&menu_button);
+    // The folder's sync with Personal's checkout: an icon, and on a click
+    // the transfers (syncstatus.rs). Shown once the folder mirrors a
+    // checkout in a VM.
+    let sync_status = crate::syncstatus::SyncStatus::new();
+    header.pack_end(&sync_status.widget);
+    if !supervisor.checkout().is_local() {
+        sync_status.show();
+    }
+    // `TASTE_PROBE_SYNC=running|conflict|failed|done`: the sync status in
+    // that state with its transfers open, which otherwise needs a folder
+    // mirroring a checkout in a VM with something moving.
+    if let Ok(kind) = std::env::var("TASTE_PROBE_SYNC") {
+        use taste_core::FolderSync;
+        sync_status.apply(&FolderSync::Done {
+            summary: Some("Brought 3 changes into your folder".into()),
+        });
+        sync_status.apply(&FolderSync::Done {
+            summary: Some(
+                "Sent 1 change to Personal · Switched your folder to devcontainer".into(),
+            ),
+        });
+        match kind.as_str() {
+            "running" => sync_status.apply(&FolderSync::Running {
+                step: "Sending services/management/Taskfile.yml to Personal".into(),
+                done: 2,
+                total: 5,
+            }),
+            "conflict" => sync_status.set_conflicts(&[
+                PathBuf::from(".devcontainer/Containerfile"),
+                PathBuf::from("README.md"),
+            ]),
+            "failed" => sync_status.apply(&FolderSync::Failed {
+                reason: "the VM did not answer".into(),
+            }),
+            _ => {}
+        }
+        let button = sync_status.widget.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
+            button.popup();
+        });
+    }
 
     // No deploy button. It was the only thing that started a Flatpak
     // build, and it went with the whole gesture (David, 2026-09-08: "drop
@@ -1367,6 +1408,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .default_height(900)
         .content(&toast_overlay)
         .build();
+
+    {
+        // Resolve… in the sync status asks again, with the conflicts as
+        // the last sync found them.
+        let window = window.downgrade();
+        let primary = supervisor.clone();
+        let bus = workspace.events.clone();
+        sync_status.set_on_resolve(move || {
+            let paths = primary.folder_conflicts();
+            if let (Some(window), false) = (window.upgrade(), paths.is_empty()) {
+                ask_folder_conflict(&window, primary.clone(), bus.clone(), &paths);
+            }
+        });
+    }
 
     // --- the responsive ladder --------------------------------------------
     // ENVIRONMENTS.md → the responsive ladder. Two breakpoints, and the
@@ -3276,6 +3331,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         &["window", "editor"]
                     } else if utilization_probe {
                         &["chat"]
+                    } else if std::env::var("TASTE_PROBE_SYNC").is_ok() {
+                        // The popover is its own surface, so it is shot as
+                        // a target of its own beside the window.
+                        &["window", "window.sync-transfers"]
                     } else {
                         &[
                             "window",
@@ -3758,6 +3817,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let bus_for_events = workspace.events.clone();
         let prompt_agent = prompt_agent.clone();
         let refresh_tasks_for_events = refresh_tasks.clone();
+        let sync_status_for_events = sync_status.clone();
         let window_for_pad = window.downgrade();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
@@ -3888,6 +3948,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         files,
                     } => {
                         if env.is_primary() {
+                            if !checkout.is_local() {
+                                sync_status_for_events.show();
+                            }
                             let from = workspace.checkout_path();
                             workspace.set_checkout(checkout.clone(), files);
                             filetree.rehome();
@@ -4094,60 +4157,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // way, and the user picks a side (David, 2026-09-23:
                     // "Stop and ask"). Published once as a conflict
                     // appears; its clearing says nothing.
-                    Event::FolderConflict { paths } if !paths.is_empty() => {
-                        let shown: Vec<String> = paths
-                            .iter()
-                            .take(8)
-                            .map(|p| format!("• {}", p.display()))
-                            .collect();
-                        let more = paths.len().saturating_sub(shown.len());
-                        let body = format!(
-                            "These changed both in your folder and in Personal since they last \
-                             agreed, so neither was written over:\n\n{}{}\n\nUntil you choose, \
-                             your folder stops following Personal.",
-                            shown.join("\n"),
-                            if more > 0 {
-                                format!("\n…and {more} more")
-                            } else {
-                                String::new()
+                    Event::FolderConflict { paths } => {
+                        sync_status_for_events.set_conflicts(&paths);
+                        if !paths.is_empty() {
+                            if let Some(window) = window_for_pad.upgrade() {
+                                ask_folder_conflict(
+                                    &window,
+                                    environments_for_events.primary(),
+                                    bus_for_events.clone(),
+                                    &paths,
+                                );
                             }
-                        );
-                        let dialog = adw::AlertDialog::new(
-                            Some("Your folder and Personal disagree"),
-                            Some(&body),
-                        );
-                        dialog.add_responses(&[
-                            ("later", "Decide Later"),
-                            ("personal", "Keep Personal's"),
-                            ("folder", "Keep My Folder's"),
-                        ]);
-                        dialog
-                            .set_response_appearance("folder", adw::ResponseAppearance::Suggested);
-                        dialog.set_default_response(Some("later"));
-                        dialog.set_close_response("later");
-                        let primary = environments_for_events.primary();
-                        let bus = bus_for_events.clone();
-                        dialog.connect_response(None, move |_, response| {
-                            let keep_folder = match response {
-                                "folder" => true,
-                                "personal" => false,
-                                _ => return,
-                            };
-                            let primary = primary.clone();
-                            let bus = bus.clone();
-                            crate::runtime::runtime().spawn_blocking(move || {
-                                if let Err(e) = primary.resolve_folder_conflict(keep_folder) {
-                                    bus.publish(Event::Toast(format!(
-                                        "The folder and Personal were not reconciled: {e:#}"
-                                    )));
-                                }
-                            });
-                        });
-                        if let Some(window) = window_for_pad.upgrade() {
-                            dialog.present(Some(&window));
                         }
                     }
-                    Event::FolderConflict { .. } => {}
+                    Event::FolderSync(moment) => sync_status_for_events.apply(&moment),
+
                     // An agent's suggested replies, to its own chat.
                     Event::SuggestedReplies { env, replies } => {
                         if let Some(pane) = chats.pane_for(&env) {
@@ -5220,6 +5244,61 @@ fn probe_port(
 /// through here, escaped.
 fn plain_toast(text: &str) -> adw::Toast {
     adw::Toast::new(&glib::markup_escape_text(text))
+}
+
+/// Ask which side keeps the paths the folder and Personal's checkout both
+/// changed, differently (David, 2026-09-23: "Stop and ask"): nothing is
+/// written either way until the answer, and Decide Later leaves the folder
+/// not following Personal.
+fn ask_folder_conflict(
+    window: &adw::ApplicationWindow,
+    primary: std::sync::Arc<taste_devcontainer::Supervisor>,
+    bus: taste_core::EventBus,
+    paths: &[PathBuf],
+) {
+    let shown: Vec<String> = paths
+        .iter()
+        .take(8)
+        .map(|p| format!("• {}", p.display()))
+        .collect();
+    let more = paths.len().saturating_sub(shown.len());
+    let body = format!(
+        "These changed both in your folder and in Personal since they last agreed, so \
+         neither was written over:\n\n{}{}\n\nUntil you choose, your folder stops \
+         following Personal.",
+        shown.join("\n"),
+        if more > 0 {
+            format!("\n…and {more} more")
+        } else {
+            String::new()
+        }
+    );
+    let dialog = adw::AlertDialog::new(Some("Your folder and Personal disagree"), Some(&body));
+    dialog.add_responses(&[
+        ("later", "Decide Later"),
+        ("personal", "Keep Personal's"),
+        ("folder", "Keep My Folder's"),
+    ]);
+    dialog.set_response_appearance("folder", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("later"));
+    dialog.set_close_response("later");
+    dialog.connect_response(None, move |_, response| {
+        let keep_folder = match response {
+            "folder" => true,
+            "personal" => false,
+            _ => return,
+        };
+        let primary = primary.clone();
+        let bus = bus.clone();
+        crate::runtime::runtime().spawn_blocking(move || {
+            if let Err(e) = primary.resolve_folder_conflict(keep_folder) {
+                bus.publish(Event::Toast(format!(
+                    "The folder and Personal were not reconciled: {e:#}"
+                )));
+            }
+        });
+    });
+    dialog.present(Some(window));
 }
 
 /// Whether the startup page has begun a NEW start since it settled —

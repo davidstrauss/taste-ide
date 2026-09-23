@@ -55,6 +55,7 @@ mod semantic;
 mod sparkline;
 mod startup;
 mod stripes;
+mod syncstatus;
 mod tabfamily;
 mod tasks;
 mod textline;

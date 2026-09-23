@@ -145,6 +145,8 @@ indicator that far into a fetch (MiB), rate and time left in its tooltip
 poses the backlog's status filter on that button, through the toggle
 itself — the filtered list, and the panel's height, which a filter must
 not move;
+`TASTE_PROBE_SYNC=running` (or `conflict`, `failed`, `done`) poses the
+title bar's folder-sync status in that state with its transfers open;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
 `TASTE_PROBE_TASKS=none` leaves the Tasks section empty the same way (it
 otherwise poses more tasks than fit, namespaced ones among them),

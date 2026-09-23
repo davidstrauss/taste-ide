@@ -150,6 +150,9 @@ pub enum Event {
         env: crate::environment::EnvironmentId,
         name: String,
     },
+    /// How the user's folder and the primary's checkout are keeping in
+    /// step: the title bar's sync status (taste-app `syncstatus`).
+    FolderSync(FolderSync),
     /// The user's folder and the primary's checkout both changed these
     /// paths, differently, since the folder last mirrored the checkout:
     /// nothing was written, and the user chooses a side. Empty: resolved.
@@ -435,6 +438,7 @@ impl Event {
             | Event::TaskState { .. }
             | Event::SuggestedReplies { .. }
             | Event::FolderConflict { .. }
+            | Event::FolderSync(_)
             | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }
@@ -447,6 +451,26 @@ impl Event {
             | Event::Controller { .. } => None,
         }
     }
+}
+
+/// One moment of the folder's sync with the primary's checkout
+/// (`taste_git::mirror`), for the title bar's status and its list of
+/// transfers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderSync {
+    /// A change was seen on one side; a pass follows in a moment.
+    Pending,
+    /// A pass is under way: what it is doing, and how far — `total` 0 when
+    /// there is no count to give.
+    Running {
+        step: String,
+        done: usize,
+        total: usize,
+    },
+    /// A pass ended: what moved, or `None` when nothing needed to.
+    Done { summary: Option<String> },
+    /// A pass failed, and why.
+    Failed { reason: String },
 }
 
 /// Flatpak packaging states, mirrored from `taste-flatpak` so the UI and
