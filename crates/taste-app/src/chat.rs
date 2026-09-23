@@ -2403,10 +2403,14 @@ impl ChatPane {
         // starts it. A line, not a dialog: there is no question to answer —
         // the user already knows what they want to do, and a modal between
         // them and their own send would be asking permission to obey.
+        // The whole width the bar has, wrapping only when the column is
+        // narrower than the sentence: a cap of forty characters broke
+        // "your message sends when it is up" in two with room to spare
+        // (David, 2026-09-23: "Weird wrapping").
         let revive_label = gtk::Label::builder()
             .xalign(0.0)
+            .hexpand(true)
             .wrap(true)
-            .max_width_chars(40)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .css_classes(["caption", "dim-label"])
             .build();
@@ -2424,6 +2428,32 @@ impl ChatPane {
             icon.set_pixel_size(12);
             icon.set_valign(gtk::Align::Start);
             revive_box.append(&icon);
+            // Centred on the text's FIRST line, measured (textline.rs):
+            // top-aligned it sat above the line, since a caption's line
+            // box is taller than twelve pixels, and centred on the whole
+            // label it would drop when the sentence wraps (David,
+            // 2026-09-23: "Alignment is off").
+            let align = {
+                let icon = icon.clone();
+                let label = revive_label.clone();
+                move || {
+                    let icon = icon.clone();
+                    let label = label.clone();
+                    glib::idle_add_local_once(move || {
+                        if let Some(mid) = crate::textline::first_line_mid(label.upcast_ref()) {
+                            let top = (mid - 6).max(0);
+                            if icon.margin_top() != top {
+                                icon.set_margin_top(top);
+                            }
+                        }
+                    });
+                }
+            };
+            {
+                let align = align.clone();
+                revive_label.connect_map(move |_| align());
+            }
+            revive_label.connect_label_notify(move |_| align());
         }
         revive_box.append(&revive_label);
         let revive_bar = gtk::Revealer::builder()
@@ -4530,6 +4560,11 @@ impl ChatPane {
     /// starting state and the queue behind it; or it is down, and sending
     /// is what starts it.
     fn sync_revive_bar(&self) {
+        // The probe's pose of this line holds against the environment's
+        // own state, which in a probe is not starting.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("starting") {
+            return;
+        }
         let Some(supervisor) = self.environments.get(&self.environment) else {
             self.revive_bar.set_reveal_child(false);
             return;
@@ -10560,6 +10595,16 @@ impl ChatPane {
             }
             // `stopped`: the same turn, stopped by the user — the steps it
             // left running settled, as the end of a turn settles them.
+            // `starting`: the line above the composer while the chat's
+            // environment comes up, with a message waiting on it — the
+            // longest thing it says.
+            Ok("starting") => {
+                self.revive_label.set_label(&format!(
+                    "{} is starting — your message sends when it is up",
+                    self.environment
+                ));
+                self.revive_bar.set_reveal_child(true);
+            }
             // `replies`: the turn over on a question, the agent's suggested
             // answers under it as buttons (`suggest_replies`).
             Ok("replies") => {
