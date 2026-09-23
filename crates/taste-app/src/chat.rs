@@ -2329,10 +2329,19 @@ impl ChatPane {
         // here takes focus when the card appears and nothing is bound to a
         // key: approving is a deliberate act, and Dispatch's Escape stays
         // in its own box (compose.rs).
+        //
+        // Every line FILLED, not end-aligned: three answers that did not
+        // fit side by side wrapped one per line at three different widths,
+        // each pushed to the right edge — a staircase whose widest step
+        // was the least important answer (David, 2026-09-23: "This layout
+        // is awful"). Filled, a row that fits is shared out, and a stack
+        // is a column of equal buttons, the way an AdwAlertDialog stacks
+        // its responses when they do not fit.
         let permission_answers = adw::WrapBox::builder()
             .child_spacing(8)
             .line_spacing(8)
-            .align(1.0)
+            .justify(adw::JustifyMode::Fill)
+            .justify_last_line(true)
             .build();
         permission_answers.set_widget_name("permission-answers");
         // What a standing answer would bind, said BEFORE it is given.
@@ -2342,9 +2351,7 @@ impl ChatPane {
         let permission_scope = gtk::Label::builder()
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(40)
-            .xalign(1.0)
-            .halign(gtk::Align::End)
+            .xalign(0.0)
             .visible(false)
             .css_classes(["caption", "dim-label"])
             .build();
@@ -11590,6 +11597,27 @@ fn permission_face(
         .as_ref()
         .and_then(|locations| locations.first())
         .map(|location| location.path.display().to_string());
+    // The IDE's own tools come over MCP, where no adapter has a kind to
+    // give them — so `ide_exec` asked "Ide Exec (IDE)", with the command it
+    // wanted to run nowhere on the card. Read by name, the way the
+    // transcript's steps already are (`is_command_call`).
+    let raw_title = request
+        .tool_call
+        .fields
+        .title
+        .as_deref()
+        .unwrap_or_default();
+    let raw_input = request.tool_call.fields.raw_input.as_ref();
+    let ide_tool = mcp_tool_name(raw_title);
+    if let Some(name) = ide_tool.as_deref().filter(|name| is_ide_command_tool(name)) {
+        return PermissionFace {
+            icon: "utilities-terminal-symbolic",
+            title: "Run a command?".into(),
+            subtitle: format!("{agent} · {environment}"),
+            code: Some(command_input_line(name, raw_input).unwrap_or(detail)),
+        };
+    }
+    let detail = tool_headline(raw_title, raw_input).unwrap_or(detail);
     let (icon, question) = match request.tool_call.fields.kind {
         Some(ToolKind::Execute) => ("utilities-terminal-symbolic", Some("Run a command?")),
         Some(ToolKind::Edit) => ("document-edit-symbolic", Some("Edit a file?")),

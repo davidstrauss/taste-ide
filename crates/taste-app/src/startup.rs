@@ -872,7 +872,16 @@ fn duration_words(took: std::time::Duration) -> String {
 /// A substep as one short line: the first line, its first letter up,
 /// cut with an ellipsis where a log line runs on.
 fn substep_words(text: &str) -> String {
-    let first = text.lines().next().unwrap_or(text).trim();
+    // One space between words: podman prints a continued RUN as one line
+    // with the Containerfile's indentation still in it, which read as
+    // gaps down the middle of the step ("install        golang").
+    let first = text
+        .lines()
+        .next()
+        .unwrap_or(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut chars = first.chars();
     let mut out: String = match chars.next() {
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
@@ -887,6 +896,14 @@ fn substep_words(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_continued_run_reads_as_one_spaced_line() {
+        assert_eq!(
+            substep_words("RUN dnf -y install        golang go-task just      nodejs"),
+            "RUN dnf -y install golang go-task just nodejs"
+        );
+    }
 
     #[test]
     fn preparing_words_name_their_step_and_build_lines_their_number() {

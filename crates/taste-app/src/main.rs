@@ -345,13 +345,17 @@ fn main() -> glib::ExitCode {
                  .startup-card, .startup-log { border-radius: 12px; \
                    box-shadow: 0 0 0 1px alpha(@window_fg_color, 0.18), \
                      0 1px 3px alpha(black, 0.25); }\n\
-                 .startup-card { background-color: @card_bg_color; \
-                   padding: 18px 24px; }\n\
+                 /* Opaque, the log's own surface: Adwaita's card colour \
+                    is translucent, and the stripes read through it under \
+                    the checklist's text (David, 2026-09-23: \"Darken the \
+                    translucent background\"). */\n\
+                 .startup-card { background-color: @view_bg_color; \
+                   color: @view_fg_color; padding: 18px 24px; }\n\
                  .startup-log { background-color: @view_bg_color; }\n\
                  .startup-step-done { color: @success_color; }\n\
                  /* What a checked step came to reads as text, not as \
                     more of the check's green. */\n\
-                 .startup-step-done .caption { color: @card_fg_color; }\n\
+                 .startup-step-done .caption { color: @view_fg_color; }\n\
                  .startup-step-failed { color: @error_color; }\n\
                  .startup-step-pending { opacity: 0.7; }\n\
                  tabbar.startup-locked tab:not(:selected) { opacity: 0.45; }\n\
