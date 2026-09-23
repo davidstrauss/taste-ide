@@ -370,6 +370,22 @@ pub const GUEST_STOP_DROPINS: [(&str, &str); 3] = [
     ),
 ];
 
+/// The guest's inotify limits, raised: every dev server, bundler, test
+/// watcher, language server, and editor in its containers takes watches
+/// and instances from one per-user pool, and the kernel's defaults (128
+/// instances) are what agents kept running into as "too many open files"
+/// and ENOSPC from a watcher (David, 2026-09-23: "We should set the VM OS
+/// file watch limits high. It's a common issue agents are running
+/// into"). The VM is the environment's own machine, and a watch costs
+/// about a kilobyte of kernel memory, so a million of them is a gigabyte
+/// at the very worst. Written by Ignition for a new VM, and by
+/// [`LibvirtSession::tune_guest_shutdown`] — and applied at once — into
+/// one that predates it.
+pub const GUEST_INOTIFY_SYSCTL: (&str, &str) = (
+    "/etc/sysctl.d/90-taste-inotify.conf",
+    "fs.inotify.max_user_watches = 1048576\nfs.inotify.max_user_instances = 8192\nfs.inotify.max_queued_events = 65536\n",
+);
+
 /// The guest's dead man's switch: a timer that powers the VM off once no
 /// ssh session has been established for a while. The IDE holds one for
 /// as long as it lives — the keeper's `podman exec` rides it — so the
@@ -501,7 +517,7 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
     // on the other side (David, 2026-09-22: "A ton of time gets wasted
     // waiting on this"). Ten seconds for a unit, fifteen for the user
     // manager that holds the containers.
-    for (path, contents) in GUEST_STOP_DROPINS {
+    for (path, contents) in GUEST_STOP_DROPINS.into_iter().chain([GUEST_INOTIFY_SYSCTL]) {
         files.push(serde_json::json!({
             "path": path,
             "mode": 420,
@@ -1566,6 +1582,7 @@ fn guest_tuning_script() -> String {
         .iter()
         .map(|(path, contents)| (*path, *contents, "644"))
         .collect();
+    files.push((GUEST_INOTIFY_SYSCTL.0, GUEST_INOTIFY_SYSCTL.1, "644"));
     files.push((GUEST_IDLE_OFF_SCRIPT_PATH, GUEST_IDLE_OFF_SCRIPT, "755"));
     files.push((
         "/etc/systemd/system/taste-idle-off.service",
@@ -1582,6 +1599,12 @@ fn guest_tuning_script() -> String {
             "cat > /tmp/taste-tune-{index} <<'TASTE_EOF'\n{contents}TASTE_EOF\nput /tmp/taste-tune-{index} {path} {mode}\n"
         ));
     }
+    // The limits apply now, not at the next boot: a VM already running
+    // is where an agent is hitting them. Idempotent, so every time.
+    script.push_str(&format!(
+        "sysctl -q -p {} >/dev/null 2>&1 || true\n",
+        GUEST_INOTIFY_SYSCTL.0
+    ));
     script.push_str(
         "if [ \"$changed\" = 1 ]; then systemctl daemon-reload; \
          systemctl enable --now taste-idle-off.timer >/dev/null 2>&1 || true; echo changed; fi\n",
@@ -1870,6 +1893,10 @@ mod tests {
                 .iter()
                 .any(|f| f["path"] == "/var/lib/systemd/linger/core"),
             "core must linger for its podman socket to be up from boot"
+        );
+        assert!(
+            files.iter().any(|f| f["path"] == GUEST_INOTIFY_SYSCTL.0),
+            "the raised inotify limits are in every new guest"
         );
         let links = parsed["storage"]["links"].as_array().unwrap();
         let socket = links
