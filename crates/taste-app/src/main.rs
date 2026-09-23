@@ -663,6 +663,13 @@ fn main() -> glib::ExitCode {
                     be normal-sized toolbar buttons\"). */\n\
                  .intervention-bar button.intervention-button { \
                    border-radius: 6px; }\n\
+                 /* ...and packed as one cluster: the platform's 34px \
+                    each put a button's width of air between glyphs, and \
+                    the row read as five scattered controls (David, \
+                    2026-09-23: \"Pull these buttons closer together\"). \
+                    Narrower, not shorter: the target keeps its height. */\n\
+                 .intervention-bar button.intervention-button { \
+                   min-width: 28px; padding-left: 4px; padding-right: 4px; }\n\
                  /* The Logs and Ports sections' rows (filetree.rs) share \
                     the backlog's column and wear its exact row geometry, \
                     so a dot in one list sits over a dot in the other. */\n\

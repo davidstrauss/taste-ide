@@ -134,7 +134,7 @@ impl Panel {
         while let Some(child) = self.widget.first_child() {
             self.widget.remove(&child);
         }
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         content.set_margin_top(4);
         content.set_margin_bottom(4);
         content.set_margin_start(6);

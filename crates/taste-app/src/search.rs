@@ -469,6 +469,22 @@ impl ListStepper {
                 let row = &rows[next];
                 row.add_css_class("search-hit");
                 self.at.set(Some(row.index()));
+                // The keyboard follows the hit when it is not in the box —
+                // the user tabbed here from a listing — as the tree's own
+                // stepper does. Left where it was, it stayed in the list
+                // Tab came from, and Up and Down went on moving through
+                // THAT list's rows: stepping onto Tasks from the tree,
+                // the arrows walked the files (David, 2026-09-23).
+                let in_box = row
+                    .root()
+                    .and_then(|root| gtk::prelude::RootExt::focus(&root))
+                    .is_some_and(|focus| {
+                        focus.is::<gtk::SearchEntry>()
+                            || focus.ancestor(gtk::SearchEntry::static_type()).is_some()
+                    });
+                if !in_box {
+                    row.grab_focus();
+                }
                 // Into view, without taking focus off the box.
                 if let Some(scroller) = row
                     .ancestor(gtk::ScrolledWindow::static_type())
@@ -1314,6 +1330,42 @@ impl Search {
             glib::Propagation::Stop
         });
         widget.add_controller(keys);
+    }
+
+    /// Under a query, Up and Down in `list` step `panel`'s hits, as they
+    /// do from the box — the stop moving to `panel` first if it was
+    /// elsewhere, since the keyboard being in this list says which
+    /// section the user is reading. Without it the arrows were GTK's
+    /// row-by-row navigation, which stops on the dimmed non-matches and
+    /// the headings and runs off the list's end into the next widget. For
+    /// the lists stepped in place (`ListStepper`: Ports, Tasks, Logs).
+    pub fn arrows_step_panel(list: &impl IsA<gtk::Widget>, search: &Rc<Search>, panel: Panel) {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(search);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            use gtk::gdk::Key;
+            if !matches!(key, Key::Up | Key::Down) {
+                return glib::Propagation::Proceed;
+            }
+            let Some(search) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if search.query.borrow().is_empty() {
+                return glib::Propagation::Proceed;
+            }
+            if search.stepping.get() != panel {
+                search.move_stepping_to(panel);
+                search.redraw();
+            }
+            search.step(if key == Key::Up {
+                Step::Prev
+            } else {
+                Step::Next
+            });
+            glib::Propagation::Stop
+        });
+        list.add_controller(keys);
     }
 
     /// TASTE_PROBE_CHECK only: pose a query as if typed.

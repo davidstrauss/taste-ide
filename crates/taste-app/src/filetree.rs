@@ -483,6 +483,9 @@ pub struct FileTree {
     tasks_ghost_label: gtk::Label,
     tasks: RefCell<(Vec<TaskRow>, Option<String>, bool)>,
     task_in_front: RefCell<Option<String>>,
+    /// The file whose tab is in front, when the tab in front is a file's:
+    /// the one row the tree may light (`select_for_editor`).
+    file_in_front: RefCell<Option<PathBuf>>,
     /// The query's hits inside each task's output, by name, as the window
     /// last counted them (`set_task_hits`); and the section's count banner.
     task_hits: RefCell<HashMap<String, usize>>,
@@ -1364,6 +1367,7 @@ impl FileTree {
             tasks_ghost_label,
             tasks: RefCell::new((Vec::new(), None, false)),
             task_in_front: RefCell::new(None),
+            file_in_front: RefCell::new(None),
             task_hits: RefCell::new(HashMap::new()),
             tasks_results,
             on_open_task: RefCell::new(None),
@@ -2300,6 +2304,14 @@ impl FileTree {
         crate::search::Search::tab_switches_panels(&self.list_holder, search);
         crate::search::Search::tab_switches_panels(&self.ports_list, search);
         crate::search::Search::tab_switches_panels(&self.logs_list, search);
+        // The arrows, in the lists stepped in place, step their own hits.
+        for (list, panel) in [
+            (&self.ports_list, crate::search::Panel::Ports),
+            (&self.tasks_list, crate::search::Panel::Tasks),
+            (&self.logs_list, crate::search::Panel::Logs),
+        ] {
+            crate::search::Search::arrows_step_panel(list, search, panel);
+        }
     }
 
     fn apply_query(self: &Rc<Self>, query: crate::search::Query) {
@@ -2979,6 +2991,10 @@ impl FileTree {
     pub fn select_for_editor(self: &Rc<Self>, focused: crate::editor::Focused) {
         use crate::editor::Focused;
         *self.pending_select.borrow_mut() = None;
+        *self.file_in_front.borrow_mut() = match &focused {
+            Focused::File(path) => Some(path.clone()),
+            _ => None,
+        };
         // Whatever the strip moved to, the changed-file rows answer for it:
         // the one whose document is in front is the one lit.
         self.mark_open_change_row();
@@ -3053,6 +3069,24 @@ impl FileTree {
         let selection = list.model().and_downcast::<gtk::SingleSelection>()?;
         let model = selection.model().and_downcast::<gtk::TreeListModel>()?;
         Some((list, selection, model))
+    }
+
+    /// Put the tree's selection back on the file in front — its row if it
+    /// is showing, else nothing — without scrolling or opening a folder.
+    fn restore_tree_selection(&self) {
+        let Some((_, selection, model)) = self.tree_selection() else {
+            return;
+        };
+        let front = self.file_in_front.borrow().clone();
+        let at = front.and_then(|path| {
+            (0..model.n_items()).find(|&index| {
+                model
+                    .row(index)
+                    .and_then(|row| row.item().and_downcast::<BoxedAnyObject>())
+                    .is_some_and(|item| item.borrow::<FileNode>().path == path)
+            })
+        });
+        selection.set_selected(at.unwrap_or(gtk::INVALID_LIST_POSITION));
     }
 
     fn clear_tree_selection(&self) {
@@ -6374,12 +6408,24 @@ impl FileTree {
                 .unwrap()
                 .borrow::<FileNode>()
                 .clone();
-            if node.ghost && node.is_dir {
-                tree.create_ghost_dir(&node.path);
-            } else if node.ghost {
-                tree.create_ghost(&node.path);
-            } else if node.is_dir {
-                row.set_expanded(!row.is_expanded());
+            if node.is_dir || node.ghost {
+                if node.ghost && node.is_dir {
+                    tree.create_ghost_dir(&node.path);
+                } else if node.ghost {
+                    tree.create_ghost(&node.path);
+                } else {
+                    row.set_expanded(!row.is_expanded());
+                }
+                // The click selected the row on its way to toggling it, and
+                // a folder opens no tab: the blue goes back to the file in
+                // front, or to nothing when the tab in front is not a file
+                // (David, 2026-09-23: "Nothing should be blue in the files
+                // area if I have a tab open that corresponds to a non-file
+                // object"). After the click is done with the selection.
+                // In place: no scroll to it and no folder opened for it,
+                // which would fight the click that just toggled one.
+                let tree = tree.clone();
+                glib::idle_add_local_once(move || tree.restore_tree_selection());
             } else {
                 // A file with content hits opens at the first of them; once
                 // it is the file on screen, each further click steps to the
