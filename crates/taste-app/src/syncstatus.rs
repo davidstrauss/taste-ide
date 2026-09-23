@@ -337,7 +337,9 @@ impl SyncStatus {
     fn set_face(&self, face: Face) {
         let (icon, tooltip, pie) = match &face {
             Face::InStep => (
-                "emblem-ok-symbolic",
+                // The IDE's own: the stock theme has no sync emblem, and the
+                // one first reached for drew as the missing-icon placeholder.
+                "taste-sync-symbolic",
                 "Your folder is in step with Personal",
                 false,
             ),
