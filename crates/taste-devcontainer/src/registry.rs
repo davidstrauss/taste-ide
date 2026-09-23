@@ -3169,7 +3169,7 @@ impl EnvironmentRegistry {
     }
 
     /// A package refresh recorded for `supervisor` when its image was last
-    /// built from nothing a week or more ago, and cleared when it was not.
+    /// built from nothing a day or more ago, and cleared when it was not.
     /// Only for a running container, since one that is not has no image
     /// in use to age.
     async fn detect_package_refresh(
@@ -3205,11 +3205,10 @@ impl EnvironmentRegistry {
             clear();
             return;
         }
-        let days = age / 86_400;
         let known = self.migrations.lock().unwrap().get(&id).cloned();
         let migration = match known.or_else(|| crate::migration::Migration::read(&dir)) {
             Some(mut m) if m.kind == crate::migration::Kind::Packages => {
-                m.to_release = format!("{days} days");
+                m.to_release = crate::migration::age_words(age);
                 m
             }
             _ => {
@@ -3217,11 +3216,12 @@ impl EnvironmentRegistry {
                     "info",
                     "environments",
                     &format!(
-                        "environment {id}'s image was last built from nothing {days} days ago; \
-                         its packages are refreshed"
+                        "environment {id}'s image was last built from nothing {} ago; its \
+                         packages are refreshed",
+                        crate::migration::age_words(age)
                     ),
                 );
-                crate::migration::Migration::packages(domain, release.unwrap_or("?"), days, now)
+                crate::migration::Migration::packages(domain, release.unwrap_or("?"), age, now)
             }
         };
         if let Err(e) = migration.write(&dir) {
@@ -3362,7 +3362,7 @@ impl EnvironmentRegistry {
         let mut migration = self.migration_of(env).with_context(|| {
             format!(
                 "{env} has nothing to reinstantiate: its VM runs the current guest release and \
-                 its image's packages are less than a week old"
+                 its image's packages are less than a day old"
             )
         })?;
         if env.is_primary() {

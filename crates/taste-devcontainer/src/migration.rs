@@ -11,7 +11,7 @@
 //!   home volume;
 //! - **the packages** ([`Kind::Packages`]): an image's layers are cached,
 //!   so its packages are what they were the first time it was built;
-//!   a week after its last build from nothing ([`PACKAGES_STALE_AFTER`]),
+//!   a day after its last build from nothing ([`PACKAGES_STALE_AFTER`]),
 //!   the image is rebuilt from nothing — base image pulled, no cache — and
 //!   the container started again on it.
 //!
@@ -47,7 +47,7 @@ pub const FORCE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 pub const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 /// How old an image's last build from nothing may get before its packages
 /// are refreshed.
-pub const PACKAGES_STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const PACKAGES_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// What is out of date, and so what reinstantiating does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -56,7 +56,7 @@ pub enum Kind {
     /// The VM is behind the stream: move to a VM on the current release.
     #[default]
     Guest,
-    /// The image's packages are a week old: rebuild it from nothing.
+    /// The image's packages are a day old: rebuild it from nothing.
     Packages,
 }
 
@@ -118,13 +118,13 @@ impl Migration {
     }
 
     /// A package refresh for an environment in `vm`, whose image was last
-    /// built from nothing `days` ago.
-    pub fn packages(vm: &str, release: &str, days: u64, now: u64) -> Self {
+    /// built from nothing `age` seconds ago.
+    pub fn packages(vm: &str, release: &str, age: u64, now: u64) -> Self {
         Self {
             kind: Kind::Packages,
             // For a refresh, `to_release` carries the age, which is what
             // the words about it say.
-            to_release: format!("{days} days"),
+            to_release: age_words(age),
             ..Self::new(vm, release, release, now)
         }
     }
@@ -255,6 +255,17 @@ impl Migration {
     }
 }
 
+/// An image's age as the words about it say it: hours under two days,
+/// days after.
+pub fn age_words(secs: u64) -> String {
+    let hours = secs / 3600;
+    if hours < 48 {
+        format!("{hours} hours")
+    } else {
+        format!("{} days", hours / 24)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,7 +344,10 @@ mod tests {
             told.contains("environment_reinstantiate") && told.contains("60 minutes"),
             "{told}"
         );
-        let refresh = Migration::packages("taste-a", "44.20260829.3.1", 9, m.pending_since);
+        assert_eq!(age_words(30 * 3600), "30 hours");
+        assert_eq!(age_words(50 * 3600), "2 days");
+        let refresh =
+            Migration::packages("taste-a", "44.20260829.3.1", 9 * 86_400, m.pending_since);
         let nudge = refresh.nudge_text("i-0007", refresh.pending_since);
         assert!(
             nudge.contains("9 days") && nudge.contains("without the cache"),

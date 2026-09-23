@@ -3370,7 +3370,7 @@ and the container started again.
 **Packages age too, and are refreshed the same way** (David, 2026-09-22:
 "that too — and with the same notifications and constraints"). An image's
 layers are cached, so its packages are what they were the first time it
-was built; a week after an environment's image was last built from
+was built; a day after an environment's image was last built from
 nothing, it is rebuilt with `--no-cache --pull=newer` and its container
 restarted on it — the checkout, the uncommitted work, and the
 conversation untouched. The safe-mode baseline keeps its base pinned by

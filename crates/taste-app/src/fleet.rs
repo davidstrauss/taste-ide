@@ -115,7 +115,7 @@ pub struct EnvFacts {
     pub pending_rebuild: bool,
     /// What reinstating this environment on updated versions does, while
     /// one is pending — "moving to a VM on <release>" for a VM behind the
-    /// stream, "rebuilding with updated packages" for a week-old image
+    /// stream, "rebuilding with updated packages" for a day-old image
     /// (`taste_devcontainer::migration`).
     pub reinstating: Option<String>,
     /// Why the project's config is passed over, when a config exists and

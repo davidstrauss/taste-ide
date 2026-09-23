@@ -25,7 +25,7 @@
 # The base is pinned by digest, not by tag: the baseline is the rung that
 # is supposed to always work, so it must not change under the user
 # because a tag moved. Its packages still move — the upgrade below takes
-# the base's own to what the repositories have now — and the weekly
+# the base's own to what the repositories have now — and the daily
 # refresh, a build without the cache, is when that happens
 # (taste_devcontainer::migration).
 
