@@ -3527,9 +3527,12 @@ other tabs dimmed in place — as a checklist of these steps over the
 construction stripes, slowed to a crawl at that size, with the log the
 current step is writing beneath it: the Virtual Machine log until the
 container's build begins, the Environment Build log from there
-(`crates/taste-app/src/startup.rs`). Each step is worded as a state to
-be in — "Have the guest image on this machine" — so a step a start did
-not need is simply checked, since it was already true. Only the active
+(`crates/taste-app/src/startup.rs`). Each step is named as its act,
+short — "Download guest image" — and a step a start did not need is
+simply checked, its conclusion saying it was already so ("Already built
+in this VM"); they were worded as states to be in until 2026-09-23, so
+that a check needed no conclusion, and the conclusions made that
+wording unnecessary. Only the active
 step carries a detail, and it is that step's current substep, never a
 description: "Step 2 of 9: RUN dnf install", the IDE's own line from the
 VM's story, or a measure where there is one — the guest image's MiB of

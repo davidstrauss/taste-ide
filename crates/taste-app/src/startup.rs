@@ -42,11 +42,11 @@ pub const READY_LINGER: std::time::Duration = std::time::Duration::from_millis(2
 
 /// The steps, in the order they happen. Not every start does work at
 /// every step — the guest image is fetched once per machine, the files
-/// service's image built once per VM — so each is worded as a state to
-/// be in rather than a thing to do, and a step a start did not need is
-/// simply checked: it was already true (David, 2026-09-22: "Word steps so
-/// that, if unnecessary, it's idempotently correct to show them as
-/// checked").
+/// service's image built once per VM — and a step a start did not need is
+/// simply checked, its conclusion under it saying so ("Already built in
+/// this VM"). Each is named as the act, short (David, 2026-09-23, over
+/// the states-to-be-in they were worded as from 2026-09-22): the
+/// conclusion is what says whether the act was needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
     /// Other projects' VMs that no window owns, stopped for the room.
@@ -85,13 +85,13 @@ impl Step {
     fn title(self) -> &'static str {
         match self {
             Step::Sweep => "Stop unused VMs and verify capacity",
-            Step::GuestImage => "Have the guest image on this machine",
-            Step::Vm => "Have the workspace's VM up",
-            Step::ServiceImage => "Have the files service image in the VM",
-            Step::Files => "Have the files service connected",
-            Step::Place => "Have the checkout in the VM, in step with the folder",
-            Step::Build => "Have the environment's image built",
-            Step::Start => "Have the container running with its setup done",
+            Step::GuestImage => "Download guest image",
+            Step::Vm => "Start workspace VM",
+            Step::ServiceImage => "Start files service in VM",
+            Step::Files => "Connect to files service",
+            Step::Place => "Sync checkout into VM",
+            Step::Build => "Build environment image",
+            Step::Start => "Start container",
             Step::Ready => "Environment ready",
         }
     }
