@@ -576,6 +576,14 @@ pub struct ChatPane {
     /// Sign-in methods, revealed when the agent asks for authentication.
     auth_box: gtk::Box,
     permission_bar: gtk::Revealer,
+    /// The agent's suggested replies (`suggest_replies`), as buttons under
+    /// the conversation: shown when its turn ends, gone when the next one
+    /// begins. A click sends that reply as the user's message.
+    replies_bar: gtk::Revealer,
+    replies_box: adw::WrapBox,
+    /// Offered during the turn, shown when it ends: a question is answered
+    /// once it has been asked, not while the agent is still writing it.
+    pending_replies: RefCell<Vec<String>>,
     /// The card's answer buttons, rebuilt per request from the options the
     /// agent offered — every one of them, which is the whole of i-0025.
     permission_answers: adw::WrapBox,
@@ -2383,6 +2391,23 @@ impl ChatPane {
         // Slide, don't blink: the card pushes the composer down, and a
         // question that appears instantly under a moving cursor is how a
         // click lands on a button nobody read.
+        // The agent's suggested replies: pills under its last message, in
+        // the column the permission card uses, one line when they fit.
+        let replies_box = adw::WrapBox::builder()
+            .child_spacing(6)
+            .line_spacing(6)
+            .margin_start(PANE_BAR_INSET)
+            .margin_end(PANE_BAR_INSET)
+            .margin_top(4)
+            .margin_bottom(6)
+            .build();
+        replies_box.set_widget_name("suggested-replies");
+        let replies_bar = gtk::Revealer::builder()
+            .child(&replies_box)
+            .transition_type(gtk::RevealerTransitionType::SlideUp)
+            .transition_duration(150)
+            .reveal_child(false)
+            .build();
         let permission_bar = gtk::Revealer::builder()
             .child(&permission_box)
             .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -2965,6 +2990,7 @@ impl ChatPane {
         widget.append(&stash_banner);
         widget.append(&options_overlay);
         widget.append(&busy_row);
+        widget.append(&replies_bar);
         widget.append(&permission_bar);
         // Directly above the composer, below the permission card: it is a
         // fact about the send the user is about to make, so it sits as
@@ -2999,6 +3025,9 @@ impl ChatPane {
             identity_label: identity_label.clone(),
             identity_glyph: identity_glyph.clone(),
             permission_bar,
+            replies_bar,
+            replies_box,
+            pending_replies: RefCell::new(Vec::new()),
             revive_bar,
             revive_label,
             revive_queue: RefCell::new(std::collections::VecDeque::new()),
@@ -6338,9 +6367,63 @@ impl ChatPane {
         }
     }
 
+    /// The agent offered replies to its question (`suggest_replies`):
+    /// held until its turn ends, then drawn as buttons (`show_replies`).
+    pub fn offer_replies(self: &Rc<Self>, replies: Vec<String>) {
+        *self.pending_replies.borrow_mut() = replies;
+        if !self.busy.get() {
+            self.show_replies();
+        }
+    }
+
+    /// The pending replies as buttons, the likeliest first and filled: a
+    /// click sends that reply the way Dispatch sends a typed one, which
+    /// leaves whatever is half-typed there alone (David, 2026-09-23: "Make
+    /// it so the agent can suggest next steps that appear as buttons so I
+    /// don't have to type/say a response").
+    fn show_replies(self: &Rc<Self>) {
+        while let Some(child) = self.replies_box.first_child() {
+            self.replies_box.remove(&child);
+        }
+        let replies = self.pending_replies.borrow().clone();
+        for (index, reply) in replies.iter().enumerate() {
+            let button = gtk::Button::builder()
+                .label(reply)
+                .tooltip_text(format!("Reply “{reply}”"))
+                .css_classes(if index == 0 {
+                    vec!["pill-action", "suggested-reply", "suggested-reply-first"]
+                } else {
+                    vec!["pill-action", "suggested-reply"]
+                })
+                .build();
+            let weak = Rc::downgrade(self);
+            let reply = reply.clone();
+            button.connect_clicked(move |_| {
+                let Some(pane) = weak.upgrade() else { return };
+                pane.clear_replies();
+                if let Err(why) = pane.send_from(reply.clone(), Vec::new()) {
+                    pane.meta_row(&format!("the reply was not sent: {why}"));
+                }
+            });
+            self.replies_box.append(&button);
+        }
+        self.replies_bar.set_reveal_child(!replies.is_empty());
+    }
+
+    /// Take the replies down: a turn began, or one was chosen.
+    fn clear_replies(&self) {
+        self.pending_replies.borrow_mut().clear();
+        self.replies_bar.set_reveal_child(false);
+    }
+
     fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
         if busy {
+            // A new turn answers whatever the last one asked: its replies
+            // go. Offered DURING this one, they are kept for its end.
+            if self.replies_bar.reveals_child() {
+                self.clear_replies();
+            }
             // The silence clock starts with the turn, not with its first
             // word: a model whose machine is asleep never sends one, and
             // that is exactly the case the clock is for.
@@ -8317,6 +8400,14 @@ impl ChatPane {
                 // be left behind here — the status said ready while it went
                 // on claiming otherwise next to the composer.
                 let more_queued = !self.pending_prompts.borrow().is_empty();
+                // The turn's suggested replies, now that its question is
+                // asked — unless the user has already answered it with a
+                // message queued behind the turn.
+                if more_queued {
+                    self.clear_replies();
+                } else if !self.pending_replies.borrow().is_empty() {
+                    self.show_replies();
+                }
                 if !more_queued {
                     self.stop_button.set_visible(false);
                     self.set_busy(false);
@@ -10415,6 +10506,17 @@ impl ChatPane {
             }
             // `stopped`: the same turn, stopped by the user — the steps it
             // left running settled, as the end of a turn settles them.
+            // `replies`: the turn over on a question, the agent's suggested
+            // answers under it as buttons (`suggest_replies`).
+            Ok("replies") => {
+                self.stop_button.set_visible(false);
+                self.set_busy(false);
+                self.offer_replies(vec![
+                    "File it".to_string(),
+                    "Change the title first".to_string(),
+                    "Start it on Sonnet".to_string(),
+                ]);
+            }
             Ok("stopped") => {
                 self.settle_running_steps();
                 self.meta_row("stopped");
@@ -11246,6 +11348,7 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "ide_references" => about("Find every use of", "Find every use of a symbol", "symbol"),
         "ide_list_files" => about("List the files in", "List the project's files", "subdir"),
         "ide_open_file" => about("Open", "Open a file", "path"),
+        "suggest_replies" => "Offer replies".into(),
         "ide_open_files" => "Look at what is open".into(),
         "ide_selection" => "Read what the user has selected".into(),
         "ide_git_status" => "Read the working tree's git state".into(),

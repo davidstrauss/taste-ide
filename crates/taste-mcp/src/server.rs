@@ -231,7 +231,10 @@ impl McpServer {
              because the issue is theirs to read later. Skip that confirmation only \
              when they have asked for a set of backlog items in one go: file the set \
              and show them the list. Follow-up work you find while working an issue is \
-             a new issue, not a detour.",
+             a new issue, not a detour.\n\n\
+             REPLIES. When a turn ends on a question or a choice for the user — confirm \
+             this, pick one of these — call suggest_replies last, with the replies they \
+             are likeliest to give, so they can answer with a click.",
         );
         if env.is_primary() {
             // The brief is one text, kept in taste-core, because the chat
@@ -1018,6 +1021,27 @@ impl McpServer {
                     empty.clone(),
                 ),
                 tool(
+                    "suggest_replies",
+                    "When your turn ends on a question or a choice, offer the user up to four \
+                     short replies, shown as buttons under your message; a click sends that \
+                     reply as their next message. Word each as the user would say it, e.g. \
+                     \"File it\", \"Change the title first\". Call it last in the turn. The \
+                     user can still type anything instead.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "replies": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "minItems": 1,
+                                "maxItems": 4,
+                                "description": "the replies, most likely first, each under 80 characters"
+                            }
+                        },
+                        "required": ["replies"]
+                    }),
+                ),
+                tool(
                     "ide_open_file",
                     "Show a file in the user's editor, optionally at a line. Changes \
                      nothing on disk.",
@@ -1536,6 +1560,48 @@ impl McpServer {
                     })
                 });
                 Ok(json!({ "selection": selection }))
+            }
+            "suggest_replies" => {
+                let replies: Vec<String> = args["replies"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|reply| reply.trim().to_string())
+                            .filter(|reply| !reply.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if replies.is_empty() {
+                    anyhow::bail!(
+                        "suggest_replies needs `replies`: one to four short strings, e.g. \
+                         [\"File it\", \"Change the title first\"]"
+                    );
+                }
+                if replies.len() > MAX_REPLIES {
+                    anyhow::bail!(
+                        "suggest_replies takes at most {MAX_REPLIES} replies; {} were given. Keep \
+                         the likeliest {MAX_REPLIES}",
+                        replies.len()
+                    );
+                }
+                if let Some(long) = replies.iter().find(|r| r.chars().count() > MAX_REPLY_CHARS) {
+                    anyhow::bail!(
+                        "each reply is a button, so at most {MAX_REPLY_CHARS} characters; \
+                         shorten \"{long}\""
+                    );
+                }
+                let shown = replies.len();
+                self.workspace.events.publish(Event::SuggestedReplies {
+                    env: env.clone(),
+                    replies,
+                });
+                Ok(json!({
+                    "shown": shown,
+                    "next": "End your turn now. The user picks a reply or types their own; \
+                             either arrives as their next message.",
+                }))
             }
             "ide_open_file" => {
                 let raw = arg(&args, &["path", "file"]).as_str().context(
@@ -4660,6 +4726,11 @@ fn force_confirmation(attempt: &PublishAttempt, dest: &str) -> (String, String) 
     );
     (format!("Overwrite published branch {branch}?"), body)
 }
+
+/// How many replies `suggest_replies` shows, and how long each may be:
+/// buttons in a chat column, not a menu.
+const MAX_REPLIES: usize = 4;
+const MAX_REPLY_CHARS: usize = 80;
 
 /// One job snapshot as a tool result. A command still running comes back
 /// as a handle rather than a result, and says so in the shape of the

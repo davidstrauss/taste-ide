@@ -89,7 +89,8 @@ that points at it —, `orchestrator`,
 `dirty` — the Dirty filter view, for measuring the column's rows)
 and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `quiet` — `busy` silent for over a minute, the
-working line saying for how long and naming Stop —, `stopped` — the same turn stopped, the steps it left running settled on their hollow "never reported finishing" dot —, `acts` — the coordinator's transcript, its
+working line saying for how long and naming Stop —, `replies` — the turn over on a question, the agent's suggested replies
+under it as buttons —, `stopped` — the same turn stopped, the steps it left running settled on their hollow "never reported finishing" dot —, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,
 `permission-edit`, `permission-standing`, `standing`,
 `none` — no chat seeded at all —,

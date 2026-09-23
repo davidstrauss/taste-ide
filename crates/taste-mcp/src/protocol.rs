@@ -154,6 +154,10 @@ pub fn effect(tool: &str) -> Effect {
         // `readOnlyHint` protects is the user's work, and this cannot
         // reach it.
         "ide_open_file" => Effect::Read,
+        // Draws buttons under the agent's own message; touches nothing, and
+        // a click is the user choosing, which is the opposite of a
+        // permission it would need.
+        "suggest_replies" => Effect::Read,
 
         // --- writes: recoverable, and the user can see all of them -----
         "issue_create" | "issue_update" | "issue_link" | "issue_reorder" => Effect::Write,

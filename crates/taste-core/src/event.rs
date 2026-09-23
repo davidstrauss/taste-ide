@@ -150,6 +150,13 @@ pub enum Event {
         env: crate::environment::EnvironmentId,
         name: String,
     },
+    /// An environment's agent offered the user replies to its last
+    /// question (`suggest_replies`): its chat shows them as buttons, and a
+    /// click sends one as the user's message.
+    SuggestedReplies {
+        env: crate::environment::EnvironmentId,
+        replies: Vec<String>,
+    },
     MigrationNotice {
         env: crate::environment::EnvironmentId,
         audience: MigrationAudience,
@@ -422,6 +429,7 @@ impl Event {
             | Event::MigrationNotice { .. }
             | Event::TaskOutput { .. }
             | Event::TaskState { .. }
+            | Event::SuggestedReplies { .. }
             | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }

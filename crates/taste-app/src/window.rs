@@ -4081,6 +4081,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // — and the coordinator woken as for any errand.
                     // A task's run, whoever started it: its lines to its
                     // tab, its light to its row.
+                    // An agent's suggested replies, to its own chat.
+                    Event::SuggestedReplies { env, replies } => {
+                        if let Some(pane) = chats.pane_for(&env) {
+                            pane.offer_replies(replies);
+                        }
+                    }
                     Event::TaskOutput { env, name, lines } => {
                         editor.append_task(&env, &name, &lines);
                     }

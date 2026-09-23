@@ -307,6 +307,12 @@ fn main() -> glib::ExitCode {
                     label rather than a banner — it states a fact that is \
                     true for as long as the tab exists, and a banner's \
                     weight would claim something happened. */\n\
+                 /* An agent's suggested replies (chat.rs): pills in the \
+                    conversation's accent, the likeliest one filled. */\n\
+                 button.suggested-reply { padding: 4px 12px; \
+                   color: @accent_color; }\n\
+                 button.suggested-reply.suggested-reply-first { \
+                   background-color: alpha(@accent_bg_color, 0.18); }\n\
                  .review-bar { padding: 4px 10px; background-color: \
                    color-mix(in srgb, currentColor 5%, transparent); }\n\
                  /* A log bar's one action (a failed task's Prompt Agent): \
