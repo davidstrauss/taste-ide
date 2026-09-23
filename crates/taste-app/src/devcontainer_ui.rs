@@ -321,6 +321,19 @@ impl DevcontainerBanner {
             }
             None => self.secondary.set_visible(false),
         }
+        // One blue button per face, and on the no-devcontainer face it is
+        // the agent writing the definition rather than the blank template:
+        // that is the way to a working environment, and Create is the way
+        // to write one by hand (David, 2026-09-23: "Make \"Prompt Agent\"
+        // the blue highlighted one").
+        let agent_leads = label.is_some() && matches!(action, ButtonAction::AuthorAgent);
+        if agent_leads {
+            self.button.remove_css_class("suggested-action");
+            self.secondary.add_css_class("suggested-action");
+        } else {
+            self.secondary.remove_css_class("suggested-action");
+            self.button.add_css_class("suggested-action");
+        }
     }
 
     /// The prompt Prompt Agent sends, and the log it attaches
@@ -417,7 +430,7 @@ impl DevcontainerBanner {
                 });
             }
         }
-        self.secondary.set_visible(false);
+        self.set_secondary(None, ButtonAction::PromptAgent);
         self.set_revealed(true);
         if kind == AskKind::Secret {
             self.secret.grab_focus();
