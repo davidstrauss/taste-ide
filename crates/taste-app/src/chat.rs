@@ -12814,28 +12814,26 @@ mod tests {
     /// Needs a display for the widgets; skips without one.
     #[test]
     fn a_card_whose_row_was_removed_is_no_longer_in_the_transcript() {
-        if gtk::init().is_err() {
-            println!("chat: no display — skipped");
-            return;
-        }
-        let transcript = gtk::ListBox::new();
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let row = gtk::ListBoxRow::builder().child(&card).build();
-        transcript.append(&row);
-        assert!(
-            card.is_ancestor(&transcript),
-            "in the transcript while its row is"
-        );
+        crate::gtk_test::on_gtk_thread("chat: no display — skipped", || {
+            let transcript = gtk::ListBox::new();
+            let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let row = gtk::ListBoxRow::builder().child(&card).build();
+            transcript.append(&row);
+            assert!(
+                card.is_ancestor(&transcript),
+                "in the transcript while its row is"
+            );
 
-        // Exactly what `clear_transcript` does to it.
-        while let Some(row) = transcript.first_child() {
-            transcript.remove(&row);
-        }
-        assert!(
-            !card.is_ancestor(&transcript),
-            "and out of it once the row is gone, which is when the card has \
+            // Exactly what `clear_transcript` does to it.
+            while let Some(row) = transcript.first_child() {
+                transcript.remove(&row);
+            }
+            assert!(
+                !card.is_ancestor(&transcript),
+                "and out of it once the row is gone, which is when the card has \
              to be rebuilt"
-        );
+            );
+        });
     }
 
     /// What Claude Code advertised on 2026-09-16, read off this

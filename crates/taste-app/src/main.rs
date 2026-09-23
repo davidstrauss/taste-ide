@@ -31,6 +31,8 @@ mod filetree;
 mod fleet;
 mod gadget;
 mod gauge;
+#[cfg(test)]
+mod gtk_test;
 mod holdbutton;
 mod hover;
 mod inset;

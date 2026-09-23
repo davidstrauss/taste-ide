@@ -4,7 +4,8 @@
     "runtime-version": "49",
     "sdk": "org.gnome.Sdk",
     "sdk-extensions": [
-        "org.freedesktop.Sdk.Extension.rust-stable"
+        "org.freedesktop.Sdk.Extension.rust-stable",
+        "org.freedesktop.Sdk.Extension.llvm21"
     ],
     "command": "taste-ide",
     "finish-args": [
@@ -19,9 +20,11 @@
         "--filesystem=home"
     ],
     "build-options": {
-        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "append-path": "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin",
+        "prepend-ld-library-path": "/usr/lib/sdk/llvm21/lib",
         "env": {
-            "CARGO_HOME": "/run/build/taste-ide/cargo"
+            "CARGO_HOME": "/run/build/taste-ide/cargo",
+            "LIBCLANG_PATH": "/usr/lib/sdk/llvm21/lib"
         }
     },
     "modules": [
@@ -52,28 +55,7 @@
                 "install -Dm755 target/release/taste-embed /app/bin/taste-embed",
                 "install -Dm644 data/net.davidstrauss.Taste.desktop /app/share/applications/net.davidstrauss.Taste.desktop",
                 "install -Dm644 data/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg /app/share/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-wilted-folder.svg /app/share/icons/hicolor/scalable/status/taste-wilted-folder.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-ghost-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-ghost-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-branch-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-branch-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-host-warn.svg /app/share/icons/hicolor/scalable/status/taste-host-warn.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-container-warn.svg /app/share/icons/hicolor/scalable/status/taste-container-warn.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-container-on.svg /app/share/icons/hicolor/scalable/status/taste-container-on.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-container-off.svg /app/share/icons/hicolor/scalable/status/taste-container-off.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-chat-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-chat-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-agent-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-agent-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-human-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-human-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-meaning-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-meaning-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-compose-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-compose-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-ide-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-ide-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-port-add-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-port-add-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-sync-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-sync-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-build-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-build-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-cpu-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-cpu-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-memory-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-memory-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-full-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-full-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-warn-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-warn-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-no-agent.svg /app/share/icons/hicolor/scalable/status/taste-no-agent.svg",
+                "install -Dm644 -t /app/share/icons/hicolor/scalable/status data/icons/hicolor/scalable/status/*.svg",
                 "install -Dm644 data/net.davidstrauss.Taste.metainfo.xml /app/share/metainfo/net.davidstrauss.Taste.metainfo.xml"
             ],
             "sources": [

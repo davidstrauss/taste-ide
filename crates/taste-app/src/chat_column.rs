@@ -199,62 +199,59 @@ mod tests {
     }
 
     /// The GTK behaviour underneath this widget, and the numbers that must
-    /// not move — all in one test, because GTK initializes on one thread
-    /// and a second test would silently skip itself rather than fail.
-    /// Needs a display; skips without one.
+    /// not move, on the one thread every GTK test shares
+    /// (`crate::gtk_test`). Needs a display; skips without one.
     #[test]
     fn the_column_is_as_wide_as_it_says_whatever_is_in_it() {
-        if gtk::init().is_err() {
-            println!("chat column: no display — skipped");
-            return;
-        }
-
-        // The control: a plain GtkBox answers "how wide, to fit in one
-        // line's height?" with the width of the whole line. This is what
-        // GtkPaned asked the chat column, and why the centre pane was
-        // allocated 731px in a 553px hole.
-        let control = boxed_prose();
-        let (control_any_height, _, _, _) = control.measure(gtk::Orientation::Horizontal, -1);
-        let (control_one_line, _, _, _) = control.measure(gtk::Orientation::Horizontal, 24);
-        assert!(
-            control_one_line > control_any_height,
-            "GtkBox stopped trading width for height ({control_one_line} vs \
+        crate::gtk_test::on_gtk_thread("chat column: no display — skipped", || {
+            // The control: a plain GtkBox answers "how wide, to fit in one
+            // line's height?" with the width of the whole line. This is what
+            // GtkPaned asked the chat column, and why the centre pane was
+            // allocated 731px in a 553px hole.
+            let control = boxed_prose();
+            let (control_any_height, _, _, _) = control.measure(gtk::Orientation::Horizontal, -1);
+            let (control_one_line, _, _, _) = control.measure(gtk::Orientation::Horizontal, 24);
+            assert!(
+                control_one_line > control_any_height,
+                "GtkBox stopped trading width for height ({control_one_line} vs \
              {control_any_height}); revisit whether this widget is still needed"
-        );
+            );
 
-        // The column: the same two numbers for any height, and for any
-        // content — prose, a child with a 900px floor, or nothing at all.
-        let wide = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        wide.set_width_request(900);
-        let empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        for (what, child) in [
-            ("prose", boxed_prose()),
-            ("a 900px child", wide),
-            ("nothing", empty),
-        ] {
-            let column = ChatColumn::new(&child);
-            for for_size in [-1, 24, 400] {
-                let (min, natural, _, _) = column.measure(gtk::Orientation::Horizontal, for_size);
-                assert_eq!(
-                    min, MIN_WIDTH,
-                    "minimum, holding {what}, for a height of {for_size}"
-                );
-                assert_eq!(
-                    natural, NATURAL_WIDTH,
-                    "natural, holding {what}, for a height of {for_size}"
-                );
+            // The column: the same two numbers for any height, and for any
+            // content — prose, a child with a 900px floor, or nothing at all.
+            let wide = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            wide.set_width_request(900);
+            let empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            for (what, child) in [
+                ("prose", boxed_prose()),
+                ("a 900px child", wide),
+                ("nothing", empty),
+            ] {
+                let column = ChatColumn::new(&child);
+                for for_size in [-1, 24, 400] {
+                    let (min, natural, _, _) =
+                        column.measure(gtk::Orientation::Horizontal, for_size);
+                    assert_eq!(
+                        min, MIN_WIDTH,
+                        "minimum, holding {what}, for a height of {for_size}"
+                    );
+                    assert_eq!(
+                        natural, NATURAL_WIDTH,
+                        "natural, holding {what}, for a height of {for_size}"
+                    );
+                }
             }
-        }
 
-        // Heights are still the child's: measured at the width the child
-        // will get, so a wrapping line asked about a narrow column reports
-        // the taller answer rather than the one-line one.
-        let column = ChatColumn::new(&boxed_prose());
-        let (tall, _, _, _) = column.measure(gtk::Orientation::Vertical, MIN_WIDTH);
-        let (short, _, _, _) = column.measure(gtk::Orientation::Vertical, 2000);
-        assert!(
-            tall > short,
-            "a narrow column should need more height ({tall} vs {short})"
-        );
+            // Heights are still the child's: measured at the width the child
+            // will get, so a wrapping line asked about a narrow column reports
+            // the taller answer rather than the one-line one.
+            let column = ChatColumn::new(&boxed_prose());
+            let (tall, _, _, _) = column.measure(gtk::Orientation::Vertical, MIN_WIDTH);
+            let (short, _, _, _) = column.measure(gtk::Orientation::Vertical, 2000);
+            assert!(
+                tall > short,
+                "a narrow column should need more height ({tall} vs {short})"
+            );
+        });
     }
 }

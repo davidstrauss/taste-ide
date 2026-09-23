@@ -7988,92 +7988,90 @@ mod tests {
     #[test]
     #[ignore]
     fn perf_row_widget_churn() {
-        if gtk::init().is_err() {
-            println!("row widget churn: no display — skipped");
-            return;
-        }
-        const ROWS: usize = 40;
-        const TICKS: usize = 200;
+        crate::gtk_test::on_gtk_thread("row widget churn: no display — skipped", || {
+            const ROWS: usize = 40;
+            const TICKS: usize = 200;
 
-        // The shape `build_row` produces: content icon, name, badge, and
-        // the right-click gesture.
-        let build = |path: &Path| {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            let icon = gtk::Image::from_gicon(&crate::editor::file_type_icon(path));
-            let label = gtk::Label::builder()
-                .label(path.file_name().unwrap().to_string_lossy())
-                .xalign(0.0)
-                .hexpand(true)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .build()
-                .full_text_on_hover();
-            let (badge, css) = state_style(FileState::Modified);
-            let badge = gtk::Label::builder().label(badge).build();
-            if let Some(css) = css {
-                badge.add_css_class(css);
-                label.add_css_class(css);
-            }
-            row.append(&icon);
-            row.append(&label);
-            row.append(&badge);
-            row.add_controller(gtk::GestureClick::builder().button(3).build());
-            (row, label, badge)
-        };
-
-        let paths: Vec<PathBuf> = (0..ROWS)
-            .map(|i| PathBuf::from(format!("crates/taste-app/src/module{i}.rs")))
-            .collect();
-        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let expanders: Vec<gtk::TreeExpander> = (0..ROWS)
-            .map(|_| {
-                let expander = gtk::TreeExpander::new();
-                holder.append(&expander);
-                expander
-            })
-            .collect();
-
-        // Before: a status tick reset the factory, so every bound row was
-        // rebuilt — the one under the pointer with the rest.
-        let mut painted: Vec<(gtk::Label, gtk::Label)> = Vec::new();
-        let start = std::time::Instant::now();
-        for _ in 0..TICKS {
-            painted.clear();
-            for (expander, path) in expanders.iter().zip(&paths) {
-                let (row, label, badge) = build(path);
-                expander.set_child(Some(&row));
-                painted.push((label, badge));
-            }
-        }
-        let rebuilt = start.elapsed();
-
-        // After: one row's badge and CSS.
-        let start = std::time::Instant::now();
-        for tick in 0..TICKS {
-            let (label, badge) = &painted[tick % ROWS];
-            let (old, new) = if tick % 2 == 0 {
-                (FileState::Modified, FileState::Staged)
-            } else {
-                (FileState::Staged, FileState::Modified)
+            // The shape `build_row` produces: content icon, name, badge, and
+            // the right-click gesture.
+            let build = |path: &Path| {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                let icon = gtk::Image::from_gicon(&crate::editor::file_type_icon(path));
+                let label = gtk::Label::builder()
+                    .label(path.file_name().unwrap().to_string_lossy())
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build()
+                    .full_text_on_hover();
+                let (badge, css) = state_style(FileState::Modified);
+                let badge = gtk::Label::builder().label(badge).build();
+                if let Some(css) = css {
+                    badge.add_css_class(css);
+                    label.add_css_class(css);
+                }
+                row.append(&icon);
+                row.append(&label);
+                row.append(&badge);
+                row.add_controller(gtk::GestureClick::builder().button(3).build());
+                (row, label, badge)
             };
-            if let (_, Some(css)) = state_style(old) {
-                badge.remove_css_class(css);
-                label.remove_css_class(css);
-            }
-            let (text, css) = state_style(new);
-            badge.set_label(text);
-            if let Some(css) = css {
-                badge.add_css_class(css);
-                label.add_css_class(css);
-            }
-        }
-        let restyled = start.elapsed();
 
-        println!(
-            "row widget churn: {ROWS} rows → rebuild-all {:>8.1?}/tick, \
+            let paths: Vec<PathBuf> = (0..ROWS)
+                .map(|i| PathBuf::from(format!("crates/taste-app/src/module{i}.rs")))
+                .collect();
+            let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let expanders: Vec<gtk::TreeExpander> = (0..ROWS)
+                .map(|_| {
+                    let expander = gtk::TreeExpander::new();
+                    holder.append(&expander);
+                    expander
+                })
+                .collect();
+
+            // Before: a status tick reset the factory, so every bound row was
+            // rebuilt — the one under the pointer with the rest.
+            let mut painted: Vec<(gtk::Label, gtk::Label)> = Vec::new();
+            let start = std::time::Instant::now();
+            for _ in 0..TICKS {
+                painted.clear();
+                for (expander, path) in expanders.iter().zip(&paths) {
+                    let (row, label, badge) = build(path);
+                    expander.set_child(Some(&row));
+                    painted.push((label, badge));
+                }
+            }
+            let rebuilt = start.elapsed();
+
+            // After: one row's badge and CSS.
+            let start = std::time::Instant::now();
+            for tick in 0..TICKS {
+                let (label, badge) = &painted[tick % ROWS];
+                let (old, new) = if tick % 2 == 0 {
+                    (FileState::Modified, FileState::Staged)
+                } else {
+                    (FileState::Staged, FileState::Modified)
+                };
+                if let (_, Some(css)) = state_style(old) {
+                    badge.remove_css_class(css);
+                    label.remove_css_class(css);
+                }
+                let (text, css) = state_style(new);
+                badge.set_label(text);
+                if let Some(css) = css {
+                    badge.add_css_class(css);
+                    label.add_css_class(css);
+                }
+            }
+            let restyled = start.elapsed();
+
+            println!(
+                "row widget churn: {ROWS} rows → rebuild-all {:>8.1?}/tick, \
              restyle-one {:>8.1?}/tick",
-            rebuilt / TICKS as u32,
-            restyled / TICKS as u32,
-        );
+                rebuilt / TICKS as u32,
+                restyled / TICKS as u32,
+            );
+        });
     }
 
     /// Profiling harness (run on demand):
@@ -8090,77 +8088,77 @@ mod tests {
     #[test]
     #[ignore]
     fn perf_dir_walk_moved_off_the_create_func() {
-        if gtk::init().is_err() {
-            println!("dir walk offload: no display — skipped");
-            return;
-        }
-        // A directory shaped like the worst case for a single scan: many
-        // siblings at one level (`scan_dir_nodes` never recurses — depth
-        // is 1 — so this is exactly what one `rebuild()` or one folder
-        // expansion pays for). Under the OS temp dir rather than a crate
-        // dependency: no fixture-repo tooling is needed for a flat pile of
-        // files.
-        let dir = std::env::temp_dir().join(format!(
-            "taste-filetree-perf-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fixture dir");
-        const ENTRIES: usize = 4000;
-        for i in 0..ENTRIES {
-            std::fs::write(dir.join(format!("f{i:05}.rs")), b"fn x() {}\n").expect("write fixture");
-        }
+        crate::gtk_test::on_gtk_thread("dir walk offload: no display — skipped", || {
+            // A directory shaped like the worst case for a single scan: many
+            // siblings at one level (`scan_dir_nodes` never recurses — depth
+            // is 1 — so this is exactly what one `rebuild()` or one folder
+            // expansion pays for). Under the OS temp dir rather than a crate
+            // dependency: no fixture-repo tooling is needed for a flat pile of
+            // files.
+            let dir = std::env::temp_dir().join(format!(
+                "taste-filetree-perf-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            ));
+            std::fs::create_dir_all(&dir).expect("create fixture dir");
+            const ENTRIES: usize = 4000;
+            for i in 0..ENTRIES {
+                std::fs::write(dir.join(format!("f{i:05}.rs")), b"fn x() {}\n")
+                    .expect("write fixture");
+            }
 
-        // Before: what used to run inline in `rebuild()` / the create-func.
-        let start = std::time::Instant::now();
-        let nodes = scan_dir_nodes(&Worktree::Local(dir.clone()), &dir, false, &[], None);
-        let synchronous_walk = start.elapsed();
-        assert_eq!(
-            nodes.len(),
-            ENTRIES,
-            "the fixture's own files, and nothing else"
-        );
+            // Before: what used to run inline in `rebuild()` / the create-func.
+            let start = std::time::Instant::now();
+            let nodes = scan_dir_nodes(&Worktree::Local(dir.clone()), &dir, false, &[], None);
+            let synchronous_walk = start.elapsed();
+            assert_eq!(
+                nodes.len(),
+                ENTRIES,
+                "the fixture's own files, and nothing else"
+            );
 
-        // After: what runs inline now — schedule the blocking walk and an
-        // apply-later future, then return. The walk itself happens off
-        // this measurement entirely. Warmed up once first: the tokio
-        // blocking pool spins up its first worker thread lazily, and that
-        // one-time cost belongs to process startup, not to this call —
-        // by the time a real IDE reaches its first `rebuild()`, plenty of
-        // other `spawn_blocking` calls (status refresh alone) have already
-        // paid it.
-        let _ = crate::runtime::runtime().block_on(crate::runtime::runtime().spawn_blocking(|| ()));
-        let store = gtk::gio::ListStore::new::<BoxedAnyObject>();
-        let start = std::time::Instant::now();
-        fill_dir_store_async(
-            &store,
-            Worktree::Local(dir.clone()),
-            dir.clone(),
-            false,
-            Ghosts::new(None),
-            None,
-        );
-        let create_func_returns_in = start.elapsed();
+            // After: what runs inline now — schedule the blocking walk and an
+            // apply-later future, then return. The walk itself happens off
+            // this measurement entirely. Warmed up once first: the tokio
+            // blocking pool spins up its first worker thread lazily, and that
+            // one-time cost belongs to process startup, not to this call —
+            // by the time a real IDE reaches its first `rebuild()`, plenty of
+            // other `spawn_blocking` calls (status refresh alone) have already
+            // paid it.
+            let _ =
+                crate::runtime::runtime().block_on(crate::runtime::runtime().spawn_blocking(|| ()));
+            let store = gtk::gio::ListStore::new::<BoxedAnyObject>();
+            let start = std::time::Instant::now();
+            fill_dir_store_async(
+                &store,
+                Worktree::Local(dir.clone()),
+                dir.clone(),
+                false,
+                Ghosts::new(None),
+                None,
+            );
+            let create_func_returns_in = start.elapsed();
 
-        println!(
-            "dir walk: {ENTRIES} entries → synchronous walk (the old cost) {:>8.1?}; \
+            println!(
+                "dir walk: {ENTRIES} entries → synchronous walk (the old cost) {:>8.1?}; \
              create-func now returns in {:>8.1?}",
-            synchronous_walk, create_func_returns_in,
-        );
-        assert!(
-            create_func_returns_in.as_micros() < 500,
-            "the create-func must return in microseconds, not participate in the walk \
+                synchronous_walk, create_func_returns_in,
+            );
+            assert!(
+                create_func_returns_in.as_micros() < 500,
+                "the create-func must return in microseconds, not participate in the walk \
              (took {create_func_returns_in:?})"
-        );
-        assert!(
-            create_func_returns_in < synchronous_walk / 10,
-            "the offloaded path should be an order of magnitude faster on the caller's \
+            );
+            assert!(
+                create_func_returns_in < synchronous_walk / 10,
+                "the offloaded path should be an order of magnitude faster on the caller's \
              own thread than the walk it used to run inline"
-        );
+            );
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }

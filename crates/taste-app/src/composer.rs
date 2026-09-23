@@ -1398,30 +1398,28 @@ mod tests {
     /// Needs a display for the buffer; skips without one.
     #[test]
     fn spoken_words_part_from_the_sentence_on_both_sides() {
-        if gtk::init().is_err() {
-            println!("composer: no display — skipped");
-            return;
-        }
-        let spacing = |text: &str, at: i32, spoken: &str| {
-            let buffer = gtk::TextBuffer::new(None);
-            buffer.set_text(text);
-            spoken_spacing(&buffer, &buffer.iter_at_offset(at), spoken)
-        };
+        crate::gtk_test::on_gtk_thread("composer: no display — skipped", || {
+            let spacing = |text: &str, at: i32, spoken: &str| {
+                let buffer = gtk::TextBuffer::new(None);
+                buffer.set_text(text);
+                spoken_spacing(&buffer, &buffer.iter_at_offset(at), spoken)
+            };
 
-        // An empty box: nothing to part from on either side.
-        assert_eq!(spacing("", 0, "hello"), ("hello".to_string(), false));
-        // At the end of a word: a space before, nothing after.
-        assert_eq!(spacing("ask", 3, "hello"), (" hello".to_string(), false));
-        // After a space the box already has: no second one.
-        assert_eq!(spacing("ask ", 4, "hello"), ("hello".to_string(), false));
-        // Into the middle of a word: parted on both sides, and the caller
-        // is told about the trailing space so the cursor can stay before
-        // it.
-        assert_eq!(spacing("askyou", 3, "hello"), (" hello ".to_string(), true));
-        // Where what follows is already a space: only the near side.
-        assert_eq!(
-            spacing("ask you", 3, "hello"),
-            (" hello".to_string(), false)
-        );
+            // An empty box: nothing to part from on either side.
+            assert_eq!(spacing("", 0, "hello"), ("hello".to_string(), false));
+            // At the end of a word: a space before, nothing after.
+            assert_eq!(spacing("ask", 3, "hello"), (" hello".to_string(), false));
+            // After a space the box already has: no second one.
+            assert_eq!(spacing("ask ", 4, "hello"), ("hello".to_string(), false));
+            // Into the middle of a word: parted on both sides, and the caller
+            // is told about the trailing space so the cursor can stay before
+            // it.
+            assert_eq!(spacing("askyou", 3, "hello"), (" hello ".to_string(), true));
+            // Where what follows is already a space: only the near side.
+            assert_eq!(
+                spacing("ask you", 3, "hello"),
+                (" hello".to_string(), false)
+            );
+        });
     }
 }

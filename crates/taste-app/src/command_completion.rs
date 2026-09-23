@@ -456,80 +456,78 @@ mod tests {
     #[test]
     #[ignore]
     fn the_command_popup_opens_over_a_command_and_never_over_a_sentence() {
-        if gtk::init().is_err() {
-            println!("command completion: no display — skipped");
-            return;
-        }
-        let (window, view) = composer();
-        let provider = CommandProvider::default();
-        provider.set_commands(commands());
-        sourceview5::prelude::ViewExt::completion(&view).add_provider(&provider);
+        crate::gtk_test::on_gtk_thread("command completion: no display — skipped", || {
+            let (window, view) = composer();
+            let provider = CommandProvider::default();
+            provider.set_commands(commands());
+            sourceview5::prelude::ViewExt::completion(&view).add_provider(&provider);
 
-        let logged = criticals(|| {
-            // A sentence first, and one whose words PREFIX command names:
-            // "container", "clone" and "comes" all start `compact`,
-            // `context` and `clear`. This is the burst that failed — the
-            // command list came up over ordinary prose, and every opening
-            // was a chance at the zero-width popup.
-            for word in "Relocation waits for the container and the clone comes up".split(' ') {
-                type_into(&view, &format!("{word} "));
-                // Asking whether it became visible, so the wait is spent
-                // looking for the fault rather than past it.
+            let logged = criticals(|| {
+                // A sentence first, and one whose words PREFIX command names:
+                // "container", "clone" and "comes" all start `compact`,
+                // `context` and `clear`. This is the burst that failed — the
+                // command list came up over ordinary prose, and every opening
+                // was a chance at the zero-width popup.
+                for word in "Relocation waits for the container and the clone comes up".split(' ') {
+                    type_into(&view, &format!("{word} "));
+                    // Asking whether it became visible, so the wait is spent
+                    // looking for the fault rather than past it.
+                    let (visible, width) = showing(&view, true);
+                    assert!(
+                        !visible,
+                        "the command list opened over the ordinary word {word:?} (width {width})"
+                    );
+                }
+
+                // Now a command, which still has to open the list: a slash at
+                // the start of the box is the one place one can be.
+                view.buffer().set_text("");
+                settle(100);
+                type_into(&view, "/");
                 let (visible, width) = showing(&view, true);
                 assert!(
-                    !visible,
-                    "the command list opened over the ordinary word {word:?} (width {width})"
+                    visible && width > 0,
+                    "a bare slash opened nothing (width {width})"
                 );
-            }
+                let rows = popup_rows(&view);
+                for command in ["/compact", "/context", "/clear", "/review"] {
+                    assert!(
+                        rows.iter().any(|row| row == command),
+                        "the whole list should be up, and {command} is not on it: {rows:?}"
+                    );
+                }
 
-            // Now a command, which still has to open the list: a slash at
-            // the start of the box is the one place one can be.
-            view.buffer().set_text("");
-            settle(100);
-            type_into(&view, "/");
-            let (visible, width) = showing(&view, true);
-            assert!(
-                visible && width > 0,
-                "a bare slash opened nothing (width {width})"
-            );
-            let rows = popup_rows(&view);
-            for command in ["/compact", "/context", "/clear", "/review"] {
+                // ...and narrowing it keeps it up, with the two commands that
+                // still match on it and the three that no longer do off it.
+                type_into(&view, "co");
+                let (visible, width) = showing(&view, true);
                 assert!(
-                    rows.iter().any(|row| row == command),
-                    "the whole list should be up, and {command} is not on it: {rows:?}"
+                    visible && width > 0,
+                    "typing the prefix closed the list (width {width})"
                 );
-            }
+                let rows = popup_rows(&view);
+                let on = |command: &str| rows.iter().any(|row| row == command);
+                assert!(
+                    on("/compact") && on("/context"),
+                    "typing `co` dropped a command it matches: {rows:?}"
+                );
+                assert!(
+                    !on("/clear") && !on("/review"),
+                    "typing `co` kept a command it does not match: {rows:?}"
+                );
 
-            // ...and narrowing it keeps it up, with the two commands that
-            // still match on it and the three that no longer do off it.
-            type_into(&view, "co");
-            let (visible, width) = showing(&view, true);
+                // ...and running past the last match closes it, rather than
+                // shrinking it to nothing.
+                type_into(&view, "zz");
+                let (visible, _) = showing(&view, false);
+                assert!(!visible, "the list stayed up with nothing matching");
+            });
+            window.destroy();
+            settle(50);
             assert!(
-                visible && width > 0,
-                "typing the prefix closed the list (width {width})"
+                logged.is_empty(),
+                "GTK complained while typing: {logged:#?}"
             );
-            let rows = popup_rows(&view);
-            let on = |command: &str| rows.iter().any(|row| row == command);
-            assert!(
-                on("/compact") && on("/context"),
-                "typing `co` dropped a command it matches: {rows:?}"
-            );
-            assert!(
-                !on("/clear") && !on("/review"),
-                "typing `co` kept a command it does not match: {rows:?}"
-            );
-
-            // ...and running past the last match closes it, rather than
-            // shrinking it to nothing.
-            type_into(&view, "zz");
-            let (visible, _) = showing(&view, false);
-            assert!(!visible, "the list stayed up with nothing matching");
         });
-        window.destroy();
-        settle(50);
-        assert!(
-            logged.is_empty(),
-            "GTK complained while typing: {logged:#?}"
-        );
     }
 }
