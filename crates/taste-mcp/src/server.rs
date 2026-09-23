@@ -866,11 +866,11 @@ impl McpServer {
                 json!({
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "program to run, e.g. cargo (use sh -c for pipelines)" },
+                        "command": { "type": "string", "description": "a shell command line, as typed in a terminal, e.g. cargo test --workspace | tail -20" },
                         "args": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "arguments, e.g. [\"test\", \"--workspace\"]"
+                            "description": "optional: when given, command is one program and these are its exact arguments, with no shell"
                         },
                         "timeout_seconds": { "type": "integer", "description": "how long to wait before handing back a handle (default 60, max 120)" }
                     },
@@ -1760,8 +1760,8 @@ impl McpServer {
                 let command = arg(&args, &["command", "program", "cmd"])
                     .as_str()
                     .context(
-                        "ide_exec needs a `command`: the program to run, with its arguments in \
-                     `args`, e.g. command \"cargo\" and args [\"test\"]",
+                        "ide_exec needs a `command`: a shell command line, e.g. \
+                         \"cargo test --workspace | tail -20\"",
                     )?;
                 let argv: Vec<String> = args["args"]
                     .as_array()
@@ -1771,6 +1771,23 @@ impl McpServer {
                             .collect()
                     })
                     .unwrap_or_default();
+                // Two forms, told apart by `args`. With none, `command` is
+                // a line as a terminal takes one, and the container's
+                // shell runs it: a pipe, a `&&`, a `cd` are what commands
+                // are made of, and asking for program-and-argv made every
+                // one of them `sh` with `["-c", …]`, the script quoted a
+                // second time by the agent and shown that way to the user
+                // (David, 2026-09-23). With `args`, `command` is one
+                // program and they are its exact argv, no shell between —
+                // which is also what every call written before this was,
+                // and `command: "cargo"` alone means the same either way.
+                let shell_line = argv.is_empty();
+                let line = command.to_string();
+                let (command, argv) = if shell_line {
+                    ("sh", vec!["-c".to_string(), command.to_string()])
+                } else {
+                    (command, argv)
+                };
                 let timeout = args["timeout_seconds"].as_u64().unwrap_or(60).clamp(1, 120);
                 // The gate is "is there a container", not "is this container
                 // mode". Safe mode runs the IDE's baseline environment, and
@@ -1798,11 +1815,16 @@ impl McpServer {
                 let services = self.services(env)?;
                 let jobs = &services.jobs;
                 // The console tab shows what the agent asked for; the
-                // wrapper `spec` carries is for the agent's own eyes.
-                let display = std::iter::once(command)
-                    .chain(refs.iter().copied())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                // wrapper `spec` carries is for the agent's own eyes. A
+                // shell line is shown as the line, not as `sh -c` around it.
+                let display = if shell_line {
+                    line
+                } else {
+                    std::iter::once(command)
+                        .chain(refs.iter().copied())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
                 let handle = jobs.spawn(
                     spec,
                     &display,
@@ -6424,6 +6446,22 @@ mod tests {
         .await;
         let error = refused["error"].as_str().unwrap();
         assert!(error.contains("never fall back"), "{error}");
+        // The shell-line form is refused the same way: it is the same
+        // command with the shell supplied by the IDE rather than the agent.
+        let refused = call_tool(
+            &mut stream,
+            "ide_exec",
+            json!({"command": "touch /tmp/agent-escaped-line"}),
+        )
+        .await;
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("never fall back"),
+            "{refused}"
+        );
+        assert!(!std::path::Path::new("/tmp/agent-escaped-line").exists());
         // And it points at the way out, the way the rest of safe mode does.
         assert!(error.contains("devcontainer_reload"), "{error}");
         assert!(

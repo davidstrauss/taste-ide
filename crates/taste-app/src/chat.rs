@@ -11309,11 +11309,13 @@ fn command_input_line(name: &str, input: Option<&serde_json::Value>) -> Option<S
 }
 
 /// The script of a `sh -c <script>` call — what a terminal would show as
-/// the line typed. `ide_exec` takes a program and its argv rather than a
-/// shell line, so a pipe or a `&&` reaches it as `sh` with `["-c", …]`;
-/// shown literally, every such step read `sh -c '…'` with its script
-/// quoted a second time inside (David, 2026-09-23: "Why do I see these sh
-/// -c wrappers?"). Only the exact shape: a shell, one flag cluster ending
+/// the line typed. `ide_exec` used to take only a program and its argv, so
+/// a pipe or a `&&` reached it as `sh` with `["-c", …]`, and shown
+/// literally every such step read `sh -c '…'` with its script quoted a
+/// second time inside (David, 2026-09-23: "Why do I see these sh -c
+/// wrappers?"). It takes a shell line now, with no `args`; this is for the
+/// transcripts written before that, and an agent that still wraps by
+/// habit. Only the exact shape: a shell, one flag cluster ending
 /// in `c` (`-c`, `-lc`, `-euc`), and the script, with nothing after it —
 /// positional parameters after the script would change what it means, so
 /// that call keeps its literal form.
