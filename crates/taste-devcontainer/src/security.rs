@@ -57,7 +57,10 @@ const ALLOWED_FLAGS_WITH_VALUE: &[&str] = &["-e", "--env", "--shm-size", "--host
 /// fuse-overlayfs, which fails with no `/dev/fuse` ("cannot mount: No such
 /// file or directory") and works with it. The first measurement missed
 /// this because `quay.io/podman/stable` declares its storage as volumes.
-/// No capability and no `--privileged`. `label=disable` works too, and is
+/// Then networking: a nested container's network is pasta's, which needs
+/// `/dev/net/tun` — missed by a probe that ran with `--network=none`, and
+/// found by an agent. No capability and no `--privileged`. `label=disable`
+/// works too, and is
 /// accepted for configs that already say it, but is not what the IDE asks
 /// for.
 ///
@@ -70,6 +73,7 @@ pub const NESTING_RUN_ARGS: &[&str] = &[
     "--security-opt=label=type:container_engine_t",
     "--security-opt=unmask=ALL",
     "--device=/dev/fuse",
+    "--device=/dev/net/tun",
 ];
 
 /// The `--security-opt` values a config may state: the nesting set, and
@@ -81,10 +85,12 @@ const ALLOWED_SECURITY_OPTS: &[&str] = &[
     "label=nested",
 ];
 
-/// The `--device` values a config may state. `/dev/fuse` is nesting's own
-/// (fuse-overlayfs, for storage on an overlay root); the guest has it, and
-/// it reaches nothing outside the VM.
-const ALLOWED_DEVICES: &[&str] = &["/dev/fuse"];
+/// The `--device` values a config may state, both nesting's own:
+/// `/dev/fuse` for fuse-overlayfs (storage on an overlay root), and
+/// `/dev/net/tun` for pasta, which gives a nested container its network
+/// ("Failed to open() /dev/net/tun" without it). The guest has both, and
+/// neither reaches anything outside the VM.
+const ALLOWED_DEVICES: &[&str] = &["/dev/fuse", "/dev/net/tun"];
 
 /// Flags accepted for cross-ecosystem compatibility but never passed to
 /// podman as they are. Docker needs `--privileged` for systemd-in-container
@@ -536,7 +542,8 @@ mod tests {
         // A flag the config already states is not stated twice.
         let (_dir, config) = config_with(
             r#"{"image": "img", "privileged": true,
-                "runArgs": ["--security-opt", "unmask=ALL", "--device", "/dev/fuse"]}"#,
+                "runArgs": ["--security-opt", "unmask=ALL", "--device", "/dev/fuse",
+                            "--device=/dev/net/tun"]}"#,
         );
         assert_eq!(
             privileged_run_args(&config),

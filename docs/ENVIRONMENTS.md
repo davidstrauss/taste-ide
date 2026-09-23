@@ -3015,7 +3015,8 @@ asked about and ruled out of scope (David, same day):
 - **No host process.** Every exec gate asks `ExecContext::has_exec_target()`
   and refuses a `false` rather than falling back.
 - **Repo-supplied config is vetted** (`taste_devcontainer::security`):
-  `--cap-add`, `--device` other than `/dev/fuse`, `--security-opt` other
+  `--cap-add`, `--device` other than `/dev/fuse` and `/dev/net/tun`,
+  `--security-opt` other
   than nesting's own values, `--pid=host`, `--network=host`, and arbitrary
   `-v` binds are refused; `--privileged` is never passed as asked, and
   becomes nesting (below).
@@ -3025,7 +3026,8 @@ asked about and ruled out of scope (David, same day):
   that could not host them sent that work to the user's machine, which is
   the one place it must not go. `"privileged": true` (or `--privileged` in
   `runArgs`) becomes `--security-opt=label=type:container_engine_t`,
-  `--security-opt=unmask=ALL`, and `--device=/dev/fuse`, and a config may
+  `--security-opt=unmask=ALL`, `--device=/dev/fuse`, and
+  `--device=/dev/net/tun`, and a config may
   state those itself, or `label=disable` and `label=nested`, which
   podman-in-podman guides also give. Measured in a Fedora CoreOS 44 guest
   with the IDE's own `--userns=keep-id`: with the default flags a nested
@@ -3037,8 +3039,11 @@ asked about and ruled out of scope (David, same day):
   works, but container storage on the container's own overlay root — the
   ordinary case — makes podman fall back to fuse-overlayfs, which needs
   `/dev/fuse` (the first measurement missed this, its image having
-  declared its storage as volumes; an agent's own image found it). No
-  capability and no real `--privileged`.
+  declared its storage as volumes; an agent's own image found it).
+  Networking is the fourth: a nested container's network is pasta's,
+  which needs `/dev/net/tun` (missed by a probe run with
+  `--network=none`, and found by an agent the same way). No capability
+  and no real `--privileged`.
   `"privileged": true` is the spelling to use, because VS Code and
   Codespaces read it too (Docker's docker-in-docker wants exactly that),
   while `unmask` is podman's word alone. What it widens is the container's
@@ -3046,7 +3051,7 @@ asked about and ruled out of scope (David, same day):
   section defends is the host, and nothing about it moves. The image
   supplies the rest, and each part of it was a dead end an agent met only
   by failing, measured against an image built the way an agent builds one:
-  podman and fuse-overlayfs; `newuidmap` and `newgidmap` given their file
+  podman, fuse-overlayfs, and passt; `newuidmap` and `newgidmap` given their file
   capabilities back with a `setcap` in a RUN step after the package
   install (the image build drops them, and making them setuid instead did
   NOT work); and subordinate IDs for its user inside the container's range

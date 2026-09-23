@@ -740,7 +740,7 @@ pub(crate) fn author_prompt() -> String {
      in the Containerfile too (Fedora's package is go-task; either binary name works): the \
      IDE lists and runs the project's tasks through it.\n\
      If the project runs podman or docker itself (its build, tests, or tasks call it): \
-     install podman and fuse-overlayfs; set \"privileged\": true in devcontainer.json (the \
+     install podman, fuse-overlayfs, and passt; set \"privileged\": true in devcontainer.json (the \
      IDE grants exactly what nested podman needs for it, and VS Code reads it too); after the \
      package install, run `setcap cap_setuid+ep /usr/bin/newuidmap && setcap cap_setgid+ep \
      /usr/bin/newgidmap`, because the image build drops their file capabilities; and give \

@@ -4171,20 +4171,28 @@ fn first_line(text: &str) -> &str {
 /// `--userns=keep-id:uid=U,gid=G` for a non-root container user when the
 /// config has not chosen a user namespace itself; nothing otherwise.
 /// Nested podman, end to end and offline: a user namespace, then an image
-/// built FROM scratch and a container run on it — which mounts storage and
-/// sets up `/dev/pts` and `/proc` exactly as a real one does — with an
-/// executable that does not exist, so reaching exit 127 means everything
-/// before the exec worked. It prints the stage that failed and podman's
-/// `Error:` line; the IDE's remedy is chosen from them (`nesting_gap`).
-const NESTING_PROBE: &str = r#"say() { printf '%s %s\n' "$1" "$(printf '%s\n' "$2" | grep -m1 -E 'uid_map|gid_map|Error:' || printf '%s\n' "$2" | grep -v '^[[:space:]]*$' | tail -n1)"; }
+/// built FROM scratch and a container run on it — which mounts storage,
+/// sets up `/dev/pts` and `/proc`, starts its network (pasta), and names
+/// its host exactly as a real one does, with the DEFAULT flags a
+/// project's own `podman run` uses. The image is `true` and the libraries
+/// it links, copied from the container itself, because a real one is
+/// what is needed: podman checks an image for its command before it
+/// creates anything, so a probe of a missing executable (which this was)
+/// exited 127 before a namespace, a network, or a hostname existed, and
+/// passed containers that could not run anything. It prints the stage
+/// that failed and podman's `Error:` line; the IDE's remedy is chosen
+/// from them (`nesting_gap`).
+const NESTING_PROBE: &str = r#"say() { printf '%s %s\n' "$1" "$(printf '%s\n' "$2" | grep -m1 -E 'uid_map|gid_map|Error:|Failed' || printf '%s\n' "$2" | grep -v '^[[:space:]]*$' | tail -n1)"; }
 command -v podman >/dev/null || { echo "missing podman"; exit 1; }
 out=$(podman unshare true 2>&1) || { say userns "$out"; exit 1; }
-d=$(mktemp -d); printf 'FROM scratch\nLABEL taste.probe=1\n' > "$d/Containerfile"
+t=/usr/bin/true; [ -x "$t" ] || t=/bin/true; d=$(mktemp -d); mkdir -p "$d/r"
+for f in "$t" $( (ldd "$t" 2>/dev/null || /lib64/ld-linux-x86-64.so.2 --list "$t" 2>/dev/null) | grep -o '/[^ ]*'); do mkdir -p "$d/r${f%/*}"; cp -L "$f" "$d/r$f"; done
+printf 'FROM scratch\nCOPY r/ /\nLABEL taste.probe=1\n' > "$d/Containerfile"
 out=$(podman build -q -t localhost/taste-ide-probe "$d" 2>&1); rc=$?; rm -rf "$d"
 [ $rc = 0 ] || { say storage "$out"; exit 1; }
-out=$(podman run --rm --network=none localhost/taste-ide-probe /taste-ide-probe 2>&1); rc=$?
+out=$(podman run --rm localhost/taste-ide-probe "$t" 2>&1); rc=$?
 podman rmi -f localhost/taste-ide-probe >/dev/null 2>&1
-[ $rc = 127 ] || { say run "$out"; exit 1; }"#;
+[ $rc = 0 ] || { say run "$out"; exit 1; }"#;
 
 /// A failed nesting probe's report, as the gap and what to change. Each
 /// remedy is one measured in a Fedora CoreOS 44 guest against an image
@@ -4195,7 +4203,9 @@ fn nesting_gap(report: &str) -> String {
     let report = report.trim();
     let (stage, said) = report.split_once(' ').unwrap_or((report, ""));
     let remedy = if stage == "missing" {
-        "install podman and fuse-overlayfs in the Containerfile"
+        "install podman, fuse-overlayfs, and passt in the Containerfile"
+    } else if said.contains("pasta") && said.contains("not found") {
+        "podman's network helper is missing; install passt in the Containerfile"
     } else if said.contains("should have setuid or have filecaps") {
         "newuidmap and newgidmap lost their file capabilities in the image build; after the \
          package install, add RUN setcap cap_setuid+ep /usr/bin/newuidmap && setcap \
@@ -4204,6 +4214,13 @@ fn nesting_gap(report: &str) -> String {
         "the user's subordinate IDs are outside the container's range (0-65536; useradd's \
          default is not); for a user with uid 1000, write USER:1:999 and USER:1001:64535 to \
          /etc/subuid and /etc/subgid"
+    } else if said.contains("sethostname") {
+        "the container's seccomp filter refuses sethostname to a nested container; run \
+         nested containers with --uts=host (or utsns=\"host\" under [containers] in \
+         containers.conf)"
+    } else if said.contains("/dev/net/tun") || said.contains("pasta failed") {
+        "the container has no /dev/net/tun for pasta; rebuild so the IDE grants it (it comes \
+         with \"privileged\": true)"
     } else if said.contains("fuse-overlayfs") || said.contains("mount program") {
         "container storage is on the container's overlay root and needs fuse-overlayfs; \
          install fuse-overlayfs in the Containerfile"
@@ -4900,6 +4917,12 @@ mod tests {
         );
         assert!(fuse.len() < 500, "{fuse}");
         assert!(nesting_gap("missing podman").contains("install podman"));
+        let tun = nesting_gap("run Error: pasta failed with exit code 1:");
+        assert!(tun.contains("/dev/net/tun"), "{tun}");
+        let uts = nesting_gap(
+            "run Error: crun: sethostname: Operation not permitted: OCI permission denied",
+        );
+        assert!(uts.contains("--uts=host"), "{uts}");
     }
 
     #[test]
