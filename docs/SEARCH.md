@@ -220,17 +220,20 @@ line is shown.
   specific list"; 2026-09-07: "'Tab' from the search input should hop
   through the results, same as tab from one of the listings") — never
   GTK's focus chain.
-- **The Tab strip** beside the box says where you are: a Tab keycap, then
-  one lozenge per section in that order, each the section's glyph and its
-  count, the current one filled solid, the empty ones faded but in place
-  — every lozenge a fixed width, so neither a count nor the highlight
-  moves its neighbours or the box. A lozenge is also a click: straight to
-  that section. The two toggles stand before the box, the strip after it:
-  what shapes the query on one side, where its results are on the other.
-  The strip is laid beside the box on the window's root overlay,
-  unmeasured, so its appearing and going never moves the box (2026-09-08:
-  "never allowed from text changes to the search box"); below 1080sp it
-  is hidden, where it would run into the title bar's own items.
+- **The Tab strip** says where you are: a Tab keycap, then one lozenge
+  per section in that order, each the section's glyph and its count, the
+  current one filled solid, the empty ones faded but in place — every
+  lozenge a fixed width, so neither a count nor the highlight moves its
+  neighbours. A lozenge is also a click: straight to that section. It is
+  a row of its own that opens under the title bar while there is a query,
+  above the rest of the window and above any banner, in the search's
+  wash, with the keycap and lozenges centred (David, 2026-09-23). It
+  used to sit beside the box, laid on the window's overlay unmeasured so
+  its appearing never moved the box (2026-09-08: "never allowed from text
+  changes to the search box"), and hidden below 1080sp where it ran into
+  the title bar's own items; under the title bar it moves the box by
+  construction never and has the window's width, so it hides only in the
+  gadget rung, which is narrower than seven lozenges.
   In the Ports, Logs and Backlog rows a step lights the row in the hue
   rather than selecting it — selection in those lists means the row open
   in the editor, or the environment the panes are aimed at.

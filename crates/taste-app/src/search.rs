@@ -537,7 +537,8 @@ pub struct Search {
     meaning: gtk::ToggleButton,
     /// The Tab strip: the keycap and one lozenge per stop, hidden with the
     /// query (and by the rungs that have no room — `Search::summary`).
-    summary: gtk::Box,
+    /// The row under the title bar the strip opens in (`bar()`).
+    bar: gtk::Revealer,
     strip: gtk::Box,
     /// Each stop's lozenge and its count, in `Panel::ORDER`.
     stops: Vec<(Panel, gtk::Box, gtk::Label)>,
@@ -672,15 +673,32 @@ impl Search {
             stops.push((panel, lozenge, count));
         }
         strip.set_visible(false);
-        // The strip is NOT in this widget: the window lays it beside the
-        // box on its root overlay, unmeasured, so a query starting or
-        // clearing never moves the box (David, 2026-09-08: "Clearing the
-        // search text shifted the location of the search box in the title
-        // bar, which is never allowed from text changes to the search box.
-        // … They should be added to the right without affecting the search
-        // box location"). `summary()` hands it over.
+        // The strip is NOT in the title bar: it is a row of its own under
+        // it, opening while there is a query, above the rest of the window
+        // and any banner, with the keycap and lozenges centred (David,
+        // 2026-09-23: "Move the [Tab] and match counts with icons to a
+        // banner row that opens up below the search"). Beside the box it
+        // had to be laid on the window's overlay unmeasured so a query
+        // could never move the box (2026-09-08), and it hid at every rung
+        // narrower than the header could spare seven lozenges; a row under
+        // the header moves the box by construction never, and has the
+        // window's width. The window adds `bar()` as a top bar.
         let summary = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        summary.set_halign(gtk::Align::Center);
         summary.append(&strip);
+        let bar_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .css_classes(["search-stops-bar"])
+            .build();
+        summary.set_hexpand(true);
+        bar_row.append(&summary);
+        let bar = gtk::Revealer::builder()
+            .child(&bar_row)
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .transition_duration(150)
+            .reveal_child(false)
+            .build();
+        bar.set_widget_name("search-stops-bar");
         // Results by meaning, beside the ghost: what the semantic index
         // finds joins the literal hits — a file the word is not in but the
         // idea is, a chunk of the file on screen — until this says not to
@@ -720,7 +738,7 @@ impl Search {
             widget,
             entry: entry.clone(),
             meaning: meaning.clone(),
-            summary,
+            bar,
             strip,
             stops,
             placeholders: RefCell::new(HashMap::new()),
@@ -843,9 +861,10 @@ impl Search {
         &self.entry
     }
 
-    /// The Tab strip beside the box, for the rung that has no room for it.
-    pub fn summary(&self) -> &gtk::Box {
-        &self.summary
+    /// The Tab strip's row, which opens under the title bar while there is
+    /// a query: the window adds it as a top bar, ahead of every banner.
+    pub fn bar(&self) -> &gtk::Revealer {
+        &self.bar
     }
 
     /// A section's "No matches" banner: what is lit when the stop is the
@@ -1016,6 +1035,7 @@ impl Search {
         let running: Vec<&Status> = status.values().filter(|s| s.running).collect();
         let idle = self.query.borrow().is_empty();
         self.strip.set_visible(!idle);
+        self.bar.set_reveal_child(!idle);
         let stepping = self.stepping.get();
         {
             let counts = self.panel_hits.borrow();

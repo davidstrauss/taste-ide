@@ -23,10 +23,6 @@ use crate::portview::PortFacts;
 use crate::runtime::runtime;
 use crate::tabfamily::Family;
 
-/// Below this the header sheds what the search box's Tab strip needs the
-/// room for: the strip itself goes, and the flank's own width comes down.
-const ROOMY_MIN_WIDTH_SP: f64 = 1080.0;
-
 /// A 64x44 PNG for the composer's image chip in the posed frames: sky, two
 /// hills, a sun. Small enough to sit in the source, and shaped enough that
 /// the 18px stamp reads as a picture rather than as a coloured square.
@@ -1259,6 +1255,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
+    // The search's Tab strip, a row of its own under the header and above
+    // every banner (search.rs has the why).
+    toolbar_view.add_top_bar(search.bar());
     toolbar_view.add_top_bar(&banner.widget);
     // `TASTE_PROBE_BANNER=ready|passed|none`: the running-baseline faces,
     // which need a checkout in that state to appear otherwise.
@@ -1319,33 +1318,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let root_overlay = gtk::Overlay::new();
     root_overlay.set_child(Some(&toolbar_view));
     root_overlay.add_overlay(&reveal.layer);
-    // The search's Tab strip, laid at the box's right edge on every
-    // allocation and never measured, so the box is where it is whether or
-    // not there is a query (search.rs has the why). On the root overlay
-    // rather than drawn past the title widget's edge, because a child
-    // outside its parent's bounds takes no clicks, and a lozenge is a
-    // click.
-    {
-        let summary = search.summary().clone();
-        root_overlay.add_overlay(&summary);
-        root_overlay.set_measure_overlay(&summary, false);
-        root_overlay.set_clip_overlay(&summary, false);
-        let entry = search.entry().clone();
-        root_overlay.connect_get_child_position(move |overlay, child| {
-            if child != summary.upcast_ref::<gtk::Widget>() {
-                return None;
-            }
-            let bounds = entry.compute_bounds(overlay)?;
-            let (_, width, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
-            let (_, height, _, _) = child.measure(gtk::Orientation::Vertical, -1);
-            Some(gtk::gdk::Rectangle::new(
-                (bounds.x() + bounds.width()) as i32 + 8,
-                (bounds.y() + (bounds.height() - height as f32) / 2.0) as i32,
-                width,
-                height,
-            ))
-        });
-    }
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&root_overlay));
 
@@ -1520,21 +1492,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             consolidated_breakpoint
                 .connect_unapply(move |_| set_rung(crate::tabfamily::Rung::Full));
         }
-        // The Tab strip beside the box is the first thing this rung has no
-        // width for: the title bar's minimum is the window's, and seven
-        // lozenges put the editor off the window at 680 (the walk caught
-        // it). Tab still steps; only the indicator goes.
-        consolidated_breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
-        // One breakpoint applies at a time, so the roomy one below carries
-        // only what the narrower ones repeat.
-        let roomy_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-            adw::BreakpointConditionLengthType::MaxWidth,
-            ROOMY_MIN_WIDTH_SP,
-            adw::LengthUnit::Sp,
-        ));
-        // The strip beside the box would run into the end cluster here.
-        roomy_breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
-        window.add_breakpoint(roomy_breakpoint);
         window.add_breakpoint(consolidated_breakpoint.clone());
     }
 
@@ -1557,9 +1514,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // down here.
         breakpoint.add_setter(&editor.back_button, "visible", Some(&false.to_value()));
         breakpoint.add_setter(&editor.forward_button, "visible", Some(&false.to_value()));
-        // The search summary's fixed width is what keeps the box still at
-        // full size; down here it is the width the 400px window lacks.
-        breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
+        // Seven lozenges are wider than the 400px window this rung is for.
+        breakpoint.add_setter(search.bar(), "visible", Some(&false.to_value()));
         breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
         {
             // The two panels move house. Two `remove`/`append` pairs, no

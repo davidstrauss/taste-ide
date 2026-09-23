@@ -1146,6 +1146,12 @@ fn search_css(dark: bool) -> String {
            color-mix(in srgb, {fill} {wash}, @window_bg_color); }}\n\
          .hit-badge {{ background-color: alpha({fill}, {badge}); color: {ink}; }}\n\
          .search-summary, .tab-key {{ color: {ink}; }}\n\
+         /* The Tab strip's row under the title bar (search.rs): the \
+            search's own wash, so it reads as the search's and not as a \
+            notice, and a hairline under it where the window begins. */\n\
+         .search-stops-bar {{ padding: 5px 12px; background-color: \
+           color-mix(in srgb, {fill} {wash}, @window_bg_color); \
+           box-shadow: inset 0 -1px alpha(@window_fg_color, 0.08); }}\n\
          /* The Tab strip (search.rs): the stop the search is on wears the \
             hue solid, as the one selected hit does; a stop with nothing \
             fades but keeps its place. An empty section's banner title \
