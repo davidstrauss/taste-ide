@@ -2821,9 +2821,12 @@ The IDE ships a **baseline environment definition** in-tree
 (`data/baseline-environment/`, compiled into the binary and written out at
 first need) — git, node for agents, inspection tools, no project toolchain,
 on a digest-pinned `fedora-minimal` base. An environment whose own config
-is broken, unbuilt, or absent runs the baseline instead: same topology as
-container mode, different config authority. What this changes and what it
-does not:
+is broken or absent runs the baseline instead: same topology as container
+mode, different config authority. A config that is merely UNBUILT in the
+VM an environment lands in is built by its start (2026-09-23): setting it
+aside for a Rebuild was a consent step while lifecycle commands ran on the
+user's kernel, and with them in the VM it only put new environments in
+safe mode for no visible reason. What this changes and what it does not:
 
 - "No exec in safe mode" was derived from absence — the only target
   would have been the host. A baseline container is not the host; the real

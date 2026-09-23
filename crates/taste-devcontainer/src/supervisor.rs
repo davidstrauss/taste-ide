@@ -3126,12 +3126,37 @@ impl Supervisor {
     /// container, on a stand-in workspace where the config it had just
     /// written read as "File does not exist" (David, 2026-09-16: "I really
     /// need you to actually fix these reads"; "Safe mode was supposed to
-    /// be its own containerized environment"). The project's own build
-    /// stays the user's: its Rebuild, or the agent's devcontainer_reload
-    /// with the user's yes. A baseline already running is left alone.
+    /// be its own containerized environment"). A baseline already running
+    /// is left alone.
+    ///
+    /// **A project config is built, not set aside** (David, 2026-09-23).
+    /// The automatic start used to put a config whose image this VM had
+    /// never built on the baseline and wait for a Rebuild, because building
+    /// runs the config's lifecycle commands and that was the user's act
+    /// while they ran on the user's kernel. They run in the VM now and the
+    /// reload asks nobody, so an environment placed in a VM that had not
+    /// built its image — a new issue's, most often — came up in safe mode
+    /// for no reason anyone could see, its agent oriented to it, and
+    /// rebuilt from there. Now the start builds it, the startup page shows
+    /// the build, and the baseline follows only a failure
+    /// (`reload_reporting`). A config whose last build failed is still
+    /// passed over by `resolve_config` until one of its files changes, so
+    /// a broken build is not retried at every launch.
     pub async fn reload_baseline(&self) -> Result<()> {
         if self.inside {
             bail!("the IDE is running inside this devcontainer; nothing to bring up from here");
+        }
+        let project = matches!(
+            self.resolve_config().map(|r| r.authority),
+            Ok(ConfigAuthority::Project)
+        );
+        if project {
+            if matches!(self.state(), SupervisorState::Running { .. })
+                && self.config_authority() == ConfigAuthority::Project
+            {
+                return Ok(());
+            }
+            return self.reload_reporting().await;
         }
         let _lifecycle = self.lifecycle.lock().await;
         if matches!(self.state(), SupervisorState::Running { .. })
