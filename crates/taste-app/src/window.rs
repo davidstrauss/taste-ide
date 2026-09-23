@@ -487,7 +487,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let watch_slot = std::rc::Rc::new(std::cell::RefCell::new(
         taste_core::watcher::WatchSlot::new(workspace.events.clone()),
     ));
+    // What aiming the panes does to the startup page, set once the pages
+    // exist (below): the environment aimed at shows its own start.
+    #[allow(clippy::type_complexity)]
+    let startup_follow: Rc<
+        RefCell<Option<Rc<dyn Fn(&taste_core::environment::EnvironmentId)>>>,
+    > = Rc::new(RefCell::new(None));
     let aim_panes: std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)> = {
+        let startup_follow = startup_follow.clone();
         let filetree = filetree.clone();
         let editor = editor.clone();
         let console = console.clone();
@@ -545,6 +552,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // rest: it renders the selected environment's chat, or offers
             // to start one.
             chats.show(&env);
+            // ...and its start, while it has one under way.
+            let follow = startup_follow.borrow().clone();
+            if let Some(follow) = follow {
+                follow(&env);
+            }
         })
     };
     {
@@ -1334,6 +1346,58 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // The environment's startup page (startup.rs): the checklist and the
     // log that take the editor's strip over while a start runs.
     let startup = crate::startup::StartupPage::new();
+    // A page per environment, Personal's among them: selecting another
+    // environment that is coming up shows ITS start, to watch (David,
+    // 2026-09-23: "When I select another env that's coming up, show the
+    // construction panel so I can watch"). The editor shows the page of
+    // the environment the panes are aimed at, and only while its start is
+    // under way.
+    let startups: Rc<
+        RefCell<HashMap<taste_core::environment::EnvironmentId, Rc<crate::startup::StartupPage>>>,
+    > = Rc::new(RefCell::new(HashMap::from([(
+        taste_core::environment::EnvironmentId::primary(),
+        startup.clone(),
+    )])));
+    let startup_for: Rc<
+        dyn Fn(&taste_core::environment::EnvironmentId) -> Rc<crate::startup::StartupPage>,
+    > = {
+        let startups = startups.clone();
+        Rc::new(move |env| {
+            startups
+                .borrow_mut()
+                .entry(env.clone())
+                .or_insert_with(|| {
+                    let page = crate::startup::StartupPage::new();
+                    page.set_subject(env.as_str());
+                    page
+                })
+                .clone()
+        })
+    };
+    // Which environment's page the editor is showing.
+    let startup_shown: Rc<RefCell<taste_core::environment::EnvironmentId>> = Rc::new(RefCell::new(
+        taste_core::environment::EnvironmentId::primary(),
+    ));
+    {
+        let startups = startups.clone();
+        let startup_shown = startup_shown.clone();
+        let editor = editor.clone();
+        *startup_follow.borrow_mut() = Some(Rc::new(move |env| {
+            let page = startups.borrow().get(env).cloned();
+            let live = page.as_ref().is_some_and(|p| p.underway() && !p.settled());
+            let showing_other = *startup_shown.borrow() != *env;
+            if showing_other {
+                editor.hide_startup();
+            }
+            if let (true, Some(page)) = (live, page) {
+                *startup_shown.borrow_mut() = env.clone();
+                editor.show_startup(page);
+            } else if !showing_other {
+                // Aimed at the one whose page is up, and it is not
+                // starting: nothing to watch.
+            }
+        }));
+    }
     // `TASTE_PROBE_STARTUP=vm|place|build|failed|noconfig|ready`: the page at
     // that stage, in front, which otherwise needs a start under way.
     if let Ok(kind) = std::env::var("TASTE_PROBE_STARTUP") {
@@ -3807,7 +3871,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let console = console.clone();
         let banner = banner.clone();
         let startup = startup.clone();
-        let startup_supervisor = supervisor.clone();
+        let startup_for = startup_for.clone();
+        let startup_shown = startup_shown.clone();
+        let startups_for_events = startups.clone();
         let editor = editor.clone();
         let chats = chats.clone();
         let aim_panes = aim_panes.clone();
@@ -4010,56 +4076,75 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // Every environment's row is live; only the primary
                         // drives the banner and the panes.
                         console.on_environment_state(&env, running);
-                        if env != primary_env {
-                            continue;
-                        }
-                        banner.on_state(&state);
-                        // The startup page: forward for every stage of a
-                        // start, told the outcome, and gone two seconds
-                        // after the environment is ready (startup.rs).
-                        // Not under a probe, which poses the page itself and
-                        // whose primary reports states no start produced.
+                        // The startup page: every environment has one, forward
+                        // for every stage of its start while the panes are
+                        // aimed at it, told the outcome, and gone two seconds
+                        // after it is ready (startup.rs). Not under a probe,
+                        // which poses the page itself and whose primary
+                        // reports states no start produced.
                         if !probe_mode {
                             use taste_core::event::DevcontainerStateEvent as S;
-                            let baseline = startup_supervisor.config_authority()
-                                == taste_core::ConfigAuthority::Baseline;
-                            startup.on_state(&state, baseline);
-                            match &state {
-                                S::Preparing { .. } | S::Building | S::Starting => {
-                                    editor.show_startup(startup.clone());
+                            let page = startup_for(&env);
+                            let baseline = environments_for_events.get(&env).is_some_and(|s| {
+                                s.config_authority() == taste_core::ConfigAuthority::Baseline
+                            });
+                            page.on_state(&state, baseline);
+                            let aimed = filetree.aimed_environment() == env;
+                            let bring_forward = || {
+                                if !aimed {
+                                    return;
                                 }
-                                S::Failed { .. } => {
-                                    // Shown with the reason; the fallback
-                                    // that follows keeps it up.
-                                    editor.show_startup(startup.clone());
+                                if *startup_shown.borrow() != env {
+                                    editor.hide_startup();
+                                    *startup_shown.borrow_mut() = env.clone();
+                                }
+                                editor.show_startup(page.clone());
+                            };
+                            match &state {
+                                // Shown with the reason on a failure; the
+                                // fallback that follows keeps it up.
+                                S::Preparing { .. }
+                                | S::Building
+                                | S::Starting
+                                | S::Failed { .. } => {
+                                    bring_forward();
                                 }
                                 S::Running { .. } => {
-                                    if startup.underway() {
-                                        startup.mark_settled();
-                                        let startup = startup.clone();
+                                    if page.underway() {
+                                        page.mark_settled();
+                                        let page = page.clone();
                                         let editor = editor.clone();
+                                        let shown = startup_shown.clone();
+                                        let env = env.clone();
                                         glib::timeout_add_local_once(
                                             crate::startup::READY_LINGER,
                                             move || {
                                                 // Unless another start
                                                 // began in the meantime.
-                                                if matches!(startup_state_now(&startup), Some(true))
-                                                {
+                                                if matches!(startup_state_now(&page), Some(true)) {
                                                     return;
                                                 }
-                                                startup.end();
-                                                editor.hide_startup();
+                                                page.end();
+                                                if *shown.borrow() == env {
+                                                    editor.hide_startup();
+                                                }
                                             },
                                         );
                                     }
                                 }
                                 S::Stopped => {
-                                    startup.end();
-                                    editor.hide_startup();
+                                    page.end();
+                                    if *startup_shown.borrow() == env {
+                                        editor.hide_startup();
+                                    }
                                 }
                                 S::NoConfig | S::ConfigDetected => {}
                             }
                         }
+                        if env != primary_env {
+                            continue;
+                        }
+                        banner.on_state(&state);
                         // Mode may have flipped (safe ↔ container): restyle
                         // the tree's read-only locks.
                         filetree.on_git_status_changed();
@@ -4096,8 +4181,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::DevcontainerLog { env, line } => {
                         // The primary's build log is the startup page's
                         // too, and its STEP lines the build step's count.
-                        if env == primary_env {
-                            startup.on_build_line(&line);
+                        if let Some(page) = startups_for_events.borrow().get(&env) {
+                            page.on_build_line(&line);
                         }
                         console.append_env_log(&env, &line);
                         log_activity.record(&env, crate::logview::LogKind::Environment, 1);
@@ -4120,12 +4205,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::VmLog { domain, line } => {
                         // The primary's VM story is the startup page's log
                         // through the stages before a container exists.
-                        if environments_for_events
-                            .vm_log_domain_for(&primary_env)
-                            .as_deref()
-                            == Some(&domain)
-                        {
-                            startup.on_vm_line(&line);
+                        for (env, page) in startups_for_events.borrow().iter() {
+                            if environments_for_events.vm_log_domain_for(env).as_deref()
+                                == Some(&domain)
+                            {
+                                page.on_vm_line(&line);
+                            }
                         }
                         for supervisor in environments_for_events.list() {
                             let env = supervisor.id();
@@ -4227,12 +4312,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         }
                     },
                     Event::VmProgress { domain, line } => {
-                        if environments_for_events
-                            .vm_log_domain_for(&primary_env)
-                            .as_deref()
-                            == Some(&domain)
-                        {
-                            startup.on_vm_progress(&line);
+                        for (env, page) in startups_for_events.borrow().iter() {
+                            if environments_for_events.vm_log_domain_for(env).as_deref()
+                                == Some(&domain)
+                            {
+                                page.on_vm_progress(&line);
+                            }
                         }
                     }
                     Event::FlatpakLog(line) => console.append_flatpak_log(&line),

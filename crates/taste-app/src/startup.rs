@@ -252,6 +252,9 @@ impl StepRow {
 pub struct StartupPage {
     pub widget: gtk::Widget,
     heading: gtk::Label,
+    /// Whose start this is, as the heading names it: "Environment" for
+    /// Personal's, the environment's own name for another's.
+    subject: RefCell<String>,
     note: gtk::Label,
     rows: Vec<StepRow>,
     logs: gtk::Stack,
@@ -365,6 +368,7 @@ impl StartupPage {
         let this = Rc::new(Self {
             widget: overlay.upcast(),
             heading,
+            subject: RefCell::new("Environment".to_string()),
             note,
             rows,
             logs,
@@ -411,6 +415,13 @@ impl StartupPage {
         }
     }
 
+    /// Name whose start this page draws, for an environment other than
+    /// Personal's (the window keeps a page per environment).
+    pub fn set_subject(&self, subject: &str) {
+        *self.subject.borrow_mut() = subject.to_string();
+        self.heading.set_label(&format!("{subject} starting"));
+    }
+
     /// Whether a start is being drawn.
     pub fn underway(&self) -> bool {
         self.underway.get()
@@ -422,7 +433,8 @@ impl StartupPage {
         self.underway.set(true);
         self.settled.set(false);
         self.current.set(None);
-        self.heading.set_label("Environment starting");
+        self.heading
+            .set_label(&format!("{} starting", self.subject.borrow()));
         self.note.set_visible(false);
         self.since.set(None);
         self.build_steps.set((0, 0));
@@ -579,7 +591,8 @@ impl StartupPage {
         }
         self.row(Step::Ready).set(Status::Done, None);
         self.current.set(Some(Step::Ready));
-        self.heading.set_label("Environment ready");
+        self.heading
+            .set_label(&format!("{} ready", self.subject.borrow()));
     }
 
     /// The state, as the supervisor tells it. `baseline` says whose
@@ -608,7 +621,8 @@ impl StartupPage {
                     // Not the project's doing: the safe-mode environment is
                     // the IDE's own, so this is the machine, the VM
                     // provider, or a bug in the IDE. No agent to hand it to.
-                    self.heading.set_label("Environment failed");
+                    self.heading
+                        .set_label(&format!("{} failed", self.subject.borrow()));
                     self.set_note(&format!(
                         "The safe-mode environment itself could not start: {first}. This is \
                              not the project's configuration — it is this machine's setup, the \
