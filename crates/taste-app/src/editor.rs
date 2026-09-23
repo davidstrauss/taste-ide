@@ -488,6 +488,12 @@ pub struct Editor {
     pages: RefCell<HashMap<PathBuf, Rc<EditorPage>>>,
     /// The tabs that are not files: logs and ports (see [`SurfaceEntry`]).
     surfaces: RefCell<HashMap<PathBuf, Rc<SurfaceEntry>>>,
+    /// Each open task tab's Prompt Agent, by the tab's key, for a run's
+    /// state to show or hide (`set_task_failed`).
+    task_prompts: RefCell<HashMap<PathBuf, gtk::Button>>,
+    /// What a task tab's Prompt Agent does (`set_on_prompt_task`).
+    #[allow(clippy::type_complexity)]
+    on_prompt_task: RefCell<Option<Rc<dyn Fn(taste_core::environment::EnvironmentId, String)>>>,
     /// The startup page's tab while a start is on screen: the one the
     /// selection is held to (`show_startup`).
     startup_tab: RefCell<Option<adw::TabPage>>,
@@ -670,6 +676,8 @@ impl Editor {
             mode_popover: mode_popover.clone(),
             pages: RefCell::new(HashMap::new()),
             surfaces: RefCell::new(HashMap::new()),
+            task_prompts: RefCell::new(HashMap::new()),
+            on_prompt_task: RefCell::new(None),
             startup_tab: RefCell::new(None),
             headless: RefCell::new(HashMap::new()),
             git_dirty: RefCell::new(HashMap::new()),
@@ -773,6 +781,7 @@ impl Editor {
             // A surface has nothing unsaved: it closes, and is forgotten.
             if let Some((key, _)) = editor.surface_by_tab(page) {
                 editor.surfaces.borrow_mut().remove(&key);
+                editor.task_prompts.borrow_mut().remove(&key);
                 tabs.close_page_finish(page, true);
                 editor.sync_toggle_to_selection();
                 return glib::Propagation::Stop;
@@ -1324,6 +1333,7 @@ impl Editor {
             if let Some(surface) = self.surfaces.borrow_mut().remove(path) {
                 holding.close_page(&surface.tab);
             }
+            self.task_prompts.borrow_mut().remove(path);
         }
     }
 
@@ -2135,6 +2145,26 @@ impl Editor {
             format!("task {name} · {env}")
         };
         let page = crate::logview::LogPage::titled(&what, crate::tasks::TASK_ICON, &seed);
+        // A failed run's next step, where its output is being read (David,
+        // 2026-09-23: "When a task has failed and I have the logs open,
+        // give me a \"Prompt Agent\" button inside that log viewing tab").
+        // Shown while the last run failed (`set_task_failed`).
+        let prompt = page.add_action(
+            "Prompt Agent",
+            &format!("Hand this output to the environment's agent to find why {name} failed"),
+        );
+        {
+            let weak = Rc::downgrade(self);
+            let env = env.clone();
+            let name = name.to_string();
+            prompt.connect_clicked(move |_| {
+                let Some(editor) = weak.upgrade() else { return };
+                let hook = editor.on_prompt_task.borrow().clone();
+                if let Some(hook) = hook {
+                    hook(env.clone(), name.clone());
+                }
+            });
+        }
         let tab = self.tabs.append(&page.widget);
         tab.set_title(&if env.is_primary() {
             name.to_string()
@@ -2161,8 +2191,32 @@ impl Editor {
                 kind: SurfaceKind::Task(page, name.to_string()),
             }),
         );
+        self.task_prompts
+            .borrow_mut()
+            .insert(task_key(env, name), prompt);
         self.tabs.set_selected_page(&tab);
         self.sync_toggle_to_selection();
+    }
+
+    /// Whether a task's last run failed, for its tab's Prompt Agent.
+    pub fn set_task_failed(
+        &self,
+        env: &taste_core::environment::EnvironmentId,
+        name: &str,
+        failed: bool,
+    ) {
+        if let Some(button) = self.task_prompts.borrow().get(&task_key(env, name)) {
+            button.set_visible(failed);
+        }
+    }
+
+    /// What a failed task's Prompt Agent does: the window hands the run's
+    /// output to that environment's agent.
+    pub fn set_on_prompt_task(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId, String) + 'static,
+    ) {
+        *self.on_prompt_task.borrow_mut() = Some(Rc::new(hook));
     }
 
     /// New lines for a task's output, when its tab is open.

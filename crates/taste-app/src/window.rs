@@ -334,6 +334,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 return;
             }
             editor.open_task(&env, &name, task_runs.lines(&env, &name));
+            editor.set_task_failed(
+                &env,
+                &name,
+                task_runs.state(&env, &name) == crate::tasks::RunState::Failed,
+            );
         });
     }
     {
@@ -1283,17 +1288,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // One closure for both callers: the banner (the primary's) and the
     // lifecycle-failure toast (any environment's), so the two can never
     // send a repair two different ways.
-    let prompt_agent: Rc<dyn Fn(&taste_core::environment::EnvironmentId, String, Option<String>)> = {
+    // The attachment is named by the caller: a build log and a task's
+    // output are different evidence, and the name is what the prompt
+    // points the agent at.
+    #[allow(clippy::type_complexity)]
+    let prompt_agent: Rc<
+        dyn Fn(&taste_core::environment::EnvironmentId, String, Option<(String, String)>),
+    > = {
         let chats = chats.clone();
         let compose = compose.clone();
-        Rc::new(move |env, prompt, log| {
+        Rc::new(move |env, prompt, attachment| {
             use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
             chats.show(env);
-            if let Some(log) = log {
-                compose.add_attachment(
-                    "environment-build.log".to_string(),
-                    ContentBlock::Text(TextContent::new(log)),
-                );
+            if let Some((name, text)) = attachment {
+                compose.add_attachment(name, ContentBlock::Text(TextContent::new(text)));
             }
             compose.set_text(&prompt);
             compose.dispatch(crate::compose::Destination::Chat);
@@ -1305,8 +1313,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             prompt_agent(
                 &taste_core::environment::EnvironmentId::primary(),
                 prompt,
-                log,
+                log.map(|log| ("environment-build.log".to_string(), log)),
             )
+        });
+    }
+    {
+        // A failed task's Prompt Agent: its output, the run's own record,
+        // handed to the agent of the environment it ran in.
+        let prompt_agent = prompt_agent.clone();
+        let task_runs = workspace.tasks.clone();
+        editor.set_on_prompt_task(move |env, name| {
+            let (prompt, attachment) =
+                crate::tasks::repair_prompt(&name, &task_runs.lines(&env, &name));
+            prompt_agent(&env, prompt, Some(attachment));
         });
     }
     toolbar_view.set_content(Some(&surfaces));
@@ -2714,6 +2733,28 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let editor = editor.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
                 let primary = taste_core::environment::EnvironmentId::primary();
+                // `TASTE_PROBE_TASKS=failed`: the seeded task whose run
+                // failed, its tab wearing the Prompt Agent that hands the
+                // output to the agent.
+                if std::env::var("TASTE_PROBE_TASKS").as_deref() == Ok("failed") {
+                    editor.open_task(
+                        &primary,
+                        "dev:init",
+                        [
+                            "$ task dev:init",
+                            "task: [dev:init] go run ./cmd/seed --db $DATABASE_URL",
+                            "seed: connecting to postgres://localhost:5432/dev",
+                            "seed: dial tcp 127.0.0.1:5432: connect: connection refused",
+                            "exit status 1",
+                            "task: Failed to run task \"dev:init\": exit status 1",
+                            "— failed (exit 201) —",
+                        ]
+                        .map(str::to_string)
+                        .to_vec(),
+                    );
+                    editor.set_task_failed(&primary, "dev:init", true);
+                    return;
+                }
                 editor.open_task(
                     &primary,
                     "build",
@@ -4026,7 +4067,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::TaskOutput { env, name, lines } => {
                         editor.append_task(&env, &name, &lines);
                     }
-                    Event::TaskState { env, name: _ } => {
+                    Event::TaskState { env, name } => {
+                        editor.set_task_failed(
+                            &env,
+                            &name,
+                            workspace.tasks.state(&env, &name) == crate::tasks::RunState::Failed,
+                        );
                         if filetree.aimed_environment() == env {
                             let board = workspace.tasks.clone();
                             filetree.update_task_states(|task| board.state(&env, task));
@@ -4217,7 +4263,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                 };
                                 let (prompt, log) =
                                     crate::devcontainer_ui::repair_prompt(&supervisor);
-                                prompt_agent(env, prompt, log);
+                                prompt_agent(
+                                    env,
+                                    prompt,
+                                    log.map(|log| ("environment-build.log".to_string(), log)),
+                                );
                             });
                         }
                         if action == "chat-destroy-session" {

@@ -309,6 +309,12 @@ fn main() -> glib::ExitCode {
                     weight would claim something happened. */\n\
                  .review-bar { padding: 4px 10px; background-color: \
                    color-mix(in srgb, currentColor 5%, transparent); }\n\
+                 /* A log bar's one action (a failed task's Prompt Agent): \
+                    the bar's own height, not a toolbar button's, so the \
+                    bar does not grow when it appears. */\n\
+                 .review-bar button.log-bar-action { min-height: 20px; \
+                   padding: 0 10px; margin: -2px 0; font-size: 0.85em; \
+                   border-radius: 9999px; }\n\
                  .taste-banner { background-color: \
                    color-mix(in srgb, var(--banner-color) 30%, \
                    var(--window-bg-color)); }\n\

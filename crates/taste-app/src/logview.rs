@@ -270,6 +270,8 @@ pub struct LogPage {
     /// read it as the user scrolling.
     scrolling: Rc<Cell<bool>>,
     state: gtk::Label,
+    /// The bar, for an action a page of one kind offers (`add_action`).
+    bar: gtk::Box,
     on_follow_changed: RefCell<Option<Box<dyn Fn(bool)>>>,
 }
 
@@ -365,6 +367,7 @@ impl LogPage {
             jump,
             scrolling: Rc::new(Cell::new(false)),
             state,
+            bar,
             on_follow_changed: RefCell::new(None),
         });
 
@@ -400,6 +403,21 @@ impl LogPage {
             }
         });
         page
+    }
+
+    /// A button at the bar's end, after what the page is following: the
+    /// one next step a log of some kind offers (a failed task's Prompt
+    /// Agent). Hidden until its owner shows it.
+    pub fn add_action(&self, label: &str, tooltip: &str) -> gtk::Button {
+        let button = gtk::Button::builder()
+            .label(label)
+            .tooltip_text(tooltip)
+            .css_classes(["suggested-action", "log-bar-action"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        self.bar.append(&button);
+        button
     }
 
     /// Append lines, trimming the oldest past the cap. Scrolls when
