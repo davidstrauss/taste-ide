@@ -3024,17 +3024,21 @@ asked about and ruled out of scope (David, same day):
   container, a test that starts one — are ordinary, and a devcontainer
   that could not host them sent that work to the user's machine, which is
   the one place it must not go. `"privileged": true` (or `--privileged` in
-  `runArgs`) becomes `--security-opt=label=type:container_engine_t` and
-  `--security-opt=unmask=ALL`, and a config may state those two itself,
-  or `label=disable`, `label=nested`, and `--device=/dev/fuse`, which
+  `runArgs`) becomes `--security-opt=label=type:container_engine_t`,
+  `--security-opt=unmask=ALL`, and `--device=/dev/fuse`, and a config may
+  state those itself, or `label=disable` and `label=nested`, which
   podman-in-podman guides also give. Measured in a Fedora CoreOS 44 guest
   with the IDE's own `--userns=keep-id`: with the default flags a nested
   build works and a nested `podman run` fails, SELinux's `container_t`
   refusing the `devpts` mount; container-selinux's `container_engine_t`
   (still confined, still MCS-separated) gets past that, and `unmask=ALL`
   lets the inner container mask `/proc` paths that the outer one's own
-  masked `/proc` forbids. No capability, no device, and no real
-  `--privileged`: overlay runs natively in the guest's kernel.
+  masked `/proc` forbids. Storage is the third: on a volume, native overlay
+  works, but container storage on the container's own overlay root — the
+  ordinary case — makes podman fall back to fuse-overlayfs, which needs
+  `/dev/fuse` (the first measurement missed this, its image having
+  declared its storage as volumes; an agent's own image found it). No
+  capability and no real `--privileged`.
   `"privileged": true` is the spelling to use, because VS Code and
   Codespaces read it too (Docker's docker-in-docker wants exactly that),
   while `unmask` is podman's word alone. What it widens is the container's

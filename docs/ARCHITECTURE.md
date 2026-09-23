@@ -254,9 +254,9 @@ What that leaves genuinely enforced, in every mode:
   is the one thing writable in safe mode. Those commands run in the
   environment's VM, on its kernel, with nothing of the user's in reach —
   so the agent may write the config and apply it, and `devcontainer_reload`
-  asks nobody. The user learns how it ended: a toast when that environment
-  is the one in use, its row's light otherwise, and the agent is told in
-  its next prompt. Until 2026-09-21 the hooks ran on the host and the user
+  asks nobody. The user learns how it ended: the startup page when that
+  environment is the one in use (it ends on ready or on the failure), its
+  row's light otherwise, and the agent is told in its next prompt. Until 2026-09-21 the hooks ran on the host and the user
   applied; that split returns for any agent-written path that would feed
   something executed outside the VM.
 - **Supply chain**: agent adapters fetched from registries are version-

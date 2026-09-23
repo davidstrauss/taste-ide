@@ -419,11 +419,12 @@ to.
   the user's kernel, the agent authored and the USER applied, and
   `devcontainer_reload` asked by name. They run in the VM now, so the
   agent authors AND applies: the reload asks nobody, and the user is told
-  once, at the end, whether it succeeded — as a toast when that
-  environment is the one the panes are aimed at, and as its row's light
-  otherwise (David, 2026-09-21: "I only need a notification on the final
-  success/failure of the rebuild if that env is active. Drop the
-  confirmation dialogs"). The rule that remains: any agent-writable path
+  once, at the end, whether it succeeded — by the startup page when that
+  environment is the one the panes are aimed at, which ends on ready or on
+  the failure, and by its row's light otherwise (David, 2026-09-21: "I
+  only need a notification on the final success/failure of the rebuild if
+  that env is active. Drop the confirmation dialogs"; 2026-09-23, of a
+  toast on top of that page: "I don't need this sort of toast"). The rule that remains: any agent-writable path
   that feeds something executed OUTSIDE the VM needs the author/apply
   split back.
 - Two modes only, and **both are containers** — they differ in *config

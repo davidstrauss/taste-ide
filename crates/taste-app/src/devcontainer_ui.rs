@@ -739,7 +739,7 @@ pub(crate) fn author_prompt() -> String {
      Containerfile instead. If the checkout has a Taskfile.yml (taskfile.dev), install `task` \
      in the Containerfile too: the IDE lists and runs the project's tasks through it.\n\
      If the project runs podman or docker itself (its build, tests, or tasks call it), \
-     install podman in the Containerfile, set \"privileged\": true in devcontainer.json (the \
+     install podman and fuse-overlayfs in the Containerfile, set \"privileged\": true in devcontainer.json (the \
      IDE grants exactly what nested podman needs for it, and VS Code reads it too), and give \
      the image's user subordinate IDs inside the container's range: \
      `echo USER:1:999 > /etc/subuid; echo USER:1001:64535 >> /etc/subuid`, and the same \

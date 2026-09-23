@@ -51,10 +51,15 @@ const ALLOWED_FLAGS_WITH_VALUE: &[&str] = &["-e", "--env", "--shm-size", "--host
 /// domain for exactly this — still confined, still MCS-separated — and it
 /// gets as far as the inner container masking `/proc/acpi`, which the
 /// outer container's own masked `/proc` forbids; `unmask=ALL` is that last
-/// step. No capability, no device, and no `--privileged`: overlay runs
-/// natively in the guest's kernel, so even `/dev/fuse` is not needed.
-/// `label=disable` works too, and is accepted for configs that already say
-/// it, but is not what the IDE asks for.
+/// step. Then storage: where the image's container storage is a volume,
+/// native overlay works, but on the container's own overlay root — the
+/// ordinary case, and the one an agent's image met — podman falls back to
+/// fuse-overlayfs, which fails with no `/dev/fuse` ("cannot mount: No such
+/// file or directory") and works with it. The first measurement missed
+/// this because `quay.io/podman/stable` declares its storage as volumes.
+/// No capability and no `--privileged`. `label=disable` works too, and is
+/// accepted for configs that already say it, but is not what the IDE asks
+/// for.
 ///
 /// Why this is not the boundary giving way: that boundary is the HOST
 /// (ENVIRONMENTS → "Isolation: the standard, and what meets it"), and the
@@ -64,6 +69,7 @@ const ALLOWED_FLAGS_WITH_VALUE: &[&str] = &["-e", "--env", "--shm-size", "--host
 pub const NESTING_RUN_ARGS: &[&str] = &[
     "--security-opt=label=type:container_engine_t",
     "--security-opt=unmask=ALL",
+    "--device=/dev/fuse",
 ];
 
 /// The `--security-opt` values a config may state: the nesting set, and
@@ -75,9 +81,9 @@ const ALLOWED_SECURITY_OPTS: &[&str] = &[
     "label=nested",
 ];
 
-/// The `--device` values a config may state. `/dev/fuse` is in every
-/// podman-in-podman recipe (for fuse-overlayfs); the guest has it, and it
-/// reaches nothing outside the VM.
+/// The `--device` values a config may state. `/dev/fuse` is nesting's own
+/// (fuse-overlayfs, for storage on an overlay root); the guest has it, and
+/// it reaches nothing outside the VM.
 const ALLOWED_DEVICES: &[&str] = &["/dev/fuse"];
 
 /// Flags accepted for cross-ecosystem compatibility but never passed to
@@ -103,11 +109,10 @@ pub fn privileged_run_args(config: &DevcontainerConfig) -> Vec<String> {
         return Vec::new();
     }
     let stated = |flag: &str| {
-        let value = flag.trim_start_matches("--security-opt=");
+        let (name, value) = flag.split_once('=').unwrap_or((flag, ""));
         config.run_args.iter().enumerate().any(|(i, arg)| {
             arg == flag
-                || (arg == "--security-opt"
-                    && config.run_args.get(i + 1).map(String::as_str) == Some(value))
+                || (arg == name && config.run_args.get(i + 1).map(String::as_str) == Some(value))
         })
     };
     NESTING_RUN_ARGS
@@ -521,7 +526,7 @@ mod tests {
         // A flag the config already states is not stated twice.
         let (_dir, config) = config_with(
             r#"{"image": "img", "privileged": true,
-                "runArgs": ["--security-opt", "unmask=ALL"]}"#,
+                "runArgs": ["--security-opt", "unmask=ALL", "--device", "/dev/fuse"]}"#,
         );
         assert_eq!(
             privileged_run_args(&config),
