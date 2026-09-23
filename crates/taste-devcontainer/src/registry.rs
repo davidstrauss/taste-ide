@@ -1007,14 +1007,14 @@ impl EnvironmentRegistry {
     }
 
     /// The guest image's and the VM's conclusions, once the ladder has
-    /// resolved onto the workspace's VM. `stream` is this reconcile's
-    /// reading of the stream; `fetched` says the image came down in this
+    /// resolved onto the workspace's VM (the guest image's own conclusion
+    /// is `guest_image_words`, said when that step is done). `fetched`
+    /// says the image came down in this
     /// start; `was_running` that the VM was already up before it; `took`
     /// how long the bring-up was.
     async fn conclude_vm(
         &self,
         pool: &crate::pool::Pool,
-        stream: &std::result::Result<crate::guest::StreamRecord, String>,
         fetched: bool,
         was_running: bool,
         took: std::time::Duration,
@@ -1026,46 +1026,6 @@ impl EnvironmentRegistry {
         let Ok(image) = crate::guest::image() else {
             return;
         };
-        // "44.20260912.3.0 (released 2026-09-12), the latest stable as of
-        // just now; 983 MiB, verified 2026-09-22": which release, whether
-        // it is the stream's current one and how that is known, and when
-        // its digest was checked.
-        let mut words = image.release.clone();
-        if let Some(date) = image.release_date() {
-            words.push_str(&format!(" (released {date})"));
-        }
-        match stream {
-            Ok(_) => words.push_str(", the latest stable as of just now"),
-            Err(e) => {
-                let last = crate::guest::last_stream_check()
-                    .map(|record| {
-                        format!("; last read {}", crate::guest::date_of(record.checked_at))
-                    })
-                    .unwrap_or_default();
-                words.push_str(&format!(
-                    "; the stable stream could not be read ({}){last}",
-                    e.lines().next().unwrap_or(e)
-                ));
-            }
-        }
-        let size = image
-            .bytes
-            .or_else(|| std::fs::metadata(image.path()).ok().map(|meta| meta.len()));
-        let mut facts: Vec<String> = Vec::new();
-        if let Some(bytes) = size {
-            facts.push(format!("{} MiB", bytes / (1024 * 1024)));
-        }
-        if fetched {
-            facts.push("downloaded and verified just now".to_string());
-        } else if !image.base_is_present() {
-            facts.push("downloads when a VM is next made".to_string());
-        } else if let Some(date) = image.verified_on() {
-            facts.push(format!("verified {date}"));
-        }
-        if !facts.is_empty() {
-            words.push_str(&format!("; {}", facts.join(", ")));
-        }
-        self.conclude(taste_core::StartupStage::GuestImage, words);
 
         if let Some(facts) = substrate.vm_facts() {
             let size = format!(
@@ -2599,8 +2559,23 @@ impl EnvironmentRegistry {
             let events = self.events.clone();
             let last: Mutex<Option<(std::time::Instant, taste_core::GuestImageFetch)>> =
                 Mutex::new(None);
+            let stream_for_conclusion = stream.clone();
+            let concluded = std::sync::atomic::AtomicBool::new(false);
             Arc::new(move |fetch: taste_core::GuestImageFetch| {
                 crate::substrate::report_download(fetch.clone());
+                // Downloaded and verified: the step's conclusion now, while
+                // the VM is still to boot.
+                if fetch.phase == taste_core::GuestImagePhase::Ready
+                    && !concluded.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    if let Some(summary) = guest_image_words(&stream_for_conclusion, true) {
+                        tracing::info!("startup GuestImage: {summary}");
+                        events.publish(Event::StartupConcluded {
+                            stage: taste_core::StartupStage::GuestImage,
+                            summary,
+                        });
+                    }
+                }
                 let mut last = last.lock().unwrap();
                 let publish = match &*last {
                     None => true,
@@ -2625,6 +2600,13 @@ impl EnvironmentRegistry {
         // (David, 2026-09-22).
         let stopped = self.stop_unowned_vms(&pool).await;
         self.conclude_sweep(&pool, stopped).await;
+        // The guest image is this machine's already: its step is done now,
+        // before the VM boots on it.
+        if !fetching {
+            if let Some(words) = guest_image_words(&stream, false) {
+                self.conclude(taste_core::StartupStage::GuestImage, words);
+            }
+        }
         self.primary()
             .announce_preparing("bringing up the workspace's VM");
         // The VMs' consoles, followed from before the boot so the story
@@ -2639,7 +2621,7 @@ impl EnvironmentRegistry {
         }
         let bringing_up = std::time::Instant::now();
         self.set_substrate(Substrate::resolve_in(&pool, reporter).await);
-        self.conclude_vm(&pool, &stream, fetching, was_running, bringing_up.elapsed())
+        self.conclude_vm(&pool, fetching, was_running, bringing_up.elapsed())
             .await;
         if let Ok(vms) = pool.vms().await {
             self.follow_vm_consoles(&vms);
@@ -4121,6 +4103,57 @@ fn clean_console_line(raw: &str) -> String {
         }
     }
     out
+}
+
+/// The guest image step's conclusion — "44.20260912.3.0 (released
+/// 2026-09-12), the latest stable as of just now; 983 MiB, verified
+/// 2026-09-22" — said the moment the step is done, not after the VM it
+/// is for has booted (David, 2026-09-23: "The summary should appear as the
+/// step completes or is verified as completed"): at once when the image
+/// was already here, and when a download reaches Ready otherwise.
+fn guest_image_words(
+    stream: &std::result::Result<crate::guest::StreamRecord, String>,
+    fetched: bool,
+) -> Option<String> {
+    let image = crate::guest::image().ok()?;
+    // "44.20260912.3.0 (released 2026-09-12), the latest stable as of
+    // just now; 983 MiB, verified 2026-09-22": which release, whether
+    // it is the stream's current one and how that is known, and when
+    // its digest was checked.
+    let mut words = image.release.clone();
+    if let Some(date) = image.release_date() {
+        words.push_str(&format!(" (released {date})"));
+    }
+    match stream {
+        Ok(_) => words.push_str(", the latest stable as of just now"),
+        Err(e) => {
+            let last = crate::guest::last_stream_check()
+                .map(|record| format!("; last read {}", crate::guest::date_of(record.checked_at)))
+                .unwrap_or_default();
+            words.push_str(&format!(
+                "; the stable stream could not be read ({}){last}",
+                e.lines().next().unwrap_or(e)
+            ));
+        }
+    }
+    let size = image
+        .bytes
+        .or_else(|| std::fs::metadata(image.path()).ok().map(|meta| meta.len()));
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(bytes) = size {
+        facts.push(format!("{} MiB", bytes / (1024 * 1024)));
+    }
+    if fetched {
+        facts.push("downloaded and verified just now".to_string());
+    } else if !image.base_is_present() {
+        facts.push("downloads when a VM is next made".to_string());
+    } else if let Some(date) = image.verified_on() {
+        facts.push(format!("verified {date}"));
+    }
+    if !facts.is_empty() {
+        words.push_str(&format!("; {}", facts.join(", ")));
+    }
+    Some(words)
 }
 
 #[cfg(test)]
