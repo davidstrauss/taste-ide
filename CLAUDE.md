@@ -99,8 +99,8 @@ filed/started/completed/declined/moved/prompted cards —, `permission`,
 `none` — no chat seeded at all —,
 `stash` — the conversation this machine kept for an environment whose
 agent has none, which is where a workspace restored from its archive
-lands: the banner saying so over a transcript long enough to be scrolled
-to the bottom, seeded by writing the stash and reading it back through the
+lands: a transcript long enough to be scrolled to the bottom, the line
+saying so where the restored part ends, seeded by writing the stash and reading it back through the
 real replay so the frame is a state the code can reach —; the three permission variants
 are the permission card asking about a command (all four answers, which
 is the widest it gets), about a file edit, and about one of the IDE's own

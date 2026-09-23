@@ -329,6 +329,11 @@ impl GitWorkspace {
         let source_path = source_repo
             .canonicalize()
             .with_context(|| format!("resolving {}", source_repo.display()))?;
+        // A folder the IDE tracks privately is fetched from that repository.
+        let source_path = match git2::Repository::open(&source_path) {
+            Ok(_) => source_path,
+            Err(_) => crate::private::find_private(&source_path).unwrap_or(source_path),
+        };
         // Opening it proves it is a repository before we fetch from it.
         git2::Repository::open(&source_path)
             .with_context(|| format!("opening source repository {}", source_path.display()))?;

@@ -855,16 +855,6 @@ pub struct ChatPane {
     session_info: RefCell<Option<(String, String)>>,
     /// "This fresh chat was forced" alert in the empty-transcript placeholder.
     restore_notice: gtk::Label,
-    /// Shown while this pane is displaying a conversation the AGENT does
-    /// not have: one restored from this machine's stash.
-    ///
-    /// A banner and not a transcript row, which is what it was first. A row
-    /// marks a position and scrolls away with it — and a stashed
-    /// conversation long enough to scroll is exactly the one whose marker
-    /// went off screen, leaving the pane showing history with no sign the
-    /// agent had never heard it. This is a property of the whole pane, so
-    /// it is stated where the pane states things.
-    stash_banner: adw::Banner,
     /// The empty-transcript page, whose title names the selected agent.
     placeholder: adw::StatusPage,
     /// The (agent, session) pair this chat is worth restoring FROM — the
@@ -2207,11 +2197,6 @@ impl ChatPane {
         // fresh chat was forced, not chosen. A transcript row would hide
         // the placeholder and strand tiny text in empty space; this keeps
         // the normal new-conversation view.
-        let stash_banner = adw::Banner::builder()
-            .title(
-                "This conversation was restored from this machine. The agent has no memory of it.",
-            )
-            .build();
         let restore_notice = gtk::Label::builder()
             .label("Couldn't restore the previous conversation — this is a fresh chat")
             .wrap(true)
@@ -2986,8 +2971,6 @@ impl ChatPane {
 
         widget.append(&top_bar);
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        // Above the transcript, because that is what it is about.
-        widget.append(&stash_banner);
         widget.append(&options_overlay);
         widget.append(&busy_row);
         widget.append(&replies_bar);
@@ -3117,7 +3100,6 @@ impl ChatPane {
             on_persist: RefCell::new(None),
             on_busy: RefCell::new(None),
             restore_notice,
-            stash_banner,
             placeholder,
             session_has_content: Cell::new(false),
             clear_on_replay: Cell::new(false),
@@ -4184,7 +4166,6 @@ impl ChatPane {
         // conversation the agent had just replayed, every launch (David,
         // 2026-09-23). And a later fresh session may offer the stash again,
         // since what it was drawn over is gone.
-        self.stash_banner.set_revealed(false);
         self.stash_replayed.set(false);
     }
 
@@ -4317,6 +4298,29 @@ impl ChatPane {
                 &self.bridge_command,
                 false,
             ),
+        }
+    }
+
+    /// Whether this chat's agent is outside a container that is coming
+    /// up, so it will be replaced by one inside: the environment is still
+    /// starting, or running without having said yet whether it can host
+    /// an agent.
+    fn container_on_its_way(&self) -> bool {
+        use taste_devcontainer::{AgentHosting, SupervisorState};
+        if self.relocated.get() {
+            return false;
+        }
+        let Some(supervisor) = self.environments.get(&self.environment) else {
+            return false;
+        };
+        match supervisor.state() {
+            SupervisorState::Preparing { .. }
+            | SupervisorState::Building
+            | SupervisorState::Starting => true,
+            SupervisorState::Running { .. } => {
+                !matches!(supervisor.agent_hosting(), AgentHosting::No { .. })
+            }
+            _ => false,
         }
     }
 
@@ -6318,10 +6322,15 @@ impl ChatPane {
     /// "… N more lines · open in the editor", as the line that does so.
     fn more_button(&self, key: &str, hidden: usize, tooltip: &str, doc: Document) -> gtk::Button {
         let button = gtk::Button::builder()
-            .label(format!(
-                "… {hidden} more line{} · open in the editor",
-                if hidden == 1 { "" } else { "s" }
-            ))
+            .label(if hidden == 0 {
+                // Nothing clipped: the whole of it, in another form.
+                "open in the editor".to_string()
+            } else {
+                format!(
+                    "… {hidden} more line{} · open in the editor",
+                    if hidden == 1 { "" } else { "s" }
+                )
+            })
             .tooltip_text(tooltip)
             .css_classes(["flat", "open-more"])
             .halign(gtk::Align::Start)
@@ -7580,7 +7589,39 @@ impl ChatPane {
                                 summary = Some(format!("+{} −{}", view.added, view.removed));
                             }
                             ToolCallContent::Content(block) => {
-                                if let Some(text) = content_text(&block.content) {
+                                // A tool that answers in a JSON object — the
+                                // IDE's own, mostly — reads as its fields, not
+                                // as the JSON the agent was given (David,
+                                // 2026-09-23: "This \"publish\" metadata
+                                // should be formatted nicely"). The raw text is
+                                // still the whole result, in the editor.
+                                if let Some(fields) =
+                                    content_text(&block.content).and_then(|t| json_fields(&t))
+                                {
+                                    let text = content_text(&block.content).unwrap_or_default();
+                                    card.content.append(&fields_grid(&fields));
+                                    let title = single_line(&card.title_full.borrow(), 60);
+                                    let key = format!("{marked}/result-{index}");
+                                    self.note_doc_row(&key, &card.row);
+                                    card.content.append(&self.more_button(
+                                        &key,
+                                        0,
+                                        "Open the whole result in the editor",
+                                        Document::Text {
+                                            title,
+                                            body: text,
+                                            markdown: false,
+                                            role: crate::chatdoc::TextRole::Result,
+                                        },
+                                    ));
+                                    summary.get_or_insert_with(|| {
+                                        fields
+                                            .iter()
+                                            .find(|(k, _)| k == "Status" || k == "State")
+                                            .map(|(_, v)| v.clone())
+                                            .unwrap_or_else(|| format!("{} fields", fields.len()))
+                                    });
+                                } else if let Some(text) = content_text(&block.content) {
                                     let (head, hidden) =
                                         crate::chatdoc::clip_lines(&text, OUTPUT_CLIP_LINES);
                                     card.content.append(
@@ -8061,8 +8102,15 @@ impl ChatPane {
                 if self.clear_on_replay.replace(false) {
                     self.clear_transcript();
                 }
-                // ...and when the agent has none, this machine might.
-                if !restored {
+                // ...and when the agent has none, this machine might — once
+                // the agent is where its memory would be. A chat's first
+                // agent is often spawned before its container is up, cannot
+                // reach the session it has in there, and is replaced by one
+                // inside that loads it; showing the stash for the first
+                // put "no memory of it" over conversations the agent went
+                // on to load, on most launches (David, 2026-09-23: "This
+                // shouldn't be occurring so frequently").
+                if !restored && !self.container_on_its_way() {
                     self.replay_stash();
                 }
                 self.persist_session_id();
@@ -9690,8 +9738,14 @@ impl ChatPane {
             // history over an empty page is a claim about nothing (David,
             // 2026-09-22: "This notice shouldn't show when there's zero
             // history").
+            //
+            // A line in the history where the restored part ends, not a
+            // banner over the pane: it is a fact about the conversation
+            // above it, and it scrolls away with it as the conversation
+            // goes on (David, 2026-09-23: "It also should just be a message
+            // in the chat history ... so it eventually scrolls off").
             if pane.transcript_rows.get() != 0 {
-                pane.stash_banner.set_revealed(true);
+                pane.meta_row("restored from this machine; the agent does not remember it");
             }
         });
     }
@@ -11547,6 +11601,103 @@ fn quote_command_arg(arg: &str) -> String {
     }
 }
 
+/// A JSON object's fields as a reader wants them: the key in words, the
+/// value in plain text — yes and no for booleans, lists joined, a long
+/// hex id shortened, objects compact — and what is null or empty left
+/// out. `None` for anything that is not a JSON object.
+fn json_fields(text: &str) -> Option<Vec<(String, String)>> {
+    use serde_json::Value;
+    let Value::Object(map) = serde_json::from_str::<Value>(text.trim()).ok()? else {
+        return None;
+    };
+    fn words(key: &str) -> String {
+        let spaced = key.replace(['_', '-'], " ");
+        let mut chars = spaced.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        }
+    }
+    fn plain(value: &Value) -> Option<String> {
+        Some(match value {
+            Value::Null => return None,
+            Value::Bool(true) => "yes".into(),
+            Value::Bool(false) => "no".into(),
+            Value::Number(n) => n.to_string(),
+            Value::String(s) if s.is_empty() => return None,
+            // A commit id is read by its first twelve.
+            Value::String(s) if s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) => {
+                s[..12].to_string()
+            }
+            Value::String(s) => s.clone(),
+            Value::Array(items) if items.is_empty() => return None,
+            Value::Array(items) => items
+                .iter()
+                .map(|item| match item {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            Value::Object(_) => value.to_string(),
+        })
+    }
+    // In the order the tool wrote them: serde_json's map sorts its keys,
+    // and a result reads in the order its author put it in, so each key is
+    // placed where it first appears in the text.
+    let mut keyed: Vec<(usize, String, String)> = map
+        .iter()
+        .filter_map(|(key, value)| {
+            let at = text.find(&format!("\"{key}\"")).unwrap_or(usize::MAX);
+            Some((at, words(key), plain(value)?))
+        })
+        .collect();
+    keyed.sort_by_key(|(at, _, _)| *at);
+    let fields: Vec<(String, String)> = keyed.into_iter().map(|(_, k, v)| (k, v)).collect();
+    (!fields.is_empty()).then_some(fields)
+}
+
+/// [`json_fields`] as a two-column list: the key dim, the value beside it.
+fn fields_grid(fields: &[(String, String)]) -> gtk::Grid {
+    let grid = gtk::Grid::builder()
+        .column_spacing(10)
+        .row_spacing(2)
+        .css_classes(["result-fields"])
+        .build();
+    for (row, (key, value)) in fields.iter().enumerate() {
+        grid.attach(
+            &gtk::Label::builder()
+                .label(key)
+                .xalign(0.0)
+                .yalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+            0,
+            row as i32,
+            1,
+            1,
+        );
+        grid.attach(
+            &gtk::Label::builder()
+                .label(value)
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .max_width_chars(40)
+                .selectable(true)
+                .focusable(false)
+                .hexpand(true)
+                .css_classes(["caption"])
+                .build(),
+            1,
+            row as i32,
+            1,
+            1,
+        );
+    }
+    grid
+}
+
 /// An MCP tool's answer as the agent reports it: an object already, JSON
 /// in a string, or a content array whose first text block is that JSON.
 fn act_output_json(raw: &serde_json::Value) -> Option<serde_json::Value> {
@@ -13098,6 +13249,21 @@ mod tests {
             Some("half\n[still running]")
         );
         assert_eq!(command_console_text("not json"), None);
+        let fields = json_fields(
+            r#"{"environment":"i-61v2gu","status":"unchanged","old":"531adbc6bb4c2b4250200b7e9b8684a23dde5f84","flagged_for_review":true,"note":null,"refs":["a","b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("Environment".to_string(), "i-61v2gu".to_string()),
+                ("Status".to_string(), "unchanged".to_string()),
+                ("Old".to_string(), "531adbc6bb4c".to_string()),
+                ("Flagged for review".to_string(), "yes".to_string()),
+                ("Refs".to_string(), "a, b".to_string()),
+            ]
+        );
+        assert_eq!(json_fields("[1, 2]"), None);
         let exec = |input: serde_json::Value| command_input_line("ide_exec", Some(&input));
         assert_eq!(
             exec(serde_json::json!({"command": "sh", "args": ["-c", "id; uname -a"]})).as_deref(),

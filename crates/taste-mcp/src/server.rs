@@ -2647,8 +2647,14 @@ impl McpServer {
                     "moved": updates.len() - created - pruned,
                     "pruned": pruned,
                     "refs": refs,
-                    "note": "remote-tracking refs only — your branch, index, and working tree \
-                             are untouched. Rebase or merge onto origin/<branch> yourself.",
+                    "note": if refs.is_empty() {
+                        "already up to date: nothing moved since your last update, so no refs \
+                         are listed. Your origin/* matches the user's branches. Your branch, \
+                         index, and working tree are untouched."
+                    } else {
+                        "remote-tracking refs only — your branch, index, and working tree \
+                         are untouched. Rebase or merge onto origin/<branch> yourself."
+                    },
                 }))
             }
             // The issue queue. Every one of these acts on the ref in the
