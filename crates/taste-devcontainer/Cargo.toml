@@ -17,6 +17,7 @@ notify.workspace = true
 tokio.workspace = true
 async-channel.workspace = true
 tracing.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -54,6 +54,12 @@ use crate::environment::EnvironmentId;
 /// How long a stashed conversation is kept after its last update.
 pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// The most one environment's stash may hold. What is stashed is what the
+/// agent streamed, and an agent decides how much that is; a week of it,
+/// unbounded, is this host's disk. Past this the oldest half goes: the
+/// replay is of a conversation's end, which is the part worth having.
+pub const MAX_STASH_BYTES: u64 = 32 * 1024 * 1024;
+
 /// One update as stashed: an envelope this module owns, around a payload it
 /// does not read.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -148,7 +154,31 @@ impl ChatArchive {
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         file.write_all(text.as_bytes())
-            .with_context(|| format!("appending to {}", path.display()))
+            .with_context(|| format!("appending to {}", path.display()))?;
+        drop(file);
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size > MAX_STASH_BYTES {
+            self.keep_newest(&path, MAX_STASH_BYTES / 2)?;
+        }
+        Ok(())
+    }
+
+    /// Cut a stash down to its newest `keep` bytes, whole lines only,
+    /// written beside and renamed over.
+    fn keep_newest(&self, path: &Path, keep: u64) -> Result<()> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cut = text.len().saturating_sub(keep as usize);
+        // By byte: `cut` may fall inside a character, and the newline after
+        // it never does.
+        let start = text.as_bytes()[cut..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(text.len(), |i| cut + i + 1);
+        let staged = path.with_extension("jsonl.trim");
+        std::fs::write(&staged, &text[start..])
+            .with_context(|| format!("writing {}", staged.display()))?;
+        std::fs::rename(&staged, path).with_context(|| format!("replacing {}", path.display()))
     }
 
     /// Everything stashed for this environment, oldest first.
@@ -244,6 +274,37 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_stash_past_its_cap_keeps_its_newest_half() {
+        let (_dir, archive) = archive();
+        let env = EnvironmentId::parse("review").unwrap();
+        let chunk = "é".repeat(64 * 1024);
+        let mut n = 0;
+        while archive.path_for(&env).metadata().map_or(0, |m| m.len())
+            <= MAX_STASH_BYTES - 256 * 1024
+        {
+            archive
+                .append(&env, json!({ "n": n, "text": chunk }))
+                .unwrap();
+            n += 1;
+        }
+        archive
+            .append(&env, json!({ "n": n, "text": chunk }))
+            .unwrap();
+        archive
+            .append(&env, json!({ "n": n + 1, "text": chunk }))
+            .unwrap();
+        let size = archive.path_for(&env).metadata().unwrap().len();
+        assert!(size <= MAX_STASH_BYTES, "{size}");
+        let loaded = archive.load(&env);
+        assert_eq!(loaded.skipped, 0, "only whole lines are kept");
+        assert_eq!(loaded.updates.last().unwrap().update["n"], n + 1);
+        assert!(
+            loaded.updates[0].update["n"].as_u64().unwrap() > 0,
+            "the oldest went"
+        );
+    }
 
     fn archive() -> (tempfile::TempDir, ChatArchive) {
         let dir = tempfile::tempdir().unwrap();

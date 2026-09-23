@@ -4058,6 +4058,17 @@ impl McpServer {
     {
         let main = self.workspace.root().to_path_buf();
         tokio::task::spawn_blocking(move || {
+            // Every backlog write lands in the user's own repository on this
+            // host, and an agent can file as often as it likes: none is
+            // made on a disk under the desktop's floor.
+            let free = taste_core::environment::free_bytes(&main);
+            if free.is_some_and(|f| f < taste_core::environment::MIN_FREE_DISK_BYTES) {
+                anyhow::bail!(
+                    "this machine's disk is under the {} GiB the IDE keeps free, so the backlog \
+                     takes no writes until space is freed",
+                    taste_core::environment::MIN_FREE_DISK_BYTES / (1024 * 1024 * 1024)
+                );
+            }
             let git = GitWorkspace::discover(&main)
                 .context("the user's checkout is not a git repository, so there is no issue ref")?;
             job(&git)

@@ -286,6 +286,11 @@ impl GitWorkspace {
         &self.workdir
     }
 
+    /// The repository's own directory: `.git`, or a private repository's.
+    pub fn git_dir(&self) -> &Path {
+        self.repo.path()
+    }
+
     /// Whether git ignores this path — the question a directory walk asks
     /// before descending.
     ///

@@ -1870,6 +1870,34 @@ take. When the kernel will not answer at all, nothing is refused, for the
 same reason an unmeasured workspace is not: a ceiling enforced on a number
 nobody has refuses for a reason nobody can check.
 
+**Everything the VM side can make this host store is held to the floor
+too** (David, 2026-09-23: "focus on preventing resource exhaustion on the
+desktop, specifically on disk"). An agent decides how many bytes it
+writes, and each of these is a way those bytes reach this disk:
+
+- **A VM's own disk.** A qcow2 is sparse and grows on the host as the
+  guest writes, up to its virtual size, so that size is the agent's to
+  reach. A new VM's is what the disk can give: free space, less the floor,
+  less what the VMs already made could still grow into, at most 64 GiB and
+  refused under 16 (`sizing::disk_for_new_vm`, which reads each disk's
+  virtual size from its qcow2 header). The VMs together can then never
+  take the disk under the floor — unless something else on the machine
+  eats the reserve, which is the case a running watchdog would cover and
+  nothing yet does.
+- **The fetch into the folder's repository.** A pack's size is not known
+  until it has arrived, so the fetch is refused under the floor and stopped
+  when the disk crosses it, its half-received pack removed
+  (`peer::fetch_within_floor`).
+- **The mirror's writes into the folder**, which store a second copy of
+  every file it brings in: counted before anything is written, and a pass
+  that would cross the floor pauses with the numbers in the title bar
+  (`GitWorkspace::mirror_from_within`).
+- **Backlog writes**, which land in the user's repository: none on a disk
+  under the floor.
+- **The chat stash**, the agent's stream kept on this machine for a week:
+  capped at 32 MiB per environment, its oldest half dropped past that
+  (`chatarchive::MAX_STASH_BYTES`).
+
 Its refusal carries a different instruction from the other two, which is
 the whole reason the three are kept apart. The cap says wait or destroy;
 the budget says destroy, and that stopping will not help; the floor says

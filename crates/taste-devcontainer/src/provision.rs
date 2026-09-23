@@ -1054,7 +1054,12 @@ impl LibvirtSession {
         sizing: &Sizing,
         report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> Result<Vm> {
-        crate::sizing::check_free_space(&disks_dir())?;
+        // The disk's ceiling is what this host can give it, so the VMs
+        // together cannot take the desktop's disk under the floor.
+        let sizing = &Sizing {
+            disk_gib: crate::sizing::disk_for_new_vm(&disks_dir())?,
+            ..*sizing
+        };
         let image = crate::guest::image()?;
         let base = image.ensure_base(self.sandboxed, report).await?;
 

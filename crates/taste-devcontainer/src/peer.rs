@@ -51,30 +51,6 @@ pub fn guest_url(vm: &Vm, path: &Path) -> String {
     )
 }
 
-/// Run `git -C <peer> <args>` on this host with the workspace's ssh
-/// identity, and nothing that could ask a question.
-fn git(peer: &Path, keys: &Keys, args: &[String]) -> Result<String> {
-    let mut argv = taste_git::private::cli_prefix(peer);
-    argv.extend(args.iter().cloned());
-    let (program, argv) = host_argv(taste_core::podman::sandboxed(), "git", argv);
-    let output = std::process::Command::new(&program)
-        .args(&argv)
-        .env("GIT_SSH_COMMAND", keys.git_ssh_command())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("SSH_ASKPASS_REQUIRE", "never")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("running {program}"))?;
-    if !output.status.success() {
-        bail!(
-            "git {}: {}",
-            args.first().map(String::as_str).unwrap_or_default(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 /// Push the peer's refs into the checkout at `path` in `vm`.
 pub fn push_to_guest(
     peer: &Path,
@@ -318,9 +294,119 @@ pub fn fetch_from_guest(
         guest_url(vm, path),
     ];
     args.extend(refspecs.iter().map(|s| s.to_string()));
-    git(peer, keys, &args)
+    fetch_within_floor(peer, keys, &args)
         .with_context(|| format!("fetching from {} in {}", path.display(), vm.domain))?;
     Ok(())
+}
+
+/// Why `bytes` more on the disk holding `dir` would take it under the
+/// desktop's floor (`taste_core::environment::MIN_FREE_DISK_BYTES`), or
+/// `None` when they fit. A disk that will not say how full it is is let
+/// through, as the IDE's other free-space checks do.
+pub fn room_for(dir: &Path, bytes: u64, doing: &str) -> Option<String> {
+    let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
+    let free = taste_core::environment::free_bytes(dir)?;
+    if free.saturating_sub(bytes) >= floor {
+        return None;
+    }
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    Some(format!(
+        "{doing} needs {:.1} GiB and this disk has {:.1} GiB free; the IDE keeps {:.0} GiB \
+         free for the desktop, so nothing was written — free some space and it continues",
+        gib(bytes),
+        gib(free),
+        gib(floor)
+    ))
+}
+
+/// A fetch from a checkout, which is the agent's: it decides how many bytes
+/// come back, and they land in this host's repository before anything can
+/// look at them. So the fetch is refused on a disk already under the floor,
+/// and stopped — asked to stop, and killed if it will not — the moment the
+/// disk crosses it, its half-received pack removed after (review,
+/// 2026-09-23). Polled rather than capped: a pack's size is not known until
+/// it has arrived, and the floor is the quantity that actually matters.
+fn fetch_within_floor(peer: &Path, keys: &Keys, args: &[String]) -> Result<()> {
+    if let Some(reason) = room_for(peer, 0, "fetching from the VM") {
+        bail!("{reason}");
+    }
+    let mut argv = taste_git::private::cli_prefix(peer);
+    argv.extend(args.iter().cloned());
+    let (program, argv) = host_argv(taste_core::podman::sandboxed(), "git", argv);
+    let started = std::time::SystemTime::now();
+    let mut child = std::process::Command::new(&program)
+        .args(&argv)
+        .env("GIT_SSH_COMMAND", keys.git_ssh_command())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {program}"))?;
+    // Read as it comes, so a chatty stderr cannot fill the pipe and stall
+    // the fetch the loop below is waiting on.
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut pipe, &mut text);
+            text
+        })
+    });
+    let mut stopped = None;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if stopped.is_none() {
+            if let Some(reason) = room_for(peer, 0, "fetching from the VM") {
+                // SIGTERM first: under the Flatpak the child is
+                // `flatpak-spawn`, which forwards it to the host's git and
+                // would leave that git running if killed outright.
+                unsafe {
+                    libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+                }
+                stopped = Some((reason, std::time::Instant::now()));
+            }
+        } else if stopped
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > std::time::Duration::from_secs(5))
+        {
+            let _ = child.kill();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
+    let stderr = stderr
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    if let Some((reason, _)) = stopped {
+        if let Some(git) = taste_git::GitWorkspace::discover(peer) {
+            remove_partial_packs(git.git_dir(), started);
+        }
+        bail!("{reason}");
+    }
+    if !status.success() {
+        bail!("git fetch: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// The packs a stopped fetch was receiving (`objects/pack/tmp_pack_*`)
+/// made since it started; nothing older, which is not this fetch's.
+fn remove_partial_packs(git_dir: &Path, since: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(git_dir.join("objects/pack")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let partial = entry.file_name().to_string_lossy().starts_with("tmp_");
+        let recent = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|at| at >= since);
+        if partial && recent {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The namespace a peer keeps its checkout's branches under while they
@@ -644,8 +730,10 @@ fn mirror_into_folder(
     let Some(snapshot) = git.read_ref(&taste_git::snapshot_ref("primary"))? else {
         return Ok(());
     };
+    let folder = git.workdir().to_path_buf();
+    let room = move |bytes: u64| room_for(&folder, bytes, "bringing the checkout's changes in");
     match git
-        .mirror_from(branch, tip, snapshot, force)
+        .mirror_from_within(branch, tip, snapshot, force, &room)
         .context("mirroring the checkout into this folder")?
     {
         Mirror::Applied { changed, switched } => {

@@ -23,6 +23,19 @@
 //! that grows only as the guest writes — but qcow2 does not shrink when the
 //! guest frees space, so the floor on free space is checked before every
 //! creation rather than assumed from the last one.
+//!
+//! # Why a disk is sized to what is free
+//!
+//! A sparse disk is a ceiling, and the ceiling is the guest's to reach:
+//! everything an agent writes in its VM — a build's output, a runaway log,
+//! a clone of something huge — lands in the qcow2 on this host's disk. Two
+//! 64 GiB ceilings on a disk with 50 GiB free is a desktop an agent can
+//! fill. So a VM's virtual size is what the disk can actually give it
+//! ([`disk_for_new_vm`]): what is free, less the floor the whole IDE keeps
+//! (`taste_core::environment::MIN_FREE_DISK_BYTES`), less what the VMs
+//! already made could still grow into — at most [`DISK_GIB`], and refused
+//! below [`DISK_MIN_GIB`] (review, 2026-09-23: "focus on preventing
+//! resource exhaustion on the desktop, specifically on disk").
 
 use std::path::Path;
 
@@ -37,10 +50,13 @@ pub const VCPU_MAX: u32 = 12;
 pub const MEMORY_MIN_MIB: u64 = 4096;
 /// The most it will commit to one VM.
 pub const MEMORY_MAX_MIB: u64 = 16384;
-/// The virtual size of a VM's disk. Sparse; a ceiling and not a cost.
+/// The largest virtual size a VM's disk is given. Sparse; a ceiling and
+/// not a cost — but a ceiling the guest can reach, which is why it is
+/// lowered to what the host can give ([`disk_for_new_vm`]).
 pub const DISK_GIB: u64 = 64;
-/// Free space the guests' filesystem must have before a VM is created.
-pub const MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// The smallest disk worth making: the guest OS, an image or two, and a
+/// build.
+pub const DISK_MIN_GIB: u64 = 16;
 /// Memory held back for the host — the IDE, its helpers, and the desktop —
 /// when deciding whether another VM fits.
 pub const HOST_RESERVE_MIB: u64 = 8192;
@@ -86,21 +102,72 @@ pub fn room_for(committed_mib: u64, next_mib: u64, host_memory_mib: u64) -> bool
         <= host_memory_mib
 }
 
-/// Refuse to create a VM on a filesystem with less than [`MIN_FREE_BYTES`]
-/// left. The directory need not exist yet; the nearest ancestor that does
-/// is what fills.
-pub fn check_free_space(dir: &Path) -> Result<()> {
-    if let Some(free) = taste_core::environment::free_bytes(dir) {
-        if free < MIN_FREE_BYTES {
-            bail!(
-                "{} has {:.1} GiB free; creating a VM needs {} GiB free",
-                dir.display(),
-                free as f64 / (1024.0 * 1024.0 * 1024.0),
-                MIN_FREE_BYTES / (1024 * 1024 * 1024)
-            );
-        }
+/// The virtual size, in GiB, a new VM's disk in `dir` can be given without
+/// the VMs together being able to take the disk under the floor: what is
+/// free, less `taste_core::environment::MIN_FREE_DISK_BYTES`, less the
+/// room every disk already in `dir` could still grow into, capped at
+/// [`DISK_GIB`]. Refused below [`DISK_MIN_GIB`], naming the numbers. A
+/// filesystem that will not say how full it is gets [`DISK_GIB`], as the
+/// IDE's other free-space checks allow what they cannot measure.
+pub fn disk_for_new_vm(dir: &Path) -> Result<u64> {
+    let Some(free) = taste_core::environment::free_bytes(dir) else {
+        return Ok(DISK_GIB);
+    };
+    disk_for(free, unclaimed_bytes(dir))
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+fn disk_for(free: u64, unclaimed: u64) -> Result<u64> {
+    let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
+    let headroom = free.saturating_sub(floor).saturating_sub(unclaimed);
+    let gib = (headroom / GIB).min(DISK_GIB);
+    if gib < DISK_MIN_GIB {
+        bail!(
+            "this disk has {:.1} GiB free, and the VMs already made could still grow into \
+             {:.1} GiB of it; with {} GiB kept free for the desktop, a new VM would get \
+             {gib} GiB, and it needs {DISK_MIN_GIB} GiB. Free some space, or remove a \
+             workspace's VMs",
+            free as f64 / GIB as f64,
+            unclaimed as f64 / GIB as f64,
+            floor / GIB,
+        );
     }
-    Ok(())
+    Ok(gib)
+}
+
+/// What the qcow2 disks in `dir` could still take from the host: each one's
+/// virtual size less what it already occupies.
+pub fn unclaimed_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "qcow2"))
+        .filter_map(|e| {
+            let size = qcow2_virtual_size(&e.path())?;
+            let taken = e.metadata().ok()?.blocks() * 512;
+            Some(size.saturating_sub(taken))
+        })
+        .sum()
+}
+
+/// A qcow2's virtual size, from its header: the magic `QFI\xfb`, then the
+/// size as a big-endian u64 at offset 24 (the format's documented layout).
+/// `None` for anything that is not a qcow2.
+pub fn qcow2_virtual_size(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut header = [0u8; 32];
+    std::fs::File::open(path)
+        .ok()?
+        .read_exact(&mut header)
+        .ok()?;
+    if &header[..4] != b"QFI\xfb" {
+        return None;
+    }
+    Some(u64::from_be_bytes(header[24..32].try_into().ok()?))
 }
 
 pub fn host_cpus() -> u32 {
@@ -161,18 +228,33 @@ mod tests {
         assert!((MEMORY_MIN_MIB..=MEMORY_MAX_MIB).contains(&a.memory_mib));
     }
 
-    /// A directory that does not exist yet is judged by the filesystem it
-    /// would land on, so the first VM on a fresh host is not refused for
-    /// want of a directory.
+    /// A new VM gets what the disk can give once the floor and the other
+    /// VMs' room are set aside, at most the ceiling, and is refused when
+    /// that is too little to be worth making.
     #[test]
-    fn free_space_is_judged_where_the_disk_would_land() {
+    fn a_new_disk_is_sized_to_what_the_host_can_give() {
+        let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
+        assert_eq!(disk_for(500 * GIB, 0).unwrap(), DISK_GIB);
+        assert_eq!(disk_for(floor + 40 * GIB, 0).unwrap(), 40);
+        assert_eq!(disk_for(floor + 100 * GIB, 64 * GIB).unwrap(), 36);
+        let refused = disk_for(floor + 20 * GIB, 10 * GIB).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("needs 16 GiB"),
+            "{refused:#}"
+        );
+    }
+
+    #[test]
+    fn a_qcow2_header_names_its_virtual_size() {
         let dir = tempfile::tempdir().unwrap();
-        let nested = dir.path().join("guests/machines/not-yet");
-        // Either the disk has room or it does not; the point is that the
-        // question is answerable and the error, if any, names the path.
-        match check_free_space(&nested) {
-            Ok(()) => {}
-            Err(e) => assert!(format!("{e:#}").contains("GiB free"), "{e:#}"),
-        }
+        let disk = dir.path().join("vm.qcow2");
+        let mut header = vec![0u8; 64];
+        header[..4].copy_from_slice(b"QFI\xfb");
+        header[24..32].copy_from_slice(&(64 * GIB).to_be_bytes());
+        std::fs::write(&disk, &header).unwrap();
+        assert_eq!(qcow2_virtual_size(&disk), Some(64 * GIB));
+        assert!(unclaimed_bytes(dir.path()) > 63 * GIB);
+        std::fs::write(dir.path().join("other.qcow2"), b"not a disk at all, no").unwrap();
+        assert_eq!(qcow2_virtual_size(&dir.path().join("other.qcow2")), None);
     }
 }

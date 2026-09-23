@@ -128,6 +128,23 @@ impl GitWorkspace {
         snapshot: Oid,
         force: bool,
     ) -> Result<Mirror> {
+        self.mirror_from_within(branch, tip, snapshot, force, &|_| None)
+    }
+
+    /// [`Self::mirror_from`], asking `room` before anything is written
+    /// whether the folder's disk can take the bytes this pass would write
+    /// there; a reason back pauses the pass with it, and nothing is
+    /// written. The checkout is the agent's, and a file it makes is a file
+    /// this host stores a second time, so what the mirror brings in is
+    /// bounded by the desktop's free space rather than by the VM's.
+    pub fn mirror_from_within(
+        &self,
+        branch: &str,
+        tip: Oid,
+        snapshot: Oid,
+        force: bool,
+        room: &dyn Fn(u64) -> Option<String>,
+    ) -> Result<Mirror> {
         let local = format!("refs/heads/{branch}");
         if !git2::Reference::is_valid_name(&local) {
             bail!("{branch} is not a branch name");
@@ -232,6 +249,9 @@ impl GitWorkspace {
             return Ok(Mirror::Unchanged);
         }
 
+        if let Some(reason) = room(self.bytes_written_over(current, target.id())?) {
+            return Ok(Mirror::Paused { reason });
+        }
         self.hold_ignored_if_rules_change(current, target.id())?;
         let changed = self.write_tree_over(current, target.id())?;
         self.set_ref(&local, tip)?;
@@ -529,6 +549,32 @@ impl GitWorkspace {
             .repo
             .commit(None, &signature, &signature, &message, &tree, &[])?;
         self.set_ref(MIRROR_REF, commit)
+    }
+
+    /// The bytes writing `to` over `from` would put in the folder: every
+    /// file the pass would write, whole — the room the write needs at its
+    /// peak, since each is staged beside its old copy before replacing it.
+    fn bytes_written_over(&self, from: Oid, to: Oid) -> Result<u64> {
+        let from_tree = self.repo.find_tree(from)?;
+        let to_tree = self.repo.find_tree(to)?;
+        let diff = self
+            .repo
+            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
+        let odb = self.repo.odb()?;
+        let mut bytes = 0u64;
+        for delta in diff.deltas() {
+            if matches!(delta.status(), Delta::Deleted) {
+                continue;
+            }
+            let file = delta.new_file();
+            if file.mode() == git2::FileMode::Commit {
+                continue;
+            }
+            if let Ok((size, _)) = odb.read_header(file.id()) {
+                bytes = bytes.saturating_add(size as u64);
+            }
+        }
+        Ok(bytes)
     }
 
     /// Write `to`'s files over a working tree that holds `from`'s: each
@@ -982,6 +1028,36 @@ mod tests {
             ws.mirror_from(&main, new_tip, old_snap, false).unwrap(),
             Mirror::Stale
         );
+    }
+
+    #[test]
+    fn a_pass_the_disk_cannot_take_writes_nothing() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+
+        let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join("big.bin"), vec![7u8; 4096]).unwrap();
+        });
+        let asked = std::cell::Cell::new(0u64);
+        let result = ws
+            .mirror_from_within(&main, tip2, snap2, false, &|bytes| {
+                asked.set(bytes);
+                Some("no room".into())
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            Mirror::Paused {
+                reason: "no room".into()
+            }
+        );
+        assert_eq!(asked.get(), 4096, "the bytes the pass would write");
+        assert!(!dir.path().join("big.bin").exists());
     }
 
     #[test]
