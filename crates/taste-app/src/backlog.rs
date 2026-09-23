@@ -1031,8 +1031,8 @@ impl BacklogPanel {
         );
         let delete_button = crate::holdbutton::HoldButton::new(
             "user-trash-symbolic",
-            "Delete the selected issue for good. Closing is how work ends; deleting is how \
-             a mistake is unmade",
+            "Delete the selected issue for good, and its environment with it. Closing is how \
+             work ends; deleting is how a mistake is unmade",
         );
         destroy_button.widget.set_sensitive(false);
         delete_button.widget.set_sensitive(false);
@@ -3213,15 +3213,18 @@ impl BacklogPanel {
         // rebuilt and started, a running one rebuilt in place.
         self.rebuild_button
             .set_sensitive(any(&|row| row.live.is_some()));
-        // An environment to remove: any selected issue that has one. An
-        // issue to delete: one that has none — the environment goes first,
-        // as the MCP's issue_delete insists too. Neither is the primary's.
+        // An environment to remove: any selected issue that has one, never
+        // the primary's. An issue to delete: ANY issue — its environment,
+        // if it has one, goes with it (David, 2026-09-23: "I should always
+        // be able to delete things from the backlog. Just perform any
+        // necessary cleanup of dependencies"). The MCP's issue_delete still
+        // wants the environment gone first: that one is an agent's call.
         self.destroy_button.widget.set_sensitive(any(&|row| {
             row.is_issue() && row.live.as_ref().is_some_and(|live| !live.primary)
         }));
         self.delete_button
             .widget
-            .set_sensitive(any(&|row| row.is_issue() && row.live.is_none()));
+            .set_sensitive(any(&|row| row.is_issue()));
     }
 
     /// The rows the bar is aimed at, cloned out so the caller can act
@@ -3286,14 +3289,18 @@ impl BacklogPanel {
     /// the trash was the confirmation. One that still has an environment
     /// is not deleted — its environment goes first, through the slashed
     /// container beside this button — and a toast says so.
+    /// Delete every selected issue, and first the environment each one
+    /// has — its clone, container, and volumes, as Remove takes them; the
+    /// hold on the trash was the confirmation for both. The primary's
+    /// environment is never an issue's to take.
     fn delete_selected(self: &Rc<Self>) {
         for row in self.target_rows().into_iter().filter(Row::is_issue) {
-            if row.live.is_some() {
-                self.toast(format!(
-                    "{} still has an environment; remove that first",
-                    row.id
-                ));
-                continue;
+            if let Some(live) = &row.live {
+                if !live.primary {
+                    if let Some(hook) = self.on_destroy.borrow().as_ref() {
+                        hook(live.env.clone());
+                    }
+                }
             }
             self.delete(&row.id);
         }
