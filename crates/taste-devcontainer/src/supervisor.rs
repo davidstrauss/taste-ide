@@ -4215,9 +4215,8 @@ fn nesting_gap(report: &str) -> String {
          default is not); for a user with uid 1000, write USER:1:999 and USER:1001:64535 to \
          /etc/subuid and /etc/subgid"
     } else if said.contains("sethostname") {
-        "the container's seccomp filter refuses sethostname to a nested container; run \
-         nested containers with --uts=host (or utsns=\"host\" under [containers] in \
-         containers.conf)"
+        "the container's seccomp filter refuses sethostname to a nested container; rebuild \
+         so the IDE grants CAP_SYS_ADMIN (it comes with \"privileged\": true)"
     } else if said.contains("/dev/net/tun") || said.contains("pasta failed") {
         "the container has no /dev/net/tun for pasta; rebuild so the IDE grants it (it comes \
          with \"privileged\": true)"
@@ -4922,7 +4921,7 @@ mod tests {
         let uts = nesting_gap(
             "run Error: crun: sethostname: Operation not permitted: OCI permission denied",
         );
-        assert!(uts.contains("--uts=host"), "{uts}");
+        assert!(uts.contains("CAP_SYS_ADMIN"), "{uts}");
     }
 
     #[test]

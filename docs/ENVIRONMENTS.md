@@ -3015,8 +3015,8 @@ asked about and ruled out of scope (David, same day):
 - **No host process.** Every exec gate asks `ExecContext::has_exec_target()`
   and refuses a `false` rather than falling back.
 - **Repo-supplied config is vetted** (`taste_devcontainer::security`):
-  `--cap-add`, `--device` other than `/dev/fuse` and `/dev/net/tun`,
-  `--security-opt` other
+  `--cap-add` other than `SYS_ADMIN`, `--device` other than `/dev/fuse`
+  and `/dev/net/tun`, `--security-opt` other
   than nesting's own values, `--pid=host`, `--network=host`, and arbitrary
   `-v` binds are refused; `--privileged` is never passed as asked, and
   becomes nesting (below).
@@ -3026,8 +3026,8 @@ asked about and ruled out of scope (David, same day):
   that could not host them sent that work to the user's machine, which is
   the one place it must not go. `"privileged": true` (or `--privileged` in
   `runArgs`) becomes `--security-opt=label=type:container_engine_t`,
-  `--security-opt=unmask=ALL`, `--device=/dev/fuse`, and
-  `--device=/dev/net/tun`, and a config may
+  `--security-opt=unmask=ALL`, `--device=/dev/fuse`,
+  `--device=/dev/net/tun`, and `--cap-add=SYS_ADMIN`, and a config may
   state those itself, or `label=disable` and `label=nested`, which
   podman-in-podman guides also give. Measured in a Fedora CoreOS 44 guest
   with the IDE's own `--userns=keep-id`: with the default flags a nested
@@ -3042,8 +3042,16 @@ asked about and ruled out of scope (David, same day):
   declared its storage as volumes; an agent's own image found it).
   Networking is the fourth: a nested container's network is pasta's,
   which needs `/dev/net/tun` (missed by a probe run with
-  `--network=none`, and found by an agent the same way). No capability
-  and no real `--privileged`.
+  `--network=none`, and found by an agent the same way). The hostname is
+  the fifth: podman's default seccomp profile allows `sethostname` only
+  to a process holding `CAP_SYS_ADMIN` in the outer container, so a
+  nested container could not name itself. `--cap-add=SYS_ADMIN` is the
+  grant, chosen over a seccomp profile of the IDE's own allowing the one
+  call and over every project running nested containers with
+  `--uts=host` (David, 2026-09-23): a capability in the container's own
+  user namespace, which also lets seccomp pass the rest of that
+  capability's calls — more of the VM's kernel in reach, none of the
+  host's. No real `--privileged`.
   `"privileged": true` is the spelling to use, because VS Code and
   Codespaces read it too (Docker's docker-in-docker wants exactly that),
   while `unmask` is podman's word alone. What it widens is the container's

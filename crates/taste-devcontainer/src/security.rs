@@ -59,10 +59,19 @@ const ALLOWED_FLAGS_WITH_VALUE: &[&str] = &["-e", "--env", "--shm-size", "--host
 /// this because `quay.io/podman/stable` declares its storage as volumes.
 /// Then networking: a nested container's network is pasta's, which needs
 /// `/dev/net/tun` — missed by a probe that ran with `--network=none`, and
-/// found by an agent. No capability and no `--privileged`. `label=disable`
-/// works too, and is
-/// accepted for configs that already say it, but is not what the IDE asks
-/// for.
+/// found by an agent. Then the hostname: a nested container sets its own,
+/// and the default seccomp profile allows `sethostname` only to a process
+/// holding `CAP_SYS_ADMIN` in the outer container — "crun: sethostname:
+/// Operation not permitted" without it, SELinux not involved (it failed
+/// with `label=disable` too). `--cap-add=SYS_ADMIN` is the grant (David,
+/// 2026-09-23, over a profile of the IDE's own that allowed the one call,
+/// and over every project setting `--uts=host`): a capability in the
+/// container's own user namespace, which also lets seccomp pass the rest
+/// of that capability's calls — reach into the VM's kernel, not the
+/// host's. Measured: with it, a nested `podman run` with no flags names
+/// its host and reaches the network. No `--privileged`. `label=disable`
+/// works for SELinux's part too, and is accepted for configs that already
+/// say it, but is not what the IDE asks for.
 ///
 /// Why this is not the boundary giving way: that boundary is the HOST
 /// (ENVIRONMENTS → "Isolation: the standard, and what meets it"), and the
@@ -74,6 +83,7 @@ pub const NESTING_RUN_ARGS: &[&str] = &[
     "--security-opt=unmask=ALL",
     "--device=/dev/fuse",
     "--device=/dev/net/tun",
+    "--cap-add=SYS_ADMIN",
 ];
 
 /// The `--security-opt` values a config may state: the nesting set, and
@@ -91,6 +101,10 @@ const ALLOWED_SECURITY_OPTS: &[&str] = &[
 /// ("Failed to open() /dev/net/tun" without it). The guest has both, and
 /// neither reaches anything outside the VM.
 const ALLOWED_DEVICES: &[&str] = &["/dev/fuse", "/dev/net/tun"];
+
+/// The `--cap-add` values a config may state: nesting's one, for
+/// `sethostname` in a nested container (see [`NESTING_RUN_ARGS`]).
+const ALLOWED_CAPS: &[&str] = &["SYS_ADMIN", "CAP_SYS_ADMIN"];
 
 /// Flags accepted for cross-ecosystem compatibility but never passed to
 /// podman as they are. Docker needs `--privileged` for systemd-in-container
@@ -275,6 +289,7 @@ fn validate_run_args(run_args: &[String]) -> Result<()> {
         let valued = [
             ("--security-opt", ALLOWED_SECURITY_OPTS),
             ("--device", ALLOWED_DEVICES),
+            ("--cap-add", ALLOWED_CAPS),
         ];
         if let Some((flag, allowed)) = valued
             .iter()
@@ -518,7 +533,11 @@ mod tests {
             ]}"#,
         );
         validate_security(&config, dir.path()).unwrap();
+        let (dir, config) = config_with(r#"{"image": "img", "runArgs": ["--cap-add=SYS_ADMIN"]}"#);
+        validate_security(&config, dir.path()).unwrap();
         for bad in [
+            r#"["--cap-add", "NET_ADMIN"]"#,
+            r#"["--cap-add=ALL"]"#,
             r#"["--security-opt", "seccomp=unconfined"]"#,
             r#"["--device", "/dev/kvm"]"#,
             r#"["--security-opt"]"#,
@@ -543,7 +562,7 @@ mod tests {
         let (_dir, config) = config_with(
             r#"{"image": "img", "privileged": true,
                 "runArgs": ["--security-opt", "unmask=ALL", "--device", "/dev/fuse",
-                            "--device=/dev/net/tun"]}"#,
+                            "--device=/dev/net/tun", "--cap-add", "SYS_ADMIN"]}"#,
         );
         assert_eq!(
             privileged_run_args(&config),
