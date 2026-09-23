@@ -9524,7 +9524,6 @@ impl ChatPane {
                 loaded.updates.len(),
                 pane.environment
             );
-            pane.stash_banner.set_revealed(true);
             for record in loaded.updates {
                 // A record written by an older protocol is skipped rather
                 // than fatal: a stash is a convenience, and half a
@@ -9536,6 +9535,15 @@ impl ChatPane {
             // The last streamed block's markdown pass, for the reason the
             // `Ready` arm does the same: nothing follows it to trigger one.
             pane.finalize_stream();
+            // Said only over a conversation there is to see. A stash can
+            // hold nothing but updates that draw no row — the command
+            // list, the session's options — and a banner about restored
+            // history over an empty page is a claim about nothing (David,
+            // 2026-09-22: "This notice shouldn't show when there's zero
+            // history").
+            if pane.transcript_rows.get() != 0 {
+                pane.stash_banner.set_revealed(true);
+            }
         });
     }
 
