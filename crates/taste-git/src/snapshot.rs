@@ -337,10 +337,18 @@ name='{name}'
 snap=$(git rev-parse --verify -q "$name^{{tree}}") || {{ echo "$name has no snapshot to restore" >&2; exit 3; }}
 {clean_check}
 head=$(git rev-parse --verify -q 'HEAD^{{tree}}' || true)
+# Through files, not pipes: sh has no pipefail, so a git that failed
+# halfway into a pipe left the script reporting "restored" over nothing.
+gitdir=$(git rev-parse --git-dir)
+removed="$gitdir/taste-restore-removed"
+archive="$gitdir/taste-restore.tar"
+trap 'rm -f "$removed" "$archive"' EXIT
 if [ -n "$head" ]; then
-  git diff-tree -r --name-only --diff-filter=D -z "$head" "$snap" | xargs -0 -r rm -f --
+  git diff-tree -r --name-only --diff-filter=D -z "$head" "$snap" >"$removed"
+  xargs -0 -r rm -f -- <"$removed"
 fi
-git archive --format=tar "$snap" | tar -xf -
+git archive --format=tar -o "$archive" "$snap"
+tar -xf "$archive"
 printf '%s restored
 ' "$(git rev-parse "$name")"
 "#
