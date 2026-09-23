@@ -287,6 +287,7 @@ pub enum Panel {
     Editor,
     Files,
     Ports,
+    Tasks,
     Logs,
     Backlog,
     Terminal,
@@ -301,10 +302,11 @@ impl Panel {
     /// projects disrupt muscle memory"). His order: what is under the eye
     /// first, then the flank top to bottom, then the terminal, then the
     /// chat.
-    pub const ORDER: [Panel; 7] = [
+    pub const ORDER: [Panel; 8] = [
         Panel::Editor,
         Panel::Files,
         Panel::Ports,
+        Panel::Tasks,
         Panel::Logs,
         Panel::Backlog,
         Panel::Terminal,
@@ -316,6 +318,7 @@ impl Panel {
             Panel::Editor => "editor",
             Panel::Files => "files",
             Panel::Ports => "ports",
+            Panel::Tasks => "tasks",
             Panel::Logs => "logs",
             Panel::Backlog => "backlog",
             Panel::Terminal => "terminal",
@@ -337,6 +340,7 @@ impl Panel {
             Panel::Editor => "text-x-generic-symbolic",
             Panel::Files => "folder-symbolic",
             Panel::Ports => crate::portview::PORT_ICON,
+            Panel::Tasks => crate::tasks::TASK_ICON,
             Panel::Logs => crate::logview::LOG_ICON,
             Panel::Backlog => crate::backlog::BACKLOG_ICON,
             Panel::Terminal => "utilities-terminal-symbolic",
@@ -344,7 +348,7 @@ impl Panel {
         }
     }
 
-    /// Tab stop N of 7.
+    /// Tab stop N of 8.
     pub fn stop(self) -> usize {
         Self::ORDER.iter().position(|p| *p == self).unwrap_or(0) + 1
     }
@@ -1320,6 +1324,7 @@ mod tests {
                 Panel::Editor,
                 Panel::Files,
                 Panel::Ports,
+                Panel::Tasks,
                 Panel::Logs,
                 Panel::Backlog,
                 Panel::Terminal,
@@ -1328,6 +1333,6 @@ mod tests {
         );
         assert_eq!(Panel::Files.label(), "files");
         assert_eq!(Panel::Editor.stop(), 1);
-        assert_eq!(Panel::Chat.stop(), 7);
+        assert_eq!(Panel::Chat.stop(), 8);
     }
 }

@@ -1661,7 +1661,18 @@ impl Editor {
             return;
         }
         if let Some((_, surface)) = self.surface_by_tab(&tab) {
-            if let SurfaceKind::Log(log, kind) = &surface.kind {
+            // A log's text and a task's output answer the same way.
+            let log_like = match &surface.kind {
+                SurfaceKind::Log(log, kind) => Some((
+                    log.clone(),
+                    format!("the {} log", kind.title().to_lowercase()),
+                )),
+                SurfaceKind::Task(log, name) => {
+                    Some((log.clone(), format!("task {name}'s output")))
+                }
+                _ => None,
+            };
+            if let Some((log, what)) = log_like {
                 let (count, hits) = taste_core::search::search_text(&log.text(), query, 500);
                 let items: Vec<Item> = hits
                     .into_iter()
@@ -1673,7 +1684,7 @@ impl Editor {
                     .collect();
                 self.results.show(
                     query,
-                    &format!("the {} log", kind.title().to_lowercase()),
+                    &what,
                     vec![Group {
                         title: String::new(),
                         items,
@@ -1732,7 +1743,7 @@ impl Editor {
             }
             crate::results::Target::Log { line } => {
                 if let Some(surface) = self.selected_surface() {
-                    if let SurfaceKind::Log(log, _) = &surface.kind {
+                    if let SurfaceKind::Log(log, _) | SurfaceKind::Task(log, _) = &surface.kind {
                         log.highlight_line(*line, &query);
                     }
                 }

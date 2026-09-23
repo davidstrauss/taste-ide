@@ -139,6 +139,17 @@ pub enum Event {
     /// current guest release: its own agent told the move is pending, or
     /// that it is done; the coordinator told one waits on its approval.
     /// The window delivers them as a prompt to that chat.
+    /// Lines a task's run said (`crate::tasks`), in a batch.
+    TaskOutput {
+        env: crate::environment::EnvironmentId,
+        name: String,
+        lines: Vec<String>,
+    },
+    /// A task's run started or ended: its row's light changed.
+    TaskState {
+        env: crate::environment::EnvironmentId,
+        name: String,
+    },
     MigrationNotice {
         env: crate::environment::EnvironmentId,
         audience: MigrationAudience,
@@ -409,6 +420,8 @@ impl Event {
             | Event::VmProgress { .. }
             | Event::StartupConcluded { .. }
             | Event::MigrationNotice { .. }
+            | Event::TaskOutput { .. }
+            | Event::TaskState { .. }
             | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }

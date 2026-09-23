@@ -282,7 +282,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Tasks (taskfile.dev, tasks.rs): listed for the environment the panes
     // are aimed at, opened as a log tab, run in that environment's
     // container.
-    let task_runs = crate::tasks::TaskRuns::new();
+    let task_runs = workspace.tasks.clone();
     let refresh_tasks: Rc<dyn Fn()> = {
         let filetree = filetree.clone();
         let environments = environments.clone();
@@ -330,6 +330,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor = editor.clone();
         let task_runs = task_runs.clone();
         filetree.set_on_open_task(move |env, name| {
+            // The output already on screen: a click steps through its hits,
+            // as a log's does.
+            if editor.focused() == crate::editor::Focused::Task(env.clone(), name.clone())
+                && editor.step_results()
+            {
+                return;
+            }
             editor.open_task(&env, &name, task_runs.lines(&env, &name));
         });
     }
@@ -337,7 +344,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // A row's button runs the task in the environment, its output in
         // front; while it runs, the same button stops it.
         let editor = editor.clone();
-        let filetree_for_run = filetree.clone();
         let environments = environments.clone();
         let task_runs = task_runs.clone();
         let events = workspace.events.clone();
@@ -349,26 +355,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let Some(supervisor) = environments.get(&env) else {
                 return;
             };
+            // Its output in front; the lines and the row's light come back
+            // on the bus (`Event::TaskOutput`, `Event::TaskState`), the
+            // same way an agent's run of it does.
             editor.open_task(&env, &name, Vec::new());
-            let lines = {
-                let editor = editor.clone();
-                let (env, name) = (env.clone(), name.clone());
-                move |lines: &[String]| editor.append_task(&env, &name, lines)
-            };
-            let changed = {
-                let filetree = filetree_for_run.clone();
-                let task_runs = Rc::downgrade(&task_runs);
-                let env = env.clone();
-                move || {
-                    let Some(task_runs) = task_runs.upgrade() else {
-                        return;
-                    };
-                    if filetree.aimed_environment() == env {
-                        filetree.update_task_states(|task| task_runs.state(&env, task));
-                    }
-                }
-            };
-            if let Err(why) = task_runs.start(&env, &name, supervisor.exec(), lines, changed) {
+            let _in = runtime().enter();
+            if let Err(why) = task_runs.start(&env, &name, supervisor.exec(), false) {
                 events.publish(Event::Toast(format!("{name} was not run: {why}")));
             }
         });
@@ -1807,6 +1799,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let ide_log_cursor = ide_log_cursor.clone();
             let log_activity = log_activity.clone();
             let search_for_tick = search.clone();
+            let task_runs_for_tick = task_runs.clone();
             let filetree_weak = Rc::downgrade(&filetree);
             let ticks = Rc::new(std::cell::Cell::new(0u32));
             filetree.set_on_panel_tick(move || {
@@ -1872,6 +1865,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             .collect()
                     };
                     filetree.set_log_hits(&counts);
+                    // ...and the Tasks rows': the query's hits in what each
+                    // task's run has said.
+                    let task_hits = if standing.is_empty() {
+                        std::collections::HashMap::new()
+                    } else {
+                        filetree
+                            .task_rows()
+                            .into_iter()
+                            .map(|row| {
+                                let hits = task_runs_for_tick
+                                    .lines(&env, &row.info.name)
+                                    .iter()
+                                    .filter(|line| standing.matches(line))
+                                    .count();
+                                (row.info.name, hits)
+                            })
+                            .collect()
+                    };
+                    filetree.set_task_hits(task_hits);
                 }
                 // The Logs rows' sparklines: the selected environment's
                 // logs, and the IDE's own under the primary.
@@ -4053,6 +4065,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // it is between turns, since the clock tells it again
                     // in ten minutes and a queue of the same words is noise
                     // — and the coordinator woken as for any errand.
+                    // A task's run, whoever started it: its lines to its
+                    // tab, its light to its row.
+                    Event::TaskOutput { env, name, lines } => {
+                        editor.append_task(&env, &name, &lines);
+                    }
+                    Event::TaskState { env, name: _ } => {
+                        if filetree.aimed_environment() == env {
+                            let board = workspace.tasks.clone();
+                            filetree.update_task_states(|task| board.state(&env, task));
+                        }
+                    }
                     Event::MigrationNotice {
                         env,
                         audience,

@@ -1221,6 +1221,52 @@ impl McpServer {
              after it became pending.",
             empty.clone(),
         ));
+        // The project's tasks (taskfile.dev), the ones the Tasks section
+        // lists: runs either side starts show in the same row and tab.
+        tools.push(tool(
+            "task_list",
+            "The project's tasks (Taskfile.yml, taskfile.dev) as `task` lists them in this \
+             environment: each name, description, and last run's state. `cannot_run` says \
+             why they cannot be run when they cannot (no container, no `task` in it).",
+            empty.clone(),
+        ));
+        tools.push(tool(
+            "task_run",
+            "Run a task in this environment's container, where the user sees it too: its \
+             row lights and its output tab fills. Waits up to `wait_seconds` (default 60, at \
+             most 600) and returns the state and the output's last lines; a task still \
+             running is read on with task_output.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "the task, as task_list names it (e.g. build, dev:init)" },
+                    "wait_seconds": { "type": "integer", "description": "how long to wait for it to finish (0 returns at once)" }
+                },
+                "required": ["name"]
+            }),
+        ));
+        tools.push(tool(
+            "task_output",
+            "A task's last run in this environment: its state and the last `lines` of its \
+             output (default 100, at most 1000).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "the task" },
+                    "lines": { "type": "integer", "description": "how many of the last lines" }
+                },
+                "required": ["name"]
+            }),
+        ));
+        tools.push(tool(
+            "task_stop",
+            "Stop a task running in this environment.",
+            json!({
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": "the task" } },
+                "required": ["name"]
+            }),
+        ));
         // ...and orchestration: the reads on every socket, the writes on
         // the orchestrator's alone, because the writes spawn agents. See
         // `crate::orchestration`.
@@ -2792,6 +2838,70 @@ impl McpServer {
             "environment_destroy" => {
                 self.require_orchestrator(env, "environment_destroy")?;
                 self.environment_destroy(env, args).await
+            }
+            "task_list" => {
+                let supervisor = self.supervisor(env)?;
+                let exec = supervisor.exec().clone();
+                let files = supervisor.files();
+                let root = supervisor.checkout().path().to_path_buf();
+                let listing = tokio::task::spawn_blocking(move || {
+                    taste_core::tasks::list(&exec, &files, &root)
+                })
+                .await?;
+                Ok(match listing {
+                    taste_core::tasks::Listing::NoTaskfile => json!({
+                        "taskfile": false,
+                        "tasks": [],
+                        "next": "the project has no Taskfile; write Taskfile.yml at the checkout's \
+                                 root (https://taskfile.dev) to give it named commands",
+                    }),
+                    taste_core::tasks::Listing::Tasks { tasks, cannot_run } => {
+                        let board = &self.workspace.tasks;
+                        json!({
+                            "taskfile": true,
+                            "tasks": tasks.iter().map(|task| json!({
+                                "name": task.name,
+                                "desc": task.desc,
+                                "state": task_state_word(board.state(env, &task.name)),
+                            })).collect::<Vec<_>>(),
+                            "cannot_run": cannot_run,
+                        })
+                    }
+                })
+            }
+            "task_run" => {
+                let name = args["name"]
+                    .as_str()
+                    .context("task_run needs `name`: a task as task_list names it")?
+                    .to_string();
+                let wait = args["wait_seconds"].as_u64().unwrap_or(60).min(600);
+                let supervisor = self.supervisor(env)?;
+                self.workspace
+                    .tasks
+                    .start(env, &name, supervisor.exec(), true)
+                    .map_err(|why| anyhow::anyhow!("{name} was not run: {why}"))?;
+                let board = &self.workspace.tasks;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+                while board.state(env, &name) == taste_core::tasks::RunState::Running
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Ok(task_report(board, env, &name, 100))
+            }
+            "task_output" => {
+                let name = args["name"]
+                    .as_str()
+                    .context("task_output needs `name`: the task")?;
+                let lines = lines_arg(&args).clamp(1, 1000);
+                Ok(task_report(&self.workspace.tasks, env, name, lines))
+            }
+            "task_stop" => {
+                let name = args["name"]
+                    .as_str()
+                    .context("task_stop needs `name`: the task")?;
+                self.workspace.tasks.stop(env, name);
+                Ok(json!({ "state": "stopping", "next": "task_output says when it has stopped" }))
             }
             "environment_reinstantiate_request" => {
                 let said = self.environments.request_migration(env)?;
@@ -4370,6 +4480,37 @@ fn page<T>(rows: Vec<T>, offset: usize, limit: usize) -> (Vec<T>, Option<usize>)
 }
 
 /// A log tail's `lines`, in its spellings, defaulting to 100.
+/// A task's run, as its tools report it: the state, the output's last
+/// `lines`, and what to do next when it is still running.
+fn task_report(
+    board: &taste_core::tasks::TaskBoard,
+    env: &EnvironmentId,
+    name: &str,
+    lines: usize,
+) -> Value {
+    let state = board.state(env, name);
+    let output = board.lines(env, name);
+    let tail: Vec<&String> = output.iter().rev().take(lines).rev().collect();
+    let mut out = json!({
+        "task": name,
+        "state": task_state_word(state),
+        "output": tail,
+    });
+    if state == taste_core::tasks::RunState::Running {
+        out["next"] = json!("still running: task_output reads on, task_stop stops it");
+    }
+    out
+}
+
+fn task_state_word(state: taste_core::tasks::RunState) -> &'static str {
+    match state {
+        taste_core::tasks::RunState::Idle => "never run",
+        taste_core::tasks::RunState::Running => "running",
+        taste_core::tasks::RunState::Succeeded => "succeeded",
+        taste_core::tasks::RunState::Failed => "failed",
+    }
+}
+
 fn lines_arg(args: &Value) -> usize {
     arg(args, &["lines", "limit", "n", "count"])
         .as_u64()

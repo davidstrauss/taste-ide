@@ -38,6 +38,44 @@ pub struct TaskRow {
 }
 type OpenPortCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, u16)>;
 
+/// A namespace's heading in the Tasks outline: the namespace in a folder,
+/// neither selectable nor activated — it opens nothing, so nothing lights
+/// it.
+fn task_heading(label: &str) -> gtk::ListBoxRow {
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
+    line.set_margin_end(ROW_INSET);
+    line.append(&leading_slot(
+        &gtk::Image::builder()
+            .icon_name("folder-symbolic")
+            .pixel_size(14)
+            .css_classes(["dim-label"])
+            .build(),
+    ));
+    line.append(
+        &gtk::Label::builder()
+            .label(label)
+            .css_classes(["dim-label"])
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build(),
+    );
+    gtk::ListBoxRow::builder()
+        .child(&line)
+        .activatable(false)
+        .selectable(false)
+        .css_classes(["task-heading"])
+        .build()
+}
+
+/// The Tasks list's height before it scrolls: five of its rows.
+const TASKS_MAX_HEIGHT: i32 = 5 * 40;
+
+/// The least of the Tasks list a short column keeps: two of its rows.
+const TASKS_MIN_HEIGHT: i32 = 2 * 40;
+
+/// How far a task sits in under its namespace's heading, per level.
+const TASK_INDENT: i32 = 16;
+
 /// The header every section of the flank wears — `[glyph] Title` — in
 /// the project-folder row's own insets: Logs, Ports, and the backlog
 /// (David, 2026-09-06: "Logs, Ports, and Backlog should all use the same
@@ -430,11 +468,21 @@ pub struct FileTree {
     /// and the task whose tab is in front — kept so a redraw of the rows
     /// keeps it lit.
     tasks_list: gtk::ListBox,
+    /// The list's scroller: as tall as its rows up to a cap, and scrolling
+    /// past it (David, 2026-09-23: "a maximum height that isn't too tall").
+    tasks_scroller: gtk::ScrolledWindow,
+    /// What each row of the list is: the task it runs, or `None` for a
+    /// namespace's heading (`tasks::outline`).
+    task_row_names: RefCell<Vec<Option<String>>>,
     tasks_note: gtk::Label,
     tasks_empty: gtk::Box,
     tasks_ghost_label: gtk::Label,
     tasks: RefCell<(Vec<TaskRow>, Option<String>, bool)>,
     task_in_front: RefCell<Option<String>>,
+    /// The query's hits inside each task's output, by name, as the window
+    /// last counted them (`set_task_hits`); and the section's count banner.
+    task_hits: RefCell<HashMap<String, usize>>,
+    tasks_results: Rc<crate::results::ResultsPanel>,
     on_open_task: RefCell<Option<TaskCallback>>,
     on_run_task: RefCell<Option<TaskCallback>>,
     /// Per published host port, the row's in and out sparklines, for the
@@ -1140,6 +1188,17 @@ impl FileTree {
         // the devcontainer.
         let (tasks_section, tasks_list, tasks_body) = section(crate::tasks::TASK_ICON, "Tasks");
         tasks_list.set_widget_name("tasks-list");
+        // Five rows' worth before it scrolls: the flank is shared, and a
+        // project with forty tasks must not push the Logs off it.
+        tasks_body.remove(&tasks_list);
+        let tasks_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .max_content_height(TASKS_MAX_HEIGHT)
+            .child(&tasks_list)
+            .build();
+        tasks_body.prepend(&tasks_scroller);
         let tasks_note = gtk::Label::builder()
             .css_classes(["caption", "dim-label"])
             .xalign(0.0)
@@ -1176,6 +1235,9 @@ impl FileTree {
         tasks_empty.set_cursor_from_name(Some("pointer"));
         tasks_body.append(&tasks_note);
         tasks_body.append(&tasks_empty);
+        let tasks_results = crate::results::ResultsPanel::new();
+        tasks_results.widget.set_widget_name("tasks-results");
+        tasks_body.append(&tasks_results.widget);
 
         // Dirty-file workflows that need input steal space from the
         // bottom of the file list — never a modal dialog.
@@ -1288,11 +1350,15 @@ impl FileTree {
             ports_empty,
             ports: RefCell::new(Vec::new()),
             tasks_list,
+            tasks_scroller,
+            task_row_names: RefCell::new(Vec::new()),
             tasks_note,
             tasks_empty,
             tasks_ghost_label,
             tasks: RefCell::new((Vec::new(), None, false)),
             task_in_front: RefCell::new(None),
+            task_hits: RefCell::new(HashMap::new()),
+            tasks_results,
             on_open_task: RefCell::new(None),
             on_run_task: RefCell::new(None),
             port_sparklines: RefCell::new(HashMap::new()),
@@ -1391,12 +1457,7 @@ impl FileTree {
                 let Ok(index) = usize::try_from(row.index()) else {
                     return;
                 };
-                let name = tree
-                    .tasks
-                    .borrow()
-                    .0
-                    .get(index)
-                    .map(|r| r.info.name.clone());
+                let name = tree.task_row_names.borrow().get(index).cloned().flatten();
                 let env = tree.aimed_environment();
                 let hook = tree.on_open_task.borrow();
                 if let (Some(name), Some(hook)) = (name, hook.as_ref()) {
@@ -2222,6 +2283,12 @@ impl FileTree {
         search.register_placeholder(crate::search::Panel::Files, &self.files_results);
         search.register_placeholder(crate::search::Panel::Ports, &self.ports_results);
         search.register_placeholder(crate::search::Panel::Logs, &self.logs_results);
+        let tasks_stepper = crate::search::ListStepper::new(&self.tasks_list);
+        search.register_stepper(crate::search::Panel::Tasks, move |step| {
+            tasks_stepper.step(step)
+        });
+        search.register_placeholder(crate::search::Panel::Tasks, &self.tasks_results);
+        crate::search::Search::tab_switches_panels(&self.tasks_list, search);
         // Tab from a row of the tree: the next panel with results.
         crate::search::Search::tab_switches_panels(&self.list_holder, search);
         crate::search::Search::tab_switches_panels(&self.ports_list, search);
@@ -2234,6 +2301,7 @@ impl FileTree {
         // The Ports rows wear the query's badge; the Logs rows' badges come
         // from the window, which holds the logs.
         self.render_ports();
+        self.render_tasks();
         if query.is_empty() {
             self.meaning_hits.borrow_mut().clear();
             self.files_results.hide();
@@ -2525,50 +2593,83 @@ impl FileTree {
         }
         let (rows, cannot_run, has_taskfile) = self.tasks.borrow().clone();
         let runnable = cannot_run.is_none();
-        for row in &rows {
-            let running = row.state == crate::tasks::RunState::Running;
-            let button = gtk::Button::builder()
-                .icon_name(if running {
-                    "media-playback-stop-symbolic"
-                } else {
-                    "media-playback-start-symbolic"
-                })
-                .tooltip_text(if running {
-                    format!("Stop {}", row.info.name)
-                } else {
-                    format!("Run {} in the environment", row.info.name)
-                })
-                .css_classes(["flat", "circular"])
-                .valign(gtk::Align::Center)
-                .sensitive(runnable || running)
-                .build();
-            {
-                let weak = Rc::downgrade(self);
-                let name = row.info.name.clone();
-                button.connect_clicked(move |_| {
-                    let Some(tree) = weak.upgrade() else { return };
-                    let env = tree.aimed_environment();
-                    let hook = tree.on_run_task.borrow();
-                    if let Some(hook) = hook.as_ref() {
-                        hook(env, name.clone());
-                    }
-                });
-            }
-            let subtitle = match (row.state.words(), row.info.desc.as_str()) {
-                ("", desc) => desc.to_string(),
-                (words, "") => words.to_string(),
-                (words, desc) => format!("{words} · {desc}"),
+        // The one query here as in Ports and Logs: a task's hits are the
+        // matches in its own name and description and inside its output.
+        let query = self.query.borrow().clone();
+        let hits: Vec<usize> = rows
+            .iter()
+            .map(|row| {
+                if query.is_empty() {
+                    return 0;
+                }
+                query.ranges(&row.info.name).len()
+                    + query.ranges(&row.info.desc).len()
+                    + self
+                        .task_hits
+                        .borrow()
+                        .get(&row.info.name)
+                        .copied()
+                        .unwrap_or(0)
+            })
+            .collect();
+        let total: usize = hits.iter().sum();
+        let names: Vec<String> = rows.iter().map(|row| row.info.name.clone()).collect();
+        let outline = crate::tasks::outline(&names);
+        let mut row_names = Vec::with_capacity(outline.len());
+        let mut kept_height = 0;
+        for (at, entry) in outline.iter().enumerate() {
+            // Whether this line or anything under it answers the query: a
+            // heading stays for its tasks' sake.
+            let subtree_hits: usize = outline[at..]
+                .iter()
+                .enumerate()
+                .take_while(|(offset, e)| *offset == 0 || e.depth > entry.depth)
+                .filter_map(|(_, e)| e.task.map(|i| hits[i]))
+                .sum();
+            let item = match entry.task {
+                Some(index) => {
+                    let row = &rows[index];
+                    row_names.push(Some(row.info.name.clone()));
+                    self.task_row(row, &entry.label, hits[index], runnable)
+                }
+                None => {
+                    row_names.push(None);
+                    task_heading(&entry.label)
+                }
             };
-            let item = section_row(
-                Some(row.state.dot()),
-                None,
-                &row.info.name,
-                &subtitle,
-                Some(button.upcast_ref()),
-            );
+            if let Some(child) = item.child() {
+                child.set_margin_start(ROW_INSET + entry.depth as i32 * TASK_INDENT);
+            }
+            let hidden = !query.is_empty() && subtree_hits == 0 && !query.ghost;
+            if !query.is_empty() && subtree_hits == 0 {
+                if query.ghost {
+                    item.add_css_class("search-dim");
+                } else {
+                    item.set_visible(false);
+                }
+            }
+            if !hidden {
+                kept_height += if entry.task.is_some() { 40 } else { 28 };
+            }
             self.tasks_list.append(&item);
         }
-        self.tasks_list.set_visible(!rows.is_empty());
+        // Never under two rows, the ones the query keeps: a scroller's own
+        // minimum is nothing, and a short column would take the section to
+        // a sliver. Only two — its natural height is up to the cap, which
+        // it gets where there is room; a floor of all five would raise the
+        // window's own minimum past a 900px screen.
+        self.tasks_scroller
+            .set_min_content_height(kept_height.min(TASKS_MIN_HEIGHT));
+        *self.task_row_names.borrow_mut() = row_names;
+        if let Some(search) = self.search.borrow().as_ref() {
+            search.set_panel_hits(crate::search::Panel::Tasks, total);
+        }
+        if query.is_empty() {
+            self.tasks_results.hide();
+        } else {
+            self.tasks_results.show_count(&query, "tasks", total, false);
+        }
+        self.tasks_scroller.set_visible(!rows.is_empty());
         match &cannot_run {
             Some(why) if !rows.is_empty() => {
                 self.tasks_note
@@ -2585,9 +2686,88 @@ impl FileTree {
         // The tab in front keeps its row lit through a redraw.
         let front = self.task_in_front.borrow().clone();
         let lit = front
-            .and_then(|name| rows.iter().position(|r| r.info.name == name))
+            .and_then(|name| {
+                self.task_row_names
+                    .borrow()
+                    .iter()
+                    .position(|row| row.as_deref() == Some(name.as_str()))
+            })
             .and_then(|i| self.tasks_list.row_at_index(i as i32));
         self.tasks_list.select_row(lit.as_ref());
+    }
+
+    /// One task's row: its last run's light, its name's last part, what it
+    /// does, its hits, and the button that runs or stops it.
+    fn task_row(
+        self: &Rc<Self>,
+        row: &TaskRow,
+        label: &str,
+        hits: usize,
+        runnable: bool,
+    ) -> gtk::ListBoxRow {
+        let running = row.state == crate::tasks::RunState::Running;
+        let button = gtk::Button::builder()
+            .icon_name(if running {
+                "media-playback-stop-symbolic"
+            } else {
+                "media-playback-start-symbolic"
+            })
+            .tooltip_text(if running {
+                format!("Stop {}", row.info.name)
+            } else {
+                format!("Run {} in the environment", row.info.name)
+            })
+            .css_classes(["flat", "circular"])
+            .valign(gtk::Align::Center)
+            .sensitive(runnable || running)
+            .build();
+        {
+            let weak = Rc::downgrade(self);
+            let name = row.info.name.clone();
+            button.connect_clicked(move |_| {
+                let Some(tree) = weak.upgrade() else { return };
+                let env = tree.aimed_environment();
+                let hook = tree.on_run_task.borrow();
+                if let Some(hook) = hook.as_ref() {
+                    hook(env, name.clone());
+                }
+            });
+        }
+        let subtitle = match (row.state.words(), row.info.desc.as_str()) {
+            ("", desc) => desc.to_string(),
+            (words, "") => words.to_string(),
+            (words, desc) => format!("{words} · {desc}"),
+        };
+        let trailing = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        trailing.set_valign(gtk::Align::Center);
+        if hits > 0 {
+            trailing.append(&crate::search::hit_badge(hits));
+        }
+        trailing.append(&button);
+        let item = section_row(
+            Some(crate::tasks::dot(row.state)),
+            None,
+            label,
+            &subtitle,
+            Some(trailing.upcast_ref()),
+        );
+        item.set_tooltip_text(Some(&row.info.name));
+        item
+    }
+
+    /// The query's hits inside each task's output, by name: badges, and
+    /// which rows the query keeps. Redrawn only when a count moved.
+    pub fn set_task_hits(self: &Rc<Self>, hits: HashMap<String, usize>) {
+        if *self.task_hits.borrow() == hits {
+            return;
+        }
+        *self.task_hits.borrow_mut() = hits;
+        self.render_tasks();
+    }
+
+    /// The task rows as they are, for the window to count their hits.
+    pub fn task_rows(&self) -> Vec<TaskRow> {
+        self.tasks.borrow().0.clone()
     }
 
     /// Each row's light and button again from `state`, without listing
@@ -2661,11 +2841,10 @@ impl FileTree {
                 self.ports_list.select_row(gtk::ListBoxRow::NONE);
                 let index = (env == aimed)
                     .then(|| {
-                        self.tasks
+                        self.task_row_names
                             .borrow()
-                            .0
                             .iter()
-                            .position(|r| r.info.name == name)
+                            .position(|row| row.as_deref() == Some(name.as_str()))
                     })
                     .flatten();
                 *self.task_in_front.borrow_mut() = index.is_some().then_some(name);
@@ -3033,9 +3212,9 @@ impl FileTree {
         self.set_log_activity(&[container, environment, vm, [0; BUCKETS]]);
     }
 
-    /// TASTE_PROBE_CHECK only: three tasks — one that ran, one running,
-    /// one never run — so the section's rows, lights, and buttons are
-    /// posed without a container running `task`.
+    /// TASTE_PROBE_CHECK only: tasks that ran, one running, ones never run,
+    /// and namespaced ones two levels deep — more than the list's height,
+    /// so it scrolls — posed without a container running `task`.
     #[doc(hidden)]
     pub fn seed_tasks_for_probe(self: &Rc<Self>) {
         use crate::tasks::{RunState, TaskInfo};
@@ -3051,6 +3230,9 @@ impl FileTree {
                 row("build", "Build the workspace", RunState::Succeeded),
                 row("test", "Run the test suite", RunState::Running),
                 row("lint", "", RunState::Idle),
+                row("dev:init", "Seed the dev database", RunState::Failed),
+                row("dev:serve", "Serve on :3000", RunState::Idle),
+                row("db:migrate:up", "Apply migrations", RunState::Idle),
             ],
             None,
             true,
@@ -5928,10 +6110,21 @@ impl FileTree {
                     row.set_expanded(true);
                 }
                 // A file the editor put in front may have just got its row.
+                // Asked again when the idle runs: a tab without a row that
+                // came to the front meanwhile withdrew the ask, and a row
+                // lit for a tab no longer in front is a highlight that
+                // does not map to what is open (David, 2026-09-23: "Blue
+                // highlight for an item in a panel should map 1:1 with it
+                // being open in a tab").
                 let pending = tree.pending_select.borrow().clone();
                 if let Some(path) = pending {
                     let tree = tree.clone();
-                    glib::idle_add_local_once(move || tree.select_file(path));
+                    glib::idle_add_local_once(move || {
+                        let still = tree.pending_select.borrow().as_ref() == Some(&path);
+                        if still {
+                            tree.select_file(path);
+                        }
+                    });
                 }
             });
         }

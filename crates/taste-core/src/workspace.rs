@@ -89,6 +89,9 @@ pub struct Workspace {
     /// chat would have to be given once per environment, and there are as
     /// many of those as there are issues in progress.
     pub standing: StandingAnswers,
+    /// Every task run (taskfile.dev, [`crate::tasks`]), the user's and the
+    /// agents' alike, so a run either starts shows in one row and one tab.
+    pub tasks: crate::tasks::TaskBoard,
 }
 
 impl Workspace {
@@ -105,6 +108,7 @@ impl Workspace {
         // and the one the bus deliberately refuses to carry, so the panel
         // gets it where the bytes already pass: the roster.
         shells.attach_activity(activity.clone());
+        let tasks = crate::tasks::TaskBoard::new(events.clone());
         Self {
             checkout: Arc::new(Mutex::new(Checkout::Local(root.clone()))),
             files: Arc::new(Mutex::new(Files::Local)),
@@ -118,6 +122,7 @@ impl Workspace {
             activity,
             review,
             standing,
+            tasks,
         }
     }
 

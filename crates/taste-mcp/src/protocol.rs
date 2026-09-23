@@ -192,6 +192,12 @@ pub fn effect(tool: &str) -> Effect {
         // A move restarts a container and loses nothing — the snapshot
         // carries the uncommitted work and the volume the conversation.
         "environment_reinstantiate_request" | "environment_reinstantiate" => Effect::Write,
+        // A task's list and output are reads; stopping one is a write; and
+        // running one is `ide_exec` by another name — the Taskfile is the
+        // agent's to write — so it asks as `ide_exec` does.
+        "task_list" | "task_output" => Effect::Read,
+        "task_stop" => Effect::Write,
+        "task_run" => Effect::Destructive,
         // The two removals (i-0022). A clone can be the only copy of an
         // agent's unreviewed work and an issue is the only record of why
         // something was wanted; neither comes back. Both refuse on the
@@ -282,7 +288,10 @@ fn must_ask(tool: &str) -> bool {
 /// `every_tool_says_what_it_does` fails until it does.
 pub fn is_ide_tool(tool: &str) -> bool {
     effect(tool) != Effect::Destructive
-        || matches!(tool, "ide_exec" | "environment_destroy" | "issue_delete")
+        || matches!(
+            tool,
+            "ide_exec" | "task_run" | "environment_destroy" | "issue_delete"
+        )
 }
 
 /// Whether the IDE answers this tool's permission request itself, with a

@@ -11203,6 +11203,10 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "environment_reinstantiate_request" => {
             "Ask to be reinstantiated on updated versions".into()
         }
+        "task_list" => "List the project's tasks".into(),
+        "task_run" => about("Run task", "Run a task", "name"),
+        "task_output" => about("Read the output of task", "Read a task's output", "name"),
+        "task_stop" => about("Stop task", "Stop a task", "name"),
         "flatpak_status" => "Read the Flatpak build's state".into(),
         "flatpak_logs" => "Read the Flatpak build's log".into(),
         _ => return None,

@@ -143,7 +143,7 @@ itself — the filtered list, and the panel's height, which a filter must
 not move;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
 `TASTE_PROBE_TASKS=none` leaves the Tasks section empty the same way (it
-otherwise poses three tasks — one that ran, one running, one never run),
+otherwise poses more tasks than fit, namespaced ones among them),
 and `TASTE_PROBE_VIEW=task` opens a task's output in front, its row lit;
 `TASTE_PROBE_RESOURCES=vm` (with `TASTE_PROBE_VIEW=consolidated-console`)
 poses the console's Resources list as a workspace on a VM has it — the VM

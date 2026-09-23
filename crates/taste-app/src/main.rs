@@ -854,6 +854,9 @@ fn main() -> glib::ExitCode {
                     panel title headers, except the files one). The header's own \
                     margin is the gap. */\n\
                  list.section-list, list.backlog-list { padding-top: 0; padding-bottom: 0; }\n\
+                 /* A namespace's heading in the Tasks outline: a line, \
+                    not a row's height. */\n\
+                 .section-list > row.task-heading { min-height: 28px; }\n\
                  /* A row is reordered by dragging it or by its own menu, \
                     so it carries no action chrome at all — the flank's \
                     narrowest pane spends its width on titles. What is \
