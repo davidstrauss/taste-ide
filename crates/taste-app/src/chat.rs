@@ -11281,6 +11281,9 @@ fn command_input_line(name: &str, input: Option<&serde_json::Value>) -> Option<S
     match name {
         "ide_exec" => {
             let command = input.get("command")?.as_str()?;
+            if let Some(script) = shell_script(command, input.get("args")) {
+                return Some(script);
+            }
             let args = input
                 .get("args")
                 .and_then(serde_json::Value::as_array)
@@ -11303,6 +11306,35 @@ fn command_input_line(name: &str, input: Option<&serde_json::Value>) -> Option<S
         "ide_exec_output" => Some(format!("handle {}", input.get("handle")?)),
         _ => None,
     }
+}
+
+/// The script of a `sh -c <script>` call — what a terminal would show as
+/// the line typed. `ide_exec` takes a program and its argv rather than a
+/// shell line, so a pipe or a `&&` reaches it as `sh` with `["-c", …]`;
+/// shown literally, every such step read `sh -c '…'` with its script
+/// quoted a second time inside (David, 2026-09-23: "Why do I see these sh
+/// -c wrappers?"). Only the exact shape: a shell, one flag cluster ending
+/// in `c` (`-c`, `-lc`, `-euc`), and the script, with nothing after it —
+/// positional parameters after the script would change what it means, so
+/// that call keeps its literal form.
+fn shell_script(command: &str, args: Option<&serde_json::Value>) -> Option<String> {
+    let shell = command.rsplit('/').next().unwrap_or(command);
+    if !matches!(shell, "sh" | "bash" | "dash" | "zsh" | "ash") {
+        return None;
+    }
+    let args = args?.as_array()?;
+    let [flags, script] = args.as_slice() else {
+        return None;
+    };
+    let flags = flags.as_str()?;
+    let cluster = flags.strip_prefix('-')?;
+    if cluster.is_empty()
+        || !cluster.ends_with('c')
+        || !cluster.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some(script.as_str()?.trim().to_string())
 }
 
 /// The `OUT` block for one of the IDE's own command tools: what the
@@ -12890,6 +12922,26 @@ mod tests {
             Some("half\n[still running]")
         );
         assert_eq!(command_console_text("not json"), None);
+        let exec = |input: serde_json::Value| command_input_line("ide_exec", Some(&input));
+        assert_eq!(
+            exec(serde_json::json!({"command": "sh", "args": ["-c", "id; uname -a"]})).as_deref(),
+            Some("id; uname -a"),
+            "the script, as a terminal shows the line typed"
+        );
+        assert_eq!(
+            exec(serde_json::json!({"command": "/bin/bash", "args": ["-lc", "cargo test | tail"]}))
+                .as_deref(),
+            Some("cargo test | tail")
+        );
+        assert_eq!(
+            exec(serde_json::json!({"command": "sh", "args": ["-c", "echo $0", "x"]})).as_deref(),
+            Some("sh -c 'echo $0' x"),
+            "positional parameters change the script's meaning, so the call stays literal"
+        );
+        assert_eq!(
+            exec(serde_json::json!({"command": "sh", "args": ["build.sh"]})).as_deref(),
+            Some("sh build.sh")
+        );
         assert!(is_command_call(ToolKind::Other, "ide_exec_output"));
         // The adapter's own shell tool is still recognised by kind alone —
         // it carries no name this project defined.
@@ -12931,12 +12983,12 @@ mod tests {
         // An argument with whitespace is quoted, so the line still reads
         // back as the arguments it was — not a longer flat word list.
         let input = serde_json::json!({
-            "command": "sh",
-            "args": ["-c", "cargo test && echo ok"],
+            "command": "git",
+            "args": ["commit", "-m", "it's done"],
         });
         assert_eq!(
             command_input_line("ide_exec", Some(&input)),
-            Some("sh -c 'cargo test && echo ok'".to_string())
+            Some("git commit -m 'it'\\''s done'".to_string())
         );
         // `ide_exec_output` has no command of its own — it collects what an
         // earlier `ide_exec` started — so `IN` names the handle it asked
