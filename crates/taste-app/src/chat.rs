@@ -4622,6 +4622,27 @@ impl ChatPane {
     /// may), an orchestrator's send is held behind a container something
     /// else already started (`submit_prompt`), and a prompt orphaned by a
     /// dead process is held behind the reconnect (`SessionEvent::Closed`).
+    /// Every card for a message not yet answered — held for a container,
+    /// or sent and waiting its turn — back at the bottom of the transcript
+    /// if a clear took it. In the order they were written.
+    fn reattach_pending_cards(&self) {
+        let cards: Vec<gtk::Box> = self
+            .revive_queue
+            .borrow()
+            .iter()
+            .map(|item| item.card.clone())
+            .chain(self.pending_prompts.borrow().iter().map(|p| p.card.clone()))
+            .collect();
+        for card in cards {
+            if card.is_ancestor(&self.transcript) {
+                continue;
+            }
+            // Out of the row the clear dropped, into one of its own.
+            card.unparent();
+            self.append_row(&card);
+        }
+    }
+
     fn hold_send(
         self: &Rc<Self>,
         text: &str,
@@ -4672,6 +4693,15 @@ impl ChatPane {
     /// first prompt of a start forever (i-0011).
     fn flush_revive_queue(self: &Rc<Self>) {
         if self.revive_queue.borrow().is_empty() {
+            return;
+        }
+        // Not to an agent about to be replaced: the one outside a
+        // container that is coming up is swapped for one inside as soon as
+        // it is, and a message handed to the first was answered by the
+        // second with its card gone from under it. The queue drains at that
+        // agent's `Ready`.
+        if self.container_on_its_way() {
+            self.sync_revive_bar();
             return;
         }
         // `activate` first: the whole point of holding was to have an agent
@@ -8148,6 +8178,14 @@ impl ChatPane {
                 if !restored && !self.container_on_its_way() {
                     self.replay_stash();
                 }
+                // Cards for messages still waiting or on their way, put
+                // back under the history a replay just redrew: a held
+                // message is in no history yet, so the replay's clear
+                // took its card, and the agent went on to answer a message
+                // the transcript no longer showed (David, 2026-09-23: "it
+                // seems to disappear from the chat after the container
+                // finishes coming up, even though the agent replies").
+                self.reattach_pending_cards();
                 self.persist_session_id();
                 // Close the shade only if the IDE opened it (for sign-in)
                 // and sign-in is done; a shade the user opened stays open
