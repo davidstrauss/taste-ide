@@ -2400,11 +2400,21 @@ impl McpServer {
                 // from the environment, which is what makes publishing
                 // twice move one branch instead of leaving two.
                 let dest = taste_git::env_branch_ref(env.as_str());
-                let branch = args["branch"]
+                let named = args["branch"]
                     .as_str()
                     .map(str::trim)
                     .filter(|b| !b.is_empty())
                     .map(str::to_string);
+                // The branch the CHECKOUT is on, when the agent names none:
+                // for a checkout in a VM the clone here is a peer, its HEAD
+                // parked on the unborn `taste-peer`, and asking it answered
+                // "refs/heads/taste-peer does not name a commit" to every
+                // publish (2026-09-23). The peer is synced first, so what is
+                // published is what the checkout has now.
+                let branch = match named {
+                    Some(branch) => Some(branch),
+                    None => self.checkout_branch(env).await?,
+                };
                 let ready = args["ready"].as_bool().unwrap_or(false);
                 let main = self.workspace.root().to_path_buf();
 
@@ -2602,6 +2612,15 @@ impl McpServer {
                 })
                 .await
                 .context("the update task panicked")??;
+                // For a checkout in a VM the clone here is its peer: the
+                // refs just updated are on this host, and the rebase the
+                // note tells the agent to run happens over there. Handed on,
+                // or it rebased onto whatever the checkout last saw.
+                let supervisor = self.supervisor(env)?;
+                tokio::task::spawn_blocking(move || supervisor.share_remotes_blocking())
+                    .await
+                    .context("the update task panicked")?
+                    .context("giving the checkout the updated remote-tracking refs")?;
 
                 let created = updates.iter().filter(|u| u.created()).count();
                 let pruned = updates.iter().filter(|u| u.pruned()).count();
@@ -4049,6 +4068,33 @@ impl McpServer {
     /// The primary environment IS the hub: publishing to itself would mean
     /// nothing, and updating from itself even less. Saying so beats a tool
     /// that quietly no-ops.
+    /// The branch `env`'s checkout has checked out, with its peer synced
+    /// to it first — for a checkout in a VM, whose peer here holds refs and
+    /// no HEAD of its own. `None` for a checkout on this host, whose clone
+    /// IS the checkout and answers for its own HEAD.
+    async fn checkout_branch(&self, env: &EnvironmentId) -> Result<Option<String>> {
+        let supervisor = self.supervisor(env)?;
+        let taste_core::environment::Checkout::Remote { path, .. } = supervisor.checkout() else {
+            return Ok(None);
+        };
+        let for_sync = supervisor.clone();
+        tokio::task::spawn_blocking(move || for_sync.sync_peer_blocking())
+            .await?
+            .context("bringing this environment's commits home before publishing")?;
+        let head = supervisor
+            .files()
+            .read_to_string(&path.join(".git/HEAD"))
+            .context("reading which branch the checkout is on")?;
+        match head.trim().strip_prefix("ref: refs/heads/") {
+            Some(branch) => Ok(Some(branch.to_string())),
+            None => anyhow::bail!(
+                "the checkout is not on a branch (HEAD is detached at {}); check out the branch \
+                 your work is on, or name it with `branch`, and publish again",
+                head.trim()
+            ),
+        }
+    }
+
     fn mediating_env(&self, env: &EnvironmentId, tool: &str) -> Result<PathBuf> {
         if env.is_primary() {
             anyhow::bail!(
