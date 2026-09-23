@@ -10,6 +10,10 @@
 //! Rootless podman already denies real root; this validator's job is to
 //! keep repo-controlled flags from reaching the user's data (`-v /home/...`)
 //! or weakening the container boundary (`--privileged`, `--security-opt`).
+//!
+//! One weakening is granted on purpose: **nesting** — a container engine
+//! inside the container, for a project whose own build or tests run podman
+//! (see [`NESTING_RUN_ARGS`]).
 
 use std::path::Path;
 
@@ -36,12 +40,82 @@ const ALLOWED_FLAG_PREFIXES: &[&str] = &[
 /// runArgs flags that consume the *next* entry as their value.
 const ALLOWED_FLAGS_WITH_VALUE: &[&str] = &["-e", "--env", "--shm-size", "--hostname", "--label"];
 
+/// What a container needs to run podman inside itself — `podman build`
+/// and `podman run` both, rootless, as the image's user — and nothing more.
+///
+/// Measured, not assumed (2026-09-23, Fedora CoreOS 44 guest, podman 5.8,
+/// `quay.io/podman/stable` run with the IDE's own `--userns=keep-id`):
+/// with the default flags a nested BUILD works and a nested RUN fails,
+/// `mount devpts to dev/pts: Permission denied`, which is SELinux's
+/// `container_t`. `label=type:container_engine_t` is container-selinux's
+/// domain for exactly this — still confined, still MCS-separated — and it
+/// gets as far as the inner container masking `/proc/acpi`, which the
+/// outer container's own masked `/proc` forbids; `unmask=ALL` is that last
+/// step. No capability, no device, and no `--privileged`: overlay runs
+/// natively in the guest's kernel, so even `/dev/fuse` is not needed.
+/// `label=disable` works too, and is accepted for configs that already say
+/// it, but is not what the IDE asks for.
+///
+/// Why this is not the boundary giving way: that boundary is the HOST
+/// (ENVIRONMENTS → "Isolation: the standard, and what meets it"), and the
+/// container's substrate is a VM of the workspace's pool. What nesting
+/// widens is the container's reach into its own VM, whose kernel is not
+/// the user's.
+pub const NESTING_RUN_ARGS: &[&str] = &[
+    "--security-opt=label=type:container_engine_t",
+    "--security-opt=unmask=ALL",
+];
+
+/// The `--security-opt` values a config may state: the nesting set, and
+/// the two other spellings podman-in-podman guides give it.
+const ALLOWED_SECURITY_OPTS: &[&str] = &[
+    "label=type:container_engine_t",
+    "unmask=ALL",
+    "label=disable",
+    "label=nested",
+];
+
+/// The `--device` values a config may state. `/dev/fuse` is in every
+/// podman-in-podman recipe (for fuse-overlayfs); the guest has it, and it
+/// reaches nothing outside the VM.
+const ALLOWED_DEVICES: &[&str] = &["/dev/fuse"];
+
 /// Flags accepted for cross-ecosystem compatibility but never passed to
-/// podman. Docker needs `--privileged` for systemd-in-container; rootless
-/// podman does not (`--systemd` handles it), so a devcontainer.json shared
-/// with VS Code / Codespaces keeps working here — with strictly *fewer*
-/// privileges, never more.
+/// podman as they are. Docker needs `--privileged` for systemd-in-container
+/// and for docker-in-docker; rootless podman needs it for neither
+/// (`--systemd` handles the first, [`NESTING_RUN_ARGS`] the second), so a
+/// devcontainer.json shared with VS Code / Codespaces keeps working here —
+/// and the flag becomes the nesting set, which is the one thing a config
+/// asking for it could still want (`privileged_run_args`).
 pub const STRIPPED_FLAGS: &[&str] = &["--privileged"];
+
+/// What a config's own request for privilege becomes: the nesting set,
+/// once, when `runArgs` carries `--privileged` or the spec's top-level
+/// `"privileged": true` is set, and nothing otherwise. The supervisor
+/// appends it where the stripped flag would have gone.
+pub fn privileged_run_args(config: &DevcontainerConfig) -> Vec<String> {
+    let asked = config.privileged == Some(true)
+        || config
+            .run_args
+            .iter()
+            .any(|arg| STRIPPED_FLAGS.contains(&arg.as_str()));
+    if !asked {
+        return Vec::new();
+    }
+    let stated = |flag: &str| {
+        let value = flag.trim_start_matches("--security-opt=");
+        config.run_args.iter().enumerate().any(|(i, arg)| {
+            arg == flag
+                || (arg == "--security-opt"
+                    && config.run_args.get(i + 1).map(String::as_str) == Some(value))
+        })
+    };
+    NESTING_RUN_ARGS
+        .iter()
+        .filter(|flag| !stated(flag))
+        .map(|flag| flag.to_string())
+        .collect()
+}
 
 /// The host directories the config's bind mounts read from, inside the
 /// workspace: `${localWorkspaceFolder}` expanded, volumes and everything
@@ -176,6 +250,32 @@ fn validate_run_args(run_args: &[String]) -> Result<()> {
             }
             continue;
         }
+        // Nesting's own flags, in either spelling, and only its values.
+        let valued = [
+            ("--security-opt", ALLOWED_SECURITY_OPTS),
+            ("--device", ALLOWED_DEVICES),
+        ];
+        if let Some((flag, allowed)) = valued
+            .iter()
+            .find(|(flag, _)| arg == flag || arg.starts_with(&format!("{flag}=")))
+        {
+            let value = match arg.strip_prefix(&format!("{flag}=")) {
+                Some(value) => value.to_string(),
+                None => match iter.next() {
+                    Some(value) => value.clone(),
+                    None => bail!("devcontainer.json runArgs: {arg} is missing its value"),
+                },
+            };
+            if !allowed.contains(&value.as_str()) {
+                bail!(
+                    "devcontainer.json runArgs: \"{flag} {value}\" is not allowed \
+                     (the repo is untrusted; {flag} takes only {}, which is what running \
+                     podman inside the container needs)",
+                    allowed.join(", ")
+                );
+            }
+            continue;
+        }
         let allowed = ALLOWED_FLAG_PREFIXES.iter().any(|prefix| {
             if let Some(bare) = prefix.strip_suffix('=') {
                 arg == bare || arg.starts_with(prefix)
@@ -187,7 +287,8 @@ fn validate_run_args(run_args: &[String]) -> Result<()> {
             bail!(
                 "devcontainer.json runArgs: \"{arg}\" is not allowed \
                  (the repo is untrusted; only resource limits, env, \
-                 --userns=keep-id, --hostname, --init, and labels pass)"
+                 --userns=keep-id, --hostname, --init, labels, and the \
+                 flags podman-in-podman needs pass)"
             );
         }
     }
@@ -348,9 +449,11 @@ mod tests {
         // (--privileged is absent: it is tolerated-and-stripped for
         // VS Code/Codespaces compatibility, see below.)
         for bad in [
-            "--security-opt=label=disable",
+            "--security-opt=seccomp=unconfined",
+            "--security-opt=apparmor=unconfined",
             "--cap-add=ALL",
             "--device=/dev/kvm",
+            "--device=/dev/sda",
             "--pid=host",
             "--network=host",
             "-v",
@@ -381,6 +484,49 @@ mod tests {
         );
         validate_security(&config, dir.path()).unwrap();
         assert!(STRIPPED_FLAGS.contains(&"--privileged"));
+    }
+
+    #[test]
+    fn nesting_flags_pass_in_either_spelling_and_only_theirs() {
+        let (dir, config) = config_with(
+            r#"{"image": "img", "runArgs": [
+                "--security-opt=label=type:container_engine_t",
+                "--security-opt", "unmask=ALL",
+                "--security-opt=label=disable",
+                "--device", "/dev/fuse"
+            ]}"#,
+        );
+        validate_security(&config, dir.path()).unwrap();
+        for bad in [
+            r#"["--security-opt", "seccomp=unconfined"]"#,
+            r#"["--device", "/dev/kvm"]"#,
+            r#"["--security-opt"]"#,
+        ] {
+            let (dir, config) = config_with(&format!(r#"{{"image": "img", "runArgs": {bad}}}"#));
+            assert!(validate_security(&config, dir.path()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn privileged_becomes_the_nesting_set_once() {
+        let (_dir, plain) = config_with(r#"{"image": "img"}"#);
+        assert!(privileged_run_args(&plain).is_empty());
+        for asked in [
+            r#"{"image": "img", "runArgs": ["--privileged"]}"#,
+            r#"{"image": "img", "privileged": true}"#,
+        ] {
+            let (_dir, config) = config_with(asked);
+            assert_eq!(privileged_run_args(&config), NESTING_RUN_ARGS, "{asked}");
+        }
+        // A flag the config already states is not stated twice.
+        let (_dir, config) = config_with(
+            r#"{"image": "img", "privileged": true,
+                "runArgs": ["--security-opt", "unmask=ALL"]}"#,
+        );
+        assert_eq!(
+            privileged_run_args(&config),
+            vec!["--security-opt=label=type:container_engine_t"]
+        );
     }
 
     #[test]

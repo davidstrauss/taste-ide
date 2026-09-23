@@ -738,6 +738,14 @@ pub(crate) fn author_prompt() -> String {
      Codespaces. This IDE does not apply devcontainer features: install tools in the \
      Containerfile instead. If the checkout has a Taskfile.yml (taskfile.dev), install `task` \
      in the Containerfile too: the IDE lists and runs the project's tasks through it.\n\
+     If the project runs podman or docker itself (its build, tests, or tasks call it), \
+     install podman in the Containerfile, set \"privileged\": true in devcontainer.json (the \
+     IDE grants exactly what nested podman needs for it, and VS Code reads it too), and give \
+     the image's user subordinate IDs inside the container's range: \
+     `echo USER:1:999 > /etc/subuid; echo USER:1001:64535 >> /etc/subuid`, and the same \
+     for /etc/subgid, with USER the user's name and uid 1000. useradd's default range \
+     starts at 100000, which does not exist in the container, and nested podman then \
+     fails.\n\
      3. Do not run podman, docker, or the build yourself. When the files are ready, call the \
      devcontainer_reload tool once.\n\
      4. Then call the environment tool with include [\"log\"]. If it reports a failure, read \

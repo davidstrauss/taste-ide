@@ -2901,7 +2901,10 @@ does not:
   config on the rung below both, outside any container on a read-only
   stand-in, where its own devcontainer.json read as "File does not exist"
   (David, 2026-09-16: "The agent is getting stymied again").
-- No nested container runtime, unchanged: builds stay IDE-supervised.
+- Builds stay IDE-supervised: the project's image is built by the IDE,
+  never by a container runtime inside another container. A project's OWN
+  use of podman — its build, its tests, its tasks — is a different thing,
+  and is granted: see "Nested podman" under the isolation standard.
   The agent-authors / user-applies split is unchanged, and the baseline
   declares **no lifecycle hooks**, so the fallback itself asks nothing of
   the consent gate.
@@ -3012,9 +3015,35 @@ asked about and ruled out of scope (David, same day):
 - **No host process.** Every exec gate asks `ExecContext::has_exec_target()`
   and refuses a `false` rather than falling back.
 - **Repo-supplied config is vetted** (`taste_devcontainer::security`):
-  `--security-opt=label=disable`, `--cap-add=ALL`, `--device=/dev/kvm`,
-  `--pid=host`, `--network=host`, and arbitrary `-v` binds are refused;
-  `--privileged` is stripped for Codespaces compatibility.
+  `--cap-add`, `--device` other than `/dev/fuse`, `--security-opt` other
+  than nesting's own values, `--pid=host`, `--network=host`, and arbitrary
+  `-v` binds are refused; `--privileged` is never passed as asked, and
+  becomes nesting (below).
+- **Nested podman is granted, and only as much of it as it needs**
+  (2026-09-23). Projects that run podman themselves — a build in a
+  container, a test that starts one — are ordinary, and a devcontainer
+  that could not host them sent that work to the user's machine, which is
+  the one place it must not go. `"privileged": true` (or `--privileged` in
+  `runArgs`) becomes `--security-opt=label=type:container_engine_t` and
+  `--security-opt=unmask=ALL`, and a config may state those two itself,
+  or `label=disable`, `label=nested`, and `--device=/dev/fuse`, which
+  podman-in-podman guides also give. Measured in a Fedora CoreOS 44 guest
+  with the IDE's own `--userns=keep-id`: with the default flags a nested
+  build works and a nested `podman run` fails, SELinux's `container_t`
+  refusing the `devpts` mount; container-selinux's `container_engine_t`
+  (still confined, still MCS-separated) gets past that, and `unmask=ALL`
+  lets the inner container mask `/proc` paths that the outer one's own
+  masked `/proc` forbids. No capability, no device, and no real
+  `--privileged`: overlay runs natively in the guest's kernel.
+  `"privileged": true` is the spelling to use, because VS Code and
+  Codespaces read it too (Docker's docker-in-docker wants exactly that),
+  while `unmask` is podman's word alone. What it widens is the container's
+  reach into its own VM, whose kernel is not the user's; the line this
+  section defends is the host, and nothing about it moves. The image
+  supplies the rest: podman itself, and subordinate IDs for its user
+  inside the container's range (a `keep-id` container has IDs 0–65536,
+  and `useradd`'s default range starts at 100000), which the authoring
+  prompt spells out.
 
 ### What does not meet it, and why the VM is the answer
 

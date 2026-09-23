@@ -88,8 +88,9 @@ How Taste meets it:
   and its lifecycle commands run in the VM and nothing of yours is in
   reach; you are told once, at the end, whether it worked. Repo-supplied
   configs are still vetted, and anything that would reach the host
-  (`--privileged`, host network, arbitrary binds, devices) is refused or
-  stripped.
+  (host network, arbitrary binds, devices) is refused. `--privileged` is
+  never passed as asked: it becomes what podman inside the container
+  needs, and no more.
 - **What is left is written down**, not implied: the residual list in
   [docs/ENVIRONMENTS.md](docs/ENVIRONMENTS.md) → "The residual, as it
   stands" names every host process that still parses project-controlled

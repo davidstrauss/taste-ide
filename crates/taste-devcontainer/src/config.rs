@@ -192,6 +192,9 @@ pub struct DevcontainerConfig {
     pub dockerfile: Option<String>,
     #[serde(default)]
     pub run_args: Vec<String>,
+    /// The spec's `privileged`: what it becomes here is
+    /// `security::privileged_run_args`, never `--privileged` itself.
+    pub privileged: Option<bool>,
     pub container_user: Option<String>,
     pub remote_user: Option<String>,
     pub workspace_folder: Option<String>,

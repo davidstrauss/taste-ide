@@ -242,7 +242,9 @@ What that leaves genuinely enforced, in every mode:
   already meant "send my work out".
 - **The repo cannot break out via its devcontainer config**
   (`taste-devcontainer::security`): `runArgs` allowlisted (no
-  `--privileged`, no `--security-opt`, no devices, no extra volumes);
+  `--privileged` as asked, no capabilities, no extra volumes, and
+  `--security-opt` and devices only as far as nested podman needs them —
+  ENVIRONMENTS → "Nested podman");
   mounts must be named volumes or binds inside the workspace, resolved
   through symlinks; and the build names no host path at all — the context
   is the config directory by convention, staged before use, so there is

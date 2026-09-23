@@ -3267,12 +3267,18 @@ impl Supervisor {
         }
         for arg in &config.run_args {
             if crate::security::STRIPPED_FLAGS.contains(&arg.as_str()) {
-                self.log(format!(
-                    "runArgs {arg} ignored — Docker needs it for systemd, rootless podman does not"
-                ));
                 continue;
             }
             args.push(arg.clone());
+        }
+        let nesting = crate::security::privileged_run_args(&config);
+        if !nesting.is_empty() {
+            self.log(format!(
+                "privileged: not passed as asked; granted as what running podman inside the \
+                 container needs ({})",
+                nesting.join(" ")
+            ));
+            args.extend(nesting);
         }
         args.push(image);
         if config.override_command != Some(false) {
@@ -4731,7 +4737,7 @@ mod tests {
         std::fs::create_dir_all(&dc).unwrap();
         std::fs::write(
             dc.join("devcontainer.json"),
-            r#"{"image": "img", "runArgs": ["--privileged", "--security-opt=label=disable"]}"#,
+            r#"{"image": "img", "runArgs": ["--privileged", "--security-opt=seccomp=unconfined"]}"#,
         )
         .unwrap();
 
