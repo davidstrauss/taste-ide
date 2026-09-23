@@ -6367,16 +6367,18 @@ impl FileTree {
         };
         let view_root = self.view_root();
         let worktree = self.worktree();
-        let ghosts = if search.is_some() || self.read_only() {
-            // Template suggestions are noise in search results — and an
-            // offer to create a file is a lie in a read-only view.
-            Vec::new()
-        } else {
-            // The existence checks are reads of the checkout, wherever
-            // it is; a handful of stats, and the listing itself is already
-            // off the main thread.
-            ghost_candidates(&worktree.files(), &view_root)
-        };
+        // Template suggestions are noise in search results — and an offer
+        // to create a file is a lie in a read-only view.
+        //
+        // Worked out off the main thread, by the first listing that needs
+        // them. The existence checks are stats of the checkout wherever it
+        // is — for one in a VM, a round trip each to its files service —
+        // and done here they held the window every time the tree was
+        // re-aimed: switching back to Personal froze it for as long as the
+        // service took to answer them all (David, 2026-09-23: "that
+        // shouldn't block my UI").
+        let ghosts =
+            Ghosts::new((search.is_none() && !self.read_only()).then(|| view_root.clone()));
         // The root listing is handed to `TreeListModel` empty and filled
         // in once the walk lands on the blocking pool — so `rebuild()`
         // returns immediately and the list this call attaches never blocks
@@ -7490,12 +7492,13 @@ fn fill_dir_store_async(
     worktree: Worktree,
     dir: PathBuf,
     show_ignored: bool,
-    ghosts: Vec<Ghost>,
+    ghosts: Ghosts,
     filter: Option<HashSet<PathBuf>>,
 ) {
     let weak = store.downgrade();
     let handle = crate::runtime::runtime().spawn_blocking(move || {
-        scan_dir_nodes(&worktree, &dir, show_ignored, &ghosts, filter.as_ref())
+        let ghosts = ghosts.get(&worktree);
+        scan_dir_nodes(&worktree, &dir, show_ignored, ghosts, filter.as_ref())
     });
     glib::spawn_future_local(async move {
         let Ok(nodes) = handle.await else { return };
@@ -7504,6 +7507,27 @@ fn fill_dir_store_async(
             store.append(&BoxedAnyObject::new(node));
         }
     });
+}
+
+/// The ghost rows of one rebuild, found once and shared by every listing
+/// it makes — the root's and each folder's as it opens — on whichever
+/// blocking thread asks first (`fill_dir_store_async`), never on the main
+/// one. `None` for a view that offers none.
+#[derive(Clone)]
+struct Ghosts(std::sync::Arc<(Option<PathBuf>, std::sync::OnceLock<Vec<Ghost>>)>);
+
+impl Ghosts {
+    fn new(root: Option<PathBuf>) -> Self {
+        Self(std::sync::Arc::new((root, std::sync::OnceLock::new())))
+    }
+
+    fn get(&self, worktree: &Worktree) -> &[Ghost] {
+        let (root, found) = &*self.0;
+        found.get_or_init(|| match root {
+            Some(root) => ghost_candidates(&worktree.files(), root),
+            None => Vec::new(),
+        })
+    }
 }
 
 /// A conventional path the workspace lacks, offered as a faint row where
@@ -8110,7 +8134,7 @@ mod tests {
             Worktree::Local(dir.clone()),
             dir.clone(),
             false,
-            Vec::new(),
+            Ghosts::new(None),
             None,
         );
         let create_func_returns_in = start.elapsed();
