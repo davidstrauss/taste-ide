@@ -5,11 +5,9 @@
 //!
 //! **Listed by `task` itself, where it can be.** `task --list-all --json`,
 //! run in the environment's container, is the list as `task` sees it —
-//! includes, namespaces, and all — and it needs no YAML reader here. A
-//! container without `task`, or no container at all, still lists the
-//! Taskfile's own top-level tasks, read off the file ([`read_names`]), so
-//! the section says what the project has even when it cannot run it — and
-//! says why it cannot.
+//! includes, namespaces, and all — and it needs no YAML reader here.
+//! Without `task`, or without a container to run it in, nothing is listed:
+//! the section and the tools say what is missing instead.
 //!
 //! **Run where the files are, never on the host.** A task runs through
 //! the environment's exec target, which is the container; a context with
@@ -69,9 +67,10 @@ pub enum Listing {
     /// The checkout has no Taskfile: the ghost row alone.
     NoTaskfile,
     Tasks {
+        /// The tasks as `task` lists them; empty when it could not be asked.
         tasks: Vec<TaskInfo>,
-        /// Why they cannot be run, when they cannot: no container, or no
-        /// `task` in it.
+        /// Why `task` could not list them, when it could not: no container,
+        /// or no `task` in it — and so none can be run either.
         cannot_run: Option<String>,
     },
 }
@@ -80,13 +79,12 @@ pub enum Listing {
 /// lists them, else as the Taskfile names them. Blocking: a stat, maybe a
 /// read, and a process in the container.
 pub fn list(exec: &ExecContext, files: &Files, root: &Path) -> Listing {
-    let Some(taskfile) = crate::conventions::TASKFILE_NAMES
+    let has_taskfile = crate::conventions::TASKFILE_NAMES
         .iter()
-        .map(|name| root.join(name))
-        .find(|path| files.is_file(path))
-    else {
+        .any(|name| files.is_file(&root.join(name)));
+    if !has_taskfile {
         return Listing::NoTaskfile;
-    };
+    }
     let cannot_run = if exec.has_exec_target() {
         let spec = exec.resolve("task", &["--list-all", "--json"], false);
         match std::process::Command::new(&spec.program)
@@ -106,7 +104,9 @@ pub fn list(exec: &ExecContext, files: &Files, root: &Path) -> Listing {
             Ok(out) => {
                 let said = String::from_utf8_lossy(&out.stderr);
                 if said.contains("executable file not found") || out.status.code() == Some(127) {
-                    "task is not installed in the environment".to_string()
+                    "task is not installed in the environment; add it to the devcontainer's \
+                     image (taskfile.dev/installation) to list and run these tasks"
+                        .to_string()
                 } else {
                     format!(
                         "task could not read the Taskfile: {}",
@@ -117,11 +117,14 @@ pub fn list(exec: &ExecContext, files: &Files, root: &Path) -> Listing {
             Err(e) => format!("the environment could not be asked: {e}"),
         }
     } else {
-        "no container is running to run them in".to_string()
+        "no container is running for task to list and run them in".to_string()
     };
-    let text = files.read_to_string(&taskfile).unwrap_or_default();
+    // No guess at the list without `task`: a list it cannot run is no use,
+    // and `task` is the only reader of a Taskfile that is right about it
+    // (David, 2026-09-23: "You shouldn't bother with a fallback reader if
+    // we need \"task\" installed to run tasks").
     Listing::Tasks {
-        tasks: read_names(&text),
+        tasks: Vec::new(),
         cannot_run: Some(cannot_run),
     }
 }
@@ -147,51 +150,6 @@ fn parse_list_json(bytes: &[u8]) -> Option<Vec<TaskInfo>> {
     )
 }
 
-/// The top-level tasks a Taskfile's own text names, with their `desc`:
-/// the keys one indent under `tasks:`. Not a YAML reader — includes,
-/// anchors, and flow style are `task`'s to read — only enough to list
-/// what the file plainly says when `task` is not there to say it.
-pub fn read_names(text: &str) -> Vec<TaskInfo> {
-    let indent = |line: &str| line.len() - line.trim_start().len();
-    let mut tasks: Vec<TaskInfo> = Vec::new();
-    let mut in_tasks = false;
-    let mut key_indent: Option<usize> = None;
-    for line in text.lines() {
-        let content = line.trim();
-        if content.is_empty() || content.starts_with('#') {
-            continue;
-        }
-        let at = indent(line);
-        if at == 0 {
-            in_tasks = content.trim_end_matches(':') == "tasks" && content.ends_with(':');
-            key_indent = None;
-            continue;
-        }
-        if !in_tasks {
-            continue;
-        }
-        let key_at = *key_indent.get_or_insert(at);
-        if at == key_at {
-            if let Some((key, _)) = content.split_once(':') {
-                let key = key.trim().trim_matches(['"', '\'']);
-                if !key.is_empty() && !key.contains(' ') {
-                    tasks.push(TaskInfo {
-                        name: key.to_string(),
-                        desc: String::new(),
-                    });
-                }
-            }
-        } else if at > key_at {
-            if let (Some(task), Some(desc)) = (tasks.last_mut(), content.strip_prefix("desc:")) {
-                if task.desc.is_empty() {
-                    task.desc = desc.trim().trim_matches(['"', '\'']).to_string();
-                }
-            }
-        }
-    }
-    tasks
-}
-
 /// One line of the Tasks section's outline: a task, or a heading for the
 /// namespace tasks share.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,8 +160,11 @@ pub struct OutlineEntry {
     /// namespace for a heading.
     pub label: String,
     /// The task this line is, by its index in the list; `None` for a
-    /// heading with no task of its own.
+    /// namespace's heading.
     pub task: Option<usize>,
+    /// The namespace a heading opens, `dev` or `db:migrate`; for a task,
+    /// the namespace it sits in (empty at the top) — what folding keys on.
+    pub path: String,
 }
 
 /// The tasks as an outline on `task`'s own separator, in the order they
@@ -240,18 +201,45 @@ pub fn outline(names: &[String]) -> Vec<OutlineEntry> {
             level = &mut node.children;
         }
     }
-    fn flatten(nodes: &[Node], depth: usize, out: &mut Vec<OutlineEntry>) {
+    // A namespace is always a heading, which opens and runs nothing; a task
+    // named for one (`dev` beside `dev:init`) is the first line inside it
+    // (David, 2026-09-23: "It also doesn't make sense to \"play\" dev if
+    // it's just a header").
+    fn flatten(nodes: &[Node], depth: usize, prefix: &str, out: &mut Vec<OutlineEntry>) {
         for node in nodes {
+            if node.children.is_empty() {
+                out.push(OutlineEntry {
+                    depth,
+                    label: node.label.clone(),
+                    task: node.task,
+                    path: prefix.to_string(),
+                });
+                continue;
+            }
+            let path = if prefix.is_empty() {
+                node.label.clone()
+            } else {
+                format!("{prefix}:{}", node.label)
+            };
             out.push(OutlineEntry {
                 depth,
                 label: node.label.clone(),
-                task: node.task,
+                task: None,
+                path: path.clone(),
             });
-            flatten(&node.children, depth + 1, out);
+            if let Some(task) = node.task {
+                out.push(OutlineEntry {
+                    depth: depth + 1,
+                    label: node.label.clone(),
+                    task: Some(task),
+                    path: path.clone(),
+                });
+            }
+            flatten(&node.children, depth + 1, &path, out);
         }
     }
     let mut out = Vec::new();
-    flatten(&roots, 0, &mut out);
+    flatten(&roots, 0, "", &mut out);
     out
 }
 
@@ -446,16 +434,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_taskfile_names_its_top_level_tasks_and_their_descriptions() {
-        let text = "version: '3'\n\nvars:\n  GREETING: hi\n\ntasks:\n  default:\n    desc: Say hello\n    cmds:\n      - echo {{.GREETING}}\n  # a comment\n  build:\n    cmds:\n      - cargo build\n  \"lint\": cargo clippy\n\nincludes:\n  docs: ./docs\n";
-        let tasks = read_names(text);
-        let names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["default", "build", "lint"]);
-        assert_eq!(tasks[0].desc, "Say hello");
-        assert_eq!(tasks[1].desc, "");
-    }
-
-    #[test]
     fn namespaced_tasks_sit_under_their_namespace() {
         let names: Vec<String> = ["build", "dev:init", "dev:serve", "dev", "db:migrate:up"]
             .map(str::to_string)
@@ -469,7 +447,8 @@ mod tests {
             lines,
             [
                 (0, "build", Some(0)),
-                (0, "dev", Some(3)),
+                (0, "dev", None),
+                (1, "dev", Some(3)),
                 (1, "init", Some(1)),
                 (1, "serve", Some(2)),
                 (0, "db", None),

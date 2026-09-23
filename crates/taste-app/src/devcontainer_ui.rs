@@ -723,7 +723,8 @@ pub(crate) fn author_prompt() -> String {
      .devcontainer/devcontainer.json that builds it with \
      \"build\": {\"dockerfile\": \"Containerfile\"}. Keep it usable by VS Code and \
      Codespaces. This IDE does not apply devcontainer features: install tools in the \
-     Containerfile instead.\n\
+     Containerfile instead. If the checkout has a Taskfile.yml (taskfile.dev), install `task` \
+     in the Containerfile too: the IDE lists and runs the project's tasks through it.\n\
      3. Do not run podman, docker, or the build yourself. When the files are ready, call the \
      devcontainer_reload tool once.\n\
      4. Then call the environment tool with include [\"log\"]. If it reports a failure, read \

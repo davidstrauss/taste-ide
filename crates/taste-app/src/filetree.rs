@@ -38,33 +38,15 @@ pub struct TaskRow {
 }
 type OpenPortCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, u16)>;
 
-/// A namespace's heading in the Tasks outline: the namespace in a folder,
-/// neither selectable nor activated — it opens nothing, so nothing lights
-/// it.
-fn task_heading(label: &str) -> gtk::ListBoxRow {
-    let line = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
-    line.set_margin_end(ROW_INSET);
-    line.append(&leading_slot(
-        &gtk::Image::builder()
-            .icon_name("folder-symbolic")
-            .pixel_size(14)
-            .css_classes(["dim-label"])
-            .build(),
-    ));
-    line.append(
-        &gtk::Label::builder()
-            .label(label)
-            .css_classes(["dim-label"])
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build(),
-    );
-    gtk::ListBoxRow::builder()
-        .child(&line)
-        .activatable(false)
-        .selectable(false)
-        .css_classes(["task-heading"])
-        .build()
+/// The hits of an outline line and everything under it.
+fn subtree_hits(outline: &[crate::tasks::OutlineEntry], at: usize, hits: &[usize]) -> usize {
+    let depth = outline[at].depth;
+    outline[at..]
+        .iter()
+        .enumerate()
+        .take_while(|(offset, e)| *offset == 0 || e.depth > depth)
+        .filter_map(|(_, e)| e.task.map(|i| hits[i]))
+        .sum()
 }
 
 /// The Tasks list's height before it scrolls: five of its rows.
@@ -474,6 +456,9 @@ pub struct FileTree {
     /// What each row of the list is: the task it runs, or `None` for a
     /// namespace's heading (`tasks::outline`).
     task_row_names: RefCell<Vec<Option<String>>>,
+    /// The namespaces opened in the outline (`dev`, `db:migrate`); the
+    /// rest are closed, their tasks folded under their headings.
+    tasks_open: RefCell<HashSet<String>>,
     tasks_note: gtk::Label,
     tasks_empty: gtk::Box,
     tasks_ghost_label: gtk::Label,
@@ -1352,6 +1337,7 @@ impl FileTree {
             tasks_list,
             tasks_scroller,
             task_row_names: RefCell::new(Vec::new()),
+            tasks_open: RefCell::new(HashSet::new()),
             tasks_note,
             tasks_empty,
             tasks_ghost_label,
@@ -2617,15 +2603,37 @@ impl FileTree {
         let outline = crate::tasks::outline(&names);
         let mut row_names = Vec::with_capacity(outline.len());
         let mut kept_height = 0;
+        // Which namespaces are open: the ones opened by hand, and — while a
+        // query stands — every one with a hit inside, so a match is never
+        // folded out of sight.
+        let mut open = self.tasks_open.borrow().clone();
+        if !query.is_empty() {
+            for (at, entry) in outline.iter().enumerate() {
+                if entry.task.is_none() && subtree_hits(&outline, at, &hits) > 0 {
+                    open.insert(entry.path.clone());
+                }
+            }
+        }
+        // A line shows when every namespace above it is open: a heading's
+        // own path is its to fold, a task's the one it sits in.
+        let shown = |entry: &crate::tasks::OutlineEntry| {
+            let mut above: Vec<&str> = Vec::new();
+            let parts: Vec<&str> = entry.path.split(':').filter(|p| !p.is_empty()).collect();
+            let upto = if entry.task.is_none() {
+                parts.len().saturating_sub(1)
+            } else {
+                parts.len()
+            };
+            (1..=upto).all(|n| {
+                above.clear();
+                above.extend_from_slice(&parts[..n]);
+                open.contains(&above.join(":"))
+            })
+        };
         for (at, entry) in outline.iter().enumerate() {
             // Whether this line or anything under it answers the query: a
             // heading stays for its tasks' sake.
-            let subtree_hits: usize = outline[at..]
-                .iter()
-                .enumerate()
-                .take_while(|(offset, e)| *offset == 0 || e.depth > entry.depth)
-                .filter_map(|(_, e)| e.task.map(|i| hits[i]))
-                .sum();
+            let subtree = subtree_hits(&outline, at, &hits);
             let item = match entry.task {
                 Some(index) => {
                     let row = &rows[index];
@@ -2634,19 +2642,18 @@ impl FileTree {
                 }
                 None => {
                     row_names.push(None);
-                    task_heading(&entry.label)
+                    self.task_heading(&entry.label, &entry.path, open.contains(&entry.path))
                 }
             };
             if let Some(child) = item.child() {
                 child.set_margin_start(ROW_INSET + entry.depth as i32 * TASK_INDENT);
             }
-            let hidden = !query.is_empty() && subtree_hits == 0 && !query.ghost;
-            if !query.is_empty() && subtree_hits == 0 {
-                if query.ghost {
-                    item.add_css_class("search-dim");
-                } else {
-                    item.set_visible(false);
-                }
+            let unmatched = !query.is_empty() && subtree == 0;
+            let hidden = !shown(entry) || (unmatched && !query.ghost);
+            if hidden {
+                item.set_visible(false);
+            } else if unmatched {
+                item.add_css_class("search-dim");
             }
             if !hidden {
                 kept_height += if entry.task.is_some() { 40 } else { 28 };
@@ -2671,12 +2678,15 @@ impl FileTree {
         }
         self.tasks_scroller.set_visible(!rows.is_empty());
         match &cannot_run {
-            Some(why) if !rows.is_empty() => {
-                self.tasks_note
-                    .set_label(&format!("Not runnable here: {why}."));
+            Some(why) => {
+                let mut said = why.clone();
+                if let Some(first) = said.get_mut(..1) {
+                    first.make_ascii_uppercase();
+                }
+                self.tasks_note.set_label(&format!("{said}."));
                 self.tasks_note.set_visible(true);
             }
-            _ => self.tasks_note.set_visible(false),
+            None => self.tasks_note.set_visible(false),
         }
         self.tasks_ghost_label.set_label(if has_taskfile {
             "Add more in the Taskfile."
@@ -2694,6 +2704,64 @@ impl FileTree {
             })
             .and_then(|i| self.tasks_list.row_at_index(i as i32));
         self.tasks_list.select_row(lit.as_ref());
+    }
+
+    /// A namespace's heading in the Tasks outline: a disclosure arrow and
+    /// the namespace. A click opens or folds it (David, 2026-09-23: "This
+    /// doesn't seem to drill down for sections like \"dev\""); it runs
+    /// and opens nothing, so it is neither selectable nor activated, and
+    /// nothing lights it.
+    fn task_heading(self: &Rc<Self>, label: &str, path: &str, open: bool) -> gtk::ListBoxRow {
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
+        line.set_margin_end(ROW_INSET);
+        line.append(&leading_slot(
+            &gtk::Image::builder()
+                .icon_name(if open {
+                    "pan-down-symbolic"
+                } else {
+                    "pan-end-symbolic"
+                })
+                .pixel_size(14)
+                .css_classes(["dim-label"])
+                .build(),
+        ));
+        line.append(
+            &gtk::Label::builder()
+                .label(label)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build(),
+        );
+        let row = gtk::ListBoxRow::builder()
+            .child(&line)
+            .activatable(false)
+            .selectable(false)
+            .css_classes(["task-heading"])
+            .tooltip_text(if open {
+                format!("Fold the {path} tasks")
+            } else {
+                format!("Show the {path} tasks")
+            })
+            .build();
+        row.set_cursor_from_name(Some("pointer"));
+        let click = gtk::GestureClick::new();
+        {
+            let weak = Rc::downgrade(self);
+            let path = path.to_string();
+            click.connect_released(move |_, _, _, _| {
+                let Some(tree) = weak.upgrade() else { return };
+                {
+                    let mut open = tree.tasks_open.borrow_mut();
+                    if !open.remove(&path) {
+                        open.insert(path.clone());
+                    }
+                }
+                tree.render_tasks();
+            });
+        }
+        row.add_controller(click);
+        row
     }
 
     /// One task's row: its last run's light, its name's last part, what it
@@ -3218,6 +3286,8 @@ impl FileTree {
     #[doc(hidden)]
     pub fn seed_tasks_for_probe(self: &Rc<Self>) {
         use crate::tasks::{RunState, TaskInfo};
+        // One namespace open, one folded: both of the heading's faces.
+        self.tasks_open.borrow_mut().insert("dev".to_string());
         let row = |name: &str, desc: &str, state| TaskRow {
             info: TaskInfo {
                 name: name.to_string(),
@@ -3230,6 +3300,7 @@ impl FileTree {
                 row("build", "Build the workspace", RunState::Succeeded),
                 row("test", "Run the test suite", RunState::Running),
                 row("lint", "", RunState::Idle),
+                row("dev", "Build for dev", RunState::Idle),
                 row("dev:init", "Seed the dev database", RunState::Failed),
                 row("dev:serve", "Serve on :3000", RunState::Idle),
                 row("db:migrate:up", "Apply migrations", RunState::Idle),
