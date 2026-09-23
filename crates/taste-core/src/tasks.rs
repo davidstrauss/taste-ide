@@ -165,6 +165,9 @@ pub struct OutlineEntry {
     /// The namespace a heading opens, `dev` or `db:migrate`; for a task,
     /// the namespace it sits in (empty at the top) — what folding keys on.
     pub path: String,
+    /// A heading: it folds the lines under it. A heading can be a task too
+    /// (`dev` beside `dev:init`), and then it runs as one.
+    pub folds: bool,
 }
 
 /// The tasks as an outline on `task`'s own separator, in the order they
@@ -201,10 +204,11 @@ pub fn outline(names: &[String]) -> Vec<OutlineEntry> {
             level = &mut node.children;
         }
     }
-    // A namespace is always a heading, which opens and runs nothing; a task
-    // named for one (`dev` beside `dev:init`) is the first line inside it
-    // (David, 2026-09-23: "It also doesn't make sense to \"play\" dev if
-    // it's just a header").
+    // A namespace is a heading. One that is only a namespace runs nothing;
+    // one that is also a task (`dev` beside `dev:init`) is that task, and
+    // runs as one (David, 2026-09-23: "It also doesn't make sense to
+    // \"play\" dev if it's just a header … But you are correct that a
+    // heading that's also a task gets a play button").
     fn flatten(nodes: &[Node], depth: usize, prefix: &str, out: &mut Vec<OutlineEntry>) {
         for node in nodes {
             if node.children.is_empty() {
@@ -213,6 +217,7 @@ pub fn outline(names: &[String]) -> Vec<OutlineEntry> {
                     label: node.label.clone(),
                     task: node.task,
                     path: prefix.to_string(),
+                    folds: false,
                 });
                 continue;
             }
@@ -224,17 +229,10 @@ pub fn outline(names: &[String]) -> Vec<OutlineEntry> {
             out.push(OutlineEntry {
                 depth,
                 label: node.label.clone(),
-                task: None,
+                task: node.task,
                 path: path.clone(),
+                folds: true,
             });
-            if let Some(task) = node.task {
-                out.push(OutlineEntry {
-                    depth: depth + 1,
-                    label: node.label.clone(),
-                    task: Some(task),
-                    path: path.clone(),
-                });
-            }
             flatten(&node.children, depth + 1, &path, out);
         }
     }
@@ -447,8 +445,7 @@ mod tests {
             lines,
             [
                 (0, "build", Some(0)),
-                (0, "dev", None),
-                (1, "dev", Some(3)),
+                (0, "dev", Some(3)),
                 (1, "init", Some(1)),
                 (1, "serve", Some(2)),
                 (0, "db", None),

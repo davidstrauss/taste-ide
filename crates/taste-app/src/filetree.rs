@@ -2609,7 +2609,7 @@ impl FileTree {
         let mut open = self.tasks_open.borrow().clone();
         if !query.is_empty() {
             for (at, entry) in outline.iter().enumerate() {
-                if entry.task.is_none() && subtree_hits(&outline, at, &hits) > 0 {
+                if entry.folds && subtree_hits(&outline, at, &hits) > 0 {
                     open.insert(entry.path.clone());
                 }
             }
@@ -2619,7 +2619,7 @@ impl FileTree {
         let shown = |entry: &crate::tasks::OutlineEntry| {
             let mut above: Vec<&str> = Vec::new();
             let parts: Vec<&str> = entry.path.split(':').filter(|p| !p.is_empty()).collect();
-            let upto = if entry.task.is_none() {
+            let upto = if entry.folds {
                 parts.len().saturating_sub(1)
             } else {
                 parts.len()
@@ -2634,11 +2634,14 @@ impl FileTree {
             // Whether this line or anything under it answers the query: a
             // heading stays for its tasks' sake.
             let subtree = subtree_hits(&outline, at, &hits);
+            let fold = entry
+                .folds
+                .then(|| (entry.path.as_str(), open.contains(&entry.path)));
             let item = match entry.task {
                 Some(index) => {
                     let row = &rows[index];
                     row_names.push(Some(row.info.name.clone()));
-                    self.task_row(row, &entry.label, hits[index], runnable)
+                    self.task_row(row, &entry.label, hits[index], runnable, fold)
                 }
                 None => {
                     row_names.push(None);
@@ -2772,6 +2775,7 @@ impl FileTree {
         label: &str,
         hits: usize,
         runnable: bool,
+        fold: Option<(&str, bool)>,
     ) -> gtk::ListBoxRow {
         let running = row.state == crate::tasks::RunState::Running;
         let button = gtk::Button::builder()
@@ -2813,14 +2817,67 @@ impl FileTree {
         }
         trailing.append(&button);
         let item = section_row(
-            Some(crate::tasks::dot(row.state)),
-            None,
+            fold.is_none().then(|| crate::tasks::dot(row.state)),
+            // A slot for the arrow, filled below with one that folds.
+            fold.map(|_| "pan-end-symbolic"),
             label,
             &subtitle,
             Some(trailing.upcast_ref()),
         );
         item.set_tooltip_text(Some(&row.info.name));
+        // A heading that is a task: its arrow folds what is under it, in
+        // the slot a leaf's light takes — its state is in its subtitle —
+        // and the rest of the row opens it as any task's does.
+        if let (Some((path, open)), Some(line)) = (fold, item.child()) {
+            if let Some(slot) = line.first_child().and_downcast::<gtk::Box>() {
+                while let Some(child) = slot.first_child() {
+                    slot.remove(&child);
+                }
+                slot.append(&self.fold_arrow(path, open));
+            }
+        }
         item
+    }
+
+    /// The disclosure arrow of a heading at `path`: a click opens or folds
+    /// it, and goes no further — a heading that is a task is not opened by
+    /// its arrow.
+    fn fold_arrow(self: &Rc<Self>, path: &str, open: bool) -> gtk::Image {
+        let arrow = gtk::Image::builder()
+            .icon_name(if open {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            })
+            .pixel_size(14)
+            .css_classes(["dim-label"])
+            .tooltip_text(if open {
+                format!("Fold the {path} tasks")
+            } else {
+                format!("Show the {path} tasks")
+            })
+            .build();
+        arrow.set_cursor_from_name(Some("pointer"));
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let weak = Rc::downgrade(self);
+            let path = path.to_string();
+            click.connect_pressed(move |gesture, _, _, _| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let Some(tree) = weak.upgrade() else { return };
+                {
+                    let mut open = tree.tasks_open.borrow_mut();
+                    if !open.remove(&path) {
+                        open.insert(path.clone());
+                    }
+                }
+                let tree = tree.clone();
+                glib::idle_add_local_once(move || tree.render_tasks());
+            });
+        }
+        arrow.add_controller(click);
+        arrow
     }
 
     /// The query's hits inside each task's output, by name: badges, and
