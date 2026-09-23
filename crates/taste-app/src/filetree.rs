@@ -193,6 +193,19 @@ pub(crate) fn leading_slot(child: &impl IsA<gtk::Widget>) -> gtk::Box {
     slot
 }
 
+/// A heading's disclosure arrow, open or folded.
+fn fold_glyph(open: bool) -> gtk::Image {
+    gtk::Image::builder()
+        .icon_name(if open {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        })
+        .pixel_size(14)
+        .css_classes(["dim-label"])
+        .build()
+}
+
 /// A section's row: a dot or a glyph, a title, a caption under it — the
 /// backlog row's geometry, because the two lists share a column.
 fn section_row(
@@ -235,6 +248,11 @@ fn section_row(
             .build()
             .full_text_on_hover(),
     );
+    // No caption, no caption line: an empty one still took its height, so
+    // a task with no description had its name at the top of the row and
+    // its light centred on the blank line below it. The lines centre as
+    // one, so the title alone sits level with the light.
+    lines.set_valign(gtk::Align::Center);
     lines.append(
         &gtk::Label::builder()
             .label(subtitle)
@@ -242,6 +260,7 @@ fn section_row(
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(10)
+            .visible(!subtitle.is_empty())
             .build()
             .full_text_on_hover(),
     );
@@ -1131,7 +1150,9 @@ impl FileTree {
         // have a port with a slash through it as the icon"; then: "To add
         // ports, list them in <filename>. Clicking it should open that file
         // path. Like for backlog, keep the ghost row at the bottom always"):
-        // the rows' own geometry, the slashed port in the leading slot,
+        // the rows' own geometry, the server stack with a plus in the leading slot (it was a slashed
+        // port until David, 2026-09-23: "a server stack with a plus (like for
+        // adding tasks), not a slash"),
         // under the list whatever it holds, and a click opens the config —
         // or offers to create it, as the tree's own ghost does.
         let ports_empty = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
@@ -1145,7 +1166,7 @@ impl FileTree {
         ports_empty.add_css_class("backlog-ghost");
         ports_empty.append(&leading_slot(
             &gtk::Image::builder()
-                .icon_name("taste-port-off-symbolic")
+                .icon_name("taste-port-add-symbolic")
                 .pixel_size(13)
                 .css_classes(["dim-label"])
                 .build(),
@@ -2648,8 +2669,17 @@ impl FileTree {
                     self.task_heading(&entry.label, &entry.path, open.contains(&entry.path))
                 }
             };
+            // The depth's indent, and the row's start inset — except on a
+            // heading that is a task, whose fold strip already holds that
+            // inset (`task_row`), so stating it here too put the whole row
+            // ROW_INSET right of the column.
             if let Some(child) = item.child() {
-                child.set_margin_start(ROW_INSET + entry.depth as i32 * TASK_INDENT);
+                let inset = if entry.task.is_some() && entry.folds {
+                    0
+                } else {
+                    ROW_INSET
+                };
+                child.set_margin_start(inset + entry.depth as i32 * TASK_INDENT);
             }
             let unmatched = !query.is_empty() && subtree == 0;
             let hidden = !shown(entry) || (unmatched && !query.ghost);
@@ -2716,18 +2746,11 @@ impl FileTree {
     /// nothing lights it.
     fn task_heading(self: &Rc<Self>, label: &str, path: &str, open: bool) -> gtk::ListBoxRow {
         let line = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
+        // Both insets, as `section_row` states them: with only the end one
+        // the arrow sat ROW_INSET left of every task's light below it.
+        line.set_margin_start(ROW_INSET);
         line.set_margin_end(ROW_INSET);
-        line.append(&leading_slot(
-            &gtk::Image::builder()
-                .icon_name(if open {
-                    "pan-down-symbolic"
-                } else {
-                    "pan-end-symbolic"
-                })
-                .pixel_size(14)
-                .css_classes(["dim-label"])
-                .build(),
-        ));
+        line.append(&leading_slot(&fold_glyph(open)));
         line.append(
             &gtk::Label::builder()
                 .label(label)
@@ -2828,36 +2851,43 @@ impl FileTree {
         // A heading that is a task: its arrow folds what is under it, in
         // the slot a leaf's light takes — its state is in its subtitle —
         // and the rest of the row opens it as any task's does.
+        //
+        // The fold target is the row's whole leading strip — its inset and
+        // the slot, top to bottom — rather than the 14-pixel glyph, which
+        // was all a click could land on (David, 2026-09-23: "the clickable
+        // area for opening up nesting needs to be much larger"). The line
+        // gives its start inset up to the strip, and the strip puts the
+        // arrow back where the slot centres a light, so the arrow and the
+        // lights below it are one column.
         if let (Some((path, open)), Some(line)) = (fold, item.child()) {
             if let Some(slot) = line.first_child().and_downcast::<gtk::Box>() {
                 while let Some(child) = slot.first_child() {
                     slot.remove(&child);
                 }
-                slot.append(&self.fold_arrow(path, open));
+                line.set_margin_start(0);
+                slot.set_width_request(ROW_INSET + LEAD_WIDTH);
+                slot.set_valign(gtk::Align::Fill);
+                let arrow = fold_glyph(open);
+                arrow.set_margin_start(ROW_INSET);
+                arrow.set_hexpand(true);
+                arrow.set_halign(gtk::Align::Center);
+                arrow.set_valign(gtk::Align::Center);
+                slot.append(&arrow);
+                self.make_fold_target(&slot, path, open);
             }
         }
         item
     }
 
-    /// The disclosure arrow of a heading at `path`: a click opens or folds
-    /// it, and goes no further — a heading that is a task is not opened by
-    /// its arrow.
-    fn fold_arrow(self: &Rc<Self>, path: &str, open: bool) -> gtk::Image {
-        let arrow = gtk::Image::builder()
-            .icon_name(if open {
-                "pan-down-symbolic"
-            } else {
-                "pan-end-symbolic"
-            })
-            .pixel_size(14)
-            .css_classes(["dim-label"])
-            .tooltip_text(if open {
-                format!("Fold the {path} tasks")
-            } else {
-                format!("Show the {path} tasks")
-            })
-            .build();
-        arrow.set_cursor_from_name(Some("pointer"));
+    /// Make `target` fold or open the heading at `path` on a click, which
+    /// goes no further — a heading that is a task is not opened by it.
+    fn make_fold_target(self: &Rc<Self>, target: &impl IsA<gtk::Widget>, path: &str, open: bool) {
+        target.set_tooltip_text(Some(&if open {
+            format!("Fold the {path} tasks")
+        } else {
+            format!("Show the {path} tasks")
+        }));
+        target.set_cursor_from_name(Some("pointer"));
         let click = gtk::GestureClick::new();
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
@@ -2876,8 +2906,7 @@ impl FileTree {
                 glib::idle_add_local_once(move || tree.render_tasks());
             });
         }
-        arrow.add_controller(click);
-        arrow
+        target.add_controller(click);
     }
 
     /// The query's hits inside each task's output, by name: badges, and

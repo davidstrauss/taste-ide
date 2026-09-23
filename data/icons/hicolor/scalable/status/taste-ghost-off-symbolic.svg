@@ -2,9 +2,8 @@
 <!-- The ghost struck through: the search's "hide non-matching items"
      toggle, which is pressed by default (David, 2026-09-08: "have the icon
      be a strike over ghosts and 'on' mean 'hide non-matching items'"). The
-     slash cuts a halo through the ghost — the same mask
-     taste-port-off-symbolic uses — so the two shapes stay separate in one
-     colour. -->
+     slash cuts a halo through the ghost (a mask) so the two shapes stay
+     separate in one colour. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
   <defs>
     <mask id="halo">
