@@ -692,7 +692,16 @@ between two repos only the IDE can see as a pair:
 - **Publish** (agent → user): the agent commits in its clone, then calls
   the `publish` MCP tool. The IDE fetches that branch from the env clone
   into the main checkout at the environment's **branch of record**.
-  Explicit handoff, no shared mounts, nothing polled.
+  Explicit handoff, no shared mounts, nothing polled. With Personal's
+  checkout in a VM (2026-09-23), that checkout is where the branch of
+  record LIVES, since the coordinator reviews and merges there: the
+  publish syncs Personal's branches home first, is measured and computed
+  on this host as before, and its result is written into Personal's
+  checkout before the tool answers; the sync then carries it to the
+  folder like any other of that checkout's branches (David: "Publishing
+  should go directly to the VM personal branch, not the local copy").
+  The environment's own branch is read from its checkout's HEAD, never
+  from the refs-only peer's, whose HEAD is parked on `taste-peer`.
 - **Refresh** (user → agent): an `update_from_main` tool (and fleet-view
   action) fetches the main checkout's branches into the env clone's
   remote-tracking refs; the agent rebases inside its own world.

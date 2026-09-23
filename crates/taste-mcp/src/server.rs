@@ -2415,6 +2415,9 @@ impl McpServer {
                     Some(branch) => Some(branch),
                     None => self.checkout_branch(env).await?,
                 };
+                // Measured against the branch of record as it stands in
+                // Personal's checkout, which is where it lives.
+                self.sync_personal().await?;
                 let ready = args["ready"].as_bool().unwrap_or(false);
                 let main = self.workspace.root().to_path_buf();
 
@@ -2480,6 +2483,7 @@ impl McpServer {
                     if attempt.outcome.updated() {
                         self.workspace.events.publish(Event::GitStatusChanged);
                     }
+                    self.share_published(env).await?;
                     let review = self.flag_for_review(env, ready).await?;
                     return Ok(publish_result(&attempt.outcome, env, review));
                 }
@@ -2524,6 +2528,7 @@ impl McpServer {
                     if moved.outcome.updated() {
                         self.workspace.events.publish(Event::GitStatusChanged);
                     }
+                    self.share_published(env).await?;
                     let review = self.flag_for_review(env, ready).await?;
                     let mut result = publish_result(&moved.outcome, env, review);
                     result["rebased_onto_target"] = json!(true);
@@ -2596,6 +2601,7 @@ impl McpServer {
                 if forced.outcome.updated() {
                     self.workspace.events.publish(Event::GitStatusChanged);
                 }
+                self.share_published(env).await?;
                 let review = self.flag_for_review(env, ready).await?;
                 Ok(publish_result(&forced.outcome, env, review))
             }
@@ -4074,6 +4080,31 @@ impl McpServer {
     /// The primary environment IS the hub: publishing to itself would mean
     /// nothing, and updating from itself even less. Saying so beats a tool
     /// that quietly no-ops.
+    /// The published branch, into Personal's checkout in the VM — where
+    /// it lives, and where the coordinator reviews and merges it (David,
+    /// 2026-09-23: "Publishing should go directly to the VM personal
+    /// branch, not the local copy. Sync should handle carrying it local in
+    /// time"). The publish is computed here, against the folder's copy of
+    /// that checkout's branches (synced first, `sync_personal`), and its
+    /// result written over there before the tool answers.
+    async fn share_published(&self, env: &EnvironmentId) -> Result<()> {
+        let primary = self.supervisor(&EnvironmentId::primary())?;
+        let refname = taste_git::env_branch_ref(env.as_str());
+        tokio::task::spawn_blocking(move || primary.push_refs_to_checkout_blocking(&[refname]))
+            .await?
+            .context("writing the published branch into Personal's checkout")
+    }
+
+    /// Personal's checkout's branches brought to the folder, so a publish
+    /// is measured against the branch as it stands over there — where the
+    /// coordinator may have moved it — and not a stale copy here.
+    async fn sync_personal(&self) -> Result<()> {
+        let primary = self.supervisor(&EnvironmentId::primary())?;
+        tokio::task::spawn_blocking(move || primary.sync_peer_blocking())
+            .await?
+            .context("bringing Personal's branches home before publishing")
+    }
+
     /// The branch `env`'s checkout has checked out, with its peer synced
     /// to it first — for a checkout in a VM, whose peer here holds refs and
     /// no HEAD of its own. `None` for a checkout on this host, whose clone

@@ -1520,6 +1520,27 @@ impl Supervisor {
         }
     }
 
+    /// Write the peer's `refnames` into the checkout in the VM, forced: a
+    /// branch the IDE settled on this host that the checkout is the
+    /// authority for from now on — a published environment branch, which
+    /// the coordinator reviews and merges over there, and which the sync
+    /// then carries home like any other of the checkout's branches.
+    /// Nothing for a local checkout, which is the peer. Blocking.
+    pub fn push_refs_to_checkout_blocking(&self, refnames: &[String]) -> Result<()> {
+        let Checkout::Remote { vm, path } = self.checkout() else {
+            return Ok(());
+        };
+        let vm_info = self
+            .substrate()
+            .vm_details()
+            .cloned()
+            .with_context(|| format!("{}'s substrate is not its VM {vm}", self.env.id))?;
+        let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+        let specs: Vec<String> = refnames.iter().map(|r| format!("+{r}:{r}")).collect();
+        let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        crate::peer::push_to_guest(&self.env.peer, &vm_info, &keys, &path, &refs)
+    }
+
     /// Give the checkout in the VM the peer's remote-tracking refs, so a
     /// rebase over there has the tip the user just fetched here — with
     /// the user's keys, which never enter the VM. Nothing for a local
