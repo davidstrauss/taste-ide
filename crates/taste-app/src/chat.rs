@@ -536,7 +536,7 @@ impl ToolCard {
     }
 
     fn paint_dot(&self) {
-        for class in ["ok", "fail", "live", "wait"] {
+        for class in ["ok", "fail", "live", "wait", "cut"] {
             self.dot.remove_css_class(class);
         }
         self.dot.add_css_class(if self.waiting.get() {
@@ -5962,6 +5962,9 @@ impl ChatPane {
         self.set_busy(false);
         self.current_agent.borrow_mut().take();
         self.current_thought.borrow_mut().take();
+        // The rows stay on screen after the map forgets them, so they are
+        // settled first.
+        self.settle_running_steps();
         self.tool_cards.borrow_mut().clear();
         self.doc_rows.borrow_mut().clear();
         self.lit_doc_row.borrow_mut().take();
@@ -7047,6 +7050,29 @@ impl ChatPane {
     /// Only on an Execute step: a read or an edit is the IDE's own work and
     /// finishes in milliseconds, so a stop button on one would be a control
     /// for a state nobody can catch.
+    /// Settle every step still marked running: nothing can be running
+    /// once its turn has ended, its session has, or a replayed history has
+    /// finished arriving — the agent only never said how the call ended. A
+    /// step left spinning under "stopped" or "new session" claimed work in
+    /// progress that nothing was doing (David, 2026-09-23: "This shouldn't
+    /// still be spinning"). Its dot says what is known and no more:
+    /// neither green nor red, with the reason on hover.
+    fn settle_running_steps(&self) {
+        for card in self.tool_cards.borrow().values() {
+            if !card.running.replace(false) {
+                continue;
+            }
+            card.tone.set("cut");
+            card.paint_dot();
+            card.status_spinner.stop();
+            card.status_spinner.set_visible(false);
+            card.dot.set_visible(true);
+            card.dot
+                .set_tooltip_text(Some("Never reported finishing: its turn ended first"));
+            self.refresh_kill(card);
+        }
+    }
+
     fn refresh_kill(&self, card: &ToolCard) {
         let running = card.running.get() && card.kind.get() == ToolKind::Execute;
         // Only when there is something to stop. What the pinned Claude Code
@@ -7350,6 +7376,9 @@ impl ChatPane {
                 _ => "live",
             });
             card.paint_dot();
+            // A status after all: the "never reported" hover is no longer
+            // true.
+            card.dot.set_tooltip_text(None);
             card.status_spinner.set_visible(running);
             card.dot.set_visible(!running);
             if running {
@@ -7919,8 +7948,10 @@ impl ChatPane {
                 // restored conversation sat there as raw markdown.
                 self.finalize_stream();
                 // The replay, if there was one, ends here — so updates from
-                // now on are new and belong in the stash.
+                // now on are new and belong in the stash. And a call it left
+                // open is history: the process that was running it is gone.
                 self.replaying.set(false);
+                self.settle_running_steps();
                 // A silent blank where a conversation was expected reads
                 // as data loss; the placeholder alert says why it's fresh.
                 self.restore_notice.set_visible(restore_failed);
@@ -8250,6 +8281,7 @@ impl ChatPane {
                 self.turns.set(self.turns.get() + 1);
                 self.touch();
                 self.finalize_stream();
+                self.settle_running_steps();
                 // The turn is the commit boundary for both durable
                 // things this chat produces: its transcript, and the work
                 // the agent just did to the checkout.
@@ -8410,6 +8442,7 @@ impl ChatPane {
                 );
                 self.status_spinner.stop();
                 self.finalize_stream();
+                self.settle_running_steps();
                 self.stop_button.set_visible(false);
                 self.set_busy(false);
                 if let Some((_, on_done)) = self.capture.borrow_mut().take() {
@@ -9558,6 +9591,8 @@ impl ChatPane {
             // The last streamed block's markdown pass, for the reason the
             // `Ready` arm does the same: nothing follows it to trigger one.
             pane.finalize_stream();
+            // A stashed call left open is history too.
+            pane.settle_running_steps();
             // Said only over a conversation there is to see. A stash can
             // hold nothing but updates that draw no row — the command
             // list, the session's options — and a banner about restored
@@ -10377,6 +10412,14 @@ impl ChatPane {
                     std::time::Instant::now() - std::time::Duration::from_secs(75),
                 ));
                 self.draw_activity_line();
+            }
+            // `stopped`: the same turn, stopped by the user — the steps it
+            // left running settled, as the end of a turn settles them.
+            Ok("stopped") => {
+                self.settle_running_steps();
+                self.meta_row("stopped");
+                self.stop_button.set_visible(false);
+                self.set_busy(false);
             }
             Ok("standing") => self.seed_standing_for_probe(),
             Ok("controls") => self.seed_controls_for_probe(),

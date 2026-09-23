@@ -479,6 +479,12 @@ fn main() -> glib::ExitCode {
                  .rail-dot.fail { background-color: @error_color; }\n\
                  .rail-dot.wait { background-color: @warning_color; }\n\
                  .rail-dot.live { background-color: @accent_color; }\n\
+                 /* A call whose turn ended before it said how it went: \
+                    known only to have stopped, so neither green nor red, \
+                    and hollow like an aside. */\n\
+                 .rail-dot.cut { background-color: transparent; \
+                   border: 2px solid alpha(currentColor, 0.45); \
+                   min-width: 3px; min-height: 3px; }\n\
                  /* An aside — a note, a thought, the plan — is a hollow \
                     dot. */\n\
                  .rail-dot.note { background-color: transparent; \
