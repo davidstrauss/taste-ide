@@ -2314,6 +2314,25 @@ impl EnvironmentRegistry {
     /// untrusted repository must not execute any of its code. The container
     /// is *not* built here: environments are lazy by policy (clone on
     /// create, build on first need, agent on first prompt).
+    /// The branch Personal's checkout is on, and its tip as the folder
+    /// last fetched it (`refs/taste/vm/<branch>`): where a new environment
+    /// starts. `None` for a checkout on this host, which is the folder.
+    fn personal_branch_tip(&self) -> Option<(String, taste_git::Oid)> {
+        let primary = self.get(&EnvironmentId::primary())?;
+        let Checkout::Remote { path, .. } = primary.checkout() else {
+            return None;
+        };
+        let head = primary
+            .files()
+            .read_to_string(&path.join(".git/HEAD"))
+            .ok()?;
+        let branch = head.trim().strip_prefix("ref: refs/heads/")?.to_string();
+        let tip = taste_git::GitWorkspace::discover(&self.workspace_root)?
+            .read_ref(&format!("refs/taste/vm/{branch}"))
+            .ok()??;
+        Some((branch, tip))
+    }
+
     pub fn create(&self, id: EnvironmentId) -> Result<Arc<Supervisor>> {
         if id.is_primary() {
             bail!("the primary environment is the main checkout; it is never created");
@@ -2327,6 +2346,19 @@ impl EnvironmentRegistry {
         }
         taste_git::clone_local(&self.workspace_root, &repo)
             .with_context(|| format!("creating environment {id}"))?;
+        // Branched from Personal's branch, not the folder's HEAD: the
+        // folder mirrors Personal, but not while a conflict has the mirror
+        // paused, and "whatever branch I'm using for personal" is the
+        // base asked for (David, 2026-09-23).
+        if let Some((branch, tip)) = self.personal_branch_tip() {
+            let started = taste_git::GitWorkspace::discover(&repo)
+                .context("the new environment's clone is not a repository")
+                .and_then(|git| git.start_on(&branch, tip));
+            if let Err(e) = started {
+                let _ = std::fs::remove_dir_all(self.env_dir(&id));
+                return Err(e).with_context(|| format!("starting {id} on Personal's {branch}"));
+            }
+        }
         // Where the checkout lives: in a VM of the workspace's pool, chosen
         // by capacity, and this clone becomes the peer that holds the
         // refs. On this host only for the test suites' host substrate,

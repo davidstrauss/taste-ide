@@ -14,6 +14,8 @@ pub mod clone;
 pub mod issues;
 pub mod mediate;
 pub mod merge;
+/// Object ids, for callers that name commits without depending on git2.
+pub use git2::Oid;
 pub mod mirror;
 pub mod presence;
 pub mod refs;
@@ -648,6 +650,28 @@ impl GitWorkspace {
         self.switch_branch(name)
     }
 
+    /// Put this repository — a fresh clone about to become an
+    /// environment — on `branch` at `tip`, checked out. When the clone
+    /// does not have `tip` (its source's copy of the branch lagged the
+    /// commit it names), its own copy of `branch` is used; without either,
+    /// it is left where the clone put it.
+    pub fn start_on(&self, branch: &str, tip: git2::Oid) -> Result<()> {
+        let local = format!("refs/heads/{branch}");
+        let target = if self.repo.find_commit(tip).is_ok() {
+            tip
+        } else if let Some(own) = self.read_ref(&local)? {
+            own
+        } else {
+            return Ok(());
+        };
+        self.set_ref(&local, target)?;
+        self.repo.set_head(&local)?;
+        self.repo
+            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .with_context(|| format!("checking out {branch}"))?;
+        Ok(())
+    }
+
     pub fn branch_name(&self) -> Option<String> {
         let head = self.repo.head().ok()?;
         head.shorthand().map(str::to_owned)
@@ -1137,6 +1161,42 @@ mod tests {
     /// A branch made off main that the remote does not have: its status is
     /// against `<remote>/<branch>`, counted as new there, whatever HEAD is,
     /// and its push names it and sets the upstream.
+    #[test]
+    fn a_clone_starts_on_the_branch_it_is_given() {
+        let (dir, ws) = temp_repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        ws.create_branch("devcontainer").unwrap();
+        fs::write(dir.path().join("b.txt"), "two\n").unwrap();
+        ws.stage(Path::new("b.txt")).unwrap();
+        ws.commit("second").unwrap();
+        let tip = Repository::open(dir.path())
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap();
+        ws.switch_branch(&main).unwrap();
+
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = clone_dir.path().join("env");
+        crate::clone_local(dir.path(), &clone).unwrap();
+        let env = GitWorkspace::discover(&clone).unwrap();
+        assert_eq!(
+            env.branch_name().as_deref(),
+            Some(main.as_str()),
+            "the clone's own start"
+        );
+        env.start_on("devcontainer", tip).unwrap();
+        assert_eq!(env.branch_name().as_deref(), Some("devcontainer"));
+        assert!(
+            clone.join("b.txt").exists(),
+            "checked out, not only pointed at"
+        );
+    }
+
     #[test]
     fn a_branch_without_an_upstream_pushes_to_its_own_name() {
         let (dir, ws) = temp_repo();
