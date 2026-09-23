@@ -2848,6 +2848,31 @@ impl FileTree {
             Some(trailing.upcast_ref()),
         );
         item.set_tooltip_text(Some(&row.info.name));
+        // A run under way spins where its light will be: amber is this
+        // window's word for a warning, and a task that is running is not
+        // one (David, 2026-09-23: "Show a spinner when it's running, not
+        // yellow status").
+        if running && fold.is_none() {
+            if let Some(slot) = item
+                .child()
+                .and_then(|line| line.first_child())
+                .and_downcast::<gtk::Box>()
+            {
+                while let Some(child) = slot.first_child() {
+                    slot.remove(&child);
+                }
+                let spinner = gtk::Spinner::builder()
+                    .spinning(true)
+                    .width_request(12)
+                    .height_request(12)
+                    .valign(gtk::Align::Center)
+                    .tooltip_text("Running")
+                    .build();
+                spinner.set_hexpand(true);
+                spinner.set_halign(gtk::Align::Center);
+                slot.append(&spinner);
+            }
+        }
         // A heading that is a task: its arrow folds what is under it, in
         // the slot a leaf's light takes — its state is in its subtitle —
         // and the rest of the row opens it as any task's does.

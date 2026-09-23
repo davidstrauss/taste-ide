@@ -7,10 +7,11 @@ pub use taste_core::tasks::{list, outline, Listing, OutlineEntry, RunState, Task
 pub const TASK_ICON: &str = "system-run-symbolic";
 
 /// A run's light on its row (`env-dot` classes, the fleet's own colours).
+/// A running task's row spins instead (`FileTree::task_row`): amber means
+/// a warning here, and a run under way is not one, so it has no light.
 pub fn dot(state: RunState) -> &'static str {
     match state {
-        RunState::Idle => "unknown",
-        RunState::Running => "amber",
+        RunState::Idle | RunState::Running => "unknown",
         RunState::Succeeded => "green",
         RunState::Failed => "red",
     }
