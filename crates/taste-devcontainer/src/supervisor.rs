@@ -557,8 +557,13 @@ pub struct Supervisor {
     folder_conflicts: Mutex<Vec<std::path::PathBuf>>,
     /// The watch on the user's folder (`watch_folder`), held for its life.
     folder_watch: Mutex<Option<notify::RecommendedWatcher>>,
-    /// Until when the folder watch ignores changes: the mirror's own.
-    folder_quiet_until: Arc<Mutex<std::time::Instant>>,
+    /// Held for the whole of a primary sync, fetch to resnapshot: one at a
+    /// time. A sync starts from half a dozen places (the folder watch, the
+    /// keeper watch, the chat cadence, the file tree, a publish, a close),
+    /// and two at once raced on the folder's ref locks and index, and could
+    /// send an older version of a file after a newer one (review,
+    /// 2026-09-23).
+    folder_sync: Mutex<()>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     /// What the container itself wrote (`podman logs`), ring-buffered like
@@ -862,7 +867,7 @@ impl Supervisor {
             capability_gaps: Mutex::new(Vec::new()),
             folder_conflicts: Mutex::new(Vec::new()),
             folder_watch: Mutex::new(None),
-            folder_quiet_until: Arc::new(Mutex::new(std::time::Instant::now())),
+            folder_sync: Mutex::new(()),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
@@ -1329,6 +1334,7 @@ impl Supervisor {
         // its own; an agent environment's is refs only, and takes the
         // checkout's word whole.
         if self.env.id.is_primary() {
+            let _one = self.folder_sync.lock().unwrap_or_else(|e| e.into_inner());
             self.sync_primary_blocking(&vm_info, &keys, &path, false, 0)?;
         } else {
             crate::peer::fetch_from_guest(
@@ -1385,10 +1391,6 @@ impl Supervisor {
                 reason: format!("{e:#}"),
             }));
         }
-        // The mirror's own writes into the folder are not the user's: the
-        // folder watch ignores them for a moment.
-        *self.folder_quiet_until.lock().unwrap() =
-            std::time::Instant::now() + std::time::Duration::from_millis(1500);
         let sync = sync?;
         let had_conflict = !self.folder_conflicts.lock().unwrap().is_empty();
         if sync.conflicts.is_empty() == had_conflict {
@@ -1424,14 +1426,20 @@ impl Supervisor {
     /// sync two seconds after the last change of a burst. Reads are not
     /// changes, and the mirror reads every file it compares, so an access
     /// event would be the sync triggering itself (`configwatch` learnt the
-    /// same thing at 96,000 events a second); the sync's own writes are
-    /// quieted for a moment after it.
+    /// same thing at 96,000 events a second). The mirror's own writes do
+    /// start one more sync, which finds the two sides agreeing and does
+    /// nothing: quieting the watch for a moment after each sync, as it once
+    /// did, also dropped a save the user made in that moment, which then
+    /// waited for the next change anywhere (review, 2026-09-23). The quiet
+    /// that remains is the burst's: the sync runs two seconds after its
+    /// LAST event, so a checkout or a build writing for longer is not sent
+    /// half-written.
     fn watch_folder(self: &Arc<Self>) {
         use notify::Watcher;
         let folder = self.env.peer.clone();
         let weak = Arc::downgrade(self);
         let pending = Arc::new(AtomicBool::new(false));
-        let quiet = self.folder_quiet_until.clone();
+        let last = Arc::new(Mutex::new(std::time::Instant::now()));
         let root = folder.clone();
         let events = self.events.clone();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -1448,17 +1456,26 @@ impl Supervisor {
                         && !churn_path(&rel)
                 })
             });
-            if !relevant || std::time::Instant::now() < *quiet.lock().unwrap() {
+            if !relevant {
                 return;
             }
+            *last.lock().unwrap() = std::time::Instant::now();
             if pending.swap(true, Ordering::SeqCst) {
                 return;
             }
             events.publish(Event::FolderSync(taste_core::FolderSync::Pending));
             let weak = weak.clone();
             let pending = pending.clone();
+            let last = last.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                let settle = std::time::Duration::from_secs(2);
+                loop {
+                    let since = last.lock().unwrap().elapsed();
+                    if since >= settle {
+                        break;
+                    }
+                    std::thread::sleep(settle - since);
+                }
                 pending.store(false, Ordering::SeqCst);
                 if let Some(supervisor) = weak.upgrade() {
                     if let Err(e) = supervisor.sync_peer_blocking() {
@@ -1501,13 +1518,16 @@ impl Supervisor {
             .cloned()
             .with_context(|| format!("{}'s substrate is not its VM {vm}", self.env.id))?;
         let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+        let _one = self.folder_sync.lock().unwrap_or_else(|e| e.into_inner());
         if keep_folder {
             let git = taste_git::GitWorkspace::discover(&self.env.peer)
                 .context("the folder is not a git working tree")?;
             let files = self.files();
-            for change in git.folder_changes()? {
-                crate::peer::send_change(&files, &path, &change)?;
+            let changes = git.folder_changes()?;
+            for change in &changes {
+                crate::peer::send_change(&files, &path, change)?;
             }
+            git.record_sent(&changes)?;
             let name = taste_git::snapshot_ref(self.env.id.as_str());
             let script = taste_git::snapshot::script(&name)?;
             let out = files.exec(&path, &["sh".into(), "-c".into(), script])?;
@@ -4449,6 +4469,15 @@ fn folder_sync_summary(sync: &crate::peer::PeerSync) -> Option<String> {
             "{} changed on both sides",
             plural(sync.conflicts.len(), "file", "files")
         ));
+    }
+    // Why the folder was left as it is — a branch ahead, a merge under
+    // way, a switch of the user's — is the one thing the title bar must
+    // not keep to itself, or the sync just looks stuck.
+    if let Some(note) = &sync.note {
+        let mut chars = note.chars();
+        if let Some(first) = chars.next() {
+            parts.push(first.to_uppercase().chain(chars).collect());
+        }
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
 }

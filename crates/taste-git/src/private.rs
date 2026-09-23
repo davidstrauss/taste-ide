@@ -168,8 +168,9 @@ pub fn ensure_repository(folder: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Remove the private repositories nothing needs: their folder is gone, or
-/// has a `.git` of its own now. What was removed, for the log.
+/// Remove the private repositories nothing needs: their folder is gone
+/// from a parent that is still there, or has a `.git` of its own now. What
+/// was removed, for the log.
 pub fn sweep() -> Vec<PathBuf> {
     let Some(root) = root() else {
         return Vec::new();
@@ -183,13 +184,23 @@ pub fn sweep() -> Vec<PathBuf> {
         if dir.extension().is_none_or(|e| e != "git") {
             continue;
         }
-        let folder = git2::Repository::open(&dir)
+        // Read from its config rather than by opening it: libgit2 will not
+        // open a repository whose working tree is gone, which is the very
+        // case being looked for.
+        let folder = git2::Config::open(&dir.join("config"))
             .ok()
-            .and_then(|repo| repo.workdir().map(Path::to_path_buf));
+            .and_then(|config| config.get_path("core.worktree").ok());
+        // Only a verdict the disk can give for certain removes a history:
+        // a folder on a drive that is not mounted right now has lost its
+        // parent too, and a repository whose config will not read this
+        // moment (a lock, a partly written file) is not thereby nobody's.
+        // Both are left for a sweep that can tell.
         let junk = match &folder {
-            // Unreadable, or with no working tree: nothing points at it.
-            None => true,
-            Some(folder) => !folder.exists() || folder.join(".git").exists(),
+            None => false,
+            Some(folder) => {
+                folder.join(".git").exists()
+                    || (!folder.exists() && folder.parent().is_some_and(Path::exists))
+            }
         };
         if junk && std::fs::remove_dir_all(&dir).is_ok() {
             removed.push(dir);

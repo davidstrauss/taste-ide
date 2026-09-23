@@ -46,6 +46,19 @@ use crate::GitWorkspace;
 /// folder's working copy as the mirror left it.
 pub const MIRROR_REF: &str = "refs/taste/mirror/primary";
 
+/// What the folder has sent the checkout since the mirror last agreed with
+/// it: [`MIRROR_REF`]'s tree with each sent path at the entry it was sent
+/// as ([`GitWorkspace::record_sent`]). The checkout holding one of these is
+/// holding the folder's own earlier version, so a later save of the same
+/// file here is the folder's to send, not a conflict with itself (review,
+/// 2026-09-23: two quick saves raised "your folder and Personal disagree"
+/// over the user's own file).
+pub const SENT_REF: &str = "refs/taste/mirror/sent";
+
+/// How the mirror's baseline commit names the branch the folder was on
+/// when it was recorded.
+const RECORDED_ON: &str = "taste mirror on ";
+
 /// What mirroring did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mirror {
@@ -65,6 +78,11 @@ pub enum Mirror {
     /// Paths changed on both sides, to different content, since the last
     /// mirror: relative to the folder. Nothing was written.
     Drift { paths: Vec<PathBuf> },
+    /// The folder is in the middle of something of git's or the user's own
+    /// — a merge, a rebase, a detached HEAD, a branch the user switched to
+    /// here — and a diff across it would read git's work as the user's
+    /// edits. Nothing was written or sent; `reason` says what to do.
+    Paused { reason: String },
 }
 
 /// One path's new state in the folder, for the checkout to take.
@@ -122,6 +140,9 @@ impl GitWorkspace {
             .repo
             .find_commit(snapshot)
             .with_context(|| format!("finding the snapshot {snapshot}"))?;
+        if let Some(reason) = self.mirror_paused(&local)? {
+            return Ok(Mirror::Paused { reason });
+        }
         let target = snap.tree()?;
         let based_on_tip = snapshot_base(snap.message().unwrap_or("")) == Some(tip);
         if !based_on_tip && target.id() != tip_commit.tree_id() {
@@ -138,8 +159,8 @@ impl GitWorkspace {
                 None => self.repo.treebuilder(None)?.write()?,
             },
         };
-        let current = self.worktree_tree()?;
-        if !force && current != baseline {
+        let mut current = self.worktree_tree()?;
+        if current != baseline {
             // Each side's changes since the base, path by path, as the
             // entry each now has (`None`: deleted).
             let held = self.held_paths();
@@ -149,19 +170,50 @@ impl GitWorkspace {
             // change surfaced is not the user's edit to send.
             here.retain(|path, _| !under_any(path, &held));
             let there = self.entries_between(baseline, target.id())?;
+            // What the checkout holds because the folder sent it is the
+            // folder's own, not a change of the checkout's.
+            let sent = match self.read_ref(SENT_REF)? {
+                Some(oid) => {
+                    self.entries_between(baseline, self.repo.find_commit(oid)?.tree_id())?
+                }
+                None => Default::default(),
+            };
+            let theirs = |path: &PathBuf| {
+                there
+                    .get(path)
+                    .filter(|entry| sent.get(path) != Some(*entry))
+            };
             let conflicts: Vec<PathBuf> = here
                 .iter()
-                .filter(|(path, entry)| there.get(*path).is_some_and(|theirs| theirs != *entry))
+                .filter(|(path, entry)| theirs(path).is_some_and(|t| t != *entry))
                 .map(|(path, _)| path.clone())
                 .collect();
             if !conflicts.is_empty() {
-                return Ok(Mirror::Drift { paths: conflicts });
+                if !force {
+                    return Ok(Mirror::Drift { paths: conflicts });
+                }
+                // "Keep Personal's" is about the paths it was asked about:
+                // those take the checkout's side here, and every other
+                // change of the folder's still goes out below (review,
+                // 2026-09-23: forcing the whole tree dropped new files
+                // nobody had been asked about).
+                let forced: std::collections::BTreeMap<_, _> = conflicts
+                    .iter()
+                    .map(|path| (path.clone(), there.get(path).cloned().flatten()))
+                    .collect();
+                let resolved = self.tree_with(current, &forced)?;
+                self.write_tree_over(current, resolved)?;
+                current = resolved;
+                for path in &conflicts {
+                    here.remove(path);
+                }
             }
             // The folder's own changes the checkout does not yet have go
             // there first; the ones it already has are agreement.
             let outgoing: Vec<&PathBuf> = here
-                .keys()
-                .filter(|path| !there.contains_key(*path))
+                .iter()
+                .filter(|(path, entry)| there.get(*path) != Some(*entry))
+                .map(|(path, _)| path)
                 .collect();
             if !outgoing.is_empty() {
                 let current_tree = self.repo.find_tree(current)?;
@@ -176,7 +228,7 @@ impl GitWorkspace {
         let on_branch = self.head_ref_name().as_deref() == Some(local.as_str());
         let at_tip = self.repo.head().ok().and_then(|h| h.target()) == Some(tip);
         if current == target.id() && on_branch && at_tip {
-            self.record_mirror(target.id())?;
+            self.record_mirror(target.id(), &local)?;
             return Ok(Mirror::Unchanged);
         }
 
@@ -194,11 +246,141 @@ impl GitWorkspace {
         let mut index = self.repo.index()?;
         index.read_tree(&tip_commit.tree()?)?;
         index.write()?;
-        self.record_mirror(target.id())?;
+        self.record_mirror(target.id(), &local)?;
         Ok(Mirror::Applied {
             changed,
             switched: !on_branch,
         })
+    }
+
+    /// Why the mirror should leave the folder alone this pass, if it
+    /// should: git is partway through something here, or the user switched
+    /// the folder to a branch of its own. `local` is the branch the
+    /// checkout is on, which the folder switching to is agreement.
+    fn mirror_paused(&self, local: &str) -> Result<Option<String>> {
+        if self.repo.path().join("index.lock").exists() {
+            return Ok(Some("git is working in this folder".into()));
+        }
+        let what = match self.repo.state() {
+            git2::RepositoryState::Clean => None,
+            git2::RepositoryState::Merge => Some("a merge"),
+            git2::RepositoryState::Revert | git2::RepositoryState::RevertSequence => {
+                Some("a revert")
+            }
+            git2::RepositoryState::CherryPick | git2::RepositoryState::CherryPickSequence => {
+                Some("a cherry-pick")
+            }
+            git2::RepositoryState::Bisect => Some("a bisect"),
+            _ => Some("a rebase"),
+        };
+        if let Some(what) = what {
+            return Ok(Some(format!(
+                "{what} is in progress in this folder; the folder follows Personal again once \
+                 it is finished or aborted"
+            )));
+        }
+        let Some(head) = self.head_ref_name() else {
+            return Ok(Some(
+                "this folder's HEAD is detached; switch it back to a branch and it follows \
+                 Personal again"
+                    .into(),
+            ));
+        };
+        let recorded = self
+            .read_ref(MIRROR_REF)?
+            .and_then(|oid| self.repo.find_commit(oid).ok())
+            .and_then(|c| {
+                let message = c.message()?.to_string();
+                Some(
+                    message
+                        .strip_prefix(RECORDED_ON)?
+                        .lines()
+                        .next()?
+                        .to_string(),
+                )
+            });
+        if let Some(recorded) = recorded {
+            if head != recorded && head != local {
+                let short = |r: &str| r.trim_start_matches("refs/heads/").to_string();
+                return Ok(Some(format!(
+                    "this folder was switched to {} while Personal is on {}; switch either to \
+                     the other's branch and the folder follows Personal again",
+                    short(&head),
+                    short(local)
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Note that `changes` were written into the checkout: until the mirror
+    /// next agrees with it, the checkout holding one of them is holding
+    /// the folder's own version ([`SENT_REF`]).
+    pub fn record_sent(&self, changes: &[Change]) -> Result<()> {
+        let base = match self.read_ref(SENT_REF)?.or(self.read_ref(MIRROR_REF)?) {
+            Some(oid) => self.repo.find_commit(oid)?.tree_id(),
+            None => match self.repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
+                Some(tree) => tree.id(),
+                None => self.repo.treebuilder(None)?.write()?,
+            },
+        };
+        let mut entries = std::collections::BTreeMap::new();
+        for change in changes {
+            let entry = match &change.content {
+                None => None,
+                Some(bytes) => {
+                    let mode = if change.link {
+                        git2::FileMode::Link
+                    } else if change.executable {
+                        git2::FileMode::BlobExecutable
+                    } else {
+                        git2::FileMode::Blob
+                    };
+                    Some((self.repo.blob(bytes)?, i32::from(mode)))
+                }
+            };
+            entries.insert(change.path.clone(), entry);
+        }
+        let tree = self.repo.find_tree(self.tree_with(base, &entries)?)?;
+        let signature = git2::Signature::now("taste-ide", "taste-ide@localhost")?;
+        let commit = self.repo.commit(
+            None,
+            &signature,
+            &signature,
+            "taste mirror: what the folder has sent since they last agreed",
+            &tree,
+            &[],
+        )?;
+        self.set_ref(SENT_REF, commit)
+    }
+
+    /// `base` with each of `entries` put in place (`None`: removed).
+    fn tree_with(
+        &self,
+        base: Oid,
+        entries: &std::collections::BTreeMap<PathBuf, Option<(Oid, i32)>>,
+    ) -> Result<Oid> {
+        let base = self.repo.find_tree(base)?;
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        for (path, entry) in entries {
+            match entry {
+                Some((oid, mode)) => {
+                    let mode = match *mode {
+                        m if m == i32::from(git2::FileMode::BlobExecutable) => {
+                            git2::FileMode::BlobExecutable
+                        }
+                        m if m == i32::from(git2::FileMode::Link) => git2::FileMode::Link,
+                        m if m == i32::from(git2::FileMode::Commit) => git2::FileMode::Commit,
+                        _ => git2::FileMode::Blob,
+                    };
+                    update.upsert(path, *oid, mode);
+                }
+                None => {
+                    update.remove(path);
+                }
+            }
+        }
+        Ok(update.create_updated(&self.repo, &base)?)
     }
 
     /// Every path the folder changed since the last mirror, as the
@@ -324,22 +506,28 @@ impl GitWorkspace {
         Ok(())
     }
 
-    fn record_mirror(&self, tree: Oid) -> Result<()> {
+    /// Record `tree` as the folder the mirror and the checkout agree on,
+    /// with the branch the folder is on (`local`), which is how a switch
+    /// the user makes here is told from one the checkout made
+    /// ([`Self::mirror_paused`]). What was sent before is agreement now.
+    fn record_mirror(&self, tree: Oid, local: &str) -> Result<()> {
+        if self.read_ref(SENT_REF)?.is_some() {
+            if let Ok(mut sent) = self.repo.find_reference(SENT_REF) {
+                sent.delete()?;
+            }
+        }
+        let message = format!("{RECORDED_ON}{local}\n\nThe folder as the IDE last wrote it.");
         if let Some(oid) = self.read_ref(MIRROR_REF)? {
-            if self.repo.find_commit(oid)?.tree_id() == tree {
+            let last = self.repo.find_commit(oid)?;
+            if last.tree_id() == tree && last.message() == Some(message.as_str()) {
                 return Ok(());
             }
         }
         let tree = self.repo.find_tree(tree)?;
         let signature = git2::Signature::now("taste-ide", "taste-ide@localhost")?;
-        let commit = self.repo.commit(
-            None,
-            &signature,
-            &signature,
-            "taste mirror: the folder as the IDE last wrote it",
-            &tree,
-            &[],
-        )?;
+        let commit = self
+            .repo
+            .commit(None, &signature, &signature, &message, &tree, &[])?;
         self.set_ref(MIRROR_REF, commit)
     }
 
@@ -675,12 +863,81 @@ mod tests {
             mine[0].content.as_deref(),
             Some(&b"edited in the folder\n"[..])
         );
-        // Forced: the checkout's wins.
-        ws.mirror_from(&main, tip2, snap2, true).unwrap();
+        // Forced: the checkout's wins for the path asked about, and a file
+        // nobody was asked about still goes out rather than being deleted.
+        fs::write(dir.path().join("new.txt"), "unasked\n").unwrap();
+        match ws.mirror_from(&main, tip2, snap2, true).unwrap() {
+            Mirror::Outgoing { changes } => {
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].path, PathBuf::from("new.txt"));
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "edited in the vm\n"
         );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "unasked\n"
+        );
+    }
+
+    #[test]
+    fn a_second_save_after_a_send_is_the_folders_not_a_conflict() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+        let (tip2, snap2) = checkout_state(&ws, dir.path(), |_, _| {});
+        let Mirror::Outgoing { changes } = ws.mirror_from(&main, tip2, snap2, false).unwrap()
+        else {
+            panic!("v1 goes out");
+        };
+        ws.record_sent(&changes).unwrap();
+
+        // Saved again before the checkout's snapshot came back with v1.
+        fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+        let (tip3, snap3) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join("a.txt"), "v1\n").unwrap();
+        });
+        match ws.mirror_from(&main, tip3, snap3, false).unwrap() {
+            Mirror::Outgoing { changes } => {
+                assert_eq!(changes[0].content.as_deref(), Some(&b"v2\n"[..]));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_branch_the_user_switched_to_here_pauses_the_mirror() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+
+        let head = ws.repo.head().unwrap().peel_to_commit().unwrap();
+        ws.repo.branch("mine", &head, false).unwrap();
+        ws.repo.set_head("refs/heads/mine").unwrap();
+        fs::write(dir.path().join("a.txt"), "on my branch\n").unwrap();
+        let (tip2, snap2) = checkout_state(&ws, dir.path(), |_, _| {});
+        assert!(matches!(
+            ws.mirror_from(&main, tip2, snap2, false).unwrap(),
+            Mirror::Paused { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "on my branch\n"
+        );
+        assert_eq!(ws.head_ref_name().as_deref(), Some("refs/heads/mine"));
     }
 
     #[test]

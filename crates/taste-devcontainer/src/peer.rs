@@ -335,13 +335,25 @@ pub const VM_BRANCH_NAMESPACE: &str = "refs/taste/vm/";
 /// had already synced once carried `refs/taste/vm/*` of its own, and the
 /// fetch refused to put both a branch and that ref on one name
 /// (2026-09-21: "Cannot fetch both refs/heads/X and refs/taste/vm/X").
-pub const PRIMARY_SYNC_REFSPECS: [&str; 5] = [
+///
+/// Tags come home into a namespace of their own too, and only a tag the
+/// folder does not have is made from one (`adopt_tags`): forced into
+/// `refs/tags`, the checkout could replace a release tag of the user's.
+/// And the mirror's baseline is the folder's alone — fetched, the VM could
+/// choose what the mirror measures the user's edits against (review,
+/// 2026-09-23).
+pub const PRIMARY_SYNC_REFSPECS: [&str; 7] = [
     "+refs/heads/*:refs/taste/vm/*",
-    "+refs/tags/*:refs/tags/*",
+    "+refs/tags/*:refs/taste/vm-tags/*",
     "+refs/taste/*:refs/taste/*",
     "^refs/taste/vm/*",
+    "^refs/taste/vm-tags/*",
     "^refs/taste/peer/*",
+    "^refs/taste/mirror/*",
 ];
+
+/// Where the checkout's tags land in the folder before `adopt_tags`.
+const VM_TAG_NAMESPACE: &str = "refs/taste/vm-tags/";
 
 /// Where the folder's branch lands in the checkout while the checkout
 /// fast-forwards to it (`push_ahead_into_checkout`); deleted after.
@@ -351,11 +363,13 @@ const PEER_STAGING: &str = "refs/taste/peer";
 /// branches, tags, the IDE's refs (never the peer's own comparison
 /// namespace), and the remote-tracking refs the sync flow rebases onto
 /// over there.
-pub const PRIMARY_SEED_REFSPECS: [&str; 5] = [
+pub const PRIMARY_SEED_REFSPECS: [&str; 7] = [
     "+refs/heads/*:refs/heads/*",
     "+refs/tags/*:refs/tags/*",
     "+refs/taste/*:refs/taste/*",
     "^refs/taste/vm/*",
+    "^refs/taste/vm-tags/*",
+    "^refs/taste/mirror/*",
     "+refs/remotes/*:refs/remotes/*",
 ];
 
@@ -467,9 +481,28 @@ pub fn sync_primary_peer_with(
         let local = format!("refs/heads/{branch}");
         let mine = git.read_ref(&local)?;
         if Some(branch) != sync.branch.as_deref() {
-            // Not checked out here: the checkout's word is final.
-            if mine != Some(oid) {
-                git.set_ref(&local, oid)?;
+            // Not checked out here: the checkout moves it, but only
+            // FORWARD. Forced, as it was, the checkout could reset a branch
+            // of the user's holding commits it never had — unpushed work on
+            // main, gone to the reflog — and a later push from this folder
+            // would publish what the agent wrote under the user's keys
+            // (review, 2026-09-23). The environments' published branches
+            // are the IDE's own, rewritten on purpose by a forced publish,
+            // and keep following the checkout.
+            match mine {
+                None => git.set_ref(&local, oid)?,
+                Some(mine) if mine == oid => {}
+                Some(_) => {
+                    let (ahead, behind) = git.ahead_behind(&local, &name)?;
+                    if (ahead == 0 && behind > 0) || branch.starts_with("agents/") {
+                        git.set_ref(&local, oid)?;
+                    } else if ahead > 0 {
+                        sync.note = Some(format!(
+                            "this folder's {branch} has {ahead} commit(s) the checkout in the VM \
+                             does not; it was left as it is"
+                        ));
+                    }
+                }
             }
             continue;
         }
@@ -526,10 +559,36 @@ pub fn sync_primary_peer_with(
             }
         }
     }
+    adopt_tags(&git)?;
     if let (Some(branch), false) = (checkout_branch, commits_unsettled) {
-        mirror_into_folder(&git, &branch, files, path, force, on_send, &mut sync)?;
+        // The folder the user opened, and nothing wider: a folder inside
+        // another repository (a dotfiles repository in the home directory)
+        // discovers THAT one, and the mirror would write the checkout's
+        // tree over its whole working tree (review, 2026-09-23).
+        let same = git.workdir().canonicalize().ok() == peer.canonicalize().ok();
+        if !same {
+            sync.note = Some(format!(
+                "{} is inside the repository at {}; the folder is not mirrored",
+                peer.display(),
+                git.workdir().display()
+            ));
+        } else {
+            mirror_into_folder(&git, &branch, files, path, force, on_send, &mut sync)?;
+        }
     }
     Ok(sync)
+}
+
+/// The checkout's tags the folder does not have, made in the folder; one
+/// it has already is left as the folder has it, whatever the checkout says.
+fn adopt_tags(git: &taste_git::GitWorkspace) -> Result<()> {
+    for (name, oid) in git.refs_under(VM_TAG_NAMESPACE)? {
+        let tag = format!("refs/tags/{}", &name[VM_TAG_NAMESPACE.len()..]);
+        if git.read_ref(&tag)?.is_none() {
+            git.set_ref(&tag, oid)?;
+        }
+    }
+    Ok(())
 }
 
 /// The mirror step of [`sync_primary_peer_with`]: the folder onto the
@@ -545,9 +604,26 @@ fn mirror_into_folder(
     sync: &mut PeerSync,
 ) -> Result<()> {
     use taste_git::mirror::Mirror;
-    let Some(tip) = git.read_ref(&format!("{VM_BRANCH_NAMESPACE}{branch}"))? else {
+    let vm_ref = format!("{VM_BRANCH_NAMESPACE}{branch}");
+    let Some(tip) = git.read_ref(&vm_ref)? else {
         return Ok(());
     };
+    // The mirror moves the folder's copy of the branch to the checkout's
+    // tip; a copy holding commits the checkout lacks is not the mirror's to
+    // move, whichever branch the folder has checked out.
+    let local = format!("refs/heads/{branch}");
+    if let Some(mine) = git.read_ref(&local)? {
+        if mine != tip {
+            let (ahead, _) = git.ahead_behind(&local, &vm_ref)?;
+            if ahead > 0 {
+                sync.note = Some(format!(
+                    "this folder's {branch} has {ahead} commit(s) the checkout in the VM does \
+                     not; the folder follows again once they agree"
+                ));
+                return Ok(());
+            }
+        }
+    }
     let Some(snapshot) = git.read_ref(&taste_git::snapshot_ref("primary"))? else {
         return Ok(());
     };
@@ -564,12 +640,30 @@ fn mirror_into_folder(
         }
         Mirror::Unchanged => sync.mirrored = true,
         Mirror::Stale => {}
+        Mirror::Paused { reason } => sync.note = Some(reason),
         Mirror::Outgoing { changes } => {
+            let mut sent = Vec::new();
+            let mut failed = None;
             for (done, change) in changes.iter().enumerate() {
                 on_send(done, changes.len(), &change.path);
-                send_change(files, path, change).with_context(|| {
-                    format!("sending {} to the checkout", change.path.display())
-                })?;
+                match send_change(files, path, change) {
+                    Ok(()) => sent.push(change.clone()),
+                    Err(e) => {
+                        failed = Some(
+                            e.context(format!("sending {} to the checkout", change.path.display())),
+                        );
+                        break;
+                    }
+                }
+            }
+            // What did go is recorded as sent even when a later path
+            // failed, so the next pass does not mistake it for the
+            // checkout's own change.
+            if !sent.is_empty() {
+                git.record_sent(&sent)?;
+            }
+            if let Some(e) = failed {
+                return Err(e);
             }
             sync.sent = changes.len();
         }
@@ -603,6 +697,7 @@ pub fn send_change(files: &Files, path: &Path, change: &taste_git::mirror::Chang
                 &[
                     "ln".into(),
                     "-sfn".into(),
+                    "--".into(),
                     link_target,
                     target.display().to_string(),
                 ],
@@ -621,6 +716,7 @@ pub fn send_change(files: &Files, path: &Path, change: &taste_git::mirror::Chang
                 &[
                     "chmod".into(),
                     if change.executable { "+x" } else { "-x" }.into(),
+                    "--".into(),
                     target.display().to_string(),
                 ],
             )?;
@@ -668,11 +764,10 @@ fn push_ahead_into_checkout(
         path,
         &[&format!("+refs/heads/{branch}:{staging}")],
     )?;
-    let script = format!(
-        r#"set -e
-staging='{staging}'
-branch='{branch}'
-cleanup() {{ git update-ref -d "$staging" 2>/dev/null || true; }}
+    let script = r#"set -e
+staging="$1"
+branch="$2"
+cleanup() { git update-ref -d "$staging" 2>/dev/null || true; }
 if ! git merge-base --is-ancestor "refs/heads/$branch" "$staging"; then
   cleanup; echo "the checkout's $branch is not behind the folder's" >&2; exit 2
 fi
@@ -687,7 +782,7 @@ if git ls-files -u | grep -q .; then
     git reset -q --hard
   else
     cleanup
-    echo "the checkout has unresolved conflicts in $(git ls-files -u | awk '{{print $4}}' | sort -u | tr '\n' ' ')- resolve or discard them in the file tree, and the folder's commits follow" >&2
+    echo "the checkout has unresolved conflicts in $(git ls-files -u | awk '{print $4}' | sort -u | tr '\n' ' ')- resolve or discard them in the file tree, and the folder's commits follow" >&2
     exit 5
   fi
 fi
@@ -707,9 +802,21 @@ if [ "$stashed" = 1 ] && ! git stash pop -q 2>/dev/null; then
   exit 4
 fi
 "#
-    );
+    .to_string();
     let out = files
-        .exec(path, &["sh".into(), "-c".into(), script])
+        .exec(
+            path,
+            // The names ride as arguments, never spliced into the script: a
+            // branch name may hold a quote, and this runs a shell.
+            &[
+                "sh".into(),
+                "-c".into(),
+                script,
+                "taste-sync".into(),
+                staging.clone(),
+                branch.to_string(),
+            ],
+        )
         .with_context(|| format!("fast-forwarding {branch} in VM {}", vm.domain))?;
     match out.status {
         0 => Ok(None),
@@ -744,6 +851,12 @@ mod tests {
         assert!(PRIMARY_SEED_REFSPECS.contains(&"^refs/taste/vm/*"));
         assert!(PRIMARY_SYNC_REFSPECS.contains(&"^refs/taste/vm/*"));
         assert!(PRIMARY_SYNC_REFSPECS.contains(&"+refs/heads/*:refs/taste/vm/*"));
+        // The folder's own: the mirror's baseline never comes from the VM,
+        // and the checkout's tags do not land on the folder's.
+        for specs in [&PRIMARY_SYNC_REFSPECS[..], &PRIMARY_SEED_REFSPECS[..]] {
+            assert!(specs.contains(&"^refs/taste/mirror/*"));
+        }
+        assert!(!PRIMARY_SYNC_REFSPECS.contains(&"+refs/tags/*:refs/tags/*"));
     }
 
     #[test]
