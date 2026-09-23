@@ -350,6 +350,9 @@ impl StartupPage {
             .transition_type(gtk::StackTransitionType::Crossfade)
             .vexpand(true)
             .css_classes(["startup-log"])
+            // The log's header bar and text are square; the surface is
+            // rounded, and its corners clip them.
+            .overflow(gtk::Overflow::Hidden)
             .margin_start(24)
             .margin_end(24)
             .margin_bottom(24)

@@ -336,11 +336,17 @@ fn main() -> glib::ExitCode {
                     the checklist over the construction stripes, the log in \
                     a card of its own below; the strip's other tabs dimmed \
                     while it holds the selection. */\n\
+                 /* The startup page's two surfaces over the stripes, one \
+                    edge for both: a hairline in the text colour that holds \
+                    in either scheme — white on pale yellow had no edge at \
+                    all (David, 2026-09-22: \"still lacks a defined \
+                    border\") — and the lift beneath it. */\n\
+                 .startup-card, .startup-log { border-radius: 12px; \
+                   box-shadow: 0 0 0 1px alpha(@window_fg_color, 0.18), \
+                     0 1px 3px alpha(black, 0.25); }\n\
                  .startup-card { background-color: @card_bg_color; \
-                   border-radius: 12px; padding: 18px 24px; \
-                   box-shadow: 0 1px 3px alpha(black, 0.25); }\n\
-                 .startup-log { background-color: @view_bg_color; \
-                   border-radius: 12px; }\n\
+                   padding: 18px 24px; }\n\
+                 .startup-log { background-color: @view_bg_color; }\n\
                  .startup-step-done { color: @success_color; }\n\
                  /* What a checked step came to reads as text, not as \
                     more of the check's green. */\n\
