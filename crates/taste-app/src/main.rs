@@ -1150,6 +1150,15 @@ fn search_css(dark: bool) -> String {
     format!(
         ".search-box entry.search {{ background-color: alpha({fill}, {field}); }}\n\
          .search-box entry.search image {{ color: {ink}; }}\n\
+         /* The two toggles before the box shape its query, so they wear \
+            its hue: pressed, the field's own fill and ink; released, \
+            the ink alone (David, 2026-09-23: \"These buttons should use \
+            the search purple color scheme\"). */\n\
+         .search-box button.search-toggle {{ color: {ink}; }}\n\
+         .search-box button.search-toggle:checked {{ \
+           background-color: alpha({fill}, {field}); }}\n\
+         .search-box button.search-toggle:checked:hover {{ \
+           background-color: alpha({fill}, {listening}); }}\n\
          .search-box entry.search:focus-within {{ outline-color: {ink}; }}\n\
          /* Ctrl+F (or Start) held: the box is listening, and says so in \
             the hue's solid shade until the words replace the query. */\n\

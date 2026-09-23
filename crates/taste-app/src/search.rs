@@ -642,7 +642,7 @@ impl Search {
                 "Hide non-matching items. Release to keep every row and dim the ones \
                  that do not match",
             )
-            .css_classes(["flat"])
+            .css_classes(["flat", "search-toggle"])
             .build();
         // The Tab strip: a keycap, then one lozenge per section in the order
         // Tab takes them, every section whether or not it has matches, the
@@ -737,7 +737,7 @@ impl Search {
         let meaning = gtk::ToggleButton::builder()
             .child(&meaning_face)
             .tooltip_text(MEANING_TOOLTIP)
-            .css_classes(["flat"])
+            .css_classes(["flat", "search-toggle"])
             .active(true)
             .build();
         // The toggles BEFORE the box and the Tab strip after it: what

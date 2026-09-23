@@ -193,6 +193,39 @@ pub(crate) fn leading_slot(child: &impl IsA<gtk::Widget>) -> gtk::Box {
     slot
 }
 
+/// `.gitignore`'s text with a line for each of `paths` it does not have:
+/// anchored to the root with a leading `/`, so it ignores that file and not
+/// every file of the same name, and with gitignore's own characters
+/// escaped, so a name is matched as written.
+fn with_ignored(current: &str, paths: &[&PathBuf]) -> String {
+    let have: HashSet<&str> = current.lines().map(str::trim_end).collect();
+    let mut out = current.to_string();
+    let mut added = false;
+    for path in paths {
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let mut line = String::from("/");
+        for c in rel.chars() {
+            if matches!(c, '*' | '?' | '[' | ']' | '!' | '#') {
+                line.push('\\');
+            }
+            line.push(c);
+        }
+        if line.ends_with(' ') {
+            line.insert(line.len() - 1, '\\');
+        }
+        if have.contains(line.as_str()) {
+            continue;
+        }
+        if !added && !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&line);
+        out.push('\n');
+        added = true;
+    }
+    out
+}
+
 /// A heading's disclosure arrow, open or folded.
 fn fold_glyph(open: bool) -> gtk::Image {
     gtk::Image::builder()
@@ -5363,6 +5396,10 @@ impl FileTree {
             .iter()
             .filter(|p| status.get(&rel_of(p)) == Some(&FileState::Conflicted))
             .count();
+        let untracked = selected
+            .iter()
+            .filter(|p| status.get(&rel_of(p)) == Some(&FileState::Untracked))
+            .count();
         drop(status);
         drop(stashed);
 
@@ -5445,12 +5482,26 @@ impl FileTree {
             )
         } else {
             (
-                vec![(
-                    "← Stash",
-                    stageable + staged,
-                    "stash",
-                    "Set the checked files aside — out of the working tree",
-                )],
+                vec![
+                    (
+                        "← Stash",
+                        stageable + staged,
+                        "stash",
+                        "Set the checked files aside — out of the working tree",
+                    ),
+                    // Out of the pipeline altogether: git stops seeing
+                    // them (David, 2026-09-23: "I should have an ignore
+                    // option for checked dirty files"). Untracked ones
+                    // only — .gitignore does not untrack a file git
+                    // already has, and a button that says Ignore over a
+                    // modified file would do nothing it could show.
+                    (
+                        "Ignore",
+                        untracked,
+                        "ignore",
+                        "Add the checked untracked files to .gitignore",
+                    ),
+                ],
                 vec![(
                     "Stage →",
                     stageable,
@@ -5517,6 +5568,17 @@ impl FileTree {
         let Some(root) = self.worktree_root() else {
             return;
         };
+        // Ignore takes the untracked ones only (see the button), read off
+        // the status here, where it is.
+        let untracked: HashSet<PathBuf> = {
+            let status = self.status.borrow();
+            selected
+                .iter()
+                .filter_map(|p| p.strip_prefix(&root).ok())
+                .filter(|rel| status.get(*rel) == Some(&FileState::Untracked))
+                .map(Path::to_path_buf)
+                .collect()
+        };
         let worktree = self.worktree();
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
@@ -5564,6 +5626,23 @@ impl FileTree {
                             worktree.stage(rel).map_err(err)?;
                         }
                     }
+                    "ignore" => {
+                        let ignoring: Vec<&PathBuf> =
+                            rels.iter().filter(|rel| untracked.contains(*rel)).collect();
+                        let files = worktree.files();
+                        let path = root.join(".gitignore");
+                        let current = match files.read_to_string(&path) {
+                            Ok(text) => text,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                            Err(e) => return Err(format!("reading .gitignore: {e}")),
+                        };
+                        let updated = with_ignored(&current, &ignoring);
+                        if updated != current {
+                            files
+                                .write(&path, updated.as_bytes())
+                                .map_err(|e| format!("writing .gitignore: {e}"))?;
+                        }
+                    }
                     "unstash" => {
                         for rel in &rels {
                             // Re-read per file: dropping an entry below
@@ -5595,6 +5674,7 @@ impl FileTree {
                     "keep-yours" => "Resolved with your version".to_string(),
                     "take-remote" => "Resolved with the remote version".to_string(),
                     "mark-resolved" => "Marked resolved".to_string(),
+                    "ignore" => "Added to .gitignore".to_string(),
                     _ => format!("{op}: done"),
                 })),
                 Err(e) => events.publish(Event::Toast(format!("{op} failed: {e}"))),
@@ -7469,6 +7549,24 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::files_reached;
+
+    #[test]
+    fn ignoring_anchors_escapes_and_does_not_repeat() {
+        use super::with_ignored;
+        use std::path::PathBuf;
+        let a = PathBuf::from("services/management/management");
+        let b = PathBuf::from("notes #1.txt");
+        let out = with_ignored("target/\n/services/management/management\n", &[&a, &b]);
+        assert_eq!(
+            out,
+            "target/\n/services/management/management\n/notes \\#1.txt\n"
+        );
+        assert_eq!(with_ignored("", &[&a]), "/services/management/management\n");
+        assert_eq!(
+            with_ignored("dist", &[&a]),
+            "dist\n/services/management/management\n"
+        );
+    }
 
     fn meaning(paths: &[&str]) -> Vec<crate::search::MeaningHit> {
         paths
