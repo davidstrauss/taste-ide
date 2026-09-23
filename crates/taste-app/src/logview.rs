@@ -275,20 +275,27 @@ pub struct LogPage {
 
 impl LogPage {
     pub fn new(kind: LogKind, environment: &str, seed: &[String]) -> Rc<Self> {
+        let what = if kind.per_environment() {
+            format!("{} · {environment}", kind.subtitle())
+        } else {
+            kind.subtitle().to_string()
+        };
+        Self::titled(&what, LOG_ICON, seed)
+    }
+
+    /// A log page whose bar says `what` beside `icon`: a task's output
+    /// (tasks.rs) is a log of its own that is none of the [`LogKind`]s.
+    pub fn titled(what: &str, icon: &str, seed: &[String]) -> Rc<Self> {
         // A slim bar like the review tab's: what this is, since the tab is
         // one word and the text below could be anything.
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         bar.add_css_class("review-bar");
-        let icon = gtk::Image::from_icon_name(LOG_ICON);
+        let icon = gtk::Image::from_icon_name(icon);
         icon.add_css_class("dim-label");
         icon.set_pixel_size(12);
         bar.append(&icon);
         let what = gtk::Label::builder()
-            .label(if kind.per_environment() {
-                format!("{} · {environment}", kind.subtitle())
-            } else {
-                kind.subtitle().to_string()
-            })
+            .label(what)
             .css_classes(["caption-heading"])
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .xalign(0.0)

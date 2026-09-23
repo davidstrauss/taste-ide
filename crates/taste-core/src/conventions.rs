@@ -7,6 +7,19 @@
 
 use std::path::{Path, PathBuf};
 
+/// The names `task` (taskfile.dev) looks for a Taskfile under, in its own
+/// order; the first is the canonical one a new Taskfile gets.
+pub const TASKFILE_NAMES: [&str; 8] = [
+    "Taskfile.yml",
+    "taskfile.yml",
+    "Taskfile.yaml",
+    "taskfile.yaml",
+    "Taskfile.dist.yml",
+    "taskfile.dist.yml",
+    "Taskfile.dist.yaml",
+    "taskfile.dist.yaml",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Convention {
     /// Absolute path where the file belongs in this workspace.
@@ -102,6 +115,19 @@ pub fn conventions_via(files: &crate::files::Files, root: &Path) -> Vec<Conventi
             is_dir: false,
         });
     }
+    // The project's named commands, for the Tasks section (taskfile.dev).
+    // Present under any of the names `task` itself looks for; the ghost
+    // offers the canonical one.
+    list.push(Convention {
+        exists: TASKFILE_NAMES
+            .iter()
+            .any(|name| files.exists(&root.join(name))),
+        path: root.join(TASKFILE_NAMES[0]),
+        purpose: "the project's named commands (taskfile.dev): the IDE lists them under \
+                  Tasks and runs them in the environment",
+        ghost: true,
+        is_dir: false,
+    });
     list.push(Convention {
         exists: files.exists(&root.join(".taste.yaml")),
         path: root.join(".taste.yaml"),
@@ -176,6 +202,19 @@ mod tests {
     }
 
     #[test]
+    fn a_taskfile_under_any_of_tasks_names_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let taskfile = |list: Vec<Convention>| {
+            list.into_iter()
+                .find(|c| c.path.ends_with("Taskfile.yml"))
+                .unwrap()
+        };
+        assert!(!taskfile(conventions(dir.path())).exists);
+        std::fs::write(dir.path().join("taskfile.yaml"), "version: '3'\n").unwrap();
+        assert!(taskfile(conventions(dir.path())).exists);
+    }
+
+    #[test]
     fn an_empty_devcontainer_folder_offers_the_config_and_a_containerfile() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".devcontainer")).unwrap();
@@ -192,7 +231,8 @@ mod tests {
                 "Containerfile",
                 ".editorconfig",
                 ".gitignore",
-                ".gitattributes"
+                ".gitattributes",
+                "Taskfile.yml"
             ]
         );
 

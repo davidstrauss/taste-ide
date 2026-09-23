@@ -189,6 +189,9 @@ enum SurfaceKind {
     /// own key for it, so the transcript can light the step while the tab
     /// is in front.
     Doc(Rc<crate::chatdoc::DocPage>, String),
+    /// A task's output (tasks.rs), by its name: a log of its own, read as
+    /// the Logs are.
+    Task(Rc<crate::logview::LogPage>, String),
 }
 
 /// What the editor's selected tab is, for the flank to mirror (David,
@@ -208,6 +211,8 @@ pub enum Focused {
     /// A chat step's document (chatdoc.rs): the environment whose chat
     /// opened it, and the step's key for it.
     Doc(taste_core::environment::EnvironmentId, String),
+    /// A task's output: the environment it ran in, and the task.
+    Task(taste_core::environment::EnvironmentId, String),
     Other,
 }
 
@@ -223,6 +228,11 @@ fn log_key(env: &taste_core::environment::EnvironmentId, kind: crate::logview::L
     } else {
         PathBuf::from(format!("log:{}", kind.slug()))
     }
+}
+
+/// `task:<env>/<name>` — one tab per environment per task.
+fn task_key(env: &taste_core::environment::EnvironmentId, name: &str) -> PathBuf {
+    PathBuf::from(format!("task:{env}")).join(name)
 }
 
 /// `port:<env>/<port>` — one tab per environment per forwarded port.
@@ -1530,6 +1540,14 @@ impl Editor {
                     crate::logview::LOG_ICON,
                 ),
                 SurfaceKind::Port(_) => (0, crate::portview::PORT_ICON),
+                SurfaceKind::Task(log, _) => (
+                    if query.is_empty() {
+                        0
+                    } else {
+                        taste_core::search::search_text(&log.text(), query, 0).0
+                    },
+                    crate::tasks::TASK_ICON,
+                ),
                 SurfaceKind::Doc(page, _) => (0, page.icon),
                 SurfaceKind::Startup(_) => (0, STARTUP_ICON),
             };
@@ -1752,6 +1770,9 @@ impl Editor {
                         SurfaceKind::Log(_, kind) => Focused::Log(surface.env.clone(), *kind),
                         SurfaceKind::Port(page) => Focused::Port(surface.env.clone(), page.port),
                         SurfaceKind::Doc(_, key) => Focused::Doc(surface.env.clone(), key.clone()),
+                        SurfaceKind::Task(_, name) => {
+                            Focused::Task(surface.env.clone(), name.clone())
+                        }
                         SurfaceKind::Startup(_) => Focused::Other,
                     }
                 } else {
@@ -1782,6 +1803,13 @@ impl Editor {
                         "go-bottom-symbolic"
                     } else {
                         crate::logview::LOG_ICON
+                    }
+                }
+                SurfaceKind::Task(page, _) => {
+                    if page.is_following() {
+                        "go-bottom-symbolic"
+                    } else {
+                        crate::tasks::TASK_ICON
                     }
                 }
                 // The startup page's toggle is its log's: the one on
@@ -1920,7 +1948,7 @@ impl Editor {
                     ));
                 }
             }
-            SurfaceKind::Log(page, _) => {
+            SurfaceKind::Log(page, _) | SurfaceKind::Task(page, _) => {
                 let following = page.is_following();
                 let page = page.clone();
                 rows.push((
@@ -2075,6 +2103,69 @@ impl Editor {
         );
         self.tabs.set_selected_page(&tab);
         self.sync_toggle_to_selection();
+    }
+
+    /// Open (or focus) a task's output as a tab, seeded with what its run
+    /// has said so far.
+    pub fn open_task(
+        self: &Rc<Self>,
+        env: &taste_core::environment::EnvironmentId,
+        name: &str,
+        seed: Vec<String>,
+    ) {
+        let key = task_key(env, name);
+        if let Some(existing) = self.surfaces.borrow().get(&key) {
+            self.tabs.set_selected_page(&existing.tab);
+            return;
+        }
+        let what = if env.is_primary() {
+            format!("task {name}")
+        } else {
+            format!("task {name} · {env}")
+        };
+        let page = crate::logview::LogPage::titled(&what, crate::tasks::TASK_ICON, &seed);
+        let tab = self.tabs.append(&page.widget);
+        tab.set_title(&if env.is_primary() {
+            name.to_string()
+        } else {
+            format!("{name} · {env}")
+        });
+        tab.set_icon(Some(&gtk::gio::ThemedIcon::new(crate::tasks::TASK_ICON)));
+        tab.set_tooltip(&format!(
+            "The output of task {name}, run in the environment"
+        ));
+        {
+            let weak = Rc::downgrade(self);
+            page.set_on_follow_changed(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.sync_toggle_to_selection();
+                }
+            });
+        }
+        self.surfaces.borrow_mut().insert(
+            key,
+            Rc::new(SurfaceEntry {
+                tab: tab.clone(),
+                env: env.clone(),
+                kind: SurfaceKind::Task(page, name.to_string()),
+            }),
+        );
+        self.tabs.set_selected_page(&tab);
+        self.sync_toggle_to_selection();
+    }
+
+    /// New lines for a task's output, when its tab is open.
+    pub fn append_task(
+        &self,
+        env: &taste_core::environment::EnvironmentId,
+        name: &str,
+        lines: &[String],
+    ) {
+        if let Some(surface) = self.surfaces.borrow().get(&task_key(env, name)) {
+            if let SurfaceKind::Task(page, _) = &surface.kind {
+                page.append(lines);
+            }
+        }
     }
 
     /// New lines for a log, wherever its tab is (on screen or stowed).

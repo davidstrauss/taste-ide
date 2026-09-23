@@ -279,6 +279,117 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             probe_port(&editor, &environments, &port_facts, env, spec);
         });
     }
+    // Tasks (taskfile.dev, tasks.rs): listed for the environment the panes
+    // are aimed at, opened as a log tab, run in that environment's
+    // container.
+    let task_runs = crate::tasks::TaskRuns::new();
+    let refresh_tasks: Rc<dyn Fn()> = {
+        let filetree = filetree.clone();
+        let environments = environments.clone();
+        let task_runs = task_runs.clone();
+        Rc::new(move || {
+            let env = filetree.aimed_environment();
+            let Some(supervisor) = environments.get(&env) else {
+                return;
+            };
+            let exec = supervisor.exec().clone();
+            let files = supervisor.files();
+            let root = supervisor.checkout().path().to_path_buf();
+            let filetree = filetree.clone();
+            let task_runs = task_runs.clone();
+            glib::spawn_future_local(async move {
+                let listed = runtime()
+                    .spawn_blocking(move || crate::tasks::list(&exec, &files, &root))
+                    .await;
+                let Ok(listing) = listed else { return };
+                // The panes may have been aimed elsewhere while it listed.
+                if filetree.aimed_environment() != env {
+                    return;
+                }
+                match listing {
+                    crate::tasks::Listing::NoTaskfile => {
+                        filetree.set_tasks(Vec::new(), None, false)
+                    }
+                    crate::tasks::Listing::Tasks { tasks, cannot_run } => {
+                        let rows = tasks
+                            .into_iter()
+                            .map(|info| crate::filetree::TaskRow {
+                                state: task_runs.state(&env, &info.name),
+                                info,
+                            })
+                            .collect();
+                        filetree.set_tasks(rows, cannot_run, true);
+                    }
+                }
+            });
+        })
+    };
+    {
+        // A row opens the task's output — what its last run said, and
+        // what it goes on saying.
+        let editor = editor.clone();
+        let task_runs = task_runs.clone();
+        filetree.set_on_open_task(move |env, name| {
+            editor.open_task(&env, &name, task_runs.lines(&env, &name));
+        });
+    }
+    {
+        // A row's button runs the task in the environment, its output in
+        // front; while it runs, the same button stops it.
+        let editor = editor.clone();
+        let filetree_for_run = filetree.clone();
+        let environments = environments.clone();
+        let task_runs = task_runs.clone();
+        let events = workspace.events.clone();
+        filetree.set_on_run_task(move |env, name| {
+            if task_runs.state(&env, &name) == crate::tasks::RunState::Running {
+                task_runs.stop(&env, &name);
+                return;
+            }
+            let Some(supervisor) = environments.get(&env) else {
+                return;
+            };
+            editor.open_task(&env, &name, Vec::new());
+            let lines = {
+                let editor = editor.clone();
+                let (env, name) = (env.clone(), name.clone());
+                move |lines: &[String]| editor.append_task(&env, &name, lines)
+            };
+            let changed = {
+                let filetree = filetree_for_run.clone();
+                let task_runs = Rc::downgrade(&task_runs);
+                let env = env.clone();
+                move || {
+                    let Some(task_runs) = task_runs.upgrade() else {
+                        return;
+                    };
+                    if filetree.aimed_environment() == env {
+                        filetree.update_task_states(|task| task_runs.state(&env, task));
+                    }
+                }
+            };
+            if let Err(why) = task_runs.start(&env, &name, supervisor.exec(), lines, changed) {
+                events.publish(Event::Toast(format!("{name} was not run: {why}")));
+            }
+        });
+    }
+    // Listed again when the panes are aimed elsewhere: a two-second look
+    // at where they point, since nothing announces it to this pane.
+    {
+        let filetree = filetree.clone();
+        let refresh_tasks = refresh_tasks.clone();
+        let aimed = std::cell::RefCell::new(None::<taste_core::environment::EnvironmentId>);
+        glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+            let now = filetree.aimed_environment();
+            if aimed.borrow().as_ref() != Some(&now) {
+                *aimed.borrow_mut() = Some(now);
+                if !probe_mode {
+                    refresh_tasks();
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     let console = Console::new(workspace.clone(), environments.clone());
     // One chat per environment, and the pane shows the selected
     // environment's (see chats.rs). There is no tab strip: choosing a
@@ -2623,6 +2734,33 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             filetree.seed_ports_for_probe(port_state_for_probe());
         }
         filetree.seed_log_activity_for_probe();
+        // `TASTE_PROBE_TASKS=none` leaves the Tasks section empty, for its
+        // ghost row alone.
+        if std::env::var("TASTE_PROBE_TASKS").ok().as_deref() != Some("none") {
+            filetree.seed_tasks_for_probe();
+        }
+        // `task`: a task's output in front, its row lit in the section.
+        // After the probe's file has loaded — a file's tab is selected when
+        // its read lands — so the task is the tab in front for the shot.
+        if view == "task" {
+            let editor = editor.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+                let primary = taste_core::environment::EnvironmentId::primary();
+                editor.open_task(
+                    &primary,
+                    "build",
+                    [
+                        "$ task build",
+                        "task: [build] cargo build --workspace",
+                        "   Compiling taste-core v0.1.0",
+                        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.2s",
+                        "— done —",
+                    ]
+                    .map(str::to_string)
+                    .to_vec(),
+                );
+            });
+        }
         if view == "port" {
             let primary = taste_core::environment::EnvironmentId::primary();
             editor.open_port(
@@ -2869,7 +3007,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // The port view keeps its port tab in front: the file is
                 // there to show a port tab is a tab among files, not to be
                 // what the frame is of.
-                if let Some(path) = probe_open.filter(|_| view_for_open != "port") {
+                if let Some(path) =
+                    probe_open.filter(|_| view_for_open != "port" && view_for_open != "task")
+                {
                     editor_for_probe.open_at(&path, Some(113));
                 }
                 // `TASTE_PROBE_PREVIEW=<markdown file>`: that file, on its
@@ -3583,6 +3723,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let environments_for_events = environments.clone();
         let bus_for_events = workspace.events.clone();
         let prompt_agent = prompt_agent.clone();
+        let refresh_tasks_for_events = refresh_tasks.clone();
         let window_for_pad = window.downgrade();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
@@ -3659,6 +3800,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         console.refresh_issues();
                     }
                     Event::FileChanged(path) => {
+                        if path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                taste_core::conventions::TASKFILE_NAMES.contains(&name)
+                            })
+                        {
+                            refresh_tasks_for_events();
+                        }
                         editor.on_file_changed(&path);
                         filetree.on_git_status_changed();
                         semantic_keeper.schedule_refresh();
@@ -3677,6 +3827,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         }
                     }
                     Event::FileTreeChanged => {
+                        // A Taskfile made or removed is a tree change.
+                        refresh_tasks_for_events();
                         filetree.refresh_tree();
                         filetree.rebuild_index();
                         editor.sync_git_state();
@@ -3736,6 +3888,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         banner.on_pending_changes(pending);
                     }
                     Event::DevcontainerState { env, state } => {
+                        // Tasks are listed by `task` in the container: one
+                        // that has just come up can say what the file alone
+                        // could not.
+                        if matches!(
+                            state,
+                            taste_core::event::DevcontainerStateEvent::Running { .. }
+                        ) && filetree.aimed_environment() == env
+                            && !probe_mode
+                        {
+                            refresh_tasks_for_events();
+                        }
                         // Chats route on the environment they are BOUND to,
                         // not on the one the panes are aimed at: a chat in
                         // its own environment moves its agent into that

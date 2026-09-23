@@ -28,6 +28,14 @@ pub struct PortRow {
 }
 
 type OpenLogCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind)>;
+type TaskCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, String)>;
+
+/// One row of the Tasks section: the task, and how its last run went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    pub info: crate::tasks::TaskInfo,
+    pub state: crate::tasks::RunState,
+}
 type OpenPortCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, u16)>;
 
 /// The header every section of the flank wears — `[glyph] Title` — in
@@ -416,6 +424,19 @@ pub struct FileTree {
     /// when the devcontainer forwards nothing.
     ports_empty: gtk::Box,
     ports: RefCell<Vec<PortRow>>,
+    /// The Tasks section (taskfile.dev, tasks.rs): its rows, the note
+    /// that says why they cannot be run when they cannot, the ghost row
+    /// that opens the Taskfile or offers to create one, what is listed,
+    /// and the task whose tab is in front — kept so a redraw of the rows
+    /// keeps it lit.
+    tasks_list: gtk::ListBox,
+    tasks_note: gtk::Label,
+    tasks_empty: gtk::Box,
+    tasks_ghost_label: gtk::Label,
+    tasks: RefCell<(Vec<TaskRow>, Option<String>, bool)>,
+    task_in_front: RefCell<Option<String>>,
+    on_open_task: RefCell<Option<TaskCallback>>,
+    on_run_task: RefCell<Option<TaskCallback>>,
     /// Per published host port, the row's in and out sparklines, for the
     /// tick to feed; and the last readings, so a redrawn row starts from
     /// them (David, 2026-09-21: "proper ingress/egress sparklines for
@@ -1112,6 +1133,50 @@ impl FileTree {
         ports_body.append(&ports_empty);
         ports_body.append(&ports_results.widget);
 
+        // Tasks (taskfile.dev, tasks.rs), below Ports (David, 2026-09-23):
+        // one row per task with its last run's light and a run button, a
+        // note when they cannot be run, and the ghost row under them that
+        // opens the Taskfile — or offers to create one — as Ports' does
+        // the devcontainer.
+        let (tasks_section, tasks_list, tasks_body) = section(crate::tasks::TASK_ICON, "Tasks");
+        tasks_list.set_widget_name("tasks-list");
+        let tasks_note = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(30)
+            .visible(false)
+            .build();
+        tasks_note.set_margin_start(ROW_INSET + 4 + LEAD_WIDTH + ROW_GAP);
+        tasks_note.set_margin_end(ROW_INSET + 4);
+        tasks_note.set_margin_top(2);
+        let tasks_empty = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
+        tasks_empty.set_margin_start(ROW_INSET + 4);
+        tasks_empty.set_margin_end(ROW_INSET + 4);
+        tasks_empty.set_margin_top(2);
+        tasks_empty.set_margin_bottom(6);
+        tasks_empty.add_css_class("backlog-ghost");
+        tasks_empty.append(&leading_slot(
+            &gtk::Image::builder()
+                .icon_name("document-new-symbolic")
+                .pixel_size(13)
+                .css_classes(["dim-label"])
+                .build(),
+        ));
+        let tasks_ghost_label = gtk::Label::builder()
+            .label("Add tasks in a Taskfile.yml.")
+            .css_classes(["caption", "dim-label", "ghost-text"])
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(30)
+            .build();
+        tasks_empty.append(&tasks_ghost_label);
+        tasks_empty.set_cursor_from_name(Some("pointer"));
+        tasks_body.append(&tasks_note);
+        tasks_body.append(&tasks_empty);
+
         // Dirty-file workflows that need input steal space from the
         // bottom of the file list — never a modal dialog.
         let intervention = crate::intervention::Panel::new();
@@ -1154,6 +1219,7 @@ impl FileTree {
         // Ports first, then Logs (David, 2026-09-06): what is running is
         // read before what it wrote.
         widget.append(&ports_section);
+        widget.append(&tasks_section);
         widget.append(&logs_section);
         // Last, and permanent: the backlog sits below everything else this
         // pane opens, so the context it names is never the thing that gets
@@ -1221,6 +1287,14 @@ impl FileTree {
             ports_list,
             ports_empty,
             ports: RefCell::new(Vec::new()),
+            tasks_list,
+            tasks_note,
+            tasks_empty,
+            tasks_ghost_label,
+            tasks: RefCell::new((Vec::new(), None, false)),
+            task_in_front: RefCell::new(None),
+            on_open_task: RefCell::new(None),
+            on_run_task: RefCell::new(None),
             port_sparklines: RefCell::new(HashMap::new()),
             port_traffic_seed: RefCell::new(HashMap::new()),
             files_results,
@@ -1281,6 +1355,55 @@ impl FileTree {
                 });
             });
             tree.ports_empty.add_controller(click);
+        }
+        {
+            // The Tasks ghost: the Taskfile there is, under whichever of
+            // task's names — or the canonical one as an unsaved buffer.
+            let weak = Rc::downgrade(&tree);
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_, _, _, _| {
+                let Some(tree) = weak.upgrade() else { return };
+                let root = tree.view_root();
+                let files = tree.workspace.files();
+                let weak = weak.clone();
+                glib::spawn_future_local(async move {
+                    let handle = crate::runtime::runtime().spawn_blocking(move || {
+                        taste_core::conventions::TASKFILE_NAMES
+                            .iter()
+                            .map(|name| root.join(name))
+                            .find(|path| files.is_file(path))
+                            .ok_or_else(|| root.join(taste_core::conventions::TASKFILE_NAMES[0]))
+                    });
+                    let Ok(found) = handle.await else { return };
+                    let Some(tree) = weak.upgrade() else { return };
+                    match found {
+                        Ok(existing) => tree.open(existing, None),
+                        Err(absent) => tree.create_ghost(&absent),
+                    }
+                });
+            });
+            tree.tasks_empty.add_controller(click);
+        }
+        {
+            let weak = Rc::downgrade(&tree);
+            tree.tasks_list.connect_row_activated(move |_, row| {
+                let Some(tree) = weak.upgrade() else { return };
+                let Ok(index) = usize::try_from(row.index()) else {
+                    return;
+                };
+                let name = tree
+                    .tasks
+                    .borrow()
+                    .0
+                    .get(index)
+                    .map(|r| r.info.name.clone());
+                let env = tree.aimed_environment();
+                let hook = tree.on_open_task.borrow();
+                if let (Some(name), Some(hook)) = (name, hook.as_ref()) {
+                    hook(env, name);
+                }
+                drop(hook);
+            });
         }
 
         {
@@ -2363,6 +2486,120 @@ impl FileTree {
         *self.on_open_log.borrow_mut() = Some(Box::new(f));
     }
 
+    /// A Tasks row was activated: open that task's output for the
+    /// environment the panes are aimed at.
+    pub fn set_on_open_task(
+        &self,
+        f: impl Fn(taste_core::environment::EnvironmentId, String) + 'static,
+    ) {
+        *self.on_open_task.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// A Tasks row's button: run the task, or stop it when it is running.
+    pub fn set_on_run_task(
+        &self,
+        f: impl Fn(taste_core::environment::EnvironmentId, String) + 'static,
+    ) {
+        *self.on_run_task.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// The Tasks section's rows: the tasks with their last runs, why they
+    /// cannot be run when they cannot, and whether there is a Taskfile.
+    pub fn set_tasks(
+        self: &Rc<Self>,
+        rows: Vec<TaskRow>,
+        cannot_run: Option<String>,
+        has_taskfile: bool,
+    ) {
+        let next = (rows, cannot_run, has_taskfile);
+        if *self.tasks.borrow() == next {
+            return;
+        }
+        *self.tasks.borrow_mut() = next;
+        self.render_tasks();
+    }
+
+    fn render_tasks(self: &Rc<Self>) {
+        while let Some(child) = self.tasks_list.first_child() {
+            self.tasks_list.remove(&child);
+        }
+        let (rows, cannot_run, has_taskfile) = self.tasks.borrow().clone();
+        let runnable = cannot_run.is_none();
+        for row in &rows {
+            let running = row.state == crate::tasks::RunState::Running;
+            let button = gtk::Button::builder()
+                .icon_name(if running {
+                    "media-playback-stop-symbolic"
+                } else {
+                    "media-playback-start-symbolic"
+                })
+                .tooltip_text(if running {
+                    format!("Stop {}", row.info.name)
+                } else {
+                    format!("Run {} in the environment", row.info.name)
+                })
+                .css_classes(["flat", "circular"])
+                .valign(gtk::Align::Center)
+                .sensitive(runnable || running)
+                .build();
+            {
+                let weak = Rc::downgrade(self);
+                let name = row.info.name.clone();
+                button.connect_clicked(move |_| {
+                    let Some(tree) = weak.upgrade() else { return };
+                    let env = tree.aimed_environment();
+                    let hook = tree.on_run_task.borrow();
+                    if let Some(hook) = hook.as_ref() {
+                        hook(env, name.clone());
+                    }
+                });
+            }
+            let subtitle = match (row.state.words(), row.info.desc.as_str()) {
+                ("", desc) => desc.to_string(),
+                (words, "") => words.to_string(),
+                (words, desc) => format!("{words} · {desc}"),
+            };
+            let item = section_row(
+                Some(row.state.dot()),
+                None,
+                &row.info.name,
+                &subtitle,
+                Some(button.upcast_ref()),
+            );
+            self.tasks_list.append(&item);
+        }
+        self.tasks_list.set_visible(!rows.is_empty());
+        match &cannot_run {
+            Some(why) if !rows.is_empty() => {
+                self.tasks_note
+                    .set_label(&format!("Not runnable here: {why}."));
+                self.tasks_note.set_visible(true);
+            }
+            _ => self.tasks_note.set_visible(false),
+        }
+        self.tasks_ghost_label.set_label(if has_taskfile {
+            "Add more in the Taskfile."
+        } else {
+            "Add tasks in a Taskfile.yml."
+        });
+        // The tab in front keeps its row lit through a redraw.
+        let front = self.task_in_front.borrow().clone();
+        let lit = front
+            .and_then(|name| rows.iter().position(|r| r.info.name == name))
+            .and_then(|i| self.tasks_list.row_at_index(i as i32));
+        self.tasks_list.select_row(lit.as_ref());
+    }
+
+    /// Each row's light and button again from `state`, without listing
+    /// the tasks again: a run started or ended.
+    pub fn update_task_states(self: &Rc<Self>, state: impl Fn(&str) -> crate::tasks::RunState) {
+        let (mut rows, cannot_run, has_taskfile) = self.tasks.borrow().clone();
+        for row in &mut rows {
+            row.state = state(&row.info.name);
+        }
+        self.set_tasks(rows, cannot_run, has_taskfile);
+    }
+
     /// A Ports row was activated: open that port for the environment the
     /// panes are aimed at.
     pub fn set_on_open_port(
@@ -2387,11 +2624,13 @@ impl FileTree {
             Focused::File(path) => {
                 self.logs_list.select_row(gtk::ListBoxRow::NONE);
                 self.ports_list.select_row(gtk::ListBoxRow::NONE);
+                self.clear_task_selection();
                 self.select_file(path);
             }
             Focused::Log(env, kind) => {
                 self.clear_tree_selection();
                 self.ports_list.select_row(gtk::ListBoxRow::NONE);
+                self.clear_task_selection();
                 let index = crate::logview::LogKind::ALL
                     .iter()
                     .position(|k| *k == kind)
@@ -2404,6 +2643,7 @@ impl FileTree {
             Focused::Port(env, port) => {
                 self.clear_tree_selection();
                 self.logs_list.select_row(gtk::ListBoxRow::NONE);
+                self.clear_task_selection();
                 let index = (env == aimed)
                     .then(|| self.ports.borrow().iter().position(|r| r.spec.port == port))
                     .flatten();
@@ -2412,12 +2652,38 @@ impl FileTree {
             }
             // A chat's document lights its step in the transcript
             // (chats.rs), and nothing here.
+            // A task's tab lights its row, as a log's and a port's do
+            // (David, 2026-09-23: "the same blue on selection as anything
+            // else that opens in the editor").
+            Focused::Task(env, name) => {
+                self.clear_tree_selection();
+                self.logs_list.select_row(gtk::ListBoxRow::NONE);
+                self.ports_list.select_row(gtk::ListBoxRow::NONE);
+                let index = (env == aimed)
+                    .then(|| {
+                        self.tasks
+                            .borrow()
+                            .0
+                            .iter()
+                            .position(|r| r.info.name == name)
+                    })
+                    .flatten();
+                *self.task_in_front.borrow_mut() = index.is_some().then_some(name);
+                let row = index.and_then(|i| self.tasks_list.row_at_index(i as i32));
+                self.tasks_list.select_row(row.as_ref());
+            }
             Focused::Doc(..) | Focused::Other => {
                 self.clear_tree_selection();
                 self.logs_list.select_row(gtk::ListBoxRow::NONE);
                 self.ports_list.select_row(gtk::ListBoxRow::NONE);
+                self.clear_task_selection();
             }
         }
+    }
+
+    fn clear_task_selection(&self) {
+        *self.task_in_front.borrow_mut() = None;
+        self.tasks_list.select_row(gtk::ListBoxRow::NONE);
     }
 
     fn tree_selection(&self) -> Option<(gtk::ListView, gtk::SingleSelection, gtk::TreeListModel)> {
@@ -2496,7 +2762,7 @@ impl FileTree {
 
     /// The environment the tree is aimed at, as an id: the primary when
     /// it is home.
-    fn aimed_environment(&self) -> taste_core::environment::EnvironmentId {
+    pub fn aimed_environment(&self) -> taste_core::environment::EnvironmentId {
         self.watching()
             .unwrap_or_else(taste_core::environment::EnvironmentId::primary)
     }
@@ -2765,6 +3031,30 @@ impl FileTree {
             };
         }
         self.set_log_activity(&[container, environment, vm, [0; BUCKETS]]);
+    }
+
+    /// TASTE_PROBE_CHECK only: three tasks — one that ran, one running,
+    /// one never run — so the section's rows, lights, and buttons are
+    /// posed without a container running `task`.
+    #[doc(hidden)]
+    pub fn seed_tasks_for_probe(self: &Rc<Self>) {
+        use crate::tasks::{RunState, TaskInfo};
+        let row = |name: &str, desc: &str, state| TaskRow {
+            info: TaskInfo {
+                name: name.to_string(),
+                desc: desc.to_string(),
+            },
+            state,
+        };
+        self.set_tasks(
+            vec![
+                row("build", "Build the workspace", RunState::Succeeded),
+                row("test", "Run the test suite", RunState::Running),
+                row("lint", "", RunState::Idle),
+            ],
+            None,
+            true,
+        );
     }
 
     /// TASTE_PROBE_CHECK only: two ports, one answering, so the section
@@ -6703,6 +6993,20 @@ fn clean_commit_message(reply: &str) -> String {
 /// Starter content for a ghost, so creation lands somewhere useful.
 fn ghost_template(file_name: Option<&str>) -> &'static str {
     match file_name {
+        // taskfile.dev: the IDE lists these under Tasks and runs them in
+        // the environment, which needs `task` installed there.
+        Some("Taskfile.yml") => {
+            "# The project's named commands (https://taskfile.dev). taste-ide lists them\n\
+             # under Tasks and runs them in the environment, where `task` must be\n\
+             # installed (see https://taskfile.dev/installation).\n\
+             version: '3'\n\
+             \n\
+             tasks:\n  \
+               default:\n    \
+                 desc: Build the project\n    \
+                 cmds:\n      \
+                   - echo \"say what building means here\"\n"
+        }
         Some("devcontainer.json") => {
             "{\n    // Define the project's devcontainer. taste-ide validates this\n    \
              // config (no privileged flags, mounts stay in the workspace).\n    \

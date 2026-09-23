@@ -71,6 +71,7 @@ configuration:
 | Offline cargo sources | `cargo-sources.json` beside the manifest |
 | Editor behavior | `.editorconfig` at the root |
 | Tree filtering | `.gitignore` |
+| The project's named commands | `Taskfile.yml` at the root ([taskfile.dev](https://taskfile.dev); any name `task` looks for) — listed under Tasks in the flank as `task --list-all --json` in the environment says them, read off the file when it cannot, and run in the environment's container; a task's output is a log tab |
 | User file templates | `~/.config/taste-ide/templates/<file-name>/<variant>` — one plain file per variant; the directory listing *is* the configuration |
 | An environment's branch | `agents/<env>` in the main checkout — one per environment, derived from its id (`taste_git::env_branch`), never chosen |
 | The issue queue and its backlog order | `refs/taste/issues`: `issues/<id>/issue.md`, comments beside it, and one `order` file of ids |

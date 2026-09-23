@@ -56,6 +56,7 @@ mod sparkline;
 mod startup;
 mod stripes;
 mod tabfamily;
+mod tasks;
 mod textline;
 mod ui_probe;
 mod voice;
