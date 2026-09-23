@@ -1668,9 +1668,8 @@ it, and carries its actions.
   (David, 2026-09-06: "It ought to leverage a new terminal"). Device code,
   never a browser callback: a CLI's web flow listens on a loopback port for
   the redirect, in the login's network namespace, and the browser is on
-  the host — reachable from the outside-confined login container only
-  because it shares the host's network, and never from an environment's
-  own container. Only an agent with neither is asked over ACP.
+  the host, never reachable from the environment's own container, which
+  is where the sign-in runs (`relocate::relocated_login_command`). Only an agent with neither is asked over ACP.
 - **Session model**: `AgentSession` owns one ACP session; exposes
   `prompt()`, a stream of `SessionUpdate`s, and cancellation. Sessions
   survive devcontainer transitions because nothing in them references the

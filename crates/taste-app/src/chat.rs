@@ -8914,10 +8914,11 @@ impl ChatPane {
     /// `on_sign_in_finished`), so a login that exits clean reconnects the
     /// chat. The login must run in the SAME confinement as the agent (same
     /// home, same container) or the credentials land where the agent never
-    /// looks — and it is outside-confined always, even for a chat whose
-    /// agent is relocated: it writes to the agent's home, and the home is
-    /// the same volume in both topologies. `status` is what the chat says
-    /// while the tab is up.
+    /// looks: in the environment's container when the agent would relocate
+    /// there, which puts them on the home volume in the environment's VM.
+    /// It once ran in a container on this host's podman, whose volume of
+    /// the same name the relocated agent never reads. `status` is what the
+    /// chat says while the tab is up.
     fn open_sign_in_terminal(
         self: &Rc<Self>,
         spec: &taste_acp::AgentSpec,
@@ -8926,11 +8927,13 @@ impl ChatPane {
         status: &str,
     ) {
         let aim = self.aim();
+        let relocation = self.relocation(spec);
         match taste_acp::login_command(
             spec,
             &aim.cwd,
             &aim.workspace_root,
             &aim.home_volume,
+            relocation.as_ref(),
             extra_args,
             extra_env,
         ) {

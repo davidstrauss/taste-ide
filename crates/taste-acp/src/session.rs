@@ -330,7 +330,7 @@ impl AgentClient {
                 .push(("GIT_CONFIG_GLOBAL".into(), git_policy.display().to_string()));
             spec.env
                 .push(("BROWSER".into(), url_script.display().to_string()));
-            // The environment announces itself (see container_agent_command).
+            // The environment announces itself, as in every confinement.
             spec.env
                 .push(("TASTE_IDE_VERSION".into(), env!("CARGO_PKG_VERSION").into()));
             spec.env
@@ -351,39 +351,10 @@ impl AgentClient {
             ));
         }
 
-        // Preferred confinement everywhere else: the agent runs inside
-        // the devcontainer image via host podman. Neither the packaged
-        // Flatpak's host nor a bare Silverblue has node/npx — the image
-        // does, and a container out-isolates bwrap.
-        if let Some((program, args)) = crate::sandbox::container_agent_command(
-            &spec,
-            &cwd,
-            &git_policy,
-            &workspace_stub,
-            &home.volume,
-            mcp_socket.as_deref(),
-            (&url_script, &url_dir),
-            false,
-        ) {
-            // The IDE binary's path means nothing inside a container;
-            // see `sandbox::mcp_bridge_command`.
-            let bridge = mcp_socket
-                .as_deref()
-                .map(crate::sandbox::mcp_bridge_command);
-            return Ok(Self::spawn_with_command(
-                spec,
-                cwd,
-                files.clone(),
-                bridge.or(mcp_bridge),
-                resume_session,
-                ui_probe,
-                terminals,
-                safe_mode,
-                program,
-                args,
-            ));
-        }
-
+        // No container to run in: the rung below them all, confined by
+        // bwrap on this machine's own OS. There is no container rung on
+        // this host's podman (`sandbox::wrap`).
+        crate::sandbox::runs_outside_a_container(&spec.command)?;
         // Inside the Flatpak-packaged IDE the sandbox PATH has no bwrap;
         // the host's is used via flatpak-spawn below.
         let flatpak = std::path::Path::new("/.flatpak-info").exists();
@@ -1576,11 +1547,15 @@ pub struct LoginCommand {
 ///
 /// It takes no `safe_mode`: the agent's mount set no longer encodes the
 /// mode, because every write is checked when it is made.
+///
+/// With a `relocation`, which is where the agent itself runs, the sign-in
+/// runs there too, so the credentials land in the home the agent reads.
 pub fn login_command(
     spec: &AgentSpec,
     cwd: &std::path::Path,
     workspace_root: &std::path::Path,
     home_volume: &str,
+    relocation: Option<&crate::Relocation>,
     extra_args: &[String],
     extra_env: &[(String, String)],
 ) -> Result<LoginCommand> {
@@ -1603,17 +1578,8 @@ pub fn login_command(
         });
     }
 
-    // Preferred: the agent container (env baked in as podman -e flags).
-    if let Some((program, args)) = crate::sandbox::container_agent_command(
-        &spec,
-        cwd,
-        &git_policy,
-        &workspace_stub,
-        home_volume,
-        None,
-        (&url_script, &url_dir),
-        true,
-    ) {
+    if let Some(relocation) = relocation {
+        let (program, args) = crate::relocate::relocated_login_command(&spec, cwd, relocation);
         return Ok(LoginCommand {
             program,
             args,
@@ -1621,6 +1587,7 @@ pub fn login_command(
         });
     }
 
+    crate::sandbox::runs_outside_a_container(&spec.command)?;
     let flatpak = std::path::Path::new("/.flatpak-info").exists();
     if !flatpak && !crate::sandbox::bwrap_available() {
         anyhow::bail!("bubblewrap (bwrap) not found: agents only run confined, never unconfined");

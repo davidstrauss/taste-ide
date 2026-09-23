@@ -16,10 +16,10 @@
 //!    The supervisor binds each environment's checkout into its container a
 //!    second time at its REAL host path, so `/home/u/.local/state/…/repo`
 //!    resolves in both topologies and the key does not move.
-//! 2. **`HOME` is the same volume at the same path on both sides.** Both
-//!    the outside-confined agent container and the relocated exec use
-//!    `environment::env_home_volume` mounted at
-//!    `policy::AGENT_HOME_IN_DEVCONTAINER`. The volume outlives container
+//! 2. **`HOME` is the environment's home volume.** The relocated exec uses
+//!    `environment::env_home_volume`, which the supervisor mounts at
+//!    `policy::AGENT_HOME_IN_DEVCONTAINER`, and so does the agent's sign-in
+//!    ([`relocated_login_command`]). The volume outlives container
 //!    rebuilds, which is what makes a rebuild a respawn rather than an
 //!    amnesia event.
 //! 3. **No path translation anywhere.** Falling out of (1): the IDE and the
@@ -42,10 +42,9 @@ use crate::AgentSpec;
 
 /// What a relocated agent announces in `TASTE_IDE_CONFINEMENT`.
 ///
-/// Distinct from `container`, which is the sibling agent container the
-/// outside-confined topology uses. Anything in either container — an MCP
-/// tool, a bare `env` in a shell — can tell which world it is in without
-/// reverse-engineering it from `/proc`.
+/// Distinct from `bwrap` and `direct`, the other two confinements, so
+/// anything in the container — an MCP tool, a bare `env` in a shell — can
+/// tell which world it is in without reverse-engineering it from `/proc`.
 pub const CONFINEMENT: &str = "container-exec";
 
 /// How a relocated agent reaches the IDE's auth proxy.
@@ -161,18 +160,38 @@ pub fn relocated_agent_command(
     cwd: &Path,
     relocation: &Relocation,
 ) -> (String, Vec<String>) {
-    let mut args: Vec<String> = Vec::new();
     // No `-t`: ACP is a stdio protocol and a pty would corrupt it. `-i`
     // because the agent reads requests from stdin for its whole life.
-    args.extend(["exec".into(), "-i".into()]);
+    exec_in_environment(spec, cwd, relocation, false)
+}
+
+/// The agent's sign-in, in the same container, home, and environment as
+/// the agent itself, with a terminal: a login TUI runs in a console tab and
+/// needs raw mode. Where the credentials land is the agent's home volume in
+/// the environment's VM, which is the only home the agent reads.
+pub fn relocated_login_command(
+    spec: &AgentSpec,
+    cwd: &Path,
+    relocation: &Relocation,
+) -> (String, Vec<String>) {
+    exec_in_environment(spec, cwd, relocation, true)
+}
+
+fn exec_in_environment(
+    spec: &AgentSpec,
+    cwd: &Path,
+    relocation: &Relocation,
+    tty: bool,
+) -> (String, Vec<String>) {
+    let mut args: Vec<String> = Vec::new();
+    args.extend(["exec".into(), if tty { "-it" } else { "-i" }.into()]);
     args.push("--workdir".into());
     args.push(cwd.display().to_string());
 
     let mut env: Vec<(String, String)> = Vec::new();
     // The agent's own home: the per-environment volume the supervisor
-    // already mounts, and the SAME volume at the SAME path the
-    // outside-confined agent container uses. That identity is what makes
-    // relocation a respawn rather than a fresh start — see the module docs.
+    // already mounts, so a rebuilt container finds the same conversations
+    // — see the module docs.
     env.push((
         "HOME".into(),
         taste_core::policy::AGENT_HOME_IN_DEVCONTAINER.into(),

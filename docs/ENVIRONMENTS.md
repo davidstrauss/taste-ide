@@ -2772,17 +2772,21 @@ substrate actually is, unchanged. The relocated agent follows its
 container onto the substrate because the connection rides on the
 `Relocation` value: a container name alone is not an address.
 
-**One rung deliberately stays local: the outside-confined agent**
-(`taste_acp::sandbox`). It is the fallback for an environment with no
-container to relocate into, and it is built out of host sockets — the
-IDE's MCP socket, the URL bridge, `--network=host` for the OAuth
-callback. A unix socket is not connectable from inside a VM and the
-host's loopback is not the VM's, so moving that rung into a VM would
-produce an agent with no tools and no way to log in. Its confinement is
-unchanged; what runs on the substrate is the topology the design actually
-wants, the agent beside the files in its environment's own container,
-which is where the isolation is for. It sees no files: an environment
-whose container refused to start has nothing for an agent to read.
+**No agent rung runs on this host's podman** (David, 2026-09-23: "This
+shouldn't exist. Remove it."). There was one: for an environment with no
+container to relocate into, the agent ran in a container of the IDE's
+image on the HOST's podman, with `--network=host` and SELinux separation
+off — the host's kernel and the host's network, whatever the image, and
+its home a host volume the relocated agent in the VM never read, so a
+sign-in there landed nowhere the agent looked. What is left below the
+environment's own container is the bwrap rung (`taste_acp::sandbox::wrap`),
+which runs the agent from this machine's own OS and so needs its tools
+there; a bare host has no node, and the agent says so and starts when its
+container is up (`sandbox::runs_outside_a_container`). Sign-in runs where
+the agent does, in the environment's container, in device-code mode
+(`relocate::relocated_login_command`). The chat's container gate holds a
+spawn while an environment is on its way, so the lower rung is reached
+only by an environment settled without a container.
 
 ### The one compatibility rule the substrate imposes
 
@@ -2922,10 +2926,10 @@ safe mode for no visible reason. What this changes and what it does not:
   the consent gate.
 - `NoConfig` stops being a dead state: a repo with no devcontainer gets
   the baseline immediately — one environment is always usable.
-- The outside-confined topology (bwrap, stand-in workspace, sibling
-  agent container) is kept only as the rung of last resort for a broken
-  substrate, and becomes deletable the day that rung is judged
-  unnecessary. One topology, two config authorities — that is the end
+- The outside-confined topology (bwrap, stand-in workspace) is kept only
+  as the rung of last resort for a broken substrate, and becomes deletable
+  the day that rung is judged unnecessary. Its sibling agent container on
+  the host's podman was judged so on 2026-09-23 and is gone. One topology, two config authorities — that is the end
   state.
 
 **Three things the implementation settled.** First, the mode predicate had

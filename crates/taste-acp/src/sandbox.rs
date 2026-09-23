@@ -393,192 +393,42 @@ pub fn inside_container() -> bool {
     Path::new("/run/.containerenv").exists() || Path::new("/.dockerenv").exists()
 }
 
+/// Whether `command` can run outside a container on this machine: the
+/// rung below every container runs the agent from the host's own OS, and a
+/// bare host has no node. Said, rather than left to a confined
+/// `npx: not found`, because the remedy is the environment's container,
+/// not an install. Unknowable from inside the Flatpak, whose PATH is not
+/// the host's, so assumed there.
+pub fn runs_outside_a_container(command: &str) -> Result<()> {
+    if Path::new("/.flatpak-info").exists() || Path::new(command).is_absolute() {
+        return Ok(());
+    }
+    let found = std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()));
+    if !found {
+        anyhow::bail!(
+            "this agent runs in its environment's container, which is not up, and this \
+             machine has no {command} to run it anywhere else; it starts once the \
+             container is"
+        );
+    }
+    Ok(())
+}
+
 pub fn bwrap_available() -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("bwrap").is_file()))
         .unwrap_or(false)
 }
 
-/// Wrap an agent command in the confinement sandbox.
+/// Wrap an agent command in the confinement sandbox: the rung below every
+/// container, for an agent whose environment has none. There is no
+/// container rung on this host's own podman any more — it ran the agent on
+/// the host's kernel with the host's network and SELinux separation off,
+/// which is the host, whatever the image (David, 2026-09-23: "This
+/// shouldn't exist. Remove it."). An agent runs in its environment's
+/// container in the VM (`crate::relocate`) or, lacking one, here.
 ///
-/// `safe_mode` narrows workspace writes to the devcontainer scope.
-/// `mcp_socket` is the one path under the masked runtime dir that is bound
-/// back in, so the agent can reach the IDE's MCP server. The mount set is
-/// fixed for the life of the process: a session spawned in safe mode keeps
-/// safe-mode confinement until a new session is started.
-/// Agent-in-a-container confinement: run the agent inside the project's
-/// devcontainer image via (host) podman. Stronger than bwrap — no host
-/// filesystem at all beyond the workspace and the IDE's bridge files —
-/// and it is what makes the packaged Flatpak and bare-host runs work at
-/// all: neither has node/npx installed.
-///
-/// Returns None when podman or the image is unavailable (bwrap fallback
-/// applies). The availability probe runs once and is cached.
-#[allow(clippy::too_many_arguments)]
-pub fn container_agent_command(
-    spec: &AgentSpec,
-    cwd: &Path,
-    git_policy: &Path,
-    workspace_stub: &Path,
-    home_volume: &str,
-    mcp_socket: Option<&Path>,
-    url_bridge: (&Path, &Path),
-    tty: bool,
-) -> Option<(String, Vec<String>)> {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let image =
-        std::env::var("TASTE_AGENT_IMAGE").unwrap_or_else(|_| "taste-ide-devcontainer".to_string());
-    // **Deliberately the LOCAL podman, whatever substrate the workspace's
-    // environments are on.** This is the outside-confined rung — the one
-    // that runs when an environment has no container to relocate into —
-    // and it is built out of host sockets: the IDE's MCP socket, the URL
-    // bridge, `--network=host` for the OAuth callback. A unix socket
-    // bind-mounted through virtiofs is not connectable from inside a VM,
-    // and the host's loopback is not the VM's, so moving this rung onto a
-    // machine would produce an agent with no tools and no way to log in.
-    //
-    // Nothing about confinement changes by staying here: this container is
-    // as confined as it ever was, and it is not the host. What runs on the
-    // substrate is the topology the design actually wants — the agent
-    // beside the files, in its environment's own container (see
-    // `crate::relocate`), which is where the substrate's isolation is for.
-    let podman = taste_core::PodmanTarget::detect_local();
-    let available = *AVAILABLE.get_or_init(|| {
-        let (program, args) = podman.argv(["image", "exists", &image]);
-        std::process::Command::new(program)
-            .args(args)
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    });
-    if !available {
-        return None;
-    }
-    Some(container_agent_args(
-        spec,
-        cwd,
-        git_policy,
-        workspace_stub,
-        home_volume,
-        mcp_socket,
-        url_bridge,
-        tty,
-        image,
-        podman.sandboxed(),
-    ))
-}
-
-/// The pure command-line assembly behind [`container_agent_command`],
-/// split out so tests can check the composed args without a podman probe.
-#[allow(clippy::too_many_arguments)]
-fn container_agent_args(
-    spec: &AgentSpec,
-    cwd: &Path,
-    git_policy: &Path,
-    workspace_stub: &Path,
-    home_volume: &str,
-    mcp_socket: Option<&Path>,
-    url_bridge: (&Path, &Path),
-    tty: bool,
-    image: String,
-    sandboxed: bool,
-) -> (String, Vec<String>) {
-    let mut args: Vec<String> = Vec::new();
-    if sandboxed {
-        args.extend(["--host".into(), "podman".into()]);
-    }
-    args.extend(
-        [
-            "run",
-            "--rm",
-            "-i",
-            "--userns=keep-id:uid=1000,gid=1000",
-            "--security-opt",
-            "label=disable",
-            // OAuth callbacks reach the login flow.
-            "--network=host",
-        ]
-        .map(String::from),
-    );
-    // The agent's own home, isolated from the real one: this ENVIRONMENT's
-    // volume, at the path the environment's devcontainer mounts it at too.
-    // Both of those matter. Per environment because a machine-global
-    // `taste-agent-home` put every workspace's agent in one directory; at
-    // the shared path because the agent's conversation history lives here,
-    // and relocating into the devcontainer must find the same history in
-    // the same place — see `crate::relocate`.
-    args.push("-v".into());
-    args.push(format!(
-        "{home_volume}:{}",
-        taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
-    ));
-    args.push("-e".into());
-    args.push(format!(
-        "HOME={}",
-        taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
-    ));
-    if tty {
-        // Login TUIs run in a console tab (a real pty): give the container
-        // a terminal so raw-mode prompts work.
-        args.push("-t".into());
-    }
-    // NOT the workspace: a read-only stand-in, so the agent's working
-    // directory exists and paths it exchanges with the IDE still mean the
-    // same thing on both sides — while the only route to the project's
-    // actual contents is through the IDE. See `ensure_workspace_stub`.
-    args.push("-v".into());
-    args.push(format!("{}:{}:ro", workspace_stub.display(), cwd.display()));
-    // ...except the agent's own instructions and settings, read-only, on
-    // top of the stand-in. Podman orders nested mounts by destination
-    // depth, so these land after the stub they sit inside.
-    for (source, destination) in agent_context_binds(cwd) {
-        args.push("-v".into());
-        args.push(format!("{}:{}:ro", source.display(), destination.display()));
-    }
-    args.push("-w".into());
-    args.push(cwd.display().to_string());
-    args.push("-v".into());
-    args.push(format!(
-        "{}:{}:ro",
-        git_policy.display(),
-        git_policy.display()
-    ));
-    args.push("-e".into());
-    args.push(format!("GIT_CONFIG_GLOBAL={}", git_policy.display()));
-    if let Some(socket) = mcp_socket {
-        args.push("-v".into());
-        args.push(format!("{}:{}", socket.display(), socket.display()));
-    }
-    let (url_script, url_dir) = url_bridge;
-    args.push("-v".into());
-    args.push(format!("{}:{}", url_dir.display(), url_dir.display()));
-    args.push("-v".into());
-    args.push(format!(
-        "{}:{}:ro",
-        url_script.display(),
-        url_script.display()
-    ));
-    args.push("-e".into());
-    args.push(format!("BROWSER={}", url_script.display()));
-    // The environment announces itself: any process in this container —
-    // MCP-aware or a bare `env` in a shell — can see it runs under
-    // taste-ide and HOW it is confined, instead of reverse-engineering
-    // the topology from /proc (which shows only this container).
-    args.push("-e".into());
-    args.push(format!("TASTE_IDE_VERSION={}", env!("CARGO_PKG_VERSION")));
-    args.push("-e".into());
-    args.push("TASTE_IDE_CONFINEMENT=container".into());
-    for (key, value) in &spec.env {
-        args.push("-e".into());
-        args.push(format!("{key}={value}"));
-    }
-    args.push(image);
-    args.push(spec.command.clone());
-    args.extend(spec.args.iter().cloned());
-    let program = if sandboxed { "flatpak-spawn" } else { "podman" };
-    (program.to_string(), args)
-}
-
 /// `home` is where `$HOME` is inside the sandbox, `agent_home` what is
 /// mounted there ([`ensure_agent_home`]).
 #[allow(clippy::too_many_arguments)]
@@ -739,83 +589,14 @@ mod tests {
         .1
     }
 
+    /// The relocated agent's home is the mount point the supervisor put
+    /// the environment's home volume at, so its conversations survive a
+    /// container rebuild, and it works at the checkout's real path.
     #[test]
-    fn container_agent_args_keep_flags_paired() {
-        // Regression: "--security-opt" once lost its "label=disable"
-        // value, and podman parsed the value as the image (exit 125).
-        let spec = AgentSpec::new("test", "Test", "npx", &["agent"], &[]);
-        let cwd = Path::new("/work/project");
-        let policy = Path::new("/tmp/gitpolicy");
-        let bridge = (Path::new("/tmp/url.sh"), Path::new("/tmp/urldrop"));
-        for tty in [false, true] {
-            let (program, args) = container_agent_args(
-                &spec,
-                cwd,
-                policy,
-                Path::new("/cache/workspace-stub"),
-                "taste-env-abc-primary-home",
-                None,
-                bridge,
-                tty,
-                "test-image".into(),
-                false,
-            );
-            assert_eq!(program, "podman");
-            for (index, arg) in args.iter().enumerate() {
-                for flag in ["--security-opt", "-v", "-e", "-w"] {
-                    if arg == flag {
-                        let value = args
-                            .get(index + 1)
-                            .unwrap_or_else(|| panic!("{flag} at end of args: {args:?}"));
-                        assert!(
-                            !value.starts_with('-'),
-                            "{flag} followed by flag {value}: {args:?}"
-                        );
-                    }
-                }
-            }
-            assert!(args.iter().any(|a| a == "label=disable"));
-            let pos = args.iter().position(|a| a == "label=disable").unwrap();
-            assert_eq!(args[pos - 1], "--security-opt");
-            assert_eq!(args.iter().any(|a| a == "-t"), tty);
-            // The image comes right before the agent command.
-            let image = args.iter().position(|a| a == "test-image").unwrap();
-            assert_eq!(args[image + 1], "npx");
-        }
-    }
-
-    /// The two container topologies must agree about the agent's home, or
-    /// relocating a chat loses its conversation: the adapter keeps history
-    /// under `$HOME`, so a different volume or a different mount point is
-    /// a different past. Same volume, same path, both sides.
-    #[test]
-    fn both_container_topologies_mount_the_same_agent_home() {
+    fn the_relocated_agent_keeps_its_home_and_its_directory() {
         let spec = AgentSpec::new("claude-code", "Claude", "npx", &["acp"], &[]);
-        let volume = "taste-env-abc123-review-home";
         let cwd = Path::new("/state/environments/abc123/review/repo");
-        let (_, outside) = container_agent_args(
-            &spec,
-            cwd,
-            Path::new("/cache/gitpolicy"),
-            Path::new("/cache/workspace-stub"),
-            volume,
-            None,
-            (Path::new("/tmp/url.sh"), Path::new("/tmp/urldrop")),
-            false,
-            "test-image".into(),
-            false,
-        );
         let home = taste_core::policy::AGENT_HOME_IN_DEVCONTAINER;
-        let joined = outside.join(" ");
-        assert!(joined.contains(&format!("-v {volume}:{home}")), "{joined}");
-        assert!(joined.contains(&format!("-e HOME={home}")), "{joined}");
-        // Never the machine-global volume the single-environment scheme
-        // used: two workspaces sharing one agent home was already wrong.
-        assert!(!joined.contains("taste-agent-home"), "{joined}");
-
-        // ...and the relocated spawn names the same mount point. (It does
-        // not mount the volume: the supervisor already did, which is what
-        // makes the history survive a container rebuild.)
         let (_, inside) = crate::relocate::relocated_agent_command(
             &spec,
             cwd,
@@ -829,9 +610,7 @@ mod tests {
             },
         );
         assert!(inside.contains(&format!("HOME={home}")), "{inside:?}");
-        // And both work in the same directory, at its real host path.
         assert!(inside.contains(&cwd.display().to_string()));
-        assert!(outside.contains(&cwd.display().to_string()));
     }
 
     /// The bridge has to run in the PROJECT devcontainer once the agent
@@ -938,32 +717,6 @@ mod tests {
             .position(|a| a == "sk-ant-taste-abc")
             .unwrap();
         assert!(token < separator);
-
-        let (_, container_args) = container_agent_args(
-            &spec,
-            Path::new("/work/p"),
-            Path::new("/cache/gitpolicy"),
-            Path::new("/cache/workspace-stub"),
-            "taste-env-abc-primary-home",
-            None,
-            (Path::new("/tmp/url.sh"), Path::new("/tmp/urldrop")),
-            false,
-            "test-image".into(),
-            false,
-        );
-        let joined = container_args.join(" ");
-        assert!(joined.contains("-e ANTHROPIC_BASE_URL=http://127.0.0.1:41234"));
-        assert!(joined.contains("-e ANTHROPIC_AUTH_TOKEN=sk-ant-taste-abc"));
-        // ...and before the image, or podman reads them as the command.
-        let image = container_args
-            .iter()
-            .position(|a| a == "test-image")
-            .unwrap();
-        let token = container_args
-            .iter()
-            .position(|a| a == "ANTHROPIC_AUTH_TOKEN=sk-ant-taste-abc")
-            .unwrap();
-        assert!(token < image);
     }
 
     #[test]
