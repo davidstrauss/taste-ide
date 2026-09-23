@@ -150,6 +150,55 @@ pub fn list(exec: &ExecContext, files: &Files, root: &Path) -> Listing {
     }
 }
 
+/// A line as a terminal left it: a task runs in one, so its lines end in
+/// `\r`, and a progress bar redraws itself with bare `\r`s — of which only
+/// what the last one left is what a terminal ended up showing.
+fn terminal_line(line: &str) -> String {
+    let line = line.trim_end_matches('\r');
+    line.rsplit('\r')
+        .find(|part| !part.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A line without its terminal escapes: what an agent reads of a task's
+/// output (`task_output`), where colour is bytes to pay for and nothing to
+/// see. CSI sequences (`ESC [ … final`) and OSC ones (`ESC ] … BEL` or
+/// `ESC \\`) go; anything else is kept.
+pub fn plain_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // A two-character escape (`ESC (`, `ESC =`, …): both go.
+            Some(_) | None => {}
+        }
+    }
+    out
+}
+
 /// `task --list-all --json`'s tasks: `{"tasks": [{"name", "desc", …}]}`.
 fn parse_list_json(bytes: &[u8]) -> Option<Vec<TaskInfo>> {
     let doc: serde_json::Value = serde_json::from_slice(bytes).ok()?;
@@ -340,9 +389,9 @@ impl TaskBoard {
         let (program, argv) = task_command(&[name]);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let spec = if by_agent {
-            exec.resolve_for_agent(program, &argv)
+            exec.resolve_for_agent_in_terminal(program, &argv)
         } else {
-            exec.resolve(program, &argv, false)
+            exec.resolve_in_terminal(program, &argv)
         };
         let mut child = {
             let _in = runtime.enter();
@@ -390,11 +439,11 @@ impl TaskBoard {
             while !(out_done && err_done) {
                 tokio::select! {
                     line = out.next_line(), if !out_done => match line {
-                        Ok(Some(line)) => batch.push(line),
+                        Ok(Some(line)) => batch.push(terminal_line(&line)),
                         _ => out_done = true,
                     },
                     line = err.next_line(), if !err_done => match line {
-                        Ok(Some(line)) => batch.push(line),
+                        Ok(Some(line)) => batch.push(terminal_line(&line)),
                         _ => err_done = true,
                     },
                     _ = flush.tick() => {
@@ -453,6 +502,27 @@ impl TaskBoard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_lines_lose_their_returns_and_keep_what_a_redraw_left() {
+        assert_eq!(terminal_line("   Compiling foo\r"), "   Compiling foo");
+        assert_eq!(terminal_line(" 10%\r 50%\r100%\r"), "100%");
+        assert_eq!(terminal_line("plain"), "plain");
+        assert_eq!(terminal_line("\r"), "");
+    }
+
+    #[test]
+    fn a_plain_line_has_no_escapes() {
+        assert_eq!(
+            plain_line("\u{1b}[1;32m   Compiling\u{1b}[0m foo v0.1"),
+            "   Compiling foo v0.1"
+        );
+        assert_eq!(
+            plain_line("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7}"),
+            "link"
+        );
+        assert_eq!(plain_line("no escapes"), "no escapes");
+    }
 
     /// The line itself, run: an image with only Fedora's `go-task` runs
     /// it with the arguments intact, and one with neither exits 127.

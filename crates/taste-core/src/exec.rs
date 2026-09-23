@@ -302,11 +302,45 @@ impl ExecContext {
         program: &str,
         args: &[&str],
     ) -> CommandSpec {
+        self.resolve_for_agent_with(false, cwd, extra_env, program, args)
+    }
+
+    /// [`Self::resolve`], with a terminal for the command: `podman exec -t`,
+    /// no stdin. What a task runs under, so the tools in it see a terminal
+    /// and colour what they print, as they would in the user's own (David,
+    /// 2026-09-23: "Task log output should be color when possible"). The
+    /// cost is the terminal's: stderr arrives in stdout, and lines end in
+    /// `\r\n`. Measured with a podman client that has no terminal itself.
+    pub fn resolve_in_terminal(&self, program: &str, args: &[&str]) -> CommandSpec {
+        match &*self.target.read().unwrap() {
+            Target::Container { .. } => {
+                self.resolve_with_exec_flags(&["-t".to_string()], None, program, args)
+            }
+            Target::Host => self.host_spec(program, args),
+        }
+    }
+
+    /// [`Self::resolve_for_agent`], in a terminal ([`Self::resolve_in_terminal`]).
+    pub fn resolve_for_agent_in_terminal(&self, program: &str, args: &[&str]) -> CommandSpec {
+        self.resolve_for_agent_with(true, None, &[], program, args)
+    }
+
+    fn resolve_for_agent_with(
+        &self,
+        terminal: bool,
+        cwd: Option<&str>,
+        extra_env: &[(String, String)],
+        program: &str,
+        args: &[&str],
+    ) -> CommandSpec {
         let mut env: Vec<(String, String)> = extra_env.to_vec();
         env.extend(crate::policy::agent_git_config_env());
         match &*self.target.read().unwrap() {
             Target::Container { .. } => {
                 let mut prefix: Vec<String> = Vec::new();
+                if terminal {
+                    prefix.push("-t".into());
+                }
                 for (key, value) in &env {
                     prefix.push("--env".into());
                     prefix.push(format!("{key}={value}"));

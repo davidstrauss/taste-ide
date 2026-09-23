@@ -2742,11 +2742,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         "dev:init",
                         [
                             "$ task dev:init",
-                            "task: [dev:init] go run ./cmd/seed --db $DATABASE_URL",
+                            "\u{1b}[32mtask: [dev:init] go run ./cmd/seed --db $DATABASE_URL\u{1b}[0m",
                             "seed: connecting to postgres://localhost:5432/dev",
                             "seed: dial tcp 127.0.0.1:5432: connect: connection refused",
                             "exit status 1",
-                            "task: Failed to run task \"dev:init\": exit status 1",
+                            "\u{1b}[31mtask: Failed to run task \"dev:init\": exit status 1\u{1b}[0m",
                             "— failed (exit 201) —",
                         ]
                         .map(str::to_string)
@@ -2758,11 +2758,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 editor.open_task(
                     &primary,
                     "build",
+                    // As a run in a terminal prints them: Task's own line
+                    // and cargo's in their colours (`resolve_in_terminal`).
                     [
                         "$ task build",
-                        "task: [build] cargo build --workspace",
-                        "   Compiling taste-core v0.1.0",
-                        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.2s",
+                        "\u{1b}[32mtask: [build] cargo build --workspace\u{1b}[0m",
+                        "\u{1b}[1m\u{1b}[92m   Compiling\u{1b}[0m taste-core v0.1.0",
+                        "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m\u{1b}[1m: unused variable: `row`\u{1b}[0m",
+                        "\u{1b}[1m\u{1b}[92m    Finished\u{1b}[0m `dev` profile [unoptimized + debuginfo] \
+                         target(s) in 41.2s",
                         "— done —",
                     ]
                     .map(str::to_string)

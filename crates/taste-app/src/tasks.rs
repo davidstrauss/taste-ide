@@ -28,7 +28,12 @@ pub fn repair_prompt(name: &str, lines: &[String]) -> (String, (String, String))
     let file = format!("task-{}.log", name.replace([':', '/'], "-"));
     let from = lines.len().saturating_sub(REPAIR_LINES);
     let clipped = from > 0;
-    let log = lines[from..].join("\n");
+    // Plain: the run's colour is for the tab, not for the agent.
+    let log = lines[from..]
+        .iter()
+        .map(|line| taste_core::tasks::plain_line(line))
+        .collect::<Vec<_>>()
+        .join("\n");
     let prompt = format!(
         "Task `{name}` failed in this environment.\n\n\
          WHAT IS TRUE\n\

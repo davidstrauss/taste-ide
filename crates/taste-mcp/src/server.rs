@@ -4512,7 +4512,15 @@ fn task_report(
 ) -> Value {
     let state = board.state(env, name);
     let output = board.lines(env, name);
-    let tail: Vec<&String> = output.iter().rev().take(lines).rev().collect();
+    // Without the terminal's colour: the run is in one so the user's tab
+    // is in colour, and escapes are nothing an agent reads.
+    let tail: Vec<String> = output
+        .iter()
+        .rev()
+        .take(lines)
+        .rev()
+        .map(|line| taste_core::tasks::plain_line(line))
+        .collect();
     let mut out = json!({
         "task": name,
         "state": task_state_word(state),
