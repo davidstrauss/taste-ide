@@ -331,15 +331,14 @@ impl StartupPage {
         card.append(&note);
         card.append(&list);
         card.append(&prompt);
-        let clamp = adw::Clamp::builder()
-            .maximum_size(640)
-            .tightening_threshold(480)
-            .child(&card)
-            .margin_top(24)
-            .margin_bottom(12)
-            .margin_start(24)
-            .margin_end(24)
-            .build();
+        // As wide as the log beneath it, on the same margins: two surfaces
+        // of one page, not a centred card over a wider panel (David,
+        // 2026-09-23: "Make these the same width by expanding the
+        // checklist area").
+        card.set_margin_top(24);
+        card.set_margin_bottom(12);
+        card.set_margin_start(24);
+        card.set_margin_end(24);
 
         // The log the current step is writing, below the checklist: the
         // VM's story until the container's build begins, the environment's
@@ -370,7 +369,7 @@ impl StartupPage {
         vm_log.set_min_lines(5);
         build_log.set_min_lines(5);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        content.append(&clamp);
+        content.append(&card);
         content.append(&logs);
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -783,7 +782,13 @@ impl StartupPage {
         if step.log() != LogKind::Vm {
             return;
         }
-        if let Some(said) = line.strip_prefix("[taste-ide] ") {
+        // The IDE's own step lines are substeps; its markers in the story —
+        // `— the guest's console starts over —` — are not, and say nothing
+        // about what the step is doing.
+        if let Some(said) = line
+            .strip_prefix("[taste-ide] ")
+            .filter(|said| !said.starts_with('—'))
+        {
             let row = self.row(step);
             if row.status.get() == Status::Active {
                 row.set(Status::Active, Some(&substep_words(said)));
