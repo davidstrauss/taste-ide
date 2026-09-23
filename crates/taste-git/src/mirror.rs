@@ -556,63 +556,86 @@ impl GitWorkspace {
             })
             .map(Path::to_path_buf)
             .collect();
+        let skip = |delta: &git2::DiffDelta| {
+            let path = delta.new_file().path().or(delta.old_file().path());
+            path.is_some_and(|p| protected.contains(p))
+        };
+        // Every removal before any write: the delta lists `a` (now a file)
+        // before `a/b` (a file of the directory it replaces), and written
+        // in that order the file met the directory still standing and
+        // failed the pass, every pass (review, 2026-09-23).
         let mut changed = 0;
         for delta in diff.deltas() {
-            let path = delta.new_file().path().or(delta.old_file().path());
-            if path.is_some_and(|p| protected.contains(p)) {
+            if skip(&delta) {
                 continue;
             }
-            let removed = matches!(delta.status(), Delta::Deleted | Delta::Typechange);
-            let written = !matches!(delta.status(), Delta::Deleted);
-            if removed {
+            if matches!(delta.status(), Delta::Deleted | Delta::Typechange) {
                 if let Some(rel) = delta.old_file().path() {
                     self.remove_in_worktree(rel)?;
                 }
             }
-            if written {
-                let Some(rel) = delta.new_file().path() else {
-                    continue;
-                };
-                let file = delta.new_file();
-                if file.mode() == git2::FileMode::Commit {
-                    // A submodule's pointer: nothing to write here.
-                    continue;
+            if matches!(delta.status(), Delta::Deleted) {
+                changed += 1;
+            }
+        }
+        for delta in diff.deltas() {
+            if skip(&delta) || matches!(delta.status(), Delta::Deleted) {
+                continue;
+            }
+            changed += 1;
+            let Some(rel) = delta.new_file().path() else {
+                continue;
+            };
+            let file = delta.new_file();
+            if file.mode() == git2::FileMode::Commit {
+                // A submodule's pointer: nothing to write here.
+                continue;
+            }
+            let absolute = self.checked_path(rel)?;
+            if let Some(parent) = absolute.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("making {}", parent.display()))?;
+            }
+            let blob = self.repo.find_blob(file.id())?;
+            // A path that was a file becoming one, a link, or a directory
+            // the old tree never had: cleared first, so the write below
+            // cannot land through a link.
+            if std::fs::symlink_metadata(&absolute).is_ok_and(|m| m.file_type().is_symlink()) {
+                std::fs::remove_file(&absolute)?;
+            }
+            match file.mode() {
+                git2::FileMode::Link => {
+                    let _ = std::fs::remove_file(&absolute);
+                    let target = std::ffi::OsStr::from_bytes(blob.content());
+                    std::os::unix::fs::symlink(target, &absolute)
+                        .with_context(|| format!("linking {}", absolute.display()))?;
                 }
-                let absolute = self.checked_path(rel)?;
-                if let Some(parent) = absolute.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("making {}", parent.display()))?;
-                }
-                let blob = self.repo.find_blob(file.id())?;
-                // A path that was a file becoming one, a link, or a
-                // directory the old tree never had: cleared first, so the
-                // write below cannot land through a link.
-                if std::fs::symlink_metadata(&absolute).is_ok_and(|m| m.file_type().is_symlink()) {
-                    std::fs::remove_file(&absolute)?;
-                }
-                match file.mode() {
-                    git2::FileMode::Link => {
-                        let _ = std::fs::remove_file(&absolute);
-                        let target = std::ffi::OsStr::from_bytes(blob.content());
-                        std::os::unix::fs::symlink(target, &absolute)
-                            .with_context(|| format!("linking {}", absolute.display()))?;
-                    }
-                    mode => {
-                        std::fs::write(&absolute, blob.content())
-                            .with_context(|| format!("writing {}", absolute.display()))?;
-                        let executable = mode == git2::FileMode::BlobExecutable;
-                        let mut permissions = std::fs::metadata(&absolute)?.permissions();
-                        let bits = permissions.mode();
-                        permissions.set_mode(if executable {
-                            bits | 0o111
-                        } else {
-                            bits & !0o111
-                        });
-                        std::fs::set_permissions(&absolute, permissions)?;
+                mode => {
+                    // Written beside and renamed over, so a file is never
+                    // seen half-written — by the user's editor, a build, or
+                    // a close that stops the pass partway.
+                    let name = absolute.file_name().unwrap_or_default().to_string_lossy();
+                    let staging = absolute.with_file_name(format!(".{name}.taste-mirror"));
+                    std::fs::write(&staging, blob.content())
+                        .with_context(|| format!("writing {}", absolute.display()))?;
+                    let executable = mode == git2::FileMode::BlobExecutable;
+                    let mut permissions = std::fs::metadata(&staging)?.permissions();
+                    let bits = match std::fs::metadata(&absolute) {
+                        Ok(existing) => existing.permissions().mode(),
+                        Err(_) => permissions.mode(),
+                    };
+                    permissions.set_mode(if executable {
+                        bits | 0o111
+                    } else {
+                        bits & !0o111
+                    });
+                    std::fs::set_permissions(&staging, permissions)?;
+                    if let Err(e) = std::fs::rename(&staging, &absolute) {
+                        let _ = std::fs::remove_file(&staging);
+                        return Err(e).with_context(|| format!("writing {}", absolute.display()));
                     }
                 }
             }
-            changed += 1;
         }
         Ok(changed)
     }
@@ -959,6 +982,37 @@ mod tests {
             ws.mirror_from(&main, new_tip, old_snap, false).unwrap(),
             Mirror::Stale
         );
+    }
+
+    #[test]
+    fn a_directory_the_checkout_made_a_file_is_replaced() {
+        let (dir, ws) = repo();
+        fs::create_dir_all(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/b"), "inside\n").unwrap();
+        ws.stage(Path::new("a/b")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+
+        let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::remove_dir_all(vm.join("a")).unwrap();
+            fs::write(vm.join("a"), "a file now\n").unwrap();
+        });
+        assert!(matches!(
+            ws.mirror_from(&main, tip2, snap2, false).unwrap(),
+            Mirror::Applied { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a")).unwrap(),
+            "a file now\n"
+        );
+        let strays: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".taste-mirror"))
+            .collect();
+        assert!(strays.is_empty(), "no staging file is left behind");
     }
 
     #[test]

@@ -97,8 +97,23 @@ impl GitWorkspace {
             ),
             None => None,
         };
+        // The message names the commit the working copy was sitting on, so
+        // a restore can tell what this is a snapshot OF without walking the
+        // chain to find a parent that is on a branch.
+        let message = match &head {
+            Some(commit) => format!("taste snapshot against {}", commit.id()),
+            None => "taste snapshot against an unborn branch".to_string(),
+        };
+        // Unchanged only when the tree AND the commit under it are: a
+        // commit that leaves the working copy as it was (part of the
+        // changes committed, an amended message) still moves what the
+        // snapshot is of, and a snapshot naming the old commit held the
+        // folder's mirror at Stale until the next edit (review,
+        // 2026-09-23).
         if let Some(previous) = &previous {
-            if previous.tree_id() == tree_id {
+            if previous.tree_id() == tree_id
+                && previous.message().map(str::trim) == Some(message.as_str())
+            {
                 return Ok(Snapshot {
                     commit: previous.id(),
                     wrote: false,
@@ -107,13 +122,6 @@ impl GitWorkspace {
         }
 
         let tree = self.repo.find_tree(tree_id)?;
-        // The message names the commit the working copy was sitting on, so
-        // a restore can tell what this is a snapshot OF without walking the
-        // chain to find a parent that is on a branch.
-        let message = match &head {
-            Some(commit) => format!("taste snapshot against {}", commit.id()),
-            None => "taste snapshot against an unborn branch".to_string(),
-        };
         // Parent: the previous snapshot when there is one, so the ref is a
         // history; HEAD for the first, so the chain is rooted in the branch
         // rather than floating free.
@@ -154,6 +162,42 @@ impl GitWorkspace {
         // way, but a deterministic order makes a failure reproducible.
         let mut paths: Vec<PathBuf> = status.into_keys().collect();
         paths.sort();
+
+        // A directory the working copy has made a file, or a link: libgit2
+        // will not put a blob where its base has a tree ("cannot replace
+        // 'tree' with 'blob'"), so every snapshot failed until the change
+        // was committed. Such a directory is cleared from the base first.
+        let replaced: Vec<PathBuf> = paths
+            .iter()
+            .filter(|rel| {
+                base_tree
+                    .get_path(rel)
+                    .is_ok_and(|entry| entry.kind() == Some(git2::ObjectType::Tree))
+                    && std::fs::symlink_metadata(self.workdir.join(rel)).is_ok_and(|m| !m.is_dir())
+            })
+            .cloned()
+            .collect();
+        let base_tree = if replaced.is_empty() {
+            base_tree
+        } else {
+            let mut clear = git2::build::TreeUpdateBuilder::new();
+            for rel in &replaced {
+                clear.remove(rel);
+            }
+            let cleared = clear
+                .create_updated(&self.repo, &base_tree)
+                .context("clearing the directories the working copy replaced")?;
+            self.repo.find_tree(cleared)?
+        };
+        // What was inside them is gone with them.
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|rel| {
+                !replaced
+                    .iter()
+                    .any(|dir| rel != dir && rel.starts_with(dir))
+            })
+            .collect();
 
         let mut builder = git2::build::TreeUpdateBuilder::new();
         for rel in &paths {
@@ -250,12 +294,13 @@ git add -A -- .
 tree=$(git write-tree)
 rm -f "$GIT_INDEX_FILE"
 prev=$(git rev-parse --verify -q "$name" || true)
-if [ -n "$prev" ] && [ "$(git rev-parse "$prev^{{tree}}")" = "$tree" ]; then
+if [ -n "$head" ]; then msg="taste snapshot against $head"; else msg="taste snapshot against an unborn branch"; fi
+if [ -n "$prev" ] && [ "$(git rev-parse "$prev^{{tree}}")" = "$tree" ] \
+   && [ "$(git log -1 --format=%B "$prev")" = "$msg" ]; then
   printf '%s unchanged
 ' "$prev"
   exit 0
 fi
-if [ -n "$head" ]; then msg="taste snapshot against $head"; else msg="taste snapshot against an unborn branch"; fi
 parent="${{prev:-$head}}"
 if [ -n "$parent" ]; then commit=$(git commit-tree "$tree" -p "$parent" -m "$msg"); else commit=$(git commit-tree "$tree" -m "$msg"); fi
 if [ -n "$prev" ]; then git update-ref "$name" "$commit" "$prev"; else git update-ref "$name" "$commit"; fi
@@ -417,6 +462,37 @@ impl GitWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_commit_that_leaves_the_working_copy_as_it_was_is_a_new_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+        drop(repo);
+        let ws = GitWorkspace::discover(dir.path()).unwrap();
+        std::fs::write(dir.path().join("a"), "a\n").unwrap();
+        ws.stage(Path::new("a")).unwrap();
+        ws.commit("first").unwrap();
+        std::fs::write(dir.path().join("a"), "edited\n").unwrap();
+        std::fs::write(dir.path().join("b"), "b\n").unwrap();
+        let before = ws.snapshot_worktree(REF).unwrap();
+        assert!(before.wrote);
+        // Part of it committed: the working copy is what it was, the
+        // commit under it is not.
+        ws.stage(Path::new("b")).unwrap();
+        ws.commit("b").unwrap();
+        let after = ws.snapshot_worktree(REF).unwrap();
+        assert!(
+            after.wrote,
+            "a snapshot naming the old commit would be stale"
+        );
+        assert!(
+            !ws.snapshot_worktree(REF).unwrap().wrote,
+            "and then it is unchanged"
+        );
+    }
 
     /// The script and the library agree byte for byte: run on the same
     /// dirty working copy, both produce the same tree. The script needs
