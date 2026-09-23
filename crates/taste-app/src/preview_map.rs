@@ -175,6 +175,33 @@ impl PreviewMap {
             });
         }
         this.add_controller(drag);
+
+        // The wheel scrolls the document, as it does over the source map
+        // (David, 2026-09-23: "Scrolling over the document minimap works
+        // for code but not markdown preview"): a wheel notch by the step a
+        // scrolled window takes for one — the page's height to the two
+        // thirds — and a touchpad by its own pixels.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        {
+            let weak = this.downgrade();
+            scroll.connect_scroll(move |controller, _dx, dy| {
+                let Some(this) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                let Some(adjustment) = this.imp().adjustment.borrow().clone() else {
+                    return glib::Propagation::Proceed;
+                };
+                let step = match controller.unit() {
+                    gtk::gdk::ScrollUnit::Wheel => adjustment.page_size().powf(2.0 / 3.0),
+                    _ => 1.0,
+                };
+                let top = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+                adjustment
+                    .set_value((adjustment.value() + dy * step).clamp(adjustment.lower(), top));
+                glib::Propagation::Stop
+            });
+        }
+        this.add_controller(scroll);
         this
     }
 
