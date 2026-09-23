@@ -2700,6 +2700,10 @@ impl FileTree {
         // window's own minimum past a 900px screen.
         self.tasks_scroller
             .set_min_content_height(kept_height.min(TASKS_MIN_HEIGHT));
+        // And nothing at all with no row kept: an empty scroller still
+        // takes its scrollbar's height, which read as a blank band under
+        // the section's header whenever a query matched none of its tasks.
+        self.tasks_scroller.set_visible(kept_height > 0);
         *self.task_row_names.borrow_mut() = row_names;
         if let Some(search) = self.search.borrow().as_ref() {
             search.set_panel_hits(crate::search::Panel::Tasks, total);

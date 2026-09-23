@@ -871,6 +871,39 @@ fn duration_words(took: std::time::Duration) -> String {
 
 /// A substep as one short line: the first line, its first letter up,
 /// cut with an ellipsis where a log line runs on.
+/// Programs a line can begin with, spelled as their own names are: never
+/// capitalised at the start of a step's detail.
+const LOWERCASE_NAMES: &[&str] = &[
+    "sshd",
+    "ssh",
+    "podman",
+    "git",
+    "dnf",
+    "microdnf",
+    "rpm",
+    "crun",
+    "conmon",
+    "qemu",
+    "libvirt",
+    "systemd",
+    "passt",
+    "pasta",
+    "npm",
+    "npx",
+    "node",
+    "cargo",
+    "rustc",
+    "go",
+    "task",
+    "just",
+    "make",
+    "pip",
+    "curl",
+    "zincati",
+    "ignition",
+    "rpm-ostree",
+];
+
 fn substep_words(text: &str) -> String {
     // One space between words: podman prints a continued RUN as one line
     // with the Containerfile's indentation still in it, which read as
@@ -882,9 +915,20 @@ fn substep_words(text: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    // A sentence starts with a capital; a program's name keeps its own
+    // spelling. The VM's lines begin with the programs they are about, and
+    // capitalising them wrote "Sshd answers" and "Podman in the guest
+    // answers" (David, 2026-09-23: "It should just be sshd, not Sshd").
+    let first_word = first
+        .split(|c: char| c.is_whitespace() || c == ':' || c == ';' || c == ',')
+        .next()
+        .unwrap_or("");
     let mut chars = first.chars();
     let mut out: String = match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        Some(c) if !LOWERCASE_NAMES.contains(&first_word) => {
+            c.to_uppercase().collect::<String>() + chars.as_str()
+        }
+        Some(_) => first.clone(),
         None => String::new(),
     };
     if out.chars().count() > 96 {
@@ -936,6 +980,14 @@ mod tests {
         assert_eq!(
             substep_words("waiting for the guest's sshd on 127.0.0.1:35551"),
             "Waiting for the guest's sshd on 127.0.0.1:35551"
+        );
+        assert_eq!(
+            substep_words("sshd answers; registering the podman connection"),
+            "sshd answers; registering the podman connection"
+        );
+        assert_eq!(
+            substep_words("podman in the guest answers; the VM is ready"),
+            "podman in the guest answers; the VM is ready"
         );
         assert!(Step::Sweep < Step::Vm && Step::Vm < Step::Build && Step::Build < Step::Ready);
     }

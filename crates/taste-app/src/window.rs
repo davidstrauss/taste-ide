@@ -1166,9 +1166,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
     }
 
+    // The flank scrolls as one, and only when the window is shorter than
+    // its sections' minimum. Filled exactly as before when there is room —
+    // a scrolled window gives its child at least the viewport — but a
+    // banner, the search's row, and every section's results line under a
+    // query asked for more than a 900px window had, and libadwaita said so
+    // on every frame ("AdwToastOverlay exceeds AdwApplicationWindow
+    // height", David, 2026-09-23); a 768px screen could never have fit it.
+    // Horizontal never: the column's width is the ladder's to measure.
+    let flank = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&filetree.widget)
+        .build();
     let outer = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .start_child(&filetree.widget)
+        .start_child(&flank)
         .end_child(&center_and_chat)
         .resize_start_child(false)
         .resize_end_child(true)
