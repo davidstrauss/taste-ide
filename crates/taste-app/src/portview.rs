@@ -506,9 +506,75 @@ impl PortPage {
                 page.forward.set_sensitive(view.can_go_forward());
             });
         }
-        view.load_uri(&self.base_url);
+        self.guard_then_load(&view);
         self.browser_holder.append(&view);
         *self.browser.borrow_mut() = Some(view);
+    }
+
+    /// Load the port's page once the network guard is in place, and not
+    /// before. The page is the project's — the agent's own server — and
+    /// WebKit fetches for it with this host's network: WebKit's own sandbox
+    /// confines the page's process to no files, but what it fetches is the
+    /// network process's, which runs as the IDE does. Unguarded, its
+    /// scripts reach this machine's loopback services and the LAN the VM's
+    /// own network is kept from (`provision::PRIVATE_NETWORKS`). The guard
+    /// is a content blocker ([`network_guard_rules`]), which applies to
+    /// documents, subresources, fetch, XHR, and WebSockets alike; a guard
+    /// that will not compile loads nothing.
+    fn guard_then_load(self: &Rc<Self>, view: &webkit6::WebView) {
+        let Some(port) = self
+            .base_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+        else {
+            self.refuse_load(view, "the port's address names no port to guard");
+            return;
+        };
+        let store = webkit6::UserContentFilterStore::new(
+            &gtk::glib::user_cache_dir()
+                .join("taste-ide/content-filters")
+                .to_string_lossy(),
+        );
+        let rules = gtk::glib::Bytes::from_owned(network_guard_rules(port).into_bytes());
+        let weak = Rc::downgrade(self);
+        let view = view.clone();
+        store.save(
+            &format!("port-{port}"),
+            &rules,
+            None::<&gtk::gio::Cancellable>,
+            move |filter| {
+                let Some(page) = weak.upgrade() else { return };
+                let manager = webkit6::prelude::WebViewExt::user_content_manager(&view);
+                match (filter, manager) {
+                    (Ok(filter), Some(manager)) => {
+                        manager.add_filter(&filter);
+                        view.load_uri(&page.base_url);
+                    }
+                    (Ok(_), None) => {
+                        page.refuse_load(&view, "the browser has no content manager to guard it")
+                    }
+                    (Err(e), _) => page.refuse_load(
+                        &view,
+                        &format!("the browser's network guard did not compile: {e}"),
+                    ),
+                }
+            },
+        );
+    }
+
+    fn refuse_load(&self, view: &webkit6::WebView, reason: &str) {
+        view.load_alternate_html(
+            &error_page(
+                &self.base_url,
+                reason,
+                adw::StyleManager::default().is_dark(),
+                self.port,
+                &self.facts.borrow(),
+            ),
+            &self.base_url,
+            None,
+        );
     }
 
     fn load(self: &Rc<Self>, text: &str) {
@@ -624,6 +690,58 @@ impl PortPage {
 /// its form controls and scrollbars agree with the colours chosen here,
 /// which are the terminal's — the one pair this window already keeps for
 /// text on a plain ground in each theme.
+/// The port browser's network guard, as WebKit content-blocker rules:
+/// every load to a loopback, private, shared, or link-local address, an
+/// IPv6 literal, a single-label host, or a `.local`-style name is blocked,
+/// and then the port's own origin on 127.0.0.1 is let back through — any
+/// scheme, so the dev server's own WebSocket (hot reload) still connects.
+/// Public addresses are left alone: egress is a project's already
+/// (ENVIRONMENTS → "Isolation: the standard, and what meets it"), and a
+/// page's CDN fonts and scripts are how dev servers look. What a name
+/// resolves to cannot be judged from a URL, so a public name pointing at a
+/// private address is not caught here.
+///
+/// The rule syntax has no alternation, which is why each range is a rule
+/// of its own.
+fn network_guard_rules(port: u16) -> String {
+    const BLOCKED: &[&str] = &[
+        r"^[a-z]+://127\.",
+        r"^[a-z]+://0\.",
+        r"^[a-z]+://10\.",
+        r"^[a-z]+://192\.168\.",
+        r"^[a-z]+://169\.254\.",
+        r"^[a-z]+://172\.1[6-9]\.",
+        r"^[a-z]+://172\.2[0-9]\.",
+        r"^[a-z]+://172\.3[01]\.",
+        r"^[a-z]+://100\.6[4-9]\.",
+        r"^[a-z]+://100\.[7-9][0-9]\.",
+        r"^[a-z]+://100\.1[01][0-9]\.",
+        r"^[a-z]+://100\.12[0-7]\.",
+        r"^[a-z]+://\[",
+        // A host with no dot: `localhost`, an intranet name, a router.
+        r"^[a-z]+://[a-z0-9-]+[:/]",
+        r"^[a-z]+://[a-z0-9.-]*\.local[:/]",
+        r"^[a-z]+://[a-z0-9.-]*\.lan[:/]",
+        r"^[a-z]+://[a-z0-9.-]*\.internal[:/]",
+        r"^[a-z]+://[a-z0-9.-]*\.home\.arpa[:/]",
+        r"^[a-z]+://[a-z0-9.-]*\.localhost[:/]",
+    ];
+    let mut rules: Vec<serde_json::Value> = BLOCKED
+        .iter()
+        .map(|filter| {
+            serde_json::json!({
+                "trigger": { "url-filter": filter },
+                "action": { "type": "block" },
+            })
+        })
+        .collect();
+    rules.push(serde_json::json!({
+        "trigger": { "url-filter": format!(r"^[a-z]+://127\.0\.0\.1:{port}/") },
+        "action": { "type": "ignore-previous-rules" },
+    }));
+    serde_json::Value::Array(rules).to_string()
+}
+
 fn error_page(uri: &str, reason: &str, dark: bool, port: u16, facts: &PortFacts) -> String {
     let (fg, bg) = if dark {
         crate::palette::TERMINAL_DARK
@@ -984,6 +1102,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_network_guard_blocks_the_host_and_lets_the_port_through() {
+        let rules: serde_json::Value = serde_json::from_str(&network_guard_rules(3000)).unwrap();
+        let rules = rules.as_array().unwrap();
+        let last = rules.last().unwrap();
+        assert_eq!(last["action"]["type"], "ignore-previous-rules");
+        assert_eq!(
+            last["trigger"]["url-filter"],
+            r"^[a-z]+://127\.0\.0\.1:3000/"
+        );
+        let blocked: Vec<&str> = rules[..rules.len() - 1]
+            .iter()
+            .map(|rule| rule["trigger"]["url-filter"].as_str().unwrap())
+            .collect();
+        for filter in &blocked {
+            assert!(
+                !filter.contains('|'),
+                "no alternation in this syntax: {filter}"
+            );
+        }
+        assert!(blocked.contains(&r"^[a-z]+://127\."));
+        assert!(blocked.contains(&r"^[a-z]+://192\.168\."));
+    }
 
     #[test]
     fn ss_output_names_the_process() {
