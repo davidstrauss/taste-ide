@@ -90,6 +90,11 @@ pub fn clone_local(source: &Path, dest: &Path) -> Result<()> {
     let source = source
         .canonicalize()
         .with_context(|| format!("resolving {}", source.display()))?;
+    // A folder the IDE tracks privately is cloned from that repository.
+    let source = match git2::Repository::discover(&source) {
+        Ok(_) => source,
+        Err(_) => crate::private::find_private(&source).unwrap_or(source),
+    };
     git2::build::RepoBuilder::new()
         .clone_local(git2::build::CloneLocal::NoLinks)
         .clone(&source.to_string_lossy(), dest)

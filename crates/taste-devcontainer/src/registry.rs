@@ -1608,6 +1608,20 @@ impl EnvironmentRegistry {
     pub fn place_primary(&self, vm: &Vm) -> Result<Option<crate::peer::PeerSync>> {
         let primary = self.primary();
         let peer = self.workspace_root.clone();
+        // A folder without git is tracked in a repository of the IDE's own
+        // (`taste_git::private`), so it can be placed like any other.
+        match taste_git::private::ensure_repository(&peer) {
+            Ok(true) => self.note_vm(
+                &vm.domain,
+                format!(
+                    "{} has no git of its own; tracking it in a private repository, the \
+                     folder untouched",
+                    peer.display()
+                ),
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("tracking {}: {e:#}", peer.display()),
+        }
         let Some(host) = taste_git::GitWorkspace::discover(&peer) else {
             tracing::info!(
                 "{} is not a git repository; the primary environment stays on this machine",
@@ -1705,7 +1719,8 @@ impl EnvironmentRegistry {
             // folder has one: git refuses to commit as nobody.
             for key in ["user.name", "user.email"] {
                 let value = std::process::Command::new("git")
-                    .args(["-C", &peer.display().to_string(), "config", "--get", key])
+                    .args(taste_git::private::cli_prefix(&peer))
+                    .args(["config", "--get", key])
                     .output()
                     .ok()
                     .filter(|o| o.status.success())
@@ -1830,6 +1845,17 @@ impl EnvironmentRegistry {
         primary.set_checkout(checkout.clone());
         primary.set_substrate(self.substrate_for(&checkout));
         primary.set_keeper(keeper);
+        // A privately tracked folder's excludes are the checkout's too:
+        // they live in the private repository, not in a .gitignore the
+        // checkout would have, and without them the checkout's snapshots
+        // carry the build output the folder never tracked.
+        if let Some(dir) = taste_git::private::find_private(&peer) {
+            if let Ok(text) = std::fs::read_to_string(dir.join("info/exclude")) {
+                if let Err(e) = files.write(&path.join(".git/info/exclude"), text.as_bytes()) {
+                    tracing::warn!("giving the checkout the folder's excludes: {e}");
+                }
+            }
+        }
         self.note_vm(
             &vm.domain,
             "the panes now read the checkout through the files service; the container comes next",

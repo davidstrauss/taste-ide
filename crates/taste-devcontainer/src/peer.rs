@@ -54,7 +54,7 @@ pub fn guest_url(vm: &Vm, path: &Path) -> String {
 /// Run `git -C <peer> <args>` on this host with the workspace's ssh
 /// identity, and nothing that could ask a question.
 fn git(peer: &Path, keys: &Keys, args: &[String]) -> Result<String> {
-    let mut argv = vec!["-C".to_string(), peer.display().to_string()];
+    let mut argv = taste_git::private::cli_prefix(peer);
     argv.extend(args.iter().cloned());
     let (program, argv) = host_argv(taste_core::podman::sandboxed(), "git", argv);
     let output = std::process::Command::new(&program)
@@ -241,7 +241,7 @@ fn git_streaming(
     progress: &mut dyn FnMut(&GitProgress),
 ) -> Result<()> {
     use std::io::Read;
-    let mut argv = vec!["-C".to_string(), peer.display().to_string()];
+    let mut argv = taste_git::private::cli_prefix(peer);
     argv.extend(args.iter().cloned());
     let (program, argv) = host_argv(taste_core::podman::sandboxed(), "git", argv);
     let mut child = std::process::Command::new(&program)

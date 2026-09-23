@@ -179,8 +179,7 @@ impl Worktree {
         match self {
             Worktree::Local(path) => {
                 let output = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(path)
+                    .args(taste_git::private::cli_prefix(path))
                     .args(args)
                     .envs(taste_git::non_interactive_env())
                     .envs(envs.iter().cloned())

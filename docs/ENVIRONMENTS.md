@@ -3094,6 +3094,18 @@ asked about and ruled out of scope (David, same day):
   and it was chosen over holding those paths back (David, 2026-09-23:
   "Mirror all, note the risk"). Anything that would run such a file
   without the user asking is still the user's host tooling, not this.
+- **A folder without git is tracked privately** (2026-09-23). Placing,
+  snapshotting, and mirroring all travel as git, so a folder with no
+  repository of its own is given one of the IDE's, in
+  `$XDG_STATE_HOME/taste-ide/folders/<name>-<hash>.git` with the folder as
+  its `core.worktree` (`taste_git::private`): the folder never gains a
+  `.git`, its first commit is the folder as it was, and build output and
+  caches are excluded from the start (and the checkout in the VM is given
+  the same excludes). `GitWorkspace::discover` finds it and
+  `private::cli_prefix` names it on every `git` command line. A folder
+  over 50,000 files is refused, so a home directory opened by mistake is
+  not walked into a repository. Each launch sweeps the private
+  repositories whose folder is gone or has since got a `.git` of its own.
 
 ### What does not meet it, and why the VM is the answer
 

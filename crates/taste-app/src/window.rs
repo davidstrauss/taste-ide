@@ -99,6 +99,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         workspace.events.clone(),
         workspace.exec.clone(),
     );
+    // Private repositories nothing needs any more — their folder gone, or
+    // given a .git of its own (taste_git::private) — are swept once per
+    // launch, off the main thread.
+    runtime().spawn_blocking(|| {
+        for dir in taste_git::private::sweep() {
+            tracing::info!("removed the unused private repository {}", dir.display());
+        }
+    });
     let supervisor = environments.primary();
     let primary_env = supervisor.id().clone();
 

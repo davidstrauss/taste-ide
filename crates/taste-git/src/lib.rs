@@ -18,6 +18,7 @@ pub mod merge;
 pub use git2::Oid;
 pub mod mirror;
 pub mod presence;
+pub mod private;
 pub mod refs;
 pub mod review;
 pub mod snapshot;
@@ -272,7 +273,11 @@ impl GitWorkspace {
     }
 
     pub fn discover(root: &Path) -> Option<Self> {
-        let repo = Repository::discover(root).ok()?;
+        // The folder's own repository, else the IDE's private one for a
+        // folder without git (`private`), whose working tree it is.
+        let repo = Repository::discover(root)
+            .ok()
+            .or_else(|| Repository::open(private::find_private(root)?).ok())?;
         let workdir = repo.workdir()?.to_path_buf();
         Some(Self { repo, workdir })
     }
@@ -772,7 +777,7 @@ impl GitWorkspace {
     fn git_command_owned(&self, args: Vec<String>) -> (String, Vec<String>) {
         (
             "git".to_string(),
-            ["-C".to_string(), self.workdir.display().to_string()]
+            private::cli_prefix(&self.workdir)
                 .into_iter()
                 .chain(args)
                 .collect(),
