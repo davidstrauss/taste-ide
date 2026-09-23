@@ -225,13 +225,14 @@ impl McpServer {
              one list of what is wanted. \"The backlog\" and \"an issue\" mean THIS \
              queue — issue_create, issue_list and the other issue_* tools here — never \
              GitHub issues or any other tracker, which are a separate surface you \
-             should not reach for unless asked by name. When the user asks you to do or change \
-             something, write it on the backlog first with issue_create — and before \
-             filing, show them the exact title and body you propose and confirm it, \
-             because the issue is theirs to read later. Skip that confirmation only \
-             when they have asked for a set of backlog items in one go: file the set \
-             and show them the list. Follow-up work you find while working an issue is \
-             a new issue, not a detour.\n\n\
+             should not reach for unless asked by name. When the user asks you to do or \
+             change something, do it where you are. When it is bigger — a feature, work \
+             across many files, anything worth its own review — offer to put it on the \
+             backlog instead, and file it with issue_create only if they agree, showing \
+             them the exact title and body first, because the issue is theirs to read \
+             later. When they ask for a set of backlog items in one go, file the set and \
+             show them the list. Follow-up work you find while working an issue is a new \
+             issue, not a detour.\n\n\
              REPLIES. When a turn ends on a question or a choice for the user — confirm \
              this, pick one of these — call suggest_replies last, with the replies they \
              are likeliest to give, so they can answer with a click.",
@@ -7053,14 +7054,20 @@ mod tests {
                 "{tool} missing from the brief: {coordinator}"
             );
         }
-        // Rule 7 reads the diff through the IDE, and rule 9 sends the work
-        // to the backlog. Neither is inferable from the tool names above.
+        // Rule 7 reads the diff through the IDE, and rule 1 does a change
+        // asked for in place, offering an issue only for bigger work
+        // (David, 2026-09-23: "it's okay to do work right in personal if I
+        // ask for it"). Neither is inferable from the tool names above.
         assert!(
             coordinator.contains("never a cat or a grep in a shell"),
             "{coordinator}"
         );
         assert!(
-            coordinator.contains("implementation is an agent's work on the backlog"),
+            coordinator.contains("A change they ask you to make, make here"),
+            "{coordinator}"
+        );
+        assert!(
+            coordinator.contains("offer to write it up as an issue"),
             "{coordinator}"
         );
         let worker = instructions(&worker_socket).await;
