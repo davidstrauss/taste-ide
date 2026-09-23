@@ -2745,9 +2745,11 @@ impl FileTree {
         // window's own minimum past a 900px screen.
         self.tasks_scroller
             .set_min_content_height(kept_height.min(TASKS_MIN_HEIGHT));
-        // And nothing at all with no row kept: an empty scroller still
-        // takes its scrollbar's height, which read as a blank band under
-        // the section's header whenever a query matched none of its tasks.
+        // And nothing at all with no row kept — no tasks, or a query that
+        // matched none of them: an empty scroller still takes its
+        // scrollbar's height, a blank band under the section's header. (A
+        // second, older line below set it visible again whenever there
+        // were tasks at all, which is why the band outlived this one.)
         self.tasks_scroller.set_visible(kept_height > 0);
         *self.task_row_names.borrow_mut() = row_names;
         if let Some(search) = self.search.borrow().as_ref() {
@@ -2758,7 +2760,6 @@ impl FileTree {
         } else {
             self.tasks_results.show_count(&query, "tasks", total, false);
         }
-        self.tasks_scroller.set_visible(!rows.is_empty());
         match &cannot_run {
             Some(why) => {
                 let mut said = why.clone();
