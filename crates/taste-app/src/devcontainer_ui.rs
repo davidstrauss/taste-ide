@@ -55,6 +55,9 @@ enum ButtonAction {
     /// Hand the primary's agent the repair: what failed, the log's tail,
     /// and how to work (`repair_prompt`).
     PromptAgent,
+    /// Ask the primary's agent to write the definition a project has none
+    /// of (`author_prompt`) — set-up, not repair.
+    AuthorAgent,
 }
 
 /// The faces the strip has while the baseline runs, by what the project's
@@ -273,6 +276,12 @@ impl DevcontainerBanner {
                             .publish(taste_core::Event::Toast("No chat to prompt yet".into())),
                     }
                 }
+                ButtonAction::AuthorAgent => match this.on_prompt_agent.borrow().as_ref() {
+                    Some(send) => send(author_prompt(), None),
+                    None => this
+                        .events
+                        .publish(taste_core::Event::Toast("No chat to prompt yet".into())),
+                },
                 ButtonAction::ViewLog => {
                     this.events.publish(taste_core::Event::ShowDevcontainerLog);
                 }
@@ -575,7 +584,7 @@ impl DevcontainerBanner {
                 self.set_title("Safe mode — no devcontainer");
                 self.action.set(ButtonAction::CreateConfig);
                 self.set_button(Some("Create"));
-                self.set_secondary(None, ButtonAction::PromptAgent);
+                self.set_secondary(Some("Prompt Agent"), ButtonAction::AuthorAgent);
             }
         }
         self.set_revealed(true);
@@ -663,6 +672,10 @@ impl DevcontainerBanner {
                 self.set_title("Safe mode — no devcontainer");
                 self.action.set(ButtonAction::CreateConfig);
                 self.set_button(Some("Create"));
+                // The other way to a definition: the agent writes it
+                // (David, 2026-09-23: "This should have the prompt agent
+                // option on it").
+                self.set_secondary(Some("Prompt Agent"), ButtonAction::AuthorAgent);
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::Stopped => {

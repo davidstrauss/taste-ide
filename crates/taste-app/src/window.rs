@@ -1207,28 +1207,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             )
         });
     }
-    {
-        // The startup page's button: the same repair the banner sends,
-        // from the page that says why the fallback happened — or, for a
-        // project with no definition yet, the authoring of one.
-        let prompt_agent = prompt_agent.clone();
-        let supervisor = supervisor.clone();
-        startup.set_on_prompt_agent(move |kind| {
-            let (prompt, log) = match kind {
-                crate::startup::PromptKind::Repair => {
-                    crate::devcontainer_ui::repair_prompt(&supervisor)
-                }
-                crate::startup::PromptKind::Author => {
-                    (crate::devcontainer_ui::author_prompt(), None)
-                }
-            };
-            prompt_agent(
-                &taste_core::environment::EnvironmentId::primary(),
-                prompt,
-                log,
-            )
-        });
-    }
     toolbar_view.set_content(Some(&surfaces));
 
     // Toasts: transient action outcomes (commit/push/sync failures and the

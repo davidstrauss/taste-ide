@@ -157,7 +157,7 @@ safe-mode banner's running-baseline face;
 `TASTE_PROBE_STARTUP=vm` (or `place` — the checkout's seed partway,
 git's progress as its detail —, `build`, `failed`, `noconfig`, `ready`)
 poses the environment's startup page — the checklist over the stripes,
-the log below, the safe-mode note and Prompt Agent on the fallback faces
+the log below, the safe-mode note on the fallback faces
 — pinned in front of the editor's strip as a real start puts it, which
 otherwise needs a bring-up under way; — the project's config ready to
 rebuild into, its image failed to build (View Log, Prompt Agent),

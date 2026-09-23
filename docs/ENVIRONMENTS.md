@@ -3486,8 +3486,13 @@ from the cache." — the registry's steps through `Event::StartupConcluded`,
 the build's and the container's worked out by the page from the log it
 watched. A pending step is its title alone. The page says why
 when the safe-mode environment is what is coming up — the project's
-devcontainer is missing, or it failed, with the failure — and offers
-Prompt Agent for the repair. The safe-mode environment itself failing is
+devcontainer is missing, or it failed, with the failure — and points at
+the banner for the next step rather than offering a button of its own:
+the page goes when the start succeeds, and a next step that vanishes
+with it is no next step (David, 2026-09-23). The banner's safe-mode faces
+carry it for as long as it applies — Create and Prompt Agent (which asks
+for a definition to be written) when there is none, View Log and Prompt
+Agent (which hands over the repair) when it failed. The safe-mode environment itself failing is
 said apart: that is the machine's setup, the VM provider, or a bug in the
 IDE, and no agent is offered, since there is none to hand it to. The
 banner above the strip says nothing during a start; its faces are the

@@ -16,11 +16,13 @@
 //!
 //! Two kinds of fallback are told apart, because they mean different
 //! things for the person reading (David, same day). A project whose
-//! devcontainer is missing or broken gets the safe-mode environment and
-//! a button that hands the agent the repair: that is the case this page
-//! exists to make ordinary. The safe-mode environment itself failing is
-//! the machine's setup, the VM provider, or a bug in the IDE — said so,
-//! with no agent to prompt, since there is none.
+//! devcontainer is missing or broken gets the safe-mode environment, and
+//! the note says so and where the next step is: the banner, which offers
+//! it once safe mode is up. The page itself offers no button, because it
+//! goes when the start succeeds and a next step that vanishes with it is
+//! no next step (David, 2026-09-23). The safe-mode environment itself
+//! failing is the machine's setup, the VM provider, or a bug in the IDE —
+//! said so, with no agent to prompt, since there is none.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -119,14 +121,6 @@ impl Step {
             Step::Vm
         }
     }
-}
-
-/// What the page's button asks the agent for: the repair of a definition
-/// that failed, or a definition for a project that has none yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptKind {
-    Repair,
-    Author,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,7 +253,6 @@ pub struct StartupPage {
     pub widget: gtk::Widget,
     heading: gtk::Label,
     note: gtk::Label,
-    prompt: gtk::Button,
     rows: Vec<StepRow>,
     logs: gtk::Stack,
     vm_log: Rc<LogPage>,
@@ -280,9 +273,6 @@ pub struct StartupPage {
     area: gtk::DrawingArea,
     offset: Cell<f64>,
     tick: RefCell<Option<gtk::TickCallbackId>>,
-    on_prompt: RefCell<Option<Rc<dyn Fn(PromptKind)>>>,
-    /// What the button asks the agent for, as the note last said.
-    prompt_kind: Cell<PromptKind>,
 }
 
 impl StartupPage {
@@ -303,16 +293,6 @@ impl StartupPage {
             .wrap(true)
             .visible(false)
             .build();
-        let prompt = gtk::Button::builder()
-            .label("Prompt Agent")
-            .tooltip_text(
-                "Hand the agent what failed and the log's tail, and ask it to diagnose and \
-                 repair the devcontainer",
-            )
-            .css_classes(["suggested-action"])
-            .halign(gtk::Align::Start)
-            .visible(false)
-            .build();
         let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         let rows: Vec<StepRow> = Step::ALL
             .iter()
@@ -330,7 +310,6 @@ impl StartupPage {
         card.append(&heading);
         card.append(&note);
         card.append(&list);
-        card.append(&prompt);
         // As wide as the log beneath it, on the same margins: two surfaces
         // of one page, not a centred card over a wider panel (David,
         // 2026-09-23: "Make these the same width by expanding the
@@ -387,7 +366,6 @@ impl StartupPage {
             widget: overlay.upcast(),
             heading,
             note,
-            prompt,
             rows,
             logs,
             vm_log,
@@ -400,8 +378,6 @@ impl StartupPage {
             area,
             offset: Cell::new(0.0),
             tick: RefCell::new(None),
-            on_prompt: RefCell::new(None),
-            prompt_kind: Cell::new(PromptKind::Repair),
         });
         {
             let weak = Rc::downgrade(&this);
@@ -417,23 +393,7 @@ impl StartupPage {
                 );
             });
         }
-        {
-            let weak = Rc::downgrade(&this);
-            this.prompt.connect_clicked(move |_| {
-                let Some(this) = weak.upgrade() else { return };
-                let hook = this.on_prompt.borrow().clone();
-                if let Some(hook) = hook {
-                    hook(this.prompt_kind.get());
-                }
-            });
-        }
         this
-    }
-
-    /// Where the button goes: the primary's chat, with the repair or the
-    /// authoring the note offered.
-    pub fn set_on_prompt_agent(&self, hook: impl Fn(PromptKind) + 'static) {
-        *self.on_prompt.borrow_mut() = Some(Rc::new(hook));
     }
 
     /// The two logs, for the editor to wire their follow state to its
@@ -464,7 +424,6 @@ impl StartupPage {
         self.current.set(None);
         self.heading.set_label("Environment starting");
         self.note.set_visible(false);
-        self.prompt.set_visible(false);
         self.since.set(None);
         self.build_steps.set((0, 0));
         for row in &self.rows {
@@ -650,24 +609,18 @@ impl StartupPage {
                     // the IDE's own, so this is the machine, the VM
                     // provider, or a bug in the IDE. No agent to hand it to.
                     self.heading.set_label("Environment failed");
-                    self.set_note(
-                        &format!(
-                            "The safe-mode environment itself could not start: {first}. This is \
+                    self.set_note(&format!(
+                        "The safe-mode environment itself could not start: {first}. This is \
                              not the project's configuration — it is this machine's setup, the \
                              VM provider, or a bug in the IDE. The Taste IDE log has the detail."
-                        ),
-                        None,
-                    );
+                    ));
                 } else {
                     self.heading.set_label("Falling back to safe mode");
-                    self.set_note(
-                        &format!(
-                            "The project's devcontainer failed: {first}. The safe-mode environment \
+                    self.set_note(&format!(
+                        "The project's devcontainer failed: {first}. The safe-mode environment \
                              is coming up instead, with the tools to fix the definition and \
-                             rebuild; the agent can be handed the repair."
-                        ),
-                        Some(PromptKind::Repair),
-                    );
+                             rebuild; once it is up, the banner above hands the agent the repair."
+                    ));
                 }
             }
             // Not a failure, and never worded as one: a project with no
@@ -683,36 +636,17 @@ impl StartupPage {
                 self.set_note(
                     "This project has no devcontainer definition yet. Safe mode is where one \
                      gets written: a generic container with .devcontainer/ writable, and a \
-                     rebuild into the project's own environment once it exists. The agent can \
-                     write it for you.",
-                    Some(PromptKind::Author),
+                     rebuild into the project's own environment once it exists. Once it is up, \
+                     the banner above creates one or asks the agent to write it.",
                 );
             }
             DevcontainerStateEvent::ConfigDetected | DevcontainerStateEvent::Stopped => {}
         }
     }
 
-    fn set_note(&self, text: &str, prompt: Option<PromptKind>) {
+    fn set_note(&self, text: &str) {
         self.note.set_label(text);
         self.note.set_visible(true);
-        self.prompt.set_visible(prompt.is_some());
-        if let Some(kind) = prompt {
-            self.prompt_kind.set(kind);
-            let (label, tooltip) = match kind {
-                PromptKind::Repair => (
-                    "Prompt Agent",
-                    "Hand the agent what failed and the log's tail, and ask it to diagnose and \
-                     repair the devcontainer",
-                ),
-                PromptKind::Author => (
-                    "Ask Agent to Write It",
-                    "Ask the agent to look at the project and write its devcontainer \
-                     definition, then rebuild into it",
-                ),
-            };
-            self.prompt.set_label(label);
-            self.prompt.set_tooltip_text(Some(tooltip));
-        }
     }
 
     /// The guest image's fetch, unpack, or check: the first step, once per
