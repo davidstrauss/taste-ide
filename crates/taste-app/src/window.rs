@@ -4613,12 +4613,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         environments.set_substrate(std::sync::Arc::new(
             taste_devcontainer::Substrate::not_supervising(),
         ));
-        if let Err(e) = supervisor.recheck() {
-            tracing::warn!("devcontainer recheck failed: {e:#}");
-        }
-        if let Err(e) = environments.watch_config(&supervisor) {
-            tracing::warn!("devcontainer watcher failed: {e:#}");
-        }
+        // Off the GTK thread: a recheck reads the config and asks podman.
+        let supervisor = supervisor.clone();
+        let environments = environments.clone();
+        crate::runtime::runtime().spawn_blocking(move || {
+            if let Err(e) = supervisor.recheck() {
+                tracing::warn!("devcontainer recheck failed: {e:#}");
+            }
+            if let Err(e) = environments.watch_config(&supervisor) {
+                tracing::warn!("devcontainer watcher failed: {e:#}");
+            }
+        });
     }
 
     // --- restore what was last open (XDG state + ACP session/load) -------
@@ -4674,20 +4679,33 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             Err(_) => path.to_path_buf(),
         }
     };
-    let files = workspace.files();
-    for path in &persisted.open_files {
-        let path = rehome(path);
-        if files.is_file(&path) {
-            editor.open_at(&path, None);
+    // Which of them still exist is asked off the GTK thread — each is a
+    // stat, and over the files service a round trip — and the tabs open in
+    // their saved order once it has answered, the active one last so it
+    // ends up in front.
+    {
+        let files = workspace.files();
+        let mut wanted: Vec<PathBuf> = persisted.open_files.iter().map(|p| rehome(p)).collect();
+        if let Some(active) = &persisted.active_file {
+            wanted.push(rehome(active));
         }
+        let editor = editor.clone();
+        glib::spawn_future_local(async move {
+            let present = crate::runtime::runtime()
+                .spawn_blocking(move || {
+                    wanted
+                        .into_iter()
+                        .filter(|path| files.is_file(path))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+            for path in &present {
+                editor.open_at(path, None);
+            }
+            editor.sync_git_state();
+        });
     }
-    if let Some(active) = &persisted.active_file {
-        let active = rehome(active);
-        if files.is_file(&active) {
-            editor.open_at(&active, None);
-        }
-    }
-    editor.sync_git_state();
     // Seven days of stashed conversations is the policy; this is where it
     // gets enforced. Once per window launch, off the main thread, and
     // silent about the common answer of zero — a retention sweep that
@@ -4733,13 +4751,73 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // then asks for does the rest (David, 2026-09-23: "I should be
         // able to just open up Taste, edit and save some files, and close
         // it").
-        let flushed = Rc::new(Cell::new(false));
+        //
+        // Nothing of it is done on the GTK thread: the first close request
+        // gathers what is in memory, hands the state file's read and write,
+        // the VMs' deferred shutdown, and the flush to a worker, and closes
+        // the window again once they are done — the close it then asks for
+        // proceeds.
+        let done = Rc::new(Cell::new(false));
         let primary_for_close = supervisor.clone();
         window.connect_close_request(move |window| {
-            if !flushed.replace(true) && !primary_for_close.checkout().is_local() {
-                let supervisor = primary_for_close.clone();
-                let window = window.clone();
-                glib::spawn_future_local(async move {
+            if done.get() {
+                return glib::Propagation::Proceed;
+            }
+            // What the save needs from this thread, taken now.
+            let granted = supervision.as_ref().is_none_or(|s| s.is_granted());
+            let open = workspace.ide.open_files();
+            let checkout = workspace.checkout_path();
+            let chats_now = chats.snapshot();
+            let root = root.clone();
+            let supervisor = primary_for_close.clone();
+            let remote = !supervisor.checkout().is_local();
+            let window = window.clone();
+            let done = done.clone();
+            glib::spawn_future_local(async move {
+                // Restore state has one owner too, for the same reason the
+                // containers do: two windows on one folder writing one file
+                // is whichever closed last deciding what the other had open.
+                let save = crate::runtime::runtime().spawn_blocking(move || {
+                    if !granted {
+                        return;
+                    }
+                    // The workspace's VMs stop with its window: their memory
+                    // is committed for as long as they run, and nothing in
+                    // them is lost to a warm boot next launch — after a
+                    // grace, which a relaunch inside it cancels
+                    // (`shutdown_deferred`), so closing and reopening does
+                    // not cost a shutdown and a boot. One sleeper for the
+                    // workspace, detached, which lists its VMs itself when
+                    // it fires.
+                    if let Err(e) = taste_devcontainer::LibvirtSession::new().shutdown_deferred(
+                        &root,
+                        taste_devcontainer::provision::CLOSE_SHUTDOWN_GRACE,
+                    ) {
+                        tracing::warn!("deferring the workspace's VM shutdown: {e}");
+                    }
+                    // Update in place: fields owned elsewhere survive
+                    // untouched.
+                    let mut state = taste_core::state::load(&root);
+                    state.root = root.clone();
+                    // Tabs over the checkout are saved as paths in the
+                    // folder the user opened, which is stable across
+                    // launches; the checkout's own path is a VM's and the
+                    // VM may be another next time.
+                    let home = |path: &PathBuf| -> PathBuf {
+                        match path.strip_prefix(&checkout) {
+                            Ok(rel) => root.join(rel),
+                            Err(_) => path.clone(),
+                        }
+                    };
+                    state.open_files = open.iter().map(|f| home(&f.path)).collect();
+                    state.active_file = open.iter().find(|f| f.active).map(|f| home(&f.path));
+                    state.set_chats(chats_now);
+                    if let Err(e) = taste_core::state::save(&root, &state) {
+                        tracing::warn!("saving workspace state failed: {e:#}");
+                    }
+                });
+                let _ = save.await;
+                if remote {
                     let flush = crate::runtime::runtime().spawn(async move {
                         let work = tokio::task::spawn_blocking(move || {
                             let _ = supervisor.snapshot_blocking();
@@ -4756,51 +4834,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             "bringing the folder up to date on close did not finish in 20s"
                         ),
                     }
-                    window.close();
-                });
-                return glib::Propagation::Stop;
-            }
-            // Restore state has one owner too, for the same reason the
-            // containers do: two windows on one folder writing one file is
-            // whichever closed last deciding what the other had open.
-            if supervision.as_ref().is_none_or(|s| s.is_granted()) {
-                // The workspace's VMs stop with its window: their memory is
-                // committed for as long as they run, and nothing in them is
-                // lost to a warm boot next launch. Spawned detached, so the
-                // GTK thread does not wait and the exit that follows does
-                // not cut the signal short.
-                // ...after a grace, which a relaunch inside it cancels
-                // (`shutdown_deferred`), so closing and reopening does
-                // not cost a shutdown and a boot. One sleeper for the
-                // workspace, which lists its VMs itself when it fires.
-                if let Err(e) = taste_devcontainer::LibvirtSession::new()
-                    .shutdown_deferred(&root, taste_devcontainer::provision::CLOSE_SHUTDOWN_GRACE)
-                {
-                    tracing::warn!("deferring the workspace's VM shutdown: {e}");
                 }
-                let open = workspace.ide.open_files();
-                // Update in place: fields owned elsewhere survive untouched.
-                let mut state = taste_core::state::load(&root);
-                state.root = root.clone();
-                // Tabs over the checkout are saved as paths in the folder
-                // the user opened, which is stable across launches; the
-                // checkout's own path is a VM's and the VM may be another
-                // next time.
-                let checkout = workspace.checkout_path();
-                let home = |path: &PathBuf| -> PathBuf {
-                    match path.strip_prefix(&checkout) {
-                        Ok(rel) => root.join(rel),
-                        Err(_) => path.clone(),
-                    }
-                };
-                state.open_files = open.iter().map(|f| home(&f.path)).collect();
-                state.active_file = open.iter().find(|f| f.active).map(|f| home(&f.path));
-                state.set_chats(chats.snapshot());
-                if let Err(e) = taste_core::state::save(&root, &state) {
-                    tracing::warn!("saving workspace state failed: {e:#}");
-                }
-            }
-            glib::Propagation::Proceed
+                done.set(true);
+                window.close();
+            });
+            glib::Propagation::Stop
         });
     }
 
