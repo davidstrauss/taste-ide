@@ -481,6 +481,11 @@ pub struct Supervisor {
     /// cache — which is how an image's packages are refreshed
     /// (`crate::migration`, `Kind::Packages`). Consumed by that build.
     fresh_build: AtomicBool,
+    /// The next start skips the image build when its tag is already there:
+    /// how an environment restarts on the image another environment just
+    /// rebuilt from nothing, rather than building it again. Consumed by
+    /// that start.
+    reuse_image: AtomicBool,
     /// This environment's live channel to its container, if it has one. The
     /// helper on the far end binds the sockets a relocated agent dials, so
     /// this is what makes relocation reachable at all — see
@@ -822,6 +827,7 @@ impl Supervisor {
             hosting: Mutex::new(AgentHosting::Unknown),
             agent_reload: AtomicBool::new(false),
             fresh_build: AtomicBool::new(false),
+            reuse_image: AtomicBool::new(false),
             channel: tokio::sync::Mutex::new(None),
             channel_services: Mutex::new(None),
             running_hash: Mutex::new(None),
@@ -2792,6 +2798,17 @@ impl Supervisor {
         result
     }
 
+    /// Start this environment's container again on the image its tag
+    /// names now, building nothing when the tag is there — the refresh of
+    /// an environment whose image another environment rebuilt from
+    /// nothing today (`crate::migration`).
+    pub async fn restart_on_current_image(&self) -> Result<()> {
+        self.reuse_image.store(true, Ordering::SeqCst);
+        let result = self.reload().await;
+        self.reuse_image.store(false, Ordering::SeqCst);
+        result
+    }
+
     pub async fn reload(&self) -> Result<()> {
         let result = self.reload_reporting().await;
         if self.agent_reload.swap(false, Ordering::SeqCst) {
@@ -3050,11 +3067,27 @@ impl Supervisor {
                 &staged,
                 &self.workspace_key(),
             );
-            if self.fresh_build.swap(false, Ordering::SeqCst) {
+            let reuse = self.reuse_image.swap(false, Ordering::SeqCst)
+                && self
+                    .run_captured(vec!["image".into(), "exists".into(), tag.clone()])
+                    .await
+                    .is_ok();
+            if reuse {
+                self.log(format!(
+                    "starting on {tag} as it stands: another environment rebuilt it with \
+                     updated packages today"
+                ));
+                args.clear();
+            } else if self.fresh_build.swap(false, Ordering::SeqCst) {
                 self.log("building from nothing: the base image pulled, no layer cached, so every package is current".to_string());
                 args.splice(1..1, ["--no-cache".to_string(), "--pull=newer".to_string()]);
             }
-            self.run_logged(args).await.inspect_err(|e| {
+            let built = if args.is_empty() {
+                Ok(())
+            } else {
+                self.run_logged(args).await
+            };
+            built.inspect_err(|e| {
                 if authority == ConfigAuthority::Project {
                     self.remember_build_failure(&config, e);
                 }

@@ -3368,14 +3368,26 @@ removed, the old VM destroyed once nothing of the workspace is left in it,
 and the container started again.
 
 **Packages age too, and are refreshed the same way** (David, 2026-09-22:
-"that too — and with the same notifications and constraints"). An image's
-layers are cached, so its packages are what they were the first time it
-was built; a day after an environment's image was last built from
-nothing, it is rebuilt with `--no-cache --pull=newer` and its container
-restarted on it — the checkout, the uncommitted work, and the
-conversation untouched. The safe-mode baseline keeps its base pinned by
-digest and upgrades the base's packages in its first step, so a build
-from nothing brings those current too. A pending move takes the place of a
+"that too — and with the same notifications and constraints"), with as
+little rebuilding as starting fresh allows ("minimize the work while
+starting fresh frequently"). An image's layers are cached, so its packages
+are what they were the first time it was built. Once a day its package
+manager is asked, as root in a running container, whether anything has an
+update — `dnf check-update`, apt's simulated upgrade, `apk -u list`;
+seconds, where a rebuild is minutes — and an image pulled from a registry
+is asked by pulling it and comparing. Nothing found resets the clock and
+restarts nothing. A refresh becomes pending on a yes, on a manager that
+cannot be asked, and in any case a week after the image's last build from
+nothing, since what a package manager does not see — a tool fetched by
+`curl`, a `pip install` — only a rebuild refreshes. The work is per image
+in a VM, not per environment (`image-freshness.json` beside the
+environments): the first environment on an image rebuilds it with
+`--no-cache --pull=newer`, and the others restart on what it built without
+building, as does an environment whose image was rebuilt since its
+container started. The checkout, the uncommitted work, and the
+conversation are untouched. The safe-mode baseline keeps its base pinned by
+digest and upgrades the base's packages in its first step, so a build from
+nothing brings those current too. A pending move takes the place of a
 refresh, since a new VM holds no cache and builds from nothing anyway.
 
 **Who times a reinstantiation** (`crate::migration`, David, 2026-09-22) —

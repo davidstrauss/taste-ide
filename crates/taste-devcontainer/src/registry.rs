@@ -392,6 +392,10 @@ pub struct EnvironmentRegistry {
     /// Whether the new release's base image is being fetched ahead of the
     /// moves that need it.
     prefetching_guest: AtomicBool,
+    /// Package checks under way, by image, so one image is asked once.
+    image_checks: Mutex<std::collections::BTreeSet<String>>,
+    /// One writer at a time for the image records file.
+    image_records_lock: Mutex<()>,
     /// Test seam: what `statvfs` would have said about the environments'
     /// volume. The floor is the one ceiling whose input the suite has to
     /// substitute for — a unit test cannot fill a disk, and a test that
@@ -471,6 +475,8 @@ impl EnvironmentRegistry {
             relocations_in_flight: Mutex::new(std::collections::BTreeSet::new()),
             relocating: tokio::sync::Mutex::new(()),
             prefetching_guest: AtomicBool::new(false),
+            image_checks: Mutex::new(std::collections::BTreeSet::new()),
+            image_records_lock: Mutex::new(()),
             free_disk_for_tests: Mutex::new(None),
             keepers: Mutex::new(BTreeMap::new()),
             substrates: Mutex::new(BTreeMap::new()),
@@ -3168,10 +3174,13 @@ impl EnvironmentRegistry {
         }
     }
 
-    /// A package refresh recorded for `supervisor` when its image was last
-    /// built from nothing a day or more ago, and cleared when it was not.
-    /// Only for a running container, since one that is not has no image
-    /// in use to age.
+    /// A package refresh recorded for `supervisor` when its image needs
+    /// one — the image its tag names was rebuilt since this container
+    /// started, its package manager has updates, or a week has passed since
+    /// its last build from nothing — and cleared when it does not. The
+    /// daily check is started from here, off the clock's tick. Only for a
+    /// running container: it is what the check runs in and what a refresh
+    /// restarts.
     async fn detect_package_refresh(
         self: &Arc<Self>,
         supervisor: &Arc<Supervisor>,
@@ -3179,6 +3188,7 @@ impl EnvironmentRegistry {
         release: Option<&str>,
         now: u64,
     ) {
+        use crate::migration::{age_words, PACKAGES_BACKSTOP, PACKAGES_CHECK_EVERY};
         let id = supervisor.id().clone();
         let dir = self.env_dir(&id);
         let clear = || {
@@ -3197,31 +3207,45 @@ impl EnvironmentRegistry {
             }
             return;
         }
-        let Some(built) = self.packages_built_at(supervisor).await else {
+        let Some(image) = running_image(supervisor).await else {
             return;
         };
-        let age = now.saturating_sub(built);
-        if age < crate::migration::PACKAGES_STALE_AFTER.as_secs() {
+        let key = format!("{domain}|{}", image.name);
+        let record = self.image_record(&key);
+        let fresh = record.fresh_at.unwrap_or(image.tag_created);
+        let why = if image.running_id != image.tag_id {
+            Some("the image it runs was rebuilt since its container started".to_string())
+        } else if now.saturating_sub(fresh) >= PACKAGES_BACKSTOP.as_secs() {
+            Some(format!(
+                "a week has passed since its last build from nothing ({})",
+                age_words(now.saturating_sub(fresh))
+            ))
+        } else if let Some(found) = record.stale.clone() {
+            Some(found)
+        } else {
+            let checked = record.checked_at.unwrap_or(0).max(fresh);
+            if now.saturating_sub(checked) >= PACKAGES_CHECK_EVERY.as_secs() {
+                self.spawn_image_check(key, supervisor.clone(), image);
+            }
+            None
+        };
+        let Some(why) = why else {
             clear();
             return;
-        }
+        };
         let known = self.migrations.lock().unwrap().get(&id).cloned();
         let migration = match known.or_else(|| crate::migration::Migration::read(&dir)) {
             Some(mut m) if m.kind == crate::migration::Kind::Packages => {
-                m.to_release = crate::migration::age_words(age);
+                m.to_release = why;
                 m
             }
             _ => {
                 taste_core::app_log::push(
                     "info",
                     "environments",
-                    &format!(
-                        "environment {id}'s image was last built from nothing {} ago; its \
-                         packages are refreshed",
-                        crate::migration::age_words(age)
-                    ),
+                    &format!("environment {id} is due updated packages: {why}"),
                 );
-                crate::migration::Migration::packages(domain, release.unwrap_or("?"), age, now)
+                crate::migration::Migration::packages(domain, release.unwrap_or("?"), &why, now)
             }
         };
         if let Err(e) = migration.write(&dir) {
@@ -3230,45 +3254,162 @@ impl EnvironmentRegistry {
         self.migrations.lock().unwrap().insert(id, migration);
     }
 
-    /// Where the last build from nothing of an environment's image is
-    /// recorded.
-    fn packages_record(&self, env: &EnvironmentId) -> PathBuf {
-        self.env_dir(env).join("packages-built-at")
+    /// Where the workspace keeps what is known of its images' packages.
+    fn image_records_path(&self) -> PathBuf {
+        self.environments_base
+            .join(environment::workspace_key(&self.workspace_root))
+            .join("image-freshness.json")
     }
 
-    /// When `supervisor`'s image was last built from nothing: the record
-    /// the refresh writes, or — before there is one — when podman says its
-    /// running container's image was made, which is the oldest its
-    /// packages can be.
-    async fn packages_built_at(&self, supervisor: &Arc<Supervisor>) -> Option<u64> {
-        if let Ok(text) = std::fs::read_to_string(self.packages_record(supervisor.id())) {
-            if let Ok(at) = text.trim().parse() {
-                return Some(at);
-            }
+    fn image_records(&self) -> BTreeMap<String, crate::migration::ImageRecord> {
+        std::fs::read_to_string(self.image_records_path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn image_record(&self, key: &str) -> crate::migration::ImageRecord {
+        self.image_records().remove(key).unwrap_or_default()
+    }
+
+    fn update_image_record(
+        &self,
+        key: &str,
+        change: impl FnOnce(&mut crate::migration::ImageRecord),
+    ) {
+        let _one_writer = self.image_records_lock.lock().unwrap();
+        let mut records = self.image_records();
+        change(records.entry(key.to_string()).or_default());
+        let path = self.image_records_path();
+        let part = path.with_extension("json.part");
+        let written = serde_json::to_string_pretty(&records)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| Ok(std::fs::write(&part, text)?))
+            .and_then(|()| Ok(std::fs::rename(&part, &path)?));
+        if let Err(e) = written {
+            tracing::warn!("recording image {key}: {e:#}");
         }
-        let substrate = supervisor.substrate();
-        let name = supervisor.container_name();
-        tokio::task::spawn_blocking(move || -> Option<u64> {
-            let image = substrate
-                .std_command(&[])
-                .args(["container", "inspect", "--format", "{{.Image}}", &name])
-                .stdin(std::process::Stdio::null())
-                .output()
-                .ok()
-                .filter(|out| out.status.success())?;
-            let image = String::from_utf8_lossy(&image.stdout).trim().to_string();
-            let created = substrate
-                .std_command(&[])
-                .args(["image", "inspect", "--format", "{{.Created.Unix}}", &image])
-                .stdin(std::process::Stdio::null())
-                .output()
-                .ok()
-                .filter(|out| out.status.success())?;
-            String::from_utf8_lossy(&created.stdout).trim().parse().ok()
-        })
-        .await
-        .ok()
-        .flatten()
+    }
+
+    /// Ask the image's package manager, in `supervisor`'s running
+    /// container, whether anything has an update — or, for an image pulled
+    /// from a registry rather than built, whether the registry has a newer
+    /// one — and record the answer for every environment on the image.
+    /// One check per image at a time.
+    fn spawn_image_check(
+        self: &Arc<Self>,
+        key: String,
+        supervisor: Arc<Supervisor>,
+        image: RunningImage,
+    ) {
+        if !self.image_checks.lock().unwrap().insert(key.clone()) {
+            return;
+        }
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let substrate = supervisor.substrate();
+            let container = supervisor.container_name();
+            let built_here = image.name.contains("taste-img-");
+            let name = image.name.clone();
+            let tag_id = image.tag_id.clone();
+            let found = tokio::task::spawn_blocking(move || -> Option<String> {
+                if !built_here {
+                    let pulled = substrate
+                        .std_command(&[])
+                        .args(["pull", "-q", &name])
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())?;
+                    let pulled = String::from_utf8_lossy(&pulled.stdout).trim().to_string();
+                    return Some(
+                        if !pulled.is_empty()
+                            && !tag_id.contains(&pulled)
+                            && !pulled.contains(&tag_id)
+                        {
+                            "updates".to_string()
+                        } else {
+                            "none".to_string()
+                        },
+                    );
+                }
+                let out = substrate
+                    .std_command(&[])
+                    .args([
+                        "exec",
+                        "--user",
+                        "0",
+                        &container,
+                        "sh",
+                        "-c",
+                        crate::migration::PACKAGE_CHECK_SCRIPT,
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .ok()?;
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            })
+            .await
+            .ok()
+            .flatten();
+            let now = now_secs();
+            match found.as_deref() {
+                Some("none") => registry.update_image_record(&key, |r| r.checked_at = Some(now)),
+                Some("updates") => registry.update_image_record(&key, |r| {
+                    r.stale = Some(if built_here {
+                        "package updates are available".to_string()
+                    } else {
+                        "its registry image has a newer build".to_string()
+                    })
+                }),
+                Some(_) => registry.update_image_record(&key, |r| {
+                    r.stale = Some(
+                        "its package manager could not be asked, so it is rebuilt to be sure"
+                            .to_string(),
+                    )
+                }),
+                // The container went away mid-check: asked again next tick.
+                None => {}
+            }
+            registry.image_checks.lock().unwrap().remove(&key);
+        });
+    }
+
+    /// An environment's package refresh: a restart on its image as it
+    /// stands when another environment on it rebuilt it from nothing
+    /// within the day and nothing has been found since, and otherwise a
+    /// rebuild from nothing, recorded for the image so the others reuse it.
+    async fn refresh_image(&self, supervisor: &Arc<Supervisor>) -> Result<()> {
+        let domain = supervisor
+            .checkout()
+            .vm()
+            .map(str::to_string)
+            .unwrap_or_default();
+        let key = running_image(supervisor)
+            .await
+            .map(|image| format!("{domain}|{}", image.name));
+        let now = now_secs();
+        let reuse = key
+            .as_deref()
+            .map(|k| self.image_record(k))
+            .is_some_and(|r| {
+                r.stale.is_none()
+                    && r.fresh_at.is_some_and(|at| {
+                        now.saturating_sub(at) < crate::migration::PACKAGES_CHECK_EVERY.as_secs()
+                    })
+            });
+        if reuse {
+            return supervisor.restart_on_current_image().await;
+        }
+        supervisor.refresh_packages().await?;
+        if let Some(key) = key {
+            self.update_image_record(&key, |r| {
+                r.fresh_at = Some(now);
+                r.checked_at = Some(now);
+                r.stale = None;
+            });
+        }
+        Ok(())
     }
 
     /// The new release's base image, fetched in the background once a move
@@ -3432,8 +3573,8 @@ impl EnvironmentRegistry {
         let outcome = match migration.kind {
             crate::migration::Kind::Guest => self.relocate_inner(env).await,
             crate::migration::Kind::Packages => match self.get(env) {
-                Some(supervisor) => supervisor
-                    .refresh_packages()
+                Some(supervisor) => self
+                    .refresh_image(&supervisor)
                     .await
                     .map(|()| migration.from_vm.clone()),
                 None => Err(anyhow::anyhow!("no environment {env}")),
@@ -3443,9 +3584,6 @@ impl EnvironmentRegistry {
             Ok(domain) => {
                 self.migrations.lock().unwrap().remove(env);
                 crate::migration::Migration::clear(&self.env_dir(env));
-                // Either way its image was just built from nothing: a new
-                // VM holds no cache, and a refresh used none.
-                let _ = std::fs::write(self.packages_record(env), format!("{}\n", now_secs()));
                 let (note, toast, told) = match migration.kind {
                     crate::migration::Kind::Guest => (
                         format!(
@@ -3699,6 +3837,62 @@ impl EnvironmentRegistry {
         }
         Ok(target.domain)
     }
+}
+
+/// The image an environment's running container runs, and what its tag
+/// names now.
+#[derive(Debug, Clone)]
+struct RunningImage {
+    /// The image name the container was made from, e.g.
+    /// `localhost/taste-img-<hash>:latest`.
+    name: String,
+    /// The image the container runs.
+    running_id: String,
+    /// The image the name points at now, and when it was made.
+    tag_id: String,
+    tag_created: u64,
+}
+
+async fn running_image(supervisor: &Arc<Supervisor>) -> Option<RunningImage> {
+    let substrate = supervisor.substrate();
+    let container = supervisor.container_name();
+    tokio::task::spawn_blocking(move || -> Option<RunningImage> {
+        let ask = |args: &[&str]| -> Option<String> {
+            let out = substrate
+                .std_command(&[])
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|out| out.status.success())?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        let running = ask(&[
+            "container",
+            "inspect",
+            "--format",
+            "{{.Image}}|{{.ImageName}}",
+            &container,
+        ])?;
+        let (running_id, name) = running.split_once('|')?;
+        let tag = ask(&[
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}|{{.Created.Unix}}",
+            name,
+        ])?;
+        let (tag_id, created) = tag.split_once('|')?;
+        Some(RunningImage {
+            name: name.to_string(),
+            running_id: running_id.to_string(),
+            tag_id: tag_id.to_string(),
+            tag_created: created.parse().ok()?,
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn now_secs() -> u64 {

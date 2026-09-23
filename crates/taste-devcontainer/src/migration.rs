@@ -10,10 +10,15 @@
 //!   through snapshot and restore, their conversation carried in their
 //!   home volume;
 //! - **the packages** ([`Kind::Packages`]): an image's layers are cached,
-//!   so its packages are what they were the first time it was built;
-//!   a day after its last build from nothing ([`PACKAGES_STALE_AFTER`]),
-//!   the image is rebuilt from nothing — base image pulled, no cache — and
-//!   the container started again on it.
+//!   so its packages are what they were the first time it was built. Once
+//!   a day ([`PACKAGES_CHECK_EVERY`]) its package manager is asked, in a
+//!   running container, whether anything has an update — seconds, where a
+//!   rebuild is minutes — and only a yes (or a manager nobody can ask, or a
+//!   week since the last build from nothing, [`PACKAGES_BACKSTOP`]) makes a
+//!   refresh pending. The refresh is per image, not per environment: the
+//!   first environment on an image rebuilds it from nothing — base pulled,
+//!   no cache — and the others restart on what it built (David,
+//!   2026-09-22: "minimize the work while starting fresh frequently").
 //!
 //! Either restarts the environment's container under its agent, so it is
 //! the agent's to time and the coordinator's to approve, with the same
@@ -45,9 +50,14 @@ pub const TELL_COORDINATOR_AFTER: Duration = Duration::from_secs(60 * 60);
 pub const FORCE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long a move that failed waits before it is tried again.
 pub const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
-/// How old an image's last build from nothing may get before its packages
-/// are refreshed.
-pub const PACKAGES_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often an image's package manager is asked whether it has updates,
+/// and how recent another environment's build from nothing must be for a
+/// refresh to reuse it rather than build again.
+pub const PACKAGES_CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// The longest an image goes without a build from nothing, whatever the
+/// check says: what a package manager does not see — a tool fetched by
+/// `curl`, a `pip install` — is only refreshed by a rebuild.
+pub const PACKAGES_BACKSTOP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// What is out of date, and so what reinstantiating does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -56,7 +66,8 @@ pub enum Kind {
     /// The VM is behind the stream: move to a VM on the current release.
     #[default]
     Guest,
-    /// The image's packages are a day old: rebuild it from nothing.
+    /// The image's packages have updates, or are a week old: rebuild it
+    /// from nothing, or restart on another environment's rebuild of it.
     Packages,
 }
 
@@ -117,14 +128,15 @@ impl Migration {
         }
     }
 
-    /// A package refresh for an environment in `vm`, whose image was last
-    /// built from nothing `age` seconds ago.
-    pub fn packages(vm: &str, release: &str, age: u64, now: u64) -> Self {
+    /// A package refresh for an environment in `vm`, pending because of
+    /// `why` — "package updates are available", "a week has passed since
+    /// its last build from nothing".
+    pub fn packages(vm: &str, release: &str, why: &str, now: u64) -> Self {
         Self {
             kind: Kind::Packages,
-            // For a refresh, `to_release` carries the age, which is what
-            // the words about it say.
-            to_release: age_words(age),
+            // For a refresh, `to_release` carries why, which is what the
+            // words about it say.
+            to_release: why.to_string(),
             ..Self::new(vm, release, release, now)
         }
     }
@@ -149,10 +161,11 @@ impl Migration {
                 self.from_vm, self.from_release, self.to_release, self.to_release
             ),
             Kind::Packages => format!(
-                "Environment {env}'s image was last built from nothing {} ago, so its packages \
-                 are that old. It must be reinstantiated on updated packages: the image is \
-                 rebuilt without the cache and the container restarts on it, in a few minutes; \
-                 the checkout, uncommitted work, and this conversation stay as they are.",
+                "Environment {env}'s image is out of date: {}. It must be reinstantiated on \
+                 updated packages: the image is rebuilt without the cache — or taken as another \
+                 environment already rebuilt it today — and the container restarts on it, in a \
+                 few minutes; the checkout, uncommitted work, and this conversation stay as they \
+                 are.",
                 self.to_release
             ),
         }
@@ -255,6 +268,48 @@ impl Migration {
     }
 }
 
+/// What is known of one image's packages in one VM: the workspace keeps
+/// one of these per image, since environments with one config share an
+/// image, and one check or one rebuild answers for all of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRecord {
+    /// Unix seconds: the image's last build from nothing.
+    #[serde(default)]
+    pub fresh_at: Option<u64>,
+    /// When its package manager last said nothing had an update.
+    #[serde(default)]
+    pub checked_at: Option<u64>,
+    /// What the last check found, when it found something: why the image
+    /// is due a rebuild. Cleared by the rebuild.
+    #[serde(default)]
+    pub stale: Option<String>,
+}
+
+/// The check an image's package manager is asked, as root in a running
+/// container: one word out — `updates`, `none`, or `unknown` for a manager
+/// it cannot ask. dnf's `check-update` exits 100 with updates; apt and apk
+/// are asked after their indexes are refreshed.
+pub const PACKAGE_CHECK_SCRIPT: &str = r#"
+if command -v dnf >/dev/null 2>&1; then
+    dnf -q check-update >/dev/null 2>&1
+    case $? in 100) echo updates ;; 0) echo none ;; *) echo unknown ;; esac
+elif command -v apt-get >/dev/null 2>&1; then
+    if apt-get update -qq >/dev/null 2>&1; then
+        if apt-get -s -qq upgrade 2>/dev/null | grep -q '^Inst '; then echo updates; else echo none; fi
+    else
+        echo unknown
+    fi
+elif command -v apk >/dev/null 2>&1; then
+    if apk update -q >/dev/null 2>&1; then
+        if [ -n "$(apk -u list 2>/dev/null)" ]; then echo updates; else echo none; fi
+    else
+        echo unknown
+    fi
+else
+    echo unknown
+fi
+"#;
+
 /// An image's age as the words about it say it: hours under two days,
 /// days after.
 pub fn age_words(secs: u64) -> String {
@@ -346,14 +401,37 @@ mod tests {
         );
         assert_eq!(age_words(30 * 3600), "30 hours");
         assert_eq!(age_words(50 * 3600), "2 days");
-        let refresh =
-            Migration::packages("taste-a", "44.20260829.3.1", 9 * 86_400, m.pending_since);
+        let refresh = Migration::packages(
+            "taste-a",
+            "44.20260829.3.1",
+            "a week has passed since its last build from nothing (9 days)",
+            m.pending_since,
+        );
         let nudge = refresh.nudge_text("i-0007", refresh.pending_since);
         assert!(
             nudge.contains("9 days") && nudge.contains("without the cache"),
             "{nudge}"
         );
         assert_eq!(refresh.row_words(), "rebuilding with updated packages");
+    }
+
+    /// The check runs in whatever shell the image has, so it is plain sh
+    /// that parses — and on a host with none of the three managers it says
+    /// it cannot ask rather than claiming there is nothing.
+    #[test]
+    fn the_package_check_is_plain_sh_and_admits_when_it_cannot_ask() {
+        let parsed = std::process::Command::new("sh")
+            .args(["-n", "-c", PACKAGE_CHECK_SCRIPT])
+            .status()
+            .unwrap();
+        assert!(parsed.success());
+        // By its path: a PATH set for the child is where Command looks.
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", PACKAGE_CHECK_SCRIPT])
+            .env("PATH", "/nonexistent")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "unknown");
     }
 
     /// A record written before package refreshes reads as a guest move.
