@@ -73,16 +73,9 @@ impl SyncStatus {
         widget.set_widget_name("sync-status");
 
         let heading = gtk::Label::builder()
-            .label("Folder Sync")
+            .label("Local ↔ Virtualized Container Sync")
             .css_classes(["heading"])
             .xalign(0.0)
-            .build();
-        let explainer = gtk::Label::builder()
-            .label("Your folder and Personal's checkout in the VM, kept in step both ways")
-            .css_classes(["caption", "dim-label"])
-            .xalign(0.0)
-            .wrap(true)
-            .max_width_chars(34)
             .build();
 
         // One of Files' progress rows: status, detail, bar.
@@ -138,10 +131,7 @@ impl SyncStatus {
             .margin_end(12)
             .width_request(300)
             .build();
-        let head = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        head.append(&heading);
-        head.append(&explainer);
-        content.append(&head);
+        content.append(&heading);
         content.append(&conflict_row);
         content.append(&current_row);
         content.append(&history_box);
