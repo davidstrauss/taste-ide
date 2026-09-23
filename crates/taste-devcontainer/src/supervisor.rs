@@ -552,6 +552,13 @@ pub struct Supervisor {
     /// found by probing the container after its start
     /// (`Supervisor::probe_capabilities`): each a gap and its remedy.
     capability_gaps: Mutex<Vec<String>>,
+    /// Paths the folder and the checkout both changed, differently
+    /// (`sync_primary_blocking`); the primary's only.
+    folder_conflicts: Mutex<Vec<std::path::PathBuf>>,
+    /// The watch on the user's folder (`watch_folder`), held for its life.
+    folder_watch: Mutex<Option<notify::RecommendedWatcher>>,
+    /// Until when the folder watch ignores changes: the mirror's own.
+    folder_quiet_until: Arc<Mutex<std::time::Instant>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     /// What the container itself wrote (`podman logs`), ring-buffered like
@@ -853,6 +860,9 @@ impl Supervisor {
             failed_build_log: Mutex::new(None),
             hook_failure: Mutex::new(None),
             capability_gaps: Mutex::new(Vec::new()),
+            folder_conflicts: Mutex::new(Vec::new()),
+            folder_watch: Mutex::new(None),
+            folder_quiet_until: Arc::new(Mutex::new(std::time::Instant::now())),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
@@ -1001,6 +1011,10 @@ impl Supervisor {
         let weak = Arc::downgrade(self);
         let pending = self.recheck_pending.clone();
         let snapshot_pending = self.snapshot_pending.clone();
+        let primary = self.env.id.is_primary();
+        if primary {
+            self.watch_folder();
+        }
         // The primary's tree is what the panes show, so its changes over
         // there become the events inotify would have raised here — the
         // editor reloads, the tree restyles, the dots move. Debounced the
@@ -1024,7 +1038,16 @@ impl Supervisor {
             let ref_moved = name == ".git/HEAD"
                 || name == ".git/packed-refs"
                 || name.starts_with(".git/refs/heads/");
-            if ref_moved && !snapshot_pending.swap(true, Ordering::SeqCst) {
+            // And for the primary, any change to its working tree: the
+            // folder mirrors it (`taste_git::mirror`), so a saved file or
+            // an agent's edit reaches the folder two seconds after the
+            // last write of a burst (David, 2026-09-23: "keep my local
+            // checkout/working copy updated from the VM data"). Git's own
+            // files are not the working tree, and a build's output churns
+            // without being anything git would show.
+            let worktree_changed =
+                primary && !name.starts_with(".git/") && name != ".git" && !churn_path(&name);
+            if (ref_moved || worktree_changed) && !snapshot_pending.swap(true, Ordering::SeqCst) {
                 let weak = weak.clone();
                 let snapshot_pending = snapshot_pending.clone();
                 std::thread::spawn(move || {
@@ -1302,7 +1325,7 @@ impl Supervisor {
         // its own; an agent environment's is refs only, and takes the
         // checkout's word whole.
         if self.env.id.is_primary() {
-            crate::peer::sync_primary_peer(&self.env.peer, &vm_info, &keys, &self.files(), &path)?;
+            self.sync_primary_blocking(&vm_info, &keys, &path, false, 0)?;
         } else {
             crate::peer::fetch_from_guest(
                 &self.env.peer,
@@ -1313,6 +1336,157 @@ impl Supervisor {
             )?;
         }
         Ok(())
+    }
+
+    /// The primary's sync, and what follows from it: the folder's own
+    /// changes, once sent, come back as agreement only after the checkout
+    /// is snapshotted again, so that is done here (a pass or two, never a
+    /// loop: `depth` stops it); a conflict is published for the window to
+    /// ask about, and its going is published too.
+    fn sync_primary_blocking(
+        &self,
+        vm: &crate::provision::Vm,
+        keys: &crate::keys::Keys,
+        path: &Path,
+        force: bool,
+        depth: u8,
+    ) -> Result<()> {
+        let sync = crate::peer::sync_primary_peer_with(
+            &self.env.peer,
+            vm,
+            keys,
+            &self.files(),
+            path,
+            force,
+        );
+        // The mirror's own writes into the folder are not the user's: the
+        // folder watch ignores them for a moment.
+        *self.folder_quiet_until.lock().unwrap() =
+            std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let sync = sync?;
+        let had_conflict = !self.folder_conflicts.lock().unwrap().is_empty();
+        if sync.conflicts.is_empty() == had_conflict {
+            self.events.publish(Event::FolderConflict {
+                paths: sync.conflicts.clone(),
+            });
+        }
+        *self.folder_conflicts.lock().unwrap() = sync.conflicts.clone();
+        if sync.sent > 0 && depth < 2 {
+            self.log(format!(
+                "sent {} change(s) from your folder to the checkout in the VM",
+                sync.sent
+            ));
+            let name = taste_git::snapshot_ref(self.env.id.as_str());
+            let script = taste_git::snapshot::script(&name)?;
+            let out = self
+                .files()
+                .exec(path, &["sh".into(), "-c".into(), script])
+                .context("snapshotting the checkout after sending the folder's changes")?;
+            if !out.success() {
+                bail!("snapshotting the checkout: {}", out.stderr_utf8().trim());
+            }
+            return self.sync_primary_blocking(vm, keys, path, false, depth + 1);
+        }
+        Ok(())
+    }
+
+    /// Watch the user's folder — the primary's peer, on this host — so a
+    /// file changed here reaches the checkout (the mirror's other way): a
+    /// sync two seconds after the last change of a burst. Reads are not
+    /// changes, and the mirror reads every file it compares, so an access
+    /// event would be the sync triggering itself (`configwatch` learnt the
+    /// same thing at 96,000 events a second); the sync's own writes are
+    /// quieted for a moment after it.
+    fn watch_folder(self: &Arc<Self>) {
+        use notify::Watcher;
+        let folder = self.env.peer.clone();
+        let weak = Arc::downgrade(self);
+        let pending = Arc::new(AtomicBool::new(false));
+        let quiet = self.folder_quiet_until.clone();
+        let root = folder.clone();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            let Ok(event) = event else { return };
+            if matches!(event.kind, notify::EventKind::Access(_)) {
+                return;
+            }
+            let relevant = event.paths.iter().any(|path| {
+                path.strip_prefix(&root).is_ok_and(|rel| {
+                    let rel = rel.to_string_lossy();
+                    !rel.is_empty()
+                        && rel != ".git"
+                        && !rel.starts_with(".git/")
+                        && !churn_path(&rel)
+                })
+            });
+            if !relevant || std::time::Instant::now() < *quiet.lock().unwrap() {
+                return;
+            }
+            if pending.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let weak = weak.clone();
+            let pending = pending.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                pending.store(false, Ordering::SeqCst);
+                if let Some(supervisor) = weak.upgrade() {
+                    if let Err(e) = supervisor.sync_peer_blocking() {
+                        tracing::warn!("sync after a change in your folder: {e:#}");
+                    }
+                }
+            });
+        });
+        match watcher {
+            Ok(mut watcher) => match watcher.watch(&folder, notify::RecursiveMode::Recursive) {
+                Ok(()) => *self.folder_watch.lock().unwrap() = Some(watcher),
+                Err(e) => tracing::warn!(
+                    "watching {} for changes to send to the checkout: {:#}",
+                    folder.display(),
+                    taste_core::watcher::name_the_inotify_limit(e)
+                ),
+            },
+            Err(e) => tracing::warn!("watching {}: {e}", folder.display()),
+        }
+    }
+
+    /// The paths the folder and the checkout both changed, differently,
+    /// as the last sync found them; empty when they agree.
+    pub fn folder_conflicts(&self) -> Vec<std::path::PathBuf> {
+        self.folder_conflicts.lock().unwrap().clone()
+    }
+
+    /// The user's answer to a conflict between their folder and the
+    /// primary's checkout: `keep_folder` sends every change the folder
+    /// made since they last agreed — the conflicting paths among them —
+    /// into the checkout; otherwise the checkout's side is written over
+    /// the folder. Blocking.
+    pub fn resolve_folder_conflict(&self, keep_folder: bool) -> Result<()> {
+        let Checkout::Remote { vm, path } = self.checkout() else {
+            return Ok(());
+        };
+        let vm_info = self
+            .substrate()
+            .vm_details()
+            .cloned()
+            .with_context(|| format!("{}'s substrate is not its VM {vm}", self.env.id))?;
+        let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+        if keep_folder {
+            let git = taste_git::GitWorkspace::discover(&self.env.peer)
+                .context("the folder is not a git working tree")?;
+            let files = self.files();
+            for change in git.folder_changes()? {
+                crate::peer::send_change(&files, &path, &change)?;
+            }
+            let name = taste_git::snapshot_ref(self.env.id.as_str());
+            let script = taste_git::snapshot::script(&name)?;
+            let out = files.exec(&path, &["sh".into(), "-c".into(), script])?;
+            if !out.success() {
+                bail!("snapshotting the checkout: {}", out.stderr_utf8().trim());
+            }
+            self.sync_primary_blocking(&vm_info, &keys, &path, false, 0)
+        } else {
+            self.sync_primary_blocking(&vm_info, &keys, &path, true, 0)
+        }
     }
 
     /// Give the checkout in the VM the peer's remote-tracking refs, so a
@@ -4170,6 +4344,18 @@ fn first_line(text: &str) -> &str {
 
 /// `--userns=keep-id:uid=U,gid=G` for a non-root container user when the
 /// config has not chosen a user namespace itself; nothing otherwise.
+/// A path a build or a package manager churns, which the mirror's
+/// watches do not react to: none of it is anything git would show in a
+/// project that ignores its build output, and reacting to it would
+/// snapshot the checkout every two seconds through a build. A project
+/// that TRACKS a file under one of these still has it mirrored, on the
+/// next change anywhere else, since the snapshot is the whole working
+/// copy.
+fn churn_path(rel: &str) -> bool {
+    const CHURN: [&str; 6] = ["target", "node_modules", ".cache", "dist", "build", ".venv"];
+    rel.split('/').any(|part| CHURN.contains(&part))
+}
+
 /// Nested podman, end to end and offline: a user namespace, then an image
 /// built FROM scratch and a container run on it — which mounts storage,
 /// sets up `/dev/pts` and `/proc`, starts its network (pasta), and names

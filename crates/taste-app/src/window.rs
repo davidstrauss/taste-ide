@@ -1,7 +1,7 @@
 //! The one window arrangement: files left, editor center, console bottom,
 //! AI chat right. Resizable and collapsible; never rearrangeable.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -4081,6 +4081,65 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // — and the coordinator woken as for any errand.
                     // A task's run, whoever started it: its lines to its
                     // tab, its light to its row.
+                    // The folder and Personal's checkout both changed the
+                    // same paths, differently: nothing was written either
+                    // way, and the user picks a side (David, 2026-09-23:
+                    // "Stop and ask"). Published once as a conflict
+                    // appears; its clearing says nothing.
+                    Event::FolderConflict { paths } if !paths.is_empty() => {
+                        let shown: Vec<String> = paths
+                            .iter()
+                            .take(8)
+                            .map(|p| format!("• {}", p.display()))
+                            .collect();
+                        let more = paths.len().saturating_sub(shown.len());
+                        let body = format!(
+                            "These changed both in your folder and in Personal since they last \
+                             agreed, so neither was written over:\n\n{}{}\n\nUntil you choose, \
+                             your folder stops following Personal.",
+                            shown.join("\n"),
+                            if more > 0 {
+                                format!("\n…and {more} more")
+                            } else {
+                                String::new()
+                            }
+                        );
+                        let dialog = adw::AlertDialog::new(
+                            Some("Your folder and Personal disagree"),
+                            Some(&body),
+                        );
+                        dialog.add_responses(&[
+                            ("later", "Decide Later"),
+                            ("personal", "Keep Personal's"),
+                            ("folder", "Keep My Folder's"),
+                        ]);
+                        dialog
+                            .set_response_appearance("folder", adw::ResponseAppearance::Suggested);
+                        dialog.set_default_response(Some("later"));
+                        dialog.set_close_response("later");
+                        let primary = environments_for_events.primary();
+                        let bus = bus_for_events.clone();
+                        dialog.connect_response(None, move |_, response| {
+                            let keep_folder = match response {
+                                "folder" => true,
+                                "personal" => false,
+                                _ => return,
+                            };
+                            let primary = primary.clone();
+                            let bus = bus.clone();
+                            crate::runtime::runtime().spawn_blocking(move || {
+                                if let Err(e) = primary.resolve_folder_conflict(keep_folder) {
+                                    bus.publish(Event::Toast(format!(
+                                        "The folder and Personal were not reconciled: {e:#}"
+                                    )));
+                                }
+                            });
+                        });
+                        if let Some(window) = window_for_pad.upgrade() {
+                            dialog.present(Some(&window));
+                        }
+                    }
+                    Event::FolderConflict { .. } => {}
                     // An agent's suggested replies, to its own chat.
                     Event::SuggestedReplies { env, replies } => {
                         if let Some(pane) = chats.pane_for(&env) {
@@ -4550,7 +4609,40 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let chats = chats.clone();
         let root = root.clone();
         let supervision = supervision;
-        window.connect_close_request(move |_| {
+        // The folder is the checkout's mirror (taste_git::mirror), so the
+        // last edits reach it before the window goes: the first close
+        // request waits for one snapshot and sync — bounded, so a VM that
+        // does not answer cannot hold the window open — and the close it
+        // then asks for does the rest (David, 2026-09-23: "I should be
+        // able to just open up Taste, edit and save some files, and close
+        // it").
+        let flushed = Rc::new(Cell::new(false));
+        let primary_for_close = supervisor.clone();
+        window.connect_close_request(move |window| {
+            if !flushed.replace(true) && !primary_for_close.checkout().is_local() {
+                let supervisor = primary_for_close.clone();
+                let window = window.clone();
+                glib::spawn_future_local(async move {
+                    let flush = crate::runtime::runtime().spawn(async move {
+                        let work = tokio::task::spawn_blocking(move || {
+                            let _ = supervisor.snapshot_blocking();
+                            supervisor.sync_peer_blocking()
+                        });
+                        tokio::time::timeout(std::time::Duration::from_secs(20), work).await
+                    });
+                    match flush.await {
+                        Ok(Ok(Ok(Ok(())))) => {}
+                        Ok(Ok(Ok(Err(e)))) => {
+                            tracing::warn!("bringing the folder up to date on close: {e:#}")
+                        }
+                        _ => tracing::warn!(
+                            "bringing the folder up to date on close did not finish in 20s"
+                        ),
+                    }
+                    window.close();
+                });
+                return glib::Propagation::Stop;
+            }
             // Restore state has one owner too, for the same reason the
             // containers do: two windows on one folder writing one file is
             // whichever closed last deciding what the other had open.

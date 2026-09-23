@@ -24,7 +24,7 @@
 //! with the user's keys, which is the "no push, ever" the standard makes
 //! (CLAUDE.md → the boundary is the host).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use taste_core::podman::host_argv;
@@ -379,6 +379,16 @@ pub struct PeerSync {
     pub host_behind: usize,
     /// Why the folder was left where it was, when it was.
     pub note: Option<String>,
+    /// The folder was made the checkout's mirror (`taste_git::mirror`):
+    /// its branch, index, and working tree now match the checkout's.
+    pub mirrored: bool,
+    /// The folder's own changes, written into the checkout this pass: the
+    /// checkout has to be snapshotted and synced again for them to come
+    /// back as agreement.
+    pub sent: usize,
+    /// Paths changed on both sides since the last mirror, to different
+    /// content: nothing was written, and the user is asked.
+    pub conflicts: Vec<PathBuf>,
 }
 
 /// Bring the user's folder — the primary's peer — up to date with the
@@ -401,6 +411,27 @@ pub fn sync_primary_peer(
     files: &Files,
     path: &Path,
 ) -> Result<PeerSync> {
+    sync_primary_peer_with(peer, vm, keys, files, path, false)
+}
+
+/// [`sync_primary_peer`], with `force` to write the checkout's side over
+/// paths both sides changed — the user's answer to a conflict.
+///
+/// Then the folder is made the checkout's MIRROR (`taste_git::mirror`):
+/// HEAD onto the checkout's branch, and its working tree onto the
+/// checkout's latest snapshot, both ways — the folder's own changes go to
+/// the checkout first, and a path both changed is a conflict, asked about
+/// (David, 2026-09-23: "I want Taste to keep my local checkout/working
+/// copy updated from the VM data"; "If there isn't a conflict, I want the
+/// sync to be two-way").
+pub fn sync_primary_peer_with(
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+    force: bool,
+) -> Result<PeerSync> {
     fetch_from_guest(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS)?;
     let git = taste_git::GitWorkspace::discover(peer)
         .with_context(|| format!("{} is not a git working tree", peer.display()))?;
@@ -408,6 +439,19 @@ pub fn sync_primary_peer(
         branch: git.branch_name(),
         ..PeerSync::default()
     };
+    // The branch the checkout is on, from its own HEAD: the one the
+    // folder follows.
+    let checkout_branch = files
+        .read_to_string(&path.join(".git/HEAD"))
+        .ok()
+        .and_then(|head| {
+            head.trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_string)
+        });
+    // Whether commits moved between the two this pass, or could not: the
+    // mirror waits for a pass where the branches agree.
+    let mut commits_unsettled = false;
     let clean = git.status().map(|s| s.is_empty()).unwrap_or(false);
     for (name, oid) in git.refs_under(VM_BRANCH_NAMESPACE)? {
         let branch = &name[VM_BRANCH_NAMESPACE.len()..];
@@ -425,6 +469,9 @@ pub fn sync_primary_peer(
         }
         let (ahead, behind) = git.ahead_behind(&local, &name)?;
         match (ahead, behind) {
+            // Behind: the mirror below moves the branch, the index, and the
+            // working tree together, when the checkout is on it.
+            (0, behind) if behind > 0 && checkout_branch.is_some() => {}
             (0, behind) if behind > 0 => {
                 if clean {
                     git.fast_forward_branch(&name)
@@ -439,6 +486,7 @@ pub fn sync_primary_peer(
                 }
             }
             (ahead, 0) if ahead > 0 => {
+                commits_unsettled = true;
                 match push_ahead_into_checkout(peer, vm, keys, files, path, branch) {
                     Ok(None) => sync.pushed = true,
                     // Taken, but its uncommitted work did not come along:
@@ -459,6 +507,7 @@ pub fn sync_primary_peer(
                 }
             }
             (ahead, behind) => {
+                commits_unsettled = true;
                 sync.host_ahead = ahead;
                 sync.host_behind = behind;
                 sync.note = Some(format!(
@@ -468,7 +517,106 @@ pub fn sync_primary_peer(
             }
         }
     }
+    if let (Some(branch), false) = (checkout_branch, commits_unsettled) {
+        mirror_into_folder(&git, &branch, files, path, force, &mut sync)?;
+    }
     Ok(sync)
+}
+
+/// The mirror step of [`sync_primary_peer_with`]: the folder onto the
+/// checkout's `branch` and latest snapshot, the folder's own changes
+/// written into the checkout first.
+fn mirror_into_folder(
+    git: &taste_git::GitWorkspace,
+    branch: &str,
+    files: &Files,
+    path: &Path,
+    force: bool,
+    sync: &mut PeerSync,
+) -> Result<()> {
+    use taste_git::mirror::Mirror;
+    let Some(tip) = git.read_ref(&format!("{VM_BRANCH_NAMESPACE}{branch}"))? else {
+        return Ok(());
+    };
+    let Some(snapshot) = git.read_ref(&taste_git::snapshot_ref("primary"))? else {
+        return Ok(());
+    };
+    match git
+        .mirror_from(branch, tip, snapshot, force)
+        .context("mirroring the checkout into this folder")?
+    {
+        Mirror::Applied { .. } => {
+            sync.mirrored = true;
+            sync.branch = Some(branch.to_string());
+            sync.note = None;
+        }
+        Mirror::Unchanged => sync.mirrored = true,
+        Mirror::Stale => {}
+        Mirror::Outgoing { changes } => {
+            for change in &changes {
+                send_change(files, path, change).with_context(|| {
+                    format!("sending {} to the checkout", change.path.display())
+                })?;
+            }
+            sync.sent = changes.len();
+        }
+        Mirror::Drift { paths } => {
+            sync.note = Some(format!(
+                "{} path(s) changed both here and in the checkout in the VM since they last \
+                 agreed; the folder was left as it is",
+                paths.len()
+            ));
+            sync.conflicts = paths;
+        }
+    }
+    Ok(())
+}
+
+/// One of the folder's changes, written into the checkout at `path` over
+/// the files service: the bytes, the executable bit, a link as a link, a
+/// deletion as a deletion.
+pub fn send_change(files: &Files, path: &Path, change: &taste_git::mirror::Change) -> Result<()> {
+    let target = path.join(&change.path);
+    match &change.content {
+        None => match files.remove(&target, false) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        },
+        Some(bytes) if change.link => {
+            let link_target = String::from_utf8_lossy(bytes).to_string();
+            let out = files.exec(
+                path,
+                &[
+                    "ln".into(),
+                    "-sfn".into(),
+                    link_target,
+                    target.display().to_string(),
+                ],
+            )?;
+            if !out.success() {
+                bail!("linking: {}", out.stderr_utf8().trim());
+            }
+        }
+        Some(bytes) => {
+            if let Some(parent) = target.parent() {
+                files.mkdir_all(parent)?;
+            }
+            files.write(&target, bytes)?;
+            let out = files.exec(
+                path,
+                &[
+                    "chmod".into(),
+                    if change.executable { "+x" } else { "-x" }.into(),
+                    target.display().to_string(),
+                ],
+            )?;
+            if !out.success() {
+                bail!("setting its mode: {}", out.stderr_utf8().trim());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Bring the checkout in the VM up to the folder's `branch`, which is

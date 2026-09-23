@@ -3073,6 +3073,28 @@ asked about and ruled out of scope (David, same day):
   that failed. The same probe checks for Task when the checkout has a
   Taskfile, which Fedora packages as `go-task`; the IDE runs either name.
 
+- **The folder mirrors the checkout, and that widens the line on
+  purpose** (2026-09-23). The user's folder follows the primary's
+  checkout both ways (`taste_git::mirror`, `peer::sync_primary_peer_with`):
+  its HEAD onto the checkout's branch, its index onto that commit, its
+  working tree onto the checkout's latest snapshot, which is `git
+  status`'s working copy, so ignored files are never written or removed.
+  A path changed only in the folder goes to the checkout first, before
+  anything is written back; a path changed on both sides to different
+  content is a conflict, asked about with nothing written either way.
+  Triggers are a working-tree change in the VM or the folder (two seconds
+  after a burst, build churn aside), every snapshot, and the window's
+  close, which waits up to twenty seconds for the last one (David: "I
+  should be able to just open up Taste, edit and save some files, and
+  close it"). **What this concedes:** files an agent wrote, uncommitted,
+  now land in the user's home, and a few kinds are run there — a
+  `.githooks/` under `core.hooksPath`, an `.envrc` under direnv, an
+  editor's task files. Committed work already reached the folder by
+  fast-forward, so this widens an existing path rather than opening one,
+  and it was chosen over holding those paths back (David, 2026-09-23:
+  "Mirror all, note the risk"). Anything that would run such a file
+  without the user asking is still the user's host tooling, not this.
+
 ### What does not meet it, and why the VM is the answer
 
 **The kernel.** A project's `RUN` steps and its `postCreateCommand` are

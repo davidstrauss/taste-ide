@@ -81,6 +81,56 @@ impl GitWorkspace {
     pub fn snapshot_worktree(&self, name: &str) -> Result<Snapshot> {
         self.check_ref_writable(name)?;
 
+        let head = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok());
+        let tree_id = self.worktree_tree()?;
+
+        let expected = self.read_ref(name)?;
+        let previous = match expected {
+            Some(oid) => Some(
+                self.repo
+                    .find_commit(oid)
+                    .with_context(|| format!("{name} does not point at a commit"))?,
+            ),
+            None => None,
+        };
+        if let Some(previous) = &previous {
+            if previous.tree_id() == tree_id {
+                return Ok(Snapshot {
+                    commit: previous.id(),
+                    wrote: false,
+                });
+            }
+        }
+
+        let tree = self.repo.find_tree(tree_id)?;
+        // The message names the commit the working copy was sitting on, so
+        // a restore can tell what this is a snapshot OF without walking the
+        // chain to find a parent that is on a branch.
+        let message = match &head {
+            Some(commit) => format!("taste snapshot against {}", commit.id()),
+            None => "taste snapshot against an unborn branch".to_string(),
+        };
+        // Parent: the previous snapshot when there is one, so the ref is a
+        // history; HEAD for the first, so the chain is rooted in the branch
+        // rather than floating free.
+        let parent = previous.as_ref().or(head.as_ref());
+        let commit = self.commit_tree_to_ref(name, expected, parent, &tree, &message)?;
+        Ok(Snapshot {
+            commit,
+            wrote: true,
+        })
+    }
+
+    /// The working copy as a tree object — the tree a snapshot would
+    /// record, HEAD's with every change `git status` shows laid over it —
+    /// written to the object database and nowhere else: no ref, no index,
+    /// no file touched. What a snapshot commits, and what the mirror
+    /// (`crate::mirror`) compares a folder against.
+    pub fn worktree_tree(&self) -> Result<Oid> {
         // HEAD is the base the changes are overlaid on, so a snapshot's tree
         // is the whole working copy rather than only the diff — a restore
         // wants a checkout, not a patch. An unborn branch has no tree, and
@@ -158,42 +208,7 @@ impl GitWorkspace {
         let tree_id = builder
             .create_updated(&self.repo, &base_tree)
             .context("building the snapshot tree")?;
-
-        let expected = self.read_ref(name)?;
-        let previous = match expected {
-            Some(oid) => Some(
-                self.repo
-                    .find_commit(oid)
-                    .with_context(|| format!("{name} does not point at a commit"))?,
-            ),
-            None => None,
-        };
-        if let Some(previous) = &previous {
-            if previous.tree_id() == tree_id {
-                return Ok(Snapshot {
-                    commit: previous.id(),
-                    wrote: false,
-                });
-            }
-        }
-
-        let tree = self.repo.find_tree(tree_id)?;
-        // The message names the commit the working copy was sitting on, so
-        // a restore can tell what this is a snapshot OF without walking the
-        // chain to find a parent that is on a branch.
-        let message = match &head {
-            Some(commit) => format!("taste snapshot against {}", commit.id()),
-            None => "taste snapshot against an unborn branch".to_string(),
-        };
-        // Parent: the previous snapshot when there is one, so the ref is a
-        // history; HEAD for the first, so the chain is rooted in the branch
-        // rather than floating free.
-        let parent = previous.as_ref().or(head.as_ref());
-        let commit = self.commit_tree_to_ref(name, expected, parent, &tree, &message)?;
-        Ok(Snapshot {
-            commit,
-            wrote: true,
-        })
+        Ok(tree_id)
     }
 }
 

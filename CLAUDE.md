@@ -42,7 +42,10 @@ VM of the pool. The primary's checkout is placed there at reconcile from
 the folder you opened, which becomes its git **peer** (its refs, the
 fetch and push with your keys, the review surfaces); the panes read the
 checkout through the files service (`taste_core::files`, the keeper), and
-the folder's working tree fast-forwards when it is clean. A workspace
+the folder MIRRORS the checkout both ways (`taste_git::mirror`, since
+2026-09-23): its branch, and its working tree less what is ignored, follow
+Personal's; a file changed in the folder goes to the checkout first; a path
+both sides changed is asked about, never overwritten. A workspace
 whose provisioner cannot supply a VM has environments that **refuse to
 start** with the reason on their rows — there is no host rung and no
 `podman machine` (ENVIRONMENTS.md → "There is no rung below VM

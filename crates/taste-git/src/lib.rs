@@ -14,6 +14,7 @@ pub mod clone;
 pub mod issues;
 pub mod mediate;
 pub mod merge;
+pub mod mirror;
 pub mod presence;
 pub mod refs;
 pub mod review;

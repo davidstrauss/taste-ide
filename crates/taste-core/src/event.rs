@@ -150,6 +150,10 @@ pub enum Event {
         env: crate::environment::EnvironmentId,
         name: String,
     },
+    /// The user's folder and the primary's checkout both changed these
+    /// paths, differently, since the folder last mirrored the checkout:
+    /// nothing was written, and the user chooses a side. Empty: resolved.
+    FolderConflict { paths: Vec<std::path::PathBuf> },
     /// An environment's agent offered the user replies to its last
     /// question (`suggest_replies`): its chat shows them as buttons, and a
     /// click sends one as the user's message.
@@ -430,6 +434,7 @@ impl Event {
             | Event::TaskOutput { .. }
             | Event::TaskState { .. }
             | Event::SuggestedReplies { .. }
+            | Event::FolderConflict { .. }
             | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }
