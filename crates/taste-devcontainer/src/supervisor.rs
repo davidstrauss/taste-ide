@@ -548,6 +548,10 @@ pub struct Supervisor {
     /// fixed the command outside any container, blind (David, 2026-09-16:
     /// "So friggin tired of these read/write errors").
     hook_failure: Mutex<Option<String>>,
+    /// What the project needs that its environment turned out not to have,
+    /// found by probing the container after its start
+    /// (`Supervisor::probe_capabilities`): each a gap and its remedy.
+    capability_gaps: Mutex<Vec<String>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     /// What the container itself wrote (`podman logs`), ring-buffered like
@@ -848,6 +852,7 @@ impl Supervisor {
             build_failed: Mutex::new(None),
             failed_build_log: Mutex::new(None),
             hook_failure: Mutex::new(None),
+            capability_gaps: Mutex::new(Vec::new()),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
@@ -1466,6 +1471,15 @@ impl Supervisor {
                 .or_else(|| {
                     self.hook_failure()
                         .map(|message| format!("a lifecycle command failed: {message}"))
+                })
+                .or_else(|| {
+                    let gaps = self.capability_gaps();
+                    (!gaps.is_empty()).then(|| {
+                        format!(
+                            "the environment is up but lacks what the project needs: {}",
+                            gaps.join("; ")
+                        )
+                    })
                 }),
         };
         // The CONFIG decides, not the folder: the IDE makes `.devcontainer/`
@@ -1533,6 +1547,12 @@ impl Supervisor {
     /// `devcontainer_status` say about it.
     pub fn hook_failure(&self) -> Option<String> {
         self.hook_failure.lock().unwrap().clone()
+    }
+
+    /// What the last start's probes found missing, each with its remedy
+    /// (`probe_capabilities`). Empty when nothing was, or nothing asked.
+    pub fn capability_gaps(&self) -> Vec<String> {
+        self.capability_gaps.lock().unwrap().clone()
     }
 
     /// The forwarded ports of the config this environment last resolved,
@@ -3003,8 +3023,10 @@ impl Supervisor {
                 return Err(e);
             }
         };
-        // A new start is a new chance for the lifecycle commands.
+        // A new start is a new chance for the lifecycle commands, and a
+        // new image a new answer to what it has.
         self.hook_failure.lock().unwrap().take();
+        self.capability_gaps.lock().unwrap().clear();
         // An automatic start sets a project config aside for the baseline
         // when its image has never been built: building it runs the
         // config's lifecycle commands, and that is the user's Rebuild (or
@@ -3388,6 +3410,10 @@ impl Supervisor {
             }
         }
 
+        if authority == ConfigAuthority::Project {
+            self.probe_capabilities(&config, &name, &workdir).await;
+        }
+
         // Success: record the hash, clear drift, re-point execution.
         *self.running_hash.lock().unwrap() = Some(hash);
         *self.authority.lock().unwrap() = authority;
@@ -3399,6 +3425,72 @@ impl Supervisor {
         self.probe_container().await;
         self.set_state(SupervisorState::Running { container_id });
         Ok(())
+    }
+
+    /// Ask the started container for what the project will need of it,
+    /// and remember each gap with its remedy (`capability_gaps`).
+    ///
+    /// These are the dead ends an agent writing a devcontainer met only by
+    /// failing, each a fact about one distribution or one image build
+    /// rather than about the project (2026-09-23): Task packaged under
+    /// another name, nested podman's `newuidmap` stripped of its file
+    /// capabilities by the image build, the user's subordinate IDs outside
+    /// the container's range, fuse-overlayfs missing. The container is up
+    /// either way, so a gap is reported, never fatal; what it buys is that
+    /// the agent reads the remedy in its next prompt, rather than finding
+    /// the cause by bisecting its own Containerfile. As the container's
+    /// user, in its workdir, since that is who runs the project's work.
+    async fn probe_capabilities(&self, config: &DevcontainerConfig, name: &str, workdir: &str) {
+        let mut gaps = Vec::new();
+        let exec = |script: &str| {
+            let mut args: Vec<String> =
+                vec!["exec".into(), "--workdir".into(), workdir.to_string()];
+            if let Some(user) = config.effective_user() {
+                args.push("--user".into());
+                args.push(user.to_string());
+            }
+            args.extend([
+                name.to_string(),
+                "sh".into(),
+                "-c".into(),
+                script.to_string(),
+            ]);
+            args
+        };
+        let has_taskfile = taste_core::conventions::TASKFILE_NAMES
+            .iter()
+            .any(|file| self.exists_in_checkout(&self.checkout().path().join(file)));
+        if has_taskfile {
+            let found = self
+                .podman(&exec("command -v task || command -v go-task"))
+                .output()
+                .await
+                .is_ok_and(|out| out.status.success());
+            self.log(format!(
+                "check: task (the project has a Taskfile) — {}",
+                if found { "ok" } else { "missing" }
+            ));
+            if !found {
+                gaps.push(
+                    "task (taskfile.dev) is not in the image, as task or as Fedora's go-task; \
+                     install it in the Containerfile (Fedora: dnf install go-task)"
+                        .to_string(),
+                );
+            }
+        }
+        if crate::security::asks_for_nesting(config) {
+            let gap = match self.podman(&exec(NESTING_PROBE)).output().await {
+                Ok(out) if out.status.success() => None,
+                Ok(out) => Some(nesting_gap(&String::from_utf8_lossy(&out.stdout))),
+                Err(e) => Some(format!("nested podman could not be checked: {e}")),
+            };
+            self.log(format!(
+                "check: nested podman (the config is privileged) — {}",
+                gap.as_deref().unwrap_or("ok")
+            ));
+            gaps.extend(gap);
+        }
+        *self.capability_gaps.lock().unwrap() = gaps;
     }
 
     /// The `--userns` flag the run wants, if the config chose none and the
@@ -4078,6 +4170,56 @@ fn first_line(text: &str) -> &str {
 
 /// `--userns=keep-id:uid=U,gid=G` for a non-root container user when the
 /// config has not chosen a user namespace itself; nothing otherwise.
+/// Nested podman, end to end and offline: a user namespace, then an image
+/// built FROM scratch and a container run on it — which mounts storage and
+/// sets up `/dev/pts` and `/proc` exactly as a real one does — with an
+/// executable that does not exist, so reaching exit 127 means everything
+/// before the exec worked. It prints the stage that failed and podman's
+/// `Error:` line; the IDE's remedy is chosen from them (`nesting_gap`).
+const NESTING_PROBE: &str = r#"say() { printf '%s %s\n' "$1" "$(printf '%s\n' "$2" | grep -m1 -E 'uid_map|gid_map|Error:' || printf '%s\n' "$2" | grep -v '^[[:space:]]*$' | tail -n1)"; }
+command -v podman >/dev/null || { echo "missing podman"; exit 1; }
+out=$(podman unshare true 2>&1) || { say userns "$out"; exit 1; }
+d=$(mktemp -d); printf 'FROM scratch\nLABEL taste.probe=1\n' > "$d/Containerfile"
+out=$(podman build -q -t localhost/taste-ide-probe "$d" 2>&1); rc=$?; rm -rf "$d"
+[ $rc = 0 ] || { say storage "$out"; exit 1; }
+out=$(podman run --rm --network=none localhost/taste-ide-probe /taste-ide-probe 2>&1); rc=$?
+podman rmi -f localhost/taste-ide-probe >/dev/null 2>&1
+[ $rc = 127 ] || { say run "$out"; exit 1; }"#;
+
+/// A failed nesting probe's report, as the gap and what to change. Each
+/// remedy is one measured in a Fedora CoreOS 44 guest against an image
+/// built the way an agent builds one (2026-09-23): setuid on `newuidmap`
+/// did NOT fix it there, a `setcap` in a RUN step after the package
+/// install did.
+fn nesting_gap(report: &str) -> String {
+    let report = report.trim();
+    let (stage, said) = report.split_once(' ').unwrap_or((report, ""));
+    let remedy = if stage == "missing" {
+        "install podman and fuse-overlayfs in the Containerfile"
+    } else if said.contains("should have setuid or have filecaps") {
+        "newuidmap and newgidmap lost their file capabilities in the image build; after the \
+         package install, add RUN setcap cap_setuid+ep /usr/bin/newuidmap && setcap \
+         cap_setgid+ep /usr/bin/newgidmap"
+    } else if said.contains("uid_map") || said.contains("gid_map") || said.contains("subuid") {
+        "the user's subordinate IDs are outside the container's range (0-65536; useradd's \
+         default is not); for a user with uid 1000, write USER:1:999 and USER:1001:64535 to \
+         /etc/subuid and /etc/subgid"
+    } else if said.contains("fuse-overlayfs") || said.contains("mount program") {
+        "container storage is on the container's overlay root and needs fuse-overlayfs; \
+         install fuse-overlayfs in the Containerfile"
+    } else {
+        "podman's error above is the cause"
+    };
+    // podman's cause is at the END of its line, after the storage paths
+    // and container ids: keep that end.
+    let said = match said.char_indices().rev().nth(179) {
+        _ if said.is_empty() => "no output".to_string(),
+        Some((cut, _)) => format!("…{}", &said[cut..]),
+        None => said.to_string(),
+    };
+    format!("nested podman fails at {stage} ({said}); {remedy}")
+}
+
 fn keep_id_flag(run_args: &[String], uid: u32, gid: u32) -> Option<String> {
     if run_args.iter().any(|arg| arg.starts_with("--userns")) || uid == 0 {
         return None;
@@ -4729,6 +4871,37 @@ mod tests {
     /// exactly as it was before the baseline existed — it does not get to
     /// *replace* the baseline, and the reason is reported rather than
     /// swallowed. The untrusted-repo gate runs before the rung is chosen.
+    /// The probe's reports as the guest printed them (2026-09-23), each to
+    /// the remedy measured for it.
+    #[test]
+    fn a_nesting_report_names_its_remedy() {
+        let caps = nesting_gap(
+            "userns Error: cannot set up namespace using \"/usr/bin/newuidmap\": should have \
+             setuid or have filecaps setuid: exit status 1",
+        );
+        assert!(
+            caps.contains("setcap cap_setuid+ep /usr/bin/newuidmap"),
+            "{caps}"
+        );
+        let ids = nesting_gap(
+            "userns time=\"…\" level=error msg=\"running `/usr/bin/newuidmap 13 0 1000 1 1 \
+             524288 65536`: newuidmap: write to uid_map failed: Operation not permitted\"",
+        );
+        assert!(ids.contains("/etc/subuid"), "{ids}");
+        let fuse = nesting_gap(&format!(
+            "storage Error: mounting new container: {}: using mount program \
+             /usr/bin/fuse-overlayfs: fuse: device /dev/fuse not found. Kernel module not loaded?",
+            "x".repeat(400)
+        ));
+        assert!(fuse.contains("install fuse-overlayfs"), "{fuse}");
+        assert!(
+            fuse.contains("/dev/fuse not found"),
+            "the cause survives the cut: {fuse}"
+        );
+        assert!(fuse.len() < 500, "{fuse}");
+        assert!(nesting_gap("missing podman").contains("install podman"));
+    }
+
     #[test]
     fn a_config_the_validator_refuses_does_not_become_the_environment() {
         let dir = tempfile::tempdir().unwrap();

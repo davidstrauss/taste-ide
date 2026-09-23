@@ -3044,10 +3044,21 @@ asked about and ruled out of scope (David, same day):
   while `unmask` is podman's word alone. What it widens is the container's
   reach into its own VM, whose kernel is not the user's; the line this
   section defends is the host, and nothing about it moves. The image
-  supplies the rest: podman itself, and subordinate IDs for its user
-  inside the container's range (a `keep-id` container has IDs 0–65536,
-  and `useradd`'s default range starts at 100000), which the authoring
-  prompt spells out.
+  supplies the rest, and each part of it was a dead end an agent met only
+  by failing, measured against an image built the way an agent builds one:
+  podman and fuse-overlayfs; `newuidmap` and `newgidmap` given their file
+  capabilities back with a `setcap` in a RUN step after the package
+  install (the image build drops them, and making them setuid instead did
+  NOT work); and subordinate IDs for its user inside the container's range
+  (a `keep-id` container has IDs 0–65536, and `useradd`'s default range is
+  not in it). The authoring prompt spells that recipe out, and after every
+  start of a privileged config the supervisor probes the container for it
+  (`Supervisor::probe_capabilities`: a user namespace, then an image built
+  FROM scratch and a container run on it, offline). A gap is reported,
+  never fatal — the container is up — as the failure in the `environment`
+  tool and the agent's next orientation, with the remedy for the stage
+  that failed. The same probe checks for Task when the checkout has a
+  Taskfile, which Fedora packages as `go-task`; the IDE runs either name.
 
 ### What does not meet it, and why the VM is the answer
 

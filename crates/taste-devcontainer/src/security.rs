@@ -95,6 +95,16 @@ const ALLOWED_DEVICES: &[&str] = &["/dev/fuse"];
 /// asking for it could still want (`privileged_run_args`).
 pub const STRIPPED_FLAGS: &[&str] = &["--privileged"];
 
+/// Whether the config asks for a container engine inside the container:
+/// privileged, or stating nesting's SELinux domain itself. What decides
+/// that the started container is probed for it.
+pub fn asks_for_nesting(config: &DevcontainerConfig) -> bool {
+    !privileged_run_args(config).is_empty()
+        || config.run_args.iter().any(|arg| {
+            arg.contains("label=type:container_engine_t") || arg.contains("label=disable")
+        })
+}
+
 /// What a config's own request for privilege becomes: the nesting set,
 /// once, when `runArgs` carries `--privileged` or the spec's top-level
 /// `"privileged": true` is set, and nothing otherwise. The supervisor

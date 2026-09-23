@@ -75,6 +75,25 @@ pub enum Listing {
     },
 }
 
+/// `task`, under whichever of its two names the image has, with `args`:
+/// the program and argv to resolve in the container.
+///
+/// Fedora packages Task as `go-task`, binary and all, so an image that
+/// installed it the obvious way had no `task` and the section said it was
+/// not installed — a dead end an agent met writing a devcontainer, with the
+/// tool sitting right there (2026-09-23). The shell finds either and hands
+/// over with `exec`, so there is one process, and exits 127 when neither
+/// exists, which is what "not installed" is read from.
+fn task_command(args: &[&str]) -> (&'static str, Vec<String>) {
+    let mut argv = vec![
+        "-c".to_string(),
+        "t=$(command -v task || command -v go-task) || exit 127; exec \"$t\" \"$@\"".to_string(),
+        "task".to_string(),
+    ];
+    argv.extend(args.iter().map(|arg| arg.to_string()));
+    ("sh", argv)
+}
+
 /// The tasks of the checkout at `root`, as `task` in the environment
 /// lists them, else as the Taskfile names them. Blocking: a stat, maybe a
 /// read, and a process in the container.
@@ -86,7 +105,9 @@ pub fn list(exec: &ExecContext, files: &Files, root: &Path) -> Listing {
         return Listing::NoTaskfile;
     }
     let cannot_run = if exec.has_exec_target() {
-        let spec = exec.resolve("task", &["--list-all", "--json"], false);
+        let (program, argv) = task_command(&["--list-all", "--json"]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let spec = exec.resolve(program, &argv, false);
         match std::process::Command::new(&spec.program)
             .args(&spec.args)
             .stdin(std::process::Stdio::null())
@@ -104,8 +125,8 @@ pub fn list(exec: &ExecContext, files: &Files, root: &Path) -> Listing {
             Ok(out) => {
                 let said = String::from_utf8_lossy(&out.stderr);
                 if said.contains("executable file not found") || out.status.code() == Some(127) {
-                    "task is not installed in the environment; add it to the devcontainer's \
-                     image (taskfile.dev/installation) to list and run these tasks"
+                    "task is not installed in the environment (as task, or as Fedora's \
+                     go-task); add it to the devcontainer's image to list and run these tasks"
                         .to_string()
                 } else {
                     format!(
@@ -316,10 +337,12 @@ impl TaskBoard {
         if self.state(env, name) == RunState::Running {
             return Err(format!("{name} is already running"));
         }
+        let (program, argv) = task_command(&[name]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let spec = if by_agent {
-            exec.resolve_for_agent("task", &[name])
+            exec.resolve_for_agent(program, &argv)
         } else {
-            exec.resolve("task", &[name], false)
+            exec.resolve(program, &argv, false)
         };
         let mut child = {
             let _in = runtime.enter();
@@ -430,6 +453,31 @@ impl TaskBoard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The line itself, run: an image with only Fedora's `go-task` runs
+    /// it with the arguments intact, and one with neither exits 127.
+    #[test]
+    fn task_runs_under_either_name_and_127_names_neither() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let run = |path: &std::path::Path| {
+            let (program, argv) = task_command(&["--list-all", "a b"]);
+            assert_eq!(program, "sh");
+            std::process::Command::new("/bin/sh")
+                .args(&argv)
+                .env("PATH", path)
+                .output()
+                .unwrap()
+        };
+        let neither = run(dir.path());
+        assert_eq!(neither.status.code(), Some(127));
+        let go_task = dir.path().join("go-task");
+        std::fs::write(&go_task, "#!/bin/sh\nprintf '%s|' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&go_task, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let found = run(dir.path());
+        assert!(found.status.success(), "{found:?}");
+        assert_eq!(String::from_utf8_lossy(&found.stdout), "--list-all|a b|");
+    }
 
     #[test]
     fn namespaced_tasks_sit_under_their_namespace() {

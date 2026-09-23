@@ -736,20 +736,22 @@ pub(crate) fn author_prompt() -> String {
      .devcontainer/devcontainer.json that builds it with \
      \"build\": {\"dockerfile\": \"Containerfile\"}. Keep it usable by VS Code and \
      Codespaces. This IDE does not apply devcontainer features: install tools in the \
-     Containerfile instead. If the checkout has a Taskfile.yml (taskfile.dev), install `task` \
-     in the Containerfile too: the IDE lists and runs the project's tasks through it.\n\
-     If the project runs podman or docker itself (its build, tests, or tasks call it), \
-     install podman and fuse-overlayfs in the Containerfile, set \"privileged\": true in devcontainer.json (the \
-     IDE grants exactly what nested podman needs for it, and VS Code reads it too), and give \
-     the image's user subordinate IDs inside the container's range: \
-     `echo USER:1:999 > /etc/subuid; echo USER:1001:64535 >> /etc/subuid`, and the same \
-     for /etc/subgid, with USER the user's name and uid 1000. useradd's default range \
-     starts at 100000, which does not exist in the container, and nested podman then \
-     fails.\n\
+     Containerfile instead. If the checkout has a Taskfile.yml (taskfile.dev), install Task \
+     in the Containerfile too (Fedora's package is go-task; either binary name works): the \
+     IDE lists and runs the project's tasks through it.\n\
+     If the project runs podman or docker itself (its build, tests, or tasks call it): \
+     install podman and fuse-overlayfs; set \"privileged\": true in devcontainer.json (the \
+     IDE grants exactly what nested podman needs for it, and VS Code reads it too); after the \
+     package install, run `setcap cap_setuid+ep /usr/bin/newuidmap && setcap cap_setgid+ep \
+     /usr/bin/newgidmap`, because the image build drops their file capabilities; and give \
+     the image's user subordinate IDs inside the container's range, for a user with uid \
+     1000: `echo USER:1:999 > /etc/subuid; echo USER:1001:64535 >> /etc/subuid`, and the \
+     same for /etc/subgid. useradd's default range does not exist in the container.\n\
      3. Do not run podman, docker, or the build yourself. When the files are ready, call the \
      devcontainer_reload tool once.\n\
      4. Then call the environment tool with include [\"log\"]. If it reports a failure, read \
-     the log, fix the files, and reload again. Stop after three attempts and report what you \
+     the log, fix the files, and reload again. After a start, the IDE checks the container for \
+     Task and for nested podman; a failure names what is missing and the change that fixes it. Stop after three attempts and report what you \
      tried.\n\
      5. Finish with one short paragraph: what the environment provides, and why."
         .to_string()
