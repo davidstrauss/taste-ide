@@ -1919,6 +1919,25 @@ impl EnvironmentRegistry {
             .lock()
             .unwrap()
             .insert(vm.domain.clone(), keeper.clone());
+        // The agent's own node, for the environments' containers on this
+        // VM to mount (`crate::agentnode`): before any of them starts, and
+        // once per VM, since it lands on the VM's disk. A failure is not
+        // the files service's: the containers still start, and their agent
+        // runs on the image's own node or says why it cannot.
+        let deploying = std::time::Instant::now();
+        match crate::agentnode::ensure_in_vm(vm.ssh_port, &self.workspace_root) {
+            Ok(build) => self.note_vm(
+                &vm.domain,
+                format!(
+                    "the agent's node is {build} ({} ms)",
+                    deploying.elapsed().as_millis().max(1)
+                ),
+            ),
+            Err(e) => self.note_vm(
+                &vm.domain,
+                format!("the agent's own node is not deployed: {e:#}"),
+            ),
+        }
         Ok(keeper)
     }
 

@@ -402,6 +402,26 @@ both sides rather than by a code path remembering to translate:
   agent in one directory, and an existing one is not adopted.)
 - **Path translation**: none, which falls out of the first.
 
+**The agent brings its own node** (`taste_devcontainer::agentnode`, David,
+2026-09-23). Every adapter is a node program, and so are the MCP bridge and
+the auth forwarder, so relocation once required the project's image to
+carry node — a plain Rust or Python image kept its agent outside, and on a
+bare host there is no outside to run it in. VS Code has the same problem
+with its server and brings its own node; so does this. The official Linux
+build, pinned by version and SHA-256, is fetched once per VM into the
+workspace's directory there, right after the files service is up, and every
+environment's container mounts it read-only at `/opt/taste-agent`. The
+hosting probe asks that node for its version — running it is the test,
+since the build is glibc's — and when it answers, the agent's command runs
+with its `bin` first on the image's own `PATH` (prepended in the
+container's shell, not set with `--env`, which would replace the image's
+`PATH` and hide the toolchain the agent's shell is there to reach). An
+image it will not run on, which today means Alpine's musl, falls back to
+the image's own node, and without one keeps the agent out and says why;
+Alpine is unsupported by decision, for now. Checked on node-less Debian
+slim, Ubuntu, and Fedora minimal images, where the pinned adapter answers
+`initialize`, and on Alpine, where the probe refuses.
+
 **The socket direction is inverted, and that is what makes relocation work
 at all.** (Shipped as phase 4's sibling batch; the paragraph it replaces
 described mounting the IDE's sockets in, which never worked on an
@@ -1232,8 +1252,9 @@ work, and a project with none does not inherit another's.
   volume (`~/.gemini`, `~/.copilot`), which is on the agent's side of the
   boundary in both topologies. They **relocate like Claude Code does**:
   the gate asks whether the environment has somewhere to be, not which
-  agent is asking, and every image that can host an agent carries node,
-  so each is launched as its pinned npm package (`npx -y <pkg>@<version>`)
+  agent is asking, and every container that can host an agent has node —
+  the IDE's own, mounted in, or the image's — so each is launched as its
+  pinned npm package (`npx -y <pkg>@<version>`)
   rather than as a bare command the container was never going to have.
   What they lack is the proxy's half — spend accounting and a placeholder
   in place of a credential — and that is the difference to say out loud.

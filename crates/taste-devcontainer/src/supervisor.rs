@@ -564,6 +564,9 @@ pub struct Supervisor {
     /// send an older version of a file after a newer one (review,
     /// 2026-09-23).
     folder_sync: Mutex<()>,
+    /// What the last hosting probe found of the IDE's own node
+    /// (`Supervisor::agent_node_bin`).
+    agent_node: Mutex<Option<String>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     /// What the container itself wrote (`podman logs`), ring-buffered like
@@ -868,6 +871,7 @@ impl Supervisor {
             folder_conflicts: Mutex::new(Vec::new()),
             folder_watch: Mutex::new(None),
             folder_sync: Mutex::new(()),
+            agent_node: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
@@ -2019,6 +2023,13 @@ impl Supervisor {
         self.hosting.lock().unwrap().clone()
     }
 
+    /// The `bin` directory of the IDE's own node in this environment's
+    /// container, when the last probe found it running there
+    /// (`crate::agentnode`); `None` means the agent uses the image's.
+    pub fn agent_node_bin(&self) -> Option<String> {
+        self.agent_node.lock().unwrap().clone()
+    }
+
     /// Ask the container whether it can host an agent, and remember the
     /// answer for as long as that container lives.
     ///
@@ -2026,11 +2037,11 @@ impl Supervisor {
     /// any of them:
     ///
     /// - **`node`.** Every ACP adapter here is a node program, and so is
-    ///   the MCP stdio bridge that gives it the IDE's tools. A container
-    ///   without node cannot run either. (This is why "a devcontainer that
-    ///   wants an in-container agent carries node" is a convention in
-    ///   ENVIRONMENTS.md rather than something the IDE installs — the IDE
-    ///   does not modify the repo's image.)
+    ///   the MCP stdio bridge that gives it the IDE's tools. The IDE's own
+    ///   node is mounted into every container in a VM
+    ///   (`crate::agentnode`), so the image need not carry one; the probe
+    ///   runs it, since a build the image's C library cannot load is
+    ///   there and useless, and falls back to the image's own node.
     /// - **A writable agent home.** The per-environment home volume mounts
     ///   at [`taste_core::policy::AGENT_HOME_IN_DEVCONTAINER`], and podman
     ///   creates a fresh named volume owned by the container's root when
@@ -2092,15 +2103,25 @@ impl Supervisor {
         let home = taste_core::policy::AGENT_HOME_IN_DEVCONTAINER;
         let writable = format!("mkdir -p {home} 2>/dev/null; test -w {home}");
 
-        let hosting = if self
-            .run_captured(sh("command -v node".into()))
+        // Our node first (`crate::agentnode`), the image's own after it.
+        let ours = self
+            .run_captured(sh(crate::agentnode::PROBE.into()))
             .await
-            .is_err()
+            .ok()
+            .map(|bin| bin.trim().to_string())
+            .filter(|bin| !bin.is_empty());
+        *self.agent_node.lock().unwrap() = ours.clone();
+        let hosting = if ours.is_none()
+            && self
+                .run_captured(sh("command -v node".into()))
+                .await
+                .is_err()
         {
             AgentHosting::No {
                 reason: format!(
-                    "{name} has no node: an ACP adapter and the IDE's MCP bridge are both \
-                     node programs, so this environment's agent runs outside the container"
+                    "{name} has no node the agent can run on: the IDE's own did not run \
+                     there (an Alpine image's C library is not supported yet) and the image \
+                     carries none, so this environment's agent cannot move in"
                 ),
             }
         } else {
@@ -2284,6 +2305,7 @@ impl Supervisor {
 
     fn forget_agent_hosting(&self) {
         *self.hosting.lock().unwrap() = AgentHosting::Unknown;
+        *self.agent_node.lock().unwrap() = None;
         // The helper lives in the container; a container that is gone (or
         // about to be) is not one to keep an address for. Dropping it kills
         // the exec and every connection riding it, which is what a relocated
@@ -2903,6 +2925,15 @@ impl Supervisor {
             environment::env_home_volume(&self.env.workspace_root, &self.env.id),
             taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
         ));
+
+        // The agent's own node, read-only, so an agent moves into a
+        // project's container whatever its image carries
+        // (`crate::agentnode`). In a VM only: that is where it is deployed,
+        // and where every environment's container runs.
+        if !self.checkout().is_local() {
+            mounts.push("-v".into());
+            mounts.push(crate::agentnode::mount_arg(&self.env.workspace_root));
+        }
 
         // **No IDE socket is mounted here, deliberately.** The MCP socket
         // and the auth proxy's socket used to ride in at their host paths,

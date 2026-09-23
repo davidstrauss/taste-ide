@@ -4437,6 +4437,9 @@ impl ChatPane {
             podman: supervisor.substrate().target().clone(),
             mcp_socket: paths.mcp,
             auth,
+            // The IDE's own node when the container runs it, the image's
+            // otherwise (`taste_devcontainer::agentnode`).
+            node_bin: supervisor.agent_node_bin().map(std::path::PathBuf::from),
         })
     }
 

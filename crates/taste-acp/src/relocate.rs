@@ -97,6 +97,12 @@ pub struct Relocation {
     /// is to say, when `spec.env` carries an `ANTHROPIC_BASE_URL` that has
     /// to be re-pointed at something reachable from in there.
     pub auth: Option<AuthForward>,
+    /// The `bin` directory of the IDE's own node inside the container,
+    /// when the environment found it running there
+    /// (`taste_devcontainer::agentnode`): put first on the agent's `PATH`,
+    /// so the adapter, the bridge, and the forwarder all run on it and the
+    /// image need carry no node. `None` uses the image's own.
+    pub node_bin: Option<PathBuf>,
 }
 
 /// The in-container auth forwarder, as a node program.
@@ -218,7 +224,24 @@ fn exec_in_environment(
     }
 
     args.push(relocation.container.clone());
-    args.extend(inner_command(spec, relocation.auth.as_ref()));
+    let inner = inner_command(spec, relocation.auth.as_ref());
+    match &relocation.node_bin {
+        // Prepended in the container's own shell rather than set with
+        // `--env`, which would replace the image's `PATH` wholesale, and
+        // it is the image's tools the agent's shell is there to reach.
+        // The directory rides as an argument, never in the script.
+        Some(bin) => {
+            args.extend([
+                "sh".into(),
+                "-c".into(),
+                r#"PATH="$1:$PATH"; export PATH; shift; exec "$@""#.into(),
+                "taste-agent".into(),
+                bin.display().to_string(),
+            ]);
+            args.extend(inner);
+        }
+        None => args.extend(inner),
+    }
     relocation.podman.argv(args)
 }
 
@@ -244,11 +267,47 @@ mod tests {
             auth: Some(AuthForward {
                 socket: taste_core::environment::container_auth_socket(&env),
             }),
+            node_bin: None,
         }
     }
 
     fn relocation() -> Relocation {
         relocation_on(taste_core::PodmanTarget::local(false))
+    }
+
+    /// With the IDE's own node found in the container, the agent runs with
+    /// it first on the image's `PATH`, the directory an argument rather
+    /// than part of the script, and the command itself unchanged after.
+    #[test]
+    fn the_injected_node_goes_first_on_the_images_path() {
+        let mut relocation = relocation();
+        relocation.node_bin = Some("/opt/taste-agent/node-v24.21.0-linux-x64/bin".into());
+        let (_, args) = relocated_agent_command(&spec(), Path::new("/w"), &relocation);
+        let container = args
+            .iter()
+            .position(|a| a == "taste-abc123-review")
+            .unwrap();
+        assert_eq!(args[container + 1], "sh");
+        assert_eq!(args[container + 2], "-c");
+        assert!(
+            !args[container + 3].contains("/opt/taste-agent"),
+            "{args:?}"
+        );
+        assert_eq!(
+            args[container + 5],
+            "/opt/taste-agent/node-v24.21.0-linux-x64/bin"
+        );
+        let (_, plain) = relocated_agent_command(&spec(), Path::new("/w"), &self::relocation());
+        let tail = &plain[plain
+            .iter()
+            .position(|a| a == "taste-abc123-review")
+            .unwrap()
+            + 1..];
+        assert_eq!(
+            &args[container + 6..],
+            tail,
+            "the same command, after the prefix"
+        );
     }
 
     fn args_for(sandboxed: bool) -> (String, Vec<String>) {
@@ -468,6 +527,7 @@ mod tests {
                 podman: taste_core::PodmanTarget::local(false),
                 mcp_socket: PathBuf::from("/tmp/taste-ide-p/mcp.sock"),
                 auth: None,
+                node_bin: None,
             },
         );
         let container = args.iter().position(|a| a == "c").unwrap();

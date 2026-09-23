@@ -441,6 +441,7 @@ impl Relocated {
                 auth: Some(AuthForward {
                     socket: channel.paths().auth.clone(),
                 }),
+                node_bin: None,
             }),
             Some(terminals),
             false,

@@ -607,6 +607,7 @@ mod tests {
                     &taste_core::environment::EnvironmentId::parse("review").unwrap(),
                 ),
                 auth: None,
+                node_bin: None,
             },
         );
         assert!(inside.contains(&format!("HOME={home}")), "{inside:?}");

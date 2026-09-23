@@ -10,6 +10,7 @@
 //! checkout, and every other environment is a git clone of it under
 //! `$XDG_STATE_HOME`. See `docs/ENVIRONMENTS.md` for the design of record.
 
+pub mod agentnode;
 pub mod baseline;
 pub mod channel;
 pub mod config;
