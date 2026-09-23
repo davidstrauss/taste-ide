@@ -5480,6 +5480,9 @@ impl ChatPane {
         }
         let row = |title: &str, subtitle: &str| {
             let row = adw::ActionRow::builder()
+                // Text from the agent, the repository, or an adapter:
+                // never parsed as markup.
+                .use_markup(false)
                 .title(title)
                 .subtitle(subtitle)
                 .build();
@@ -5544,6 +5547,9 @@ impl ChatPane {
         }
         let row = |title: &str, subtitle: &str| {
             let row = adw::ActionRow::builder()
+                // Text from the agent, the repository, or an adapter:
+                // never parsed as markup.
+                .use_markup(false)
                 .title(title)
                 .subtitle(subtitle)
                 .subtitle_lines(3)
@@ -9583,6 +9589,9 @@ impl ChatPane {
         let names: Vec<String> = choices.iter().map(|(_, name)| name.clone()).collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let row = adw::ComboRow::builder()
+            // Text from the agent, the repository, or an adapter:
+            // never parsed as markup.
+            .use_markup(false)
             .title(&option.name)
             .model(&gtk::StringList::new(&name_refs))
             .build();
@@ -9699,6 +9708,9 @@ impl ChatPane {
             }
             check.set_active(index == selected);
             let row = adw::ActionRow::builder()
+                // Text from the agent, the repository, or an adapter:
+                // never parsed as markup.
+                .use_markup(false)
                 .title(name)
                 .activatable(true)
                 .build();
@@ -9719,7 +9731,12 @@ impl ChatPane {
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
             .build();
-        let row = adw::SwitchRow::builder().title(title).build();
+        let row = adw::SwitchRow::builder()
+            // Text from the agent, the repository, or an adapter:
+            // never parsed as markup.
+            .use_markup(false)
+            .title(title)
+            .build();
         self.syncing.set(true);
         row.set_active(active);
         self.syncing.set(false);
@@ -11176,6 +11193,9 @@ impl ChatPane {
         self.standing_group.set_visible(!settled.is_empty());
         for record in settled {
             let row = adw::ActionRow::builder()
+                // Text from the agent, the repository, or an adapter:
+                // never parsed as markup.
+                .use_markup(false)
                 .title(&record.tool)
                 .subtitle(record.answer.detail())
                 .build();
@@ -11245,7 +11265,15 @@ impl ChatPane {
 /// [`mcp_tool_name`] does the reading, in whichever dress the adapter gave
 /// the call, because a second parser for the same thing is how the first
 /// one drifts.
+///
+/// A call the adapter typed `Execute` is its shell, whatever its title
+/// says: a bare title is read as a tool name, so a command that happened
+/// to be called `devcontainer_reload` would otherwise take that tool's
+/// standing answer, or pass as one that asks nobody (review, 2026-09-23).
 fn standing_tool(request: &RequestPermissionRequest) -> Option<String> {
+    if request.tool_call.fields.kind == Some(ToolKind::Execute) {
+        return None;
+    }
     let title = request.tool_call.fields.title.as_deref()?;
     mcp_tool_name(title).filter(|name| taste_mcp::is_ide_tool(name))
 }
@@ -11570,7 +11598,12 @@ fn command_input_line(name: &str, input: Option<&serde_json::Value>) -> Option<S
     let input = input?;
     match name {
         "ide_exec" => {
-            let command = input.get("command")?.as_str()?;
+            // Every name the server takes the command under
+            // (`taste_mcp::server`), or a call made with `cmd` asks to run
+            // a command it does not show.
+            let command = ["command", "program", "cmd"]
+                .iter()
+                .find_map(|key| input.get(*key)?.as_str())?;
             if let Some(script) = shell_script(command, input.get("args")) {
                 return Some(script);
             }
@@ -13427,6 +13460,11 @@ mod tests {
         // caller falls back to the title rather than showing a blank IN.
         assert_eq!(command_input_line("ide_exec", None), None);
         assert_eq!(command_input_line("ide_search", Some(&input)), None);
+        // The server's other names for the command show it too.
+        assert_eq!(
+            command_input_line("ide_exec", Some(&serde_json::json!({"cmd": "make check"}))),
+            Some("make check".to_string())
+        );
     }
 
     #[test]

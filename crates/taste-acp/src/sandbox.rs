@@ -6,8 +6,12 @@
 //! with:
 //!
 //! - the OS visible read-only (toolchains, certs, DNS keep working),
-//! - a tmpfs over `$HOME` — no general home-directory access, ever — with
-//!   only the agent's own auth/config paths bound back in,
+//! - a home of the agent's own over `$HOME` ([`ensure_agent_home`]), one
+//!   per workspace in the IDE's state directory — no access to the user's
+//!   home, ever, not even to the agent's own paths in it: binding the real
+//!   `~/.claude` back in handed the agent the machine's Claude credential
+//!   and a `settings.json` whose hooks run unconfined the next time the
+//!   user runs `claude` (review, 2026-09-23),
 //! - a tmpfs over `$XDG_RUNTIME_DIR` and `/tmp`, hiding the session D-Bus
 //!   socket (which could otherwise reach the Flatpak portal → host exec),
 //!   the Wayland/X11 sockets, and everything else that lives there; only
@@ -26,7 +30,7 @@
 //! both stricter (one rule, the same one the user's edits pass) and kinder
 //! (the workspace unlocks for the session already running).
 //!
-//! Remote git is read-only by construction: the tmpfs home contains no ssh
+//! Remote git is read-only by construction: the agent's home contains no ssh
 //! keys and no credential helpers, so authenticated push is impossible, and
 //! `taste-devcontainer::security` keeps any from being mounted into the
 //! devcontainer where brokered commands run. The push-block config is
@@ -305,6 +309,40 @@ pub fn url_bridge_dir(workspace_root: &Path) -> PathBuf {
 /// The IDE's cache directory: deliberately outside `XDG_RUNTIME_DIR`,
 /// which every agent sandbox masks. The files bound into sandboxes from
 /// here (git policy, URL helper, workspace stub) all live under it.
+/// The home an agent confined by bwrap gets, for the workspace whose
+/// agent home volume is `volume` (the container rungs' equivalent, so the
+/// two are one per workspace alike): under the IDE's state directory,
+/// private to the user, made on first use. Its sign-in and settings
+/// persist here and nowhere else.
+pub fn ensure_agent_home(volume: &str) -> Result<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            Path::new(&home).join(".local/state")
+        });
+    let name: String = volume
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = state.join("taste-ide/agent-homes").join(name);
+    std::fs::create_dir_all(&dir).context("creating the agent's home")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .context("making the agent's home private")?;
+    }
+    Ok(dir)
+}
+
 fn cache_dir() -> PathBuf {
     std::env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -541,11 +579,15 @@ fn container_agent_args(
     (program.to_string(), args)
 }
 
+/// `home` is where `$HOME` is inside the sandbox, `agent_home` what is
+/// mounted there ([`ensure_agent_home`]).
+#[allow(clippy::too_many_arguments)]
 pub fn wrap(
     spec: &AgentSpec,
     workspace_root: &Path,
     workspace_stub: &Path,
     home: &Path,
+    agent_home: &Path,
     git_policy: &Path,
     mcp_socket: Option<&Path>,
     url_bridge: Option<(&Path, &Path)>,
@@ -563,8 +605,9 @@ pub fn wrap(
         "/proc".into(),
         "--tmpfs".into(),
         "/tmp".into(),
-        // No home directory. Full stop.
-        "--tmpfs".into(),
+        // Not the user's home: the agent's own, for this workspace.
+        "--bind".into(),
+        agent_home.display().to_string(),
         home.display().to_string(),
     ];
 
@@ -578,16 +621,6 @@ pub fn wrap(
         args.push("--bind".into());
         args.push(socket.display().to_string());
         args.push(socket.display().to_string());
-    }
-
-    // Bind back only the agent's own auth/config/cache paths (if present).
-    for rel in &spec.home_paths {
-        let path = home.join(rel);
-        if path.exists() {
-            args.push("--bind".into());
-            args.push(path.display().to_string());
-            args.push(path.display().to_string());
-        }
     }
 
     // The workspace is NOT here — a read-only stand-in occupies its path so
@@ -698,6 +731,7 @@ mod tests {
             Path::new("/work/p"),
             Path::new("/cache/workspace-stub"),
             Path::new("/home/u"),
+            Path::new("/state/agent-homes/v"),
             Path::new("/cache/gitpolicy"),
             Some(Path::new("/run/user/1/taste-mcp.sock")),
             None,
@@ -826,6 +860,7 @@ mod tests {
             Path::new("/work/p"),
             Path::new("/cache/workspace-stub"),
             Path::new("/home/u"),
+            Path::new("/state/agent-homes/v"),
             Path::new("/cache/gitpolicy"),
             None,
             Some((
@@ -888,6 +923,7 @@ mod tests {
             Path::new("/work/p"),
             Path::new("/cache/workspace-stub"),
             Path::new("/home/u"),
+            Path::new("/state/agent-homes/v"),
             Path::new("/cache/gitpolicy"),
             None,
             None,
@@ -963,9 +999,12 @@ mod tests {
     }
 
     #[test]
-    fn home_is_tmpfs_and_the_environment_announces_itself() {
+    fn home_is_the_agents_own_and_the_environment_announces_itself() {
         let joined = wrap_args().join(" ");
-        assert!(joined.contains("--tmpfs /home/u"));
+        assert!(joined.contains("--bind /state/agent-homes/v /home/u"));
+        // Nothing of the user's home is bound back, the agent's own paths
+        // in it included.
+        assert!(!joined.contains("/home/u/.claude"), "{joined}");
         assert!(joined.contains("--setenv GIT_CONFIG_GLOBAL /cache/gitpolicy"));
         // The environment announces itself in every confinement.
         assert!(joined.contains("--setenv TASTE_IDE_CONFINEMENT bwrap"));
@@ -1043,6 +1082,7 @@ mod tests {
             root,
             &stub,
             Path::new("/home/u"),
+            Path::new("/state/agent-homes/v"),
             Path::new("/cache/gitpolicy"),
             None,
             None,

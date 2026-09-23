@@ -29,8 +29,10 @@ pub struct AgentSpec {
     /// same list, not a setting to flip between visits.
     #[serde(default)]
     pub upstream: Route,
-    /// Home-relative paths bound back into the agent's otherwise-empty
-    /// sandbox home: its own auth/config/cache, nothing else.
+    /// Home-relative paths the agent keeps its auth, config, and cache in.
+    /// Descriptive only: every rung gives the agent a home of its own (a
+    /// volume, or `sandbox::ensure_agent_home`), and nothing is ever bound
+    /// in from the user's.
     #[serde(default)]
     pub home_paths: Vec<String>,
     /// How to sign in when ACP cannot: the agent's own interactive CLI,

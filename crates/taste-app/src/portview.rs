@@ -424,6 +424,12 @@ impl PortPage {
         // Ephemeral: cookies, storage and cache live as long as this tab
         // and no longer. A dev server's session is not something to keep.
         let session = webkit6::NetworkSession::new_ephemeral();
+        // No downloads. The page is the project's — the agent's server —
+        // and WebKit's default for an attachment is to save it into the
+        // user's Downloads folder: a write into the home directory from the
+        // far side of the boundary (review, 2026-09-23). A file the server
+        // offers is had from the checkout instead.
+        session.connect_download_started(|_, download| download.cancel());
         let view = webkit6::WebView::builder()
             .network_session(&session)
             .vexpand(true)

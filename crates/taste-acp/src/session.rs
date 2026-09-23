@@ -392,21 +392,16 @@ impl AgentClient {
                 "bubblewrap (bwrap) not found: agents only run confined, never unconfined"
             );
         }
-        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
-        // Sign-in persistence: the sandbox home is tmpfs, so the agent's
-        // auth/cache dirs must exist to be bound back in. Create the
-        // directory-shaped ones (never files — an empty ~/.claude.json
-        // would be corrupt, and auth lives in the dirs).
-        for rel in &spec.home_paths {
-            if !rel.ends_with(".json") {
-                let _ = std::fs::create_dir_all(home.join(rel));
-            }
-        }
+        let sandbox_home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+        // Sign-in persists in the agent's own home for this workspace,
+        // never the user's (`sandbox::ensure_agent_home`).
+        let agent_home = crate::sandbox::ensure_agent_home(&home.volume)?;
         let (mut program, mut args) = crate::sandbox::wrap(
             &spec,
             &cwd,
             &workspace_stub,
-            &home,
+            &sandbox_home,
+            &agent_home,
             &git_policy,
             mcp_socket.as_deref(),
             Some((&url_script, &url_dir)),
@@ -1631,16 +1626,13 @@ pub fn login_command(
         anyhow::bail!("bubblewrap (bwrap) not found: agents only run confined, never unconfined");
     }
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
-    for rel in &spec.home_paths {
-        if !rel.ends_with(".json") {
-            let _ = std::fs::create_dir_all(home.join(rel));
-        }
-    }
+    let agent_home = crate::sandbox::ensure_agent_home(home_volume)?;
     let (mut program, mut args) = crate::sandbox::wrap(
         &spec,
         cwd,
         &workspace_stub,
         &home,
+        &agent_home,
         &git_policy,
         None,
         Some((&url_script, &url_dir)),

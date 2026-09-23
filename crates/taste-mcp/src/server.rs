@@ -744,6 +744,33 @@ impl McpServer {
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default().to_string();
                 let args = params["arguments"].clone();
+                // What a role was not listed is refused, not merely unseen:
+                // hidden alone, a clone's socket could still call the
+                // primary's screenshot, selection, and editor tools by name
+                // (review, 2026-09-23). The four names `environment`
+                // replaced stay callable, unlisted, as the listing says.
+                const REPLACED: [&str; 4] = [
+                    "devcontainer_status",
+                    "devcontainer_logs",
+                    "devcontainer_resources",
+                    "ide_environment",
+                ];
+                // The tools with a refusal of their own, which says what
+                // the caller can do instead, keep it.
+                let own_gate = crate::orchestration::is_write(&name)
+                    || matches!(name.as_str(), "publish" | "update_from_main");
+                let listed = tools
+                    .iter()
+                    .any(|t| t["name"].as_str() == Some(name.as_str()));
+                if !listed && !own_gate && !REPLACED.contains(&name.as_str()) {
+                    return Response::ok(
+                        id,
+                        tool_result(
+                            &json!({"error": format!("{name} is not a tool of this environment")}),
+                            true,
+                        ),
+                    );
+                }
                 // The non-JSON tools: a screenshot's payload, and an issue's
                 // image attachment, are MCP image content blocks, not
                 // JSON-as-text.
@@ -1609,17 +1636,27 @@ impl McpServer {
                     "ide_open_file needs a `path`: a workspace-relative or absolute file \
                      path, e.g. one from ide_list_files",
                 )?;
+                // Against this environment's checkout, which is what the
+                // panes read — never the folder on this host, where a file
+                // the folder ignores (a `.env`) or a link the mirror
+                // carried home would open from the user's disk, and an
+                // `ide_screenshot` of the editor would carry it back
+                // (review, 2026-09-23).
+                let root = self.checkout_path(env)?;
                 let requested = PathBuf::from(raw);
                 let path = if requested.is_absolute() {
                     requested
                 } else {
-                    self.workspace.root().join(requested)
+                    root.join(requested)
                 };
-                if !path.starts_with(self.workspace.root()) || raw.contains("..") {
+                let climbs = path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir));
+                if !path.starts_with(&root) || climbs {
                     anyhow::bail!(
                         "{raw} is outside the workspace {}; ide_open_file shows workspace \
                          files only, so pass a path under it",
-                        self.workspace.root().display()
+                        root.display()
                     );
                 }
                 let line = args["line"].as_u64().map(|l| l as u32);
@@ -5327,6 +5364,17 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("-review"));
+        // What a clone is not listed it cannot call either: the primary's
+        // editor and rendering are the user's, not a clone's to read.
+        for tool in ["ide_screenshot", "ide_selection", "ide_open_file"] {
+            let refused = call_tool(&mut on_review, tool, json!({})).await;
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("not a tool of this environment")),
+                "{tool}: {refused}"
+            );
+        }
         let primary_status = call_tool(&mut on_primary, "environment", json!({})).await;
         assert!(primary_status["environment"]["container_name"]
             .as_str()

@@ -951,6 +951,9 @@ impl RestClient {
                 self.schema_status.set_label(&schema.describe());
                 for operation in &schema.operations {
                     let row = adw::ActionRow::builder()
+                        // Text from the agent, the repository, or an adapter:
+                        // never parsed as markup.
+                        .use_markup(false)
                         .title(format!("{} {}", operation.method, operation.path))
                         .subtitle(&operation.summary)
                         .title_lines(1)

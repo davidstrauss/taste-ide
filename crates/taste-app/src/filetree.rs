@@ -4992,6 +4992,9 @@ impl FileTree {
             check.set_active(true);
         }
         let row = adw::ActionRow::builder()
+            // Text from the agent, the repository, or an adapter:
+            // never parsed as markup.
+            .use_markup(false)
             .title(
                 rel.file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -5197,6 +5200,9 @@ impl FileTree {
         );
         for file in changed {
             let row = adw::ActionRow::builder()
+                // Text from the agent, the repository, or an adapter:
+                // never parsed as markup.
+                .use_markup(false)
                 .title(
                     file.path
                         .file_name()

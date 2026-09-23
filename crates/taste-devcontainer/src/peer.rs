@@ -329,28 +329,30 @@ pub const VM_BRANCH_NAMESPACE: &str = "refs/taste/vm/";
 
 /// The refspecs that bring a checkout's state home to a peer that is the
 /// user's own folder: branches into the comparison namespace (the folder
-/// has branches of its own), everything else in place — except the
-/// comparison namespace itself, which is the peer's and never the
-/// checkout's. Without that exclusion a checkout seeded from a peer that
-/// had already synced once carried `refs/taste/vm/*` of its own, and the
-/// fetch refused to put both a branch and that ref on one name
-/// (2026-09-21: "Cannot fetch both refs/heads/X and refs/taste/vm/X").
+/// has branches of its own), tags into one of their own, and of the IDE's
+/// refs only Personal's snapshot, which is what the mirror reads
+/// ([`VM_SNAPSHOT_NAMESPACE`]).
 ///
-/// Tags come home into a namespace of their own too, and only a tag the
-/// folder does not have is made from one (`adopt_tags`): forced into
-/// `refs/tags`, the checkout could replace a release tag of the user's.
-/// And the mirror's baseline is the folder's alone — fetched, the VM could
-/// choose what the mirror measures the user's edits against (review,
-/// 2026-09-23).
-pub const PRIMARY_SYNC_REFSPECS: [&str; 7] = [
+/// Nothing else of `refs/taste` comes from the VM, because nothing else of
+/// it is the checkout's: the backlog (`refs/taste/issues`) is filed in the
+/// folder, the other environments' snapshots come from their own VMs, and
+/// the mirror's baseline is the folder's alone. This fetched
+/// `+refs/taste/*` once, which put the checkout's seed-time copy of the
+/// backlog over the folder's on every sync — issues filed since, gone —
+/// and let the agent in the checkout rewrite any of them with plain git
+/// (review, 2026-09-23). Tags land apart and only a tag the folder does not
+/// have is made from one (`adopt_tags`): forced into `refs/tags`, the
+/// checkout could replace a release tag of the user's.
+pub const PRIMARY_SYNC_REFSPECS: [&str; 3] = [
     "+refs/heads/*:refs/taste/vm/*",
     "+refs/tags/*:refs/taste/vm-tags/*",
-    "+refs/taste/*:refs/taste/*",
-    "^refs/taste/vm/*",
-    "^refs/taste/vm-tags/*",
-    "^refs/taste/peer/*",
-    "^refs/taste/mirror/*",
+    "+refs/taste/snapshot/*:refs/taste/vm-snapshot/*",
 ];
+
+/// Where the checkout's snapshots land; only Personal's is taken from here
+/// (`adopt_snapshot`). A glob, because a fetch naming one ref fails
+/// outright on a checkout that has not been snapshotted yet.
+const VM_SNAPSHOT_NAMESPACE: &str = "refs/taste/vm-snapshot/";
 
 /// Where the checkout's tags land in the folder before `adopt_tags`.
 const VM_TAG_NAMESPACE: &str = "refs/taste/vm-tags/";
@@ -363,12 +365,13 @@ const PEER_STAGING: &str = "refs/taste/peer";
 /// branches, tags, the IDE's refs (never the peer's own comparison
 /// namespace), and the remote-tracking refs the sync flow rebases onto
 /// over there.
-pub const PRIMARY_SEED_REFSPECS: [&str; 7] = [
+pub const PRIMARY_SEED_REFSPECS: [&str; 8] = [
     "+refs/heads/*:refs/heads/*",
     "+refs/tags/*:refs/tags/*",
     "+refs/taste/*:refs/taste/*",
     "^refs/taste/vm/*",
     "^refs/taste/vm-tags/*",
+    "^refs/taste/vm-snapshot/*",
     "^refs/taste/mirror/*",
     "+refs/remotes/*:refs/remotes/*",
 ];
@@ -560,6 +563,7 @@ pub fn sync_primary_peer_with(
         }
     }
     adopt_tags(&git)?;
+    adopt_snapshot(&git)?;
     if let (Some(branch), false) = (checkout_branch, commits_unsettled) {
         // The folder the user opened, and nothing wider: a folder inside
         // another repository (a dotfiles repository in the home directory)
@@ -577,6 +581,19 @@ pub fn sync_primary_peer_with(
         }
     }
     Ok(sync)
+}
+
+/// Personal's snapshot, from where the fetch put it to where the mirror
+/// reads it; every other snapshot the checkout holds stays where it landed.
+fn adopt_snapshot(git: &taste_git::GitWorkspace) -> Result<()> {
+    let name = taste_git::snapshot_ref("primary");
+    let fetched = format!("{VM_SNAPSHOT_NAMESPACE}primary");
+    if let Some(oid) = git.read_ref(&fetched)? {
+        if git.read_ref(&name)? != Some(oid) {
+            git.set_ref(&name, oid)?;
+        }
+    }
+    Ok(())
 }
 
 /// The checkout's tags the folder does not have, made in the folder; one
@@ -849,14 +866,15 @@ mod tests {
     #[test]
     fn the_comparison_namespace_never_crosses() {
         assert!(PRIMARY_SEED_REFSPECS.contains(&"^refs/taste/vm/*"));
-        assert!(PRIMARY_SYNC_REFSPECS.contains(&"^refs/taste/vm/*"));
         assert!(PRIMARY_SYNC_REFSPECS.contains(&"+refs/heads/*:refs/taste/vm/*"));
-        // The folder's own: the mirror's baseline never comes from the VM,
-        // and the checkout's tags do not land on the folder's.
-        for specs in [&PRIMARY_SYNC_REFSPECS[..], &PRIMARY_SEED_REFSPECS[..]] {
-            assert!(specs.contains(&"^refs/taste/mirror/*"));
+        // The folder's own: the mirror's baseline is never seeded into the
+        // VM, and nothing of the IDE's but Personal's snapshot comes back —
+        // not the backlog, not the checkout's tags over the folder's.
+        assert!(PRIMARY_SEED_REFSPECS.contains(&"^refs/taste/mirror/*"));
+        for spec in PRIMARY_SYNC_REFSPECS {
+            let destination = spec.split(':').nth(1).unwrap();
+            assert!(destination.starts_with("refs/taste/vm"), "{spec}");
         }
-        assert!(!PRIMARY_SYNC_REFSPECS.contains(&"+refs/tags/*:refs/tags/*"));
     }
 
     #[test]
