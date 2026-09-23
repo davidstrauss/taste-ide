@@ -4140,6 +4140,16 @@ impl ChatPane {
         self.plan_card.borrow_mut().take();
         self.transcript_log.borrow_mut().clear();
         self.transcript_dropped.set(0);
+        // The banner is a claim about the rows under it, so it goes with
+        // them. A chat whose first spawn could not reach its session (the
+        // container was not up yet) shows the stash, and the respawn beside
+        // its files then loads the real conversation over it: the notice
+        // that stayed up said "the agent has no memory of it" over a
+        // conversation the agent had just replayed, every launch (David,
+        // 2026-09-23). And a later fresh session may offer the stash again,
+        // since what it was drawn over is gone.
+        self.stash_banner.set_revealed(false);
+        self.stash_replayed.set(false);
     }
 
     /// Wire the owning tab strip: `persist` fires when this chat's
@@ -7399,6 +7409,12 @@ impl ChatPane {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    // The IDE's own command tools answer in JSON, for the
+                    // agent; OUT is what the command printed, for the user.
+                    let output = mcp_tool_name(&card.title_full.borrow())
+                        .filter(|name| is_ide_command_tool(name))
+                        .and_then(|_| command_console_text(&output))
+                        .unwrap_or(output);
                     let key = format!("{marked}/command");
                     self.note_doc_row(&key, &card.row);
                     let open = self.opener(
@@ -10300,8 +10316,22 @@ impl ChatPane {
             "command": "cargo",
             "args": ["test", "-p", "taste-app", "chat"],
         }));
+        // The answer as the tool really gives it — JSON for the agent, the
+        // `podman exec` wrapper in it — since a plain-text fixture is how a
+        // card that showed that JSON as its OUT got past every shot.
         exec.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-            TextContent::new("test result: ok. 214 passed; 0 failed; 0 ignored\n"),
+            TextContent::new(
+                serde_json::json!({
+                    "command": "podman -c taste-vm exec --workdir /workspace taste-primary \
+                                sh -c 'cargo test -p taste-app chat'",
+                    "exit_code": 0,
+                    "stdout": "running 214 tests\ntest result: ok. 214 passed; 0 failed; 0 ignored\n",
+                    "stderr": "   Compiling taste-app v0.1.0\n    Finished `test` profile in 41.2s\n",
+                    "output_truncated": false,
+                    "failure": null,
+                })
+                .to_string(),
+            ),
         )))];
         self.render_update(SessionUpdate::ToolCall(exec));
         self.expand_tool_card_for_probe("probe-ide-exec");
@@ -11169,7 +11199,12 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "ide_open_files" => "Look at what is open".into(),
         "ide_selection" => "Read what the user has selected".into(),
         "ide_git_status" => "Read the working tree's git state".into(),
-        "ide_exec" => about("Run", "Run a command", "command"),
+        // The command line itself, as a shell step's title is: "Run sh"
+        // named the interpreter and hid everything it was asked to do.
+        "ide_exec" => match command_input_line(&name, input) {
+            Some(line) => single_line(&line, 200),
+            None => "Run a command".into(),
+        },
         "ide_exec_output" => "Collect what that command has written".into(),
         "ide_exec_kill" => "Stop that command".into(),
         "ide_app_log" => "Read the IDE's own log".into(),
@@ -11268,6 +11303,50 @@ fn command_input_line(name: &str, input: Option<&serde_json::Value>) -> Option<S
         "ide_exec_output" => Some(format!("handle {}", input.get("handle")?)),
         _ => None,
     }
+}
+
+/// The `OUT` block for one of the IDE's own command tools: what the
+/// command printed, as a terminal would have shown it, from the JSON the
+/// tool answers the agent with. stdout, then stderr, then whatever a
+/// terminal would have said about the ending — a nonzero exit, a failure to
+/// run at all, clipped output, or that it is still going. `None` for a
+/// result that is not that JSON (an error string, an older shape), which
+/// the card then shows as it came.
+fn command_console_text(result: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(result.trim()).ok()?;
+    let object = value.as_object()?;
+    let text = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+            .unwrap_or("")
+            .trim_end()
+            .to_string()
+    };
+    let stdout = text(&["stdout", "stdout_so_far"]);
+    let stderr = text(&["stderr", "stderr_so_far"]);
+    if !object.contains_key("exit_code") && !object.contains_key("running") {
+        return None;
+    }
+    let mut lines: Vec<String> = [stdout, stderr]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect();
+    if object
+        .get("output_truncated")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        lines.push("[output truncated]".into());
+    }
+    if let Some(failure) = object.get("failure").and_then(serde_json::Value::as_str) {
+        lines.push(format!("[{}]", failure.trim()));
+    }
+    match object.get("exit_code").and_then(serde_json::Value::as_i64) {
+        Some(0) => {}
+        Some(code) => lines.push(format!("[exit code {code}]")),
+        None => lines.push("[still running]".into()),
+    }
+    Some(lines.join("\n"))
 }
 
 /// An argument as a reader of the `IN` line would need to split it back
@@ -12793,6 +12872,24 @@ mod tests {
     fn ide_exec_is_a_command_even_with_no_useful_kind() {
         assert!(is_command_call(ToolKind::Other, "mcp__taste-ide__ide_exec"));
         assert!(is_command_call(ToolKind::Other, "ide_exec"));
+        assert_eq!(
+            command_console_text(
+                r#"{"command":"podman -c vm exec c sh -c id","exit_code":0,"stdout":"uid=0(root)\n","stderr":"","output_truncated":false,"failure":null}"#
+            )
+            .as_deref(),
+            Some("uid=0(root)"),
+            "the wrapper and the bookkeeping stay out of OUT"
+        );
+        assert_eq!(
+            command_console_text(r#"{"exit_code":2,"stdout":"a\n","stderr":"b: no\n"}"#).as_deref(),
+            Some("a\nb: no\n[exit code 2]")
+        );
+        assert_eq!(
+            command_console_text(r#"{"running":true,"handle":3,"stdout_so_far":"half"}"#)
+                .as_deref(),
+            Some("half\n[still running]")
+        );
+        assert_eq!(command_console_text("not json"), None);
         assert!(is_command_call(ToolKind::Other, "ide_exec_output"));
         // The adapter's own shell tool is still recognised by kind alone —
         // it carries no name this project defined.
