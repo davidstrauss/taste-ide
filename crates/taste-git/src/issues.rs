@@ -1458,6 +1458,15 @@ impl GitWorkspace {
         }
     }
 
+    /// [`GitWorkspace::push_branch_command`] with the issues ref riding
+    /// along when there is one, as the plain push carries it.
+    pub fn push_branch_command_including_issues(&self, branch: &str) -> (String, Vec<String>) {
+        match self.read_ref(ISSUES_REF) {
+            Ok(Some(_)) => self.push_branch_command(branch, &[ISSUES_PUSH_REFSPEC]),
+            _ => self.push_branch_command(branch, &[]),
+        }
+    }
+
     /// Fetch the remote's issues ref into the local tracking ref. Separate
     /// from the branch fetch because a remote with no issues ref makes this
     /// fail, and that is the normal case before the first push — callers

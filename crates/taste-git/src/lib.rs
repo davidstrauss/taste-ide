@@ -691,16 +691,27 @@ impl GitWorkspace {
     /// Remote the current branch pushes to: its upstream's remote, else
     /// `origin`, else the only configured remote.
     fn push_remote(&self) -> String {
-        if let Some(branch) = self.branch_name() {
-            if let Ok(remote) = self
-                .repo
-                .branch_upstream_remote(&format!("refs/heads/{branch}"))
-            {
-                if let Some(name) = remote.as_str() {
-                    return name.to_string();
-                }
+        match self.branch_name() {
+            Some(branch) => self.push_remote_of(&branch),
+            None => self.default_remote(),
+        }
+    }
+
+    /// Remote `branch` pushes to: its upstream's remote, else the default.
+    fn push_remote_of(&self, branch: &str) -> String {
+        if let Ok(remote) = self
+            .repo
+            .branch_upstream_remote(&format!("refs/heads/{branch}"))
+        {
+            if let Some(name) = remote.as_str() {
+                return name.to_string();
             }
         }
+        self.default_remote()
+    }
+
+    /// `origin`, else the only configured remote.
+    fn default_remote(&self) -> String {
         let remotes = self.remotes().unwrap_or_default();
         if remotes.iter().any(|r| r == "origin") || remotes.len() != 1 {
             "origin".to_string()
@@ -745,6 +756,105 @@ impl GitWorkspace {
 
     // --- sync with the remote tip (fetch + rebase, never merge) ----------
 
+    /// How `branch` — any local branch, not only the one checked out here —
+    /// relates to where it pushes.
+    ///
+    /// Its upstream when it has one. Without one, `<remote>/<branch>`: the
+    /// branch a push creates, measured against its tracking ref if the
+    /// remote already has it, else counted as new there — every commit
+    /// the remote's refs do not reach. This is what the header shows for a
+    /// checkout in a VM, whose branch is not this repository's HEAD: asked
+    /// of HEAD, a branch just made there read as main against origin/main
+    /// (David, 2026-09-23: "It should offer to push to
+    /// <remote>/<same-branch-name>").
+    pub fn sync_status_of(&self, branch: &str) -> Result<SyncStatus> {
+        let Ok(local) = self.repo.find_branch(branch, git2::BranchType::Local) else {
+            return Ok(SyncStatus::no_upstream());
+        };
+        let Some(tip) = local.get().target() else {
+            return Ok(SyncStatus::no_upstream());
+        };
+        if let Ok(upstream) = local.upstream() {
+            let name = upstream
+                .name()?
+                .map(str::to_owned)
+                .unwrap_or_else(|| "upstream".into());
+            let Some(remote) = upstream.get().target() else {
+                return Ok(SyncStatus::no_upstream());
+            };
+            let (ahead, behind) = self.repo.graph_ahead_behind(tip, remote)?;
+            return Ok(SyncStatus {
+                upstream: Some(name),
+                ahead,
+                behind,
+                new_branch: false,
+            });
+        }
+        if self.remotes().unwrap_or_default().is_empty() {
+            return Ok(SyncStatus::no_upstream());
+        }
+        let remote = self.push_remote_of(branch);
+        let target = format!("{remote}/{branch}");
+        if let Some(there) = self
+            .repo
+            .find_reference(&format!("refs/remotes/{target}"))
+            .ok()
+            .and_then(|r| r.target())
+        {
+            let (ahead, behind) = self.repo.graph_ahead_behind(tip, there)?;
+            return Ok(SyncStatus {
+                upstream: Some(target),
+                ahead,
+                behind,
+                new_branch: false,
+            });
+        }
+        let mut walk = self.repo.revwalk()?;
+        walk.push(tip)?;
+        // A remote with no refs fetched yet hides nothing: every commit is
+        // new there, which is true.
+        let _ = walk.hide_glob(&format!("refs/remotes/{remote}/*"));
+        let ahead = walk.filter(Result::is_ok).count();
+        Ok(SyncStatus {
+            upstream: Some(target),
+            ahead,
+            behind: 0,
+            new_branch: true,
+        })
+    }
+
+    /// The push of `branch` by name, from whatever this repository has
+    /// checked out: to its upstream when it has one, else to
+    /// `<remote>/<branch>` with `--set-upstream`, so the next status reads
+    /// it as the branch's own. `extra_refspecs` ride along after it.
+    pub fn push_branch_command(
+        &self,
+        branch: &str,
+        extra_refspecs: &[&str],
+    ) -> (String, Vec<String>) {
+        let upstream_branch = self
+            .repo
+            .branch_upstream_name(&format!("refs/heads/{branch}"))
+            .ok()
+            .and_then(|name| {
+                let name = name.as_str()?.to_string();
+                let rest = name.strip_prefix("refs/remotes/")?;
+                let (_, branch) = rest.split_once('/')?;
+                Some(branch.to_string())
+            });
+        let mut args = vec!["push".to_string()];
+        if upstream_branch.is_none() {
+            args.push("--set-upstream".to_string());
+        }
+        args.push(self.push_remote_of(branch));
+        args.push(format!(
+            "refs/heads/{branch}:refs/heads/{}",
+            upstream_branch.as_deref().unwrap_or(branch)
+        ));
+        args.extend(extra_refspecs.iter().map(|s| (*s).to_string()));
+        self.git_command_owned(args)
+    }
+
     /// How the current branch relates to its upstream tip.
     pub fn sync_status(&self) -> Result<SyncStatus> {
         let head = self.repo.head().ok().and_then(|h| h.target());
@@ -770,6 +880,7 @@ impl GitWorkspace {
             upstream: Some(upstream_name),
             ahead,
             behind,
+            new_branch: false,
         })
     }
 
@@ -783,6 +894,17 @@ impl GitWorkspace {
         let branch = self
             .repo
             .find_branch(&branch, git2::BranchType::Local)
+            .ok()?;
+        branch.upstream().ok()?.get().name().map(str::to_string)
+    }
+
+    /// [`GitWorkspace::upstream_ref`] of `branch` rather than of HEAD: what
+    /// a checkout in a VM, on a branch this repository has not checked
+    /// out, rebases onto.
+    pub fn upstream_ref_of(&self, branch: &str) -> Option<String> {
+        let branch = self
+            .repo
+            .find_branch(branch, git2::BranchType::Local)
             .ok()?;
         branch.upstream().ok()?.get().name().map(str::to_string)
     }
@@ -844,6 +966,9 @@ pub struct SyncStatus {
     pub upstream: Option<String>,
     pub ahead: usize,
     pub behind: usize,
+    /// The upstream is where a push would CREATE the branch
+    /// (`sync_status_of`): the remote does not have it yet.
+    pub new_branch: bool,
 }
 
 impl SyncStatus {
@@ -852,6 +977,7 @@ impl SyncStatus {
             upstream: None,
             ahead: 0,
             behind: 0,
+            new_branch: false,
         }
     }
 }
@@ -1005,6 +1131,48 @@ mod tests {
             status.len(),
             start.elapsed()
         );
+    }
+
+    /// A branch made off main that the remote does not have: its status is
+    /// against `<remote>/<branch>`, counted as new there, whatever HEAD is,
+    /// and its push names it and sets the upstream.
+    #[test]
+    fn a_branch_without_an_upstream_pushes_to_its_own_name() {
+        let (dir, ws) = temp_repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .unwrap();
+        // origin has main, as a fetch would have left it.
+        let tip = repo.head().unwrap().target().unwrap();
+        repo.reference(&format!("refs/remotes/origin/{main}"), tip, true, "fetched")
+            .unwrap();
+        ws.create_branch("devcontainer").unwrap();
+        fs::write(dir.path().join("b.txt"), "two\n").unwrap();
+        ws.stage(Path::new("b.txt")).unwrap();
+        ws.commit("second").unwrap();
+        // HEAD back on main, as a peer's is while the VM is on the branch.
+        ws.switch_branch(&main).unwrap();
+
+        let sync = ws.sync_status_of("devcontainer").unwrap();
+        assert_eq!(sync.upstream.as_deref(), Some("origin/devcontainer"));
+        assert_eq!((sync.ahead, sync.behind, sync.new_branch), (1, 0, true));
+
+        let (_, args) = ws.push_branch_command("devcontainer", &[]);
+        assert_eq!(
+            &args[2..],
+            [
+                "push",
+                "--set-upstream",
+                "origin",
+                "refs/heads/devcontainer:refs/heads/devcontainer"
+            ]
+        );
+        // The branch HEAD is on is still measured the old way.
+        assert!(!ws.sync_status_of(&main).unwrap().new_branch);
     }
 
     #[test]

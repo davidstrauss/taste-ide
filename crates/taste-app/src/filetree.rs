@@ -4374,11 +4374,22 @@ impl FileTree {
                         return Err(false);
                     }
                 };
-                let sync = if worktree.is_local() {
-                    GitWorkspace::discover(&root).and_then(|git| git.sync_status().ok())
+                // The branch the WORKING TREE is on, asked of the repository
+                // that holds the remote-tracking refs: for a checkout in a
+                // VM that is the peer, whose own HEAD is whatever the
+                // folder last fast-forwarded to — asking about HEAD there
+                // read a branch just made in the VM as main against
+                // origin/main.
+                let branch = worktree.branch_name();
+                let sync = GitWorkspace::discover(if worktree.is_local() {
+                    &root
                 } else {
-                    GitWorkspace::discover(&refs_root).and_then(|git| git.sync_status().ok())
-                };
+                    &refs_root
+                })
+                .and_then(|git| match &branch {
+                    Some(branch) => git.sync_status_of(branch).ok(),
+                    None => git.sync_status().ok(),
+                });
                 Ok(StatusSnapshot {
                     status,
                     stashed: worktree.stashed_paths().unwrap_or_default(),
@@ -4394,7 +4405,7 @@ impl FileTree {
                                 .count()
                         })
                         .unwrap_or(0),
-                    branch: worktree.branch_name(),
+                    branch,
                     sync,
                     rebasing: worktree.rebase_in_progress(),
                 })
@@ -4514,14 +4525,28 @@ impl FileTree {
                                     // tooltips; the label is for exceptions.
                                     self.set_sync_label("");
                                     self.push_face.set_label(&format!("↑ {}", sync.ahead));
-                                    self.push_button.set_sensitive(sync.ahead > 0);
-                                    self.push_button.set_tooltip_text(Some(&format!(
-                                        "Push {} commit{} to {upstream}",
-                                        sync.ahead,
-                                        if sync.ahead == 1 { "" } else { "s" }
-                                    )));
+                                    // A branch the remote does not have yet
+                                    // is worth a push with nothing ahead:
+                                    // the push is what creates it there.
+                                    self.push_button
+                                        .set_sensitive(sync.ahead > 0 || sync.new_branch);
+                                    self.push_button.set_tooltip_text(Some(&if sync.new_branch {
+                                        format!(
+                                            "Push {} commit{} to {upstream}, creating the branch \
+                                             there",
+                                            sync.ahead,
+                                            if sync.ahead == 1 { "" } else { "s" }
+                                        )
+                                    } else {
+                                        format!(
+                                            "Push {} commit{} to {upstream}",
+                                            sync.ahead,
+                                            if sync.ahead == 1 { "" } else { "s" }
+                                        )
+                                    }));
                                     self.pull_face.set_label(&format!("↓ {}", sync.behind));
-                                    self.pull_button.set_sensitive(sync.behind > 0);
+                                    self.pull_button
+                                        .set_sensitive(sync.behind > 0 && !sync.new_branch);
                                     let held = self
                                         .fetch_hold
                                         .borrow()
@@ -5352,8 +5377,15 @@ impl FileTree {
             }
             if let Some(tree) = weak.upgrade() {
                 // New HEAD: statuses, rows, and open buffers all changed.
+                // Redrawn as the view the toggles say — rebuild() alone is
+                // the whole tree, which put All under a lit Dirty after
+                // every new branch (David, 2026-09-23).
                 tree.refresh_status();
-                tree.rebuild();
+                if tree.filters_active() {
+                    tree.render_filter_view();
+                } else {
+                    tree.rebuild();
+                }
                 tree.workspace.events.publish(Event::FileTreeChanged);
             }
         });
@@ -6034,6 +6066,9 @@ impl FileTree {
         if self.refuse_read_only() {
             return;
         }
+        // The working tree's branch, as the push has it: for a checkout in
+        // a VM, not this repository's HEAD, whose upstream is main's.
+        let branch = self.status_branch.borrow().clone();
         let Some((fetch, fetch_issues, rebase_command, remote, upstream)) =
             self.git.borrow().as_ref().map(|git| {
                 (
@@ -6041,7 +6076,10 @@ impl FileTree {
                     git.fetch_issues_command(),
                     git.rebase_command(),
                     git.upstream_remote_url(),
-                    git.upstream_ref(),
+                    match &branch {
+                        Some(branch) => git.upstream_ref_of(branch),
+                        None => git.upstream_ref(),
+                    },
                 )
             })
         else {
@@ -6979,14 +7017,21 @@ impl FileTree {
         // to the plain push until the ref exists, so a workspace that has
         // never filed an issue pushes exactly what it always did — and the
         // queue reaches a remote on the USER's action, never an agent's.
+        // The branch the working tree is on — for a checkout in a VM, not
+        // this repository's HEAD, which a plain `git push` here would have
+        // pushed instead — pushed by name, to its upstream or, when it has
+        // none, to the same name on the remote.
+        let branch = self.status_branch.borrow().clone();
         let Some((program, args, remote, sync)) = self.git.borrow().as_ref().map(|git| {
-            let (program, args) = git.push_command_including_issues();
-            (
-                program,
-                args,
-                git.upstream_remote_url(),
-                git.sync_status().ok(),
-            )
+            let (program, args) = match &branch {
+                Some(branch) => git.push_branch_command_including_issues(branch),
+                None => git.push_command_including_issues(),
+            };
+            let sync = match &branch {
+                Some(branch) => git.sync_status_of(branch).ok(),
+                None => git.sync_status().ok(),
+            };
+            (program, args, git.upstream_remote_url(), sync)
         }) else {
             return;
         };
