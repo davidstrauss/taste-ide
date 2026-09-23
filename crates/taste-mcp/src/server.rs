@@ -360,6 +360,11 @@ impl McpServer {
         }
         if include.iter().any(|item| item == "log" || item == "logs") {
             out["log"] = json!(supervisor.logs_tail(lines_arg(args)));
+            // While a build's failure stands, its own lines: the live log's
+            // tail is the baseline's build by then.
+            if let Some(failed) = supervisor.failed_build_log() {
+                out["failed_build_log"] = json!(failed);
+            }
         }
         if include.iter().any(|item| item == "resources") {
             let resources: Vec<Value> = supervisor

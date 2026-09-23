@@ -459,6 +459,10 @@ pub struct ResolvedConfig {
     pub reason: Option<String>,
 }
 
+/// How much of a failed build's log is kept for its repair: enough for a
+/// failing step's own output and podman's error after it.
+const FAILED_BUILD_LOG_LINES: usize = 120;
+
 pub struct Supervisor {
     env: EnvironmentIdentity,
     events: EventBus,
@@ -528,6 +532,13 @@ pub struct Supervisor {
     /// this banner with the one suggesting rebuild as soon as new changes
     /// occur").
     build_failed: Mutex<Option<(String, String)>>,
+    /// The failed build's own log, as it stood when it failed — before the
+    /// baseline that stands in writes its build after it. What a repair is
+    /// handed (David, 2026-09-23: "the prompt agent button will direct the
+    /// agent to troubleshoot the *failed* build, right?"): the tail of the
+    /// live log by then is the baseline's, and podman's error is lines
+    /// above it.
+    failed_build_log: Mutex<Option<Vec<String>>>,
     /// The lifecycle command that failed on the last start, when one did,
     /// with its exit. The container stays up and the environment runs —
     /// the command is the project's, the environment it ran in is real,
@@ -835,6 +846,7 @@ impl Supervisor {
             published_ports: Mutex::new(std::collections::HashMap::new()),
             passed_over: Mutex::new(None),
             build_failed: Mutex::new(None),
+            failed_build_log: Mutex::new(None),
             hook_failure: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
@@ -1638,6 +1650,7 @@ impl Supervisor {
                 return baseline(Some(format!("it could not be built or started: {reason}")));
             }
             self.build_failed.lock().unwrap().take();
+            self.failed_build_log.lock().unwrap().take();
         }
         Ok(ResolvedConfig {
             config,
@@ -1669,8 +1682,29 @@ impl Supervisor {
     /// resolution passes the config over until it changes.
     fn remember_build_failure(&self, config: &DevcontainerConfig, error: &anyhow::Error) {
         let hash = self.setup_hash(config).unwrap_or_default();
-        let reason = error.to_string();
+        let log = self.logs_tail(FAILED_BUILD_LOG_LINES);
+        // podman's exit status says only that it failed; its `Error:` line
+        // says what, and rides in the reason every surface quotes.
+        let said = log
+            .iter()
+            .rev()
+            .map(|line| line.trim())
+            .find(|line| line.starts_with("Error:") || line.starts_with("error:"))
+            .map(str::to_string);
+        let reason = match said {
+            Some(said) => format!("{error} — {said}"),
+            None => error.to_string(),
+        };
         *self.build_failed.lock().unwrap() = Some((hash, reason));
+        *self.failed_build_log.lock().unwrap() = Some(log);
+    }
+
+    /// The last failed build's own log, while that failure stands.
+    pub fn failed_build_log(&self) -> Option<Vec<String>> {
+        if self.build_failed.lock().unwrap().is_none() {
+            return None;
+        }
+        self.failed_build_log.lock().unwrap().clone()
     }
 
     /// The whole setup as one hash — every file the config reads, plus
@@ -4794,6 +4828,43 @@ mod tests {
     /// A project image that would not build or pull is passed over for the
     /// baseline, with podman's reason, until the config builds a different
     /// image — which is a new attempt.
+    /// A failed build keeps its own lines for the repair, whatever the
+    /// baseline writes after it, and the reason says podman's error rather
+    /// than only its exit status.
+    #[test]
+    fn a_failed_build_keeps_its_own_log_and_names_podmans_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("devcontainer.json"),
+            r#"{"image": "example.invalid/php:nope"}"#,
+        )
+        .unwrap();
+        let sup = make(dir.path());
+        sup.log("STEP 2/3: RUN dnf install -y gti");
+        sup.log("Error: building at STEP \"RUN dnf install -y gti\": exit status 1");
+        let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
+        sup.remember_build_failure(
+            &config,
+            &anyhow::anyhow!("podman build failed: exit status: 1"),
+        );
+        for n in 0..200 {
+            sup.log(format!("the baseline's build, line {n}"));
+        }
+        let kept = sup.failed_build_log().expect("the failure's log is kept");
+        assert!(
+            kept.last().unwrap().starts_with("Error: building at STEP"),
+            "{kept:?}"
+        );
+        assert!(!kept.iter().any(|line| line.contains("baseline")));
+        let (_, reason) = sup.resolve_authority();
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("gti")),
+            "{reason:?}"
+        );
+    }
+
     #[test]
     fn a_failed_image_is_passed_over_until_the_config_moves() {
         let dir = tempfile::tempdir().unwrap();

@@ -751,9 +751,18 @@ pub(crate) fn author_prompt() -> String {
 pub(crate) fn repair_prompt(
     supervisor: &taste_devcontainer::Supervisor,
 ) -> (String, Option<String>) {
-    let log = supervisor.logs_tail(REPAIR_LOG_LINES);
+    // The failed build's own lines when a build failed: by the time anyone
+    // asks, the live log's tail is the baseline's build, written after it.
+    let failed_log = supervisor.failed_build_log();
+    let from_failure = failed_log.is_some();
+    let log = failed_log.unwrap_or_else(|| supervisor.logs_tail(REPAIR_LOG_LINES));
     let log = (!log.is_empty()).then(|| log.join("\n"));
     let evidence = match &log {
+        Some(_) if from_failure => {
+            "The failed build's log, as it stood when it failed, is attached as \
+             environment-build.log; podman's error is at its end. Read it before changing \
+             anything."
+        }
         Some(_) => {
             "The last lines of the environment build log are attached as \
              environment-build.log; read them before changing anything."
