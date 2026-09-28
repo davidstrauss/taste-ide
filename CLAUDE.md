@@ -217,7 +217,9 @@ view at that width, lets the rung apply, then grows the window back to
 1440x900 and shoots THAT — the only way to check that a rung gives
 everything back (the window's own frame comes out blank right after an
 X11 resize, so judge the round trip from the pane shots and the geometry
-dump). Every probe run also prints `fit
+dump); `=WxH` makes the trip to that size instead, which is how a shrink
+across a rung is posed (half a 1920 screen lands on the consolidated
+rung's 960 exactly). Every probe run also prints `fit
 <pane>: … ok|OFF-WINDOW` — a pane whose right edge is past the window's
 is a layout that does not fit, whatever the screenshot looks like.
 `TASTE_PROBE_WALK=1500-380[:20]` is that check as a *sweep*: it poses the

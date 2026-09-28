@@ -3138,10 +3138,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // than one — a window shot immediately after an X11 resize is a
             // paintable that has not been drawn into yet, which photographs
             // as a uniform slab.
-            if std::env::var("TASTE_PROBE_ROUNDTRIP").is_ok() {
+            //
+            // `=WxH` makes the trip to that size instead, which is how a
+            // shrink across a rung gets posed — a window snapped to half a
+            // 1920 screen lands on the consolidated rung's 960 exactly.
+            if let Ok(trip) = std::env::var("TASTE_PROBE_ROUNDTRIP") {
+                let (width, height) = trip
+                    .split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                    .unwrap_or((1440, 900));
                 let w = window.clone();
                 glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-                    w.set_default_size(1440, 900)
+                    w.set_default_size(width, height)
                 });
             }
             // Long enough for the FIRST frame, not just for the jump. On a
