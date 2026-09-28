@@ -1398,7 +1398,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             }
         }));
     }
-    // `TASTE_PROBE_STARTUP=vm|place|build|failed|noconfig|ready`: the page at
+    // `TASTE_PROBE_STARTUP=vm|image|novm|place|build|failed|noconfig|ready`: the page at
     // that stage, in front, which otherwise needs a start under way.
     if let Ok(kind) = std::env::var("TASTE_PROBE_STARTUP") {
         startup.pose_for_probe(&kind);

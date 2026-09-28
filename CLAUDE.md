@@ -165,7 +165,9 @@ the two it is; otherwise it needs a container running a server bound
 the wrong way;
 `TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
 safe-mode banner's running-baseline face;
-`TASTE_PROBE_STARTUP=vm` (or `place` — the checkout's seed partway,
+`TASTE_PROBE_STARTUP=vm` (or `image` — the guest image fetching inside
+the VM's bring-up —, `novm` — that bring-up failing once the image is in,
+as a host with VT-x off does —, `place` — the checkout's seed partway,
 git's progress as its detail —, `build`, `failed`, `noconfig`, `ready`)
 poses the environment's startup page — the checklist over the stripes,
 the log below, the safe-mode note on the fallback faces

@@ -227,7 +227,7 @@ impl StepRow {
         // descriptions under the completed env rebuild steps, but I want
         // them to state the summary/conclusion"). A failed one says why.
         let show = |text: &str| {
-            self.detail.set_label(text);
+            self.detail.set_label(&sentence_case(text));
             self.detail.set_visible(true);
         };
         match (status, detail) {
@@ -673,10 +673,18 @@ impl StartupPage {
     /// machine.
     pub fn on_guest_image(self: &Rc<Self>, fetch: &taste_core::GuestImageFetch) {
         use taste_core::GuestImagePhase as P;
+        // The image is fetched inside the VM's bring-up — only a VM being
+        // made needs it — so its phases arrive after that step is
+        // announced. The VM is not booting while its disk's image is still
+        // on its way, so the page steps back to the image for the fetch
+        // and returns to the VM once the image is verified.
         if !fetch.phase.active() {
             if self.row(Step::GuestImage).status.get() == Status::Active {
                 self.row(Step::GuestImage)
                     .set(Status::Done, Some("fetched and verified"));
+                if self.current.get() == Some(Step::GuestImage) {
+                    self.activate(Step::Vm, Some("bringing up the workspace's VM"));
+                }
             }
             return;
         }
@@ -689,20 +697,11 @@ impl StartupPage {
             P::Decompressing => "unpacking".to_string(),
             _ => "verifying".to_string(),
         };
-        // The image is fetched inside the VM's bring-up, so its phases
-        // arrive after that step is announced: the image's row says how
-        // far it has got, and the page stays on the VM's step, where a
-        // failure that follows belongs.
-        if self
-            .current
-            .get()
-            .is_some_and(|step| step > Step::GuestImage)
-        {
-            let row = self.row(Step::GuestImage);
-            if row.status.get() != Status::Failed {
-                row.set(Status::Active, Some(&detail));
+        for later in Step::ALL.iter().filter(|s| **s > Step::GuestImage) {
+            let row = self.row(*later);
+            if row.status.get() == Status::Active {
+                row.set(Status::Pending, None);
             }
-            return;
         }
         self.activate(Step::GuestImage, Some(&detail));
     }
@@ -779,7 +778,7 @@ impl StartupPage {
     }
 
     /// TASTE_PROBE_CHECK only: pose the page at a stage —
-    /// `TASTE_PROBE_STARTUP=vm|place|build|failed|noconfig|ready` — with a few
+    /// `TASTE_PROBE_STARTUP=vm|image|novm|place|build|failed|noconfig|ready` — with a few
     /// lines in its log, since a start is a minute of a machine's life and
     /// a shot has none of it.
     #[doc(hidden)]
@@ -851,6 +850,34 @@ impl StartupPage {
                 self.on_state(&DevcontainerStateEvent::NoConfig, false);
                 self.activate(Step::Build, Some("the safe-mode environment"));
             }
+            // The guest image arriving inside the VM's bring-up, as the
+            // first VM on a machine has it; `novm` is the same bring-up
+            // failing once the image is in, as a host with VT-x off in its
+            // firmware does.
+            "image" | "novm" => {
+                self.activate(Step::Vm, Some("bringing up the workspace's VM"));
+                let fetch = |phase, done: u64, total: u64| taste_core::GuestImageFetch {
+                    release: "44.20260829.3.1".into(),
+                    phase,
+                    done: done * 1024 * 1024,
+                    total: total * 1024 * 1024,
+                };
+                self.on_guest_image(&fetch(taste_core::GuestImagePhase::Fetching, 612, 976));
+                if kind == "novm" {
+                    self.on_guest_image(&fetch(taste_core::GuestImagePhase::Ready, 0, 0));
+                    self.on_state(
+                        &DevcontainerStateEvent::Failed {
+                            message: "could not provision a VM for this workspace (defining \
+                                      the domain: virsh define: Failed to define domain from \
+                                      taste-799fd7acd369bf5c-wm6k0x.xml: unsupported \
+                                      configuration: Emulator '/usr/bin/qemu-system-x86_64' \
+                                      does not support virt type 'kvm')"
+                                .into(),
+                        },
+                        false,
+                    );
+                }
+            }
             "place" => {
                 self.activate(Step::Vm, None);
                 self.activate(Step::Files, None);
@@ -904,8 +931,6 @@ fn duration_words(took: std::time::Duration) -> String {
     }
 }
 
-/// A substep as one short line: the first line, its first letter up,
-/// cut with an ellipsis where a log line runs on.
 /// Programs a line can begin with, spelled as their own names are: never
 /// capitalised at the start of a step's detail.
 const LOWERCASE_NAMES: &[&str] = &[
@@ -937,8 +962,31 @@ const LOWERCASE_NAMES: &[&str] = &[
     "zincati",
     "ignition",
     "rpm-ostree",
+    "virsh",
+    "qemu-img",
 ];
 
+/// A step's detail as a sentence: its first letter up, unless the first
+/// word is a program's name, which keeps its own spelling. Every detail
+/// goes through this — substeps, a failure's reason, and the IDE's own
+/// words alike — because they arrive as log lines and error chains, which
+/// begin in lowercase.
+fn sentence_case(text: &str) -> String {
+    let first_word = text
+        .split(|c: char| c.is_whitespace() || c == ':' || c == ';' || c == ',')
+        .next()
+        .unwrap_or("");
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) if !LOWERCASE_NAMES.contains(&first_word) => {
+            c.to_uppercase().collect::<String>() + chars.as_str()
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// A substep as one short line: the first line, its first letter up,
+/// cut with an ellipsis where a log line runs on.
 fn substep_words(text: &str) -> String {
     // One space between words: podman prints a continued RUN as one line
     // with the Containerfile's indentation still in it, which read as
@@ -954,18 +1002,7 @@ fn substep_words(text: &str) -> String {
     // spelling. The VM's lines begin with the programs they are about, and
     // capitalising them wrote "Sshd answers" and "Podman in the guest
     // answers" (David, 2026-09-23: "It should just be sshd, not Sshd").
-    let first_word = first
-        .split(|c: char| c.is_whitespace() || c == ':' || c == ';' || c == ',')
-        .next()
-        .unwrap_or("");
-    let mut chars = first.chars();
-    let mut out: String = match chars.next() {
-        Some(c) if !LOWERCASE_NAMES.contains(&first_word) => {
-            c.to_uppercase().collect::<String>() + chars.as_str()
-        }
-        Some(_) => first.clone(),
-        None => String::new(),
-    };
+    let mut out = sentence_case(&first);
     if out.chars().count() > 96 {
         out = out.chars().take(95).collect::<String>() + "…";
     }
@@ -975,6 +1012,27 @@ fn substep_words(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_detail_is_a_sentence_unless_it_opens_on_a_program() {
+        assert_eq!(
+            super::sentence_case("could not provision a VM"),
+            "Could not provision a VM"
+        );
+        assert_eq!(
+            super::sentence_case("fetched and verified"),
+            "Fetched and verified"
+        );
+        assert_eq!(
+            super::sentence_case("systemd: unit failed"),
+            "systemd: unit failed"
+        );
+        assert_eq!(
+            super::sentence_case("virsh define: Failed"),
+            "virsh define: Failed"
+        );
+        assert_eq!(super::sentence_case(""), "");
+    }
 
     #[test]
     fn a_continued_run_reads_as_one_spaced_line() {
