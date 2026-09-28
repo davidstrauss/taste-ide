@@ -4849,6 +4849,26 @@ impl ChatPane {
     /// Say once, in the transcript, why this chat's agent is not running
     /// beside its files. Repeating it on every reconnect would bury the
     /// conversation under a fact that has not changed.
+    /// Whether a spawn now would relocate, asked without saying anything:
+    /// [`Self::relocation`]'s gates, less its notes. A refused launch
+    /// waiting for its container asks this on every settled state, and
+    /// `relocation` answering it wrote "agent not relocated … starts
+    /// outside it" when nothing was starting at all (2026-09-28).
+    fn could_relocate(&self) -> bool {
+        if taste_acp::sandbox::inside_container() {
+            return false;
+        }
+        let Some(supervisor) = self.environments.get(&self.environment) else {
+            return false;
+        };
+        supervisor.exec().has_exec_target()
+            && matches!(
+                supervisor.agent_hosting(),
+                taste_devcontainer::AgentHosting::Yes
+            )
+            && supervisor.channel_paths().is_some()
+    }
+
     fn report_hosting_refusal(&self, reason: &str) {
         if self.hosting_refusal.borrow().as_deref() == Some(reason) {
             return;
@@ -5018,9 +5038,7 @@ impl ChatPane {
             // in this same cell (a panic, 2026-09-28).
             let refused = self.refused_launch.borrow_mut().take();
             if let Some(refused) = refused {
-                let agents = builtin_agents();
-                let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
-                if self.relocation(&agents[index]).is_none() {
+                if !self.could_relocate() {
                     *self.refused_launch.borrow_mut() = Some(refused);
                     return;
                 }
