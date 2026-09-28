@@ -220,27 +220,6 @@ fn main() -> glib::ExitCode {
             }
         }
         gtk::Window::set_default_icon_name(APP_ID);
-        // `TASTE_FONT_RENDERING=manual`: text on the pixel grid. GTK's
-        // automatic rendering places glyphs at fractional positions under a
-        // fractional display scale, so at 125% a 23px row is 28.75 device
-        // pixels and three rows in four draw their top strokes across a
-        // pixel boundary, faint — "the tops of letters" clipped in the
-        // file list (David, 2026-09-28). An experiment before a default:
-        // it changes how every label in the app renders.
-        if std::env::var("TASTE_FONT_RENDERING").as_deref() == Ok("manual") {
-            if let Some(settings) = gtk::Settings::default() {
-                // By nick, through the enum's own type: the typed setter
-                // is GTK 4.16's, past the 4.14 this crate builds against.
-                let manual = settings
-                    .find_property("gtk-font-rendering")
-                    .and_then(|pspec| glib::EnumClass::with_type(pspec.value_type()))
-                    .and_then(|class| class.to_value_by_nick("manual"));
-                if let Some(manual) = manual {
-                    settings.set_property_from_value("gtk-font-rendering", &manual);
-                    settings.set_property("gtk-hint-font-metrics", true);
-                }
-            }
-        }
         // App-level styling: the chat prompt entry (transparent TextView in
         // an entry-shaped container, matching GNOME chat apps).
         // The composer wears the same treatment a selected tab gets, and
@@ -1078,11 +1057,14 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
         ".file-row label {{ color: {}; }}\n",
         crate::palette::TREE_FG_DARK
     );
-    // Measured: 0.92em gives back about a pixel of row height, and 1px
+    // Measured: 14px gives back about a pixel of row height, and 1px
     // either side spends it, so the pitch stays where it was (23px) while
     // the glyphs inside it are smaller — which is the whole of "the same
     // density, just airier". 2px either side put the pitch at 25 and made
     // the column longer than it was.
+    //
+    // Its size is `tree_font_css`'s: the desktop's, scaled, on a whole
+    // pixel.
     // The row itself carries the geometry: the theme's `navigation-sidebar`
     // gives the tree the lozenge the sections have — inset from the list's
     // edge, rounded, filled when selected — and brings a 36px row with it,
@@ -1103,8 +1085,7 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
     // tall as what is in it. Measured: the content is 17px, so 3px either
     // side is the 23px pitch this listing already had — the smaller face
     // buys the air rather than a shorter column.
-    const TREE_TYPE: &str = ".file-row { font-size: 0.92em; }\n\
-                             listview.files-tree > row { margin: 0 4px; \
+    const TREE_TYPE: &str = "listview.files-tree > row { margin: 0 4px; \
                                padding: 3px 10px; min-height: 0; }\n";
     // The panels' softer text (`palette::PANEL_FG_DARK`). Set on each pane's
     // root and inherited, so anything that states no colour of its own
@@ -1127,6 +1108,64 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
     let style = adw::StyleManager::default();
     apply(&style, &provider);
     style.connect_dark_notify(move |style| apply(style, &provider));
+
+    // The listing's size, followed: the desktop's font or its text
+    // scaling changing is a new size to round.
+    let font = gtk::CssProvider::new();
+    gtk::style_context_add_provider_for_display(
+        display,
+        &font,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+    );
+    let settings = gtk::Settings::for_display(display);
+    font.load_from_string(&tree_font_css(&settings));
+    for property in ["gtk-font-name", "gtk-xft-dpi"] {
+        let font = font.clone();
+        settings.connect_notify_local(Some(property), move |settings, _| {
+            font.load_from_string(&tree_font_css(settings));
+        });
+    }
+}
+
+/// The file listing's font size: 92% of the desktop's, with its text
+/// scaling, rounded UP to a whole pixel.
+///
+/// Whole, because at the 13.49px that 0.92em came to by default GTK drew
+/// the names with the tops of their capitals cut off after any resize of
+/// the window — every renderer, a full redraw, and labels made fresh
+/// alike, while the layout under them measured whole (David,
+/// 2026-09-28). At 14px it does not. Up rather than to the nearest, so the
+/// listing keeps the 17px line its 23px pitch is built on; 13px gave a
+/// 16px line. Worked out here rather than stated in px, so the listing
+/// still follows the desktop's font and its text scaling.
+fn tree_font_css(settings: &gtk::Settings) -> String {
+    let px = settings
+        .gtk_font_name()
+        .map(|name| gtk::pango::FontDescription::from_string(&name))
+        .filter(|desc| desc.size() > 0)
+        .map(|desc| {
+            let size = desc.size() as f64 / gtk::pango::SCALE as f64;
+            if desc.is_size_absolute() {
+                size
+            } else {
+                // `gtk-xft-dpi` is 1024 × the DPI, text scaling included.
+                let dpi = match settings.gtk_xft_dpi() {
+                    dpi if dpi > 0 => dpi as f64 / 1024.0,
+                    _ => 96.0,
+                };
+                size * dpi / 72.0
+            }
+        });
+    match px {
+        Some(px) => format!(".file-row {{ font-size: {}px; }}\n", tree_font_px(px)),
+        None => ".file-row { font-size: 0.92em; }\n".to_string(),
+    }
+}
+
+fn tree_font_px(desktop_px: f64) -> i32 {
+    // The epsilon keeps a size that is whole already from rounding up past
+    // itself on a float's last digit.
+    (desktop_px * 0.92 - 1e-6).ceil() as i32
 }
 
 /// The search's colours (SEARCH.md): one hue, `palette::SEARCH_FILL`, in
@@ -1289,5 +1328,18 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AppLogLayer {
             event.metadata().target(),
             &collector.0,
         );
+    }
+}
+
+#[cfg(test)]
+mod tree_font_tests {
+    #[test]
+    fn the_listing_size_is_the_desktops_on_a_whole_pixel() {
+        // Adwaita Sans 11 at 96 DPI: 14.67px, of which 92% is 13.49.
+        assert_eq!(super::tree_font_px(11.0 * 96.0 / 72.0), 14);
+        // The same at 125% text scaling.
+        assert_eq!(super::tree_font_px(11.0 * 120.0 / 72.0), 17);
+        // Whole already stays whole.
+        assert_eq!(super::tree_font_px(25.0), 23);
     }
 }
