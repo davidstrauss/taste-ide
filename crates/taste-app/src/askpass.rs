@@ -157,27 +157,95 @@ pub fn run(prompt: &str) -> glib::ExitCode {
     ask_in_window(prompt, kind)
 }
 
-/// ssh's passphrase question in the IDE's words: the key by the name its
-/// owner gave it — the `.pub` comment ("amutable-nitro"), the file's name
-/// when it has none — and what kind of key it is, with the path on a
-/// second line for the strip's tooltip. ssh asks "Enter passphrase for key
-/// '<path>':", ssh-add "Enter passphrase for <path>:", the path alone being
-/// a line of home directory to read past (David, 2026-09-28: "Is there a
-/// cleaner key name we could show?"). `None` for any other prompt.
+/// ssh's question for a key's secret in the IDE's words — a passphrase
+/// or a security key's PIN — with the key by the name its owner gave it:
+/// the `.pub` comment ("amutable-nitro"), the file's name when it has
+/// none. The path, when there is one, goes on a second line for the
+/// strip's tooltip, since a line of home directory is a thing to read past
+/// (David, 2026-09-28: "Is there a cleaner key name we could show?").
+/// `None` for any other prompt, which is shown as ssh wrote it.
+///
+/// The wordings, from OpenSSH itself: ssh's "Enter passphrase for key
+/// '<path>':" and ssh-add's "Enter passphrase for <path>:"; a PIN as ssh
+/// asks it, "Enter PIN for <TYPE> key <path or fingerprint>:", and as the
+/// agent asks it, the same with " again " for a retry; and a FIDO device's
+/// own, "Enter PIN for '<device>':".
 fn passphrase_prompt(prompt: &str) -> Option<String> {
-    let rest = prompt.trim().strip_prefix("Enter passphrase for ")?;
-    let rest = rest.strip_prefix("key ").unwrap_or(rest);
-    let rest = rest.trim_end().trim_end_matches(':');
-    // ssh-add may add " (will confirm each use)" after the path.
-    let path = rest
-        .split(" (")
-        .next()
-        .unwrap_or(rest)
-        .trim()
-        .trim_matches('\'');
-    let path = Path::new(path);
+    let prompt = prompt.trim();
+    if let Some(rest) = prompt.strip_prefix("Enter passphrase for ") {
+        let rest = rest.strip_prefix("key ").unwrap_or(rest);
+        let rest = rest.trim_end().trim_end_matches(':');
+        // ssh-add may add " (will confirm each use)" after the path.
+        let path = rest
+            .split(" (")
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .trim_matches('\'');
+        let key = key_by_path(Path::new(path))?;
+        return Some(key.say("Passphrase", false));
+    }
+    let rest = prompt.strip_prefix("Enter PIN")?;
+    let (again, rest) = match rest.trim_start().strip_prefix("again") {
+        Some(rest) => (true, rest),
+        None => (false, rest),
+    };
+    let rest = rest.trim_start().strip_prefix("for ")?;
+    let rest = rest.trim_end().trim_end_matches(':').trim_end();
+    // A device by its own name, while a key is being made on it.
+    if let Some(device) = rest.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        return Some(format!(
+            "PIN for security key {device}{}",
+            if again { " (try again)" } else { "" }
+        ));
+    }
+    // "<TYPE> key <which>": which is a path, a fingerprint, or a comment.
+    let (kind, which) = rest.split_once(" key ")?;
+    let security = kind.to_ascii_uppercase().ends_with("-SK");
+    let key = if which.starts_with("SHA256:") {
+        key_by_fingerprint(which).unwrap_or(Key {
+            security,
+            name: which.to_string(),
+            path: None,
+        })
+    } else if Path::new(which).is_file() || Path::new(&format!("{which}.pub")).is_file() {
+        key_by_path(Path::new(which))?
+    } else {
+        Key {
+            security,
+            name: which.to_string(),
+            path: None,
+        }
+    };
+    Some(key.say("PIN", again))
+}
+
+/// A key as the strip names it.
+struct Key {
+    security: bool,
+    name: String,
+    path: Option<PathBuf>,
+}
+
+impl Key {
+    fn say(&self, what: &str, again: bool) -> String {
+        let kind = if self.security {
+            "security key"
+        } else {
+            "SSH key"
+        };
+        let again = if again { " (try again)" } else { "" };
+        match &self.path {
+            Some(path) => format!("{what} for {kind} {}{again}\n{}", self.name, path.display()),
+            None => format!("{what} for {kind} {}{again}", self.name),
+        }
+    }
+}
+
+/// The key a private key file is, named from its `.pub`.
+fn key_by_path(path: &Path) -> Option<Key> {
     let public = std::fs::read_to_string(format!("{}.pub", path.display())).ok();
-    let (kind, comment) = match public.as_deref().and_then(|text| text.lines().next()) {
+    let (security, comment) = match public.as_deref().and_then(|text| text.lines().next()) {
         Some(line) => {
             let mut fields = line.split_whitespace();
             let kind = fields.next().unwrap_or_default();
@@ -191,8 +259,33 @@ fn passphrase_prompt(prompt: &str) -> Option<String> {
     } else {
         comment
     };
-    let kind = if kind { "security key" } else { "SSH key" };
-    Some(format!("Passphrase for {kind} {name}\n{}", path.display()))
+    Some(Key {
+        security,
+        name,
+        path: Some(path.to_path_buf()),
+    })
+}
+
+/// The key in `~/.ssh` whose fingerprint is `fingerprint`, as the agent
+/// names a key it asks a PIN for.
+fn key_by_fingerprint(fingerprint: &str) -> Option<Key> {
+    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".ssh");
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let public = entry.path();
+        if public.extension().is_none_or(|ext| ext != "pub") {
+            return None;
+        }
+        let out = std::process::Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(&public)
+            .output()
+            .ok()?;
+        let listed = String::from_utf8_lossy(&out.stdout);
+        if !listed.split_whitespace().any(|field| field == fingerprint) {
+            return None;
+        }
+        key_by_path(&public.with_extension(""))
+    })
 }
 
 /// What a prompt wants, from ssh's word for it when it gives one
@@ -437,6 +530,21 @@ mod tests {
             passphrase_prompt(&format!("Enter passphrase for key '{}': ", plain.display()))
                 .as_deref(),
             Some(format!("Passphrase for SSH key id_rsa\n{}", plain.display()).as_str())
+        );
+        // A PIN, as ssh asks it over the file, and as the agent asks it
+        // again over a name it cannot place.
+        assert_eq!(
+            passphrase_prompt(&format!("Enter PIN for ED25519-SK key {}: ", key.display()))
+                .as_deref(),
+            Some(format!("PIN for security key amutable-nitro\n{}", key.display()).as_str())
+        );
+        assert_eq!(
+            passphrase_prompt("Enter PIN again for ECDSA-SK key work-yubikey: ").as_deref(),
+            Some("PIN for security key work-yubikey (try again)")
+        );
+        assert_eq!(
+            passphrase_prompt("Enter PIN for 'Nitrokey 3': ").as_deref(),
+            Some("PIN for security key Nitrokey 3")
         );
         assert_eq!(passphrase_prompt("root@host's password: "), None);
         let _ = std::fs::remove_dir_all(&dir);
