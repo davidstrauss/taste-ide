@@ -1709,6 +1709,10 @@ impl PrivateForm {
     }
 }
 
+/// "Get a token"'s tooltip while it can run.
+const GET_TOKEN_TOOLTIP: &str = "Runs the agent's own sign-in (claude setup-token) in a console \
+                                 tab; paste the token it prints into the Token row";
+
 /// The account credential's rows in the settings shade: the IDE-owned
 /// sign-in for the project. One token, which kind it is, and what to call
 /// the identity; Save writes the project's credential file and nothing
@@ -1761,10 +1765,7 @@ impl CredentialForm {
         let get_token = adw::ButtonRow::builder()
             .title("Get a token in a console tab")
             .start_icon_name("utilities-terminal-symbolic")
-            .tooltip_text(
-                "Runs the agent's own sign-in (claude setup-token) in a console tab; paste \
-                 the token it prints into the Token row",
-            )
+            .tooltip_text(GET_TOKEN_TOOLTIP)
             .build();
         // Saving asks the account one question with what was just saved
         // — the Models API, the request the proxy makes for itself — so
@@ -3906,6 +3907,7 @@ impl ChatPane {
         self.credential_form
             .get_token
             .set_visible(spec.token.is_some());
+        self.sync_sign_in_availability();
         let root = self.workspace.root().to_path_buf();
         let read = crate::runtime::runtime()
             .spawn(async move { taste_acp::authproxy::stored_credential(&root).await });
@@ -4023,12 +4025,48 @@ impl ChatPane {
         };
         let mut command = spec.clone();
         command.args = hint.args.clone();
-        self.open_sign_in_terminal(&command, &[], &hint.env, &hint.instructions);
-        self.credential_form.say(
-            Verdict::Attention,
-            "A console tab is running the sign-in; copy the token it prints into the Token \
-             row, then Save",
-        );
+        match self.open_sign_in_terminal(&command, &[], &hint.env, &hint.instructions) {
+            Ok(()) => self.credential_form.say(
+                Verdict::Attention,
+                "A console tab is running the sign-in; copy the token it prints into the Token \
+                 row, then Save",
+            ),
+            Err(refusal) => self.credential_form.say(
+                Verdict::Fail,
+                &format!("Couldn't start the sign-in: {refusal}"),
+            ),
+        }
+    }
+
+    /// "Get a token" runs the sign-in in the environment's container, so
+    /// while that container is on its way the row is greyed out and its
+    /// tooltip says what it is waiting for. Launched then, the sign-in
+    /// found nowhere to run and opened nothing.
+    fn sync_sign_in_availability(&self) {
+        use taste_devcontainer::{AgentHosting, SupervisorState};
+        // Not `container_on_its_way`, which holds until the agent has
+        // moved in: the sign-in can run as soon as the container says it
+        // can host one.
+        let waiting = !taste_acp::sandbox::inside_container()
+            && self
+                .environments
+                .get(&self.environment)
+                .is_some_and(|supervisor| match supervisor.state() {
+                    SupervisorState::Preparing { .. }
+                    | SupervisorState::Building
+                    | SupervisorState::Starting => true,
+                    SupervisorState::Running { .. } => {
+                        matches!(supervisor.agent_hosting(), AgentHosting::Unknown)
+                    }
+                    _ => false,
+                });
+        let row = &self.credential_form.get_token;
+        row.set_sensitive(!waiting);
+        row.set_tooltip_text(Some(if waiting {
+            "Available once the environment is up: the sign-in runs in its container"
+        } else {
+            GET_TOKEN_TOOLTIP
+        }));
     }
 
     /// A step's title as markup: every issue id in it drawn as its pill,
@@ -4827,6 +4865,7 @@ impl ChatPane {
         // ones included — "starting…" is exactly what a user who just sent
         // into a stopped environment is waiting to read.
         self.sync_revive_bar();
+        self.sync_sign_in_availability();
         // ...and so does the header, for the same reason and before the
         // early return below: an environment on its way somewhere is the
         // most honest thing a live-but-idle session can be saying. A
@@ -8856,7 +8895,9 @@ impl ChatPane {
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
-                        pane.open_sign_in_terminal(
+                        // A refusal is said in the transcript, beside
+                        // this button.
+                        let _ = pane.open_sign_in_terminal(
                             &spec,
                             &terminal.args,
                             &extra_env,
@@ -8884,7 +8925,8 @@ impl ChatPane {
                         };
                         let mut login = spec.clone();
                         login.args = hint.args.clone();
-                        pane.open_sign_in_terminal(&login, &[], &hint.env, &hint.instructions);
+                        let _ =
+                            pane.open_sign_in_terminal(&login, &[], &hint.env, &hint.instructions);
                     });
                 }
                 other => {
@@ -8928,7 +8970,7 @@ impl ChatPane {
         extra_args: &[String],
         extra_env: &[(String, String)],
         status: &str,
-    ) {
+    ) -> Result<(), String> {
         let aim = self.aim();
         let relocation = self.relocation(spec);
         match taste_acp::login_command(
@@ -8951,8 +8993,12 @@ impl ChatPane {
                         wrapped: true,
                     });
                 self.set_status(status);
+                Ok(())
             }
-            Err(e) => self.meta_row(&format!("sign-in launch refused: {e}")),
+            Err(e) => {
+                self.meta_row(&format!("sign-in launch refused: {e}"));
+                Err(e.to_string())
+            }
         }
     }
 
