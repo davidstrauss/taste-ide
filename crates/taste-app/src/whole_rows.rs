@@ -23,9 +23,6 @@ mod imp {
         /// A pass that found the rows not laid out yet has asked for one
         /// more; this keeps it to one.
         pub(super) retry: Cell<bool>,
-        /// The height last given, so a resize — and only a resize — puts
-        /// the scroll offset back on a row.
-        pub(super) last_height: Cell<i32>,
     }
 
     #[glib::object_subclass]
@@ -59,25 +56,10 @@ mod imp {
             let Some(child) = obj.first_child() else {
                 return;
             };
-            let scroller = child.downcast_ref::<gtk::ScrolledWindow>().cloned();
-            let measured = match &scroller {
-                Some(scroller) => whole_rows(scroller, height),
-                None => Some((height, None)),
+            let snapped = match child.downcast_ref::<gtk::ScrolledWindow>() {
+                Some(scroller) => whole_rows_height(scroller, height),
+                None => Some(height),
             };
-            // A resize leaves the list at the offset it had, which is where
-            // the old height put it: scrolled to the end, that is mid-row
-            // for the new one, and the top row came out sliced (David,
-            // 2026-09-28: "it occurs after I reposition the window using
-            // [Windows] + [Right]"). Put back on a row, after this pass —
-            // an adjustment changed inside an allocation is a relayout
-            // inside the one under way.
-            if let (Some(scroller), Some((_, Some(pitch)))) = (&scroller, measured) {
-                if self.last_height.replace(height) != height {
-                    let scroller = scroller.clone();
-                    glib::idle_add_local_once(move || snap_offset(&scroller, pitch));
-                }
-            }
-            let snapped = measured.map(|(height, _)| height);
             // Before the rows are laid out there is no pitch to read: the
             // whole height now, and one more pass once they are.
             let height = match snapped {
@@ -118,12 +100,12 @@ impl WholeRows {
 }
 
 /// `height` rounded down to the list's whole rows, its top padding
-/// included, with the rows' pitch; `height` itself, and no pitch, when the
-/// rows differ in pitch, there is no list, or there are too few rows laid
-/// out to measure one; `None` when none are laid out yet.
-fn whole_rows(scroller: &gtk::ScrolledWindow, height: i32) -> Option<(i32, Option<i32>)> {
+/// included; `height` itself when the rows differ in pitch, there is no
+/// list, or there are too few rows laid out to measure one; `None` when
+/// none are laid out yet.
+fn whole_rows_height(scroller: &gtk::ScrolledWindow, height: i32) -> Option<i32> {
     let Some(list) = scroller.child().and_downcast::<gtk::ListView>() else {
-        return Some((height, None));
+        return Some(height);
     };
     // Where each laid-out row starts. A row's own height leaves out its
     // CSS margin, so the pitch is read as the distance from one row to the
@@ -145,40 +127,17 @@ fn whole_rows(scroller: &gtk::ScrolledWindow, height: i32) -> Option<(i32, Optio
     tops.sort_unstable();
     let steps: Vec<i32> = tops.windows(2).map(|w| w[1] - w[0]).collect();
     let Some(&pitch) = steps.first() else {
-        return Some((height, None));
+        return Some(height);
     };
     if pitch <= 0 || steps.iter().any(|step| *step != pitch) {
-        return Some((height, None));
+        return Some(height);
     }
     // Where the first row sits with the list scrolled to its top — the
     // list's own padding, which a sidebar list has — read off whichever
     // row is laid out first, since a recycled list need not hold row 0.
     let offset = scroller.vadjustment().value().round() as i32;
     let pad = (tops[0] + offset).rem_euclid(pitch);
-    Some((snap(height, pitch, pad), Some(pitch)))
-}
-
-/// The scroll offset put on a row: the nearest multiple of the pitch, so
-/// a row starts where the first one does at the top — below the list's
-/// padding — and the height's whole rows end on the viewport's edge. Never
-/// past the end, where the nearest whole row below it is taken.
-fn snap_offset(scroller: &gtk::ScrolledWindow, pitch: i32) {
-    let adjustment = scroller.vadjustment();
-    let max = (adjustment.upper() - adjustment.page_size()).max(0.0);
-    let value = adjustment.value();
-    let snapped = offset_on_row(value, max, pitch as f64);
-    if (snapped - value).abs() >= 0.5 {
-        adjustment.set_value(snapped);
-    }
-}
-
-fn offset_on_row(value: f64, max: f64, pitch: f64) -> f64 {
-    let nearest = (value / pitch).round() * pitch;
-    if nearest <= max {
-        nearest
-    } else {
-        (max / pitch).floor() * pitch
-    }
+    Some(snap(height, pitch, pad))
 }
 
 /// The tallest `pad + n * pitch` that fits `height`; `height` when not
@@ -194,14 +153,6 @@ fn snap(height: i32, pitch: i32, pad: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_resized_list_rests_on_a_row() {
-        assert_eq!(super::offset_on_row(50.0, 400.0, 22.0), 44.0);
-        assert_eq!(super::offset_on_row(0.0, 400.0, 22.0), 0.0);
-        // Scrolled to an end that is not on a row: the row before it.
-        assert_eq!(super::offset_on_row(399.0, 399.0, 22.0), 396.0);
-    }
-
     #[test]
     fn a_height_rounds_down_to_whole_rows_after_the_padding() {
         assert_eq!(super::snap(100, 24, 6), 78);
