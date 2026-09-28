@@ -102,6 +102,15 @@ const TAIL_ROWS: i64 = 60;
 /// per row. Through `vte_terminal_get_text_range_format`, which the
 /// binding does not wrap; rows are the terminal's own absolute row
 /// numbers, the ones its vertical adjustment scrolls in.
+/// The link under a point: the one the program marked (OSC 8), else a URL
+/// the text itself spells.
+fn link_at(terminal: &vte4::Terminal, x: f64, y: f64) -> Option<String> {
+    terminal
+        .check_hyperlink_at(x, y)
+        .or_else(|| terminal.check_match_at(x, y).0)
+        .map(|url| url.to_string())
+}
+
 fn terminal_rows(terminal: &vte4::Terminal, start: i64, end: i64) -> String {
     use glib::translate::ToGlibPtr;
     if end < start {
@@ -3944,6 +3953,11 @@ impl Console {
             move |_| apply_terminal_theme(&terminal)
         ));
 
+        // A link a program marks as one (OSC 8) is a link, whatever it
+        // looks like on the screen: Claude Code's sign-in wraps its URL
+        // itself, a line at a time, so the text on any one row is a
+        // fragment, and only the mark carries the whole address.
+        terminal.set_allow_hyperlink(true);
         // Plain-text URLs (sign-in flows print them) become Ctrl+clickable,
         // GNOME Console style.
         const PCRE2_MULTILINE: u32 = 0x0000_0400;
@@ -3965,8 +3979,7 @@ impl Console {
                 {
                     return;
                 }
-                let (matched, _) = terminal.check_match_at(x, y);
-                if let Some(url) = matched {
+                if let Some(url) = link_at(&terminal, x, y) {
                     events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
                 }
             });
@@ -4097,8 +4110,7 @@ impl Console {
             let popover = popover.clone();
             let copy_item = copy_item.clone();
             right_click.connect_pressed(move |_, _, x, y| {
-                let (url, _) = terminal.check_match_at(x, y);
-                let url = url.map(|u| u.to_string());
+                let url = link_at(&terminal, x, y);
                 open_link_item.set_sensitive(url.is_some());
                 copy_link_item.set_sensitive(url.is_some());
                 *hovered_url.borrow_mut() = url;
