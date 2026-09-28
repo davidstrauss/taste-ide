@@ -372,12 +372,43 @@ impl LogPage {
         });
 
         // Scrolling up leaves follow; scrolling back to the end resumes it.
+        //
+        // A resize is not a scroll. A shorter view keeps its top line where
+        // it was, so the end falls below the view with no scroll at all,
+        // and the next value change read the view as scrolled up and
+        // paused a log the reader was following (David, 2026-09-28: "the
+        // resize causes the scroll frame to show the same *start* of
+        // content, but the smaller area no longer shows the end"). So a
+        // change of extent or page puts a following view back at its end,
+        // and a value change that arrives with one is the geometry's, not
+        // the reader's.
+        let extent = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
+        {
+            let weak = Rc::downgrade(&page);
+            let extent = extent.clone();
+            page.scroller
+                .vadjustment()
+                .connect_changed(move |adjustment| {
+                    let Some(page) = weak.upgrade() else { return };
+                    extent.set((adjustment.upper(), adjustment.page_size()));
+                    if page.follow.get() {
+                        page.scroll_to_end();
+                    }
+                });
+        }
         {
             let weak = Rc::downgrade(&page);
             let adjustment = page.scroller.vadjustment();
             adjustment.connect_value_changed(move |adjustment| {
                 let Some(page) = weak.upgrade() else { return };
                 if page.scrolling.get() {
+                    return;
+                }
+                let now = (adjustment.upper(), adjustment.page_size());
+                if extent.replace(now) != now {
+                    if page.follow.get() {
+                        page.scroll_to_end();
+                    }
                     return;
                 }
                 let at_end =
@@ -530,6 +561,95 @@ impl LogPage {
         glib::idle_add_local_once(move || {
             adjustment.set_value(adjustment.upper() - adjustment.page_size());
             scrolling.set(false);
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run the main context for a while, frames included, so a window
+    /// is mapped and laid out and the idles after it have run.
+    fn pump(ms: u64) {
+        let context = glib::MainContext::default();
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < until {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_resize_keeps_a_followed_log_following_and_a_scroll_up_does_not() {
+        crate::gtk_test::on_gtk_thread("log follow: no display — skipped", || {
+            let page = LogPage::new(LogKind::ALL[0], "primary", &[]);
+            let window = gtk::Window::builder()
+                .default_width(900)
+                .default_height(600)
+                .child(&page.widget)
+                .build();
+            window.present();
+            pump(300);
+            let lines: Vec<String> = (0..500)
+                .map(|n| {
+                    format!(
+                        "line {n}: {}",
+                        "words that wrap when the window narrows ".repeat(3)
+                    )
+                })
+                .collect();
+            page.append(&lines);
+            pump(300);
+            let adjustment = page.scroller.vadjustment();
+            let at_end = |a: &gtk::Adjustment| a.value() + a.page_size() >= a.upper() - 2.0;
+            assert!(page.is_following());
+            assert!(at_end(&adjustment), "not at the end before the resize");
+            // Narrower and shorter: the text rewraps taller, the view shrinks.
+            window.set_default_size(420, 300);
+            pump(500);
+            assert!(page.is_following(), "a resize paused the log");
+            assert!(
+                at_end(&adjustment),
+                "a resize left the log short of its end"
+            );
+            // And back.
+            window.set_default_size(900, 600);
+            pump(500);
+            assert!(page.is_following(), "growing the window paused the log");
+            assert!(
+                at_end(&adjustment),
+                "growing the window left it short of its end"
+            );
+            // Moved to another parent, as a rung of the responsive ladder
+            // moves the panes: unrealized and realized again, and laid out
+            // afresh in its new place.
+            window.set_child(None::<&gtk::Widget>);
+            pump(100);
+            let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            holder.append(&page.widget);
+            window.set_child(Some(&holder));
+            pump(500);
+            assert!(page.is_following(), "moving the view paused the log");
+            assert!(
+                at_end(&adjustment),
+                "moving the view left it short of its end"
+            );
+            // Squeezed to a sliver and given its room back, as a pane is
+            // when a rung stacks it under another.
+            holder.set_size_request(-1, -1);
+            page.widget.set_size_request(-1, 4);
+            page.widget.set_vexpand(false);
+            pump(300);
+            page.widget.set_vexpand(true);
+            pump(500);
+            assert!(page.is_following(), "a squeeze paused the log");
+            assert!(at_end(&adjustment), "a squeeze left it short of its end");
+            // A reader's scroll up still pauses it.
+            adjustment.set_value(adjustment.lower());
+            pump(100);
+            assert!(!page.is_following(), "scrolling up did not pause the log");
+            window.destroy();
         });
     }
 }
