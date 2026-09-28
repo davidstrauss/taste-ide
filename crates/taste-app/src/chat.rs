@@ -1715,6 +1715,10 @@ impl PrivateForm {
     }
 }
 
+/// The key of the note a refused agent launch writes, which the launch
+/// that succeeds rewrites in place.
+const LAUNCH_NOTE: &str = "launch";
+
 /// "Get a token"'s tooltip while it can run.
 const GET_TOKEN_TOOLTIP: &str = "Runs the agent's own sign-in (claude setup-token) in a console \
                                  tab; paste the token it prints into the Token row";
@@ -3624,6 +3628,16 @@ impl ChatPane {
             Some(label) => {
                 label.set_label(text);
                 label.set_tooltip_text(Some(text));
+                // A long note wears a disclosure beside it
+                // (`meta_row_label`); rewritten short, it has nothing left
+                // to disclose.
+                if let Some(disclose) = label.next_sibling().and_downcast::<gtk::ToggleButton>() {
+                    let long = text.lines().count() > 1 || text.chars().count() > 80;
+                    if !long {
+                        disclose.set_active(false);
+                    }
+                    disclose.set_visible(long);
+                }
             }
             None => {
                 let label = self.meta_row_label(text);
@@ -8172,12 +8186,31 @@ impl ChatPane {
             Err(e) => {
                 self.status_spinner.stop();
                 self.status_label.set_label("");
-                self.meta_row(&format!("agent launch refused: {e}"));
+                // Keyed, so the launch that follows rewrites this row
+                // rather than leaving the refusal as the transcript's last
+                // word under an agent that is up.
+                self.note_keyed(LAUNCH_NOTE, &format!("agent launch refused: {e}"));
                 *self.refused_launch.borrow_mut() = Some(resume_for_retry);
                 return;
             }
         };
         self.refused_launch.borrow_mut().take();
+        let refusal_shown = self
+            .keyed_notes
+            .borrow()
+            .get(LAUNCH_NOTE)
+            .is_some_and(|label| label.parent().is_some());
+        if refusal_shown {
+            self.note_keyed(
+                LAUNCH_NOTE,
+                if self.relocated.get() {
+                    "agent started, in its environment's container"
+                } else {
+                    "agent started"
+                },
+            );
+            self.keyed_notes.borrow_mut().remove(LAUNCH_NOTE);
+        }
         let events = client.events.clone();
         *self.client.borrow_mut() = Some(client);
         let generation = self.client_generation.get() + 1;
