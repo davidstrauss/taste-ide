@@ -32,7 +32,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use taste_core::environment::Checkout;
 use taste_core::files::{ExecOutput, Files};
-use taste_git::{FileState, GitWorkspace};
+use taste_git::{FileState, GitWorkspace, StashEntry};
 
 /// The working tree of one environment, on this host or in a VM.
 #[derive(Clone)]
@@ -315,16 +315,29 @@ impl Worktree {
         }
     }
 
-    /// Discard one path's changes: HEAD's version back in the working
-    /// tree. A path HEAD does not have is left alone, as libgit2 leaves it.
+    /// Discard one path's changes: the index's version back in the
+    /// working tree (`git restore --worktree`), so what is staged stays
+    /// staged and only the edits on top of it go — the words the Discard
+    /// panel uses. A conflicted path has no one version in the index, and
+    /// `restore` refuses it; there HEAD's version goes back over the index
+    /// and the file both, which resolves it (`git checkout HEAD -- path`,
+    /// which every Discard used to be). A path the index does not have is
+    /// left alone, as libgit2 leaves it.
     pub fn restore_file(&self, rel: &Path) -> Result<()> {
         match self {
             Worktree::Local(_) => self.local()?.restore_file(rel),
             Worktree::Remote { .. } => {
-                let out = self.run_git(
-                    &["checkout", "-q", "HEAD", "--", &rel.display().to_string()],
-                    &[],
-                )?;
+                let rel = rel.display().to_string();
+                let unmerged = !self
+                    .git_ok(&["ls-files", "-u", "--", &rel])?
+                    .trim()
+                    .is_empty();
+                let args: &[&str] = if unmerged {
+                    &["checkout", "-q", "HEAD", "--", &rel]
+                } else {
+                    &["restore", "--worktree", "--", &rel]
+                };
+                let out = self.run_git(args, &[])?;
                 if !out.success() && !out.stderr_utf8().contains("did not match") {
                     bail!("{}", out.stderr_utf8().trim());
                 }
@@ -403,30 +416,36 @@ impl Worktree {
         Ok(())
     }
 
-    /// The paths every stash entry holds, entry by entry, newest first.
-    pub fn stash_entries(&self) -> Result<Vec<HashSet<PathBuf>>> {
+    /// The stash entries, newest first, each named by its commit and
+    /// holding its paths. Every stash verb here takes that id rather than
+    /// a position: `stash@{n}` is true only at the moment it is read, and
+    /// an entry pushed in between — the user's terminal, an agent's shell
+    /// in the same checkout — moves every one below it down.
+    pub fn stash_entries(&self) -> Result<Vec<StashEntry>> {
         match self {
             Worktree::Local(_) => self.local()?.stash_entries(),
             Worktree::Remote { .. } => {
-                let list = self.git_ok(&["stash", "list", "--format=%gd"])?;
+                let list = self.git_ok(&["stash", "list", "--format=%H"])?;
                 let mut entries = Vec::new();
-                for entry in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                for id in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    // `stash show` takes any commit shaped like a stash.
                     let names = self.git_ok(&[
                         "stash",
                         "show",
                         "--name-only",
                         "--include-untracked",
                         "--format=",
-                        entry,
+                        id,
                     ])?;
-                    entries.push(
-                        names
+                    entries.push(StashEntry {
+                        id: id.to_string(),
+                        paths: names
                             .lines()
                             .map(str::trim)
                             .filter(|l| !l.is_empty())
                             .map(PathBuf::from)
                             .collect(),
-                    );
+                    });
                 }
                 Ok(entries)
             }
@@ -435,7 +454,11 @@ impl Worktree {
 
     /// Every path any stash entry holds.
     pub fn stashed_paths(&self) -> Result<HashSet<PathBuf>> {
-        Ok(self.stash_entries()?.into_iter().flatten().collect())
+        Ok(self
+            .stash_entries()?
+            .into_iter()
+            .flat_map(|entry| entry.paths)
+            .collect())
     }
 
     /// Stash one path, tracked or not, under `message`.
@@ -452,13 +475,18 @@ impl Worktree {
         Ok(())
     }
 
-    /// Bring one path back out of stash entry `index`: tracked content is
-    /// in the stash commit, untracked in its third parent, and the first
-    /// that has the path wins.
-    pub fn unstash_file(&self, index: usize, rel: &Path) -> Result<()> {
+    /// Bring one path back out of the stash entry `id` names: tracked
+    /// content is in the stash commit, untracked in its third parent, and
+    /// the first that has the path wins. `git restore --worktree`, not
+    /// `git checkout <tree> -- <path>`, which writes the index too and so
+    /// handed a stashed file back as staged (David, 2026-09-08:
+    /// "unstash/unstage might be buggy"). A path the entry holds as a
+    /// deletion comes back as one: `restore` takes a tracked path the
+    /// source lacks out of the working tree.
+    pub fn unstash_file(&self, id: &str, rel: &Path) -> Result<()> {
         let rel = rel.display().to_string();
         let mut last = String::new();
-        for source in [format!("stash@{{{index}}}"), format!("stash@{{{index}}}^3")] {
+        for source in [id.to_string(), format!("{id}^3")] {
             match self.git_ok(&[
                 "restore",
                 &format!("--source={source}"),
@@ -473,8 +501,8 @@ impl Worktree {
         bail!("{last}")
     }
 
-    /// Take one path out of stash entry `index`, leaving the entry holding
-    /// the rest — or dropping it, when that path was all it held.
+    /// Take one path out of the stash entry `id` names, leaving the entry
+    /// holding the rest — or dropping it, when that path was all it held.
     ///
     /// A stash entry is three commits (the working tree's, the index's,
     /// and the untracked files'), and none of them can be edited, so the
@@ -484,16 +512,18 @@ impl Worktree {
     /// Git's own plumbing throughout, through a throwaway index, so the
     /// working tree and the real index are never touched. The rebuilt
     /// entry lands at the top of the stash list, as `git stash store`
-    /// puts it.
-    pub fn remove_from_stash(&self, index: usize, rel: &Path) -> Result<()> {
-        let entry = format!("stash@{{{index}}}");
+    /// puts it, and under a new id: a caller with more to do re-reads the
+    /// list. Everything is read from the commit `id` names; only the drop
+    /// needs a position, and reads it last (`stash_drop`).
+    pub fn remove_from_stash(&self, id: &str, rel: &Path) -> Result<()> {
         let paths = self
             .stash_entries()?
             .into_iter()
-            .nth(index)
-            .unwrap_or_default();
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.paths)
+            .ok_or_else(|| anyhow::anyhow!("stash entry {id} is no longer in the list"))?;
         if paths.len() <= 1 {
-            return self.stash_drop(index);
+            return self.stash_drop(id);
         }
         let rel = rel.display().to_string();
         let rev = |spec: &str| -> Option<String> {
@@ -502,13 +532,17 @@ impl Worktree {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         };
-        let stash = rev(&entry).ok_or_else(|| anyhow::anyhow!("no {entry}"))?;
-        let base =
-            rev(&format!("{stash}^1")).ok_or_else(|| anyhow::anyhow!("{entry} has no base"))?;
+        let stash = id.to_string();
+        let base = rev(&format!("{stash}^1")).ok_or_else(|| anyhow::anyhow!("{id} has no base"))?;
         let staged = rev(&format!("{stash}^2"));
         let untracked = rev(&format!("{stash}^3"));
+        // Its message, as the list shows it, off the reflog line that
+        // names this commit.
         let message = self
-            .git_ok(&["log", "-g", "-1", "--format=%gs", &entry])?
+            .git_ok(&["stash", "list", "--format=%H%x09%gs"])?
+            .lines()
+            .find_map(|line| line.strip_prefix(&stash)?.strip_prefix('\t'))
+            .unwrap_or_default()
             .trim()
             .to_string();
         let git_dir = self.git_ok(&["rev-parse", "--absolute-git-dir"])?;
@@ -583,13 +617,24 @@ impl Worktree {
         args.push(message.clone());
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let rebuilt = ok(&args)?;
-        self.stash_drop(index)?;
+        self.stash_drop(id)?;
         self.git_ok(&["stash", "store", "-q", "-m", &message, &rebuilt])?;
         Ok(())
     }
 
-    pub fn stash_drop(&self, index: usize) -> Result<()> {
-        self.git_ok(&["stash", "drop", "--quiet", &format!("stash@{{{index}}}")])?;
+    /// Drop the stash entry `id` names. Git drops by position, and a
+    /// position is true only at the moment it is read, so it is read here,
+    /// from the list, right before the drop — and an entry the list no
+    /// longer has is refused, never guessed at. The window between that
+    /// read and the drop is git's own: it has no drop-by-commit.
+    pub fn stash_drop(&self, id: &str) -> Result<()> {
+        let list = self.git_ok(&["stash", "list", "--format=%H"])?;
+        let position = list
+            .lines()
+            .map(str::trim)
+            .position(|line| line == id)
+            .ok_or_else(|| anyhow::anyhow!("stash entry {id} is no longer in the list"))?;
+        self.git_ok(&["stash", "drop", "--quiet", &format!("stash@{{{position}}}")])?;
         Ok(())
     }
 
@@ -686,17 +731,18 @@ mod tests {
                 "taste-ide selection",
             )
             .unwrap();
-        let held =
-            |worktree: &Worktree| -> Vec<HashSet<PathBuf>> { worktree.stash_entries().unwrap() };
-        assert_eq!(held(&worktree)[0].len(), 3);
+        let held = |worktree: &Worktree| -> Vec<StashEntry> { worktree.stash_entries().unwrap() };
+        assert_eq!(held(&worktree)[0].paths.len(), 3);
         let before = state(&worktree);
 
         // A tracked file out: the others stay, as stashed.
-        worktree.remove_from_stash(0, Path::new("a.txt")).unwrap();
+        worktree
+            .remove_from_stash(&held(&worktree)[0].id, Path::new("a.txt"))
+            .unwrap();
         let entries = held(&worktree);
         assert_eq!(entries.len(), 1);
         assert_eq!(
-            entries[0],
+            entries[0].paths,
             [PathBuf::from("b.txt"), PathBuf::from("c.txt")]
                 .into_iter()
                 .collect()
@@ -714,12 +760,16 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
 
         // An untracked file out, then the last: the entry goes.
-        worktree.remove_from_stash(0, Path::new("c.txt")).unwrap();
+        worktree
+            .remove_from_stash(&held(&worktree)[0].id, Path::new("c.txt"))
+            .unwrap();
         assert_eq!(
-            held(&worktree)[0],
+            held(&worktree)[0].paths,
             [PathBuf::from("b.txt")].into_iter().collect()
         );
-        worktree.remove_from_stash(0, Path::new("b.txt")).unwrap();
+        worktree
+            .remove_from_stash(&held(&worktree)[0].id, Path::new("b.txt"))
+            .unwrap();
         assert!(held(&worktree).is_empty());
         assert_eq!(state(&worktree), before, "the index or the files moved");
     }
@@ -827,11 +877,14 @@ mod tests {
         assert!(!root.join("s1.txt").exists() && !root.join("s2.txt").exists());
         let entries = remote.stash_entries().unwrap();
         assert!(
-            entries[0].contains(Path::new("s1.txt")) && entries[0].contains(Path::new("s2.txt"))
+            entries[0].paths.contains(Path::new("s1.txt"))
+                && entries[0].paths.contains(Path::new("s2.txt"))
         );
-        remote.unstash_file(0, Path::new("s2.txt")).unwrap();
+        remote
+            .unstash_file(&entries[0].id, Path::new("s2.txt"))
+            .unwrap();
         assert!(root.join("s2.txt").exists());
-        remote.stash_drop(0).unwrap();
+        remote.stash_drop(&entries[0].id).unwrap();
         assert!(remote.stash_entries().unwrap().is_empty());
         let _ = std::fs::remove_file(root.join("s2.txt"));
         assert_eq!(
@@ -852,17 +905,186 @@ mod tests {
         assert!(!root.join("new.txt").exists());
         let entries = remote.stash_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].contains(Path::new("new.txt")));
+        assert!(entries[0].paths.contains(Path::new("new.txt")));
         assert_eq!(
-            remote.stashed_paths().unwrap(),
-            local.stashed_paths().unwrap()
+            remote.stash_entries().unwrap(),
+            local.stash_entries().unwrap()
         );
-        remote.unstash_file(0, Path::new("new.txt")).unwrap();
+        remote
+            .unstash_file(&entries[0].id, Path::new("new.txt"))
+            .unwrap();
         assert!(root.join("new.txt").exists());
-        remote.stash_drop(0).unwrap();
+        remote.stash_drop(&entries[0].id).unwrap();
         assert!(remote.stash_entries().unwrap().is_empty());
         assert!(!remote.rebase_in_progress());
         assert!(!local.rebase_in_progress());
+    }
+
+    fn remote_at(root: &Path) -> Worktree {
+        Worktree::Remote {
+            files: Files::Local,
+            path: root.to_path_buf(),
+            after_ref_change: None,
+        }
+    }
+
+    /// The list moved under the verb: an entry pushed after the list was
+    /// read — from a terminal, from an agent's shell in the same checkout —
+    /// sits above every entry read, and a drop by the position read first
+    /// would take the wrong one. Named by commit, the verbs find theirs
+    /// wherever it now sits, and refuse one that is gone.
+    #[test]
+    fn a_stash_pushed_meanwhile_does_not_move_the_drop() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_commit(root);
+        let worktree = remote_at(root);
+        std::fs::write(root.join("a.txt"), "a changed\n").unwrap();
+        std::fs::write(root.join("c.txt"), "untracked\n").unwrap();
+        worktree
+            .stash_paths(&[PathBuf::from("a.txt"), PathBuf::from("c.txt")], "first")
+            .unwrap();
+        let first = worktree.stash_entries().unwrap()[0].clone();
+        // Read, then pushed over: `first` is stash@{1} now.
+        std::fs::write(root.join("b.txt"), "b changed\n").unwrap();
+        worktree.stash_file(Path::new("b.txt"), "second").unwrap();
+        let second = worktree.stash_entries().unwrap()[0].clone();
+        assert_ne!(first.id, second.id);
+
+        // The rebuild finds its entry: `second` untouched, `first` rebuilt
+        // without a.txt.
+        worktree
+            .remove_from_stash(&first.id, Path::new("a.txt"))
+            .unwrap();
+        let entries = worktree.stash_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.id == second.id
+                && entry.paths == HashSet::from([PathBuf::from("b.txt")])));
+        let rebuilt = entries
+            .iter()
+            .find(|entry| entry.id != second.id)
+            .unwrap()
+            .clone();
+        assert_eq!(rebuilt.paths, HashSet::from([PathBuf::from("c.txt")]));
+        assert!(worktree
+            .git_ok(&["stash", "list"])
+            .unwrap()
+            .contains("first"));
+
+        // The drop finds its entry, wherever it now sits.
+        worktree.stash_drop(&rebuilt.id).unwrap();
+        let entries = worktree.stash_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, second.id);
+        // An entry the list no longer has is refused, not guessed at.
+        assert!(worktree.stash_drop(&rebuilt.id).is_err());
+        assert!(worktree
+            .remove_from_stash(&first.id, Path::new("c.txt"))
+            .is_err());
+        assert_eq!(worktree.stash_entries().unwrap().len(), 1);
+    }
+
+    /// A path stashed as a deletion comes back as one.
+    #[test]
+    fn a_stashed_deletion_comes_back_as_a_deletion() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_commit(root);
+        let worktree = remote_at(root);
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        worktree.stash_file(Path::new("a.txt"), "gone").unwrap();
+        assert!(root.join("a.txt").exists(), "the stash put HEAD's back");
+        let entry = worktree.stash_entries().unwrap()[0].clone();
+        assert_eq!(entry.paths, HashSet::from([PathBuf::from("a.txt")]));
+        worktree
+            .unstash_file(&entry.id, Path::new("a.txt"))
+            .unwrap();
+        assert!(!root.join("a.txt").exists(), "the deletion is back");
+        worktree
+            .remove_from_stash(&entry.id, Path::new("a.txt"))
+            .unwrap();
+        assert!(worktree.stash_entries().unwrap().is_empty());
+    }
+
+    /// Discard takes the edits on top of what is staged and leaves the
+    /// staged part staged, in both arms — and on a conflicted path, which
+    /// `git restore` refuses, puts HEAD's version back, resolved.
+    #[test]
+    fn discard_keeps_what_is_staged_and_resolves_a_conflict() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_commit(root);
+        let local = Worktree::Local(root.to_path_buf());
+        let remote = remote_at(root);
+        for (arm, file, committed) in [(&local, "a.txt", "a\n"), (&remote, "b.txt", "b\n")] {
+            let path = root.join(file);
+            std::fs::write(&path, "staged\n").unwrap();
+            arm.stage(Path::new(file)).unwrap();
+            std::fs::write(&path, "staged\nand more\n").unwrap();
+            arm.restore_file(Path::new(file)).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "staged\n",
+                "{arm:?}"
+            );
+            assert_eq!(
+                arm.status().unwrap()[Path::new(file)],
+                FileState::Staged,
+                "{arm:?}"
+            );
+            // Nothing staged: HEAD's version, as before.
+            arm.unstage(Path::new(file)).unwrap();
+            arm.restore_file(Path::new(file)).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                committed,
+                "{arm:?}"
+            );
+            assert!(!arm.status().unwrap().contains_key(Path::new(file)));
+        }
+
+        // A conflict on a.txt, once per arm.
+        let main = local.branch_name().unwrap();
+        for (arm, n) in [(&remote, 1), (&local, 2)] {
+            let side = format!("side{n}");
+            remote.git_ok(&["switch", "-q", "-c", &side]).unwrap();
+            std::fs::write(root.join("a.txt"), format!("side {n}\n")).unwrap();
+            remote.git_ok(&["commit", "-q", "-am", "side"]).unwrap();
+            remote.git_ok(&["switch", "-q", &main]).unwrap();
+            std::fs::write(root.join("a.txt"), format!("main {n}\n")).unwrap();
+            remote.git_ok(&["commit", "-q", "-am", "main"]).unwrap();
+            assert!(!remote.run_git(&["merge", &side], &[]).unwrap().success());
+            assert_eq!(
+                arm.status().unwrap()[Path::new("a.txt")],
+                FileState::Conflicted,
+                "{arm:?}"
+            );
+            arm.restore_file(Path::new("a.txt")).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("a.txt")).unwrap(),
+                format!("main {n}\n"),
+                "{arm:?}"
+            );
+            assert!(
+                !arm.status().unwrap().contains_key(Path::new("a.txt")),
+                "resolved, at HEAD: {arm:?}"
+            );
+            remote.git_ok(&["merge", "--abort"]).unwrap();
+        }
     }
 
     #[test]

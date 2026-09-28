@@ -831,7 +831,15 @@ no-op at every other width.
   restores the working tree alone (`git restore --worktree`, the stash
   commit first and its untracked third parent second) and drops an entry
   that held nothing else; it used to `checkout` the file, which staged
-  it.
+  it. Every stash verb names its entry by commit id, never by
+  `stash@{n}`: a position is true only at the moment it is read, and a
+  stash pushed meanwhile — from a terminal, from an agent's shell in the
+  same checkout — moves every entry below it, so a drop by the position
+  read first took the wrong one (2026-09-28). Discard restores a file
+  from the index (`git restore --worktree`), so what is staged stays
+  staged and only the edits on top of it go, which is what its panel
+  says; a conflicted path, which `restore` refuses, gets HEAD's version
+  over index and file both, resolved.
 - **Conflicts are a first-class view, not a dead end.** A paused rebase
   (or any conflicted state) surfaces a Conflicts filter — auto-entered
   when conflicts appear, auto-left when the rebase ends — listing the

@@ -5790,28 +5790,32 @@ impl FileTree {
                     }
                     "unstash" => {
                         for rel in &rels {
-                            // Re-read per file: dropping an entry below
-                            // renumbers the ones after it.
+                            // Re-read per file: an entry rebuilt below is a
+                            // new entry, under a new id. The entry is named
+                            // by its commit, never its position, which a
+                            // stash pushed meanwhile would have moved.
                             let entries = worktree.stash_entries().map_err(err)?;
-                            let Some(index) = entries.iter().position(|paths| paths.contains(rel))
+                            let Some(entry) =
+                                entries.iter().find(|entry| entry.paths.contains(rel))
                             else {
                                 continue;
                             };
-                            worktree.unstash_file(index, rel).map_err(err)?;
+                            worktree.unstash_file(&entry.id, rel).map_err(err)?;
                             // Out of its entry too, or it goes on showing as
                             // stashed beside the copy now in the tree; an
                             // entry that held it alone is dropped.
-                            worktree.remove_from_stash(index, rel).map_err(err)?;
+                            worktree.remove_from_stash(&entry.id, rel).map_err(err)?;
                         }
                     }
                     "discard-stashed" => {
                         for rel in &rels {
                             let entries = worktree.stash_entries().map_err(err)?;
-                            let Some(index) = entries.iter().position(|paths| paths.contains(rel))
+                            let Some(entry) =
+                                entries.iter().find(|entry| entry.paths.contains(rel))
                             else {
                                 continue;
                             };
-                            worktree.remove_from_stash(index, rel).map_err(err)?;
+                            worktree.remove_from_stash(&entry.id, rel).map_err(err)?;
                         }
                     }
                     _ => {}

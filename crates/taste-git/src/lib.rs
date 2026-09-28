@@ -200,6 +200,16 @@ pub struct GitWorkspace {
     workdir: PathBuf,
 }
 
+/// One stash entry, as the file tree's Stashed view and its verbs see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashEntry {
+    /// The stash commit's id: how the entry is named to every verb, since
+    /// its position in the list can move under a caller.
+    pub id: String,
+    /// The paths it holds, tracked changes and untracked files alike.
+    pub paths: std::collections::HashSet<PathBuf>,
+}
+
 /// One commit whose message matched a search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitHit {
@@ -322,13 +332,44 @@ impl GitWorkspace {
         Ok(map)
     }
 
-    /// Discard working-tree changes to one tracked file: check out its
-    /// HEAD state over the working copy.
+    /// Discard one tracked path's working-tree changes: the index's
+    /// version back over the file, which is `git restore --worktree`, so
+    /// what is staged stays staged and only the edits on top of it go —
+    /// the words the Discard panel uses. A conflicted path has no one
+    /// version in the index, and there HEAD's goes back over the index
+    /// and the file both, which resolves it: `git checkout HEAD -- path`,
+    /// which every Discard used to be. A path the index does not have is
+    /// left alone, as libgit2 leaves it.
     pub fn restore_file(&self, rel_path: &Path) -> Result<()> {
         let mut builder = git2::build::CheckoutBuilder::new();
         builder.force().path(rel_path);
-        self.repo.checkout_head(Some(&mut builder))?;
+        if self.conflicted(rel_path)? {
+            self.repo.checkout_head(Some(&mut builder))?;
+        } else {
+            self.repo.checkout_index(None, Some(&mut builder))?;
+        }
         Ok(())
+    }
+
+    /// Whether the index holds `rel_path` as a conflict.
+    fn conflicted(&self, rel_path: &Path) -> Result<bool> {
+        let index = self.repo.index()?;
+        if !index.has_conflicts() {
+            return Ok(false);
+        }
+        let wanted = rel_path.to_string_lossy();
+        for conflict in index.conflicts()? {
+            let conflict = conflict?;
+            let path = [&conflict.our, &conflict.their, &conflict.ancestor]
+                .into_iter()
+                .flatten()
+                .next()
+                .map(|entry| String::from_utf8_lossy(&entry.path).into_owned());
+            if path.as_deref() == Some(wanted.as_ref()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// argv for stashing a single file (the CLI, because libgit2's stash
@@ -350,9 +391,14 @@ impl GitWorkspace {
         )
     }
 
-    /// Per-stash-entry touched paths, newest first (index 0 = newest),
-    /// for "which stash holds this file" lookups.
-    pub fn stash_entries(&self) -> Result<Vec<std::collections::HashSet<PathBuf>>> {
+    /// The stash entries, newest first, each named by its commit — for
+    /// "which stash holds this file", and for naming that entry to a later
+    /// verb. By commit rather than by position (`stash@{n}`), because a
+    /// position is true only at the moment it is read: an entry pushed in
+    /// between moves every one below it down.
+    pub fn stash_entries(&self) -> Result<Vec<StashEntry>> {
+        // stash_foreach needs &mut Repository; use a scratch handle so the
+        // shared one stays immutable.
         let mut scratch = Repository::open(&self.workdir)?;
         let mut oids = Vec::new();
         scratch.stash_foreach(|_, _, oid| {
@@ -364,6 +410,9 @@ impl GitWorkspace {
             let mut paths = std::collections::HashSet::new();
             let commit = self.repo.find_commit(oid)?;
             let stash_tree = commit.tree()?;
+            // The tracked changes: the stash commit against its base. A
+            // third parent, when present, holds the untracked files
+            // `stash -u` took.
             if let Ok(base) = commit.parent(0) {
                 let base_tree = base.tree()?;
                 let diff =
@@ -387,102 +436,21 @@ impl GitWorkspace {
                     git2::TreeWalkResult::Ok
                 })?;
             }
-            entries.push(paths);
+            entries.push(StashEntry {
+                id: oid.to_string(),
+                paths,
+            });
         }
         Ok(entries)
     }
 
-    /// argv candidates to bring one file's content back from a stash entry
-    /// into the WORKING TREE — "unstash this file" — tried in order until
-    /// one succeeds. `git restore --worktree`, not `git checkout <tree> --
-    /// <path>`, which writes the index too and so handed a stashed file
-    /// back as staged (David, 2026-09-08: "unstash/unstage might be
-    /// buggy"). A tracked change lives in the stash commit; a file stashed
-    /// untracked (`stash -u`) lives in its third parent, which is the
-    /// second candidate.
-    pub fn unstash_file_commands(
-        &self,
-        stash_index: usize,
-        rel_path: &Path,
-    ) -> Vec<(String, Vec<String>)> {
-        [
-            format!("stash@{{{stash_index}}}"),
-            format!("stash@{{{stash_index}}}^3"),
-        ]
-        .into_iter()
-        .map(|source| {
-            (
-                "git".into(),
-                vec![
-                    "-C".into(),
-                    self.workdir.display().to_string(),
-                    "restore".into(),
-                    format!("--source={source}"),
-                    "--worktree".into(),
-                    "--".into(),
-                    rel_path.display().to_string(),
-                ],
-            )
-        })
-        .collect()
-    }
-
-    /// argv to drop one stash entry, once everything in it is back.
-    pub fn stash_drop_command(&self, stash_index: usize) -> (String, Vec<String>) {
-        (
-            "git".into(),
-            vec![
-                "-C".into(),
-                self.workdir.display().to_string(),
-                "stash".into(),
-                "drop".into(),
-                "--quiet".into(),
-                format!("stash@{{{stash_index}}}"),
-            ],
-        )
-    }
-
-    /// Paths (relative to workdir) touched by any stash entry. A stash
-    /// commit's first parent is the base; a third parent, when present,
-    /// carries the untracked files captured by `stash -u`.
+    /// Every path any stash entry holds.
     pub fn stashed_paths(&self) -> Result<std::collections::HashSet<PathBuf>> {
-        // stash_foreach needs &mut Repository; use a scratch handle so the
-        // shared one stays immutable.
-        let mut scratch = Repository::open(&self.workdir)?;
-        let mut oids = Vec::new();
-        scratch.stash_foreach(|_, _, oid| {
-            oids.push(*oid);
-            true
-        })?;
-        let mut paths = std::collections::HashSet::new();
-        for oid in oids {
-            let commit = self.repo.find_commit(oid)?;
-            let stash_tree = commit.tree()?;
-            if let Ok(base) = commit.parent(0) {
-                let base_tree = base.tree()?;
-                let diff =
-                    self.repo
-                        .diff_tree_to_tree(Some(&base_tree), Some(&stash_tree), None)?;
-                for delta in diff.deltas() {
-                    if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path())
-                    {
-                        paths.insert(path.to_path_buf());
-                    }
-                }
-            }
-            if let Ok(untracked) = commit.parent(2) {
-                let tree = untracked.tree()?;
-                tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-                    if entry.kind() == Some(git2::ObjectType::Blob) {
-                        if let Some(name) = entry.name() {
-                            paths.insert(PathBuf::from(format!("{dir}{name}")));
-                        }
-                    }
-                    git2::TreeWalkResult::Ok
-                })?;
-            }
-        }
-        Ok(paths)
+        Ok(self
+            .stash_entries()?
+            .into_iter()
+            .flat_map(|entry| entry.paths)
+            .collect())
     }
 
     /// Content of `rel_path` at HEAD — the baseline for "changes since
