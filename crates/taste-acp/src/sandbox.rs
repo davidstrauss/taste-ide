@@ -407,9 +407,9 @@ pub fn runs_outside_a_container(command: &str) -> Result<()> {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()));
     if !found {
         anyhow::bail!(
-            "this agent runs in its environment's container, which is not up, and this \
-             machine has no {command} to run it anywhere else; it starts once the \
-             container is"
+            "this agent runs in its environment's container, which is not up yet, and \
+             this machine has no {command} to run it anywhere else; it starts once the \
+             container is up"
         );
     }
     Ok(())
