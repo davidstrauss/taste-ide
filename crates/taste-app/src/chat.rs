@@ -2770,7 +2770,10 @@ impl ChatPane {
         // caught. Not the pane's 12: this row is a strip, and it is the
         // strips it is judged against.
         top_bar.set_margin_start(6);
-        top_bar.set_margin_end(6);
+        // The END is the pane's, though: what sits there is the gauges,
+        // not a rounded tab, and at 6 the Plan bar ran into the pane's
+        // edge while every card and the composer below stop 12 short.
+        top_bar.set_margin_end(PANE_BAR_INSET);
         top_bar.set_margin_top(4);
         top_bar.set_margin_bottom(4);
         // Connection progress: a fixed-width prefix of the status text,
