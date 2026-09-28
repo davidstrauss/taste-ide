@@ -176,7 +176,7 @@ otherwise needs a bring-up under way; — the project's config ready to
 rebuild into, its image failed to build (View Log, Prompt Agent),
 refused, or absent — which otherwise needs a checkout in that state
 under a running baseline; `=ask` poses git's
-question on the strip (a PIN, hidden, with Answer and Cancel) and
+question on the strip (a key's passphrase, hidden, with its send button and close) and
 `=touch` its notice (a security key waiting for a touch), which
 otherwise need a Pull over a remote that asks;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in

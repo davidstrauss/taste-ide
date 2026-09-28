@@ -192,7 +192,7 @@ fn enter_sends(shift: bool, preedit: bool) -> bool {
 const PLACEHOLDER: &str = "A message, an issue, or a commit message";
 
 /// The send glyph, said once for the three buttons rather than on each.
-const SEND_ICON: &str = "document-send-symbolic";
+pub(crate) const SEND_ICON: &str = "document-send-symbolic";
 
 /// A destination's button face: its own glyph alone. The send glyph used
 /// to open every button (David, 2026-09-08: "'<Send icon> <Type icon>' on

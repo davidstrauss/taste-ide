@@ -138,6 +138,10 @@ pub fn answer(id: u64, answer: Option<String>) {
 /// a window of our own; print the answer.
 pub fn run(prompt: &str) -> glib::ExitCode {
     let kind = kind_of(prompt, std::env::var("SSH_ASKPASS_PROMPT").ok().as_deref());
+    // Said here, in the helper's own process, because naming the key reads
+    // its `.pub`, and the IDE's GTK thread reads no files.
+    let named = passphrase_prompt(prompt);
+    let prompt = named.as_deref().unwrap_or(prompt);
     if let Some(socket) = std::env::var_os("TASTE_ASKPASS_SOCKET") {
         match ask_ide(Path::new(&socket), prompt, kind) {
             Ok(Some(answer)) => {
@@ -151,6 +155,44 @@ pub fn run(prompt: &str) -> glib::ExitCode {
         }
     }
     ask_in_window(prompt, kind)
+}
+
+/// ssh's passphrase question in the IDE's words: the key by the name its
+/// owner gave it — the `.pub` comment ("amutable-nitro"), the file's name
+/// when it has none — and what kind of key it is, with the path on a
+/// second line for the strip's tooltip. ssh asks "Enter passphrase for key
+/// '<path>':", ssh-add "Enter passphrase for <path>:", the path alone being
+/// a line of home directory to read past (David, 2026-09-28: "Is there a
+/// cleaner key name we could show?"). `None` for any other prompt.
+fn passphrase_prompt(prompt: &str) -> Option<String> {
+    let rest = prompt.trim().strip_prefix("Enter passphrase for ")?;
+    let rest = rest.strip_prefix("key ").unwrap_or(rest);
+    let rest = rest.trim_end().trim_end_matches(':');
+    // ssh-add may add " (will confirm each use)" after the path.
+    let path = rest
+        .split(" (")
+        .next()
+        .unwrap_or(rest)
+        .trim()
+        .trim_matches('\'');
+    let path = Path::new(path);
+    let public = std::fs::read_to_string(format!("{}.pub", path.display())).ok();
+    let (kind, comment) = match public.as_deref().and_then(|text| text.lines().next()) {
+        Some(line) => {
+            let mut fields = line.split_whitespace();
+            let kind = fields.next().unwrap_or_default();
+            let comment = fields.skip(1).collect::<Vec<_>>().join(" ");
+            (kind.starts_with("sk-"), comment)
+        }
+        None => (false, String::new()),
+    };
+    let name = if comment.is_empty() {
+        path.file_name()?.to_string_lossy().into_owned()
+    } else {
+        comment
+    };
+    let kind = if kind { "security key" } else { "SSH key" };
+    Some(format!("Passphrase for {kind} {name}\n{}", path.display()))
 }
 
 /// What a prompt wants, from ssh's word for it when it gives one
@@ -368,6 +410,37 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_passphrase_prompt_names_the_key_its_owner_named() {
+        let dir = std::env::temp_dir().join(format!("taste-askpass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("id_ed25519_sk");
+        std::fs::write(
+            dir.join("id_ed25519_sk.pub"),
+            "sk-ssh-ed25519@openssh.com AAAAGnNr amutable-nitro\n",
+        )
+        .unwrap();
+        let plain = dir.join("id_rsa");
+        // ssh-add's words, and ssh's.
+        assert_eq!(
+            passphrase_prompt(&format!("Enter passphrase for {}: ", key.display())).as_deref(),
+            Some(
+                format!(
+                    "Passphrase for security key amutable-nitro\n{}",
+                    key.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            passphrase_prompt(&format!("Enter passphrase for key '{}': ", plain.display()))
+                .as_deref(),
+            Some(format!("Passphrase for SSH key id_rsa\n{}", plain.display()).as_str())
+        );
+        assert_eq!(passphrase_prompt("root@host's password: "), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_kind_comes_from_ssh_when_it_says_and_from_the_words_otherwise() {

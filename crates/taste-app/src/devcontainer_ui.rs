@@ -130,8 +130,12 @@ impl DevcontainerBanner {
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
+        // A question's dismissal, at the strip's far end as a close is:
+        // an icon, not a word beside the answer (David, 2026-09-28).
         let cancel = gtk::Button::builder()
-            .label("Cancel")
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Cancel")
+            .css_classes(["flat", "circular"])
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
@@ -140,10 +144,13 @@ impl DevcontainerBanner {
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
+        // Wide enough that a passphrase reads as a field to type a phrase
+        // into, not a PIN box.
         let secret = gtk::PasswordEntry::builder()
             .show_peek_icon(true)
             .activates_default(false)
             .valign(gtk::Align::Center)
+            .width_request(320)
             .visible(false)
             .build();
         let text = gtk::Entry::builder()
@@ -177,6 +184,8 @@ impl DevcontainerBanner {
         row.append(&text);
         row.append(&button);
         row.append(&secondary);
+        let push_end = gtk::Box::builder().hexpand(true).build();
+        row.append(&push_end);
         row.append(&cancel);
         // The bar under the row: both in one cell of a grid, which sizes
         // the cell by the row and paints its children in order — the
@@ -402,9 +411,15 @@ impl DevcontainerBanner {
                     false,
                 );
                 self.set_title(first);
+                // The path, when the helper named the key over it.
+                let detail = prompt.lines().nth(1).map(str::trim);
+                self.title.set_tooltip_text(detail);
                 self.action.set(ButtonAction::Answer);
-                self.set_button(Some("Answer"));
-                self.cancel.set_label("Cancel");
+                // Sent, as a message is: the composer's own send glyph.
+                self.button.set_icon_name(crate::compose::SEND_ICON);
+                self.button.set_tooltip_text(Some("Answer"));
+                self.button.set_visible(true);
+                self.cancel.set_tooltip_text(Some("Cancel"));
                 self.cancel.set_visible(true);
             }
             AskKind::Confirm => {
@@ -412,7 +427,7 @@ impl DevcontainerBanner {
                 self.set_title(first);
                 self.action.set(ButtonAction::Answer);
                 self.set_button(Some("Yes"));
-                self.cancel.set_label("No");
+                self.cancel.set_tooltip_text(Some("No"));
                 self.cancel.set_visible(true);
             }
             AskKind::Notice => {
@@ -486,6 +501,7 @@ impl DevcontainerBanner {
     /// Clear the question's widgets and redraw the environment's face.
     fn finish_question(self: &Rc<Self>) {
         self.notice_since.set(None);
+        self.title.set_tooltip_text(None);
         self.secret.set_text("");
         self.secret.set_visible(false);
         self.text.set_visible(false);
@@ -500,7 +516,9 @@ impl DevcontainerBanner {
     fn set_button(&self, label: Option<&str>) {
         match label {
             Some(label) => {
+                // A word replaces the question's send glyph, and its tooltip.
                 self.button.set_label(label);
+                self.button.set_tooltip_text(None);
                 self.button.set_visible(true);
             }
             None => self.button.set_visible(false),
@@ -627,7 +645,13 @@ impl DevcontainerBanner {
     pub fn pose_for_probe(self: &Rc<Self>, kind: &str) {
         self.posed.set(true);
         match kind {
-            "ask" => self.ask(u64::MAX, "Enter PIN for authenticator:", AskKind::Secret),
+            // As the helper words ssh-add's question (`askpass`): the key
+            // by its owner's name, its path under it for the tooltip.
+            "ask" => self.ask(
+                u64::MAX,
+                "Passphrase for security key amutable-nitro\n/home/dev/.ssh/id_ed25519_sk",
+                AskKind::Secret,
+            ),
             "touch" => self.ask(
                 u64::MAX,
                 "Touch your security key — Pull is waiting on it",

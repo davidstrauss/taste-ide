@@ -42,6 +42,17 @@ fn agents() -> &'static Mutex<HashMap<PathBuf, Agent>> {
     AGENTS.get_or_init(Default::default)
 }
 
+/// The key files each agent (by its socket) was given this session. An
+/// agent's own listing answers for a key whose `.pub` sits beside it; a key
+/// without one can be matched against nothing, and without this it was
+/// added — and its passphrase asked for — again on every Pull. Apart from
+/// `agents`, so no lock is held while a passphrase is waited for.
+fn loaded() -> &'static Mutex<HashMap<PathBuf, std::collections::HashSet<PathBuf>>> {
+    static LOADED: OnceLock<Mutex<HashMap<PathBuf, std::collections::HashSet<PathBuf>>>> =
+        OnceLock::new();
+    LOADED.get_or_init(Default::default)
+}
+
 fn socket_for(workspace_root: &Path) -> PathBuf {
     taste_core::mcp::runtime_socket(&format!(
         "taste-{}-ssh-agent.sock",
@@ -86,8 +97,9 @@ fn ensure_agent(workspace_root: &Path, askpass_env: &[(String, String)]) -> Opti
     }
     let socket = socket_for(workspace_root);
     // A socket left by an agent of an IDE that did not end cleanly; the
-    // new agent refuses to bind over it.
+    // new agent refuses to bind over it. A new agent holds nothing yet.
     let _ = std::fs::remove_file(&socket);
+    loaded().lock().unwrap().remove(&socket);
     let mut command = Command::new("ssh-agent");
     command
         .arg("-D")
@@ -157,7 +169,13 @@ fn load_identities(socket: &Path, target: &str, askpass_env: &[(String, String)]
         if !file.is_file() || file.extension().is_some_and(|ext| ext == "pub") {
             continue;
         }
-        if public_key(&file).is_some_and(|key| held_by(&held, &key)) {
+        if public_key(&file).is_some_and(|key| held_by(&held, &key))
+            || loaded()
+                .lock()
+                .unwrap()
+                .get(socket)
+                .is_some_and(|files| files.contains(&file))
+        {
             continue;
         }
         let added = Command::new("ssh-add")
@@ -168,7 +186,13 @@ fn load_identities(socket: &Path, target: &str, askpass_env: &[(String, String)]
             .output();
         match added {
             Ok(out) if out.status.success() => {
-                tracing::info!("the IDE's ssh-agent holds {}", file.display())
+                tracing::info!("the IDE's ssh-agent holds {}", file.display());
+                loaded()
+                    .lock()
+                    .unwrap()
+                    .entry(socket.to_path_buf())
+                    .or_default()
+                    .insert(file);
             }
             Ok(out) => tracing::info!(
                 "{} was not added to the IDE's ssh-agent: {}",
