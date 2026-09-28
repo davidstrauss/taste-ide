@@ -193,14 +193,20 @@ impl Worktree {
                 })
             }
             Worktree::Remote { files, path, .. } => {
-                let mut argv: Vec<String> = vec!["git".into()];
+                // `Files::exec` takes no environment, so what the caller
+                // asked for rides in through `env(1)`. It is not optional:
+                // a `GIT_INDEX_FILE` dropped here pointed the stash rebuild's
+                // read-tree and update-index at the checkout's REAL index,
+                // and a Discard left 457 files staged for deletion
+                // (2026-09-28). The background's non-interactive settings
+                // are the files service's own business and stay out.
+                let mut argv: Vec<String> = Vec::new();
+                if !envs.is_empty() {
+                    argv.push("env".into());
+                    argv.extend(envs.iter().map(|(key, value)| format!("{key}={value}")));
+                }
+                argv.push("git".into());
                 argv.extend(args.iter().map(|s| s.to_string()));
-                let mut env: Vec<(String, String)> = taste_git::non_interactive_env();
-                env.extend(envs.iter().cloned());
-                // The keeper's exec takes an environment when it is one
-                // (`Keeper::exec_with_env`); through `Files` it takes none,
-                // so git's own `-c` carries what matters.
-                let _ = env;
                 let out = files
                     .exec(path, &argv)
                     .with_context(|| format!("running git in {}", files.describe()))?;
@@ -659,6 +665,17 @@ mod tests {
         std::fs::write(root.join("a.txt"), "a changed\n").unwrap();
         std::fs::write(root.join("b.txt"), "b changed\n").unwrap();
         std::fs::write(root.join("c.txt"), "untracked\n").unwrap();
+        // What the checkout is besides the stash — its index and its files —
+        // none of which may move. A rebuild that ran against the real index
+        // left every file staged for deletion, and a check of the stash and
+        // of one file on disk did not see it.
+        std::fs::write(root.join("d.txt"), "kept, untracked\n").unwrap();
+        let state = |worktree: &Worktree| {
+            (
+                worktree.git_ok(&["status", "--porcelain"]).unwrap(),
+                worktree.git_ok(&["ls-files", "--stage"]).unwrap(),
+            )
+        };
         worktree
             .stash_paths(
                 &[
@@ -672,6 +689,7 @@ mod tests {
         let held =
             |worktree: &Worktree| -> Vec<HashSet<PathBuf>> { worktree.stash_entries().unwrap() };
         assert_eq!(held(&worktree)[0].len(), 3);
+        let before = state(&worktree);
 
         // A tracked file out: the others stay, as stashed.
         worktree.remove_from_stash(0, Path::new("a.txt")).unwrap();
@@ -687,6 +705,7 @@ mod tests {
             worktree.git_ok(&["show", "stash@{0}:b.txt"]).unwrap(),
             "b changed\n"
         );
+        assert_eq!(state(&worktree), before, "the index or the files moved");
         // Its message kept, and the working tree untouched.
         assert!(worktree
             .git_ok(&["stash", "list"])
@@ -702,6 +721,7 @@ mod tests {
         );
         worktree.remove_from_stash(0, Path::new("b.txt")).unwrap();
         assert!(held(&worktree).is_empty());
+        assert_eq!(state(&worktree), before, "the index or the files moved");
     }
 
     /// The two arms agree, verb by verb, on one working tree: the remote
