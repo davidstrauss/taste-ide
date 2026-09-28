@@ -968,6 +968,7 @@ impl LibvirtSession {
     }
 
     async fn run(&self, program: &str, args: Vec<String>) -> Result<String> {
+        let what = format!("{program} {}", subcommand(&args));
         let (program, args) = host_argv(self.sandboxed, program, args);
         let output = tokio::process::Command::new(&program)
             .args(&args)
@@ -977,9 +978,8 @@ impl LibvirtSession {
             .with_context(|| format!("running {program}"))?;
         if !output.status.success() {
             bail!(
-                "{program} {}: {}",
-                args.first().map(String::as_str).unwrap_or_default(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                "{what}: {}",
+                one_line(&String::from_utf8_lossy(&output.stderr))
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -1000,6 +1000,17 @@ impl LibvirtSession {
         self.virsh(&["uri"])
             .await
             .context("libvirt's session daemon did not answer; is libvirt installed?")?;
+        // Asked of libvirt rather than of /dev/kvm, since libvirt is what
+        // will be refused, and it is the host's view either way — a
+        // sandboxed IDE may not see the device at all. Without this the
+        // first sign is `virsh define` failing after the guest image's
+        // gigabyte has been fetched for nothing.
+        self.virsh(&["domcapabilities", "--virttype", "kvm"])
+            .await
+            .context(
+                "KVM is not available on this host: hardware virtualization (VT-x or \
+                 AMD-V) is off in the firmware, or the kvm module is not loaded",
+            )?;
         self.run("qemu-img", vec!["--version".into()])
             .await
             .context("qemu-img is not installed; the VM's disk needs it")?;
@@ -1549,6 +1560,33 @@ impl LibvirtSession {
     }
 }
 
+/// What a command was asked to do, for its error: the first argument that
+/// is not an option, with `-c`'s URI skipped — `virsh define`, never
+/// `virsh -c`.
+fn subcommand(args: &[String]) -> &str {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "-c" {
+            args.next();
+        } else if !arg.starts_with('-') {
+            return arg;
+        }
+    }
+    ""
+}
+
+/// A tool's stderr as one line. libvirt says what failed on its first
+/// line and why on the next, and whatever reads the error — the startup
+/// page's step, a row's reason — keeps its first line only.
+fn one_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(|line| line.trim().trim_start_matches("error: "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 /// Bytes a file actually occupies — the sparse answer, which for a qcow2
 /// overlay is the only honest one.
 fn allocated_bytes(path: &Path) -> Option<u64> {
@@ -1663,6 +1701,24 @@ pub fn release_from_base_name(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_command_says_what_and_why_on_one_line() {
+        let args: Vec<String> = ["-c", "qemu:///session", "define", "/x.xml"]
+            .map(String::from)
+            .into();
+        assert_eq!(super::subcommand(&args), "define");
+        // libvirt's own words, from a host with VT-x off in the firmware.
+        assert_eq!(
+            super::one_line(
+                "error: Failed to define domain from /x.xml\n\
+                 error: unsupported configuration: Emulator '/usr/bin/qemu-system-x86_64' \
+                 does not support virt type 'kvm'\n\n"
+            ),
+            "Failed to define domain from /x.xml: unsupported configuration: Emulator \
+             '/usr/bin/qemu-system-x86_64' does not support virt type 'kvm'"
+        );
+    }
+
     #[test]
     fn a_base_image_path_names_its_release() {
         assert_eq!(

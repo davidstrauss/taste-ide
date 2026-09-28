@@ -615,8 +615,14 @@ impl StartupPage {
                     self.begin();
                 }
                 let first = message.lines().next().unwrap_or(message).trim().to_string();
-                let current = self.current.get().unwrap_or(Step::Build);
-                self.row(current).set(Status::Failed, Some(&first));
+                // On the step still running, which is not always the
+                // current one: the guest image's fetch runs behind the VM's.
+                let failed = Step::ALL
+                    .into_iter()
+                    .find(|step| self.row(*step).status.get() == Status::Active)
+                    .or(self.current.get())
+                    .unwrap_or(Step::Build);
+                self.row(failed).set(Status::Failed, Some(&first));
                 if baseline {
                     // Not the project's doing: the safe-mode environment is
                     // the IDE's own, so this is the machine, the VM
@@ -683,6 +689,21 @@ impl StartupPage {
             P::Decompressing => "unpacking".to_string(),
             _ => "verifying".to_string(),
         };
+        // The image is fetched inside the VM's bring-up, so its phases
+        // arrive after that step is announced: the image's row says how
+        // far it has got, and the page stays on the VM's step, where a
+        // failure that follows belongs.
+        if self
+            .current
+            .get()
+            .is_some_and(|step| step > Step::GuestImage)
+        {
+            let row = self.row(Step::GuestImage);
+            if row.status.get() != Status::Failed {
+                row.set(Status::Active, Some(&detail));
+            }
+            return;
+        }
         self.activate(Step::GuestImage, Some(&detail));
     }
 
