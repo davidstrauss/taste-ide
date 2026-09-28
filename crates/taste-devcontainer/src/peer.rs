@@ -618,7 +618,16 @@ pub fn sync_primary_peer_with(
             }
             (ahead, 0) if ahead > 0 => {
                 commits_unsettled = true;
-                match push_ahead_into_checkout(peer, vm, keys, files, path, branch) {
+                let folder_tree = working_tree_id(peer);
+                match push_ahead_into_checkout(
+                    peer,
+                    vm,
+                    keys,
+                    files,
+                    path,
+                    branch,
+                    folder_tree.as_deref(),
+                ) {
                     Ok(None) => sync.pushed = true,
                     // Taken, but its uncommitted work did not come along:
                     // said as what happened, not as a refusal.
@@ -833,8 +842,154 @@ pub fn send_change(files: &Files, path: &Path, change: &taste_git::mirror::Chang
     Ok(())
 }
 
+/// The checkout's side of [`push_ahead_into_checkout`], run in the
+/// checkout with `$1` the staging ref, `$2` the branch, and `$3` the
+/// folder's working-tree id (empty when it could not be read). Exits 0
+/// fast-forwarded, 4 fast-forwarded with the checkout's own changes kept in
+/// a stash, anything else refused with the reason on stderr.
+const SYNC_SCRIPT: &str = r#"set -e
+staging="$1"
+branch="$2"
+folder_tree="$3"
+cleanup() { git update-ref -d "$staging" 2>/dev/null || true; }
+# Every taste-ide-sync stash whose every file, as stashed, is the file as
+# some commit since the stash's base has it: work that reached history, so
+# the stash only holds a copy of it. Dropped, newest index last so the
+# indices below stay put.
+prune_superseded() {
+  n=$(git stash list | wc -l)
+  i=$((n - 1))
+  while [ "$i" -ge 0 ]; do
+    s="stash@{$i}"
+    if git log -1 --format=%gs -g "$s" 2>/dev/null | grep -q 'taste-ide-sync$'; then
+      base=$(git rev-parse "$s^1")
+      if superseded "$s" "$base"; then git stash drop -q "$s"; fi
+    fi
+    i=$((i - 1))
+  done
+}
+superseded() {
+  s="$1"; base="$2"
+  { git diff --name-only "$s^1" "$s"
+    git rev-parse -q --verify "$s^3" >/dev/null && git ls-tree -r --name-only "$s^3"
+  } | while IFS= read -r p; do
+    if git rev-parse -q --verify "$s^3:$p" >/dev/null 2>&1; then want=$(git rev-parse "$s^3:$p")
+    else want=$(git rev-parse -q --verify "$s:$p" 2>/dev/null || echo none); fi
+    found=0
+    for c in $(git rev-list "$base..HEAD" -- "$p"); do
+      got=$(git rev-parse -q --verify "$c:$p" 2>/dev/null || echo none)
+      if [ "$got" = "$want" ]; then found=1; break; fi
+    done
+    [ "$found" = 1 ] || exit 1
+  done
+}
+if ! git merge-base --is-ancestor "refs/heads/$branch" "$staging"; then
+  cleanup; echo "the checkout's $branch is not behind the folder's" >&2; exit 2
+fi
+if [ "$(git symbolic-ref --short -q HEAD)" != "$branch" ]; then
+  git update-ref "refs/heads/$branch" "$staging"; cleanup; exit 0
+fi
+if git ls-files -u | grep -q .; then
+  if git stash list | grep -q taste-ide-sync && ! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    # The leftovers of a taste-ide-sync stash that did not apply, from
+    # before the sync learned to leave the tree clean: the stash holds the
+    # changes, so the tree goes back to its commit.
+    git reset -q --hard
+  else
+    cleanup
+    echo "the checkout has unresolved conflicts in $(git ls-files -u | awk '{print $4}' | sort -u | tr '\n' ' ')- resolve or discard them in the file tree, and the folder's commits follow" >&2
+    exit 5
+  fi
+fi
+# The checkout's files are the folder's: move the branch, keep the files.
+if [ -n "$folder_tree" ]; then
+  index=$(mktemp)
+  GIT_INDEX_FILE="$index" git read-tree HEAD
+  GIT_INDEX_FILE="$index" git add -A
+  mine=$(GIT_INDEX_FILE="$index" git write-tree)
+  rm -f "$index"
+  if [ "$mine" = "$folder_tree" ] && git merge-base --is-ancestor HEAD "$staging"; then
+    git reset -q "$staging"
+    cleanup
+    prune_superseded
+    exit 0
+  fi
+fi
+stashed=0
+if [ -n "$(git status --porcelain)" ]; then
+  git stash push --include-untracked -q -m taste-ide-sync && stashed=1
+fi
+if ! git merge --ff-only -q "$staging"; then
+  [ "$stashed" = 1 ] && git stash pop -q || true
+  cleanup; echo "the checkout would not fast-forward to the folder's $branch" >&2; exit 3
+fi
+cleanup
+if [ "$stashed" = 1 ] && ! git stash pop -q 2>/dev/null; then
+  git reset -q --hard
+  git clean -fdq
+  prune_superseded
+  if git stash list | grep -q 'taste-ide-sync$'; then
+    echo "its uncommitted changes do not apply over them and are kept in its stash (taste-ide-sync), for the file tree's Unstash" >&2
+    exit 4
+  fi
+  exit 0
+fi
+prune_superseded
+"#;
+
+/// The tree the folder's working files come to — tracked and untracked,
+/// less what is ignored — as git names it, built in a throwaway index so
+/// the folder's own is not touched. Content-addressed, so the checkout in
+/// the VM computing the same id over the same files means the two trees
+/// hold the same work. `None` for a folder git cannot read that way, which
+/// costs only the shortcut it feeds.
+fn working_tree_id(peer: &Path) -> Option<String> {
+    if taste_git::private::find_private(peer).is_some() {
+        return None;
+    }
+    let index = std::env::temp_dir().join(format!(
+        "taste-worktree-{}-{:x}.index",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(peer)
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+    };
+    let tree = git(&["read-tree", "HEAD"])
+        .and_then(|_| git(&["add", "-A"]))
+        .and_then(|_| git(&["write-tree"]))
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|tree| !tree.is_empty());
+    let _ = std::fs::remove_file(&index);
+    tree
+}
+
 /// Bring the checkout in the VM up to the folder's `branch`, which is
 /// ahead of it: the user committed here with another tool.
+///
+/// **Most of the time nothing needs stashing.** The folder mirrors the
+/// checkout, so at launch the checkout's working files are usually the
+/// folder's exactly, and the commits the folder is ahead by are commits
+/// of that very work — made here, on the host, while the checkout carried
+/// it uncommitted. Stashing it around the fast-forward then left a stash
+/// that could not apply over its own commits, one per relaunch: a pile of
+/// "stashed" files that were all cruft (David, 2026-09-28). So when the
+/// checkout's working tree is the folder's (`folder_tree`, the same id
+/// computed on both sides), the branch simply moves to the folder's tip
+/// with the files left as they are — which leaves exactly the folder's
+/// own uncommitted changes showing, the state the mirror means. Only a
+/// checkout whose files differ from the folder's takes the stash below.
 ///
 /// A plain push into the checked-out branch is what
 /// `receive.denyCurrentBranch=updateInstead` allows only when the
@@ -860,6 +1015,7 @@ fn push_ahead_into_checkout(
     files: &Files,
     path: &Path,
     branch: &str,
+    folder_tree: Option<&str>,
 ) -> Result<Option<String>> {
     let staging = format!("{PEER_STAGING}/{branch}");
     push_to_guest(
@@ -869,45 +1025,7 @@ fn push_ahead_into_checkout(
         path,
         &[&format!("+refs/heads/{branch}:{staging}")],
     )?;
-    let script = r#"set -e
-staging="$1"
-branch="$2"
-cleanup() { git update-ref -d "$staging" 2>/dev/null || true; }
-if ! git merge-base --is-ancestor "refs/heads/$branch" "$staging"; then
-  cleanup; echo "the checkout's $branch is not behind the folder's" >&2; exit 2
-fi
-if [ "$(git symbolic-ref --short -q HEAD)" != "$branch" ]; then
-  git update-ref "refs/heads/$branch" "$staging"; cleanup; exit 0
-fi
-if git ls-files -u | grep -q .; then
-  if git stash list | grep -q taste-ide-sync && ! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-    # The leftovers of a taste-ide-sync stash that did not apply, from
-    # before the sync learned to leave the tree clean: the stash holds the
-    # changes, so the tree goes back to its commit.
-    git reset -q --hard
-  else
-    cleanup
-    echo "the checkout has unresolved conflicts in $(git ls-files -u | awk '{print $4}' | sort -u | tr '\n' ' ')- resolve or discard them in the file tree, and the folder's commits follow" >&2
-    exit 5
-  fi
-fi
-stashed=0
-if [ -n "$(git status --porcelain)" ]; then
-  git stash push --include-untracked -q -m taste-ide-sync && stashed=1
-fi
-if ! git merge --ff-only -q "$staging"; then
-  [ "$stashed" = 1 ] && git stash pop -q || true
-  cleanup; echo "the checkout would not fast-forward to the folder's $branch" >&2; exit 3
-fi
-cleanup
-if [ "$stashed" = 1 ] && ! git stash pop -q 2>/dev/null; then
-  git reset -q --hard
-  git clean -fdq
-  echo "its uncommitted changes do not apply over them and are kept in its stash (taste-ide-sync), for the file tree's Unstash" >&2
-  exit 4
-fi
-"#
-    .to_string();
+    let script = SYNC_SCRIPT.to_string();
     let out = files
         .exec(
             path,
@@ -920,6 +1038,7 @@ fi
                 "taste-sync".into(),
                 staging.clone(),
                 branch.to_string(),
+                folder_tree.unwrap_or_default().to_string(),
             ],
         )
         .with_context(|| format!("fast-forwarding {branch} in VM {}", vm.domain))?;
@@ -933,6 +1052,143 @@ fi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder and its checkout, as `git` sees them, for the sync script.
+    struct Pair {
+        dir: PathBuf,
+    }
+
+    impl Pair {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("taste-sync-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("folder")).unwrap();
+            let pair = Self { dir };
+            pair.git("folder", &["init", "-q", "-b", "main"]);
+            pair.write("folder", "a.txt", "one\n");
+            pair.git("folder", &["add", "-A"]);
+            pair.commit("folder", "first");
+            let folder = pair.dir.join("folder").display().to_string();
+            let checkout = pair.dir.join("checkout").display().to_string();
+            pair.git(".", &["clone", "-q", &folder, &checkout]);
+            pair
+        }
+
+        fn git(&self, side: &str, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .current_dir(self.dir.join(side))
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        fn commit(&self, side: &str, message: &str) {
+            self.git(side, &["commit", "-q", "-m", message]);
+        }
+
+        fn write(&self, side: &str, file: &str, text: &str) {
+            std::fs::write(self.dir.join(side).join(file), text).unwrap();
+        }
+
+        /// The folder's tip fetched into the checkout's staging ref, and the
+        /// script run there; its exit status.
+        fn sync(&self) -> i32 {
+            let folder = self.dir.join("folder").display().to_string();
+            self.git(
+                "checkout",
+                &["fetch", "-q", &folder, "+main:refs/taste/staging/main"],
+            );
+            let tree = working_tree_id(&self.dir.join("folder")).unwrap_or_default();
+            let out = std::process::Command::new("sh")
+                .current_dir(self.dir.join("checkout"))
+                .args([
+                    "-c",
+                    SYNC_SCRIPT,
+                    "taste-sync",
+                    "refs/taste/staging/main",
+                    "main",
+                    &tree,
+                ])
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            out.status.code().unwrap_or(-1)
+        }
+
+        fn stashes(&self) -> usize {
+            self.git("checkout", &["stash", "list"]).lines().count()
+        }
+    }
+
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn work_committed_in_the_folder_moves_the_checkout_without_a_stash() {
+        let pair = Pair::new("same");
+        // The checkout carries the work, mirrored, uncommitted …
+        pair.write("checkout", "a.txt", "two\n");
+        pair.write("checkout", "new.txt", "fresh\n");
+        // … and the folder commits it, with more of the same work on top,
+        // also mirrored.
+        pair.write("folder", "a.txt", "two\n");
+        pair.write("folder", "new.txt", "fresh\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "the work");
+        pair.write("folder", "a.txt", "three\n");
+        pair.write("checkout", "a.txt", "three\n");
+        assert_eq!(pair.sync(), 0);
+        assert_eq!(
+            pair.stashes(),
+            0,
+            "the sync stashed work the folder committed"
+        );
+        assert_eq!(
+            pair.git("checkout", &["rev-parse", "HEAD"]),
+            pair.git("folder", &["rev-parse", "HEAD"])
+        );
+        // What shows as uncommitted is the folder's own uncommitted change.
+        assert_eq!(pair.git("checkout", &["status", "--porcelain"]), "M a.txt");
+    }
+
+    #[test]
+    fn a_checkout_whose_work_differs_keeps_it_and_old_copies_are_pruned() {
+        let pair = Pair::new("differs");
+        // An earlier launch's stash, of work later committed as stashed.
+        pair.write("checkout", "a.txt", "two\n");
+        pair.git("checkout", &["stash", "push", "-q", "-m", "taste-ide-sync"]);
+        pair.write("folder", "a.txt", "two\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "the work");
+        // The checkout's own change, which the folder does not have and
+        // which does not apply over the folder's next commit.
+        pair.write("folder", "a.txt", "folder's\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "more");
+        pair.write("checkout", "a.txt", "checkout's own\n");
+        assert_eq!(pair.sync(), 4);
+        // The superseded copy is gone; the checkout's own work is kept.
+        assert_eq!(pair.stashes(), 1);
+        assert_eq!(
+            pair.git("checkout", &["show", "stash@{0}:a.txt"]),
+            "checkout's own"
+        );
+    }
 
     #[test]
     fn the_guest_url_names_core_the_forward_and_the_absolute_path() {
