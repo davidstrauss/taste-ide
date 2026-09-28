@@ -967,6 +967,12 @@ pub struct ChatPane {
     /// the turn ends. The alternative — moving the process immediately —
     /// would throw away the turn the user is watching.
     relocation_pending: Cell<bool>,
+    /// A launch refused for want of somewhere to run — its container not
+    /// up yet — kept with the conversation it would have resumed, so the
+    /// environment settling is what launches it. Without this, a fresh
+    /// chat had no session to resume and `retopologize` left it silent
+    /// under a refusal that promised it would start.
+    refused_launch: RefCell<Option<Option<String>>>,
     /// The picker row the proxy added at this agent's spawn — the account's
     /// top tier as it was then read, or none (`taste_acp::authproxy::
     /// top_tier_model_id`). Compared with the listing when the proxy says
@@ -3149,6 +3155,7 @@ impl ChatPane {
             relocated: Cell::new(false),
             hosting_refusal: RefCell::new(None),
             relocation_pending: Cell::new(false),
+            refused_launch: RefCell::new(None),
             spawned_top_tier: RefCell::new(None),
             models_pending: Cell::new(false),
             container_wait: Cell::new(ContainerWait::Idle),
@@ -4984,6 +4991,13 @@ impl ChatPane {
             // budget resets because a settled environment is new
             // information, not another failed retry.
             if self.needs_auth.get() {
+                return;
+            }
+            // A launch that was refused while the container came up is
+            // launched now, conversation or none.
+            if let Some(refused) = self.refused_launch.borrow_mut().take() {
+                self.reconnect_attempts.set(0);
+                self.ensure_client(refused.or(resume));
                 return;
             }
             let Some(resume) = resume else {
@@ -8130,6 +8144,7 @@ impl ChatPane {
 
         // AgentClient::spawn uses tokio::spawn internally; enter the runtime.
         let _guard = crate::runtime::runtime().enter();
+        let resume_for_retry = resume.clone();
         let client = match AgentClient::spawn_aimed(
             spec,
             aim,
@@ -8141,10 +8156,14 @@ impl ChatPane {
         ) {
             Ok(client) => client,
             Err(e) => {
+                self.status_spinner.stop();
+                self.status_label.set_label("");
                 self.meta_row(&format!("agent launch refused: {e}"));
+                *self.refused_launch.borrow_mut() = Some(resume_for_retry);
                 return;
             }
         };
+        self.refused_launch.borrow_mut().take();
         let events = client.events.clone();
         *self.client.borrow_mut() = Some(client);
         let generation = self.client_generation.get() + 1;
