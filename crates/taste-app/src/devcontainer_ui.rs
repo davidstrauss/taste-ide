@@ -115,7 +115,19 @@ pub struct DevcontainerBanner {
     notice_since: Cell<Option<std::time::Instant>>,
     /// `TASTE_PROBE_BANNER` posed this banner: real state stops moving it.
     posed: Cell<bool>,
+    /// Counts the states drawn, so a face held back (`SETTLE`) is drawn
+    /// only if no state came after it.
+    generation: Cell<u64>,
 }
+
+/// How long a state the window starts from on its own — a config on disk
+/// with nothing running, or no config at all — must stand before its face
+/// is drawn. The start follows within a moment, and drawing the face at
+/// once flashed "Safe mode — devcontainer not running" with a Start button
+/// between the checkout's sync and the build (David, 2026-09-28: "a banner
+/// comes up and then rapidly disappears"). A start that never comes still
+/// gets the face, and its button, this much later.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl DevcontainerBanner {
     pub fn new(supervisor: Arc<Supervisor>, events: EventBus) -> Rc<Self> {
@@ -221,6 +233,7 @@ impl DevcontainerBanner {
             last_state: RefCell::new(None),
             notice_since: Cell::new(None),
             posed: Cell::new(false),
+            generation: Cell::new(0),
         });
 
         // A question's answer: the button, Enter in either entry, or the
@@ -666,8 +679,30 @@ impl DevcontainerBanner {
 
     pub fn on_state(self: &Rc<Self>, state: &DevcontainerStateEvent) {
         *self.last_state.borrow_mut() = Some(state.clone());
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
         if self.posed.get() || self.question.borrow().is_some() {
             // Remembered above; drawn once the question is over.
+            return;
+        }
+        if matches!(
+            state,
+            DevcontainerStateEvent::ConfigDetected | DevcontainerStateEvent::NoConfig
+        ) {
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_local_once(SETTLE, move || {
+                let Some(this) = weak.upgrade() else { return };
+                if this.generation.get() != generation
+                    || this.posed.get()
+                    || this.question.borrow().is_some()
+                {
+                    return;
+                }
+                let state = this.last_state.borrow().clone();
+                if let Some(state) = state {
+                    this.draw_state(&state);
+                }
+            });
             return;
         }
         self.draw_state(state);
