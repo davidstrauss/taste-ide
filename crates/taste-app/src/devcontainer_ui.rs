@@ -362,10 +362,27 @@ impl DevcontainerBanner {
     /// asks it, and the environment's own face waits behind it.
     pub fn ask(self: &Rc<Self>, id: u64, prompt: &str, kind: AskKind) {
         // One at a time: a second asker while the first stands is answered
-        // "no answer" rather than replacing a question mid-type.
-        if self.question.borrow().is_some() {
-            crate::askpass::answer(id, None);
-            return;
+        // "no answer" rather than replacing a question mid-type. A notice
+        // standing is different: it asks for nothing, and a question that
+        // arrives under it is the step it is about — a Push to a security
+        // key raises the IDE's own "touch your key" notice before ssh
+        // runs, and ssh's first ask for a key file with a passphrase is
+        // that passphrase. Turned away, it failed the Push a second after
+        // the notice with "Permission denied (publickey)" (2026-09-28). So
+        // a question displaces a notice; the notice's own end, later, names
+        // an id that is no longer the strip's and changes nothing
+        // (`ask_done`).
+        let standing = *self.question.borrow();
+        match standing {
+            Some((current, AskKind::Notice)) if kind != AskKind::Notice => {
+                crate::askpass::answer(current, None);
+                self.question.borrow_mut().take();
+            }
+            Some(_) => {
+                crate::askpass::answer(id, None);
+                return;
+            }
+            None => {}
         }
         *self.question.borrow_mut() = Some((id, kind));
         let first = prompt.lines().next().unwrap_or(prompt).trim();
