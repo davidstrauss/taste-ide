@@ -89,7 +89,9 @@ composer on Backlog, half-written, the list scrolled to the ghost row
 that points at it —, `orchestrator`,
 `port` (a forwarded port's tab on its REST face),
 `utilization`, `search` — the one query posed, every pane answering it —,
-`dirty` — the Dirty filter view, for measuring the column's rows)
+`dirty` — the Dirty filter view, for measuring the column's rows —,
+`stashed` — the Stashed filter view with two rows checked, its pane's
+Unstash and held trash in the frame, against the checkout's own stash)
 and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `quiet` — `busy` silent for over a minute, the
 working line saying for how long and naming Stop —, `starting` — the line above the composer while the environment comes up,

@@ -467,6 +467,121 @@ impl Worktree {
         bail!("{last}")
     }
 
+    /// Take one path out of stash entry `index`, leaving the entry holding
+    /// the rest — or dropping it, when that path was all it held.
+    ///
+    /// A stash entry is three commits (the working tree's, the index's,
+    /// and the untracked files'), and none of them can be edited, so the
+    /// entry is rebuilt: each tree with the path put back to the entry's
+    /// base (or out of the untracked tree), the three commits made again,
+    /// and the new entry stored in the old one's place with its message.
+    /// Git's own plumbing throughout, through a throwaway index, so the
+    /// working tree and the real index are never touched. The rebuilt
+    /// entry lands at the top of the stash list, as `git stash store`
+    /// puts it.
+    pub fn remove_from_stash(&self, index: usize, rel: &Path) -> Result<()> {
+        let entry = format!("stash@{{{index}}}");
+        let paths = self
+            .stash_entries()?
+            .into_iter()
+            .nth(index)
+            .unwrap_or_default();
+        if paths.len() <= 1 {
+            return self.stash_drop(index);
+        }
+        let rel = rel.display().to_string();
+        let rev = |spec: &str| -> Option<String> {
+            self.git_ok(&["rev-parse", "-q", "--verify", spec])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let stash = rev(&entry).ok_or_else(|| anyhow::anyhow!("no {entry}"))?;
+        let base =
+            rev(&format!("{stash}^1")).ok_or_else(|| anyhow::anyhow!("{entry} has no base"))?;
+        let staged = rev(&format!("{stash}^2"));
+        let untracked = rev(&format!("{stash}^3"));
+        let message = self
+            .git_ok(&["log", "-g", "-1", "--format=%gs", &entry])?
+            .trim()
+            .to_string();
+        let git_dir = self.git_ok(&["rev-parse", "--absolute-git-dir"])?;
+        let index_file = format!("{}/taste-stash-edit.index", git_dir.trim());
+        let with_index = [("GIT_INDEX_FILE".to_string(), index_file)];
+        let ok = |args: &[&str]| -> Result<String> {
+            let out = self.run_git(args, &with_index)?;
+            if !out.success() {
+                bail!("{}", out.stderr_utf8().trim());
+            }
+            Ok(out.stdout_utf8().trim().to_string())
+        };
+        // The tree of `commit` with `rel` as `base` has it, or gone.
+        let without = |commit: &str, from_base: bool| -> Result<String> {
+            ok(&["read-tree", commit])?;
+            let listed = if from_base {
+                ok(&["ls-tree", &base, "--", &rel])?
+            } else {
+                String::new()
+            };
+            match listed.split_once('\t') {
+                Some((meta, _)) => {
+                    let mut meta = meta.split_whitespace();
+                    let (mode, _, blob) = (meta.next(), meta.next(), meta.next());
+                    let (Some(mode), Some(blob)) = (mode, blob) else {
+                        bail!("reading {rel} in the stash's base");
+                    };
+                    ok(&[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("{mode},{blob},{rel}"),
+                    ])?;
+                }
+                None => {
+                    ok(&["update-index", "--force-remove", "--", &rel])?;
+                }
+            }
+            ok(&["write-tree"])
+        };
+        let work_tree = without(&stash, true)?;
+        let mut parents = vec![base.clone()];
+        if let Some(staged) = &staged {
+            let tree = without(staged, true)?;
+            parents.push(ok(&[
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-m",
+                &format!("index on {message}"),
+            ])?);
+        }
+        if let Some(untracked) = &untracked {
+            let tree = without(untracked, false)?;
+            let empty = ok(&["hash-object", "-t", "tree", "/dev/null"])?;
+            if tree != empty {
+                parents.push(ok(&[
+                    "commit-tree",
+                    &tree,
+                    "-m",
+                    &format!("untracked files on {message}"),
+                ])?);
+            }
+        }
+        let mut args: Vec<String> = vec!["commit-tree".into(), work_tree];
+        for parent in &parents {
+            args.push("-p".into());
+            args.push(parent.clone());
+        }
+        args.push("-m".into());
+        args.push(message.clone());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let rebuilt = ok(&args)?;
+        self.stash_drop(index)?;
+        self.git_ok(&["stash", "store", "-q", "-m", &message, &rebuilt])?;
+        Ok(())
+    }
+
     pub fn stash_drop(&self, index: usize) -> Result<()> {
         self.git_ok(&["stash", "drop", "--quiet", &format!("stash@{{{index}}}")])?;
         Ok(())
@@ -524,6 +639,69 @@ mod tests {
             config.set_str("user.email", "t@t").unwrap();
         }
         repo
+    }
+
+    #[test]
+    fn one_file_leaves_a_stash_entry_and_the_rest_stay_in_it() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_commit(root);
+        // Both arms: the VM's is `git` through the files service.
+        let worktree = Worktree::Remote {
+            files: Files::Local,
+            path: root.to_path_buf(),
+            after_ref_change: None,
+        };
+        std::fs::write(root.join("a.txt"), "a changed\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b changed\n").unwrap();
+        std::fs::write(root.join("c.txt"), "untracked\n").unwrap();
+        worktree
+            .stash_paths(
+                &[
+                    PathBuf::from("a.txt"),
+                    PathBuf::from("b.txt"),
+                    PathBuf::from("c.txt"),
+                ],
+                "taste-ide selection",
+            )
+            .unwrap();
+        let held =
+            |worktree: &Worktree| -> Vec<HashSet<PathBuf>> { worktree.stash_entries().unwrap() };
+        assert_eq!(held(&worktree)[0].len(), 3);
+
+        // A tracked file out: the others stay, as stashed.
+        worktree.remove_from_stash(0, Path::new("a.txt")).unwrap();
+        let entries = held(&worktree);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0],
+            [PathBuf::from("b.txt"), PathBuf::from("c.txt")]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            worktree.git_ok(&["show", "stash@{0}:b.txt"]).unwrap(),
+            "b changed\n"
+        );
+        // Its message kept, and the working tree untouched.
+        assert!(worktree
+            .git_ok(&["stash", "list"])
+            .unwrap()
+            .contains("taste-ide selection"));
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+
+        // An untracked file out, then the last: the entry goes.
+        worktree.remove_from_stash(0, Path::new("c.txt")).unwrap();
+        assert_eq!(
+            held(&worktree)[0],
+            [PathBuf::from("b.txt")].into_iter().collect()
+        );
+        worktree.remove_from_stash(0, Path::new("b.txt")).unwrap();
+        assert!(held(&worktree).is_empty());
     }
 
     /// The two arms agree, verb by verb, on one working tree: the remote

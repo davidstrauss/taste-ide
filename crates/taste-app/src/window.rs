@@ -2620,7 +2620,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `backlog`, whose whole subject is the panel at home:
             // untinted, with "Personal" the selected row.
-            "hero" | "backlog" | "backlog-composer" | "dirty" | "search" | "port" => {}
+            "hero" | "backlog" | "backlog-composer" | "dirty" | "stashed" | "search" | "port" => {}
             view if view.starts_with("consolidated") => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
@@ -2629,6 +2629,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // the column's leading glyphs and text can be measured on one line.
         if view == "dirty" {
             filetree.seed_dirty_view_for_probe();
+        }
+        // The Stashed filter with two rows checked: Unstash and the held
+        // trash on the pane.
+        if view == "stashed" {
+            filetree.seed_stashed_view_for_probe();
         }
         // `TASTE_PROBE_CHECKED=i-0002,i-0004`: rows marked for the
         // intervention bar. Checking is a hover gesture and a shot has no

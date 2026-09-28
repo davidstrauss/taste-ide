@@ -457,6 +457,15 @@ pub struct FileTree {
     /// row by row; `changed_rows` are its rows by path.
     changed_list: RefCell<Option<(gtk::ListBox, ChangedFlags)>>,
     changed_rows: RefCell<HashMap<PathBuf, ChangedRow>>,
+    /// The row a shift-click reaches from: the last checkbox toggled by
+    /// hand without Shift.
+    check_anchor: RefCell<Option<PathBuf>>,
+    /// Whether the checkbox being toggled was pressed with Shift held — a
+    /// toggle does not say, so its press does.
+    shift_click: std::cell::Cell<bool>,
+    /// The Stashed view's discard, held to confirm: kept here because the
+    /// button holds itself only weakly, for as long as its pane stands.
+    stash_discard: RefCell<Option<Rc<crate::holdbutton::HoldButton>>>,
     /// Mode the rows were last styled for (container vs safe): a flip must
     /// restyle the read-only locks even when git status is unchanged.
     container_mode: std::cell::Cell<bool>,
@@ -1406,6 +1415,9 @@ impl FileTree {
             syncing_selection: std::cell::Cell::new(false),
             changed_list: RefCell::new(None),
             changed_rows: RefCell::new(HashMap::new()),
+            check_anchor: RefCell::new(None),
+            shift_click: std::cell::Cell::new(false),
+            stash_discard: RefCell::new(None),
             container_mode: std::cell::Cell::new(workspace.exec.is_container()),
             commit_overlay,
             commit_blocker,
@@ -2179,6 +2191,28 @@ impl FileTree {
     /// TASTE_PROBE_CHECK only: the Dirty filter view, through its toggle.
     pub fn seed_dirty_view_for_probe(&self) {
         self.dirty_toggle.set_active(true);
+    }
+
+    /// TASTE_PROBE_CHECK only: the Stashed filter view with its first two
+    /// rows checked — the state a click and a shift-click leave — so the
+    /// pane's Unstash and its held trash are in the frame. The rows are
+    /// the checkout's own stash, listed a moment after the toggle.
+    pub fn seed_stashed_view_for_probe(self: &Rc<Self>) {
+        self.stashed_toggle.set_active(true);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+            let Some(tree) = weak.upgrade() else { return };
+            let mut rows: Vec<(i32, gtk::CheckButton)> = tree
+                .changed_rows
+                .borrow()
+                .values()
+                .map(|handle| (handle.row.index(), handle.check.clone()))
+                .collect();
+            rows.sort_by_key(|(at, _)| *at);
+            for (_, check) in rows.into_iter().take(2) {
+                check.set_active(true);
+            }
+        });
     }
 
     /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing
@@ -4937,6 +4971,26 @@ impl FileTree {
         }
     }
 
+    /// Set every checkbox between `from` and `to` (both rows included, in
+    /// the list's order) to `active`, as one change: the pane is rebuilt
+    /// once, by the caller.
+    fn check_range(&self, from: &Path, to: &Path, active: bool) {
+        let rows = self.changed_rows.borrow();
+        let (Some(a), Some(b)) = (rows.get(from), rows.get(to)) else {
+            return;
+        };
+        let (a, b) = (a.row.index(), b.row.index());
+        let (low, high) = (a.min(b), a.max(b));
+        self.syncing_selection.set(true);
+        for handle in rows.values() {
+            let at = handle.row.index();
+            if at >= low && at <= high && handle.row.is_visible() {
+                handle.check.set_active(active);
+            }
+        }
+        self.syncing_selection.set(false);
+    }
+
     /// One row of the changed-files list: the checkbox, the name and path,
     /// the state badge, discard, and the row's menu.
     fn changed_row(
@@ -4968,6 +5022,7 @@ impl FileTree {
                 .as_ref()
                 .map(|w| w.join(&rel))
                 .unwrap_or_else(|| rel.clone());
+            let row_rel = rel.clone();
             check.connect_toggled(move |check| {
                 let Some(tree) = weak.upgrade() else { return };
                 if check.is_active() {
@@ -4975,10 +5030,37 @@ impl FileTree {
                 } else {
                     tree.selection.borrow_mut().remove(&abs);
                 }
-                if !tree.syncing_selection.get() {
-                    tree.selection_intervention();
+                if tree.syncing_selection.get() {
+                    return;
+                }
+                // Shift-click: every row from the anchor to this one takes
+                // this one's new state, as a list's range select does
+                // (David, 2026-09-28: "I should be able to shift-click the
+                // checkboxes").
+                if tree.shift_click.replace(false) {
+                    let anchor = tree.check_anchor.borrow().clone();
+                    if let Some(anchor) = anchor.filter(|a| *a != row_rel) {
+                        tree.check_range(&anchor, &row_rel, check.is_active());
+                    }
+                } else {
+                    *tree.check_anchor.borrow_mut() = Some(row_rel.clone());
+                }
+                tree.selection_intervention();
+            });
+            // The press comes before the toggle, and knows the modifiers.
+            let weak = Rc::downgrade(self);
+            let press = gtk::GestureClick::new();
+            press.set_propagation_phase(gtk::PropagationPhase::Capture);
+            press.connect_pressed(move |gesture, _, _, _| {
+                if let Some(tree) = weak.upgrade() {
+                    tree.shift_click.set(
+                        gesture
+                            .current_event_state()
+                            .contains(gtk::gdk::ModifierType::SHIFT_MASK),
+                    );
                 }
             });
+            check.add_controller(press);
         }
         // Staged view: everything selected by default — the checkboxes
         // show what the commit takes (which is all of it).
@@ -5504,7 +5586,17 @@ impl FileTree {
             )
         } else if self.stashed_toggle.is_active() {
             (
-                vec![],
+                // Away from the commit is out of the pipeline altogether:
+                // the stash stops holding them (David, 2026-09-28: "I should
+                // also be able to dispose of items from the stash, not just
+                // unstash them").
+                vec![(
+                    "Discard",
+                    in_stash,
+                    "discard-stashed",
+                    "Delete the checked files' stashed changes — the stash stops holding \
+                     them, and the working tree is not touched",
+                )],
                 vec![(
                     "Unstash →",
                     in_stash,
@@ -5548,6 +5640,26 @@ impl FileTree {
         // their move (eligibility still drives sensitivity).
         let writable = !self.read_only();
         let build = |(label, count, op, tip): &Op, toward_commit: bool| {
+            // Discarding stashed work has no other copy to come back to, so
+            // it is the trash every other deletion here is: pressed and
+            // held until the ring closes, a release before that a toast
+            // (David, 2026-09-28: "The discard should use a trash icon and
+            // hold-to-confirm like other trash operations").
+            if *op == "discard-stashed" {
+                let hold = crate::holdbutton::HoldButton::new("user-trash-symbolic", tip);
+                hold.widget.set_sensitive(*count > 0 && writable);
+                let weak = Rc::downgrade(self);
+                hold.set_on_confirm(move || {
+                    if let Some(tree) = weak.upgrade() {
+                        tree.run_selection_op("discard-stashed");
+                    }
+                });
+                let events = self.workspace.events.clone();
+                hold.set_on_early_release(move |note| events.publish(Event::Toast(note)));
+                let widget = hold.widget.clone();
+                *self.stash_discard.borrow_mut() = Some(hold);
+                return widget;
+            }
             let button = gtk::Button::builder()
                 .label(*label)
                 .sensitive(*count > 0 && writable)
@@ -5686,10 +5798,20 @@ impl FileTree {
                                 continue;
                             };
                             worktree.unstash_file(index, rel).map_err(err)?;
-                            // An entry that held this file alone is spent.
-                            if entries[index].len() == 1 {
-                                worktree.stash_drop(index).map_err(err)?;
-                            }
+                            // Out of its entry too, or it goes on showing as
+                            // stashed beside the copy now in the tree; an
+                            // entry that held it alone is dropped.
+                            worktree.remove_from_stash(index, rel).map_err(err)?;
+                        }
+                    }
+                    "discard-stashed" => {
+                        for rel in &rels {
+                            let entries = worktree.stash_entries().map_err(err)?;
+                            let Some(index) = entries.iter().position(|paths| paths.contains(rel))
+                            else {
+                                continue;
+                            };
+                            worktree.remove_from_stash(index, rel).map_err(err)?;
                         }
                     }
                     _ => {}
@@ -5704,6 +5826,7 @@ impl FileTree {
                     "unstage" => "Unstaged".to_string(),
                     "stash" => "Stashed".to_string(),
                     "unstash" => "Unstashed — back in the working tree".to_string(),
+                    "discard-stashed" => "Discarded from the stash".to_string(),
                     "keep-yours" => "Resolved with your version".to_string(),
                     "take-remote" => "Resolved with the remote version".to_string(),
                     "mark-resolved" => "Marked resolved".to_string(),
