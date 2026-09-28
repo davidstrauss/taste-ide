@@ -1318,7 +1318,7 @@ impl FileTree {
             .full_text_on_hover();
         root_row.append(&root_label);
         widget.append(&root_row);
-        widget.append(&list_holder);
+        widget.append(&crate::whole_rows::WholeRows::new(&list_holder));
         widget.append(&files_results.widget);
         // The files' intervention panel opens from the bottom of the file
         // list — directly under the rows it asks about, not under the

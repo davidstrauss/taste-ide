@@ -63,6 +63,7 @@ mod tasks;
 mod textline;
 mod ui_probe;
 mod voice;
+mod whole_rows;
 mod window;
 
 use adw::prelude::*;
