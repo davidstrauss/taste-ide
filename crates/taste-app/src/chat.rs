@@ -4994,8 +4994,22 @@ impl ChatPane {
                 return;
             }
             // A launch that was refused while the container came up is
-            // launched now, conversation or none.
-            if let Some(refused) = self.refused_launch.borrow_mut().take() {
+            // launched once the container can take it, conversation or
+            // none — not on every settled state before that, which is only
+            // the same refusal said again (ConfigDetected settles with the
+            // container still to start).
+            //
+            // Taken into a local first: a scrutinee's borrow lives through
+            // the whole `if let`, and a launch refused again records itself
+            // in this same cell (a panic, 2026-09-28).
+            let refused = self.refused_launch.borrow_mut().take();
+            if let Some(refused) = refused {
+                let agents = builtin_agents();
+                let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
+                if self.relocation(&agents[index]).is_none() {
+                    *self.refused_launch.borrow_mut() = Some(refused);
+                    return;
+                }
                 self.reconnect_attempts.set(0);
                 self.ensure_client(refused.or(resume));
                 return;
