@@ -2803,6 +2803,7 @@ dependencies = [
  "libadwaita",
  "notify",
  "pulldown-cmark",
+ "serde",
  "serde_json",
  "similar",
  "sourceview5",

@@ -428,6 +428,16 @@ fn set_dirty_dot(tab: &adw::TabPage, dirty: bool) {
 
 /// The file-type icon GNOME associates with this file name.
 pub(crate) fn file_type_icon(path: &Path) -> gtk::gio::Icon {
+    // The set's icon for the name (`file_icons`), in colour; the desktop's
+    // symbolic one for its content type while the set is not loaded yet.
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let dark = adw::StyleManager::default().is_dark();
+    if let Some(icon) = crate::file_icons::icon_name(name, crate::file_icons::Kind::File, dark) {
+        return gtk::gio::ThemedIcon::new(&icon).upcast();
+    }
     let (content_type, _) = gtk::gio::functions::content_type_guess(Some(path), None::<&[u8]>);
     gtk::gio::functions::content_type_get_symbolic_icon(&content_type)
 }

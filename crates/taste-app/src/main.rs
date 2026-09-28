@@ -27,6 +27,7 @@ mod devcontainer_ui;
 mod editor;
 mod env_channel;
 mod environments;
+mod file_icons;
 mod filetree;
 mod fleet;
 mod gadget;
@@ -220,6 +221,7 @@ fn main() -> glib::ExitCode {
             }
         }
         gtk::Window::set_default_icon_name(APP_ID);
+        crate::file_icons::init();
         // App-level styling: the chat prompt entry (transparent TextView in
         // an entry-shaped container, matching GNOME chat apps).
         // The composer wears the same treatment a selected tab gets, and

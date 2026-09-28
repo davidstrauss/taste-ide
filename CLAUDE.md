@@ -372,6 +372,8 @@ to.
   capture (GStreamer), local transcription (whisper.cpp). No GTK; the
   composer drives it.
 - `crates/taste-app` — the libadwaita app; the only GTK-linking crate.
+  File icons are Material Icon Theme, vendored and pinned by
+  `build-aux/vendor-file-icons.sh` (`file_icons.rs` resolves a name).
   Its one-box-and-a-pad layer: `compose.rs` (Dispatch, the universal
   composer — one field, three send buttons: Enter, F5 held, F6 held; Ctrl+D
   to focus),

@@ -1443,6 +1443,16 @@ impl FileTree {
             unreachable: Cell::new(false),
             unreachable_retry_armed: Cell::new(false),
         });
+        // The icon set swaps a few icons between the schemes (`file_icons`),
+        // and a row resolves its icon when it is bound: a flip rebinds.
+        {
+            let weak = Rc::downgrade(&tree);
+            adw::StyleManager::default().connect_dark_notify(move |_| {
+                if let Some(tree) = weak.upgrade() {
+                    tree.rebuild_rows_in_place();
+                }
+            });
+        }
         {
             // The ghost's click: the config that exists, in the editor — or
             // the conventional one as an unsaved buffer to fill in. The
@@ -6505,7 +6515,30 @@ impl FileTree {
                 .unwrap()
                 .borrow::<FileNode>()
                 .clone();
-            expander.set_child(Some(&tree.build_row(&node)));
+            let built = tree.build_row(&node);
+            // A folder's icon follows its row open and closed: bound to the
+            // row rather than set once, because expanding does not rebind.
+            // The binding goes with the image, which the next bind replaces.
+            if node.is_dir && !node.ghost {
+                if let Some(image) = built.first_child().and_downcast::<gtk::Image>() {
+                    let name = node
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    row.bind_property("expanded", &image, "icon-name")
+                        .transform_to(move |_, expanded: bool| {
+                            crate::file_icons::icon_name(
+                                &name,
+                                crate::file_icons::Kind::Folder { expanded },
+                                adw::StyleManager::default().is_dark(),
+                            )
+                        })
+                        .sync_create()
+                        .build();
+                }
+            }
+            expander.set_child(Some(&built));
         });
 
         let list = gtk::ListView::new(Some(selection), Some(factory));

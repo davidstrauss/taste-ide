@@ -56,6 +56,8 @@
                 "install -Dm644 data/net.davidstrauss.Taste.desktop /app/share/applications/net.davidstrauss.Taste.desktop",
                 "install -Dm644 data/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg /app/share/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg",
                 "install -Dm644 -t /app/share/icons/hicolor/scalable/status data/icons/hicolor/scalable/status/*.svg",
+                "install -Dm644 -t /app/share/icons/hicolor/scalable/mimetypes data/icons/hicolor/scalable/mimetypes/taste-mi-*.svg",
+                "install -Dm644 data/file-icons/LICENSE /app/share/licenses/net.davidstrauss.Taste/material-icon-theme.LICENSE",
                 "install -Dm644 data/net.davidstrauss.Taste.metainfo.xml /app/share/metainfo/net.davidstrauss.Taste.metainfo.xml"
             ],
             "sources": [
