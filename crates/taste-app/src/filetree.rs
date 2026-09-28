@@ -14,7 +14,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk::glib::BoxedAnyObject;
 use taste_core::files::Files;
-use taste_core::{Event, EventBus, Workspace};
+use taste_core::{Event, Workspace};
 use taste_devcontainer::config::PortSpec;
 use taste_devcontainer::Worktree;
 use taste_git::{FileState, GitWorkspace};
@@ -727,27 +727,6 @@ struct StatusSnapshot {
 /// How long a fetch, rebase or push may run before it is called failed. A
 /// hung network step must not leave the sync row spinning for ever.
 const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// The strip's "touch your security key" while `operation` runs against
-/// `remote`, when the IDE knows the remote's key needs one
-/// (`taste_git::presence`) — the id to withdraw it by, or `None`. The
-/// check is a couple of local commands, so it runs on the blocking pool.
-async fn touch_notice(events: &EventBus, remote: Option<String>, operation: &str) -> Option<u64> {
-    let needs = crate::runtime::runtime()
-        .spawn_blocking(move || {
-            remote
-                .as_deref()
-                .and_then(taste_git::presence::fetch_needs_presence)
-        })
-        .await
-        .ok()
-        .flatten()?;
-    tracing::info!("{operation} will ask for a touch: {needs}");
-    Some(crate::askpass::notice(
-        events,
-        &format!("Touch your security key — {operation} is waiting on it"),
-    ))
-}
 
 /// Run one git step, bounded. `Err` carries something worth putting in a
 /// toast.
@@ -6119,16 +6098,13 @@ impl FileTree {
         self.last_fetch.set(Some(std::time::Instant::now()));
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
-        // The user pressed this: a question it runs into — a password, a
-        // passphrase, a key to touch — is theirs to answer, through the
-        // IDE's own dialog rather than a terminal nobody is watching.
-        let envs = crate::askpass::env_for(&root);
         glib::spawn_future_local(async move {
-            // A remote whose key needs a touch: say so on the strip for as
-            // long as the steps run. The key held by the agent is asked
-            // for by the agent's own prompt, which the IDE cannot route,
-            // so this is the IDE's word that the wait is for a touch.
-            let notice = touch_notice(&events, remote, "Pull").await;
+            // The user pressed this: a question it runs into — a password,
+            // a passphrase, a key to touch — is theirs to answer, on the
+            // IDE's strip rather than a terminal nobody is watching, and
+            // through the IDE's own agent, whose touch notices land on the
+            // same strip (`ssh_agent`).
+            let envs = crate::ssh_agent::network_env(root.clone(), remote).await;
             let mut steps: Vec<(&str, (String, Vec<String>))> = vec![("fetch", fetch)];
             if worktree.is_local() {
                 steps.push(("rebase", rebase_command));
@@ -6222,9 +6198,6 @@ impl FileTree {
                         events.publish(Event::Toast(warning));
                     }
                 }
-            }
-            if let Some(id) = notice {
-                crate::askpass::end_notice(&events, id);
             }
             if let Some(tree) = weak.upgrade() {
                 tree.end_sync_op();
@@ -7106,21 +7079,15 @@ impl FileTree {
         let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let notice = touch_notice(&events, remote, "Push").await;
-            let handle = crate::runtime::runtime().spawn(run_git_step(
-                spec.program,
-                spec.args,
-                crate::askpass::env_for(&root),
-            ));
+            let envs = crate::ssh_agent::network_env(root.clone(), remote).await;
+            let handle =
+                crate::runtime::runtime().spawn(run_git_step(spec.program, spec.args, envs));
             match handle.await {
                 Ok(Ok(_)) => events.publish(Event::Toast(pushed)),
                 Ok(Err(reason)) => {
                     events.publish(Event::Toast(format!("Push failed: {reason}")));
                 }
                 Err(_) => events.publish(Event::Toast("Push failed: interrupted".into())),
-            }
-            if let Some(id) = notice {
-                crate::askpass::end_notice(&events, id);
             }
             if let Some(tree) = weak.upgrade() {
                 tree.end_sync_op();

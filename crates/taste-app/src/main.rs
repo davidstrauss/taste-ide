@@ -56,6 +56,7 @@ mod runtime;
 mod search;
 mod semantic;
 mod sparkline;
+mod ssh_agent;
 mod startup;
 mod stripes;
 mod syncstatus;

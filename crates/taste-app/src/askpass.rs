@@ -134,22 +134,6 @@ pub fn answer(id: u64, answer: Option<String>) {
     }
 }
 
-/// A notice of the IDE's own — "touch your security key" while a Pull it
-/// knows needs one is waiting — shown until [`end_notice`].
-pub fn notice(events: &EventBus, text: &str) -> u64 {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    events.publish(Event::AskRequested {
-        id,
-        prompt: text.to_string(),
-        kind: AskKind::Notice,
-    });
-    id
-}
-
-pub fn end_notice(events: &EventBus, id: u64) {
-    events.publish(Event::AskDone { id });
-}
-
 /// `taste-ide --askpass <prompt…>`: ask the running IDE, or failing that
 /// a window of our own; print the answer.
 pub fn run(prompt: &str) -> glib::ExitCode {
