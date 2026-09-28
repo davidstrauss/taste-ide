@@ -220,6 +220,27 @@ fn main() -> glib::ExitCode {
             }
         }
         gtk::Window::set_default_icon_name(APP_ID);
+        // `TASTE_FONT_RENDERING=manual`: text on the pixel grid. GTK's
+        // automatic rendering places glyphs at fractional positions under a
+        // fractional display scale, so at 125% a 23px row is 28.75 device
+        // pixels and three rows in four draw their top strokes across a
+        // pixel boundary, faint — "the tops of letters" clipped in the
+        // file list (David, 2026-09-28). An experiment before a default:
+        // it changes how every label in the app renders.
+        if std::env::var("TASTE_FONT_RENDERING").as_deref() == Ok("manual") {
+            if let Some(settings) = gtk::Settings::default() {
+                // By nick, through the enum's own type: the typed setter
+                // is GTK 4.16's, past the 4.14 this crate builds against.
+                let manual = settings
+                    .find_property("gtk-font-rendering")
+                    .and_then(|pspec| glib::EnumClass::with_type(pspec.value_type()))
+                    .and_then(|class| class.to_value_by_nick("manual"));
+                if let Some(manual) = manual {
+                    settings.set_property_from_value("gtk-font-rendering", &manual);
+                    settings.set_property("gtk-hint-font-metrics", true);
+                }
+            }
+        }
         // App-level styling: the chat prompt entry (transparent TextView in
         // an entry-shaped container, matching GNOME chat apps).
         // The composer wears the same treatment a selected tab gets, and
