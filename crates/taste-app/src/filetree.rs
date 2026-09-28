@@ -1239,6 +1239,11 @@ impl FileTree {
             .propagate_natural_height(true)
             .max_content_height(TASKS_MAX_HEIGHT)
             .child(&tasks_list)
+            // Hidden until a row is kept, as `render_tasks` leaves it: a
+            // project with no Taskfile is the state the tree starts in, so
+            // `set_tasks` finds nothing changed, never renders, and the
+            // empty scroller stood between the header and the ghost row.
+            .visible(false)
             .build();
         tasks_body.prepend(&tasks_scroller);
         let tasks_note = gtk::Label::builder()
