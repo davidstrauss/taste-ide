@@ -474,6 +474,14 @@ devcontainer that will not start.
 5. **Commit flow completion**: push button surfacing sync state more
    prominently after commit; changed-files funnel counts in the filter
    toggles ("Dirty (7)").
+6. **Claude Code (GLM-5.3), on a VM in the user's GCP project** — planned
+   2026-10-01 (ENVIRONMENTS → "A model on a cloud VM", evidence in
+   `docs/spikes/glm-on-gcp.md`). GLM-5.3 Q8_0 on llama.cpp with its sparse
+   attention, on-demand, chosen by cost per task; a serving VM with no
+   way out and only the IDE able to reach it; stopped in three layers and
+   held to a monthly cap. Six phases, the fourth an acceptance test
+   against Z.ai's own stack that can end the plan, and the option offered
+   only in environments whose egress is cut.
 
 ## 2026 bets (superlean, hyperfunctional)
 

@@ -1259,6 +1259,283 @@ work, and a project with none does not inherit another's.
   What they lack is the proxy's half — spend accounting and a placeholder
   in place of a credential — and that is the difference to say out loud.
 
+### A model on a cloud VM: GLM-5.3 on GCP, as the proxy's third upstream (planned)
+
+**Planned, 2026-10-01; nothing of it is built.** The research behind every
+choice below, with its commands and sources, is
+`docs/spikes/glm-on-gcp.md`; this section is what the IDE commits to.
+
+A third place for Claude Code to send its requests: GLM-5.3, run on a
+machine the IDE provisions in the user's own GCP project, started when a
+chat needs it and stopped when nothing does. What was asked for, ranked
+the way David ranked it (2026-10-01): **capability first** ("I don't want
+any compromise on the model's capabilities … Capability is more important
+than speed"), **cost managed**, **no capacity games** ("I really don't
+care about token speed as long as cost is managed. Capability comes
+first, and I'd rather no[t] play capacity games"), and a machine that
+**only the IDE can reach and that reaches nothing itself** ("I don't
+entirely trust GLM-5.3, so I want the VM sandboxed for egress. I only
+want my IDE client to be able to access it").
+
+- **What runs: the model as trained, on whatever is cheapest per task.**
+  GLM-5.3 itself — not GLM-5.3-Flash, not a 4-bit quant — as unsloth's
+  Q8_0 GGUF, pinned by commit and per-shard digest, on llama.cpp at or
+  after its GLM indexer support (#25407, 2026-07-24), so the model's
+  DeepSeek Sparse Attention runs as it was trained rather than densely.
+  That last clause is checked, not assumed: llama.cpp treats the indexer
+  tensors as optional and runs a GGUF without them densely and silently,
+  so the pin is verified to carry them (`build-aux/gguf-tensors.py`)
+  every time it moves, and the bake-off reads the server's own load log.
+  The machine is on-demand, never Spot, and is chosen by **measured cost
+  per task** among `c4-highmem-192`, `c4d-highmem-192`, and
+  `g4-standard-192`: billing is hourly, so a slow machine is not a cheap
+  one, and dollars per hour ranks them wrongly. Rejected, each for the
+  requirement it fails: 8× H200 running the official FP8 (no on-demand
+  capacity at all — Spot, a two-hour queue, or a reservation that bills
+  around the clock), GLM-5.2 on Vertex (faithful and managed, but a
+  measured gap where this work lives: 4.6 against 28.3 on
+  Terminal-Bench 3.0, 24.4 against 54.4 on ExploitBench), and anything
+  smaller than Q8_0.
+- **One agent option, a third route.** "Claude Code (GLM-5.3)", id
+  `claude-code-glm`, is a third entry in the agent registry: the same
+  pinned adapter and home as the other two, differing in
+  `AgentSpec::upstream`, which is `Route::Cloud`. Everything "Two agents,
+  one adapter" says above holds for three: the route is per chat, decided
+  by which agent the chat was opened as, and a route with nothing behind
+  it fails the request rather than falling back to the account. Like the
+  private variant it starts in Accept edits, for the same reason and more
+  so — auto mode's reviewer would be the same slow model, prefilling a
+  fresh prompt for every tool call — shows no model drop-down, measures
+  its context gauge against the server's own window, and hides the Plan
+  gauge. Unlike it, the header's slot is not empty: it says **this
+  month's spend against the cap** ("$41 of $300"), because on this route
+  the bill is the thing to watch.
+- **The upstream is the IDE's to manage, so there is no endpoint to
+  type.** `private-model.json` holds an address the user writes. Here the
+  address is the VM's ephemeral one, different at every start, the key is
+  minted by the IDE at every start, and the certificate is the VM's own,
+  generated at every boot. What the user provides is a **GCP
+  service-account key for this project**, kept as `gcp.json` (`0600`), and
+  the few choices in `cloud-model.json` beside it — project (read off the
+  key), zone, and the monthly cap. Both are IDE state in this project's
+  state directory, never the checkout, for the reason the private model's
+  file gives: an agent that could write them could aim the IDE's own
+  requests, and its own GCP spend, wherever it liked. **Per project, with
+  no fallback, and never imported**: the IDE does not read gcloud's
+  application-default credentials, `GOOGLE_APPLICATION_CREDENTIALS`, or
+  anything under `~/.config/gcloud`. The key is a file the user made for
+  this project and chooses in the settings shade; the IDE never looks for
+  one (David, 2026-09-16: "Always require project-level creds").
+- **Two machines, and only one of them ever has a way out.** The weights
+  are fetched by a **staging VM**: small, on its own network, with egress
+  to port 443 and ordinary DNS. It formats the weights disk, downloads the
+  pinned shards and the pinned container images (the llama.cpp server and
+  a TLS terminator) onto it, checks every digest, reports progress through
+  guest attributes, and powers off; the IDE then deletes it and keeps the
+  disk. It runs nothing from the weights — a download and a hash are all
+  it does with them. The **serving VM** is the one the model runs on, on a
+  second network that has:
+  - a deny-all egress rule above every allow;
+  - a DNS server policy forwarding every query to an unassigned private
+    address, because the metadata server answers DNS and no firewall
+    reaches the metadata server;
+  - no Cloud NAT and no Private Google Access;
+  - no service account, so the metadata server mints it no credentials;
+  - no SSH (no rule admits port 22, project keys are blocked, and OS
+    Login is off) and no serial console;
+  - ingress on one port only, from the IDE's own public address;
+  - the weights disk attached read-only, and Shielded VM's secure boot.
+- **How the IDE knows it is talking to its VM, and the VM knows it is the
+  IDE.** Three locks, each sufficient against a different attacker. The
+  **address allowlist** keeps the internet's scanners off the TLS
+  terminator, the only thing listening before authentication. The
+  **pinned certificate**: the VM generates its key and a self-signed
+  certificate in `/run` at every boot, so the private key never leaves
+  it, and publishes the certificate's SHA-256 as a guest attribute; the
+  IDE reads the fingerprint through the authenticated Compute API — so
+  the pin comes from Google's API under the project's key, never from the
+  network it protects — and the proxy's TLS verifier accepts that
+  certificate and nothing else. The **rotating key**: 256 random bits the
+  IDE writes into the instance's metadata before each start, which the
+  terminator checks before a byte reaches llama-server. The address
+  allowlist is refreshed at every start, and again whenever a request
+  finds the VM running but unreachable, which is what a laptop that
+  changed networks looks like.
+- **The guest is the pool's guest.** Fedora CoreOS from the same pinned
+  stream the local pool boots (`taste_devcontainer::guest`; the stream
+  metadata already carries the GCP image ID for the release), configured
+  by Ignition through `provision::ignition`'s builder, never
+  self-updating (Zincati off — and with no egress it could not anyway).
+  Its units mount the weights disk read-only, load the staged images by
+  digest, generate the certificate, run llama-server on loopback (with
+  `--jinja`, the context window the gauge measures against, and
+  `--no-mmap`, so that "ready" means loaded rather than "will page in on
+  the first request"), run the TLS terminator in front of it, publish
+  `taste/ready` with the boot id once `/health` answers, and keep the
+  idle watchdog. Both containers run rootless, with read-only root
+  filesystems and no capabilities, so a weights file crafted to exploit
+  the loader finds no way out and nothing worth taking.
+- **Waking is starting.** The private route's hook is the one this uses:
+  before a request goes out, the proxy checks that something is listening,
+  and on this route "wake" means start the VM rather than send a magic
+  packet. In order: check the cap; mint the key and write it; refresh the
+  allowlist; start; wait for RUNNING; wait for `taste/ready`; read and pin
+  the certificate; send. Every step is a sentence in the chat whose turn
+  it is (`Event::ChatNotice`), as Wake-on-LAN's are — "Starting GLM-5.3
+  on c4-highmem-192 ($12.51/h); the weights take about six minutes to
+  load", "ready after 6m40s", "not started: this month's GCP spend is $298
+  of the $300 cap" — because a turn that waits seven minutes in silence is
+  a turn the user abandons. One wake at a time per workspace: several
+  chats share one VM, and the second waits on the first's start rather
+  than issuing its own. The private route's silence rule applies
+  unchanged: a stream quiet past the idle window is held while the
+  server's `/health` answers, which on a CPU reading a long prompt it
+  will be for minutes.
+- **Stopping, in three layers, so that no one failure leaves it running.**
+  The IDE stops the VM after fifteen minutes with no request in flight —
+  it sees every request — and when the window quits. The guest powers
+  itself off after the same span, judged from the terminator's own log,
+  which is the dead man's switch for an IDE that crashed or a laptop that
+  closed. And the instance is created with a maximum run duration and
+  STOP as its termination action, which GCP enforces even against a hung
+  guest. The first two never interrupt a turn in flight; the third is the
+  backstop and can.
+- **The ledger, and the one setting.** What the VM has cost is computed
+  from the Compute API's own start and stop timestamps, so a crash loses
+  nothing, at the SKU prices the Cloud Billing Catalog API reports, with
+  the disks' standing cost prorated in (`cloud-ledger.json`, IDE state).
+  The monthly cap is the one thing on this route that is configuration,
+  because it is the user's money: $300 by default, standing costs
+  included. At the cap the VM is not started, and the chat says why; a
+  session that crosses it finishes its turn and stops. The ledger is an
+  estimate of the bill and is labelled as one — the bill is Cloud
+  Billing's — and the settings shade recommends a budget alert on the
+  billing account, which the IDE does not create, because the project's
+  key is given no billing permissions.
+- **Parking.** A weights disk nobody has started against for fourteen
+  days is deleted, since it is most of the standing cost, and the next
+  use re-stages it, saying so in the chat. "Remove from GCP" in the shade
+  deletes everything the IDE created for this workspace, every resource
+  carrying its label, and nothing else.
+- **Setting it up.** A Claude Code (GLM-5.3) chat's settings shade
+  carries a GCP group in the place the private variant's Private model
+  group sits: the key (a file chooser), the project read off it, the zone
+  (defaulting to the first in the region offering the chosen machine),
+  the cap, and "Set up and test", which runs a preflight before anything
+  is created — the APIs enabled, the key's permissions (asked of the API
+  by name with `testIamPermissions`), the regional vCPU quota for the
+  machine, and a pointer to the organization policy when key creation
+  itself was refused — and reports each miss as a sentence under the
+  rows. Staging's progress is drawn where the guest image's fetch is
+  drawn, in the backlog's header, from the bytes the staging VM reports.
+- **What this protects, and what it does not.** It protects against the
+  serving stack — llama.cpp, its GGUF loader, and anything in the weights
+  — sending the user's code or prompts anywhere: the machine has no route
+  out, no name resolution, and no credentials, and only the IDE can
+  reach it. It does not protect against:
+  - **the model's outputs.** They become tool calls in the user's
+    environment, and that environment has egress, so a model that wants
+    to exfiltrate asks the agent to `curl` something. Phase 5 below closes
+    this, and the option is not offered until it has;
+  - **a model that writes subtly wrong code.** That is review's job, and
+    the acceptance test's for the parts of it that are the engine's
+    fault;
+  - **Google**, whose machine it is;
+  - **the project's own IAM principals**, who can read the key from the
+    instance's metadata. They can also delete the instance, so it is no
+    new power.
+
+#### The plan
+
+Each phase ends at a gate it can be judged by, and Phase 4's gate can end
+the plan.
+
+**Phase 1 — `taste-gcp`, the client.** A crate with no GTK: the
+service-account grant (a JWT signed RS256 with `ring`, which rustls
+already brings), REST over the hyper and rustls stack the proxy uses, and
+the Compute, Cloud DNS, Billing Catalog, and IAM permission calls the
+lifecycle needs. Plus the resource plan as data — names, labels, networks,
+rules, the policy, the disks, the instances — so what the IDE will create
+can be read and tested before it is created. The same client is what
+"Phase 3 — cloud provisioners" in the substrate plan needs to place
+environments in GCP, and it is written once for both. Gate: unit tests
+against a recorded mock of the API; a live test gated on
+`TASTE_GCP_TESTS=1`, which spends money and is run by a person.
+
+**Phase 2 — staging, and the bake-off.** Stage the pinned weights once,
+then run each candidate machine against them: load time, prompt-reading
+and writing rates at 2k, 32k, and 128k tokens of context, and cost per
+task on one fixed replay of a real session. From inside the serving VM,
+verify what the lockdown claims: a public name does not resolve, an
+outbound connection does not complete, the metadata server mints no
+token, and llama.cpp's load log names the indexer. Pin the llama.cpp
+build and both images by digest, settle whether the disk's throughput can
+be lowered while stopped, write the numbers into the spike, and choose the
+machine. Gate: the spike's estimates are all replaced by measurements.
+The bake-off costs on the order of a hundred dollars, which is the
+estimate it exists to replace.
+
+**Phase 3 — the route and the lifecycle.** `Route::Cloud` in the proxy,
+its pinned-certificate verifier, waking as starting with its notices, the
+three stopping layers, and the ledger and cap. Gate: the proxy against a
+local TLS fixture with a self-signed certificate (the pin accepted, any
+other certificate refused, a rotated key honoured), and the lifecycle
+against the mock — including the IDE crashing mid-session, which the
+guest's watchdog has to cover.
+
+**Phase 4 — the acceptance test, against Z.ai's own stack.** The same
+public tasks run through the real route and through Z.ai's hosted
+GLM-5.3, which is served on the reference stack; only public material
+goes to Z.ai. What it measures is what remains unmeasured: tool calls
+whose arguments are escaping-heavy (regexes, YARA and Sigma rules, shell
+one-liners, payload strings, JSON inside strings) checked byte for byte
+against the content the task specifies, and finding a known flaw planted
+in a public codebase at 30k, 100k, and 150k tokens of context. Gate: no
+corrupted tool argument, and success rates within noise of the
+reference. A failure stops the plan here, with the finding written up
+for llama.cpp, because an agent option built on a stack that loses
+backslashes is a liability.
+
+**Phase 5 — cutting egress for the chat's own commands** (David,
+2026-10-01: "Yes, cut it"). Designed in its own step, from one decision
+recorded now: egress is a property of the **environment**, not the chat,
+because a GLM-5.3 chat's commands run in the environment's container,
+where every chat's commands run. So Claude Code (GLM-5.3) is offered only
+in an environment created without egress, and a plain chat opened beside
+it inherits the same cut. Such an environment keeps the IDE's own unix
+sockets, the proxy's and the MCP server's, which is how a relocated agent
+reaches them already. This narrows, for those environments only, what
+"Isolation: the standard" grants a project, and that section says so when
+it lands. Open for that step: whether the cut is the container's
+(`--network=none`) or the guest's (its own VM, with nftables dropping all
+output rather than only the LAN); what becomes of lifecycle hooks that
+need the network, and of forwarded ports.
+
+**Phase 6 — the agent option and its surfaces.** The registry entry
+(with `AGENT_IDS` and `PROXIED_AGENTS`), the shade's GCP group, the
+header's spend slot, the Utilization tab's starts, hours, and costs, and
+staging in the backlog's header — each posed under the probe
+(`TASTE_PROBE_CLOUD`: setup, staging, starting, ready, capped) and looked
+at before it ships. The drop-down offers it only in an environment Phase
+5 has cut, so it first appears when both have landed. ARCHITECTURE's
+state table gains `gcp.json`, `cloud-model.json`, and
+`cloud-ledger.json` in the same change.
+
+**Open, and none of it blocks Phase 1:**
+
+1. Which documented service tells the IDE its own public address for the
+   allowlist. Every candidate has to clear "Intended interfaces only"
+   first; until one does, the IDE refuses to start the VM rather than
+   opening the port to everyone.
+2. Organizations created since 2024 refuse service-account key creation
+   by default. Whether the project needs an exception, or a keyless grant
+   (workload identity federation) the IDE can use instead, is settled by
+   the first real setup.
+3. Claude Code sends background requests (titles, summaries) on whatever
+   route its session is on, and here each one lands on the VM, wakes it,
+   and keeps it awake. Whether its documented settings turn them off
+   (`DISABLE_NON_ESSENTIAL_MODEL_CALLS`) is checked in Phase 3.
+
 ### Subscription usage
 
 The credential the IDE holds is billed to a subscription, and a
@@ -3942,7 +4219,9 @@ done.
 
 **Phase 3 — cloud provisioners.** Small, once Phases 0 to 2 exist:
 authenticate, create a host from the same stream, register a connection.
-Nothing below the substrate learns a new word.
+Nothing below the substrate learns a new word. For GCP, the authenticating
+and creating half is planned as `taste-gcp`, Phase 1 of the GLM-5.3 route
+(The auth proxy → "A model on a cloud VM"), and is written once for both.
 
 **Phase 4 — close what none of it closes.** WebKit on a remote dev
 server's page is the widest residual and the one most worth bounding.
