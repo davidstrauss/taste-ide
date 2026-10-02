@@ -3385,6 +3385,15 @@ impl Supervisor {
         let hash = config_hash(&config, &self.ide_mounts(&config, authority))?;
         let name = self.container_name();
 
+        // In transition BEFORE the teardown, not after it: a relocated
+        // agent lives in the container being removed, and it dies during
+        // the `rm` below. Its chat reads this state to tell a rebuild's
+        // ordinary death from a crash, and to wait for the environment
+        // rather than respawn into the gap with no exec target; reading
+        // `Running` there showed the dying exec's error as a failure and
+        // raced a respawn outside the container (2026-10-02).
+        self.set_state(SupervisorState::Building);
+
         // Tear down any previous instance (ignore "no such container").
         self.exec.set_host();
         self.forget_agent_hosting();
@@ -3399,7 +3408,6 @@ impl Supervisor {
             .await;
 
         // Build or pull the image.
-        self.set_state(SupervisorState::Building);
         let image = if let Some(dockerfile) = config.dockerfile_path() {
             let tag = self.image_tag(&config)?;
             // Build from a STAGED copy, never from the live directory.

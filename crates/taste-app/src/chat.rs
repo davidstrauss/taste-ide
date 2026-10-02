@@ -8801,8 +8801,17 @@ impl ChatPane {
                     self.set_status("disconnected");
                 }
                 self.clear_notification("permission");
-                // Error details are transcript-worthy; clean closes are not.
-                if let Some(e) = error {
+                // A relocated agent dies with its container, so a close
+                // while the environment is rebuilding is that rebuild's
+                // ordinary consequence, not a failure: the exec's own error
+                // ("no such container") says nothing a reader needs, and
+                // nobody is notified of a death they or their agent asked
+                // for. `schedule_reconnect` below waits for the same state.
+                // Error details are transcript-worthy otherwise; clean
+                // closes are not.
+                if self.environment_in_transition() {
+                    self.note("the agent stopped with its container — it comes back when the rebuild finishes");
+                } else if let Some(e) = error {
                     self.notify(crate::notify::Moment::AgentDisconnected {
                         chat: self.notify_chat(),
                         reason: e.to_string(),

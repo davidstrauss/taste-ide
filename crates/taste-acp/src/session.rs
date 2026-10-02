@@ -846,12 +846,19 @@ fn serve_terminal<T>(
 /// in the middle. A command the container does not have is the common
 /// case (`crun: executable file `gemini` not found in $PATH`, exit 127),
 /// and it deserves the sentence that says so. Anything else keeps the
-/// exit's own `data` line, and text that is not that shape is passed
-/// through untouched.
+/// exit's own `data`, and text that is not that shape is passed through
+/// untouched.
+///
+/// The object is parsed, not cut out of the text: `data` is a JSON string,
+/// so the agent's stderr inside it arrives with its newlines as `\n` and
+/// its quotes as `\"`, and splitting on quotes printed the escapes and
+/// stopped at the first quoted word.
 fn describe_close_error(raw: &str) -> String {
+    let data = close_error_data(raw);
+    let text = data.as_deref().unwrap_or(raw);
     // The runtime names the missing program between backticks, whichever
     // runtime it is: crun and runc both say `executable file `X` not found`.
-    if let Some(rest) = raw.split("executable file `").nth(1) {
+    if let Some(rest) = text.split("executable file `").nth(1) {
         if let Some((program, _)) = rest.split_once('`') {
             return format!(
                 "`{program}` is not installed where this chat's agent runs — \
@@ -859,16 +866,17 @@ fn describe_close_error(raw: &str) -> String {
             );
         }
     }
-    // A dead-process error carries the exit in its `data`; the spawn path
-    // beside it is the library's own and says nothing to a reader.
-    if raw.contains("\"spawned_at\"") {
-        if let Some(rest) = raw.split("\"data\": \"").nth(1) {
-            if let Some((data, _)) = rest.split_once('"') {
-                return data.to_string();
-            }
-        }
-    }
-    raw.to_string()
+    text.trim_end().to_string()
+}
+
+/// The `data` of the ACP crate's dead-process error, unescaped: the spawn
+/// path beside it is the library's own and says nothing to a reader.
+fn close_error_data(raw: &str) -> Option<String> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    let object: serde_json::Value = serde_json::from_str(raw.get(start..=end)?).ok()?;
+    object.get("spawned_at")?;
+    object.get("data")?.as_str().map(str::to_string)
 }
 
 /// PATH-style lookup so spawn failures can say which program is missing.
@@ -1640,6 +1648,18 @@ mod tests {
         assert_eq!(
             describe_close_error(raw),
             "Process exited with exit status: 1"
+        );
+    }
+
+    #[test]
+    fn the_data_is_unescaped_not_cut_at_its_first_quote() {
+        // A container removed under a relocated agent: podman's exit, the
+        // adapter's stderr after it, a quoted word inside.
+        let raw = "Internal error: {\n  \"spawned_at\": \"/x/rpc.rs:100\",\n  \"data\": \"Process exited with exit status: 125: [session/create] phase=\\\"register\\\"\\nError: no such container\\n\"\n}";
+        assert_eq!(
+            describe_close_error(raw),
+            "Process exited with exit status: 125: [session/create] phase=\"register\"\n\
+             Error: no such container"
         );
     }
 
