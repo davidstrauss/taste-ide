@@ -485,10 +485,8 @@ fn main() -> glib::ExitCode {
                     (David, 2026-09-07, beside Claude Code's: the scale and \
                     spacing are still much better there): body text a step down \
                     from the window's, code a step under that. The pinned \
-                    prompt floats outside the list and follows it. */\n\
-                 list.transcript, .pinned-prompt { font-size: 0.92em; }\n\
-                 list.transcript label.monospace, \
-                 list.transcript textview.diff-side { font-size: 0.9em; }\n\
+                    prompt floats outside the list and follows it. The sizes \
+                    themselves are `whole_font_css`'s, on whole pixels. */\n\
                  .rail-line { min-width: 1px; \
                    background-color: alpha(currentColor, 0.22); }\n\
                  .rail-dot { min-width: 7px; min-height: 7px; \
@@ -1071,7 +1069,7 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
     // density, just airier". 2px either side put the pitch at 25 and made
     // the column longer than it was.
     //
-    // Its size is `tree_font_css`'s: the desktop's, scaled, on a whole
+    // Its size is `whole_font_css`'s: the desktop's, scaled, on a whole
     // pixel.
     // The row itself carries the geometry: the theme's `navigation-sidebar`
     // gives the tree the lozenge the sections have — inset from the list's
@@ -1117,8 +1115,8 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
     apply(&style, &provider);
     style.connect_dark_notify(move |style| apply(style, &provider));
 
-    // The listing's size, followed: the desktop's font or its text
-    // scaling changing is a new size to round.
+    // The listing's and the transcript's sizes, followed: the desktop's
+    // font or its text scaling changing is a new size to round.
     let font = gtk::CssProvider::new();
     gtk::style_context_add_provider_for_display(
         display,
@@ -1126,27 +1124,27 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
     let settings = gtk::Settings::for_display(display);
-    font.load_from_string(&tree_font_css(&settings));
+    font.load_from_string(&whole_font_css(&settings));
     for property in ["gtk-font-name", "gtk-xft-dpi"] {
         let font = font.clone();
         settings.connect_notify_local(Some(property), move |settings, _| {
-            font.load_from_string(&tree_font_css(settings));
+            font.load_from_string(&whole_font_css(settings));
         });
     }
 }
 
-/// The file listing's font size: 92% of the desktop's, with its text
-/// scaling, rounded UP to a whole pixel.
+/// The font sizes that were fractions of the window's, on whole pixels:
+/// the file listing's, and the transcript's body, captions, and code.
 ///
 /// Whole, because at the 13.49px that 0.92em came to by default GTK drew
-/// the names with the tops of their capitals cut off after any resize of
-/// the window — every renderer, a full redraw, and labels made fresh
-/// alike, while the layout under them measured whole (David,
-/// 2026-09-28). At 14px it does not. Up rather than to the nearest, so the
-/// listing keeps the 17px line its 23px pitch is built on; 13px gave a
-/// 16px line. Worked out here rather than stated in px, so the listing
-/// still follows the desktop's font and its text scaling.
-fn tree_font_css(settings: &gtk::Settings) -> String {
+/// the file listing's names with the tops of their capitals cut off after
+/// any resize of the window — every renderer, a full redraw, and labels
+/// made fresh alike, while the layout under them measured whole (David,
+/// 2026-09-28). At 14px it does not. The transcript was at the same 0.92em
+/// and its steps' one-line summaries, captions at 82% of that (11.06px),
+/// were cut the same way (2026-10-02). Worked out here rather than stated
+/// in px, so both still follow the desktop's font and its text scaling.
+fn whole_font_css(settings: &gtk::Settings) -> String {
     let px = settings
         .gtk_font_name()
         .map(|name| gtk::pango::FontDescription::from_string(&name))
@@ -1164,12 +1162,37 @@ fn tree_font_css(settings: &gtk::Settings) -> String {
                 size * dpi / 72.0
             }
         });
-    match px {
-        Some(px) => format!(".file-row {{ font-size: {}px; }}\n", tree_font_px(px)),
-        None => ".file-row { font-size: 0.92em; }\n".to_string(),
-    }
+    let Some(px) = px else {
+        return ".file-row { font-size: 0.92em; }\n\
+                list.transcript, .pinned-prompt { font-size: 0.92em; }\n\
+                list.transcript label.monospace, \
+                list.transcript textview.diff-side { font-size: 0.9em; }\n"
+            .to_string();
+    };
+    let body = tree_font_px(px);
+    let (caption, code) = transcript_font_px(px);
+    format!(
+        ".file-row {{ font-size: {body}px; }}\n\
+         list.transcript, .pinned-prompt {{ font-size: {body}px; }}\n\
+         list.transcript .caption, .pinned-prompt .caption {{ font-size: {caption}px; }}\n\
+         list.transcript label.monospace, \
+         list.transcript textview.diff-side {{ font-size: {code}px; }}\n"
+    )
 }
 
+/// The transcript's caption and code sizes, from the desktop's: the 82% a
+/// libadwaita caption is and the 90% code is, of the body's 92%, each to
+/// the NEAREST whole pixel — they were 11.06px and 12.14px by default, so
+/// the nearest is the size they already looked; only the body rounds up,
+/// for the line its pitch is built on.
+fn transcript_font_px(desktop_px: f64) -> (i32, i32) {
+    let body = desktop_px * 0.92;
+    ((body * 0.82).round() as i32, (body * 0.9).round() as i32)
+}
+
+/// The file listing's and the transcript's body size: 92% of the
+/// desktop's, rounded UP to a whole pixel, so the listing keeps the 17px
+/// line its 23px pitch is built on; 13px gave a 16px line.
 fn tree_font_px(desktop_px: f64) -> i32 {
     // The epsilon keeps a size that is whole already from rounding up past
     // itself on a float's last digit.
@@ -1419,5 +1442,13 @@ mod tree_font_tests {
         assert_eq!(super::tree_font_px(11.0 * 120.0 / 72.0), 17);
         // Whole already stays whole.
         assert_eq!(super::tree_font_px(25.0), 23);
+    }
+
+    #[test]
+    fn the_transcripts_captions_and_code_are_their_nearest_whole_pixel() {
+        // 11.06px and 12.14px at Adwaita Sans 11 and 96 DPI.
+        assert_eq!(super::transcript_font_px(11.0 * 96.0 / 72.0), (11, 12));
+        // 13.83px and 15.18px at 125% text scaling.
+        assert_eq!(super::transcript_font_px(11.0 * 120.0 / 72.0), (14, 15));
     }
 }
