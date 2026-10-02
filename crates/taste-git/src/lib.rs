@@ -814,15 +814,29 @@ impl GitWorkspace {
         }
         let mut walk = self.repo.revwalk()?;
         walk.push(tip)?;
-        // A remote with no refs fetched yet hides nothing: every commit is
-        // new there, which is true.
-        let _ = walk.hide_glob(&format!("refs/remotes/{remote}/*"));
+        // What ANY remote's refs reach is hidden, not only the push
+        // remote's: a fork shares its parent's history, and a push remote
+        // configured as a bare URL (`branch.<name>.pushremote =
+        // https://…`) has no tracking refs at all, so hiding only its own
+        // counted a systemd branch nine commits ahead as all 83,614 of
+        // its history (2026-10-02). What no remote has seen is the
+        // number a person means by "ahead", and the most a push can carry.
+        let _ = walk.hide_glob("refs/remotes/*");
         let ahead = walk.filter(Result::is_ok).count();
+        // A branch configured to track one was pushed before, by `push -u`
+        // or by hand, so it is not being created — even when the remote is
+        // a URL whose refs this repository never fetches, and the IDE
+        // cannot see the branch there.
+        let tracked = self
+            .repo
+            .config()
+            .and_then(|config| config.get_string(&format!("branch.{branch}.merge")))
+            .is_ok();
         Ok(SyncStatus {
             upstream: Some(target),
             ahead,
             behind: 0,
-            new_branch: true,
+            new_branch: !tracked,
         })
     }
 
@@ -1212,6 +1226,44 @@ mod tests {
         );
         // The branch HEAD is on is still measured the old way.
         assert!(!ws.sync_status_of(&main).unwrap().new_branch);
+    }
+
+    /// The shape the header counted as all of systemd's history: a fork
+    /// to push to, named only by URL in the branch's own config, with the
+    /// history it shares fetched under `origin`. Ahead is what no remote
+    /// has, and a branch that tracks something is not being created.
+    #[test]
+    fn a_branch_pushed_to_a_url_counts_only_what_no_remote_has() {
+        let (dir, ws) = temp_repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.remote("origin", "https://example.invalid/upstream.git")
+            .unwrap();
+        let tip = repo.head().unwrap().target().unwrap();
+        repo.reference(&format!("refs/remotes/origin/{main}"), tip, true, "fetched")
+            .unwrap();
+        ws.create_branch("topic").unwrap();
+        fs::write(dir.path().join("b.txt"), "two\n").unwrap();
+        ws.stage(Path::new("b.txt")).unwrap();
+        ws.commit("second").unwrap();
+
+        // Pushed before, by `push -u <url>`, so no tracking ref names it.
+        let mut config = repo.config().unwrap();
+        let fork = "https://example.invalid/fork.git";
+        config.set_str("branch.topic.remote", fork).unwrap();
+        config.set_str("branch.topic.pushremote", fork).unwrap();
+        config
+            .set_str("branch.topic.merge", "refs/heads/topic")
+            .unwrap();
+        let sync = ws.sync_status_of("topic").unwrap();
+        assert_eq!(
+            (sync.ahead, sync.behind, sync.new_branch),
+            (1, 0, false),
+            "{sync:?}"
+        );
     }
 
     #[test]
