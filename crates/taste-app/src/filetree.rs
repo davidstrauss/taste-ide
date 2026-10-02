@@ -763,6 +763,50 @@ async fn run_git_step(
     }
 }
 
+/// For a branch that pushes to a URL — what `gh pr checkout` leaves — ask
+/// the remote for the branch's tip there, and fetch that tip when it is not
+/// here yet, so ↑ is counted against what the fork actually has rather
+/// than against no remote at all. Nothing is written into the repository
+/// but objects (`taste_git::relation`). Quiet on failure: the count stays
+/// a ceiling, and its tooltip says so.
+async fn observe_push_tip(root: PathBuf, branch: Option<String>, envs: Vec<(String, String)>) {
+    let Some(branch) = branch else { return };
+    let ask_root = root.clone();
+    let asked = tokio::task::spawn_blocking(move || {
+        taste_git::GitWorkspace::discover(&ask_root)
+            .and_then(|git| git.ask_push_tip_command(&branch))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((program, args, target)) = asked else {
+        return;
+    };
+    let out = match run_git_step(program, args, envs.clone()).await {
+        Ok(out) => out,
+        Err(reason) => {
+            tracing::debug!("asking {} for its tip: {reason}", target.display());
+            return;
+        }
+    };
+    taste_git::record_remote_tip(
+        &target.remote,
+        &target.branch,
+        &String::from_utf8_lossy(&out.stdout),
+    );
+    let fetch = tokio::task::spawn_blocking(move || {
+        taste_git::GitWorkspace::discover(&root).and_then(|git| git.fetch_push_tip_command(&target))
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some((program, args)) = fetch {
+        if let Err(reason) = run_git_step(program, args, envs).await {
+            tracing::debug!("fetching the push target's tip: {reason}");
+        }
+    }
+}
+
 /// A commit time as a review row wants it: coarse, short, and never a
 /// timestamp the reader has to subtract from today's date. Shared with the
 /// issue queue, which reads ages the same way for the same reason.
@@ -4061,8 +4105,20 @@ impl FileTree {
         body: &str,
         on_confirm: impl Fn(&Rc<Self>) + 'static,
     ) {
+        self.confirm_destructive_as(heading, body, "Delete", on_confirm);
+    }
+
+    /// [`Self::confirm_destructive`] with the confirming button saying
+    /// what it does.
+    fn confirm_destructive_as(
+        self: Rc<Self>,
+        heading: &str,
+        body: &str,
+        label: &str,
+        on_confirm: impl Fn(&Rc<Self>) + 'static,
+    ) {
         let dialog = adw::AlertDialog::new(Some(heading), Some(body));
-        dialog.add_responses(&[("cancel", "Cancel"), ("confirm", "Delete")]);
+        dialog.add_responses(&[("cancel", "Cancel"), ("confirm", label)]);
         dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -4553,29 +4609,60 @@ impl FileTree {
                                     // The upstream name lives in the button
                                     // tooltips; the label is for exceptions.
                                     self.set_sync_label("");
-                                    self.push_face.set_label(&format!("↑ {}", sync.ahead));
+                                    let plural = |n: usize| if n == 1 { "" } else { "s" };
+                                    // A fork's rebased branch: what the push
+                                    // replaces there is the point of it.
+                                    let replacing = sync
+                                        .base
+                                        .as_ref()
+                                        .and(sync.replaces.as_ref())
+                                        .map(|(_, dropped)| *dropped);
+                                    self.push_face.set_label(&if sync.push_unknown {
+                                        "↑ ?".to_string()
+                                    } else {
+                                        format!("↑ {}", sync.ahead)
+                                    });
                                     // A branch the remote does not have yet
                                     // is worth a push with nothing ahead:
                                     // the push is what creates it there.
-                                    self.push_button
-                                        .set_sensitive(sync.ahead > 0 || sync.new_branch);
-                                    self.push_button.set_tooltip_text(Some(&if sync.new_branch {
-                                        format!(
-                                            "Push {} commit{} to {upstream}, creating the branch \
-                                             there",
-                                            sync.ahead,
-                                            if sync.ahead == 1 { "" } else { "s" }
-                                        )
-                                    } else {
-                                        format!(
-                                            "Push {} commit{} to {upstream}",
-                                            sync.ahead,
-                                            if sync.ahead == 1 { "" } else { "s" }
-                                        )
+                                    self.push_button.set_sensitive(
+                                        sync.ahead > 0
+                                            || sync.new_branch
+                                            || replacing.is_some()
+                                            || sync.push_unknown,
+                                    );
+                                    let ahead = sync.ahead;
+                                    self.push_button.set_tooltip_text(Some(&match replacing {
+                                        Some(dropped) => format!(
+                                            "Push the rebased branch to {upstream}: {ahead} \
+                                             commit{} it lacks, replacing the {dropped} it has \
+                                             that this branch does not",
+                                            plural(ahead)
+                                        ),
+                                        None if sync.push_unknown => format!(
+                                            "Push to {upstream}. What it has is not known yet \
+                                             — the next fetch asks — so up to {ahead} \
+                                             commit{} may go",
+                                            plural(ahead)
+                                        ),
+                                        None if sync.new_branch => format!(
+                                            "Push {ahead} commit{} to {upstream}, creating the \
+                                             branch there",
+                                            plural(ahead)
+                                        ),
+                                        None => format!(
+                                            "Push {ahead} commit{} to {upstream}",
+                                            plural(ahead)
+                                        ),
                                     }));
                                     self.pull_face.set_label(&format!("↓ {}", sync.behind));
-                                    self.pull_button
-                                        .set_sensitive(sync.behind > 0 && !sync.new_branch);
+                                    // Against a base, a branch the push
+                                    // target lacks still has a base to
+                                    // catch up with.
+                                    self.pull_button.set_sensitive(
+                                        sync.behind > 0
+                                            && (sync.base.is_some() || !sync.new_branch),
+                                    );
                                     let held = self
                                         .fetch_hold
                                         .borrow()
@@ -4588,11 +4675,19 @@ impl FileTree {
                                             )
                                         })
                                         .unwrap_or_default();
-                                    self.pull_button.set_tooltip_text(Some(&format!(
-                                        "Pull {} commit{} (fetch + rebase){held}",
-                                        sync.behind,
-                                        if sync.behind == 1 { "" } else { "s" }
-                                    )));
+                                    self.pull_button.set_tooltip_text(Some(&match &sync.base {
+                                        Some(base) => format!(
+                                            "Rebase onto {base}: {} commit{} there that this \
+                                             branch lacks (fetch + rebase){held}",
+                                            sync.behind,
+                                            plural(sync.behind)
+                                        ),
+                                        None => format!(
+                                            "Pull {} commit{} (fetch + rebase){held}",
+                                            sync.behind,
+                                            plural(sync.behind)
+                                        ),
+                                    }));
                                 }
                                 None => {
                                     self.set_sync_label("no upstream");
@@ -6197,17 +6292,25 @@ impl FileTree {
         // The working tree's branch, as the push has it: for a checkout in
         // a VM, not this repository's HEAD, whose upstream is main's.
         let branch = self.status_branch.borrow().clone();
+        // Every remote is fetched, because a fork's workflow has two: the
+        // base it rebases onto and the fork it pushes to. The rebase is
+        // onto the base when the branch has one (`rebase_target_of`), its
+        // upstream otherwise.
         let Some((fetch, fetch_issues, rebase_command, remote, upstream)) =
             self.git.borrow().as_ref().map(|git| {
+                let target = match &branch {
+                    Some(branch) => git.rebase_target_of(branch),
+                    None => git.upstream_ref(),
+                };
                 (
-                    git.fetch_command(),
+                    git.fetch_all_command(),
                     git.fetch_issues_command(),
-                    git.rebase_command(),
-                    git.upstream_remote_url(),
-                    match &branch {
-                        Some(branch) => git.upstream_ref_of(branch),
-                        None => git.upstream_ref(),
+                    match &target {
+                        Some(target) => git.rebase_onto_command(target),
+                        None => git.rebase_command(),
                     },
+                    git.upstream_remote_url(),
+                    target,
                 )
             })
         else {
@@ -6255,12 +6358,21 @@ impl FileTree {
                     break;
                 }
                 if label == "fetch" {
+                    // A push target named by URL is asked for its tip here
+                    // too, so the counts after this Sync are true ones.
+                    let _ = crate::runtime::runtime()
+                        .spawn(observe_push_tip(root.clone(), branch.clone(), envs.clone()))
+                        .await;
                     let measure_root = root.clone();
+                    let measure_branch = branch.clone();
                     let measured = crate::runtime::runtime()
                         .spawn_blocking(move || {
                             taste_git::GitWorkspace::discover(&measure_root)
-                                .and_then(|git| git.sync_status().ok())
-                                .map(|sync| (sync.behind, sync.upstream))
+                                .and_then(|git| match &measure_branch {
+                                    Some(branch) => git.sync_status_of(branch).ok(),
+                                    None => git.sync_status().ok(),
+                                })
+                                .map(|sync| (sync.behind, sync.base.or(sync.upstream)))
                         })
                         .await;
                     if let Ok(Some(measured)) = measured {
@@ -6399,11 +6511,13 @@ impl FileTree {
             .git
             .borrow()
             .as_ref()
-            .map(|g| (g.fetch_command(), g.upstream_remote_url()))
+            .map(|g| (g.fetch_all_command(), g.upstream_remote_url()))
             .map(|((program, args), remote)| (program, args, remote))
         else {
             return;
         };
+        let observe_root = self.refs_root();
+        let observe_branch = self.status_branch.borrow().clone();
         self.last_fetch.set(Some(std::time::Instant::now()));
         // First, whether fetching would ask the user to touch a key: a
         // background fetch must never pop a presence prompt, so a remote
@@ -6437,6 +6551,12 @@ impl FileTree {
             }
             let events = tree.workspace.events.clone();
             crate::runtime::runtime().spawn(async move {
+                observe_push_tip(
+                    observe_root,
+                    observe_branch,
+                    taste_git::non_interactive_env(),
+                )
+                .await;
                 match tokio::process::Command::new(&program)
                     .envs(taste_git::non_interactive_env())
                     .args(&args)
@@ -7169,16 +7289,72 @@ impl FileTree {
         // pushed instead — pushed by name, to its upstream or, when it has
         // none, to the same name on the remote.
         let branch = self.status_branch.borrow().clone();
+        let sync = self.git.borrow().as_ref().and_then(|git| match &branch {
+            Some(branch) => git.sync_status_of(branch).ok(),
+            None => git.sync_status().ok(),
+        });
+        // A branch rebased onto a base its push target is not — a fork's
+        // pull request after Sync — replaces what the push target has.
+        // That is the push the workflow wants, and it overwrites commits on
+        // a remote, so it is asked about by name, and leased on the tip
+        // last seen there so commits someone pushed since are refused
+        // rather than lost. Without a base the same divergence means the
+        // push target moved: Pull first, and git's own refusal says so.
+        let replacing = sync.as_ref().and_then(|sync| {
+            sync.base.as_ref()?;
+            sync.replaces.clone()
+        });
+        match replacing {
+            Some((expected, dropped)) => {
+                // The click started the spinner; the question comes first.
+                self.end_sync_op();
+                self.workspace.events.publish(Event::GitStatusChanged);
+                let target = sync
+                    .as_ref()
+                    .and_then(|s| s.upstream.clone())
+                    .unwrap_or_else(|| "the remote".to_string());
+                let body = format!(
+                    "{dropped} commit{} on {target} {} not in this branch — the ones \
+                     it had before the rebase — and the push replaces {}. It is refused \
+                     if {target} has changed since it was last fetched.",
+                    if dropped == 1 { "" } else { "s" },
+                    if dropped == 1 { "is" } else { "are" },
+                    if dropped == 1 { "it" } else { "them" },
+                );
+                self.clone().confirm_destructive_as(
+                    &format!("Replace {target}?"),
+                    &body,
+                    "Push and Replace",
+                    move |tree| {
+                        tree.begin_sync_op(&tree.push_button);
+                        tree.push_now(Some(expected.clone()));
+                    },
+                );
+            }
+            None => self.push_now(None),
+        }
+    }
+
+    /// The push itself, replacing what the push target has when `expected`
+    /// is its tip (the lease), an ordinary push otherwise.
+    fn push_now(self: &Rc<Self>, expected: Option<String>) {
+        let branch = self.status_branch.borrow().clone();
         let Some((program, args, remote, sync)) = self.git.borrow().as_ref().map(|git| {
             let (program, args) = match &branch {
-                Some(branch) => git.push_branch_command_including_issues(branch),
+                Some(branch) => {
+                    git.push_branch_command_including_issues(branch, expected.as_deref())
+                }
                 None => git.push_command_including_issues(),
             };
             let sync = match &branch {
                 Some(branch) => git.sync_status_of(branch).ok(),
                 None => git.sync_status().ok(),
             };
-            (program, args, git.upstream_remote_url(), sync)
+            let remote = match &branch {
+                Some(branch) => git.push_url_of(branch),
+                None => git.upstream_remote_url(),
+            };
+            (program, args, remote, sync)
         }) else {
             return;
         };
