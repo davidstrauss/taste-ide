@@ -4777,10 +4777,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // the window again once they are done — the close it then asks for
         // proceeds.
         let done = Rc::new(Cell::new(false));
+        // A close is under way: the flush can take its whole twenty
+        // seconds, and a close asked for meanwhile is the same close, not
+        // another. Each one used to start its own save — and its own VM
+        // shutdown sleeper, of which a relaunch could cancel only the last;
+        // the first fired two minutes later and stopped the VM under the
+        // new window (2026-10-02).
+        let closing = Rc::new(Cell::new(false));
         let primary_for_close = supervisor.clone();
         window.connect_close_request(move |window| {
             if done.get() {
                 return glib::Propagation::Proceed;
+            }
+            if closing.replace(true) {
+                return glib::Propagation::Stop;
             }
             // What the save needs from this thread, taken now.
             let granted = supervision.as_ref().is_none_or(|s| s.is_granted());

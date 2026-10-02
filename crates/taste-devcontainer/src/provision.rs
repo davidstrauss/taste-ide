@@ -1397,6 +1397,12 @@ impl LibvirtSession {
     /// workspace, and it writes its own pid, so the pid is the host
     /// process's even when the IDE reached it through `flatpak-spawn`.
     pub fn shutdown_deferred(&self, workspace_root: &Path, grace: Duration) -> std::io::Result<()> {
+        // One sleeper per workspace by construction, not only by the
+        // caller's care: one already pending is cancelled first, because
+        // the pin names only the newest, and a relaunch's cancel cannot
+        // reach a sleeper the pin no longer names — it fires, and stops
+        // the VM under the window that cancelled "it" (2026-10-02).
+        self.cancel_deferred_shutdown(workspace_root);
         let pin = deferred_shutdown_pin(workspace_root);
         if let Some(dir) = pin.parent() {
             std::fs::create_dir_all(dir)?;
