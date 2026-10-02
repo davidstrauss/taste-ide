@@ -235,7 +235,8 @@ impl McpServer {
              issue, not a detour.\n\n\
              REPLIES. When a turn ends on a question or a choice for the user — confirm \
              this, pick one of these — call suggest_replies last, with the replies they \
-             are likeliest to give, so they can answer with a click.",
+             are likeliest to give, so they can answer with a click. Each reply names \
+             what it chooses, so it reads right with only the question above it.",
         );
         if env.is_primary() {
             // The brief is one text, kept in taste-core, because the chat
@@ -1052,9 +1053,12 @@ impl McpServer {
                     "suggest_replies",
                     "When your turn ends on a question or a choice, offer the user up to four \
                      short replies, shown as buttons under your message; a click sends that \
-                     reply as their next message. Word each as the user would say it, e.g. \
-                     \"File it\", \"Change the title first\". Call it last in the turn. The \
-                     user can still type anything instead.",
+                     reply as their next message. Each reply must make sense alone, read \
+                     with only the question above it: name what it chooses (\"Add checks to \
+                     TEST-26 only\", \"File it as a bug\"), never point at your text (\"all \
+                     of it\", \"option 2\", \"the first one\"). Ask the question itself in the \
+                     last message of the turn. Call it last. The user can still type \
+                     anything instead.",
                     json!({
                         "type": "object",
                         "properties": {

@@ -590,6 +590,12 @@ pub struct ChatPane {
     /// Offered during the turn, shown when it ends: a question is answered
     /// once it has been asked, not while the agent is still writing it.
     pending_replies: RefCell<Vec<String>>,
+    /// Renders this turn's last response whole, when it was clipped: the
+    /// replies answer what it asked, and a question cut to "… 2 more
+    /// lines" left buttons like "Yes, write all of it" pointing at a list
+    /// nobody could see (2026-10-02). Taken when the replies are drawn;
+    /// dropped by the next response, which is the last one then.
+    unclip_last: RefCell<Option<Box<dyn Fn()>>>,
     /// The card's answer buttons, rebuilt per request from the options the
     /// agent offered — every one of them, which is the whole of i-0025.
     permission_answers: adw::WrapBox,
@@ -3070,6 +3076,7 @@ impl ChatPane {
             replies_bar,
             replies_box,
             pending_replies: RefCell::new(Vec::new()),
+            unclip_last: RefCell::new(None),
             revive_bar,
             revive_label,
             revive_queue: RefCell::new(std::collections::VecDeque::new()),
@@ -6711,6 +6718,13 @@ impl ChatPane {
             self.replies_box.remove(&child);
         }
         let replies = self.pending_replies.borrow().clone();
+        // The replies answer the turn's last response: shown whole, so
+        // what they choose between is on screen above them.
+        if !replies.is_empty() {
+            if let Some(unclip) = self.unclip_last.borrow_mut().take() {
+                unclip();
+            }
+        }
         for (index, reply) in replies.iter().enumerate() {
             let button = gtk::Button::builder()
                 .label(reply)
@@ -7378,27 +7392,32 @@ impl ChatPane {
                         }),
                     }
                 });
-                let rendered = crate::markdown_view::render_in(
+                let rendered = response_prose(
                     &head,
-                    on_link,
+                    on_link.clone(),
                     Some(self.issues.clone()),
-                    base,
+                    base.clone(),
                 );
-                // The renderer is the markdown PREVIEW's, and it arrives
-                // wearing a document's inset — 16 on every side. In the
-                // transcript it is one more step, and the rail is the
-                // inset, so it states none of its own.
-                rendered.set_margin_top(0);
-                rendered.set_margin_bottom(0);
-                rendered.set_margin_start(0);
-                rendered.set_margin_end(0);
-                // ...and a document's 10px between blocks becomes a chat's 6.
-                if let Some(blocks) = rendered.downcast_ref::<gtk::Box>() {
-                    blocks.set_spacing(6);
-                }
                 let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
                 body.set_hexpand(true);
                 body.append(&rendered);
+                *self.unclip_last.borrow_mut() = (hidden > 0).then(|| {
+                    let body = body.downgrade();
+                    let whole = text.clone();
+                    let issues = self.issues.clone();
+                    Box::new(move || {
+                        let Some(body) = body.upgrade() else { return };
+                        while let Some(child) = body.first_child() {
+                            body.remove(&child);
+                        }
+                        body.append(&response_prose(
+                            &whole,
+                            on_link.clone(),
+                            Some(issues.clone()),
+                            base.clone(),
+                        ));
+                    }) as Box<dyn Fn()>
+                });
                 if hidden > 0 {
                     let key = next_doc_key("response");
                     if let Some(row) = slot.parent().and_downcast::<gtk::ListBoxRow>() {
@@ -13002,6 +13021,27 @@ fn fit_top_segment(rail: &gtk::Widget, top: &gtk::Box, hole: &gtk::Box) {
     if top.height_request() != wanted {
         top.set_height_request(wanted);
     }
+}
+
+/// A response's prose as the transcript shows it: the markdown preview's
+/// renderer, less a document's inset — 16 on every side, which in the
+/// transcript is one more step, where the rail is the inset — and with a
+/// chat's 6px between blocks rather than a document's 10.
+fn response_prose(
+    text: &str,
+    on_link: Rc<dyn Fn(&str)>,
+    issues: Option<crate::issue_pill::SharedIssueIndex>,
+    base: Option<crate::markdown_view::DocumentBase>,
+) -> gtk::Widget {
+    let rendered = crate::markdown_view::render_in(text, on_link, issues, base);
+    rendered.set_margin_top(0);
+    rendered.set_margin_bottom(0);
+    rendered.set_margin_start(0);
+    rendered.set_margin_end(0);
+    if let Some(blocks) = rendered.downcast_ref::<gtk::Box>() {
+        blocks.set_spacing(6);
+    }
+    rendered
 }
 
 /// The same, once there is a laid-out line to measure.
