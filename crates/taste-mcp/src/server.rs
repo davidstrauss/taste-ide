@@ -1056,9 +1056,9 @@ impl McpServer {
                      reply as their next message. Each reply must make sense alone, read \
                      with only the question above it: name what it chooses (\"Add checks to \
                      TEST-26 only\", \"File it as a bug\"), never point at your text (\"all \
-                     of it\", \"option 2\", \"the first one\"). Ask the question itself in the \
-                     last message of the turn. Call it last. The user can still type \
-                     anything instead.",
+                     of it\", \"option 2\", \"the first one\"). Call it last, after your answer \
+                     and the question are written: the buttons stand under them. The user \
+                     can still type anything instead.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -1629,10 +1629,16 @@ impl McpServer {
                     env: env.clone(),
                     replies,
                 });
+                // Not "end your turn now": an agent that called this before
+                // answering was told to stop there, and ended a turn the
+                // user had asked a question in with nothing but "Want me to
+                // go ahead?" (2026-10-02). The answer still comes first.
                 Ok(json!({
                     "shown": shown,
-                    "next": "End your turn now. The user picks a reply or types their own; \
-                             either arrives as their next message.",
+                    "next": "The buttons appear under your last message when your turn ends. \
+                             If your answer or the question is not written yet, write it now; \
+                             then end your turn. The user's pick, or whatever they type \
+                             instead, arrives as their next message.",
                 }))
             }
             "ide_open_file" => {
