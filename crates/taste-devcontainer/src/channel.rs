@@ -326,9 +326,15 @@ Promise.all(jobs).then(()=>{clearTimeout(deadline);console.log('reachable');proc
 ///
 /// Each service arrives as `<code>:<basename>`, so the helper never has to
 /// know what a service means — it tags what it accepts and the IDE decides.
-pub fn helper_command(env: &EnvironmentId) -> Vec<String> {
+///
+/// `node` is the program that runs it: the IDE's own node in the container
+/// when the hosting probe found it there (`crate::agentnode`), which is on
+/// no PATH, and the image's `node` otherwise. A bare `node` against an
+/// image with none failed every channel with `crun: executable file
+/// `node` not found` beside a node the probe had just run (2026-10-02).
+pub fn helper_command(env: &EnvironmentId, node: &str) -> Vec<String> {
     vec![
-        "node".into(),
+        node.into(),
         "-e".into(),
         HELPER.into(),
         environment::container_channel_dir(env)
@@ -417,11 +423,12 @@ impl EnvChannel {
     pub async fn start(
         env: EnvironmentId,
         container: &str,
+        node: &str,
         substrate: &crate::substrate::Substrate,
         services: Arc<dyn ChannelServices>,
     ) -> Result<Arc<Self>> {
         let mut args: Vec<String> = vec!["exec".into(), "-i".into(), container.to_string()];
-        args.extend(helper_command(&env));
+        args.extend(helper_command(&env, node));
         let mut child = crate::reconcile::podman(substrate, &args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -688,8 +695,11 @@ mod tests {
     #[test]
     fn the_helper_is_told_where_to_bind_and_what_to_call_it() {
         let env = EnvironmentId::parse("review").unwrap();
-        let argv = helper_command(&env);
+        let argv = helper_command(&env, "node");
         assert_eq!(argv[0], "node");
+        // The IDE's own node, where the probe found it, by its path.
+        let ours = helper_command(&env, "/opt/taste-agent/node/bin/node");
+        assert_eq!(ours[0], "/opt/taste-agent/node/bin/node");
         assert_eq!(argv[1], "-e");
         let dir = environment::container_channel_dir(&env);
         assert_eq!(argv[3], dir.display().to_string());

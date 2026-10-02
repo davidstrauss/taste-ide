@@ -2261,15 +2261,31 @@ impl Supervisor {
                 return Ok(channel.clone());
             }
         }
+        let node = self.node_program();
         let channel = EnvChannel::start(
             self.env.id.clone(),
             &self.container_name(),
+            &node,
             &self.substrate(),
             services,
         )
         .await?;
         *slot = Some(channel.clone());
         Ok(channel)
+    }
+
+    /// The `node` the IDE's own programs in this container run on: the
+    /// IDE's pinned node by its path when the probe found it running there
+    /// — it is on no PATH, since it is mounted rather than installed — and
+    /// the image's `node` otherwise. The agent is told the same thing
+    /// through `agent_node_bin`; the channel helper and its reach probe are
+    /// node programs too, and asked the image's PATH alone they failed in
+    /// every image without a node of its own.
+    fn node_program(&self) -> String {
+        match self.agent_node_bin() {
+            Some(bin) => format!("{}/node", bin.trim_end_matches('/')),
+            None => "node".to_string(),
+        }
     }
 
     /// The in-container endpoints a relocated spawn points at, if this
@@ -2303,7 +2319,7 @@ impl Supervisor {
         let mut args = vec![
             "exec".into(),
             name.to_string(),
-            "node".into(),
+            self.node_program(),
             "-e".into(),
             crate::channel::REACH_PROBE.into(),
             channel.paths().mcp.display().to_string(),

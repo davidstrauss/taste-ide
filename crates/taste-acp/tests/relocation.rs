@@ -384,6 +384,7 @@ impl Relocated {
         let channel = EnvChannel::start(
             environment.clone(),
             &env.container,
+            "node",
             &substrate(),
             Arc::new(TestServices {
                 mcp,
