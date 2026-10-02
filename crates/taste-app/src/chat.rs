@@ -7823,6 +7823,30 @@ impl ChatPane {
         if let Some(kind) = kind {
             card.kind.set(kind);
         }
+        // A command's step in the face its IN/OUT block is in, collapsed as
+        // well as open: the title where it IS the command line, and the
+        // summary, which is the output's last line (David, 2026-10-02:
+        // "Have commands and responses use a fixed-width typeface"). Not
+        // the IDE's sentences — "Collect what that command has written".
+        {
+            let title = card.title_full.borrow();
+            let command = is_command_call(card.kind.get(), &title);
+            let command_title = command
+                && match mcp_tool_name(&title).as_deref() {
+                    Some("ide_exec") => {
+                        command_input_line("ide_exec", card.cmd_input.borrow().as_ref()).is_some()
+                    }
+                    Some(_) => false,
+                    None => true,
+                };
+            for (label, on) in [(&card.title_label, command_title), (&card.summary, command)] {
+                if on {
+                    label.add_css_class("monospace");
+                } else {
+                    label.remove_css_class("monospace");
+                }
+            }
+        }
         // The Kill, now that both the command and the kind are on the card.
         self.refresh_kill(card);
         // An ACP content update REPLACES the collection, it does not extend

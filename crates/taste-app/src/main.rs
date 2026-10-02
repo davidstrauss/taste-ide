@@ -1144,6 +1144,9 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
 /// and its steps' one-line summaries, captions at 82% of that (11.06px),
 /// were cut the same way (2026-10-02). Worked out here rather than stated
 /// in px, so both still follow the desktop's font and its text scaling.
+/// A command step's summary is a caption in the code face, and keeps the
+/// caption's size: the code rule is the more specific of the two, and
+/// would have grown it.
 fn whole_font_css(settings: &gtk::Settings) -> String {
     let px = settings
         .gtk_font_name()
@@ -1166,7 +1169,8 @@ fn whole_font_css(settings: &gtk::Settings) -> String {
         return ".file-row { font-size: 0.92em; }\n\
                 list.transcript, .pinned-prompt { font-size: 0.92em; }\n\
                 list.transcript label.monospace, \
-                list.transcript textview.diff-side { font-size: 0.9em; }\n"
+                list.transcript textview.diff-side { font-size: 0.9em; }\n\
+                list.transcript label.step-summary.monospace { font-size: 0.82em; }\n"
             .to_string();
     };
     let body = tree_font_px(px);
@@ -1176,7 +1180,8 @@ fn whole_font_css(settings: &gtk::Settings) -> String {
          list.transcript, .pinned-prompt {{ font-size: {body}px; }}\n\
          list.transcript .caption, .pinned-prompt .caption {{ font-size: {caption}px; }}\n\
          list.transcript label.monospace, \
-         list.transcript textview.diff-side {{ font-size: {code}px; }}\n"
+         list.transcript textview.diff-side {{ font-size: {code}px; }}\n\
+         list.transcript label.step-summary.monospace {{ font-size: {caption}px; }}\n"
     )
 }
 
