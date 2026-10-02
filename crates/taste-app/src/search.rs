@@ -130,9 +130,19 @@ const MEANING_TOOLTIP: &str = "Include results by meaning: what the local semant
 /// The pill's text while the index builds: whole minutes left, rounded up,
 /// never under one — a build that is nearly done is still building — and
 /// an ellipsis until the plan pass has counted what there is to embed.
+/// Past three hours it is whole hours, rounded up the same way: "1017m"
+/// is a sum for the reader to do (David, 2026-10-02: "Show hours past 180
+/// minutes").
 pub fn minutes_left(eta: Option<std::time::Duration>) -> String {
     match eta {
-        Some(eta) => format!("{}m", (eta.as_secs_f64() / 60.0).ceil().max(1.0) as u64),
+        Some(eta) => {
+            let minutes = (eta.as_secs_f64() / 60.0).ceil().max(1.0) as u64;
+            if minutes > 180 {
+                format!("{}h", minutes.div_ceil(60))
+            } else {
+                format!("{minutes}m")
+            }
+        }
         None => "…".to_string(),
     }
 }
@@ -1386,6 +1396,10 @@ mod tests {
         assert_eq!(minutes_left(Some(Duration::from_secs(600))), "10m");
         assert_eq!(minutes_left(Some(Duration::from_secs(5))), "1m");
         assert_eq!(minutes_left(None), "…");
+        // Three hours is still minutes; past it, hours, rounded up.
+        assert_eq!(minutes_left(Some(Duration::from_secs(180 * 60))), "180m");
+        assert_eq!(minutes_left(Some(Duration::from_secs(181 * 60))), "4h");
+        assert_eq!(minutes_left(Some(Duration::from_secs(1017 * 60))), "17h");
     }
 
     #[test]
