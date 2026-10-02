@@ -490,7 +490,14 @@ to.
   virtualized (`ListView`) or hard-capped (transcript). Measure before
   shipping hot paths: `cargo test -p <crate> perf_ -- --ignored --nocapture`
   runs the in-repo profiling harness; for frame-level analysis run the GUI
-  under sysprof or `GDK_DEBUG=frames`.
+  under sysprof or `GDK_DEBUG=frames`. Transcript scrolling has a probe of
+  its own: `TASTE_PROBE_CHECK=1 TASTE_PROBE_SCROLL=1
+  TASTE_PROBE_DELAY_MS=60000` fills the transcript to its row cap and
+  scrolls it down and back up, printing each frame's work and the time
+  between frames (`=prose`, `=shell`, `=edit` for one kind of row,
+  `TASTE_PROBE_SCROLL_ROWS=N` for fewer rows). Run it on the machine that
+  lags, in the build it runs: in the devcontainer it measures llvmpipe's
+  software rendering, about 30ms a frame whatever the transcript holds.
 - **Convention over configuration over code.** Fixed locations for project
   behavior (see ARCHITECTURE → Conventions); add configuration only where a
   convention can't hold; never add per-project scripting of IDE behavior,

@@ -10804,6 +10804,10 @@ impl ChatPane {
             self.seed_stash_for_probe();
             return;
         }
+        if std::env::var("TASTE_PROBE_SCROLL").is_ok() {
+            self.seed_scroll_bench_for_probe();
+            return;
+        }
         use agent_client_protocol::schema::v1::{
             Content, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ToolCall,
             ToolCallUpdate, ToolCallUpdateFields, ToolKind,
@@ -11218,6 +11222,192 @@ impl ChatPane {
     /// TASTE_PROBE_CHECK only: open a tool card, so the screenshot shows its
     /// content and not just a row of collapsed headers.
     #[doc(hidden)]
+    /// `TASTE_PROBE_SCROLL=1`: the transcript filled to its row cap with
+    /// the probe's own mix — prose with a list and a code block, a shell
+    /// step opened on its output, an edit opened on its diff — then
+    /// scrolled top to bottom and back up in 240 frames each way, and two
+    /// things printed per pass: each frame's work, from the frame clock's
+    /// update to its after-paint, and the time between frames, which is
+    /// what a person sees as smooth or not. GTK's own phases are not split
+    /// out: a handler connected here runs after GTK's for the same signal,
+    /// so it cannot time them. Meaningful on the machine that reported the
+    /// lag — software rendering in a container measures llvmpipe — and in
+    /// the build that is run (pair with `TASTE_PROBE_DELAY_MS=60000`, so
+    /// the shot waits for it).
+    fn seed_scroll_bench_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::{ContentChunk, ToolCall, ToolKind};
+        let prose = "Reproduced it. `refresh_status` rebuilds the row model, and the \
+                     `ListView` drops its adjustment when the factory is reset.\n\n\
+                     So the offset has to be **read before** the rebuild and restored \
+                     *after* the rows bind — restoring it inline lands while the list \
+                     is still empty and does nothing.\n\n\
+                     - `keep_scroll` wraps the rebuild\n\
+                     - the offset is restored on the next idle tick\n\n\
+                     ```rust\nfn keep_scroll(adj: &gtk::Adjustment, rebuild: impl FnOnce()) {\n    \
+                     let value = adj.value();\n    rebuild();\n    \
+                     glib::idle_add_local_once(move || adj.set_value(value));\n}\n```\n";
+        // `=prose`, `=shell`, `=edit` fill it with that kind of row alone,
+        // which is how the row type a cost belongs to is found.
+        let only = std::env::var("TASTE_PROBE_SCROLL").unwrap_or_default();
+        let wants =
+            |kind: &str| !matches!(only.as_str(), "prose" | "shell" | "edit") || only == kind;
+        // `TASTE_PROBE_SCROLL_ROWS` fills fewer than the cap: a cost that
+        // scales with the row count is a walk over every row each frame.
+        let cap = std::env::var("TASTE_PROBE_SCROLL_ROWS")
+            .ok()
+            .and_then(|rows| rows.parse().ok())
+            .unwrap_or(MAX_TRANSCRIPT_ROWS);
+        let mut index = 0;
+        while self.transcript_rows() < cap {
+            if wants("prose") {
+                self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(prose)),
+                )));
+                // Closed as a message, as the next step would close it.
+                self.finalize_stream();
+            }
+            if !wants("shell") && !wants("edit") {
+                index += 1;
+                continue;
+            }
+            let id = format!("bench-shell-{index}");
+            let mut shell = ToolCall::new(id.clone(), PROBE_SHELL_COMMAND);
+            shell.kind = ToolKind::Execute;
+            shell.status = ToolCallStatus::Completed;
+            shell.content = vec![ToolCallContent::Content(
+                agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
+                    TextContent::new(PROBE_SHELL_OUTPUT),
+                )),
+            )];
+            if wants("shell") {
+                self.render_update(SessionUpdate::ToolCall(shell));
+                self.expand_tool_card_for_probe(&id);
+            }
+            if wants("edit") {
+                let id = format!("bench-edit-{index}");
+                let mut edit = ToolCall::new(id.clone(), "Edit crates/taste-app/src/filetree.rs");
+                edit.kind = ToolKind::Edit;
+                edit.status = ToolCallStatus::Completed;
+                edit.content = vec![ToolCallContent::Diff(probe_edit_diff())];
+                self.render_update(SessionUpdate::ToolCall(edit));
+                self.expand_tool_card_for_probe(&id);
+            }
+            index += 1;
+        }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
+            if let Some(pane) = weak.upgrade() {
+                pane.run_scroll_bench();
+            }
+        });
+    }
+
+    fn transcript_rows(&self) -> u32 {
+        let mut rows = 0;
+        let mut child = self.transcript.first_child();
+        while let Some(row) = child {
+            rows += 1;
+            child = row.next_sibling();
+        }
+        rows
+    }
+
+    fn run_scroll_bench(self: &Rc<Self>) {
+        use std::time::Instant;
+        let Some(clock) = self.transcript.frame_clock() else {
+            println!("scroll bench: no frame clock");
+            return;
+        };
+        let adjustment = self.transcript_scroller.vadjustment();
+        adjustment.set_value(0.0);
+        self.stick_to_bottom.set(false);
+        // Per frame: (work, interval since the previous frame's end), ms.
+        let started_frame: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+        let last_end: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+        let frames: Rc<RefCell<Vec<(f64, f64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1000.0;
+        let handlers = {
+            let start = started_frame.clone();
+            let update = clock.connect_update(move |_| start.set(Some(Instant::now())));
+            let (start, last, f) = (started_frame.clone(), last_end.clone(), frames.clone());
+            let after = clock.connect_after_paint(move |_| {
+                let now = Instant::now();
+                if let Some(begun) = start.take() {
+                    let interval = last.get().map(|end| ms(end, now)).unwrap_or(0.0);
+                    f.borrow_mut().push((ms(begun, now), interval));
+                }
+                last.set(Some(now));
+            });
+            [update, after]
+        };
+        let handlers = RefCell::new(Some(handlers));
+        let started = Instant::now();
+        // The whole length in 240 frames, at least 40px a frame: a full
+        // transcript is tens of thousands of pixels.
+        let step = ((adjustment.upper() - adjustment.page_size()) / 240.0).max(40.0);
+        println!(
+            "scroll bench: {} rows, {:.0}px tall, {step:.0}px a frame",
+            self.transcript_rows(),
+            adjustment.upper()
+        );
+        // Down, then back up: the first pass is every row's first time on
+        // screen, the second is rows that have all been shown before.
+        let going_up = Cell::new(false);
+        let down_frames: RefCell<Vec<(f64, f64)>> = RefCell::new(Vec::new());
+        self.transcript_scroller.add_tick_callback(move |_, clock| {
+            let bottom = adjustment.upper() - adjustment.page_size();
+            if !going_up.get() {
+                if adjustment.value() < bottom {
+                    adjustment.set_value((adjustment.value() + step).min(bottom));
+                    return glib::ControlFlow::Continue;
+                }
+                going_up.set(true);
+                *down_frames.borrow_mut() = std::mem::take(&mut *frames.borrow_mut());
+                return glib::ControlFlow::Continue;
+            }
+            if adjustment.value() > 0.0 {
+                adjustment.set_value((adjustment.value() - step).max(0.0));
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(handlers) = handlers.borrow_mut().take() {
+                for handler in handlers {
+                    clock.disconnect(handler);
+                }
+            }
+            let quantiles = |mut v: Vec<f64>| -> (f64, f64, f64) {
+                if v.is_empty() {
+                    return (0.0, 0.0, 0.0);
+                }
+                v.sort_by(|a, b| a.total_cmp(b));
+                let at = |q: f64| v[((v.len() as f64 - 1.0) * q).round() as usize];
+                (at(0.5), at(0.95), v[v.len() - 1])
+            };
+            for (label, frames) in [
+                ("down", down_frames.borrow().clone()),
+                ("up", frames.borrow().clone()),
+            ] {
+                let work = quantiles(frames.iter().map(|f| f.0).collect());
+                let gap = quantiles(frames.iter().skip(1).map(|f| f.1).collect());
+                println!(
+                    "scroll bench {label}: {} frames; ms p50/p95/max — work {:.1}/{:.1}/{:.1}, \
+                     between frames {:.1}/{:.1}/{:.1}",
+                    frames.len(),
+                    work.0,
+                    work.1,
+                    work.2,
+                    gap.0,
+                    gap.1,
+                    gap.2,
+                );
+            }
+            println!(
+                "scroll bench: done in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+            glib::ControlFlow::Break
+        });
+    }
+
     fn expand_tool_card_for_probe(&self, id: &str) {
         if let Some(card) = self.tool_cards.borrow().get(id) {
             card.set_expanded(true);
