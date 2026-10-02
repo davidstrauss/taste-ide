@@ -160,7 +160,7 @@ impl GitWorkspace {
             .repo
             .find_commit(snapshot)
             .with_context(|| format!("finding the snapshot {snapshot}"))?;
-        if let Some(reason) = self.mirror_paused(&local)? {
+        if let Some(reason) = self.mirror_paused()? {
             return Ok(Mirror::Paused { reason });
         }
         let target = snap.tree()?;
@@ -169,6 +169,21 @@ impl GitWorkspace {
             return Ok(Mirror::Stale);
         }
 
+        // A folder switched here to a branch of its own is not followed
+        // back to Personal's: the switch is the folder's act, and the peer
+        // sync carries it to Personal (`taste_devcontainer::peer`), which
+        // then records the two agreeing on it (`record_switch`). Until
+        // then there is nothing to mirror.
+        if self.switched_here(&local)? {
+            let head = self.head_ref_name().unwrap_or_default();
+            return Ok(Mirror::Paused {
+                reason: format!(
+                    "this folder is on {} and Personal on {branch}; Personal follows the \
+                     folder once it can",
+                    head.trim_start_matches("refs/heads/")
+                ),
+            });
+        }
         // What the folder should still look like: what the mirror last
         // wrote, or — the first time — its own HEAD, which a folder with no
         // uncommitted work matches and one with some does not.
@@ -277,10 +292,10 @@ impl GitWorkspace {
     }
 
     /// Why the mirror should leave the folder alone this pass, if it
-    /// should: git is partway through something here, or the user switched
-    /// the folder to a branch of its own. `local` is the branch the
-    /// checkout is on, which the folder switching to is agreement.
-    fn mirror_paused(&self, local: &str) -> Result<Option<String>> {
+    /// should: git is partway through something here, or HEAD is detached.
+    /// A switch to a branch of the folder's own is not a pause any more:
+    /// the folder goes back to Personal's branch (`switched_here`).
+    fn mirror_paused(&self) -> Result<Option<String>> {
         if self.repo.path().join("index.lock").exists() {
             return Ok(Some("git is working in this folder".into()));
         }
@@ -302,12 +317,24 @@ impl GitWorkspace {
                  it is finished or aborted"
             )));
         }
-        let Some(head) = self.head_ref_name() else {
+        if self.head_ref_name().is_none() {
             return Ok(Some(
                 "this folder's HEAD is detached; switch it back to a branch and it follows \
                  Personal again"
                     .into(),
             ));
+        }
+        Ok(None)
+    }
+
+    /// Whether this folder was switched, here, to a branch of its own: on
+    /// neither Personal's branch (`local`) nor the one the mirror last left
+    /// it on. A folder still on the recorded branch while Personal moved is
+    /// Personal's switch, which the folder follows with its edits sent
+    /// first, as ever.
+    fn switched_here(&self, local: &str) -> Result<bool> {
+        let Some(head) = self.head_ref_name() else {
+            return Ok(false);
         };
         let recorded = self
             .read_ref(MIRROR_REF)?
@@ -322,18 +349,51 @@ impl GitWorkspace {
                         .to_string(),
                 )
             });
-        if let Some(recorded) = recorded {
-            if head != recorded && head != local {
-                let short = |r: &str| r.trim_start_matches("refs/heads/").to_string();
-                return Ok(Some(format!(
-                    "this folder was switched to {} while Personal is on {}; switch either to \
-                     the other's branch and the folder follows Personal again",
-                    short(&head),
-                    short(local)
-                )));
-            }
+        Ok(recorded.is_some_and(|recorded| head != recorded && head != local))
+    }
+
+    /// Record that Personal followed this folder onto `branch`: the two
+    /// agree on that branch at its tip, and on its committed files — not
+    /// on whatever the folder has uncommitted, which is the folder's own
+    /// and goes to Personal on the next pass, as any edit does.
+    pub fn record_switch(&self, branch: &str) -> Result<()> {
+        let local = format!("refs/heads/{branch}");
+        let Some(tip) = self.read_ref(&local)? else {
+            bail!("this folder has no branch {branch}");
+        };
+        let tree = self.repo.find_commit(tip)?.tree_id();
+        self.record_mirror(tree, &local)
+    }
+
+    /// The branch the mirror last recorded the two agreeing on.
+    pub fn mirror_recorded_branch(&self) -> Result<Option<String>> {
+        let Some(oid) = self.read_ref(MIRROR_REF)? else {
+            return Ok(None);
+        };
+        let last = self.repo.find_commit(oid)?;
+        Ok(last
+            .message()
+            .and_then(|m| m.strip_prefix(RECORDED_ON))
+            .and_then(|m| m.lines().next())
+            .and_then(|r| r.strip_prefix("refs/heads/"))
+            .map(str::to_string))
+    }
+
+    /// The tip the mirror last recorded `branch` at, when its baseline is
+    /// of that branch and says: the point both sides last agreed on.
+    pub fn mirror_recorded_tip(&self, branch: &str) -> Result<Option<Oid>> {
+        let Some(oid) = self.read_ref(MIRROR_REF)? else {
+            return Ok(None);
+        };
+        let last = self.repo.find_commit(oid)?;
+        let message = last.message().unwrap_or_default();
+        if message.lines().next() != Some(format!("{RECORDED_ON}refs/heads/{branch}").as_str()) {
+            return Ok(None);
         }
-        Ok(None)
+        Ok(message
+            .lines()
+            .find_map(|line| line.strip_prefix(RECORDED_TIP))
+            .and_then(|tip| Oid::from_str(tip.trim()).ok()))
     }
 
     /// Note that `changes` were written into the checkout: until the mirror
@@ -569,7 +629,7 @@ impl GitWorkspace {
     /// Record `tree` as the folder the mirror and the checkout agree on,
     /// with the branch the folder is on (`local`), which is how a switch
     /// the user makes here is told from one the checkout made
-    /// ([`Self::mirror_paused`]). What was sent before is agreement now.
+    /// ([`Self::switched_here`]). What was sent before is agreement now.
     fn record_mirror(&self, tree: Oid, local: &str) -> Result<()> {
         if self.read_ref(SENT_REF)?.is_some() {
             if let Ok(mut sent) = self.repo.find_reference(SENT_REF) {

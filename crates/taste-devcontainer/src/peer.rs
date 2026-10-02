@@ -583,7 +583,38 @@ pub fn sync_primary_peer_with(
                 Some(mine) if mine == oid => {}
                 Some(_) => {
                     let (ahead, behind) = git.ahead_behind(&local, &name)?;
-                    if (ahead == 0 && behind > 0) || branch.starts_with("agents/") {
+                    // Personal's own branch, moved here while the folder
+                    // was on another — committed to, or rebased by a tool
+                    // that restacks several branches — goes to Personal:
+                    // forward always, a rewrite only while Personal's copy
+                    // is where the two last agreed.
+                    let personal = checkout_branch.as_deref() == Some(branch);
+                    let agreed = git.mirror_recorded_tip(branch)?;
+                    let rewrite = personal && ahead > 0 && behind > 0 && agreed == Some(oid);
+                    if personal && ahead > 0 && (behind == 0 || rewrite) {
+                        commits_unsettled = true;
+                        let expected = rewrite.then(|| oid.to_string());
+                        match push_ahead_into_checkout(
+                            peer,
+                            vm,
+                            keys,
+                            files,
+                            path,
+                            branch,
+                            Arrival {
+                                folder_tree: None,
+                                rewrite_from: expected.as_deref(),
+                            },
+                        ) {
+                            Ok(_) => sync.pushed = true,
+                            Err(e) => {
+                                sync.note = Some(format!(
+                                    "this folder's {branch} would not go to the checkout in the \
+                                     VM: {e:#}"
+                                ))
+                            }
+                        }
+                    } else if (ahead == 0 && behind > 0) || branch.starts_with("agents/") {
                         git.set_ref(&local, oid)?;
                     } else if ahead > 0 {
                         sync.note = Some(format!(
@@ -626,7 +657,10 @@ pub fn sync_primary_peer_with(
                     files,
                     path,
                     branch,
-                    folder_tree.as_deref(),
+                    Arrival {
+                        folder_tree: folder_tree.as_deref(),
+                        rewrite_from: None,
+                    },
                 ) {
                     Ok(None) => sync.pushed = true,
                     // Taken, but its uncommitted work did not come along:
@@ -654,6 +688,43 @@ pub fn sync_primary_peer_with(
             // sat as "diverged: 9 commit(s) here, 8282 there" while the
             // folder had not moved). The old tip stays in the reflog.
             _ if checkout_branch.is_some() && git.unmoved_since_mirror(branch)? => {}
+            // Diverged the other way: the folder rewrote the branch and the
+            // checkout has not moved since the two last agreed, so the
+            // rewrite goes there — the same rule, from this side.
+            (ahead, _)
+                if checkout_branch.as_deref() == Some(branch)
+                    && git.mirror_recorded_tip(branch)? == Some(oid) =>
+            {
+                commits_unsettled = true;
+                let folder_tree = working_tree_id(peer);
+                match push_ahead_into_checkout(
+                    peer,
+                    vm,
+                    keys,
+                    files,
+                    path,
+                    branch,
+                    Arrival {
+                        folder_tree: folder_tree.as_deref(),
+                        rewrite_from: Some(&oid.to_string()),
+                    },
+                ) {
+                    Ok(None) => sync.pushed = true,
+                    Ok(Some(kept)) => {
+                        sync.pushed = true;
+                        sync.note = Some(format!(
+                            "the checkout in the VM took this folder's rewritten {branch}; {kept}"
+                        ));
+                    }
+                    Err(e) => {
+                        sync.host_ahead = ahead;
+                        sync.note = Some(format!(
+                            "this folder rewrote {branch}, and the checkout in the VM would not \
+                             take it: {e:#}"
+                        ));
+                    }
+                }
+            }
             (ahead, behind) => {
                 commits_unsettled = true;
                 sync.host_ahead = ahead;
@@ -665,6 +736,46 @@ pub fn sync_primary_peer_with(
             }
         }
     }
+    // The branch each side is on, by the same rule as everything else:
+    // compared with the branch the two last agreed on, the side that moved
+    // is followed by the other. Personal switching is followed by the
+    // mirror below; the folder switching — `git switch`, or a tool that
+    // rebases a stack and leaves HEAD on its top — is followed here, by
+    // Personal (David, 2026-10-02: "If I do something on one side, do it
+    // on the other. The only exception is a conflict"). Both having moved
+    // is that conflict, and is said rather than settled.
+    let checkout_branch = match (
+        sync.branch.clone(),
+        checkout_branch,
+        git.mirror_recorded_branch()?,
+    ) {
+        (Some(here), Some(there), Some(agreed)) if here != there && here != agreed => {
+            if there == agreed {
+                match switch_checkout(peer, vm, keys, files, path, &here, &there) {
+                    Ok(()) => {
+                        git.record_switch(&here)?;
+                        commits_unsettled = true;
+                        sync.pushed = true;
+                        Some(here)
+                    }
+                    Err(e) => {
+                        sync.note = Some(format!(
+                            "this folder switched to {here}, and Personal could not follow \
+                             from {there}: {e:#}"
+                        ));
+                        Some(there)
+                    }
+                }
+            } else {
+                sync.note = Some(format!(
+                    "this folder switched to {here} and Personal to {there} since they last \
+                     agreed on {agreed}; switch either to the other's branch"
+                ));
+                Some(there)
+            }
+        }
+        (_, there, _) => there,
+    };
     adopt_tags(&git)?;
     adopt_snapshot(&git)?;
     if let (Some(branch), false) = (checkout_branch, commits_unsettled) {
@@ -854,14 +965,17 @@ pub fn send_change(files: &Files, path: &Path, change: &taste_git::mirror::Chang
 }
 
 /// The checkout's side of [`push_ahead_into_checkout`], run in the
-/// checkout with `$1` the staging ref, `$2` the branch, and `$3` the
-/// folder's working-tree id (empty when it could not be read). Exits 0
-/// fast-forwarded, 4 fast-forwarded with the checkout's own changes kept in
-/// a stash, anything else refused with the reason on stderr.
+/// checkout with `$1` the staging ref, `$2` the branch, `$3` the folder's
+/// working-tree id (empty when it could not be read), and `$4` — for a
+/// branch the folder REWROTE, a rebase or an amend — the tip both sides
+/// last agreed on, which the checkout's branch must still be at. Exits 0
+/// moved, 4 moved with the checkout's own changes kept in a stash,
+/// anything else refused with the reason on stderr.
 const SYNC_SCRIPT: &str = r#"set -e
 staging="$1"
 branch="$2"
 folder_tree="$3"
+expected="$4"
 cleanup() { git update-ref -d "$staging" 2>/dev/null || true; }
 # Every taste-ide-sync stash whose every file, as stashed, is the file as
 # some commit since the stash's base has it: work that reached history, so
@@ -894,11 +1008,19 @@ superseded() {
     [ "$found" = 1 ] || exit 1
   done
 }
-if ! git merge-base --is-ancestor "refs/heads/$branch" "$staging"; then
+if [ -n "$expected" ]; then
+  # A rewrite is taken only from where the two last agreed: a checkout that
+  # has moved since holds work of its own, and this would drop it.
+  if [ "$(git rev-parse -q --verify "refs/heads/$branch")" != "$expected" ]; then
+    cleanup; echo "the checkout's $branch has moved since it last agreed with the folder" >&2; exit 2
+  fi
+elif ! git merge-base --is-ancestor "refs/heads/$branch" "$staging"; then
   cleanup; echo "the checkout's $branch is not behind the folder's" >&2; exit 2
 fi
 if [ "$(git symbolic-ref --short -q HEAD)" != "$branch" ]; then
-  git update-ref "refs/heads/$branch" "$staging"; cleanup; exit 0
+  if [ -n "$expected" ]; then git update-ref "refs/heads/$branch" "$staging" "$expected"
+  else git update-ref "refs/heads/$branch" "$staging"; fi
+  cleanup; exit 0
 fi
 if git ls-files -u | grep -q .; then
   if git stash list | grep -q taste-ide-sync && ! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
@@ -919,7 +1041,7 @@ if [ -n "$folder_tree" ]; then
   GIT_INDEX_FILE="$index" git add -A
   mine=$(GIT_INDEX_FILE="$index" git write-tree)
   rm -f "$index"
-  if [ "$mine" = "$folder_tree" ] && git merge-base --is-ancestor HEAD "$staging"; then
+  if [ "$mine" = "$folder_tree" ] && { [ -n "$expected" ] || git merge-base --is-ancestor HEAD "$staging"; }; then
     git reset -q "$staging"
     cleanup
     prune_superseded
@@ -930,7 +1052,11 @@ stashed=0
 if [ -n "$(git status --porcelain)" ]; then
   git stash push --include-untracked -q -m taste-ide-sync && stashed=1
 fi
-if ! git merge --ff-only -q "$staging"; then
+if [ -n "$expected" ]; then
+  # The tree is clean here (its changes are in the stash), so this moves
+  # the branch and its files and loses nothing.
+  git reset -q --hard "$staging"
+elif ! git merge --ff-only -q "$staging"; then
   [ "$stashed" = 1 ] && git stash pop -q || true
   cleanup; echo "the checkout would not fast-forward to the folder's $branch" >&2; exit 3
 fi
@@ -947,6 +1073,82 @@ if [ "$stashed" = 1 ] && ! git stash pop -q 2>/dev/null; then
 fi
 prune_superseded
 "#;
+
+/// The checkout's side of [`switch_checkout`], run in the checkout with
+/// `$1` the staging ref holding the folder's branch, `$2` that branch, and
+/// `$3` the branch the two last agreed on, which the checkout must still be
+/// on. Personal's own uncommitted changes, or its own commits on the branch
+/// it is switching to, are work this would drop: refused, with the reason.
+const SWITCH_SCRIPT: &str = r#"set -e
+staging="$1"
+branch="$2"
+from="$3"
+cleanup() { git update-ref -d "$staging" 2>/dev/null || true; }
+if [ "$(git symbolic-ref --short -q HEAD)" != "$from" ]; then
+  cleanup; echo "Personal has moved off $from since it last agreed with the folder" >&2; exit 2
+fi
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  cleanup; echo "Personal has uncommitted changes on $from" >&2; exit 3
+fi
+if git rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+  if ! git merge-base --is-ancestor "refs/heads/$branch" "$staging"; then
+    cleanup; echo "Personal's $branch has commits the folder's does not" >&2; exit 4
+  fi
+fi
+git update-ref "refs/heads/$branch" "$staging"
+if ! git switch -q "$branch" 2>&1; then
+  cleanup; exit 5
+fi
+cleanup
+"#;
+
+/// Switch Personal's checkout to `branch`, the folder's, from `from`, the
+/// branch the two last agreed on: the folder's branch first, as it stands,
+/// then the switch, both refused rather than forced over work Personal has
+/// of its own ([`SWITCH_SCRIPT`]).
+fn switch_checkout(
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+    branch: &str,
+    from: &str,
+) -> Result<()> {
+    let staging = format!("{PEER_STAGING}/{branch}");
+    push_to_guest(
+        peer,
+        vm,
+        keys,
+        path,
+        &[&format!("+refs/heads/{branch}:{staging}")],
+    )?;
+    let out = files
+        .exec(
+            path,
+            &[
+                "sh".into(),
+                "-c".into(),
+                SWITCH_SCRIPT.to_string(),
+                "taste-switch".into(),
+                staging,
+                branch.to_string(),
+                from.to_string(),
+            ],
+        )
+        .with_context(|| format!("switching Personal to {branch} in VM {}", vm.domain))?;
+    if !out.success() {
+        let stderr = out.stderr_utf8();
+        let stdout = out.stdout_utf8();
+        let reason = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
+        bail!("{}", reason.trim());
+    }
+    Ok(())
+}
 
 /// The tree the folder's working files come to — tracked and untracked,
 /// less what is ignored — as git names it, built in a throwaway index so
@@ -1019,6 +1221,15 @@ fn working_tree_id(peer: &Path) -> Option<String> {
 /// paths with no such stash, or a merge in progress — is refused by name,
 /// with what to do. A branch that is not a fast-forward is left alone, an
 /// error.
+/// What a branch arriving in the checkout brings with it: the folder's
+/// working-tree id, for the move that keeps the checkout's files, and —
+/// for a branch the folder rewrote — the tip the two last agreed on.
+#[derive(Clone, Copy, Default)]
+struct Arrival<'a> {
+    folder_tree: Option<&'a str>,
+    rewrite_from: Option<&'a str>,
+}
+
 fn push_ahead_into_checkout(
     peer: &Path,
     vm: &Vm,
@@ -1026,8 +1237,12 @@ fn push_ahead_into_checkout(
     files: &Files,
     path: &Path,
     branch: &str,
-    folder_tree: Option<&str>,
+    arrival: Arrival,
 ) -> Result<Option<String>> {
+    let Arrival {
+        folder_tree,
+        rewrite_from,
+    } = arrival;
     let staging = format!("{PEER_STAGING}/{branch}");
     push_to_guest(
         peer,
@@ -1050,6 +1265,7 @@ fn push_ahead_into_checkout(
                 staging.clone(),
                 branch.to_string(),
                 folder_tree.unwrap_or_default().to_string(),
+                rewrite_from.unwrap_or_default().to_string(),
             ],
         )
         .with_context(|| format!("fast-forwarding {branch} in VM {}", vm.domain))?;
@@ -1115,6 +1331,11 @@ mod tests {
         /// The folder's tip fetched into the checkout's staging ref, and the
         /// script run there; its exit status.
         fn sync(&self) -> i32 {
+            self.sync_rewrite("")
+        }
+
+        /// [`Self::sync`] for a branch the folder rewrote, from `agreed`.
+        fn sync_rewrite(&self, agreed: &str) -> i32 {
             let folder = self.dir.join("folder").display().to_string();
             self.git(
                 "checkout",
@@ -1130,6 +1351,7 @@ mod tests {
                     "refs/taste/staging/main",
                     "main",
                     &tree,
+                    agreed,
                 ])
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
@@ -1175,6 +1397,93 @@ mod tests {
         );
         // What shows as uncommitted is the folder's own uncommitted change.
         assert_eq!(pair.git("checkout", &["status", "--porcelain"]), "M a.txt");
+    }
+
+    /// A rebase or an amend in the folder reaches the checkout while the
+    /// checkout is where the two last agreed — and not once it has moved,
+    /// which is a conflict the script refuses rather than settles.
+    #[test]
+    fn a_rewrite_in_the_folder_reaches_a_checkout_that_has_not_moved() {
+        let pair = Pair::new("rewrite");
+        let agreed = pair.git("checkout", &["rev-parse", "HEAD"]);
+        pair.git(
+            "folder",
+            &["commit", "-q", "--amend", "-m", "first, reworded"],
+        );
+        assert_eq!(pair.sync(), 2, "a rewrite is not a fast-forward");
+        assert_eq!(pair.sync_rewrite(&agreed), 0);
+        assert_eq!(
+            pair.git("checkout", &["rev-parse", "HEAD"]),
+            pair.git("folder", &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            pair.git("checkout", &["log", "-1", "--format=%s"]),
+            "first, reworded"
+        );
+
+        // The checkout commits on its own, and a second rewrite from the
+        // old agreement is refused: both sides moved.
+        let agreed = pair.git("checkout", &["rev-parse", "HEAD"]);
+        pair.write("checkout", "b.txt", "mine\n");
+        pair.git("checkout", &["add", "-A"]);
+        pair.commit("checkout", "the checkout's own");
+        pair.git("folder", &["commit", "-q", "--amend", "-m", "first, again"]);
+        assert_eq!(pair.sync_rewrite(&agreed), 2);
+        assert_eq!(
+            pair.git("checkout", &["log", "-1", "--format=%s"]),
+            "the checkout's own"
+        );
+    }
+
+    /// A branch the folder switched to is the branch Personal switches to,
+    /// with the folder's commits on it; Personal's own uncommitted work
+    /// refuses the switch.
+    #[test]
+    fn a_switch_in_the_folder_switches_the_checkout() {
+        let pair = Pair::new("switch");
+        pair.git("folder", &["switch", "-q", "-c", "topic"]);
+        pair.write("folder", "t.txt", "topic\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "on topic");
+        let folder = pair.dir.join("folder").display().to_string();
+        let switch = |from: &str| {
+            pair.git(
+                "checkout",
+                &["fetch", "-q", &folder, "+topic:refs/taste/staging/topic"],
+            );
+            std::process::Command::new("sh")
+                .current_dir(pair.dir.join("checkout"))
+                .args([
+                    "-c",
+                    SWITCH_SCRIPT,
+                    "taste-switch",
+                    "refs/taste/staging/topic",
+                    "topic",
+                    from,
+                ])
+                .output()
+                .unwrap()
+                .status
+                .code()
+                .unwrap_or(-1)
+        };
+        pair.write("checkout", "a.txt", "personal's edit\n");
+        assert_eq!(switch("main"), 3, "Personal's uncommitted work holds it");
+        pair.git("checkout", &["checkout", "-q", "--", "a.txt"]);
+        assert_eq!(
+            switch("elsewhere"),
+            2,
+            "Personal moved off the agreed branch"
+        );
+        assert_eq!(switch("main"), 0);
+        assert_eq!(
+            pair.git("checkout", &["symbolic-ref", "--short", "HEAD"]),
+            "topic"
+        );
+        assert_eq!(
+            pair.git("checkout", &["rev-parse", "HEAD"]),
+            pair.git("folder", &["rev-parse", "HEAD"])
+        );
     }
 
     #[test]
