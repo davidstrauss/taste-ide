@@ -175,11 +175,21 @@ impl Worktree {
     /// Run `git <args>` in the working tree, wherever it is. On this host
     /// through `std::process`; in the VM through the files service. The
     /// IDE's own git, so nothing that could ask a question.
+    ///
+    /// Always `--no-optional-locks`, which git documents for exactly this:
+    /// a process in the background that must not contend with the
+    /// repository's own users. Without it the file tree's `git status`,
+    /// run on every change, refreshed the index as a side effect and took
+    /// `index.lock` to do it, and the agent working in the same checkout
+    /// met "index.lock: File exists" in the middle of a rebase
+    /// (2026-10-02). What genuinely writes the index — a stage, a commit —
+    /// still locks it.
     pub fn run_git(&self, args: &[&str], envs: &[(String, String)]) -> Result<ExecOutput> {
         match self {
             Worktree::Local(path) => {
                 let output = std::process::Command::new("git")
                     .args(taste_git::private::cli_prefix(path))
+                    .arg("--no-optional-locks")
                     .args(args)
                     .envs(taste_git::non_interactive_env())
                     .envs(envs.iter().cloned())
@@ -206,6 +216,7 @@ impl Worktree {
                     argv.extend(envs.iter().map(|(key, value)| format!("{key}={value}")));
                 }
                 argv.push("git".into());
+                argv.push("--no-optional-locks".into());
                 argv.extend(args.iter().map(|s| s.to_string()));
                 let out = files
                     .exec(path, &argv)

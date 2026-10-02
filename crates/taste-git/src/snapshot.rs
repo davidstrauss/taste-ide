@@ -265,7 +265,11 @@ impl GitWorkspace {
 /// honours `.gitignore` for free and is exactly what `git status` would
 /// show), `write-tree`, `commit-tree` parented on the previous snapshot or
 /// on HEAD, `update-ref`. Neither HEAD nor the real index is touched; the
-/// scratch index is the script's own and is removed. An unchanged working
+/// scratch index is the script's own — named for its process, so two
+/// snapshots at once do not meet on one index lock, as six did after a
+/// burst of ref moves (2026-10-02) — and is removed however the script
+/// ends. Nothing in it takes an optional lock on the repository the agent
+/// is working in (`GIT_OPTIONAL_LOCKS=0`). An unchanged working
 /// copy writes nothing and says so. The last line is what
 /// [`parse_script_output`] reads: the commit, and `wrote` or `unchanged`.
 ///
@@ -284,9 +288,11 @@ pub fn script(name: &str) -> Result<String> {
         r#"set -eu
 export GIT_AUTHOR_NAME=taste-ide GIT_AUTHOR_EMAIL=taste-ide@localhost
 export GIT_COMMITTER_NAME=taste-ide GIT_COMMITTER_EMAIL=taste-ide@localhost
+export GIT_OPTIONAL_LOCKS=0
 name='{name}'
 gitdir=$(git rev-parse --git-dir)
-export GIT_INDEX_FILE="$gitdir/taste-snapshot-index"
+export GIT_INDEX_FILE="$gitdir/taste-snapshot-index.$$"
+trap 'rm -f "$GIT_INDEX_FILE"' EXIT
 rm -f "$GIT_INDEX_FILE"
 head=$(git rev-parse --verify -q HEAD || true)
 if [ -n "$head" ]; then git read-tree "$head"; fi
