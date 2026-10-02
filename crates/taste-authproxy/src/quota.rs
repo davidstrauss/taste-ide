@@ -255,6 +255,9 @@ enum Field {
 enum Represented {
     Session,
     Weekly,
+    /// A claim naming some other window — an overage, a model's own — which
+    /// is neither of these two and is not filed as one.
+    Neither,
 }
 
 /// What `anthropic-ratelimit-unified-representative-claim` says.
@@ -274,17 +277,22 @@ fn represented_window(headers: &HeaderMap) -> Represented {
         .and_then(|(_, value)| value.to_str().ok())
         .map(|value| value.trim().to_ascii_lowercase());
     match claim.as_deref() {
+        None => Represented::Session,
+        Some(claim) if is_session_word(claim) => Represented::Session,
         Some(claim) if is_weekly_word(claim) => Represented::Weekly,
-        _ => Represented::Session,
+        Some(_) => Represented::Neither,
     }
 }
 
-/// Whether a word names the weekly window rather than the session one.
+/// Whether a word names the five-hour window, and nothing more specific.
+fn is_session_word(word: &str) -> bool {
+    matches!(word, "5h" | "session" | "five_hour" | "five-hour")
+}
+
+/// Whether a word names the weekly window, and nothing more specific: a
+/// `seven_day_opus` is one model's window inside it, not the window.
 fn is_weekly_word(word: &str) -> bool {
-    word.contains("7d")
-        || word.contains("week")
-        || word.contains("seven_day")
-        || word.contains("seven-day")
+    matches!(word, "7d" | "week" | "weekly" | "seven_day" | "seven-day")
 }
 
 /// A header naming a subscription window rather than a per-minute limit.
@@ -309,14 +317,27 @@ fn plan_field(
     {
         return false;
     }
-    let named_weekly = parts.iter().any(|part| {
-        is_weekly_word(part)
-            || part.ends_with('d') && part.trim_end_matches('d').parse::<u32>().is_ok()
-    });
-    let named_session = parts
+    // What the family says beyond being the plan's: nothing (the unnamed
+    // family, which `representative-claim` speaks for), a window's name,
+    // or something else. Something else — `unified-overage-*`, a model's
+    // own window — is neither of these two, and filed as one it put its
+    // reset over the session's: "resets in 29 d 10 h" on a five-hour
+    // window (2026-10-02). It is kept verbatim instead.
+    let qualifiers: Vec<&str> = parts
         .iter()
-        .any(|part| matches!(*part, "5h" | "session" | "five_hour" | "five-hour"));
-    let weekly = named_weekly || (!named_session && unnamed == Represented::Weekly);
+        .copied()
+        .filter(|part| !matches!(*part, "unified" | "plan" | "subscription"))
+        .collect();
+    let weekly = match qualifiers.as_slice() {
+        [] => match unnamed {
+            Represented::Session => false,
+            Represented::Weekly => true,
+            Represented::Neither => return false,
+        },
+        [word] if is_session_word(word) => false,
+        [word] if is_weekly_word(word) => true,
+        _ => return false,
+    };
     let plan = if weekly {
         &mut snapshot.weekly
     } else {
@@ -335,8 +356,20 @@ fn plan_field(
             plan.window.remaining.is_some()
         }
         Field::Reset => {
-            plan.window.reset = parse_instant(value, now);
-            plan.window.reset.is_some()
+            // A window cannot reset further away than it is long: a reset
+            // past that is some other window's, whatever its name said,
+            // and is kept verbatim rather than shown under this one.
+            let span = if weekly {
+                Duration::from_secs(7 * 24 * 3600)
+            } else {
+                Duration::from_secs(5 * 3600)
+            };
+            let reset = parse_instant(value, now)
+                .filter(|reset| *reset <= now + span + Duration::from_secs(600));
+            if reset.is_some() {
+                plan.window.reset = reset;
+            }
+            reset.is_some()
         }
         Field::Status => {
             plan.status = Some(value.to_string());
@@ -584,6 +617,65 @@ mod tests {
         // The weekly window is fuller, so it is what a gauge shows.
         let headline = snapshot.headline(now).unwrap();
         assert_eq!(headline.meter, taste_core::quota::Meter::Weekly);
+    }
+
+    /// A family that names some other window — an overage, a model's own
+    /// week — is not filed as the session or weekly window: one did, and a
+    /// five-hour window read "resets in 29 d 10 h".
+    #[test]
+    fn a_window_that_is_neither_keeps_out_of_both() {
+        let now = epoch(1_788_300_000);
+        let mixed = headers(&[
+            ("anthropic-ratelimit-unified-utilization", "0.15"),
+            ("anthropic-ratelimit-unified-reset", "1788303000"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.10"),
+            ("anthropic-ratelimit-unified-7d-reset", "1788530000"),
+            ("anthropic-ratelimit-unified-overage-utilization", "0.40"),
+            ("anthropic-ratelimit-unified-overage-reset", "1790840000"),
+            (
+                "anthropic-ratelimit-unified-seven_day_opus-utilization",
+                "0.90",
+            ),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
+        ]);
+        let snapshot = harvest(StatusCode::OK, &mixed, now, "primary").unwrap();
+        assert_eq!(snapshot.session.used(), Some(0.15));
+        assert_eq!(
+            snapshot.session.resets_in(now),
+            Some(Duration::from_secs(3_000))
+        );
+        assert_eq!(snapshot.weekly.used(), Some(0.10));
+        let kept: Vec<&str> = snapshot
+            .other
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(
+            kept.iter().any(|name| name.contains("overage-reset")),
+            "{kept:?}"
+        );
+        assert!(
+            kept.iter().any(|name| name.contains("seven_day_opus")),
+            "{kept:?}"
+        );
+
+        // A claim naming another window leaves the unnamed family unfiled,
+        // and a reset further off than the window is long is not its own.
+        let other = headers(&[
+            ("anthropic-ratelimit-unified-utilization", "0.40"),
+            ("anthropic-ratelimit-unified-reset", "1790840000"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "overage",
+            ),
+            ("anthropic-ratelimit-unified-5h-reset", "1790840000"),
+        ]);
+        let snapshot = harvest(StatusCode::OK, &other, now, "primary").unwrap();
+        assert_eq!(snapshot.session.used(), None);
+        assert_eq!(snapshot.session.resets_in(now), None);
     }
 
     /// The headers a real subscription sent, verbatim.
