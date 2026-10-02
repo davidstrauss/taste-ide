@@ -150,6 +150,11 @@ fn main() -> glib::ExitCode {
             .with(AppLogLayer)
             .init();
     }
+    // ...and a third, on disk, for the questions asked after the window
+    // has closed. Not from a probe, which leaves no footprint.
+    if std::env::var("TASTE_PROBE_CHECK").is_err() {
+        keep_app_log_on_disk();
+    }
     // GLib's structured log (GTK CSS parse errors, missing icons,
     // unparented-widget warnings) is mirrored the same way, then handed to
     // the default writer so stderr behaves exactly as before.
@@ -1297,6 +1302,76 @@ fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
     taste_acp::authproxy::start(runtime::runtime().handle(), &root);
     let window = window::build_window(app, root);
     window.present();
+}
+
+/// How many runs' app logs are kept: the newest, by the start time in
+/// their names.
+const APP_LOGS_KEPT: usize = 10;
+
+/// This process's app log, at `$XDG_STATE_HOME/taste-ide/logs/
+/// app-<start>-<pid>.log` — one file per run, since every window on every
+/// folder is a process of its own and one shared file would interleave
+/// them. Older runs past [`APP_LOGS_KEPT`] are removed, off this thread.
+fn keep_app_log_on_disk() {
+    let Some(dir) = taste_core::environment::environments_base()
+        .parent()
+        .map(|base| base.join("logs"))
+    else {
+        return;
+    };
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let path = dir.join(format!("app-{started}-{}.log", std::process::id()));
+    let Some(file) = taste_core::logfile::LogFile::open(&path) else {
+        return;
+    };
+    file.line(&format!(
+        "--- taste-ide {} (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    ));
+    taste_core::app_log::keep_on_disk(file);
+    std::thread::spawn(move || {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut runs: Vec<std::path::PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("app-") && name.contains(".log"))
+            })
+            .collect();
+        // Same-width seconds, so the names sort as the starts do; a
+        // rotated `.log.1` sorts beside its own run.
+        runs.sort();
+        let mut starts: Vec<String> = runs
+            .iter()
+            .filter_map(|path| {
+                path.file_name()?
+                    .to_str()?
+                    .split('.')
+                    .next()
+                    .map(String::from)
+            })
+            .collect();
+        starts.dedup();
+        let keep = starts.len().saturating_sub(APP_LOGS_KEPT);
+        let old: std::collections::HashSet<&String> = starts[..keep].iter().collect();
+        for path in &runs {
+            let run = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.split('.').next())
+                .map(String::from);
+            if run.is_some_and(|run| old.contains(&run)) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    });
 }
 
 async fn taste_mcp_bridge(socket: &std::path::Path) -> anyhow::Result<()> {

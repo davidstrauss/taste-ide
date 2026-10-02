@@ -107,6 +107,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             tracing::info!("removed the unused private repository {}", dir.display());
         }
     });
+    // Its environments' logs kept on disk, where the questions asked after
+    // the window has closed can be answered — only by the window that
+    // supervises, and never by a probe, which leaves no footprint.
+    if supervising && !probe_mode {
+        environments.keep_logs_on_disk();
+    }
     let supervisor = environments.primary();
     let primary_env = supervisor.id().clone();
 

@@ -41,9 +41,22 @@ pub fn clock() -> String {
     )
 }
 
+/// The same lines on disk, from `keep_on_disk` on.
+static FILE: OnceLock<std::sync::Arc<crate::logfile::LogFile>> = OnceLock::new();
+
+/// Keep every line pushed from now on in `file` as well — the ring answers
+/// `ide_app_log`; the file answers what happened after the process exited.
+/// Once per process; a second call is ignored.
+pub fn keep_on_disk(file: std::sync::Arc<crate::logfile::LogFile>) {
+    let _ = FILE.set(file);
+}
+
 /// Append one line. Callable from any thread (GLib log writers run on
 /// whichever thread logged).
 pub fn push(level: &str, source: &str, message: &str) {
+    if let Some(file) = FILE.get() {
+        file.line(&format!("{:5} {}: {}", level, source, message.trim_end()));
+    }
     let line = format!("{} {:5} {}: {}", clock(), level, source, message.trim_end());
     let mut buffer = buffer().lock().unwrap();
     if buffer.len() >= CAPACITY {

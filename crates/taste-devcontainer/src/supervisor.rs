@@ -574,6 +574,10 @@ pub struct Supervisor {
     agent_node: Mutex<Option<String>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
+    /// The same lines on disk, once the window that supervises this
+    /// workspace has asked for it (`set_log_file`). The ring answers the
+    /// console; the file answers what happened after the IDE has exited.
+    log_file: Mutex<Option<Arc<taste_core::logfile::LogFile>>>,
     /// What the container itself wrote (`podman logs`), ring-buffered like
     /// the build log, and followed for as long as the container runs.
     container_logs: Arc<Mutex<VecDeque<String>>>,
@@ -880,6 +884,7 @@ impl Supervisor {
             agent_node: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
+            log_file: Mutex::new(None),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
             log_follower: Mutex::new(Vec::new()),
             config_watch: Mutex::new(None),
@@ -2342,6 +2347,19 @@ impl Supervisor {
         }
     }
 
+    /// Keep this environment's log on disk from now on, as well as in its
+    /// ring. Opened with a line saying which process it is, since a file
+    /// outlives the run that wrote it and the next run appends.
+    pub fn set_log_file(&self, file: Arc<taste_core::logfile::LogFile>) {
+        file.line(&format!(
+            "--- taste-ide {} (pid {}) supervising {}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            self.env.id
+        ));
+        *self.log_file.lock().unwrap() = Some(file);
+    }
+
     /// Last `n` lines of build/startup output (for the MCP `devcontainer_logs`
     /// tool and the supervisor console tab's backfill).
     pub fn logs_tail(&self, n: usize) -> Vec<String> {
@@ -2555,6 +2573,9 @@ impl Supervisor {
     /// subscriber showing one environment's build can drop the rest.
     fn log(&self, line: impl Into<String>) {
         let line = line.into();
+        if let Some(file) = self.log_file.lock().unwrap().as_ref() {
+            file.line(&line);
+        }
         let mut logs = self.logs.lock().unwrap();
         if logs.len() >= LOG_RING_CAPACITY {
             logs.pop_front();

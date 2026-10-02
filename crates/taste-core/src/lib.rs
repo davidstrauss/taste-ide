@@ -15,6 +15,7 @@ pub mod exec;
 pub mod files;
 pub mod ide_state;
 pub mod instance;
+pub mod logfile;
 pub mod mcp;
 pub mod orchestration;
 pub mod podman;

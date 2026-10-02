@@ -318,6 +318,11 @@ pub struct EnvironmentRegistry {
     /// Test seam, mirrored from [`Supervisor`]: the suite runs inside a
     /// container and must not get self-hosting semantics.
     outside_container_for_tests: bool,
+    /// Environments' logs are kept on disk (`keep_logs_on_disk`): set by
+    /// the window that supervises this workspace, and by no other — a
+    /// second window or a probe writing the same file would interleave
+    /// its lines with the real one's.
+    logs_on_disk: AtomicBool,
     /// Which podman service this workspace's containers live on.
     ///
     /// Held by the registry rather than by each supervisor because it is a
@@ -465,6 +470,7 @@ impl EnvironmentRegistry {
             events: events.clone(),
             environments_base,
             outside_container_for_tests,
+            logs_on_disk: AtomicBool::new(false),
             substrate: Mutex::new(substrate),
             environments: Mutex::new(BTreeMap::new()),
             channel_services: Mutex::new(None),
@@ -534,7 +540,36 @@ impl EnvironmentRegistry {
         if let Some(services) = self.channel_services.lock().unwrap().clone() {
             supervisor.set_channel_services(services);
         }
+        if self.logs_on_disk.load(Ordering::SeqCst) {
+            self.open_log_file(&supervisor);
+        }
         supervisor
+    }
+
+    /// Keep every environment's log on disk — present and future — at
+    /// `<env_dir>/supervisor.log`, beside its clone rather than in it.
+    ///
+    /// Called once, by the window that supervises this workspace.
+    pub fn keep_logs_on_disk(&self) {
+        self.logs_on_disk.store(true, Ordering::SeqCst);
+        let supervisors: Vec<Arc<Supervisor>> = self
+            .environments
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for supervisor in supervisors {
+            self.open_log_file(&supervisor);
+        }
+    }
+
+    fn open_log_file(&self, supervisor: &Supervisor) {
+        let path = self.env_dir(supervisor.id()).join("supervisor.log");
+        match taste_core::logfile::LogFile::open(&path) {
+            Some(file) => supervisor.set_log_file(file),
+            None => tracing::warn!("cannot keep a log at {}", path.display()),
+        }
     }
 
     /// Tell every environment — present and future — what the IDE serves
