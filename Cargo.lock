@@ -2892,6 +2892,7 @@ name = "taste-embed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "llama-cpp-2",
  "serde",
  "serde_json",

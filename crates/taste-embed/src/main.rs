@@ -58,13 +58,10 @@ impl Embedder {
         let backend = LlamaBackend::init().context("initialising llama.cpp")?;
         let model = LlamaModel::load_from_file(&backend, path, &LlamaModelParams::default())
             .with_context(|| format!("loading {}", path.display()))?;
-        // Half the machine: this is background work beside an IDE that
-        // must stay snappy, and embedding gains little past a few threads.
-        let threads = (std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            / 2)
-        .clamp(1, 16) as i32;
+        // Half the machine's compute: this is background work beside an
+        // IDE that must stay snappy, and embedding gains little past a few
+        // threads (`compute_threads`).
+        let threads = compute_threads();
         Ok(Self {
             backend,
             model,
@@ -129,6 +126,70 @@ impl Embedder {
     }
 }
 
+/// Half the machine's PHYSICAL cores. Half its logical CPUs was the rule,
+/// and on a machine whose cores each run two hardware threads it is the
+/// whole of it: llama.cpp's vector arithmetic on two threads of one core
+/// shares that core's units, so eight threads on sixteen logical CPUs read
+/// as 44% in a process monitor and kept every core busy (David,
+/// 2026-10-02: "Cap it at 50%"). Cores are counted from the kernel's
+/// topology — one per distinct set of sibling threads — and fall back to
+/// the logical count where it is not exposed.
+fn compute_threads() -> i32 {
+    (physical_cores() / 2).clamp(1, 16) as i32
+}
+
+fn physical_cores() -> usize {
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let mut cores = std::collections::BTreeSet::new();
+    for cpu in 0..logical {
+        let siblings = format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list");
+        match std::fs::read_to_string(&siblings) {
+            Ok(list) => {
+                cores.insert(list.trim().to_string());
+            }
+            Err(_) => return logical,
+        }
+    }
+    cores.len().max(1)
+}
+
+/// The share of the machine indexing may average: half of every logical
+/// CPU's time. The thread count keeps the arithmetic under it on its own;
+/// this is the ceiling that holds whatever the hardware or the backend
+/// does with threads — tokenising, a backend that spins — measured rather
+/// than assumed.
+const CPU_SHARE: f64 = 0.5;
+
+/// This process's CPU time so far, every thread of it.
+fn cpu_time() -> std::time::Duration {
+    // SAFETY: getrusage writes the struct it is handed and reads nothing.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return std::time::Duration::ZERO;
+    }
+    let seconds = |t: libc::timeval| {
+        std::time::Duration::from_secs(t.tv_sec as u64)
+            + std::time::Duration::from_micros(t.tv_usec as u64)
+    };
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
+/// How long to rest after a stretch of work so it averages `share` of the
+/// machine: `cpu` spent over `wall` on `cpus` logical CPUs. Nothing when
+/// it is already under.
+fn rest_for(
+    cpu: std::time::Duration,
+    wall: std::time::Duration,
+    cpus: usize,
+    share: f64,
+) -> std::time::Duration {
+    let allowed = share * cpus as f64;
+    let needed = cpu.as_secs_f64() / allowed;
+    std::time::Duration::from_secs_f64((needed - wall.as_secs_f64()).max(0.0))
+}
+
 fn normalize(v: &[f32]) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -142,7 +203,17 @@ fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
         .context("usage: taste-embed <model.gguf>")?;
+    // Background work yields to the IDE and the VM when they want the
+    // machine: a niceness of ten, for this process and the threads it
+    // starts after.
+    // SAFETY: setpriority on our own process changes nothing it reads.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
     let embedder = Embedder::load(Path::new(&path))?;
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     writeln!(
@@ -151,13 +222,28 @@ fn main() -> Result<()> {
         serde_json::json!({ "ready": true, "dim": embedder.model.n_embd() })
     )?;
     out.flush()?;
+    let mut rest_until: Option<std::time::Instant> = None;
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
+        let mut indexing = false;
+        let mut began = (std::time::Instant::now(), cpu_time());
         let reply = match serde_json::from_str::<Request>(&line) {
             Ok(request) => {
+                indexing = request.kind != "query";
+                // The rest the last indexing stretch earned is taken before
+                // the next one, not after it: a query that arrives in the
+                // meantime is answered at once.
+                if indexing {
+                    if let Some(rest) = rest_until.take() {
+                        std::thread::sleep(
+                            rest.saturating_duration_since(std::time::Instant::now()),
+                        );
+                    }
+                    began = (std::time::Instant::now(), cpu_time());
+                }
                 let prefix = match request.kind.as_str() {
                     "query" => QUERY_PREFIX,
                     _ => DOCUMENT_PREFIX,
@@ -176,6 +262,52 @@ fn main() -> Result<()> {
         };
         writeln!(out, "{reply}")?;
         out.flush()?;
+        // Indexing rests until it averages its share; a query, which
+        // someone is waiting on, does not.
+        if indexing {
+            rest_until = Some(
+                std::time::Instant::now()
+                    + rest_for(
+                        cpu_time().saturating_sub(began.1),
+                        began.0.elapsed(),
+                        cpus,
+                        CPU_SHARE,
+                    ),
+            );
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn indexing_rests_until_it_averages_half_the_machine() {
+        // Eight CPUs' worth for a second, on sixteen: exactly half, no rest.
+        assert_eq!(
+            rest_for(Duration::from_secs(8), Duration::from_secs(1), 16, 0.5),
+            Duration::ZERO
+        );
+        // Twelve CPU-seconds in one second on sixteen: half allows eight a
+        // second, so the stretch must last 1.5 s — half a second of rest.
+        assert_eq!(
+            rest_for(Duration::from_secs(12), Duration::from_secs(1), 16, 0.5),
+            Duration::from_millis(500)
+        );
+        // Under the share: nothing.
+        assert_eq!(
+            rest_for(Duration::from_secs(1), Duration::from_secs(1), 16, 0.5),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn threads_are_half_the_physical_cores() {
+        let threads = compute_threads();
+        assert!(threads >= 1);
+        assert!(threads as usize <= physical_cores().max(2));
+    }
 }
