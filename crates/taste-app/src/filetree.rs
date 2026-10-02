@@ -1662,13 +1662,19 @@ impl FileTree {
         pull_button.connect_clicked(move |button| {
             if let Some(tree) = weak_pull.upgrade() {
                 tree.begin_sync_op(button);
-                tree.sync();
+                tree.sync(true);
             }
         });
+        // Fetch, as its tooltip says, and nothing else: it ran the whole
+        // Pull, which was a no-op only while the rebase target was the
+        // branch's own tip, and became an 8274-commit rebase the moment it
+        // was a fork's base instead (David, 2026-10-02: "I should not be
+        // getting questions about the rebase from running 'fetch the
+        // remote'").
         sync_button.connect_clicked(move |button| {
             if let Some(tree) = weak.upgrade() {
                 tree.begin_sync_op(button);
-                tree.sync();
+                tree.sync(false);
             }
         });
         let weak = Rc::downgrade(&tree);
@@ -6281,11 +6287,13 @@ impl FileTree {
         entry.connect_activate(move |entry| save(entry));
     }
 
-    /// Fetch, then rebase onto the remote tip — the full sync, conflicts
-    /// and all (a paused rebase gets the Conflicts view and the
-    /// Continue/Abort pair). Push stays a separate, deliberate action;
-    /// count freshness is the background fetch's job, not a button's.
-    fn sync(self: &Rc<Self>) {
+    /// Fetch, then — when `rebase` — rebase onto the remote tip: the full
+    /// sync, conflicts and all (a paused rebase gets the Conflicts view and
+    /// the Continue/Abort pair). Without `rebase` it is the refresh
+    /// button's fetch: every remote, the push target's tip, and the issues
+    /// ref, and the counts redrawn. Push stays a separate, deliberate
+    /// action.
+    fn sync(self: &Rc<Self>, rebase: bool) {
         if self.refuse_read_only() {
             return;
         }
@@ -6324,7 +6332,7 @@ impl FileTree {
         let worktree = self.worktree();
         let share_remotes = self.share_remotes.borrow().clone();
         self.sync_button.set_sensitive(false);
-        self.set_sync_label("syncing…");
+        self.set_sync_label(if rebase { "syncing…" } else { "fetching…" });
         self.last_fetch.set(Some(std::time::Instant::now()));
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
@@ -6336,7 +6344,7 @@ impl FileTree {
             // same strip (`ssh_agent`).
             let envs = crate::ssh_agent::network_env(root.clone(), remote).await;
             let mut steps: Vec<(&str, (String, Vec<String>))> = vec![("fetch", fetch)];
-            if worktree.is_local() {
+            if rebase && worktree.is_local() {
                 steps.push(("rebase", rebase_command));
             }
             let mut failed = false;
@@ -6380,7 +6388,7 @@ impl FileTree {
                     }
                 }
             }
-            if !failed && !worktree.is_local() {
+            if rebase && !failed && !worktree.is_local() {
                 let worktree = worktree.clone();
                 let handle = crate::runtime::runtime().spawn_blocking(move || {
                     let Some(upstream) = upstream else {
@@ -6403,7 +6411,7 @@ impl FileTree {
                     }
                 }
             }
-            if !failed {
+            if rebase && !failed {
                 let (count, upstream) = behind.unwrap_or((0, None));
                 let upstream = upstream.unwrap_or_else(|| "the remote".to_string());
                 events.publish(Event::Toast(if count == 0 {
