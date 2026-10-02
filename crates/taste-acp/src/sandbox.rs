@@ -399,6 +399,11 @@ pub fn inside_container() -> bool {
 /// `npx: not found`, because the remedy is the environment's container,
 /// not an install. Unknowable from inside the Flatpak, whose PATH is not
 /// the host's, so assumed there.
+///
+/// Says only what it knows, which is this machine. Where the container
+/// stands — on its way, up but unable to host the agent, stopped — is the
+/// caller's to add: this error once said "which is not up yet" about a
+/// container that was up.
 pub fn runs_outside_a_container(command: &str) -> Result<()> {
     if Path::new("/.flatpak-info").exists() || Path::new(command).is_absolute() {
         return Ok(());
@@ -406,11 +411,7 @@ pub fn runs_outside_a_container(command: &str) -> Result<()> {
     let found = std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()));
     if !found {
-        anyhow::bail!(
-            "this agent runs in its environment's container, which is not up yet, and \
-             this machine has no {command} to run it anywhere else; it starts once the \
-             container is up"
-        );
+        anyhow::bail!("this machine has no {command} to run this agent outside a container");
     }
     Ok(())
 }

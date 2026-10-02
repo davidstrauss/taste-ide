@@ -477,6 +477,11 @@ pub struct Supervisor {
     /// whenever the container changes, because it is a fact about *that*
     /// container and not about the environment.
     hosting: Mutex<AgentHosting>,
+    /// A [`Supervisor::probe_agent_hosting`] is under way. Two askers —
+    /// the registry after adoption, a chat that found the answer still
+    /// unknown — get one probe between them, and the one in flight
+    /// republishes `Running` for both.
+    probing: AtomicBool,
     /// The environment's own agent asked for the reload in flight
     /// (`devcontainer_reload`, approved): when it finishes, the outcome is
     /// published as `Event::ReloadReport` for that agent's chat to hand it.
@@ -855,6 +860,7 @@ impl Supervisor {
             state: Mutex::new(SupervisorState::NoConfig),
             authority: Mutex::new(ConfigAuthority::Project),
             hosting: Mutex::new(AgentHosting::Unknown),
+            probing: AtomicBool::new(false),
             agent_reload: AtomicBool::new(false),
             fresh_build: AtomicBool::new(false),
             reuse_image: AtomicBool::new(false),
@@ -2064,11 +2070,18 @@ impl Supervisor {
     ///
     /// Deliberately not fatal to anything: a `No` costs relocation and
     /// nothing else.
+    ///
+    /// Asked while one is already under way, it answers `Unknown` at once
+    /// and leaves the republish to the probe in flight.
     pub async fn probe_agent_hosting(&self) -> AgentHosting {
         let SupervisorState::Running { container_id } = self.state() else {
             return AgentHosting::Unknown;
         };
+        if self.probing.swap(true, Ordering::SeqCst) {
+            return AgentHosting::Unknown;
+        }
         let hosting = self.probe_container().await;
+        self.probing.store(false, Ordering::SeqCst);
         // Republish Running so a chat that already connected — because the
         // answer was still Unknown when it did — gets the one event it
         // relocates on. Same channel, no second mechanism, and idempotent
@@ -2121,7 +2134,7 @@ impl Supervisor {
                 reason: format!(
                     "{name} has no node the agent can run on: the IDE's own did not run \
                      there (an Alpine image's C library is not supported yet) and the image \
-                     carries none, so this environment's agent cannot move in"
+                     carries none"
                 ),
             }
         } else {
@@ -2149,25 +2162,23 @@ impl Supervisor {
             }
             match self.run_captured(sh(writable)).await {
                 Err(e) => AgentHosting::No {
-                    reason: format!(
-                        "{name} cannot write the agent home at {home} ({e}); this \
-                         environment's agent runs outside the container"
-                    ),
+                    reason: format!("{name} cannot write the agent home at {home} ({e})"),
                 },
                 Ok(_) => match self.probe_channel(&name).await {
                     Ok(()) => AgentHosting::Yes,
                     Err(e) => AgentHosting::No {
                         reason: format!(
                             "{name} cannot reach the IDE through its environment \
-                             channel ({e}); this environment's agent runs outside \
-                             the container, where it can."
+                             channel ({e})"
                         ),
                     },
                 },
             }
         };
+        // The reason is the fact alone; its consequence is said here and
+        // by each chat in its own terms (where its agent goes instead).
         if let AgentHosting::No { reason } = &hosting {
-            self.log(reason.clone());
+            self.log(format!("no agent can move into this container: {reason}"));
         }
         // Under the project's config the checkout is bound read-write, and
         // the container's user must be able to write it, or every agent
@@ -3921,6 +3932,12 @@ impl Supervisor {
         let _lifecycle = self.lifecycle.lock().await;
         let name = self.container_name();
         self.log(format!("stopping {name}"));
+        // Before the teardown, as a reload does: a relocated agent dies
+        // during the `rm`, and its chat tells a stop's ordinary death from
+        // a crash by this environment no longer having an exec target.
+        // Whatever that container could host, it can host nothing now.
+        self.exec.set_host();
+        self.forget_agent_hosting();
         let _ = self
             .run_captured(vec![
                 "rm".into(),
@@ -3931,9 +3948,6 @@ impl Supervisor {
             ])
             .await;
         *self.running_hash.lock().unwrap() = None;
-        self.exec.set_host();
-        // Whatever that container could host, it can host nothing now.
-        self.forget_agent_hosting();
         self.set_state(SupervisorState::Stopped);
         self.set_pending(false);
         Ok(())

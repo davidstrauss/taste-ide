@@ -197,9 +197,15 @@ fn container_gate(facts: GateFacts) -> Gate {
     // (`session/load` against a home that is not there, then a respawn
     // inside; 2026-09-21). Settled without a container, it spawns anyway:
     // its chat is the coordinator, and a silent coordinator cannot say why.
+    // Up with its hosting not yet answered, it waits for the answer, as
+    // every other environment does: spawning there put the agent outside a
+    // container that was up — or, on a machine with no node, refused it
+    // with a note saying the container was not up (2026-10-02). The wait
+    // is a probe long, and the chat asks for the probe (`ask_hosting`).
     if facts.primary {
         return match facts.env {
             Some(env) if env.in_transition && !env.has_exec_target => Gate::Hold,
+            Some(env) if env.has_exec_target && env.hosting_unknown => Gate::Hold,
             _ => Gate::Spawn,
         };
     }
@@ -973,6 +979,15 @@ pub struct ChatPane {
     /// chat had no session to resume and `retopologize` left it silent
     /// under a refusal that promised it would start.
     refused_launch: RefCell<Option<Option<String>>>,
+    /// Why that launch was refused, as the spawn said it — this machine's
+    /// half of the note, kept so the note can be rewritten when what is
+    /// known about the container changes (`explain_held_launch`).
+    refused_error: RefCell<String>,
+    /// This settled state has already asked the supervisor to reopen a
+    /// channel that was down under a container that can host the agent.
+    /// Once per settled state: a channel that opens and is still not
+    /// readable must not become a loop of reopens.
+    channel_retried: Cell<bool>,
     /// The picker row the proxy added at this agent's spawn — the account's
     /// top tier as it was then read, or none (`taste_acp::authproxy::
     /// top_tier_model_id`). Compared with the listing when the proxy says
@@ -3160,6 +3175,8 @@ impl ChatPane {
             hosting_refusal: RefCell::new(None),
             relocation_pending: Cell::new(false),
             refused_launch: RefCell::new(None),
+            refused_error: RefCell::new(String::new()),
+            channel_retried: Cell::new(false),
             spawned_top_tier: RefCell::new(None),
             models_pending: Cell::new(false),
             container_wait: Cell::new(ContainerWait::Idle),
@@ -4869,6 +4886,118 @@ impl ChatPane {
             && supervisor.channel_paths().is_some()
     }
 
+    /// Ask this chat's container whether it can host the agent, when its
+    /// container is up and nobody knows yet. The supervisor republishes
+    /// `Running` with the answer, which is what releases a held agent and
+    /// a held launch, and it coalesces askers: the registry and this can
+    /// both ask, and one probe runs.
+    fn ask_hosting(&self) {
+        let Some(supervisor) = self.environments.get(&self.environment) else {
+            return;
+        };
+        if !matches!(
+            supervisor.state(),
+            taste_devcontainer::SupervisorState::Running { .. }
+        ) || supervisor.agent_hosting() != taste_devcontainer::AgentHosting::Unknown
+        {
+            return;
+        }
+        crate::runtime::runtime().spawn(async move {
+            supervisor.probe_agent_hosting().await;
+        });
+    }
+
+    /// Where this chat's container stands, for an agent that could not run
+    /// in it: why it is not there, and what brings it. `None` with no
+    /// supervisor, where nothing will come up.
+    fn container_standing(&self) -> Option<String> {
+        use taste_devcontainer::{AgentHosting, SupervisorState};
+        let supervisor = self.environments.get(&self.environment)?;
+        if supervisor.exec().has_exec_target() {
+            return Some(match supervisor.agent_hosting() {
+                AgentHosting::No { reason } => {
+                    format!("its container is up but cannot host it: {reason}")
+                }
+                AgentHosting::Unknown => "its container is up and is being asked whether it \
+                                          can host the agent, which starts there when it answers"
+                    .into(),
+                AgentHosting::Yes => "its container's channel to the IDE is not up; the agent \
+                                      starts in the container once it is"
+                    .into(),
+            });
+        }
+        Some(match supervisor.state() {
+            SupervisorState::Stopped => {
+                "its container is stopped; the agent starts in it when it is started".into()
+            }
+            SupervisorState::Failed { .. } => {
+                "its container did not come up; the agent starts in it once a rebuild does".into()
+            }
+            _ => "its container is not up yet; the agent starts in it once it is".into(),
+        })
+    }
+
+    /// The refused launch's note: what the spawn said about this machine,
+    /// then where the container stands, read now.
+    fn launch_refusal_note(&self) -> String {
+        let error = self.refused_error.borrow().clone();
+        match self.container_standing() {
+            Some(standing) if !self.relocated.get() => {
+                format!("agent launch refused: {error}; {standing}")
+            }
+            _ => format!("agent launch refused: {error}"),
+        }
+    }
+
+    /// A refused launch that the container settling did not release: say
+    /// why, and do what can be done about it, rather than leaving a note
+    /// that promises a start nothing is coming to make.
+    ///
+    /// Hosting `Unknown` is asked about (`ask_hosting`); hosting `No` is a
+    /// final answer for this container, and the note now says so; hosting
+    /// `Yes` with no readable channel is a helper that died or never
+    /// started, and is reopened once per settled state.
+    fn explain_held_launch(self: &Rc<Self>) {
+        let Some(supervisor) = self.environments.get(&self.environment) else {
+            return;
+        };
+        let note = self.launch_refusal_note();
+        self.note_keyed(LAUNCH_NOTE, &note);
+        if !supervisor.exec().has_exec_target() {
+            return;
+        }
+        match supervisor.agent_hosting() {
+            taste_devcontainer::AgentHosting::Unknown => self.ask_hosting(),
+            taste_devcontainer::AgentHosting::No { .. } => {}
+            taste_devcontainer::AgentHosting::Yes => {
+                if self.channel_retried.replace(true) {
+                    return;
+                }
+                let task = crate::runtime::runtime()
+                    .spawn(async move { supervisor.ensure_channel().await.map(|_| ()) });
+                let weak = Rc::downgrade(self);
+                glib::spawn_future_local(async move {
+                    let result = task.await;
+                    let Some(pane) = weak.upgrade() else { return };
+                    match result {
+                        Ok(Ok(())) => pane.retopologize(),
+                        Ok(Err(e)) => {
+                            let error = pane.refused_error.borrow().clone();
+                            pane.note_keyed(
+                                LAUNCH_NOTE,
+                                &format!(
+                                    "agent launch refused: {error}; its container is up, but \
+                                     its channel to the IDE would not open: {e:#}"
+                                ),
+                            );
+                        }
+                        Err(_) => {}
+                    }
+                });
+            }
+        }
+    }
+
     fn report_hosting_refusal(&self, reason: &str) {
         if self.hosting_refusal.borrow().as_deref() == Some(reason) {
             return;
@@ -4921,6 +5050,13 @@ impl ChatPane {
         // A settled state is a fresh chance to say why relocation was
         // declined, if it still is.
         self.hosting_refusal.borrow_mut().take();
+        self.channel_retried.set(false);
+        // A container this chat cannot move into until it is asked: one
+        // adopted by a recheck the registry did not follow with a probe —
+        // the config watcher's, the VM's change watcher's — published
+        // `Running` with nobody asking, and every chat waiting on the
+        // republish waited for ever.
+        self.ask_hosting();
         // ...and new facts the agent cannot see from inside its confinement
         // — its mode, what is writable, what failed — so the next prompt
         // carries them (`orientation`).
@@ -5040,6 +5176,7 @@ impl ChatPane {
             if let Some(refused) = refused {
                 if !self.could_relocate() {
                     *self.refused_launch.borrow_mut() = Some(refused);
+                    self.explain_held_launch();
                     return;
                 }
                 self.reconnect_attempts.set(0);
@@ -5218,6 +5355,9 @@ impl ChatPane {
                 }
                 self.container_wait.set(ContainerWait::Waiting);
                 self.sync_revive_bar();
+                // A hold on a container that is up is a hold on its hosting
+                // answer, which only a probe gives.
+                self.ask_hosting();
                 true
             }
         }
@@ -8207,7 +8347,9 @@ impl ChatPane {
                 // Keyed, so the launch that follows rewrites this row
                 // rather than leaving the refusal as the transcript's last
                 // word under an agent that is up.
-                self.note_keyed(LAUNCH_NOTE, &format!("agent launch refused: {e}"));
+                *self.refused_error.borrow_mut() = e.to_string();
+                let note = self.launch_refusal_note();
+                self.note_keyed(LAUNCH_NOTE, &note);
                 *self.refused_launch.borrow_mut() = Some(resume_for_retry);
                 return;
             }
@@ -8811,6 +8953,11 @@ impl ChatPane {
                 // closes are not.
                 if self.environment_in_transition() {
                     self.note("the agent stopped with its container — it comes back when the rebuild finishes");
+                } else if self.relocated.get() && !self.has_exec_target() {
+                    // Stopped rather than rebuilt: the supervisor gives up
+                    // the exec target before its teardown for exactly this
+                    // reading.
+                    self.note("the agent stopped with its container");
                 } else if let Some(e) = error {
                     self.notify(crate::notify::Moment::AgentDisconnected {
                         chat: self.notify_chat(),
@@ -13136,6 +13283,30 @@ mod tests {
                 ..facts
             }),
             Gate::Hold
+        );
+        // ...and so does it while its container is up and has not yet said
+        // whether it can host the agent: an adopted container is in that
+        // state until its probe answers.
+        assert_eq!(
+            container_gate(GateFacts {
+                primary: true,
+                env: Some(EnvGate {
+                    hosting_unknown: true,
+                    ..env(true, false, false).unwrap()
+                }),
+                ..facts
+            }),
+            Gate::Hold
+        );
+        // Answered, it spawns: in the container, or outside with the
+        // reason said.
+        assert_eq!(
+            container_gate(GateFacts {
+                primary: true,
+                env: env(true, false, false),
+                ..facts
+            }),
+            Gate::Spawn
         );
 
         // EVERY "no" ends in a spawn. Below the container rungs there is
