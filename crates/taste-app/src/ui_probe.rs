@@ -317,7 +317,31 @@ fn geometry(registry: &[(&'static str, gtk::Widget)], target: &str) -> Result<Ui
 /// remains is exactly the widget's deviations — the things worth reading.
 fn dump(widget: &gtk::Widget, root: &gtk::Widget, depth: usize, budget: &mut usize) -> Value {
     if *budget == 0 {
-        return json!({"truncated": "node budget exhausted"});
+        // Past the budget a widget still says what it is and where it
+        // landed, without its subtree: a transcript of two hundred rows
+        // spends the budget in its first forty, and the row that came out
+        // three thousand pixels too tall was one of the rest (2026-10-02).
+        let bounds = widget.compute_bounds(root).map(|b| {
+            json!({
+                "x": round1(b.x()), "y": round1(b.y()),
+                "w": round1(b.width()), "h": round1(b.height()),
+            })
+        });
+        let (min, nat, _, _) = widget.measure(gtk::Orientation::Vertical, -1);
+        let mut node = json!({
+            "truncated": "node budget exhausted",
+            "type": widget.type_().name(),
+            "bounds": bounds,
+            "measure_h": {"min": min, "nat": nat},
+        });
+        // As a full node says it, so a reader skipping the hidden skips
+        // these too (near-miss.py).
+        if !widget.is_visible() {
+            node["visible"] = false.into();
+        } else if !widget.is_mapped() {
+            node["mapped"] = false.into();
+        }
+        return node;
     }
     *budget -= 1;
     let mut node = serde_json::Map::new();

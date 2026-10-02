@@ -11345,10 +11345,23 @@ impl ChatPane {
         // The whole length in 240 frames, at least 40px a frame: a full
         // transcript is tens of thousands of pixels.
         let step = ((adjustment.upper() - adjustment.page_size()) / 240.0).max(40.0);
+        // The last ROW: the list's last child is its empty-state placeholder.
+        let mut last_end = 0.0f32;
+        let mut child = self.transcript.first_child();
+        while let Some(widget) = child {
+            if widget.is::<gtk::ListBoxRow>() {
+                if let Some(b) = widget.compute_bounds(&self.transcript) {
+                    last_end = last_end.max(b.y() + b.height());
+                }
+            }
+            child = widget.next_sibling();
+        }
         println!(
-            "scroll bench: {} rows, {:.0}px tall, {step:.0}px a frame",
+            "scroll bench: {} rows, {:.0}px tall, {step:.0}px a frame; the list is {}px and \
+             its last row ends at {last_end:.0}",
             self.transcript_rows(),
-            adjustment.upper()
+            adjustment.upper(),
+            self.transcript.height(),
         );
         // Down, then back up: the first pass is every row's first time on
         // screen, the second is rows that have all been shown before.
