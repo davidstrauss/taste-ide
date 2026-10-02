@@ -59,6 +59,9 @@ pub const SENT_REF: &str = "refs/taste/mirror/sent";
 /// when it was recorded.
 const RECORDED_ON: &str = "taste mirror on ";
 
+/// How the mirror's baseline commit names the commit that branch was at.
+const RECORDED_TIP: &str = "Tip: ";
+
 /// What mirroring did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mirror {
@@ -526,6 +529,43 @@ impl GitWorkspace {
         Ok(())
     }
 
+    /// Whether this folder's `branch` is where the mirror last left it: no
+    /// commit, reset, or rebase made here since the two last agreed. A
+    /// branch that diverged from the checkout's while this holds was
+    /// rewritten THERE — the agent rebased it — and the folder has nothing
+    /// of its own to lose by following; one that does not hold has work of
+    /// its own, and divergence is the user's to settle.
+    ///
+    /// A baseline from before the tip was recorded is judged by its tree:
+    /// the folder's working copy as the mirror wrote it, which is the
+    /// branch's tree plus what git does not track, so a tip whose tree it
+    /// only adds to is the tip it was written at.
+    pub fn unmoved_since_mirror(&self, branch: &str) -> Result<bool> {
+        let local = format!("refs/heads/{branch}");
+        let Some(mine) = self.read_ref(&local)? else {
+            return Ok(false);
+        };
+        let Some(oid) = self.read_ref(MIRROR_REF)? else {
+            return Ok(false);
+        };
+        let last = self.repo.find_commit(oid)?;
+        let message = last.message().unwrap_or_default();
+        if message.lines().next() != Some(format!("{RECORDED_ON}{local}").as_str()) {
+            return Ok(false);
+        }
+        if let Some(tip) = message
+            .lines()
+            .find_map(|line| line.strip_prefix(RECORDED_TIP))
+        {
+            return Ok(Oid::from_str(tip.trim()).ok() == Some(mine));
+        }
+        let mine_tree = self.repo.find_commit(mine)?.tree()?;
+        let diff = self
+            .repo
+            .diff_tree_to_tree(Some(&mine_tree), Some(&last.tree()?), None)?;
+        Ok(diff.deltas().all(|delta| delta.status() == Delta::Added))
+    }
+
     /// Record `tree` as the folder the mirror and the checkout agree on,
     /// with the branch the folder is on (`local`), which is how a switch
     /// the user makes here is told from one the checkout made
@@ -536,7 +576,14 @@ impl GitWorkspace {
                 sent.delete()?;
             }
         }
-        let message = format!("{RECORDED_ON}{local}\n\nThe folder as the IDE last wrote it.");
+        // The tip too: a folder still at it has made no commit, reset, or
+        // rebase since, which is what lets a rebase in the checkout be
+        // taken here rather than read as a divergence (`unmoved_since_mirror`).
+        let tip = self
+            .read_ref(local)?
+            .map(|oid| format!("\n\n{RECORDED_TIP}{oid}"))
+            .unwrap_or_default();
+        let message = format!("{RECORDED_ON}{local}\n\nThe folder as the IDE last wrote it.{tip}");
         if let Some(oid) = self.read_ref(MIRROR_REF)? {
             let last = self.repo.find_commit(oid)?;
             if last.tree_id() == tree && last.message() == Some(message.as_str()) {
@@ -851,6 +898,66 @@ mod tests {
             ws.mirror_from("feature", tip, snap, false).unwrap(),
             Mirror::Unchanged
         );
+    }
+
+    /// The folder is "unmoved" while its branch is at the tip the mirror
+    /// recorded, and stops being so the moment a commit is made here —
+    /// which is what tells a rebase in the checkout (taken) from a
+    /// divergence of the folder's own (asked about).
+    #[test]
+    fn the_folder_is_unmoved_until_it_commits_on_its_own() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        assert!(!ws.unmoved_since_mirror(&main).unwrap(), "never mirrored");
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, vm_ws| {
+            fs::write(vm.join("b.txt"), "two\n").unwrap();
+            vm_ws.stage(Path::new("b.txt")).unwrap();
+            vm_ws.commit("second").unwrap();
+        });
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+        assert!(ws.unmoved_since_mirror(&main).unwrap());
+        fs::write(dir.path().join("c.txt"), "mine\n").unwrap();
+        ws.stage(Path::new("c.txt")).unwrap();
+        ws.commit("the folder's own").unwrap();
+        assert!(!ws.unmoved_since_mirror(&main).unwrap());
+        assert!(!ws.unmoved_since_mirror("elsewhere").unwrap());
+    }
+
+    /// A baseline written before the tip was recorded is judged by its
+    /// tree: the folder's working copy, which only ADDS untracked files to
+    /// the tip it was written at.
+    #[test]
+    fn a_baseline_without_a_tip_is_judged_by_its_tree() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        // The old format: the folder with an untracked file, no Tip line.
+        fs::write(dir.path().join("untracked.txt"), "loose\n").unwrap();
+        let tree = ws.worktree_tree().unwrap();
+        let tree = ws.repo.find_tree(tree).unwrap();
+        let signature = git2::Signature::now("taste-ide", "taste-ide@localhost").unwrap();
+        let old = ws
+            .repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                &format!("{RECORDED_ON}refs/heads/{main}\n\nThe folder as the IDE last wrote it."),
+                &tree,
+                &[],
+            )
+            .unwrap();
+        ws.set_ref(MIRROR_REF, old).unwrap();
+        assert!(ws.unmoved_since_mirror(&main).unwrap());
+        fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("moved").unwrap();
+        assert!(!ws.unmoved_since_mirror(&main).unwrap());
     }
 
     #[test]

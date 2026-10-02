@@ -646,6 +646,14 @@ pub fn sync_primary_peer_with(
                     }
                 }
             }
+            // Diverged, with the folder where the mirror last left it: the
+            // branch was rewritten in the checkout — an agent's rebase —
+            // and the folder has made nothing of its own since, so the
+            // mirror below moves it to the rewrite as it would to a
+            // fast-forward (David, 2026-10-02: a finished rebase in the VM
+            // sat as "diverged: 9 commit(s) here, 8282 there" while the
+            // folder had not moved). The old tip stays in the reflog.
+            _ if checkout_branch.is_some() && git.unmoved_since_mirror(branch)? => {}
             (ahead, behind) => {
                 commits_unsettled = true;
                 sync.host_ahead = ahead;
@@ -725,7 +733,10 @@ fn mirror_into_folder(
     // move, whichever branch the folder has checked out.
     let local = format!("refs/heads/{branch}");
     if let Some(mine) = git.read_ref(&local)? {
-        if mine != tip {
+        // ...unless the folder made none of them: a branch rewritten in the
+        // checkout leaves the folder's old commits "ahead" of it, and they
+        // are the checkout's own, from before the rebase.
+        if mine != tip && !git.unmoved_since_mirror(branch)? {
             let (ahead, _) = git.ahead_behind(&local, &vm_ref)?;
             if ahead > 0 {
                 sync.note = Some(format!(
