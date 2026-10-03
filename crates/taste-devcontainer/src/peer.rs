@@ -435,6 +435,11 @@ pub const PRIMARY_SYNC_REFSPECS: [&str; 3] = [
     "+refs/taste/snapshot/*:refs/taste/vm-snapshot/*",
 ];
 
+/// The ref Personal's detached HEAD is pinned to in the checkout, so a
+/// fetch can bring its commit, and where it lands in the folder.
+const CHECKOUT_HEAD_PIN: &str = "refs/taste/head";
+const VM_HEAD: &str = "refs/taste/vm-head";
+
 /// Where the checkout's snapshots land; only Personal's is taken from here
 /// (`adopt_snapshot`). A glob, because a fetch naming one ref fails
 /// outright on a checkout that has not been snapshotted yet.
@@ -544,7 +549,42 @@ pub fn sync_primary_peer_with(
     force: bool,
     on_send: OnSend,
 ) -> Result<PeerSync> {
+    use taste_git::mirror::Head;
+    // What Personal's HEAD names, from its own file. A detached one is
+    // pinned to a ref first, so the fetch brings its commit: a commit no
+    // branch holds is otherwise one the folder never receives.
+    let checkout_head = files
+        .read_to_string(&path.join(".git/HEAD"))
+        .ok()
+        .and_then(|head| Head::parse(&head));
+    let detached = matches!(checkout_head, Some(Head::Commit(_)));
+    if detached {
+        let pinned = files.exec(
+            path,
+            &[
+                "git".into(),
+                "update-ref".into(),
+                CHECKOUT_HEAD_PIN.into(),
+                "HEAD".into(),
+            ],
+        )?;
+        if !pinned.success() {
+            bail!(
+                "pinning Personal's detached HEAD: {}",
+                pinned.stderr_utf8().trim()
+            );
+        }
+    }
     fetch_from_guest(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS)?;
+    if detached {
+        fetch_from_guest(
+            peer,
+            vm,
+            keys,
+            path,
+            &[&format!("+{CHECKOUT_HEAD_PIN}:{VM_HEAD}")],
+        )?;
+    }
     let git = taste_git::GitWorkspace::discover(peer)
         .with_context(|| format!("{} is not a git working tree", peer.display()))?;
     // A folder whose branch has no commit yet is still on that branch: the
@@ -555,16 +595,11 @@ pub fn sync_primary_peer_with(
         branch: git.branch_name().or_else(|| unborn.clone()),
         ..PeerSync::default()
     };
-    // The branch the checkout is on, from its own HEAD: the one the
-    // folder follows.
-    let checkout_branch = files
-        .read_to_string(&path.join(".git/HEAD"))
-        .ok()
-        .and_then(|head| {
-            head.trim()
-                .strip_prefix("ref: refs/heads/")
-                .map(str::to_string)
-        });
+    // The branch the checkout is on, when it is on one.
+    let checkout_branch = match &checkout_head {
+        Some(Head::Branch(branch)) => Some(branch.clone()),
+        _ => None,
+    };
     // Whether commits moved between the two this pass, or could not: the
     // mirror waits for a pass where the branches agree.
     let mut commits_unsettled = false;
@@ -757,32 +792,40 @@ pub fn sync_primary_peer_with(
     // Personal (David, 2026-10-02: "If I do something on one side, do it
     // on the other. The only exception is a conflict"). Both having moved
     // is that conflict, and is said rather than settled.
-    let checkout_branch = match (
-        sync.branch.clone(),
-        checkout_branch,
-        git.mirror_recorded_branch()?,
+    let follow = match (
+        git.checked_out(),
+        checkout_head,
+        git.mirror_recorded_head()?,
     ) {
         (Some(here), Some(there), Some(agreed)) if here != there && here != agreed => {
             if there == agreed {
                 match switch_checkout(peer, vm, keys, files, path, &here, &there) {
                     Ok(()) => {
-                        git.record_switch(&here)?;
+                        match &here {
+                            Head::Branch(branch) => git.record_switch(branch)?,
+                            Head::Commit(oid) => git.record_switch_detached(*oid)?,
+                        }
                         commits_unsettled = true;
                         sync.pushed = true;
                         Some(here)
                     }
                     Err(e) => {
                         sync.note = Some(format!(
-                            "this folder switched to {here}, and Personal could not follow \
-                             from {there}: {e:#}"
+                            "this folder moved to {}, and Personal could not follow from {}: \
+                             {e:#}",
+                            here.describe(),
+                            there.describe()
                         ));
                         Some(there)
                     }
                 }
             } else {
                 sync.note = Some(format!(
-                    "this folder switched to {here} and Personal to {there} since they last \
-                     agreed on {agreed}; switch either to the other's branch"
+                    "this folder moved to {} and Personal to {} since they last agreed on {}; \
+                     move either to where the other is",
+                    here.describe(),
+                    there.describe(),
+                    agreed.describe()
                 ));
                 Some(there)
             }
@@ -791,7 +834,7 @@ pub fn sync_primary_peer_with(
     };
     adopt_tags(&git)?;
     adopt_snapshot(&git)?;
-    if let (Some(branch), false) = (checkout_branch, commits_unsettled) {
+    if let (Some(head), false) = (follow, commits_unsettled) {
         // The folder the user opened, and nothing wider: a folder inside
         // another repository (a dotfiles repository in the home directory)
         // discovers THAT one, and the mirror would write the checkout's
@@ -804,7 +847,7 @@ pub fn sync_primary_peer_with(
                 git.workdir().display()
             ));
         } else {
-            mirror_into_folder(&git, &branch, files, path, force, on_send, &mut sync)?;
+            mirror_into_folder(&git, &head, files, path, force, on_send, &mut sync)?;
         }
     }
     Ok(sync)
@@ -840,14 +883,34 @@ fn adopt_tags(git: &taste_git::GitWorkspace) -> Result<()> {
 /// written into the checkout first.
 fn mirror_into_folder(
     git: &taste_git::GitWorkspace,
-    branch: &str,
+    head: &taste_git::mirror::Head,
     files: &Files,
     path: &Path,
     force: bool,
     on_send: OnSend,
     sync: &mut PeerSync,
 ) -> Result<()> {
-    use taste_git::mirror::Mirror;
+    use taste_git::mirror::Head;
+    let branch = match head {
+        Head::Branch(branch) => branch.as_str(),
+        // Detached: the folder goes to the commit, which the fetch brought
+        // pinned (`CHECKOUT_HEAD_PIN`), with no branch to move.
+        Head::Commit(tip) => {
+            if git.read_ref(VM_HEAD)? != Some(*tip) {
+                return Ok(());
+            }
+            let Some(snapshot) = git.read_ref(&taste_git::snapshot_ref("primary"))? else {
+                return Ok(());
+            };
+            let folder = git.workdir().to_path_buf();
+            let room =
+                move |bytes: u64| room_for(&folder, bytes, "bringing the checkout's changes in");
+            let outcome = git
+                .mirror_detached_within(*tip, snapshot, force, &room)
+                .context("mirroring the checkout into this folder")?;
+            return settle_mirror(git, outcome, None, files, path, on_send, sync);
+        }
+    };
     let vm_ref = format!("{VM_BRANCH_NAMESPACE}{branch}");
     let Some(tip) = git.read_ref(&vm_ref)? else {
         return Ok(());
@@ -876,15 +939,31 @@ fn mirror_into_folder(
     };
     let folder = git.workdir().to_path_buf();
     let room = move |bytes: u64| room_for(&folder, bytes, "bringing the checkout's changes in");
-    match git
+    let outcome = git
         .mirror_from_within(branch, tip, snapshot, force, &room)
-        .context("mirroring the checkout into this folder")?
-    {
+        .context("mirroring the checkout into this folder")?;
+    settle_mirror(git, outcome, Some(branch), files, path, on_send, sync)
+}
+
+/// What a mirror pass came to, said in `sync` — and the folder's own
+/// changes it found, sent to the checkout. `branch` is the branch the
+/// folder is now on, `None` for a detached HEAD.
+fn settle_mirror(
+    git: &taste_git::GitWorkspace,
+    outcome: taste_git::mirror::Mirror,
+    branch: Option<&str>,
+    files: &Files,
+    path: &Path,
+    on_send: OnSend,
+    sync: &mut PeerSync,
+) -> Result<()> {
+    use taste_git::mirror::Mirror;
+    match outcome {
         Mirror::Applied { changed, switched } => {
             sync.received = changed;
             sync.switched = switched;
             sync.mirrored = true;
-            sync.branch = Some(branch.to_string());
+            sync.branch = branch.map(str::to_string);
             sync.note = None;
         }
         Mirror::Unchanged => sync.mirrored = true,
@@ -1117,11 +1196,21 @@ staging="$1"
 branch="$2"
 from="$3"
 cleanup() { git update-ref -d "$staging" 2>/dev/null || true; }
-if [ "$(git symbolic-ref --short -q HEAD)" != "$from" ]; then
+# Where Personal stands, as the folder records it: a branch's name, or the
+# commit its HEAD is detached at.
+here=$(git symbolic-ref --short -q HEAD || git rev-parse -q --verify HEAD)
+if [ "$here" != "$from" ]; then
   cleanup; echo "Personal has moved off $from since it last agreed with the folder" >&2; exit 2
 fi
 if ! git diff --quiet || ! git diff --cached --quiet; then
   cleanup; echo "Personal has uncommitted changes on $from" >&2; exit 3
+fi
+# Not a branch: the folder is detached at the commit, and so is Personal.
+if [ -z "$branch" ]; then
+  if ! git switch -q --detach "$staging" 2>&1; then
+    cleanup; exit 5
+  fi
+  cleanup; exit 0
 fi
 if git rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
   if ! git merge-base --is-ancestor "refs/heads/$branch" "$staging"; then
@@ -1135,27 +1224,34 @@ fi
 cleanup
 "#;
 
-/// Switch Personal's checkout to `branch`, the folder's, from `from`, the
-/// branch the two last agreed on: the folder's branch first, as it stands,
-/// then the switch, both refused rather than forced over work Personal has
-/// of its own ([`SWITCH_SCRIPT`]).
+/// Move Personal's checkout to `to`, where the folder is, from `from`,
+/// where the two last agreed — as `git checkout <commit-ish>` would: onto
+/// the folder's branch, its commits first, or detached at the folder's
+/// commit. Refused rather than forced over work Personal has of its own
+/// ([`SWITCH_SCRIPT`]).
 fn switch_checkout(
     peer: &Path,
     vm: &Vm,
     keys: &Keys,
     files: &Files,
     path: &Path,
-    branch: &str,
-    from: &str,
+    to: &taste_git::mirror::Head,
+    from: &taste_git::mirror::Head,
 ) -> Result<()> {
-    let staging = format!("{PEER_STAGING}/{branch}");
-    push_to_guest(
-        peer,
-        vm,
-        keys,
-        path,
-        &[&format!("+refs/heads/{branch}:{staging}")],
-    )?;
+    use taste_git::mirror::Head;
+    let (staging, source, branch) = match to {
+        Head::Branch(branch) => (
+            format!("{PEER_STAGING}/{branch}"),
+            format!("refs/heads/{branch}"),
+            branch.clone(),
+        ),
+        Head::Commit(oid) => (
+            format!("{PEER_STAGING}/HEAD"),
+            oid.to_string(),
+            String::new(),
+        ),
+    };
+    push_to_guest(peer, vm, keys, path, &[&format!("+{source}:{staging}")])?;
     let out = files
         .exec(
             path,
@@ -1165,11 +1261,11 @@ fn switch_checkout(
                 SWITCH_SCRIPT.to_string(),
                 "taste-switch".into(),
                 staging,
-                branch.to_string(),
-                from.to_string(),
+                branch,
+                from.commitish(),
             ],
         )
-        .with_context(|| format!("switching Personal to {branch} in VM {}", vm.domain))?;
+        .with_context(|| format!("moving Personal to {} in VM {}", to.describe(), vm.domain))?;
     if !out.success() {
         let stderr = out.stderr_utf8();
         let stdout = out.stdout_utf8();
@@ -1601,6 +1697,77 @@ mod tests {
         assert_eq!(
             pair.git("checkout", &["symbolic-ref", "--short", "HEAD"]),
             "topic"
+        );
+        assert_eq!(
+            pair.git("checkout", &["rev-parse", "HEAD"]),
+            pair.git("folder", &["rev-parse", "HEAD"])
+        );
+    }
+
+    /// A folder detached at a commit — `git checkout <commit-ish>` — puts
+    /// Personal there too, detached; and a switch back onto a branch starts
+    /// from that commit, which is where the two then agree.
+    #[test]
+    fn a_detached_folder_detaches_the_checkout_and_back() {
+        let pair = Pair::new("detach");
+        let first = pair.git("folder", &["rev-parse", "HEAD"]);
+        pair.write("folder", "a.txt", "two\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "second");
+        pair.git("checkout", &["pull", "-q"]);
+        pair.git("folder", &["checkout", "-q", "--detach", &first]);
+        let folder = pair.dir.join("folder").display().to_string();
+        let switch = |source: &str, branch: &str, from: &str| {
+            pair.git(
+                "checkout",
+                &[
+                    "fetch",
+                    "-q",
+                    &folder,
+                    &format!("+{source}:refs/taste/staging/switch"),
+                ],
+            );
+            std::process::Command::new("sh")
+                .current_dir(pair.dir.join("checkout"))
+                .args([
+                    "-c",
+                    SWITCH_SCRIPT,
+                    "taste-switch",
+                    "refs/taste/staging/switch",
+                    branch,
+                    from,
+                ])
+                .output()
+                .unwrap()
+                .status
+                .code()
+                .unwrap_or(-1)
+        };
+        assert_eq!(switch(&first, "", "main"), 0);
+        assert_eq!(pair.git("checkout", &["rev-parse", "HEAD"]), first);
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(pair.dir.join("checkout"))
+                .args(["symbolic-ref", "-q", "HEAD"])
+                .status()
+                .unwrap()
+                .code()
+                == Some(1),
+            "Personal is detached, not on a branch"
+        );
+        assert_eq!(
+            pair.git("checkout", &["rev-parse", "refs/heads/main"]),
+            pair.git("folder", &["rev-parse", "refs/heads/main"]),
+            "detaching leaves Personal's main where it was"
+        );
+
+        // Back onto main, from the commit the two agreed on.
+        pair.git("folder", &["switch", "-q", "main"]);
+        assert_eq!(switch("main", "main", "main"), 2, "Personal is not on main");
+        assert_eq!(switch("main", "main", &first), 0);
+        assert_eq!(
+            pair.git("checkout", &["symbolic-ref", "--short", "HEAD"]),
+            "main"
         );
         assert_eq!(
             pair.git("checkout", &["rev-parse", "HEAD"]),

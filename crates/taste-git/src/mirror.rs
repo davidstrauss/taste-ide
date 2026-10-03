@@ -73,6 +73,58 @@ const RECORDED_ON: &str = "taste mirror on ";
 /// How the mirror's baseline commit names the commit that branch was at.
 const RECORDED_TIP: &str = "Tip: ";
 
+/// What a side's HEAD names, which is where it stands. Whatever commit-ish
+/// is checked out — a branch, a tag, a remote branch, `HEAD~2`, a hash —
+/// HEAD ends up holding one of two things: a branch, or the commit the
+/// commit-ish resolved to, detached. The folder and Personal follow each
+/// other by that alone, as `git checkout <commit-ish>` does: onto the
+/// branch when it is one, detached at the commit otherwise (David,
+/// 2026-10-04: "detached heads should still work"; "something more
+/// generic like git's 'commit-ish' concept").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Head {
+    Branch(String),
+    Commit(Oid),
+}
+
+impl Head {
+    /// What HEAD's own file says, read as git reads it: `ref:
+    /// refs/heads/<branch>`, or a commit id.
+    pub fn parse(head_file: &str) -> Option<Self> {
+        let text = head_file.trim();
+        match text.strip_prefix("ref: ") {
+            Some(target) => target
+                .strip_prefix("refs/heads/")
+                .map(|b| Head::Branch(b.to_string())),
+            None => Oid::from_str(text).ok().map(Head::Commit),
+        }
+    }
+
+    /// The commit-ish that puts the other side here: the branch's name, or
+    /// the commit's id.
+    pub fn commitish(&self) -> String {
+        match self {
+            Head::Branch(name) => name.clone(),
+            Head::Commit(oid) => oid.to_string(),
+        }
+    }
+
+    /// How it reads in a sentence: the branch's name, or "the commit
+    /// 1a2b3c4".
+    pub fn describe(&self) -> String {
+        match self {
+            Head::Branch(name) => name.clone(),
+            Head::Commit(oid) => {
+                let id = oid.to_string();
+                format!("the commit {}", &id[..7.min(id.len())])
+            }
+        }
+    }
+}
+
+/// How the mirror's baseline records a detached HEAD in place of a branch.
+const DETACHED: &str = "HEAD";
+
 /// What mirroring did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mirror {
@@ -163,6 +215,32 @@ impl GitWorkspace {
         if !git2::Reference::is_valid_name(&local) {
             bail!("{branch} is not a branch name");
         }
+        self.mirror_at(Some(&local), tip, snapshot, force, room)
+    }
+
+    /// [`Self::mirror_from_within`] for a checkout whose HEAD is detached
+    /// at `tip`: the folder detached there too, its files Personal's.
+    pub fn mirror_detached_within(
+        &self,
+        tip: Oid,
+        snapshot: Oid,
+        force: bool,
+        room: &dyn Fn(u64) -> Option<String>,
+    ) -> Result<Mirror> {
+        self.mirror_at(None, tip, snapshot, force, room)
+    }
+
+    /// The mirror itself, onto the branch `local` names or — `None` — onto
+    /// `tip` with no branch.
+    fn mirror_at(
+        &self,
+        local: Option<&str>,
+        tip: Oid,
+        snapshot: Oid,
+        force: bool,
+        room: &dyn Fn(u64) -> Option<String>,
+    ) -> Result<Mirror> {
+        let branch = local.map(|l| l.trim_start_matches("refs/heads/").to_string());
         let tip_commit = self
             .repo
             .find_commit(tip)
@@ -185,15 +263,17 @@ impl GitWorkspace {
         // sync carries it to Personal (`taste_devcontainer::peer`), which
         // then records the two agreeing on it (`record_switch`). Until
         // then there is nothing to mirror.
-        if self.switched_here(&local)? {
-            let head = self.head_ref_name().unwrap_or_default();
-            return Ok(Mirror::Paused {
-                reason: format!(
-                    "this folder is on {} and Personal on {branch}; Personal follows the \
-                     folder once it can",
-                    head.trim_start_matches("refs/heads/")
-                ),
-            });
+        if let (Some(local), Some(branch)) = (local, branch.as_deref()) {
+            if self.switched_here(local)? {
+                let head = self.head_ref_name().unwrap_or_default();
+                return Ok(Mirror::Paused {
+                    reason: format!(
+                        "this folder is on {} and Personal on {branch}; Personal follows the \
+                         folder once it can",
+                        head.trim_start_matches("refs/heads/")
+                    ),
+                });
+            }
         }
         // What the folder should still look like: what the mirror last
         // wrote, or — the first time — its own HEAD, which a folder with no
@@ -271,10 +351,11 @@ impl GitWorkspace {
             }
         }
 
-        let on_branch = self.head_ref_name().as_deref() == Some(local.as_str());
+        // On the branch — or, for a detached checkout, detached too.
+        let on_branch = self.head_ref_name().as_deref() == local;
         let at_tip = self.repo.head().ok().and_then(|h| h.target()) == Some(tip);
         if current == target.id() && on_branch && at_tip {
-            self.record_mirror(target.id(), &local)?;
+            self.record_at(target.id(), local, tip)?;
             return Ok(Mirror::Unchanged);
         }
 
@@ -283,11 +364,19 @@ impl GitWorkspace {
         }
         self.hold_ignored_if_rules_change(current, target.id())?;
         let changed = self.write_tree_over(current, target.id())?;
-        self.set_ref(&local, tip)?;
-        if !on_branch {
-            self.repo
-                .set_head(&local)
-                .with_context(|| format!("switching this folder to {branch}"))?;
+        match (local, branch.as_deref()) {
+            (Some(local), Some(branch)) => {
+                self.set_ref(local, tip)?;
+                if !on_branch {
+                    self.repo
+                        .set_head(local)
+                        .with_context(|| format!("switching this folder to {branch}"))?;
+                }
+            }
+            _ => self
+                .repo
+                .set_head_detached(tip)
+                .with_context(|| format!("detaching this folder at {tip}"))?,
         }
         // The index is the tip's tree: the checkout's changes read as
         // changes here, as they do there. What it has STAGED is not
@@ -295,7 +384,7 @@ impl GitWorkspace {
         let mut index = self.repo.index()?;
         index.read_tree(&tip_commit.tree()?)?;
         index.write()?;
-        self.record_mirror(target.id(), &local)?;
+        self.record_at(target.id(), local, tip)?;
         Ok(Mirror::Applied {
             changed,
             switched: !on_branch,
@@ -303,7 +392,8 @@ impl GitWorkspace {
     }
 
     /// Why the mirror should leave the folder alone this pass, if it
-    /// should: git is partway through something here, or HEAD is detached.
+    /// should: git is partway through something here. A detached HEAD is
+    /// not a pause: it is a position the two follow each other into.
     /// A switch to a branch of the folder's own is not a pause any more:
     /// the folder goes back to Personal's branch (`switched_here`).
     fn mirror_paused(&self) -> Result<Option<String>> {
@@ -327,13 +417,6 @@ impl GitWorkspace {
                 "{what} is in progress in this folder; the folder follows Personal again once \
                  it is finished or aborted"
             )));
-        }
-        if self.head_ref_name().is_none() {
-            return Ok(Some(
-                "this folder's HEAD is detached; switch it back to a branch and it follows \
-                 Personal again"
-                    .into(),
-            ));
         }
         Ok(None)
     }
@@ -374,6 +457,89 @@ impl GitWorkspace {
         };
         let tree = self.repo.find_commit(tip)?.tree_id();
         self.record_mirror(tree, &local)
+    }
+
+    /// Record that Personal followed this folder to its detached HEAD at
+    /// `tip`, as [`Self::record_switch`] does for a branch.
+    pub fn record_switch_detached(&self, tip: Oid) -> Result<()> {
+        let tree = self.repo.find_commit(tip)?.tree_id();
+        self.record_at(tree, None, tip)
+    }
+
+    /// What the folder's HEAD names: its branch, or the commit it is
+    /// detached at; `None` for a branch with no commit yet.
+    pub fn checked_out(&self) -> Option<Head> {
+        match self.head_ref_name() {
+            Some(local) => self.repo.head().ok().and(
+                local
+                    .strip_prefix("refs/heads/")
+                    .map(|b| Head::Branch(b.to_string())),
+            ),
+            None => self
+                .repo
+                .head()
+                .ok()
+                .and_then(|h| h.target())
+                .map(Head::Commit),
+        }
+    }
+
+    /// Where the mirror last recorded the two agreeing: a branch, or a
+    /// commit with no branch.
+    pub fn mirror_recorded_head(&self) -> Result<Option<Head>> {
+        let Some(oid) = self.read_ref(MIRROR_REF)? else {
+            return Ok(None);
+        };
+        let last = self.repo.find_commit(oid)?;
+        let message = last.message().unwrap_or_default();
+        let Some(on) = message
+            .strip_prefix(RECORDED_ON)
+            .and_then(|m| m.lines().next())
+        else {
+            return Ok(None);
+        };
+        if on == DETACHED {
+            return Ok(message
+                .lines()
+                .find_map(|line| line.strip_prefix(RECORDED_TIP))
+                .and_then(|tip| Oid::from_str(tip.trim()).ok())
+                .map(Head::Commit));
+        }
+        Ok(on
+            .strip_prefix("refs/heads/")
+            .map(|b| Head::Branch(b.to_string())))
+    }
+
+    /// [`Self::record_mirror`] for either position: the branch `local`
+    /// names, or — `None` — a HEAD detached at `tip`.
+    fn record_at(&self, tree: Oid, local: Option<&str>, tip: Oid) -> Result<()> {
+        match local {
+            Some(local) => self.record_mirror(tree, local),
+            None => self.record_mirror_detached(tree, tip),
+        }
+    }
+
+    fn record_mirror_detached(&self, tree: Oid, tip: Oid) -> Result<()> {
+        if self.read_ref(SENT_REF)?.is_some() {
+            if let Ok(mut sent) = self.repo.find_reference(SENT_REF) {
+                sent.delete()?;
+            }
+        }
+        let message = format!(
+            "{RECORDED_ON}{DETACHED}\n\nThe folder as the IDE last wrote it.\n\n{RECORDED_TIP}{tip}"
+        );
+        if let Some(oid) = self.read_ref(MIRROR_REF)? {
+            let last = self.repo.find_commit(oid)?;
+            if last.tree_id() == tree && last.message() == Some(message.as_str()) {
+                return Ok(());
+            }
+        }
+        let tree = self.repo.find_tree(tree)?;
+        let signature = git2::Signature::now("taste-ide", "taste-ide@localhost")?;
+        let commit = self
+            .repo
+            .commit(None, &signature, &signature, &message, &tree, &[])?;
+        self.set_ref(MIRROR_REF, commit)
     }
 
     /// The branch the mirror last recorded the two agreeing on.
@@ -1211,6 +1377,73 @@ mod tests {
             "on my branch\n"
         );
         assert_eq!(ws.head_ref_name().as_deref(), Some("refs/heads/mine"));
+    }
+
+    /// Personal detached at a commit — any commit-ish that is not a branch
+    /// — puts the folder there too, detached, its working copy Personal's,
+    /// and the mirror records that position as where the two agree.
+    #[test]
+    fn a_detached_checkout_detaches_the_folder() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        let first = ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+
+        let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, vm_ws| {
+            fs::write(vm.join("b.txt"), "two\n").unwrap();
+            vm_ws.stage(Path::new("b.txt")).unwrap();
+            vm_ws.commit("second").unwrap();
+            let commit = vm_ws.repo.find_commit(first).unwrap();
+            vm_ws
+                .repo
+                .checkout_tree(
+                    commit.as_object(),
+                    Some(git2::build::CheckoutBuilder::new().force()),
+                )
+                .unwrap();
+            vm_ws.repo.set_head_detached(first).unwrap();
+            fs::write(vm.join("a.txt"), "edited while detached\n").unwrap();
+        });
+        assert_eq!(tip2, first);
+        let outcome = ws
+            .mirror_detached_within(tip2, snap2, false, &|_| None)
+            .unwrap();
+        assert!(matches!(outcome, Mirror::Applied { .. }), "{outcome:?}");
+        assert_eq!(ws.checked_out(), Some(Head::Commit(first)));
+        assert_eq!(
+            ws.mirror_recorded_head().unwrap(),
+            Some(Head::Commit(first))
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "edited while detached\n"
+        );
+        assert!(!dir.path().join("b.txt").exists());
+        // Again: nothing to do, and a detached folder is not a paused one.
+        assert_eq!(
+            ws.mirror_detached_within(tip2, snap2, false, &|_| None)
+                .unwrap(),
+            Mirror::Unchanged
+        );
+    }
+
+    #[test]
+    fn heads_read_as_git_writes_them() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            Head::parse("ref: refs/heads/main\n"),
+            Some(Head::Branch("main".into()))
+        );
+        assert_eq!(
+            Head::parse(&format!("{oid}\n")),
+            Some(Head::Commit(Oid::from_str(oid).unwrap()))
+        );
+        let detached = Head::Commit(Oid::from_str(oid).unwrap());
+        assert_eq!(detached.commitish(), oid);
+        assert_eq!(detached.describe(), "the commit 0123456");
     }
 
     #[test]
