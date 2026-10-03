@@ -362,6 +362,17 @@ and is for Phase 1 to confirm.
 | OpenSSH | 10.2p1 with `libfido2` 1.16.0, so `ed25519-sk` keys work; a TPM-held key would need `tpm2-pkcs11` |
 | The IDE's ssh | run on the host (`flatpak-spawn --host` when sandboxed, `taste_core::podman::host_argv`) |
 
+**The TPM through `tpm2-tools`, measured against a software TPM**
+(`swtpm` 0.10.2 on this host, 2026-10-03):
+
+| Fact | Value |
+| --- | --- |
+| `tpm2_sign -f plain` for an ECDSA key | DER, the form TLS and X.509 carry (`30 45 02 21 …`); verified with `openssl dgst -verify` |
+| `tpm2_readpublic -f der` | the 91-byte P-256 SubjectPublicKeyInfo, prefix byte-for-byte what `taste_gcp::signer` builds |
+| The owner primary | re-derived identically in a fresh session (`tpm2_createprimary -C o -G ecc`), so a key's two blobs load under it any time and nothing stays resident |
+| Without a resource manager | each tool leaves its objects loaded and the third load fails with "out of memory for object contexts"; flushing transient objects between steps (`tpm2_flushcontext -t`) is what `/dev/tpmrm0` does per process |
+| The whole flow | create two keys, sign, verify, reopen, issue the CA and a leaf through them, and have webpki accept the chain: 0.31 s (`TASTE_TPM_TESTS=1`, `tpm::tests::a_software_tpm_signs_and_issues`) |
+
 **The tunnel, weighed.** Without an address allowlist, the port is open
 to everyone and authentication carries all of it:
 

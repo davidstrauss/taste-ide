@@ -77,7 +77,8 @@ pub fn sandboxed() -> bool {
 /// A **host** command, wrapped for the sandbox when there is one.
 ///
 /// podman is not the only program the IDE runs on the host: `virsh`,
-/// `qemu-img`, `xz`, `ssh`, and `ssh-keygen` all live there too, and every
+/// `qemu-img`, `xz`, `ssh`, `ssh-keygen`, and the TPM's `tpm2_*` tools
+/// (`taste_gcp::tpm`) all live there too, and every
 /// one of them has to be reached the same way podman is — through
 /// `flatpak-spawn --host` from inside the sandbox, directly otherwise.
 /// One wrapper, so the sandbox fact is decided in one place; the podman

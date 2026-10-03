@@ -81,6 +81,10 @@ Workload Identity provider trusting the workspace's TPM-held CA, run as
 the user in Cloud Shell; `--remove` takes a workspace back out. The IDE
 hands out the same file with the values filled in (`taste_gcp::setup`),
 and a test holds its permission list equal to the crate's.
+`TASTE_TPM_TESTS=1` runs the TPM backend's live test against a software
+TPM; the devcontainer has neither `swtpm` nor `tpm2-tools`, so build the
+test binary there (`cargo test -p taste-gcp --no-run`) and run it on a
+host that has both, `TASTE_TPM_TESTS=1 target/debug/deps/taste_gcp-… --ignored tpm`.
 
 `cargo test --workspace` runs headless the same way. Running the GUI needs
 `--env` forwarding of `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` plus the socket

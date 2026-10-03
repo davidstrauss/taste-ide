@@ -1330,7 +1330,10 @@ want my IDE client to be able to access it").
   non-exportable keys in this machine's TPM: a certificate authority for
   this workspace, a leaf that authenticates to Google, and a leaf that
   authenticates to the VM. The IDE builds their certificates; the private
-  halves never leave the chip, and nothing secret is written to disk. To
+  halves never leave the chip. What is written to disk is each key's
+  public half and its private half *wrapped by the TPM* — encrypted under
+  a key that never leaves the chip, so the file is useless on any other
+  machine and to anyone who copies it (`taste_gcp::tpm`). To
   Google the identity is **Workload Identity Federation with X.509
   certificates**: the IDE exchanges its leaf over mutual TLS at
   `sts.mtls.googleapis.com` for an access token good for an hour, and the
@@ -1510,13 +1513,17 @@ signer rather than a key in memory), the TPM identity (the three keys,
 the CA, the certificates, the renewal, and the Cloud Shell commands),
 REST over the hyper and rustls stack the proxy uses, and the Compute,
 Cloud DNS, Billing Catalog, and IAM permission calls the lifecycle
-needs. Three things are settled by measuring rather than guessing: how a
-Flatpak reaches the TPM (in-process through the TSS, which needs the
-broad `--device=all`, or the host's `tpm2-tools` through
-`flatpak-spawn`), whether Compute Engine accepts the federated principal
-directly or wants a service account impersonated, and whether the access
-token can be bound to the certificate so that a token lifted from memory
-is useless elsewhere. Plus the resource plan as data — names, labels, networks,
+needs. Two things are settled by the first live setup rather than
+guessed: whether Compute Engine accepts the federated principal directly
+or wants a service account impersonated, and whether the access token
+can be bound to the certificate so that a token lifted from memory is
+useless elsewhere. A third is settled already (2026-10-03): the TPM is
+reached through the host's `tpm2-tools`, the TSS's documented command
+line, through `host_argv` like every other host program, because linking
+the TSS would put a C library into the Rust build and, in the Flatpak,
+need `--device=all`, the sandbox's broadest grant, to open one device;
+the price is a few process spawns per signature, and signatures come
+about hourly and once per connection to the VM. Plus the resource plan as data — names, labels, networks,
 rules, the policy, the disks, the instances — so what the IDE will create
 can be read and tested before it is created. The same client is what
 "Phase 3 — cloud provisioners" in the substrate plan needs to place

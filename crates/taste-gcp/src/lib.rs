@@ -26,6 +26,8 @@
 //! - [`signer`]: a P-256 key that signs where it lives — in the product,
 //!   the TPM — and is never anywhere else, with the adapters that let
 //!   certificate building and TLS use it.
+//! - [`tpm`]: those keys in this machine's TPM, through the host's
+//!   `tpm2-tools`.
 //! - [`identity`]: the workspace's CA and its two leaves, one for Google
 //!   and one for the model's VM.
 //! - [`sts`]: trading the Google leaf for an access token over mutual TLS
@@ -44,3 +46,4 @@ pub mod rest;
 pub mod setup;
 pub mod signer;
 pub mod sts;
+pub mod tpm;
