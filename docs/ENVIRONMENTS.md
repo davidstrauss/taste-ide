@@ -1355,7 +1355,15 @@ want my IDE client to be able to access it").
   key, which cannot sign a TLS handshake) can hold the same three keys
   instead, at the price of a touch whenever a token renews; the TPM is the
   default because the attacker this answers is the one with a copy of
-  the disk.
+  the disk. The setup is `build-aux/gcp-setup.sh`, checked in and
+  documented there, runnable by hand (`gcp-setup.sh PROJECT WORKSPACE
+  ca.pem`, and `--remove` to take a workspace back out), and it is the
+  same file the IDE hands out with the three values filled in
+  (`taste_gcp::setup`, embedded at build time), so the copy pasted into
+  Cloud Shell and the copy reviewed in the tree cannot differ; a test
+  holds its permission list equal to the one the preflight asks about.
+  Its role is the one the substrate's cloud provisioner will widen when
+  environments are placed in GCP, rather than a second grant.
 - **Two machines, and only one of them ever has a way out.** The weights
   are fetched by a **staging VM**: small, on its own network, with egress
   to port 443 and ordinary DNS. It formats the weights disk, downloads the

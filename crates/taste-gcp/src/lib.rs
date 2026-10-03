@@ -21,9 +21,22 @@
 //!   are how the IDE gets permission without ever holding the user's own
 //!   credentials.
 //!
+//! And the identity those permissions are granted to:
+//!
+//! - [`signer`]: a P-256 key that signs where it lives — in the product,
+//!   the TPM — and is never anywhere else, with the adapters that let
+//!   certificate building and TLS use it.
+//! - [`identity`]: the workspace's CA and its two leaves, one for Google
+//!   and one for the model's VM.
+//! - [`sts`]: trading the Google leaf for an access token over mutual TLS
+//!   (Workload Identity Federation with X.509 certificates).
+//!
 //! No GTK, and no IO in the builders: a plan is values, and creating it is
 //! the caller's business.
 
+pub mod identity;
 pub mod model;
 pub mod resources;
 pub mod setup;
+pub mod signer;
+pub mod sts;

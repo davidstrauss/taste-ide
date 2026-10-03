@@ -1,19 +1,17 @@
 //! The one-time setup the user runs, and what it grants.
 //!
-//! The IDE never holds the user's own Google credentials, not even to set
-//! itself up. It writes out a short script for Cloud Shell, where the user
-//! is already signed in, and the script does the three things only a
-//! project owner can: enable the APIs, create a Workload Identity
-//! Federation provider whose only trust anchor is this workspace's CA
-//! (whose key is in the TPM), and grant the identity that CA vouches for a
-//! custom role holding exactly [`PERMISSIONS`]. Every step is idempotent,
-//! so running it again — after a re-enrollment, or a permission this list
-//! gained — repairs rather than fails.
+//! The setup is `build-aux/gcp-setup.sh`, checked in, documented there,
+//! and runnable by hand. The IDE hands out that same file with the
+//! workspace's three values filled in ([`cloud_shell_script`]), embedded
+//! at build time, so the copy a user pastes and the copy reviewed in the
+//! tree cannot differ. The constants below are the IDE's half of the same
+//! facts — the preflight asks `testIamPermissions` for [`PERMISSIONS`] —
+//! and a test reads the script and holds the two equal.
 //!
-//! The role is least privilege in the literal sense: the calls the IDE
-//! makes and nothing else. In particular nothing in it touches billing,
-//! IAM, or any service account, so the identity can spend money only by
-//! running machines, which the cap meters, and cannot widen its own reach.
+//! The IDE never holds the user's own Google credentials, not even to set
+//! itself up: the script runs where gcloud is signed in as the user, and
+//! what it grants is a role of exactly the calls the IDE makes, to the
+//! federated identity whose key is in this machine's TPM.
 
 use anyhow::{bail, Result};
 
@@ -141,93 +139,46 @@ pub fn valid_project_id(id: &str) -> bool {
         && !id.ends_with('-')
 }
 
-/// The Cloud Shell script that sets this workspace up in `project`,
-/// trusting `ca_pem` — this workspace's CA certificate, which is public.
+/// The setup script, as checked in.
+pub const SCRIPT: &str = include_str!("../../../build-aux/gcp-setup.sh");
+
+/// The line that ends the pasted block; nothing in [`SCRIPT`] is that line.
+const END: &str = "TASTE_SETUP";
+
+/// [`SCRIPT`] with this workspace's values filled in, wrapped to be pasted
+/// into Cloud Shell: run as `bash -c`, so its `set -e` ends a child shell
+/// rather than the user's session and gcloud keeps the terminal as its
+/// input. `ca_pem` is the workspace's CA certificate, which is public.
 pub fn cloud_shell_script(ws: &Workspace, project: &str, ca_pem: &str) -> Result<String> {
     if !valid_project_id(project) {
         bail!("{project:?} is not a GCP project id");
     }
     let ca_pem = ca_pem.trim();
-    if !ca_pem.starts_with("-----BEGIN CERTIFICATE-----")
-        || !ca_pem.ends_with("-----END CERTIFICATE-----")
-        || ca_pem.matches("-----BEGIN").count() != 1
+    let lines: Vec<&str> = ca_pem.lines().collect();
+    let body_ok = lines.len() > 2
+        && lines[1..lines.len() - 1].iter().all(|line| {
+            !line.is_empty()
+                && line
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+        });
+    if lines.first() != Some(&"-----BEGIN CERTIFICATE-----")
+        || lines.last() != Some(&"-----END CERTIFICATE-----")
+        || !body_ok
     {
         bail!("the trust anchor must be exactly one PEM certificate");
     }
-    if !ca_pem.lines().all(|line| {
-        line.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"+/=- ".contains(&b))
-    }) {
-        bail!("the trust anchor holds characters a PEM certificate does not");
-    }
-    let id = ws.id();
-    let subject = subject(ws);
-    let provider = provider(ws);
-    let services = SERVICES.join(" ");
-    let permissions = PERMISSIONS.join(",");
-    let anchor: String = ca_pem
-        .lines()
-        .map(|line| format!("      {line}\n"))
-        .collect();
+    let (shebang, rest) = SCRIPT
+        .split_once('\n')
+        .expect("the script has a first line");
+    debug_assert!(!SCRIPT.lines().any(|line| line == END));
     Ok(format!(
-        r#"#!/usr/bin/env bash
-# taste-ide: let workspace {id} run its model in project {project}.
-# Run once in Cloud Shell, signed in as yourself. It is safe to run again.
-set -euo pipefail
-PROJECT={project}
-
-gcloud services enable {services} --project="$PROJECT"
-PROJECT_NUMBER=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
-
-# The role: exactly the calls the IDE makes. Nothing in it touches
-# billing, IAM, or a service account.
-if gcloud iam roles describe {ROLE} --project="$PROJECT" >/dev/null 2>&1; then
-  gcloud iam roles update {ROLE} --project="$PROJECT" --quiet \
-    --permissions={permissions}
-else
-  gcloud iam roles create {ROLE} --project="$PROJECT" --stage=GA \
-    --title="taste-ide" \
-    --description="What the taste-ide model route calls" \
-    --permissions={permissions}
-fi
-
-# The pool every workspace in this project shares.
-gcloud iam workload-identity-pools describe {POOL} --location=global \
-    --project="$PROJECT" >/dev/null 2>&1 \
-  || gcloud iam workload-identity-pools create {POOL} --location=global \
-    --project="$PROJECT" --display-name="taste-ide"
-
-# This workspace's CA, whose key is in the TPM of the machine that made
-# it, as the provider's only trust anchor.
-TRUST=$(mktemp)
-cat > "$TRUST" <<'ANCHOR'
-trustStore:
-  trustAnchors:
-  - pemCertificate: |
-{anchor}ANCHOR
-if gcloud iam workload-identity-pools providers describe {provider} \
-    --location=global --workload-identity-pool={POOL} \
-    --project="$PROJECT" >/dev/null 2>&1; then
-  gcloud iam workload-identity-pools providers update-x509 {provider} \
-    --location=global --workload-identity-pool={POOL} --project="$PROJECT" \
-    --trust-store-config-path="$TRUST"
-else
-  gcloud iam workload-identity-pools providers create-x509 {provider} \
-    --location=global --workload-identity-pool={POOL} --project="$PROJECT" \
-    --trust-store-config-path="$TRUST" \
-    --attribute-mapping="google.subject=assertion.subject.dn.cn" \
-    --attribute-condition="assertion.subject.dn.cn == '{subject}'"
-fi
-rm -f "$TRUST"
-
-gcloud projects add-iam-policy-binding "$PROJECT" --condition=None --quiet \
-  --role="projects/$PROJECT/roles/{ROLE}" \
-  --member="principal://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/{POOL}/subject/{subject}" \
-  >/dev/null
-
-echo
-echo "Done. Give the IDE this project number: $PROJECT_NUMBER"
-"#
+        "bash -c \"$(cat <<'{END}'\n{shebang}\n\
+         TASTE_PROJECT={project}\n\
+         TASTE_WORKSPACE={id}\n\
+         TASTE_CA_PEM='{ca_pem}'\n\
+         {rest}{END}\n)\"\n",
+        id = ws.id(),
     ))
 }
 
@@ -240,6 +191,24 @@ mod tests {
 
     fn ws() -> Workspace {
         Workspace::new("0a1b2c3d").unwrap()
+    }
+
+    /// The words of a bash array assignment `NAME=( … )` in the script.
+    fn script_array(name: &str) -> Vec<String> {
+        let start = SCRIPT
+            .find(&format!("\n{name}=(\n"))
+            .unwrap_or_else(|| panic!("{name} in the script"));
+        let body = &SCRIPT[start..];
+        let body = &body[body.find('(').unwrap() + 1..body.find(')').unwrap()];
+        body.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn the_script_and_the_ide_agree() {
+        assert_eq!(script_array("PERMISSIONS"), PERMISSIONS);
+        assert_eq!(script_array("SERVICES"), SERVICES);
+        assert!(SCRIPT.contains(&format!("\nPOOL={POOL}\n")));
+        assert!(SCRIPT.contains(&format!("\nROLE={ROLE}\n")));
     }
 
     #[test]
@@ -271,16 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn the_script_trusts_this_ca_alone_and_names_this_subject() {
-        let script = cloud_shell_script(&ws(), "my-project-1", CA).unwrap();
-        assert!(script.contains("      -----BEGIN CERTIFICATE-----\n      MIIBszCCAVmgAwIBAgIU\n"));
-        assert!(script.contains("assertion.subject.dn.cn == 'taste-0a1b2c3d'"));
-        assert!(script.contains("/subject/taste-0a1b2c3d\""));
-        assert!(script.contains("PROJECT=my-project-1\n"));
-        assert_eq!(script.matches("BEGIN CERTIFICATE").count(), 1);
-    }
-
-    #[test]
     fn what_goes_into_the_shell_is_checked() {
         assert!(cloud_shell_script(&ws(), "my-project-1; rm -rf ~", CA).is_err());
         assert!(cloud_shell_script(&ws(), "My-Project", CA).is_err());
@@ -289,15 +248,9 @@ mod tests {
         assert!(cloud_shell_script(&ws(), "my-project-1", &two).is_err());
         let quoted = CA.replace("abc", "a'b");
         assert!(cloud_shell_script(&ws(), "my-project-1", &quoted).is_err());
-    }
-
-    #[test]
-    fn no_anchor_line_can_end_the_heredoc() {
-        // The terminator only counts at column 0, and every anchor line is
-        // indented, so even a body line that spells it stays inside.
-        let spelled = CA.replace("abc", "abc\nANCHOR");
-        let script = cloud_shell_script(&ws(), "my-project-1", &spelled).unwrap();
-        assert_eq!(script.lines().filter(|l| *l == "ANCHOR").count(), 1);
+        // A body line spelling the pasted block's terminator never gets in.
+        let ended = CA.replace("abc", "TASTE_SETUP");
+        assert!(cloud_shell_script(&ws(), "my-project-1", &ended).is_err());
     }
 
     #[test]
@@ -305,6 +258,72 @@ mod tests {
         assert_eq!(
             Federation::new(&ws(), 123456789).audience(),
             "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/taste-ide/providers/taste-0a1b2c3d"
+        );
+    }
+
+    /// Run what the IDE hands out, against a gcloud that records its
+    /// arguments, as a project where nothing exists yet.
+    #[test]
+    fn the_pasted_script_creates_the_provider_and_grants_the_role() {
+        let Ok(bash) = std::process::Command::new("bash").arg("--version").output() else {
+            eprintln!("no bash; skipping");
+            return;
+        };
+        assert!(bash.status.success());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let stub = dir.path().join("gcloud");
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env bash
+echo "$*" >> "$GCLOUD_LOG"
+case "$*" in
+  "projects describe"*) echo 123456789 ;;
+  *" describe "*) exit 1 ;;
+  *create-x509*)
+    for arg in "$@"; do
+      [[ $arg == --trust-store-config-path=* ]] && cp "${arg#*=}" "$GCLOUD_LOG.trust"
+    done ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = cloud_shell_script(&ws(), "my-project-1", CA).unwrap();
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", path)
+            .env("GCLOUD_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("project number: 123456789"));
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("iam roles create tasteIde --project=my-project-1"));
+        assert!(calls.contains("iam workload-identity-pools create taste-ide"));
+        assert!(calls.contains("providers create-x509 taste-0a1b2c3d"));
+        assert!(calls.contains("--attribute-condition=assertion.subject.dn.cn == 'taste-0a1b2c3d'"));
+        assert!(calls.contains(
+            "--member=principal://iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/taste-ide/subject/taste-0a1b2c3d"
+        ));
+        let trust = std::fs::read_to_string(dir.path().join("calls.trust")).unwrap();
+        assert_eq!(
+            trust,
+            "trustStore:\n  trustAnchors:\n  - pemCertificate: |\n      -----BEGIN CERTIFICATE-----\n      MIIBszCCAVmgAwIBAgIU\n      abc+/=\n      -----END CERTIFICATE-----\n"
         );
     }
 }

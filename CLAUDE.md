@@ -74,6 +74,14 @@ content-addressed on the config's bytes, so two projects with identical
 configs share one image and the `taste.workspace` label names only whoever
 built it last — and it touches nothing outside `taste-img-*`.
 
+`build-aux/gcp-setup.sh PROJECT WORKSPACE ca.pem` is the one-time GCP
+setup for the cloud machines (ENVIRONMENTS → "A model on a cloud VM"):
+the APIs, a custom role of exactly the calls the IDE makes, and a
+Workload Identity provider trusting the workspace's TPM-held CA, run as
+the user in Cloud Shell; `--remove` takes a workspace back out. The IDE
+hands out the same file with the values filled in (`taste_gcp::setup`),
+and a test holds its permission list equal to the crate's.
+
 `cargo test --workspace` runs headless the same way. Running the GUI needs
 `--env` forwarding of `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` plus the socket
 mount, or a host GTK stack — or no display at all via GTK Broadway:
