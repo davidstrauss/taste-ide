@@ -47,6 +47,26 @@ build_image() {
         fi
     done
 }
+# Host-side desktop integration for dev runs: GNOME resolves the dock's
+# and the app switcher's icon by matching the window's app id against a
+# desktop file on the host — the icon search path the app adds in-process
+# reaches GTK, never the shell — so the .Devel-badged identity is
+# installed into the user's data dirs on every launch path that runs the
+# dev build. It was only on the container path, so a `--host` launch,
+# which `exec`s the binary before reaching it, showed GNOME's generic
+# icon (David, 2026-10-03). `Exec` reopens the IDE the way it was
+# launched: `$1` is the mode flag, empty for the container path.
+# Idempotent; the packaged Flatpak ships the unbadged identity itself.
+install_desktop_integration() {
+    local id="net.davidstrauss.Taste.Devel" exec="$ROOT/bootstrap.sh"
+    [ -z "${1:-}" ] || exec="$exec $1"
+    install -Dm644 "$ROOT/data/icons/hicolor/scalable/apps/$id.svg" \
+        "$HOME/.local/share/icons/hicolor/scalable/apps/$id.svg"
+    mkdir -p "$HOME/.local/share/applications"
+    sed "s|@BOOTSTRAP@|$exec|" "$ROOT/data/$id.desktop" \
+        > "$HOME/.local/share/applications/$id.desktop"
+}
+
 WAYLAND="${WAYLAND_DISPLAY:-wayland-0}"
 
 # --flatpak: the production build — build, install, and run the real
@@ -71,6 +91,7 @@ fi
 # host (works: libgit2 is vendored). Real portals, real devcontainer
 # supervision; agents run confined in the devcontainer image.
 if [ "${1:-}" = "--host" ]; then
+    install_desktop_integration --host
     build_image
     # :z (shared), never :Z (private). A private relabel stamps this
     # container's own MCS categories onto the workspace, taking it from
@@ -99,16 +120,7 @@ command -v podman >/dev/null || {
     exit 1
 }
 
-# Host-side desktop integration for dev runs: GNOME resolves the app
-# switcher icon by matching the window's app-id against a desktop file on
-# the host, so install the .Devel-badged identity into the user's data
-# dirs. Idempotent; the packaged Flatpak ships the unbadged identity.
-DEV_ID="net.davidstrauss.Taste.Devel"
-install -Dm644 "$ROOT/data/icons/hicolor/scalable/apps/$DEV_ID.svg" \
-    "$HOME/.local/share/icons/hicolor/scalable/apps/$DEV_ID.svg"
-mkdir -p "$HOME/.local/share/applications"
-sed "s|@BOOTSTRAP@|$ROOT/bootstrap.sh|" "$ROOT/data/$DEV_ID.desktop" \
-    > "$HOME/.local/share/applications/$DEV_ID.desktop"
+install_desktop_integration
 
 echo "==> devcontainer image ($IMAGE)"
 build_image
