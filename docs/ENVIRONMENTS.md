@@ -1314,18 +1314,48 @@ want my IDE client to be able to access it").
   type.** `private-model.json` holds an address the user writes. Here the
   address is the VM's ephemeral one, different at every start, the key is
   minted by the IDE at every start, and the certificate is the VM's own,
-  generated at every boot. What the user provides is a **GCP
-  service-account key for this project**, kept as `gcp.json` (`0600`), and
-  the few choices in `cloud-model.json` beside it — project (read off the
-  key), zone, and the monthly cap. Both are IDE state in this project's
-  state directory, never the checkout, for the reason the private model's
-  file gives: an agent that could write them could aim the IDE's own
-  requests, and its own GCP spend, wherever it liked. **Per project, with
-  no fallback, and never imported**: the IDE does not read gcloud's
-  application-default credentials, `GOOGLE_APPLICATION_CREDENTIALS`, or
-  anything under `~/.config/gcloud`. The key is a file the user made for
-  this project and chooses in the settings shade; the IDE never looks for
-  one (David, 2026-09-16: "Always require project-level creds").
+  generated at every boot. What the user provides is a GCP project and a
+  one-time setup, and the few choices in `cloud-model.json` — the project,
+  the zone, and the monthly cap — kept with the identity's certificates
+  in this project's state directory, never the checkout, for the reason
+  the private model's file gives: an agent that could write them could aim
+  the IDE's own requests, and its own GCP spend, wherever it liked. **Per
+  project, with no fallback, and never imported**: the IDE does not read
+  gcloud's application-default credentials, `GOOGLE_APPLICATION_CREDENTIALS`,
+  or anything under `~/.config/gcloud` (David, 2026-09-16: "Always require
+  project-level creds").
+- **The IDE's identity lives in the TPM, and no key exists anywhere
+  else** (David, 2026-10-02: "Would there also be a way to use the TPM or
+  a security key instead of a service account key"). Setup creates three
+  non-exportable keys in this machine's TPM: a certificate authority for
+  this workspace, a leaf that authenticates to Google, and a leaf that
+  authenticates to the VM. The IDE builds their certificates; the private
+  halves never leave the chip, and nothing secret is written to disk. To
+  Google the identity is **Workload Identity Federation with X.509
+  certificates**: the IDE exchanges its leaf over mutual TLS at
+  `sts.mtls.googleapis.com` for an access token good for an hour, and the
+  federated principal holds a least-privilege role on this one project —
+  directly, or through a service account it may impersonate where a
+  service does not accept federated principals. No service-account key
+  is created or uploaded, which matters twice over: organizations created
+  since May 2024 forbid both by default, and a key file is exactly the
+  thing a stolen disk would yield. The setup the user runs is a block of
+  commands the IDE writes out for Cloud Shell — enable the APIs, create the
+  pool and its X.509 provider with this workspace's CA as the trust
+  anchor, grant the role — so the user's own credentials never pass
+  through the IDE at all. The Google leaf lives at most 390 days, the
+  provider's limit, and the IDE renews it before then with the CA key
+  that is still in the TPM, which leaves the provider's trust store
+  unchanged. What it costs: the TPM is reachable only by the `tss` group
+  (`/dev/tpmrm0` is `root:tss 0660`), so the user joins it once — on an
+  rpm-ostree host, after copying the group's line from `/usr/lib/group`
+  into `/etc/group`, since `usermod` reads only the latter — and a new
+  machine, or a cleared TPM, is a new enrollment rather than a restore,
+  which is the point. A PIV security key (a YubiKey 5, not a FIDO2-only
+  key, which cannot sign a TLS handshake) can hold the same three keys
+  instead, at the price of a touch whenever a token renews; the TPM is the
+  default because the attacker this answers is the one with a copy of
+  the disk.
 - **Two machines, and only one of them ever has a way out.** The weights
   are fetched by a **staging VM**: small, on its own network, with egress
   to port 443 and ordinary DNS. It formats the weights disk, downloads the
@@ -1343,24 +1373,36 @@ want my IDE client to be able to access it").
   - no service account, so the metadata server mints it no credentials;
   - no SSH (no rule admits port 22, project keys are blocked, and OS
     Login is off) and no serial console;
-  - ingress on one port only, from the IDE's own public address;
+  - ingress on one port only, from anywhere — answered by a TLS handshake
+    that completes only for this workspace's client certificate;
   - the weights disk attached read-only, and Shielded VM's secure boot.
 - **How the IDE knows it is talking to its VM, and the VM knows it is the
-  IDE.** Three locks, each sufficient against a different attacker. The
-  **address allowlist** keeps the internet's scanners off the TLS
-  terminator, the only thing listening before authentication. The
-  **pinned certificate**: the VM generates its key and a self-signed
-  certificate in `/run` at every boot, so the private key never leaves
-  it, and publishes the certificate's SHA-256 as a guest attribute; the
-  IDE reads the fingerprint through the authenticated Compute API — so
-  the pin comes from Google's API under the project's key, never from the
-  network it protects — and the proxy's TLS verifier accepts that
-  certificate and nothing else. The **rotating key**: 256 random bits the
-  IDE writes into the instance's metadata before each start, which the
-  terminator checks before a byte reaches llama-server. The address
-  allowlist is refreshed at every start, and again whenever a request
-  finds the VM running but unreachable, which is what a laptop that
-  changed networks looks like.
+  IDE: mutual TLS, with no address in it** (David, 2026-10-02: "My IP
+  changes frequently as I move my laptop around"). The **client
+  certificate**: the TLS terminator completes a handshake only for a
+  certificate issued by this workspace's CA, whose key, like the leaf's,
+  is in the TPM — so reaching the model takes this machine's chip, not a
+  file. The **pinned server certificate**: the VM generates its key and a
+  self-signed certificate in `/run` at every boot, so its private key
+  never leaves it either, and publishes the certificate's SHA-256 as a
+  guest attribute; the IDE reads the fingerprint through the
+  authenticated Compute API — so the pin comes from Google's API under
+  the federated identity, never from the network it protects — and the
+  proxy's verifier accepts that certificate and nothing else. The
+  **rotating key**: 256 random bits the IDE writes into the instance's
+  metadata before each start, which llama-server checks too, so a
+  misconfigured terminator is not an open door. Roaming costs nothing:
+  every request is its own connection from wherever the laptop is. What
+  faces the internet before authentication is the terminator's TLS
+  handshake, and that is the residual this design accepts in exchange
+  for the address allowlist it replaced. Three other tunnels were weighed
+  and set aside: SSH, because a key in the TPM would need `tpm2-pkcs11`
+  layered onto the host, and anything else leaves a key on disk; IAP's
+  TCP forwarding, because its protocol is documented only as `gcloud`'s
+  behaviour, which "Intended interfaces only" rules out; and WireGuard,
+  which answers nothing unauthenticated and so would hide even the
+  handshake, but needs a WireGuard and TCP stack inside the IDE — the
+  hardening to reach for if the residual ever has to go.
 - **The guest is the pool's guest.** Fedora CoreOS from the same pinned
   stream the local pool boots (`taste_devcontainer::guest`; the stream
   metadata already carries the GCP image ID for the release), configured
@@ -1378,9 +1420,9 @@ want my IDE client to be able to access it").
 - **Waking is starting.** The private route's hook is the one this uses:
   before a request goes out, the proxy checks that something is listening,
   and on this route "wake" means start the VM rather than send a magic
-  packet. In order: check the cap; mint the key and write it; refresh the
-  allowlist; start; wait for RUNNING; wait for `taste/ready`; read and pin
-  the certificate; send. Every step is a sentence in the chat whose turn
+  packet. In order: check the cap; mint the key and write it; start; wait
+  for RUNNING; wait for `taste/ready`; read and pin the certificate;
+  send. Every step is a sentence in the chat whose turn
   it is (`Event::ChatNotice`), as Wake-on-LAN's are — "Starting GLM-5.3
   on c4-highmem-192 ($12.51/h); the weights take about six minutes to
   load", "ready after 6m40s", "not started: this month's GCP spend is $298
@@ -1410,8 +1452,8 @@ want my IDE client to be able to access it").
   session that crosses it finishes its turn and stops. The ledger is an
   estimate of the bill and is labelled as one — the bill is Cloud
   Billing's — and the settings shade recommends a budget alert on the
-  billing account, which the IDE does not create, because the project's
-  key is given no billing permissions.
+  billing account, which the IDE does not create, because the federated
+  identity is given no billing permissions.
 - **Parking.** A weights disk nobody has started against for fourteen
   days is deleted, since it is most of the standing cost, and the next
   use re-stages it, saying so in the chat. "Remove from GCP" in the shade
@@ -1419,14 +1461,14 @@ want my IDE client to be able to access it").
   carrying its label, and nothing else.
 - **Setting it up.** A Claude Code (GLM-5.3) chat's settings shade
   carries a GCP group in the place the private variant's Private model
-  group sits: the key (a file chooser), the project read off it, the zone
-  (defaulting to the first in the region offering the chosen machine),
-  the cap, and "Set up and test", which runs a preflight before anything
-  is created — the APIs enabled, the key's permissions (asked of the API
-  by name with `testIamPermissions`), the regional vCPU quota for the
-  machine, and a pointer to the organization policy when key creation
-  itself was refused — and reports each miss as a sentence under the
-  rows. Staging's progress is drawn where the guest image's fetch is
+  group sits: the project, the zone (defaulting to the first in the region
+  offering the chosen machine), the cap, and "Set up". Setting up enrolls
+  the TPM identity, says plainly when the TPM cannot be opened and why,
+  and writes out the Cloud Shell commands with a copy button; once they
+  have run, "Test" runs a preflight before anything is created — a token
+  from the federated identity, its permissions (asked of the API by name
+  with `testIamPermissions`), and the regional vCPU quota for the machine
+  — and reports each miss as a sentence under the rows. Staging's progress is drawn where the guest image's fetch is
   drawn, in the backlog's header, from the bytes the staging VM reports.
 - **What this protects, and what it does not.** It protects against the
   serving stack — llama.cpp, its GGUF loader, and anything in the weights
@@ -1441,20 +1483,32 @@ want my IDE client to be able to access it").
     the acceptance test's for the parts of it that are the engine's
     fault;
   - **Google**, whose machine it is;
-  - **the project's own IAM principals**, who can read the key from the
-    instance's metadata. They can also delete the instance, so it is no
-    new power.
+  - **the project's own IAM principals**, who can read the rotating key
+    from the instance's metadata. They can also delete the instance, so
+    it is no new power;
+  - **malware running as the user on this machine**, which can ask the
+    TPM to sign while it runs. It cannot carry the key away, so it loses
+    the identity when it loses the machine.
 
 #### The plan
 
 Each phase ends at a gate it can be judged by, and Phase 4's gate can end
 the plan.
 
-**Phase 1 — `taste-gcp`, the client.** A crate with no GTK: the
-service-account grant (a JWT signed RS256 with `ring`, which rustls
-already brings), REST over the hyper and rustls stack the proxy uses, and
-the Compute, Cloud DNS, Billing Catalog, and IAM permission calls the
-lifecycle needs. Plus the resource plan as data — names, labels, networks,
+**Phase 1 — `taste-gcp`, the client and the identity.** A crate with no
+GTK: the federated grant (the token exchange at `sts.mtls.googleapis.com`
+over a rustls client whose certificate key signs through a hardware
+signer rather than a key in memory), the TPM identity (the three keys,
+the CA, the certificates, the renewal, and the Cloud Shell commands),
+REST over the hyper and rustls stack the proxy uses, and the Compute,
+Cloud DNS, Billing Catalog, and IAM permission calls the lifecycle
+needs. Three things are settled by measuring rather than guessing: how a
+Flatpak reaches the TPM (in-process through the TSS, which needs the
+broad `--device=all`, or the host's `tpm2-tools` through
+`flatpak-spawn`), whether Compute Engine accepts the federated principal
+directly or wants a service account impersonated, and whether the access
+token can be bound to the certificate so that a token lifted from memory
+is useless elsewhere. Plus the resource plan as data — names, labels, networks,
 rules, the policy, the disks, the instances — so what the IDE will create
 can be read and tested before it is created. The same client is what
 "Phase 3 — cloud provisioners" in the substrate plan needs to place
@@ -1476,10 +1530,11 @@ The bake-off costs on the order of a hundred dollars, which is the
 estimate it exists to replace.
 
 **Phase 3 — the route and the lifecycle.** `Route::Cloud` in the proxy,
-its pinned-certificate verifier, waking as starting with its notices, the
-three stopping layers, and the ledger and cap. Gate: the proxy against a
-local TLS fixture with a self-signed certificate (the pin accepted, any
-other certificate refused, a rotated key honoured), and the lifecycle
+its pinned-certificate verifier and client certificate, waking as
+starting with its notices, the three stopping layers, and the ledger and
+cap. Gate: the proxy against a local TLS fixture with a self-signed
+certificate (the pin accepted, any other certificate refused, the client
+certificate demanded and presented, a rotated key honoured), and the lifecycle
 against the mock — including the IDE crashing mid-session, which the
 guest's watchdog has to cover.
 
@@ -1518,23 +1573,16 @@ staging in the backlog's header — each posed under the probe
 (`TASTE_PROBE_CLOUD`: setup, staging, starting, ready, capped) and looked
 at before it ships. The drop-down offers it only in an environment Phase
 5 has cut, so it first appears when both have landed. ARCHITECTURE's
-state table gains `gcp.json`, `cloud-model.json`, and
-`cloud-ledger.json` in the same change.
+state table gains `cloud-model.json`, `cloud-ledger.json`, and the
+identity's certificates in the same change.
 
-**Open, and none of it blocks Phase 1:**
-
-1. Which documented service tells the IDE its own public address for the
-   allowlist. Every candidate has to clear "Intended interfaces only"
-   first; until one does, the IDE refuses to start the VM rather than
-   opening the port to everyone.
-2. Organizations created since 2024 refuse service-account key creation
-   by default. Whether the project needs an exception, or a keyless grant
-   (workload identity federation) the IDE can use instead, is settled by
-   the first real setup.
-3. Claude Code sends background requests (titles, summaries) on whatever
-   route its session is on, and here each one lands on the VM, wakes it,
-   and keeps it awake. Whether its documented settings turn them off
-   (`DISABLE_NON_ESSENTIAL_MODEL_CALLS`) is checked in Phase 3.
+**Settled since the plan was first written (2026-10-02).** The address
+allowlist is gone, replaced by mutual TLS, because the laptop's address
+changes as it moves; the service-account key is gone, replaced by the
+TPM-held federated identity, which also disposes of the 2024 key
+policies; and Claude Code's background requests (titles, summaries)
+landing on the VM and keeping it awake is accepted as they are (David:
+"I don't see a problem with background requests").
 
 ### Subscription usage
 

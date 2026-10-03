@@ -301,19 +301,74 @@ well under a dollar of compute).
   network path out: written to the metadata server by IP (DNS being dead),
   read back by the IDE through the authenticated Compute API.
 
-## Open questions
+## What the cap buys
 
-These are carried into ENVIRONMENTS → the plan, and none blocks Phase 1:
+An estimate, from the prices above and before any measurement. Standing
+costs (the weights disk) take ~$50–100 of $300, leaving ~$200–250 of
+running time in a 730-hour month:
 
-1. Which **documented** service reports the IDE's public address for the
-   ingress allowlist. Candidates exist (Google's `o-o.myaddr.l.google.com`
-   TXT record, STUN, the caller IP in the project's own audit log); each
-   has to clear the "intended interfaces only" rule before it is used.
-2. Whether the user's organization allows **service-account keys** at
-   all: organizations created since 2024 enforce
-   `iam.disableServiceAccountKeyCreation` by default, and the project
-   then needs an exception.
-3. Whether Claude Code's background small-model calls can be turned off
-   through its documented settings (`DISABLE_NON_ESSENTIAL_MODEL_CALLS`),
-   since on this route every request — a title, a summary — lands on the
-   VM and keeps it awake.
+| Machine | Rate | Hours | Share of the month | Per working day (22) |
+| --- | --- | --- | --- | --- |
+| `c4-highmem-192` | $12.51/h | 16–20 | 2.2–2.7% | ~45–55 min |
+| `c4d-highmem-192` | $11.95/h | 17–21 | 2.3–2.9% | ~45–55 min |
+| `g4-standard-192` | $18.00/h | 11–14 | 1.5–1.9% | ~30–40 min |
+
+At the CPU estimate of $25–55 per mid-size task that is roughly four to
+ten tasks a month, and each session also pays ~$4.50 of overhead (a
+~6-minute cold load and the 15-minute idle tail). $300 is a low cap for
+regular use; it stays the default until Phase 2's measurements say what a
+task actually costs.
+
+## Credentials and the tunnel (2026-10-02)
+
+Two requests from David reshaped the access design: "My IP changes
+frequently as I move my laptop around", and "Would there also be a way to
+use the TPM or a security key instead of a service account key".
+
+**Service-account keys are out twice over.** Organizations created on or
+after 2024-05-03 enforce secure-by-default policies that disable both
+service-account key **creation** and key **upload**
+([secure by default organizations](https://cloud.google.com/resource-manager/docs/secure-by-default-organizations),
+[baseline constraints](https://docs.cloud.google.com/resource-manager/docs/manage-baseline-constraints)),
+so "generate the key in hardware and upload its public half" hits the
+same wall as a downloaded key.
+
+**Workload Identity Federation with X.509 certificates is the keyless
+path**, and it is GA
+([docs](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-x509-certificates)):
+
+| Fact | Value |
+| --- | --- |
+| Keys | RSA 2048–4096, or ECDSA P-256 or P-384 |
+| Chain | depth at most 5; up to 3 trust anchors and 10 intermediates |
+| Leaf | `keyUsage=critical, digitalSignature, keyEncipherment`; `basicConstraints=critical, CA:FALSE`; valid at most 390 days |
+| Subject mapping | `google.subject` from the subject CN by default, or a SAN, serial, or fingerprint |
+| Exchange | `POST https://sts.mtls.googleapis.com/v1/token` over mTLS, `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, `subject_token_type=urn:ietf:params:oauth:token-type:mtls`, `subject_token` a JSON array of base64 DER certificates, leaf first |
+| Access | the federated principal directly (`principal://iam.googleapis.com/projects/N/locations/global/workloadIdentityPools/P/subject/S`), or by impersonating a service account |
+
+A token bound to the certificate, so that one lifted from memory is
+useless elsewhere, is described as possible
+([mtls-tokensource](https://github.com/salrashid123/mtls-tokensource))
+and is for Phase 1 to confirm.
+
+**This host's TPM** (read 2026-10-03):
+
+| Fact | Value |
+| --- | --- |
+| Device | TPM 2.0 (`/sys/class/tpm/tpm0/tpm_version_major` is 2) |
+| Access | `/dev/tpmrm0` is `root:tss 0660`; the user is not in `tss` |
+| The group | defined only in `/usr/lib/group` (`tss:x:59:clevis`), so on rpm-ostree `usermod -aG tss` needs the line copied into `/etc/group` first |
+| Software on the host | `tpm2-tss` 4.1.3 and `tpm2-tools` 5.7; no `tpm2-pkcs11` |
+| OpenSSH | 10.2p1 with `libfido2` 1.16.0, so `ed25519-sk` keys work; a TPM-held key would need `tpm2-pkcs11` |
+| The IDE's ssh | run on the host (`flatpak-spawn --host` when sandboxed, `taste_core::podman::host_argv`) |
+
+**The tunnel, weighed.** Without an address allowlist, the port is open
+to everyone and authentication carries all of it:
+
+| Option | Roaming | Before authentication, the internet sees | Verdict |
+| --- | --- | --- | --- |
+| **Mutual TLS, client key in the TPM** | every request is its own connection | the terminator's TLS handshake | **Chosen**: one hardware identity serves Google and the VM; nothing secret on disk; no tunnel process |
+| SSH port-forward | reconnect on the next request | sshd | Set aside: the key is on disk unless `tpm2-pkcs11` is layered onto the host |
+| IAP TCP forwarding | not applicable; no public IP | only Google | Set aside: the tunnel protocol is implemented by `gcloud` and IAP Desktop and documented by neither ([IAP Desktop](https://github.com/GoogleCloudPlatform/iap-desktop)) |
+| WireGuard | native | nothing; it does not answer unauthenticated packets | Set aside for now: needs a WireGuard and TCP stack in-process; the hardening if the TLS residual has to go |
+
