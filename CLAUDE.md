@@ -202,8 +202,8 @@ without a microphone and a model;
 cloud popover (`cloud_form.rs`) and opens it (`unset`, `fetching` — the
 IDE's own gcloud partway down —, `no-account` — signed in, the setup not
 yet run —, `missing` — a test that found the role short —, `quota` —
-ready, but the project's quotas too low for GLM-5.3's machines, with
-Request More Quota… —, or ready by default), since every real state of it needs a
+ready, but the project's quotas too low for a cloud environment host,
+with Request More Quota… —, or ready by default), since every real state of it needs a
 Google account and a project; with `TASTE_PROBE_SYNC` the badge shows
 the worse of the two;
 `TASTE_PROBE_CLOSING=1` poses the window as a close leaves it, the

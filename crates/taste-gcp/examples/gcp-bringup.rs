@@ -17,7 +17,7 @@
 //! the IDE finds the sign-in there later. `setup` runs
 //! `build-aux/gcp-setup.sh` with it, as you. `check` asks the project, as
 //! the service account, which of the role's permissions it holds, and
-//! whether the quotas let GLM-5.3's machines be created; it creates
+//! whether the quotas let a cloud environment host be created; it creates
 //! nothing, so it costs nothing.
 //!
 //! `smoke` proves the whole model route with a small model, gpt-oss-20b
@@ -218,9 +218,13 @@ async fn main() -> Result<()> {
                 setup::service_account(project),
                 PERMISSIONS.len()
             );
-            let spec = &model::GLM_5_3;
-            for machine in std::iter::once(spec.machine.name).chain(spec.fallbacks.iter().copied())
-            {
+            let hosts = taste_gcp::hosts::HOST_FALLBACKS;
+            for machine in std::iter::once(taste_gcp::hosts::HOST_MACHINE).chain(
+                hosts
+                    .iter()
+                    .copied()
+                    .filter(|m| *m != taste_gcp::hosts::HOST_MACHINE),
+            ) {
                 let short =
                     taste_gcp::quota::shortfalls(&gcp, project, model::DEFAULT_REGION, machine)
                         .await?;

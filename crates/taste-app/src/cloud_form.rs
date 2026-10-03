@@ -23,9 +23,9 @@
 //!   account holding it, and the user's leave to act as it.
 //! - **Test Connection** asks Google, *as that service account*, which of
 //!   the role's permissions it holds — the impersonation every later call
-//!   makes — and then whether the project's quotas let GLM-5.3's machines
-//!   be created at all (David, 2026-10-03: "I want to know, as a user, if
-//!   a quota is too low"), naming each one short with its limit and the
+//!   makes — and then whether the project's quotas let a cloud environment
+//!   host be created at all (David, 2026-10-03: "I want to know, as a user,
+//!   if a quota is too low"), naming each one short with its limit and the
 //!   need, and offering **Request More Quota…**, Google's own page for
 //!   asking. It also runs on its own at launch for a project that is
 //!   signed in, so the badge says how the connection stands rather than
@@ -46,7 +46,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::chat::Verdict;
-use taste_gcp::{gcloud, model, project, quota, rest, setup};
+use taste_gcp::{gcloud, hosts, model, project, quota, rest, setup};
 
 /// The console tab titles, which the window routes back here when the tab
 /// exits (`Event::CommandTabExited`).
@@ -561,7 +561,7 @@ impl CloudForm {
             // The quotas are asked only of a role that may ask them.
             let quotas = if all_held {
                 Some(
-                    glm_quotas(&gcp, &project_for_task)
+                    host_quotas(&gcp, &project_for_task)
                         .await
                         .map_err(|e| format!("{e:#}")),
                 )
@@ -655,16 +655,17 @@ impl CloudForm {
         });
     }
 
-    /// The test's last word when the permissions are all held: ready, or
-    /// ready but with quotas too low for the model's first machine — each
-    /// one short named in the line, every candidate's in its tooltip, and
-    /// Google's page for asking one click away.
+    /// The test's last word when the permissions are all held: ready while
+    /// any host machine fits the quotas — the provisioner tries them in
+    /// turn — or ready but with quotas too low for every one of them, the
+    /// first's shortfalls named in the line, every machine's in its
+    /// tooltip, and Google's page for asking one click away.
     fn say_quotas(&self, project_id: &str, machines: &[(String, Vec<quota::Shortfall>)]) {
         let Some((first, short)) = machines.first() else {
             self.say(Verdict::Pass, &ready_sentence("", project_id));
             return;
         };
-        if short.is_empty() {
+        if machines.iter().any(|(_, short)| short.is_empty()) {
             self.say(Verdict::Pass, &ready_sentence("", project_id));
             return;
         }
@@ -739,15 +740,18 @@ impl CloudForm {
                     "my-project-123",
                     &[
                         (
-                            "c4-highmem-192".into(),
+                            "n4-standard-8".into(),
                             vec![
-                                short("vCPUs in all regions", 32, 192),
-                                short("C4 vCPUs in us-central1", 24, 192),
+                                short("vCPUs in all regions", 4, 8),
+                                short("N4 vCPUs in us-central1", 0, 8),
                             ],
                         ),
                         (
-                            "g4-standard-192".into(),
-                            vec![short("NVIDIA RTX PRO 6000 GPUs in us-central1", 0, 4)],
+                            "c4-standard-8".into(),
+                            vec![
+                                short("vCPUs in all regions", 4, 8),
+                                short("C4 vCPUs in us-central1", 0, 8),
+                            ],
                         ),
                     ],
                 );
@@ -788,15 +792,21 @@ fn still_applying(said: &str) -> bool {
     said.contains("iam.serviceAccounts.getAccessToken") && said.contains("PERMISSION_DENIED")
 }
 
-/// GLM-5.3's machines, first choice first, each with the quotas too low
-/// for it in the region the machines go to.
-async fn glm_quotas(
+/// The machines a cloud environment host is made on, first choice first
+/// (`taste_gcp::hosts`), each with the quotas too low for it in the
+/// region hosts go to.
+async fn host_quotas(
     gcp: &rest::Gcp,
     project_id: &str,
 ) -> anyhow::Result<Vec<(String, Vec<quota::Shortfall>)>> {
-    let spec = &model::GLM_5_3;
     let mut machines = Vec::new();
-    for machine in std::iter::once(spec.machine.name).chain(spec.fallbacks.iter().copied()) {
+    let candidates = std::iter::once(hosts::HOST_MACHINE).chain(
+        hosts::HOST_FALLBACKS
+            .iter()
+            .copied()
+            .filter(|m| *m != hosts::HOST_MACHINE),
+    );
+    for machine in candidates {
         let short = quota::shortfalls(gcp, project_id, model::DEFAULT_REGION, machine).await?;
         machines.push((machine.to_string(), short));
     }
@@ -813,8 +823,7 @@ fn quota_sentence(machine: &str, short: &[quota::Shortfall]) -> String {
         .map(|s| format!("{}: {}, needs {}", s.need.label, s.limit, s.need.amount))
         .collect();
     format!(
-        "Ready, but quotas are too low for {} on {}. {}",
-        model::GLM_5_3.label,
+        "Ready, but quotas are too low for a cloud environment host on {}. {}",
         machine.replace('-', "\u{2011}"),
         listed.join("; ")
     )
@@ -830,16 +839,16 @@ mod quota_tests {
             need: quota::Need {
                 quota_id: "CPUS-ALL-REGIONS-per-project".into(),
                 dimensions: Vec::new(),
-                amount: 192,
+                amount: 8,
                 label: "vCPUs in all regions".into(),
             },
-            limit: 32,
+            limit: 4,
         };
-        let said = quota_sentence("c4-highmem-192", &[short]);
+        let said = quota_sentence("n4-standard-8", &[short]);
         assert_eq!(
             said,
-            "Ready, but quotas are too low for GLM-5.3 on c4\u{2011}highmem\u{2011}192. \
-             vCPUs in all regions: 32, needs 192"
+            "Ready, but quotas are too low for a cloud environment host on \
+             n4\u{2011}standard\u{2011}8. vCPUs in all regions: 4, needs 8"
         );
     }
 }
