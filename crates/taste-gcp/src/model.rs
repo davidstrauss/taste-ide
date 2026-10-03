@@ -17,6 +17,7 @@ use crate::resources::{
     self, Action, Attached, Direction, DiskPerformance, DiskSpec, FirewallSpec, ImageRef,
     InstanceSpec, Location, Maintenance, OnMaxRun, Traffic, Workspace,
 };
+use crate::rest::Gcp;
 
 /// One file of the pinned weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +357,41 @@ pub fn plan(
     })
 }
 
+/// Create everything the machines stand on — networks, subnets, rules,
+/// the DNS black hole, and the weights disk — in an order where no way out
+/// exists even for a moment: each network's deny rule is created before
+/// the rule that admits anything. Every step is an `ensure`, so running it
+/// again finishes what a failure interrupted. It does not repair a
+/// resource that exists but differs from the plan; that is the
+/// reconciliation Phase 3 adds.
+pub async fn ensure_foundation(gcp: &Gcp, loc: &Location, plan: &ModelPlan) -> Result<()> {
+    let project = &loc.project;
+    for network in &plan.networks {
+        gcp.ensure_compute(&format!("projects/{project}/global/networks"), network)
+            .await?;
+    }
+    for subnetwork in &plan.subnetworks {
+        gcp.ensure_compute(
+            &format!("projects/{project}/regions/{}/subnetworks", loc.region),
+            subnetwork,
+        )
+        .await?;
+    }
+    let mut firewalls: Vec<&Value> = plan.firewalls.iter().collect();
+    firewalls.sort_by_key(|rule| rule.get("allowed").is_some());
+    for rule in firewalls {
+        gcp.ensure_compute(&format!("projects/{project}/global/firewalls"), rule)
+            .await?;
+    }
+    gcp.ensure_dns_policy(project, &plan.dns_policy).await?;
+    gcp.ensure_compute(
+        &format!("projects/{project}/zones/{}/disks", loc.zone),
+        &plan.weights_disk,
+    )
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +570,97 @@ mod tests {
         for labelled in [&plan.weights_disk, &plan.staging, &plan.serving] {
             assert_eq!(labelled["labels"][resources::WORKSPACE_LABEL], "0a1b2c3d");
         }
+    }
+
+    #[tokio::test]
+    async fn the_foundation_denies_before_it_allows() {
+        use crate::rest::mock::{gcp, serve};
+        let done = || {
+            json!({
+                "name": "op",
+                "status": "DONE",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/proj/global/operations/op",
+            })
+        };
+        let mock = serve(vec![
+            (
+                "POST",
+                "/compute/v1/projects/proj/global/networks",
+                200,
+                done(),
+            ),
+            (
+                "POST",
+                "/compute/v1/projects/proj/global/networks",
+                200,
+                done(),
+            ),
+            (
+                "POST",
+                "/compute/v1/projects/proj/regions/us-central1/subnetworks",
+                200,
+                done(),
+            ),
+            (
+                "POST",
+                "/compute/v1/projects/proj/regions/us-central1/subnetworks",
+                200,
+                done(),
+            ),
+            (
+                "POST",
+                "/compute/v1/projects/proj/global/firewalls",
+                200,
+                done(),
+            ),
+            (
+                "POST",
+                "/compute/v1/projects/proj/global/firewalls",
+                200,
+                done(),
+            ),
+            (
+                "POST",
+                "/compute/v1/projects/proj/global/firewalls",
+                200,
+                done(),
+            ),
+            (
+                "POST",
+                "/compute/v1/projects/proj/global/firewalls",
+                200,
+                done(),
+            ),
+            ("POST", "/dns/v1/projects/proj/policies", 200, json!({})),
+            (
+                "POST",
+                "/compute/v1/projects/proj/zones/us-central1-a/disks",
+                200,
+                done(),
+            ),
+        ])
+        .await;
+        let plan = fixture(&CANDIDATES[0]);
+        let loc = Location::new("proj", "us-central1-a").unwrap();
+        ensure_foundation(&gcp(&mock), &loc, &plan).await.unwrap();
+
+        let asked = mock.asked.lock().unwrap();
+        let rules: Vec<&Value> = asked
+            .iter()
+            .filter(|a| a.path.ends_with("/firewalls"))
+            .map(|a| a.body.as_ref().unwrap())
+            .collect();
+        let first_allow = rules
+            .iter()
+            .position(|r| r.get("allowed").is_some())
+            .unwrap();
+        assert!(rules[..first_allow]
+            .iter()
+            .all(|r| r.get("denied").is_some()));
+        assert_eq!(first_allow, 2, "both denies before either allow");
+        assert_eq!(
+            asked.last().unwrap().body.as_ref(),
+            Some(&plan.weights_disk)
+        );
     }
 }

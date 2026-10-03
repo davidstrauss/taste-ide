@@ -30,6 +30,9 @@
 //!   and one for the model's VM.
 //! - [`sts`]: trading the Google leaf for an access token over mutual TLS
 //!   (Workload Identity Federation with X.509 certificates).
+//! - [`rest`]: Google's APIs as that identity — tokens renewed before they
+//!   lapse, failures read into a typed error, and Compute's operations
+//!   awaited to their end.
 //!
 //! No GTK, and no IO in the builders: a plan is values, and creating it is
 //! the caller's business.
@@ -37,6 +40,7 @@
 pub mod identity;
 pub mod model;
 pub mod resources;
+pub mod rest;
 pub mod setup;
 pub mod signer;
 pub mod sts;
