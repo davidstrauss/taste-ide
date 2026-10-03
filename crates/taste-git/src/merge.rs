@@ -112,6 +112,79 @@ impl GitWorkspace {
     /// at all: the review flow's merge. A branch the current one has moved
     /// past comes back as [`MergeStatus::NotFastForward`] with nothing
     /// written, naming how many commits it is behind.
+    /// The branch HEAD names while it has no commit yet — a repository
+    /// whose first commit has not happened — or `None` when HEAD names a
+    /// commit or nothing at all.
+    pub fn unborn_branch(&self) -> Option<String> {
+        if self.repo.head().is_ok() {
+            return None;
+        }
+        self.head_ref_name()?
+            .strip_prefix("refs/heads/")
+            .map(str::to_string)
+    }
+
+    /// Bring a branch's first commit into a folder whose branch has none
+    /// yet: the index set to `commit`'s tree, each file the folder does not
+    /// have written from it, and the branch pointed at it last. A file the
+    /// folder already has is never overwritten — a version of its own
+    /// shows as a change, which is what it is.
+    ///
+    /// Moving only the branch, as the sync used to for a branch it took to
+    /// be checked out elsewhere, left an empty index and the folder's files
+    /// as they were, so every file of the commit the folder lacked read as
+    /// one the folder had deleted — and the mirror sends the folder's
+    /// changes to the checkout first (2026-10-04: a project's first commit,
+    /// made in Personal, deleted its ten files there and then here).
+    pub fn adopt_first_commit(&self, branch: &str, commit: git2::Oid) -> Result<()> {
+        let head = self
+            .head_ref_name()
+            .context("HEAD names no branch, so there is nothing to bring the commit to")?;
+        if head != format!("refs/heads/{branch}") || self.repo.head().is_ok() {
+            bail!("{branch} is not this folder's branch-without-commits");
+        }
+        let tree = self.repo.find_commit(commit)?.tree()?;
+        let mut index = self.repo.index()?;
+        index.read_tree(&tree)?;
+        index.write()?;
+        let mut missing: Vec<(PathBuf, git2::Oid, i32)> = Vec::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                let rel = PathBuf::from(dir).join(entry.name().unwrap_or_default());
+                if std::fs::symlink_metadata(self.workdir.join(&rel)).is_err() {
+                    missing.push((rel, entry.id(), entry.filemode()));
+                }
+            }
+            git2::TreeWalkResult::Ok
+        })?;
+        for (rel, id, mode) in missing {
+            let path = self.workdir.join(&rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let blob = self.repo.find_blob(id)?;
+            if mode == i32::from(git2::FileMode::Link) {
+                let target = std::str::from_utf8(blob.content())
+                    .context("a symlink target that is not UTF-8")?;
+                std::os::unix::fs::symlink(target, &path)?;
+            } else {
+                std::fs::write(&path, blob.content())
+                    .with_context(|| format!("writing {}", path.display()))?;
+                if mode == i32::from(git2::FileMode::BlobExecutable) {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+                }
+            }
+        }
+        self.repo.reference(
+            &head,
+            commit,
+            true,
+            "taste-ide: the branch's first commit, brought into the folder",
+        )?;
+        Ok(())
+    }
+
     pub fn fast_forward_branch(&self, branch: &str) -> Result<MergeOutcome> {
         self.merge_with(branch, MergePolicy::FastForwardOnly)
     }
@@ -296,6 +369,99 @@ mod tests {
         drop(index);
         let git = GitWorkspace::discover(dir.path()).unwrap();
         (dir, git)
+    }
+
+    /// A folder whose branch has no commit yet takes its first commit
+    /// whole: the files it lacks written, the index the commit's, the
+    /// branch at it — and nothing reads as deleted.
+    #[test]
+    fn a_first_commit_comes_into_a_folder_with_none() {
+        // Where the commit is made: a second repository, as Personal is.
+        let made = tempfile::tempdir().unwrap();
+        let theirs = git2::Repository::init(made.path()).unwrap();
+        std::fs::create_dir_all(made.path().join(".devcontainer")).unwrap();
+        std::fs::write(made.path().join("Taskfile.yml"), "version: 3\n").unwrap();
+        std::fs::write(made.path().join(".devcontainer/run"), "#!/bin/sh\n").unwrap();
+        let mut index = theirs.index().unwrap();
+        index.add_path(Path::new("Taskfile.yml")).unwrap();
+        index.add_path(Path::new(".devcontainer/run")).unwrap();
+        let tree = theirs.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@example.invalid").unwrap();
+        let commit = theirs
+            .commit(None, &sig, &sig, "first", &tree, &[])
+            .unwrap();
+
+        // The folder: no commit, one file of its own, and none of the
+        // commit's.
+        let folder = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(folder.path()).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        std::fs::write(folder.path().join("notes.txt"), "mine\n").unwrap();
+        // The commit's objects, as a fetch would bring them.
+        let odb = repo.odb().unwrap();
+        let their_odb = theirs.odb().unwrap();
+        for oid in [commit, tree.id()] {
+            let object = their_odb.read(oid).unwrap();
+            odb.write(object.kind(), object.data()).unwrap();
+        }
+        for entry in ["Taskfile.yml", ".devcontainer/run"] {
+            let id = tree.get_path(Path::new(entry)).unwrap().id();
+            let object = their_odb.read(id).unwrap();
+            odb.write(object.kind(), object.data()).unwrap();
+        }
+        let sub = tree.get_path(Path::new(".devcontainer")).unwrap().id();
+        let object = their_odb.read(sub).unwrap();
+        odb.write(object.kind(), object.data()).unwrap();
+
+        let git = GitWorkspace::discover(folder.path()).unwrap();
+        assert_eq!(git.unborn_branch().as_deref(), Some("main"));
+        git.adopt_first_commit("main", commit).unwrap();
+        assert_eq!(git.unborn_branch(), None);
+        assert_eq!(git.read_ref("refs/heads/main").unwrap(), Some(commit));
+        assert_eq!(
+            std::fs::read_to_string(folder.path().join("Taskfile.yml")).unwrap(),
+            "version: 3\n"
+        );
+        // Nothing of the commit reads as deleted or changed; the folder's
+        // own file is still its own.
+        let status = git.status().unwrap();
+        assert_eq!(status.len(), 1, "{status:?}");
+        assert!(status.contains_key(Path::new("notes.txt")));
+    }
+
+    /// A file the folder already has keeps the folder's version.
+    #[test]
+    fn a_first_commit_never_overwrites_the_folders_own_file() {
+        let made = tempfile::tempdir().unwrap();
+        let theirs = git2::Repository::init(made.path()).unwrap();
+        std::fs::write(made.path().join("a.txt"), "theirs\n").unwrap();
+        let mut index = theirs.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        let tree = theirs.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@example.invalid").unwrap();
+        let commit = theirs
+            .commit(None, &sig, &sig, "first", &tree, &[])
+            .unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(folder.path()).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        std::fs::write(folder.path().join("a.txt"), "mine\n").unwrap();
+        let odb = repo.odb().unwrap();
+        let their_odb = theirs.odb().unwrap();
+        for oid in [
+            commit,
+            tree.id(),
+            tree.get_path(Path::new("a.txt")).unwrap().id(),
+        ] {
+            let object = their_odb.read(oid).unwrap();
+            odb.write(object.kind(), object.data()).unwrap();
+        }
+        let git = GitWorkspace::discover(folder.path()).unwrap();
+        git.adopt_first_commit("main", commit).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(folder.path().join("a.txt")).unwrap(),
+            "mine\n"
+        );
     }
 
     fn branch_with(git: &GitWorkspace, name: &str, files: &[(&str, &str)]) {

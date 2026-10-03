@@ -547,8 +547,12 @@ pub fn sync_primary_peer_with(
     fetch_from_guest(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS)?;
     let git = taste_git::GitWorkspace::discover(peer)
         .with_context(|| format!("{} is not a git working tree", peer.display()))?;
+    // A folder whose branch has no commit yet is still on that branch: the
+    // name HEAD gives it is the one to follow, or its first commit is taken
+    // for a branch checked out elsewhere and only the ref moves.
+    let unborn = git.unborn_branch();
     let mut sync = PeerSync {
-        branch: git.branch_name(),
+        branch: git.branch_name().or_else(|| unborn.clone()),
         ..PeerSync::default()
     };
     // The branch the checkout is on, from its own HEAD: the one the
@@ -569,6 +573,15 @@ pub fn sync_primary_peer_with(
         let branch = &name[VM_BRANCH_NAMESPACE.len()..];
         let local = format!("refs/heads/{branch}");
         let mine = git.read_ref(&local)?;
+        // The folder's branch, with no commit yet: its first arrives whole —
+        // files, index, and branch together — rather than as a moved ref
+        // over a folder that then reads as having deleted every file in it.
+        if mine.is_none() && unborn.as_deref() == Some(branch) {
+            git.adopt_first_commit(branch, oid)
+                .with_context(|| format!("bringing {branch}'s first commit into the folder"))?;
+            sync.fast_forwarded = true;
+            continue;
+        }
         if Some(branch) != sync.branch.as_deref() {
             // Not checked out here: the checkout moves it, but only
             // FORWARD. Forced, as it was, the checkout could reset a branch
