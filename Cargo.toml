@@ -11,6 +11,7 @@ members = [
     "crates/taste-mcp",
     "crates/taste-voice",
     "crates/taste-models",
+    "crates/taste-gcp",
     "crates/taste-semantic",
     "crates/taste-embed",
     "crates/taste-app",
@@ -33,6 +34,7 @@ taste-fleetlink = { path = "crates/taste-fleetlink" }
 taste-mcp = { path = "crates/taste-mcp" }
 taste-voice = { path = "crates/taste-voice" }
 taste-models = { path = "crates/taste-models" }
+taste-gcp = { path = "crates/taste-gcp" }
 taste-semantic = { path = "crates/taste-semantic" }
 
 anyhow = "1"
