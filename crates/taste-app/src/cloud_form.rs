@@ -87,6 +87,9 @@ pub struct CloudForm {
     busy: Cell<bool>,
     /// A probe has posed the section; nothing real overwrites it.
     posed: Cell<bool>,
+    /// Tests run again on their own while Google applies a new grant
+    /// ([`still_applying`]): how many so far.
+    retries: Cell<u32>,
     on_light: RefCell<Option<LightHook>>,
 }
 
@@ -193,7 +196,22 @@ impl CloudForm {
             account: RefCell::new(None),
             busy: Cell::new(false),
             posed: Cell::new(false),
+            retries: Cell::new(0),
             on_light: RefCell::new(None),
+        });
+        // A popover focuses its first focusable child, and an entry that
+        // takes focus selects all of itself, which reads as a field about
+        // to be overwritten. The caret goes to the end instead — whenever
+        // the field gains focus, since when GTK selects relative to an
+        // opening is not something to race.
+        form.project.connect_has_focus_notify(|entry| {
+            if entry.has_focus() {
+                let entry = entry.clone();
+                glib::idle_add_local_once(move || {
+                    let end = entry.text_length() as i32;
+                    entry.select_region(end, end);
+                });
+            }
         });
         let weak = Rc::downgrade(&form);
         form.project.connect_changed(move |_| {
@@ -216,6 +234,7 @@ impl CloudForm {
         let weak = Rc::downgrade(&form);
         form.test.connect_clicked(move |_| {
             if let Some(form) = weak.upgrade() {
+                form.retries.set(0);
                 form.run_test();
             }
         });
@@ -223,16 +242,10 @@ impl CloudForm {
         form
     }
 
-    /// The popover just opened, and GTK focused the project field and
-    /// selected all of it, which reads as a field about to be overwritten.
-    /// The caret goes to the end instead; the focus stays, for the keyboard.
-    pub fn popped_up(&self) {
-        let project = self.project.clone();
-        glib::idle_add_local_once(move || {
-            let end = project.text_length() as i32;
-            project.select_region(end, end);
-        });
-    }
+    /// The popover just opened. What keeps its project field from opening
+    /// selected is the focus handler in [`Self::new`]; this is the hook for
+    /// anything else an opening should do.
+    pub fn popped_up(&self) {}
 
     /// The window is closing: the section shows where the connection
     /// stands — its header and its verdict — and nothing that would start
@@ -259,6 +272,14 @@ impl CloudForm {
     /// Asking for a project nobody has named is quiet: a project with no
     /// cloud is not one with a problem.
     fn say(&self, verdict: Verdict, text: &str) {
+        self.say_more(verdict, text, None);
+    }
+
+    /// [`Self::say`], with the whole of a long story in the line's tooltip:
+    /// gcloud's errors run to a paragraph, and a popover's status line is
+    /// a sentence.
+    fn say_more(&self, verdict: Verdict, text: &str, whole: Option<&str>) {
+        self.status_text.set_tooltip_text(whole);
         for class in ["off", "green", "red", "amber"] {
             self.status_dot.remove_css_class(class);
         }
@@ -409,7 +430,12 @@ impl CloudForm {
                 Ok(gcloud) => gcloud,
                 Err(error) => {
                     form.set_busy(false);
-                    form.say(Verdict::Fail, &format!("Couldn't start: {error:#}"));
+                    let whole = format!("{error:#}");
+                    form.say_more(
+                        Verdict::Fail,
+                        &format!("Couldn't start: {}", gcloud::first_sentence(&whole)),
+                        Some(&whole),
+                    );
                     return;
                 }
             };
@@ -488,11 +514,18 @@ impl CloudForm {
             if !binary.exists() {
                 anyhow::bail!("the IDE's gcloud is not fetched yet — sign in first");
             }
-            let tokens =
-                rest::TokenSource::gcloud(project::gcloud(&state_dir, binary, &project_for_task));
+            let gcloud = project::gcloud(&state_dir, binary, &project_for_task);
+            // Asked as the user first: impersonating an account the setup
+            // has not made yet fails in a paragraph about roles, when the
+            // answer is one step away.
+            if gcloud.service_account_exists().await? == Some(false) {
+                return Ok(None);
+            }
+            let tokens = rest::TokenSource::gcloud(gcloud);
             let gcp = rest::Gcp::new(Arc::new(tokens), rest::Endpoints::default());
             gcp.test_permissions(&project_for_task, setup::PERMISSIONS)
                 .await
+                .map(Some)
         });
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -503,22 +536,69 @@ impl CloudForm {
             let Some(form) = weak.upgrade() else { return };
             form.set_busy(false);
             match result {
-                Ok(held) => {
+                Ok(None) => form.say(
+                    Verdict::Attention,
+                    &format!(
+                        "Signed in · Set Up Project creates {}, the account the IDE acts as, \
+                         which {project_id} does not have yet",
+                        setup::ACCOUNT
+                    ),
+                ),
+                Ok(Some(held)) => {
                     let missing: Vec<&str> = setup::PERMISSIONS
                         .iter()
                         .copied()
                         .filter(|p| !held.iter().any(|h| h == p))
                         .collect();
+                    form.retries.set(0);
                     if missing.is_empty() {
                         form.say(Verdict::Pass, &ready_sentence(&account, &project_id));
                     } else {
                         form.say(Verdict::Fail, &missing_sentence(&missing));
                     }
                 }
-                Err(error) => form.say(
-                    Verdict::Fail,
-                    &format!("{error:#} — Set Up Project, then test again"),
-                ),
+                Err(error) => {
+                    let whole = format!("{error:#}");
+                    if still_applying(&whole) && form.retries.get() < APPLY_RETRIES {
+                        // The setup just granted the user leave to act as
+                        // the account, and Google takes minutes to apply a
+                        // grant: what reads as "denied" is "not yet".
+                        form.retries.set(form.retries.get() + 1);
+                        form.say_more(
+                            Verdict::Attention,
+                            &format!(
+                                "Google is still applying your permission to act as {} — \
+                                 grants take up to seven minutes. Testing again in {}s.",
+                                setup::ACCOUNT,
+                                APPLY_RETRY_EVERY.as_secs()
+                            ),
+                            Some(&whole),
+                        );
+                        let weak = Rc::downgrade(&form);
+                        glib::timeout_add_local_once(APPLY_RETRY_EVERY, move || {
+                            if let Some(form) = weak.upgrade() {
+                                if !form.busy.get() {
+                                    form.run_test();
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    let advice = if still_applying(&whole) {
+                        format!(
+                            "You still may not act as {} after seven minutes. Set Up Project \
+                             grants it — run it again, signed in as the account that should \
+                             use the IDE.",
+                            setup::ACCOUNT
+                        )
+                    } else {
+                        format!(
+                            "{} Set Up Project, then test again",
+                            gcloud::first_sentence(&whole)
+                        )
+                    };
+                    form.say_more(Verdict::Fail, &advice, Some(&whole));
+                }
             }
         });
     }
@@ -543,6 +623,17 @@ impl CloudForm {
                     &format!(
                         "Fetching the IDE's own gcloud {} · 41 of 83 MiB",
                         gcloud::SDK.version
+                    ),
+                );
+            }
+            "no-account" => {
+                *self.account.borrow_mut() = Some("david@example.com".into());
+                self.say(
+                    Verdict::Attention,
+                    &format!(
+                        "Signed in · Set Up Project creates {}, the account the IDE acts as, \
+                         which my-project-123 does not have yet",
+                        setup::ACCOUNT
                     ),
                 );
             }
@@ -571,6 +662,17 @@ impl CloudForm {
 
 /// The account by its id, `taste-ide`: its full address wraps a narrow
 /// popover mid-word, and what it is called says which account it is.
+/// How often, and how many times, a test denied impersonation runs again
+/// on its own: Google applies an IAM grant within seven minutes.
+const APPLY_RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+const APPLY_RETRIES: u32 = 21;
+
+/// Whether a failure is the user being refused leave to act as the service
+/// account — what a grant Google has not applied yet looks like.
+fn still_applying(said: &str) -> bool {
+    said.contains("iam.serviceAccounts.getAccessToken") && said.contains("PERMISSION_DENIED")
+}
+
 fn ready_sentence(_account: &str, project_id: &str) -> String {
     format!(
         "Ready · {} holds all {} permissions the IDE uses in {project_id}",
@@ -609,6 +711,20 @@ mod tests {
             )
         );
         assert!(missing_sentence(&["a", "b", "c", "d", "e"]).contains("a, b, c, and 2 more"));
+    }
+
+    #[test]
+    fn a_grant_not_yet_applied_is_told_apart() {
+        assert!(still_applying(
+            "ERROR: (gcloud.auth.print-access-token) PERMISSION_DENIED: Failed to impersonate \
+             [taste-ide@taste-ide.iam.gserviceaccount.com]. Permission \
+             'iam.serviceAccounts.getAccessToken' denied on resource (or it may not exist)."
+        ));
+        assert!(!still_applying("PERMISSION_DENIED: compute.instances.list"));
+        assert_eq!(
+            APPLY_RETRY_EVERY * APPLY_RETRIES,
+            std::time::Duration::from_secs(420)
+        );
     }
 
     #[test]

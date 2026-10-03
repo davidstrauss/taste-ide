@@ -175,6 +175,36 @@ impl Gcloud {
         Ok((output.status.success() && !account.is_empty()).then_some(account))
     }
 
+    /// Whether the service account this gcloud impersonates exists, asked
+    /// as the user — so a project that has not been set up yet is told
+    /// that, rather than handed impersonation's failure. `None` when the
+    /// answer cannot be had (the user may not read IAM, or nothing is
+    /// impersonated), which the caller treats as "try it and see".
+    pub async fn service_account_exists(&self) -> Result<Option<bool>> {
+        let Some(account) = &self.impersonate else {
+            return Ok(None);
+        };
+        let output = Command::from(self.invocation(
+            &[
+                "iam",
+                "service-accounts",
+                "describe",
+                account,
+                "--format=value(email)",
+            ],
+            true,
+        ))
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("running gcloud")?;
+        if output.status.success() {
+            return Ok(Some(true));
+        }
+        let said = String::from_utf8_lossy(&output.stderr);
+        Ok((said.contains("NOT_FOUND") || said.contains("does not exist")).then_some(false))
+    }
+
     /// An access token as the impersonated service account, for the IDE's
     /// REST calls. gcloud does not say when it lapses; it renews any token
     /// with less than a few minutes left, and its tokens last an hour, so
@@ -317,6 +347,23 @@ fn isolate(command: &mut std::process::Command, config_dir: &Path) {
         .env("CLOUDSDK_CONFIG", config_dir)
         .env("CLOUDSDK_CORE_DISABLE_PROMPTS", "1")
         .env("CLOUDSDK_CORE_DISABLE_USAGE_REPORTING", "true");
+}
+
+/// The first sentence of what gcloud said, without its `ERROR: (gcloud.…)`
+/// prefix: what fits on a status line. The whole of it belongs in a
+/// tooltip.
+pub fn first_sentence(said: &str) -> String {
+    let said = said.trim();
+    let said = said.strip_prefix("gcloud gave no token: ").unwrap_or(said);
+    let said = said.strip_prefix("ERROR: ").unwrap_or(said);
+    let said = match said.strip_prefix('(') {
+        Some(rest) => rest.split_once(") ").map_or(said, |(_, rest)| rest),
+        None => said,
+    };
+    match said.find(". ") {
+        Some(end) => said[..=end].to_string(),
+        None => said.to_string(),
+    }
 }
 
 /// gcloud's own explanation: from its `ERROR:` line to the end, which is
@@ -532,6 +579,35 @@ mod tests {
             error.contains("do not currently have an active account"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_status_line_gets_the_first_sentence_without_the_prefix() {
+        assert_eq!(
+            first_sentence(
+                "gcloud gave no token: ERROR: (gcloud.auth.print-access-token) NOT_FOUND: Failed to impersonate [a@b]. Make sure the account that's trying to impersonate it has access."
+            ),
+            "NOT_FOUND: Failed to impersonate [a@b]."
+        );
+        assert_eq!(first_sentence("plain words"), "plain words");
+    }
+
+    #[tokio::test]
+    async fn a_missing_account_is_told_apart_from_an_unknowable_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gcloud");
+        let write = |body: &str| {
+            std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let g = gcloud(dir.path());
+        write("echo taste-ide@my-project-1.iam.gserviceaccount.com");
+        assert_eq!(g.service_account_exists().await.unwrap(), Some(true));
+        write("echo 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account' >&2; exit 1");
+        assert_eq!(g.service_account_exists().await.unwrap(), Some(false));
+        write("echo 'ERROR: PERMISSION_DENIED: Permission iam.serviceAccounts.get denied' >&2; exit 1");
+        assert_eq!(g.service_account_exists().await.unwrap(), None);
     }
 
     #[test]

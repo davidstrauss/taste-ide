@@ -196,8 +196,9 @@ Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;
 `TASTE_PROBE_CLOUD` poses the Google Cloud section of the title bar's
 cloud popover (`cloud_form.rs`) and opens it (`unset`, `fetching` — the
-IDE's own gcloud partway down —, `missing` — a test that found the role
-short —, or ready by default), since every real state of it needs a
+IDE's own gcloud partway down —, `no-account` — signed in, the setup not
+yet run —, `missing` — a test that found the role short —, or ready by
+default), since every real state of it needs a
 Google account and a project; with `TASTE_PROBE_SYNC` the badge shows
 the worse of the two;
 `TASTE_PROBE_CLOSING=1` poses the window as a close leaves it, the
