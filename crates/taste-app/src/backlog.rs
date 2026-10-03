@@ -88,6 +88,9 @@ pub fn title_of(row: &FleetRow) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Live {
     pub env: EnvironmentId,
+    /// Its environment runs in the project's cloud: the cloud Start then
+    /// only starts it, and the plain one moves it here.
+    pub cloud: bool,
     pub primary: bool,
     pub light: Light,
     pub busy: bool,
@@ -330,9 +333,27 @@ fn is_current(env: &EnvironmentId, current: Option<&EnvironmentId>) -> bool {
     }
 }
 
+/// Whether a Start for `host` would do anything to `row`: a queued issue
+/// with no environment is made one there; an issue whose environment is
+/// on the other kind of VM is moved there; one that is stopped where it
+/// is is started. Never the primary, which is the folder you opened and
+/// stays on this machine.
+fn can_start(row: &Row, host: taste_core::environment::Host) -> bool {
+    match &row.live {
+        None => row.work == WorkState::Queued,
+        Some(live) if live.primary => false,
+        Some(live) => {
+            let elsewhere = live.cloud != (host == taste_core::environment::Host::Cloud);
+            let running = matches!(live.light, Light::Green | Light::Amber);
+            elsewhere || !running
+        }
+    }
+}
+
 fn live_of(row: &FleetRow, current: Option<&EnvironmentId>) -> Live {
     Live {
         env: row.env.clone(),
+        cloud: row.cloud,
         primary: row.primary,
         light: row.light(),
         busy: row.chat.as_ref().is_some_and(|chat| chat.busy),
@@ -360,6 +381,7 @@ fn primary_row(fleet: &[FleetRow], current: Option<&EnvironmentId>) -> Row {
         None => {
             let env = EnvironmentId::primary();
             Live {
+                cloud: false,
                 current: is_current(&env, current),
                 env,
                 primary: true,
@@ -833,6 +855,10 @@ pub struct StartedIssue {
     pub id: String,
     pub title: String,
     pub body: String,
+    /// Where it is to run: this machine's pool, or the project's cloud —
+    /// which of the two Start buttons was pressed. An issue whose
+    /// environment is on the other is moved there.
+    pub host: taste_core::environment::Host,
 }
 type StartHook = Box<dyn Fn(StartedIssue)>;
 
@@ -907,6 +933,8 @@ pub struct BacklogPanel {
     /// boxes, whether checked or not").
     check_slots: RefCell<Vec<gtk::Stack>>,
     start_button: gtk::Button,
+    /// Start, in the project's cloud: the play glyph with a cloud badge.
+    cloud_start_button: gtk::Button,
     stop_button: gtk::Button,
     rebuild_button: gtk::Button,
     /// The two irreversible ones, held to confirm (`holdbutton.rs`): the
@@ -999,9 +1027,46 @@ impl BacklogPanel {
         };
         let start_button = action(
             "media-playback-start-symbolic",
-            "Start the selected issue: a fresh clone of the checkout, and a chat given \
-             the issue as its first prompt",
+            "Start the selected issue on this machine: a fresh clone of the checkout, and \
+             a chat given the issue as its first prompt. One running in the cloud moves \
+             here, conversation and uncommitted work with it",
         );
+        // The same Start, in the project's cloud (David, 2026-10-03: "The
+        // cloud 'play' button should be the regular play button with a
+        // cloud badge"). The badge sits where the backlog rows' health
+        // badges sit, at the glyph's lower right, ringed in the bar's own
+        // colour so it reads as a mark on the glyph rather than a second
+        // glyph beside it.
+        let cloud_start_button = {
+            let face = gtk::Overlay::builder()
+                .child(
+                    &gtk::Image::builder()
+                        .icon_name("media-playback-start-symbolic")
+                        .pixel_size(16)
+                        .build(),
+                )
+                .build();
+            face.add_overlay(
+                &gtk::Image::builder()
+                    .icon_name("taste-cloud-symbolic")
+                    .pixel_size(12)
+                    .halign(gtk::Align::End)
+                    .valign(gtk::Align::End)
+                    .can_target(false)
+                    .css_classes(["play-cloud-badge"])
+                    .build(),
+            );
+            gtk::Button::builder()
+                .child(&face)
+                .css_classes(["flat", "circular", "backlog-new"])
+                .tooltip_text(
+                    "Start the selected issue in the project's cloud, on a host the IDE makes \
+                     or reuses there. One running on this machine moves to the cloud, \
+                     conversation and uncommitted work with it",
+                )
+                .sensitive(false)
+                .build()
+        };
         let stop_button = action(
             "media-playback-stop-symbolic",
             "Stop the selected issue's container (its clone stays)",
@@ -1202,6 +1267,7 @@ impl BacklogPanel {
             row.set_halign(gtk::Align::End);
             for button in [
                 &start_button,
+                &cloud_start_button,
                 &stop_button,
                 &rebuild_button,
                 &destroy_button.widget,
@@ -1294,6 +1360,7 @@ impl BacklogPanel {
             results: results.clone(),
             list_rows: Cell::new(1),
             start_button: start_button.clone(),
+            cloud_start_button: cloud_start_button.clone(),
             stop_button: stop_button.clone(),
             rebuild_button: rebuild_button.clone(),
             destroy_button: destroy_button.clone(),
@@ -1450,7 +1517,15 @@ impl BacklogPanel {
             let weak = Rc::downgrade(&panel);
             start_button.connect_clicked(move |_| {
                 if let Some(panel) = weak.upgrade() {
-                    panel.start_selected();
+                    panel.start_selected(taste_core::environment::Host::Local);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&panel);
+            cloud_start_button.connect_clicked(move |_| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.start_selected(taste_core::environment::Host::Cloud);
                 }
             });
         }
@@ -3202,7 +3277,10 @@ impl BacklogPanel {
 
         let any = |f: &dyn Fn(&Row) -> bool| rows.iter().any(|row| f(row));
         self.start_button.set_sensitive(any(&|row| {
-            row.work == WorkState::Queued && row.live.is_none()
+            can_start(row, taste_core::environment::Host::Local)
+        }));
+        self.cloud_start_button.set_sensitive(any(&|row| {
+            can_start(row, taste_core::environment::Host::Cloud)
         }));
         self.stop_button.set_sensitive(any(&|row| {
             row.live
@@ -3255,9 +3333,9 @@ impl BacklogPanel {
     /// The ones that are already running are skipped rather than refused:
     /// the button is live because *something* in the selection can start,
     /// and starting the rest of a batch is what was asked for.
-    fn start_selected(self: &Rc<Self>) {
+    fn start_selected(self: &Rc<Self>, host: taste_core::environment::Host) {
         for row in self.target_rows() {
-            if row.work != WorkState::Queued || row.live.is_some() {
+            if !can_start(&row, host) {
                 continue;
             }
             let issues = self.issues.borrow();
@@ -3266,7 +3344,7 @@ impl BacklogPanel {
             };
             let (id, title, body) = (issue.id.clone(), issue.title.clone(), issue.body.clone());
             drop(issues);
-            self.start(id, title, body);
+            self.start(id, title, body, host);
         }
         self.clear_checks();
     }
@@ -3415,9 +3493,14 @@ impl BacklogPanel {
 
     /// Whether File may act: a title, or something attached.
     /// Hand a written issue to the window to start.
-    fn start(&self, id: String, title: String, body: String) {
+    fn start(&self, id: String, title: String, body: String, host: taste_core::environment::Host) {
         if let Some(hook) = self.on_start.borrow().as_ref() {
-            hook(StartedIssue { id, title, body });
+            hook(StartedIssue {
+                id,
+                title,
+                body,
+                host,
+            });
         }
     }
 
@@ -3799,6 +3882,7 @@ mod tests {
         let review = staged(WorkState::Review, Some(Light::Off));
         let mut home = target_row("primary");
         home.live = Some(Live {
+            cloud: false,
             env: EnvironmentId::primary(),
             primary: true,
             light: Light::Green,
@@ -3826,6 +3910,7 @@ mod tests {
         let mut row = target_row("i-1");
         row.work = work;
         row.live = light.map(|light| Live {
+            cloud: false,
             env: EnvironmentId::parse("i-1").unwrap(),
             primary: false,
             light,
@@ -3840,6 +3925,29 @@ mod tests {
             working_on: None,
         });
         row
+    }
+
+    /// Each Start acts where it would change something: a queued issue is
+    /// made one on either; an environment on the other kind of VM is
+    /// moved; one stopped where it is is started; one running where it is
+    /// is left alone; the primary is never moved.
+    #[test]
+    fn each_start_acts_where_it_changes_something() {
+        use taste_core::environment::Host::{Cloud, Local};
+        let queued = staged(WorkState::Queued, None);
+        assert!(can_start(&queued, Local) && can_start(&queued, Cloud));
+        let running_here = staged(WorkState::Queued, Some(Light::Green));
+        assert!(!can_start(&running_here, Local));
+        assert!(can_start(&running_here, Cloud), "moves it to the cloud");
+        let mut running_there = staged(WorkState::Queued, Some(Light::Green));
+        running_there.live.as_mut().unwrap().cloud = true;
+        assert!(can_start(&running_there, Local), "moves it here");
+        assert!(!can_start(&running_there, Cloud));
+        let stopped = staged(WorkState::Queued, Some(Light::Off));
+        assert!(can_start(&stopped, Local) && can_start(&stopped, Cloud));
+        let mut primary = staged(WorkState::Queued, Some(Light::Off));
+        primary.live.as_mut().unwrap().primary = true;
+        assert!(!can_start(&primary, Local) && !can_start(&primary, Cloud));
     }
 
     /// The pipeline, as positions: New → Approved → Starting → Working →
@@ -4045,6 +4153,7 @@ mod tests {
 
     fn facts(slug: &str, state: SupervisorState) -> EnvFacts {
         EnvFacts {
+            cloud: false,
             env: env(slug),
             state,
             authority: taste_core::ConfigAuthority::Project,

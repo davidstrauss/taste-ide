@@ -801,7 +801,16 @@ fn main() -> glib::ExitCode {
                  /* The title bar cloud's badge (syncstatus.rs): the \
                     env-badge's shape, a pixel larger because it sits on a \
                     16px glyph, ringed in the header bar's own background. */\n\
-                 .sync-badge { min-width: 6px; min-height: 6px; \
+                 /* The cloud Start's badge: a small cloud in the play glyph's lower
+   right, the corner a play triangle leaves empty, so it needs no ring
+   to stand apart from it — and a ring would have to match a bar whose
+   colour is a translucent card over the window, which no variable
+   names (backlog.rs). */
+.play-cloud-badge {
+    margin-right: -5px;
+    margin-bottom: -3px;
+}
+.sync-badge { min-width: 6px; min-height: 6px; \
                    border-radius: 999px; \
                    box-shadow: 0 0 0 1.5px var(--headerbar-bg-color); }\n\
                  .sync-badge.green { background-color: @success_color; }\n\

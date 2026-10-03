@@ -3033,7 +3033,7 @@ the providers below peers rather than special cases:
 | `Vm` | a VM the IDE provisioned for this workspace, behind KVM | the connection the provisioner registered | **the default**, shipped 2026-09-21 |
 | `Remote` | a host with podman the IDE was pointed at | a connection over ssh | transport shipped, adopted not provisioned |
 | `None` | nowhere | nothing; every start is refused with the reason | what a host without a provisioner gets |
-| cloud | a VM the IDE provisions elsewhere | *a provisioner that returns a connection* | future |
+| cloud | a host the IDE provisions in the project's GCP | the connection the provisioner registered, over an IAP tunnel | shipped 2026-10-03, as a `Vm` whose `cloud` says where (`taste_devcontainer::cloud`) |
 
 A cloud VM is not a fourth kind of thing. A provisioner authenticates to
 GCP/AWS/Azure, creates a host, registers a connection, and hands back a
@@ -3850,13 +3850,73 @@ new word.
 | --- | --- | --- |
 | Local `qemu:///session` | yes — **the default** | none; it is the user |
 | Remote libvirt (`qemu+ssh://host/session`) | yes | ssh key |
-| GCP / AWS / Azure | yes | the project's cloud credential |
+| GCP | yes — shipped 2026-10-03 (`taste_devcontainer::cloud`, below) | the project's own gcloud sign-in, acting as its keyless service account |
+| AWS / Azure | yes | the project's cloud credential |
 | An ssh host already running podman | **no — adopted** | ssh key |
 
 The last row is shipped and proven: it is `TASTE_PODMAN_CONNECTION`. It is
 listed because **provision versus adopt** belongs in the type rather than
 in a comment — the IDE may destroy a VM it created and may not destroy a
 host it was merely pointed at.
+
+#### Cloud hosts, as built (2026-10-03)
+
+David, 2026-10-03: "I want you to now complete the work to provision
+environments on cloud VM(s). Provide me a separate 'play' button (and
+corresponding MCP for the agent) to start one. The cloud 'play' button
+should be the regular play button with a cloud badge. If I 'cloud play' a
+non-cloud environment, migrate it. If I 'regular/local play' a cloud
+environment, migrate it."
+
+- **A cloud host is a pool VM made elsewhere.** The same Fedora CoreOS
+  release the local pool boots (the stream's own GCP image for it), the
+  same Ignition (`provision::ignition`, handed in as `user-data`) with the
+  same workspace keys, so it holds environments exactly as a local VM
+  does. It is a `Vm` whose `cloud` field says where it is; everything
+  above the pool reads it as one more VM.
+- **Reached through IAP, and only so.** The hosts' network
+  (`taste_gcp::hosts`, `taste-<id>-envs`) admits IAP's forwarders to port
+  22 and nothing else. The IDE runs `gcloud compute start-iap-tunnel` to
+  each host it uses, bound to a loopback port recorded for the host's life
+  (`cloud-hosts.json`, workspace state), so `ssh core@127.0.0.1:<port>` —
+  the keys, `known_hosts`, the podman connection, git's push and fetch,
+  and the files service — is unchanged. Egress is the internet, by the
+  host's own ephemeral address: the isolation standard grants a project
+  that. In the guest the private-network refusal still holds, with DHCP
+  and NTP to the metadata server let through (its HTTP port is not: it
+  serves the Ignition config, host key and all).
+- **Made by fit, in the project's region.** `n4-standard-8` first, the
+  other eight-vCPU machines while a zone has none, the region's zones in
+  turn; a 100 GiB boot disk is the host's only disk, kept while it is
+  stopped. A new environment goes on the fullest host it fits, a stopped
+  one included, before a host is made.
+- **Billed only while it works.** Reconcile never starts a cloud host; a
+  start of an environment in one does (`Supervisor::set_waker` →
+  `EnvironmentRegistry::wake_vm_of`). The registry stops a host that has
+  held no running container for ten minutes
+  (`stop_idle_cloud_hosts`), and the guest's own idle timer powers it off
+  five minutes after the IDE is gone, which GCE takes as a stop.
+- **Moving is relocation.** `EnvironmentRegistry::move_to(env, host)` is
+  `relocate_inner` aimed at the other kind: a fresh snapshot, the
+  container stopped, the agent's home volume carried, the checkout placed
+  from the peer and the snapshot, the old copy removed (and the old VM,
+  once it holds nothing of the workspace), and the container started where
+  it now is. The primary stays local: it is the folder you opened,
+  mirrored both ways.
+- **The two Starts.** The backlog's bar has Start and, beside it, the same
+  glyph with a cloud badge. Each makes a queued issue's environment on its
+  side, moves one that is on the other side, and starts one stopped where
+  it is. The coordinator has the same through `issue_start`'s `where`
+  (`local` by default, or `cloud`) and `environment_move`; `environment`
+  reports `runs_on`. A cloud start in a project with no cloud set up is
+  refused before anything is made, naming the title bar's cloud.
+- **Resources lists the hosts**, with their zone and machine; Stop stops
+  one, Delete deletes it and brings its environments home, and Rebuild
+  puts its environments on a fresh cloud host.
+- **Proven live** on 2026-10-03 with `examples/cloud-host` in
+  `taste-devcontainer`: a host made from the pool's Ignition in project
+  `taste-ide` (a `c4-standard-8`, `n4` being out in `us-central1-a`),
+  ssh through IAP, and podman answering, in 163 seconds.
 
 This retired `Provider::Machine` (gone since 2026-09-21). `podman machine`
 exists to hide VM creation, and it needs qemu on the host exactly as
@@ -4296,7 +4356,8 @@ start with the reason. `taste_core::chatarchive`, the host-side
 conversation stash, is wired as before: appended per turn, swept at
 launch, forgotten with its environment, and replayed onto the pane under
 a banner when the agent has no history and this machine does. Still
-prose: Phase 3 (cloud provisioners) and Phase 4 (the WebKit residual),
+prose: Phase 3's AWS and Azure (GCP shipped 2026-10-03) and Phase 4
+(the WebKit residual),
 and host-side egress enforcement, which needs root this design has
 nowhere.
 
@@ -4348,9 +4409,9 @@ done.
 
 **Phase 3 — cloud provisioners.** Small, once Phases 0 to 2 exist:
 authenticate, create a host from the same stream, register a connection.
-Nothing below the substrate learns a new word. For GCP, the authenticating
-and creating half is planned as `taste-gcp`, Phase 1 of the GLM-5.3 route
-(The auth proxy → "A model on a cloud VM"), and is written once for both.
+Nothing below the substrate learns a new word. **GCP shipped 2026-10-03**
+(VM provisioners → "Cloud hosts, as built"), on `taste-gcp`, which the
+GLM-5.3 route built first; AWS and Azure remain.
 
 **Phase 4 — close what none of it closes.** WebKit on a remote dev
 server's page is the widest residual and the one most worth bounding.

@@ -33,10 +33,14 @@ container's memory limit (`--memory=16g --memory-swap=16g` on a bare
 `podman run`), and prefer `cargo check` and per-crate tests until the
 final gate.
 
-**Where the IDE's own containers run, as of 2026-09-21.** In a Fedora
+**Where the IDE's own containers run, as of 2026-10-03.** In a Fedora
 CoreOS VM the IDE provisions per workspace through user-session libvirt
 (`taste_devcontainer::provision`, `pool`, `sizing`; a pool per workspace,
-environments placed across it by capacity), and **nowhere else**: every
+environments placed across it by capacity) — or, when an environment is
+started with the cloud Start (or `issue_start`'s `where: "cloud"`), on a
+host of the same pool in the project's GCP, reached through an IAP tunnel
+(`taste_devcontainer::cloud`; ENVIRONMENTS → "Cloud hosts, as built";
+`examples/cloud-host` brings one up by hand) — and **nowhere else**: every
 environment's checkout and container, the primary's included, live in a
 VM of the pool. The primary's checkout is placed there at reconcile from
 the folder you opened, which becomes its git **peer** (its refs, the

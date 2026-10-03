@@ -342,6 +342,11 @@ pub struct GuestSpec {
     /// mints its own on first boot and the first connection has to trust
     /// whatever it finds.
     pub host_key: Option<HostKey>,
+    /// A cloud guest's metadata server, 169.254.169.254, is its DHCP and
+    /// time server as well as its resolver, so those two are let through
+    /// the private-network refusal above; its HTTP port is not, since it
+    /// serves this config — host key and all — to anything that asks.
+    pub metadata_server: bool,
 }
 
 /// The Ignition config that makes a Fedora CoreOS guest into something the
@@ -504,7 +509,7 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
             "path": "/etc/sysconfig/nftables.conf",
             "mode": 420,
             "overwrite": true,
-            "contents": { "source": data_url(&egress_ruleset()) },
+            "contents": { "source": data_url(&egress_ruleset(spec.metadata_server)) },
         }));
         units.push(serde_json::json!({
             "name": "nftables.service",
@@ -564,7 +569,7 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
 /// Output filtering, so it covers everything in the guest including every
 /// container in it, and written as one set per family so a reader can see
 /// at a glance that nothing is missing.
-fn egress_ruleset() -> String {
+fn egress_ruleset(metadata_server: bool) -> String {
     let v4 = PRIVATE_NETWORKS.join(", ");
     let v6 = PRIVATE_NETWORKS_V6.join(", ");
     // `ct state established,related accept` first, and it is load-bearing:
@@ -584,6 +589,14 @@ fn egress_ruleset() -> String {
     // real boot (2026-09-21, confirmed by inserting the rule live). What
     // it lets through to a LAN host that is not the gateway is a DNS
     // query, and no more.
+    // A cloud guest leases its address from the metadata server and keeps
+    // its clock by it; a lease that cannot be renewed is a guest that
+    // drops off its network a day later.
+    let metadata = if metadata_server {
+        "\t\tip daddr 169.254.169.254 udp dport { 67, 123 } accept\n"
+    } else {
+        ""
+    };
     format!(
         "#!/usr/sbin/nft -f\n\
          # Written by taste-ide. The internet is allowed; the machine this\n\
@@ -596,6 +609,7 @@ fn egress_ruleset() -> String {
          \t\ttype filter hook output priority 0; policy accept;\n\
          \t\tct state established,related accept\n\
          \t\tmeta l4proto {{ tcp, udp }} th dport 53 accept\n\
+         {metadata}\
          \t\tip daddr {{ {v4} }} reject\n\
          \t\tip6 daddr {{ {v6} }} reject\n\
          \t}}\n\
@@ -747,14 +761,20 @@ pub fn parse_domstats(text: &str) -> DomainStats {
     stats
 }
 
-/// One VM the IDE made, as libvirt has it.
+/// One VM the IDE made: under libvirt on this host, or in the project's
+/// cloud ([`crate::cloud`]). Either is reached the same way — ssh on a
+/// loopback port, which for a cloud host is the IAP tunnel's end — so
+/// nothing above the pool has to know which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vm {
-    /// The libvirt domain — and the podman connection, one name for both.
+    /// The libvirt domain or the GCE instance — and the podman
+    /// connection, one name for both.
     pub domain: String,
     pub ssh_port: u16,
     pub workspace_root: PathBuf,
     pub state: DomainState,
+    /// Where a cloud host is; `None` for a VM on this host.
+    pub cloud: Option<crate::cloud::CloudPlace>,
 }
 
 impl Vm {
@@ -763,6 +783,11 @@ impl Vm {
     /// to have two.
     pub fn connection(&self) -> &str {
         &self.domain
+    }
+
+    /// Whether this VM is a cloud host rather than one on this machine.
+    pub fn is_cloud(&self) -> bool {
+        self.cloud.is_some()
     }
 
     /// The URI `podman system connection add` is given.
@@ -1037,6 +1062,7 @@ impl LibvirtSession {
                     .with_context(|| format!("reading {name}'s ssh forward"))?,
                 workspace_root: workspace_from_xml(&xml).unwrap_or_default(),
                 state: DomainState::parse(&state),
+                cloud: None,
             });
         }
         vms.sort_by(|a, b| a.domain.cmp(&b.domain));
@@ -1084,6 +1110,7 @@ impl LibvirtSession {
             ssh_port,
             workspace_root: workspace_root.to_path_buf(),
             state: DomainState::ShutOff,
+            cloud: None,
         };
 
         let ignition_text = ignition(&GuestSpec {
@@ -1091,6 +1118,7 @@ impl LibvirtSession {
             hostname: domain.clone(),
             deny_private_networks: true,
             host_key: Some(keys.host_key()?),
+            metadata_server: false,
         })?;
         write_private(&vm.ignition_path(), &ignition_text)?;
 
@@ -1252,37 +1280,7 @@ impl LibvirtSession {
     /// `podman system connection add`, named for the domain, with the
     /// workspace's identity. Replaces a stale one of the same name.
     async fn register_connection(&self, vm: &Vm) -> Result<()> {
-        let keys = Keys::for_workspace(&vm.workspace_root);
-        let podman = PodmanTarget::local(self.sandboxed);
-        let (program, args) = podman.argv(["system", "connection", "remove", &vm.domain]);
-        let _ = tokio::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await;
-        let (program, args) = podman.argv([
-            "system".to_string(),
-            "connection".into(),
-            "add".into(),
-            "--identity".into(),
-            keys.identity().display().to_string(),
-            vm.domain.clone(),
-            vm.podman_uri(),
-        ]);
-        let output = tokio::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .context("running podman system connection add")?;
-        if !output.status.success() {
-            bail!(
-                "registering the podman connection {}: {}",
-                vm.domain,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
+        register_connection(vm, self.sandboxed).await
     }
 
     /// Bring a VM up if it is not, and report what it costs.
@@ -1603,7 +1601,7 @@ fn allocated_bytes(path: &Path) -> Option<u64> {
 /// A loopback port nothing holds right now, chosen by the kernel and
 /// released at once. passt binds it when the VM starts; the gap is small
 /// and a collision fails loudly at `virsh start`.
-fn free_loopback_port() -> Result<u16> {
+pub(crate) fn free_loopback_port() -> Result<u16> {
     let listener =
         std::net::TcpListener::bind(("127.0.0.1", 0)).context("finding a free loopback port")?;
     Ok(listener.local_addr()?.port())
@@ -1705,6 +1703,44 @@ pub fn release_from_base_name(path: &str) -> Option<String> {
     Some(release.to_string())
 }
 
+/// `podman system connection add` for `vm`, named for its domain, with
+/// the workspace's identity, replacing a stale one of the same name: how
+/// a VM of either kind becomes a podman connection.
+pub(crate) async fn register_connection(vm: &Vm, sandboxed: bool) -> Result<()> {
+    let keys = Keys::for_workspace(&vm.workspace_root);
+    let podman = PodmanTarget::local(sandboxed);
+
+    let (program, args) = podman.argv(["system", "connection", "remove", &vm.domain]);
+    let _ = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await;
+    let (program, args) = podman.argv([
+        "system".to_string(),
+        "connection".into(),
+        "add".into(),
+        "--identity".into(),
+        keys.identity().display().to_string(),
+        vm.domain.clone(),
+        vm.podman_uri(),
+    ]);
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("running podman system connection add")?;
+    if !output.status.success() {
+        bail!(
+            "registering the podman connection {}: {}",
+            vm.domain,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1744,6 +1780,7 @@ mod tests {
             hostname: "taste-x".into(),
             deny_private_networks: true,
             host_key: None,
+            metadata_server: false,
         })
         .unwrap();
         for (path, _) in super::GUEST_STOP_DROPINS {
@@ -1804,6 +1841,7 @@ mod tests {
             hostname: "taste-sb".into(),
             deny_private_networks: false,
             host_key: None,
+            metadata_server: false,
         }
     }
 
@@ -2195,6 +2233,7 @@ mod tests {
             ssh_port: 40022,
             workspace_root: "/work/proj".into(),
             state: DomainState::ShutOff,
+            cloud: None,
         };
         assert_eq!(vm.connection(), "taste-799f-k7m2qx");
         assert_eq!(

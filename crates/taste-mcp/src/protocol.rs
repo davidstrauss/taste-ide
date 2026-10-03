@@ -195,7 +195,9 @@ pub fn effect(tool: &str) -> Effect {
         "devcontainer_reload" => Effect::Write,
         // A move restarts a container and loses nothing — the snapshot
         // carries the uncommitted work and the volume the conversation.
-        "environment_reinstantiate_request" | "environment_reinstantiate" => Effect::Write,
+        "environment_reinstantiate_request" | "environment_reinstantiate" | "environment_move" => {
+            Effect::Write
+        }
         // A task's list and output are reads; stopping one is a write; and
         // running one is `ide_exec` by another name — the Taskfile is the
         // agent's to write — so it asks as `ide_exec` does.

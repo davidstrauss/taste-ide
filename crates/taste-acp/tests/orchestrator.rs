@@ -133,7 +133,9 @@ fn attach_strip(
                 OrchestrationRequest::Fleet => OrchestrationReply::Fleet(serde_json::json!([
                     {"environment": HUB, "name": HUB, "mode": "safe"},
                 ])),
-                OrchestrationRequest::StartIssue { env, agent, model } => {
+                OrchestrationRequest::StartIssue {
+                    env, agent, model, ..
+                } => {
                     println!("strip: issue_start {env} agent={agent:?} model={model:?}");
                     // The environment is the issue's: it takes the id the
                     // request names rather than one this strip invents.

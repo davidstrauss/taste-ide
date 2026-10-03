@@ -68,6 +68,7 @@ pub(crate) fn is_write(tool: &str) -> bool {
             | "chat_send"
             | "environment_destroy"
             | "environment_reinstantiate"
+            | "environment_move"
             | "issue_delete"
     )
 }
@@ -102,7 +103,8 @@ pub(crate) fn tools() -> Vec<Value> {
              The container starts first and the prompt waits for it; chat_status says \
              when it has gone. Needs an issue: issue_create first. Safe to call again \
              for an issue whose environment exists but never got its chat: that \
-             finishes the start.",
+             finishes the start. `where` puts it on this machine (default) or on a \
+             host in the project's cloud.",
             json!({
                 "type": "object",
                 "properties": {
@@ -118,6 +120,11 @@ pub(crate) fn tools() -> Vec<Value> {
                     "model": {
                         "type": "string",
                         "description": "omit to follow the user's choice; otherwise an exact model id the agent advertises, not a family name — chat_status reports what actually runs"
+                    },
+                    "where": {
+                        "type": "string",
+                        "enum": ["local", "cloud"],
+                        "description": "local (default): a VM on this machine; cloud: a host in the project's cloud, made or started first (minutes), billed while it runs"
                     }
                 },
                 "required": ["issue"]
@@ -176,6 +183,28 @@ pub(crate) fn tools() -> Vec<Value> {
                     }
                 },
                 "required": ["environment"]
+            }),
+        ),
+        crate::protocol::tool(
+            "environment_move",
+            "Move an environment between this machine and the project's cloud, and \
+             start it there. Keeps its checkout, uncommitted work, and agent's \
+             conversation; stops its container for the move. Returns at once; its chat \
+             is told when it lands. One already there is just started.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "environment": {
+                        "type": "string",
+                        "description": "environment id, which is its issue's id (e.g. i-0007); not primary"
+                    },
+                    "to": {
+                        "type": "string",
+                        "enum": ["local", "cloud"],
+                        "description": "local: a VM on this machine; cloud: a host in the project's cloud"
+                    }
+                },
+                "required": ["environment", "to"]
             }),
         ),
         crate::protocol::tool(

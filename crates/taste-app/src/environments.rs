@@ -16,13 +16,15 @@ use taste_devcontainer::EnvironmentRegistry;
 pub fn create(
     registry: Arc<EnvironmentRegistry>,
     id: EnvironmentId,
+    host: taste_core::environment::Host,
     then: Box<dyn FnOnce(Result<EnvironmentId, String>)>,
 ) {
     glib::spawn_future_local(async move {
         let for_worker = id.clone();
-        // Never on the GTK thread: this is a git clone.
+        // Never on the GTK thread: this is a git clone, and for the cloud
+        // a host made or started.
         let handle = crate::runtime::runtime()
-            .spawn_blocking(move || registry.create(for_worker).map(|_| ()));
+            .spawn_blocking(move || registry.create_on(for_worker, host).map(|_| ()));
         match handle.await {
             Ok(Ok(())) => then(Ok(id)),
             Ok(Err(e)) => then(Err(format!("{e:#}"))),

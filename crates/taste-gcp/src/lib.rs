@@ -22,6 +22,8 @@
 //!   back before anything is created.
 //! - [`guest`]: what those machines are told to do, as Ignition configs.
 //! - [`lifecycle`]: staging, serving, stopping, and tearing down.
+//! - [`hosts`]: the environment pool's hosts in GCP — their network, made
+//!   from the pool's own Ignition, and reached through IAP alone.
 //! - [`quota`]: whether the project's quotas let a machine be created,
 //!   asked before it is, so a limit too low is named rather than met.
 //! - [`setup`]: the one-time setup that grants the IDE its role, run as
@@ -44,6 +46,7 @@
 
 pub mod gcloud;
 pub mod guest;
+pub mod hosts;
 pub mod lifecycle;
 pub mod model;
 pub mod project;

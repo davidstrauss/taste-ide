@@ -5407,8 +5407,29 @@ fn start_issue(
         }
     };
     if environments.get(&env).is_some() {
-        // Already started here: go there rather than make a second.
-        aim_panes(Some(env));
+        // Already made: go there rather than make a second — started where
+        // it is, or moved to where this Start asked for, conversation and
+        // uncommitted work with it (`EnvironmentRegistry::move_to`).
+        aim_panes(Some(env.clone()));
+        let moving = environments.host_of(&env) != issue.host;
+        if moving {
+            workspace.events.publish(taste_core::Event::Toast(format!(
+                "Moving {env} to {} — its checkout, uncommitted work, and conversation go \
+                 with it",
+                match issue.host {
+                    taste_core::environment::Host::Cloud => "the cloud",
+                    taste_core::environment::Host::Local => "this machine",
+                }
+            )));
+        }
+        let registry = environments.clone();
+        let events = workspace.events.clone();
+        let host = issue.host;
+        crate::runtime::runtime().spawn(async move {
+            if let Err(e) = registry.move_to(&env, host).await {
+                events.publish(taste_core::Event::Toast(format!("{env}: {e:#}")));
+            }
+        });
         return;
     }
     let events = workspace.events.clone();
@@ -5417,9 +5438,16 @@ fn start_issue(
     let aim_panes = aim_panes.clone();
     let console = console.clone();
     let registry = environments.clone();
+    if issue.host == taste_core::environment::Host::Cloud {
+        workspace.events.publish(taste_core::Event::Toast(format!(
+            "Starting {env} in the cloud — a host is started or made there first, which can \
+             take a few minutes"
+        )));
+    }
     crate::environments::create(
         environments.clone(),
         env,
+        issue.host,
         Box::new(move |outcome| {
             let env = match outcome {
                 Ok(env) => env,

@@ -1633,6 +1633,7 @@ impl Console {
             .as_ref()
             .and_then(|lookup| lookup(&env));
         EnvFacts {
+            cloud: self.environments.host_of(&env) == taste_core::environment::Host::Cloud,
             state: supervisor.state(),
             authority: supervisor.config_authority(),
             pending_rebuild: supervisor.pending_changes(),
@@ -3711,6 +3712,7 @@ impl Console {
                     shells,
                     review,
                     working_on| EnvFacts {
+            cloud: false,
             env: EnvironmentId::parse(slug).expect("valid probe slug"),
             state,
             authority: taste_core::ConfigAuthority::Project,
@@ -4191,6 +4193,7 @@ mod tests {
 
     fn row(authority: ConfigAuthority, state: SupervisorState) -> FleetRow {
         FleetRow {
+            cloud: false,
             env: EnvironmentId::primary(),
             primary: true,
             name: "Personal".into(),

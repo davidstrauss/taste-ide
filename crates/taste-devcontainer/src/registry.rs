@@ -358,6 +358,12 @@ pub struct EnvironmentRegistry {
     /// (`start_vm_meter`), as the Resources view's sparklines read it.
     vm_meters: Mutex<BTreeMap<String, VmMeter>>,
     vm_meter_started: AtomicBool,
+    /// The registry itself, weakly: what a supervisor's waker reaches back
+    /// through (`Supervisor::set_waker`).
+    me: std::sync::OnceLock<std::sync::Weak<EnvironmentRegistry>>,
+    /// Since when each cloud host has held no running container, for
+    /// [`Self::stop_idle_cloud_hosts`].
+    cloud_idle: Mutex<BTreeMap<String, std::time::Instant>>,
     /// Per environment and published port, bytes through it over the last
     /// five minutes (`crate::ports`), and the last raw counters for the
     /// differences.
@@ -490,11 +496,14 @@ impl EnvironmentRegistry {
             reconciling: tokio::sync::Mutex::new(()),
             vm_meters: Mutex::new(BTreeMap::new()),
             vm_meter_started: AtomicBool::new(false),
+            me: std::sync::OnceLock::new(),
+            cloud_idle: Mutex::new(BTreeMap::new()),
             port_traffic: Mutex::new(BTreeMap::new()),
             port_counters_last: Mutex::new(BTreeMap::new()),
             vm_logs: Arc::new(Mutex::new(BTreeMap::new())),
             console_followers: Arc::new(Mutex::new(BTreeSet::new())),
         });
+        let _ = registry.me.set(Arc::downgrade(&registry));
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
         // The primary can put itself where it runs when a start finds it
@@ -542,6 +551,18 @@ impl EnvironmentRegistry {
         }
         if self.logs_on_disk.load(Ordering::SeqCst) {
             self.open_log_file(&supervisor);
+        }
+        // A start finds its VM brought up first when it is down — a cloud
+        // host stopped while nothing ran in it, most of all
+        // (`Self::wake_vm_of`).
+        if !supervisor.id().is_primary() {
+            if let Some(me) = self.me.get().cloned() {
+                let id = supervisor.id().clone();
+                supervisor.set_waker(Arc::new(move || {
+                    let registry = me.upgrade().context("the environment registry is gone")?;
+                    registry.wake_vm_of(&id)
+                }));
+            }
         }
         supervisor
     }
@@ -657,22 +678,22 @@ impl EnvironmentRegistry {
         );
         self.settle_environments_in(domain).await;
         let pool = self.pool();
-        let vms = pool.vms().await?;
+        let vms = pool.all_vms().await?;
         let vm = vms
             .into_iter()
             .find(|vm| vm.domain == domain)
             .with_context(|| format!("this workspace's pool has no VM {domain}"))?;
-        pool.libvirt().stop(&vm).await?;
+        pool.stop(&vm).await?;
         self.keepers.lock().unwrap().remove(domain);
         // The facts, once it is down: `running` is what the row's buttons
         // read. A guest takes a few seconds to stop; wait for it, bounded.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while pool.libvirt().state(&vm).await? == crate::provision::DomainState::Running
+        while pool.state(&vm).await? == crate::provision::DomainState::Running
             && std::time::Instant::now() < deadline
         {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        if let Ok(facts) = pool.libvirt().facts(&vm).await {
+        if let Ok(facts) = pool.facts(&vm).await {
             let sandboxed = self.substrate().target().sandboxed();
             let substrate = Arc::new(Substrate::vm(&vm, facts, sandboxed));
             self.substrates
@@ -701,6 +722,32 @@ impl EnvironmentRegistry {
             domain,
             "rebuild requested: a fresh VM from the pinned image replaces this one",
         );
+        // A cloud host is replaced by a cloud host: its environments are put
+        // on a fresh one rather than brought home, which is Delete's.
+        if self.pool().is_cloud_host(domain) {
+            let held: Vec<EnvironmentId> = self
+                .list()
+                .into_iter()
+                .filter(|s| s.checkout().vm() == Some(domain))
+                .map(|s| s.id().clone())
+                .collect();
+            self.tear_down_vm(domain).await?;
+            for id in held {
+                let registry = self.clone();
+                let placed = tokio::task::spawn_blocking(move || {
+                    let supervisor = registry.get(&id).context("the environment is gone")?;
+                    let vm =
+                        registry.place_by_capacity(supervisor.grant(), environment::Host::Cloud)?;
+                    registry.place_env_in(&id, &vm)
+                })
+                .await;
+                if !matches!(placed, Ok(Ok(()))) {
+                    tracing::warn!("an environment of the rebuilt cloud host was not placed again; reconcile places it");
+                }
+            }
+            self.reconcile().await;
+            return Ok(());
+        }
         let pool = self.tear_down_vm(domain).await?;
         // The image is on this host already — a VM just ran from it — so
         // the fetch report has nothing to say and goes nowhere.
@@ -784,13 +831,12 @@ impl EnvironmentRegistry {
     async fn tear_down_vm(self: &Arc<Self>, domain: &str) -> Result<crate::pool::Pool> {
         self.settle_environments_in(domain).await;
         let pool = self.pool();
-        let vms = pool.vms().await?;
+        let vms = pool.all_vms().await?;
         let vm = vms
             .into_iter()
             .find(|vm| vm.domain == domain)
             .with_context(|| format!("this workspace's pool has no VM {domain}"))?;
-        pool.libvirt()
-            .destroy(&vm)
+        pool.destroy(&vm)
             .await
             .with_context(|| format!("removing VM {domain}"))?;
         self.keepers.lock().unwrap().remove(domain);
@@ -1104,11 +1150,17 @@ impl EnvironmentRegistry {
         use crate::provision::DomainState;
         use crate::supervisor::{ResourceInfo, ResourceKind};
         let pool = self.pool();
-        let Ok(vms) = pool.vms().await else {
+        let Ok(vms) = pool.all_vms().await else {
             return Vec::new();
         };
         vms.into_iter()
             .map(|vm| {
+                // A cloud host says where it is, and that a stopped one is
+                // the ordinary state of one nothing runs in.
+                let place = vm
+                    .cloud
+                    .as_ref()
+                    .map(|place| format!("Google Cloud, {} on {} · ", place.zone, place.machine));
                 let brought_up = self
                     .substrate_of_vm(&vm.domain)
                     .and_then(|substrate| substrate.vm_facts().cloned())
@@ -1118,10 +1170,14 @@ impl EnvironmentRegistry {
                     .filter(|facts| facts.running == (vm.state == DomainState::Running));
                 let status = match (brought_up, &vm.state) {
                     (Some(facts), _) => facts.summary(),
+                    (None, DomainState::ShutOff) if vm.is_cloud() => {
+                        "stopped — starts with the next environment started in it".into()
+                    }
                     (None, DomainState::Running) => "booting — not answering yet".into(),
                     (None, DomainState::ShutOff) => "shut off".into(),
                     (None, DomainState::Other(state)) => state.clone(),
                 };
+                let status = format!("{}{status}", place.unwrap_or_default());
                 ResourceInfo {
                     kind: ResourceKind::Substrate,
                     name: vm.domain.clone(),
@@ -1329,6 +1385,20 @@ impl EnvironmentRegistry {
         if self.vm_meter_started.swap(true, Ordering::SeqCst) {
             return;
         }
+        // Cloud hosts nothing runs in are stopped on the same clock's
+        // lifetime: for as long as this window is the workspace's.
+        {
+            let weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let Some(registry) = weak.upgrade() else {
+                        break;
+                    };
+                    registry.stop_idle_cloud_hosts().await;
+                }
+            });
+        }
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let libvirt = crate::provision::LibvirtSession::new();
@@ -1345,6 +1415,10 @@ impl EnvironmentRegistry {
                     else {
                         continue;
                     };
+                    // A cloud host's counters are GCP's, not libvirt's.
+                    if vm.is_cloud() {
+                        continue;
+                    }
                     let Ok(stats) = libvirt.domstats(vm).await else {
                         continue;
                     };
@@ -2027,7 +2101,7 @@ impl EnvironmentRegistry {
     /// The VM one more environment goes on: the pool's choice by fit
     /// (`Pool::place`) for `demand`, brought up and registered. Blocking,
     /// from the runtime's blocking pool — creation runs there.
-    fn place_by_capacity(&self, demand: Grant) -> Result<Vm> {
+    fn place_by_capacity(&self, demand: Grant, host: environment::Host) -> Result<Vm> {
         let pool = self.pool();
         let occupancy = self.occupancy();
         let handle = tokio::runtime::Handle::try_current()
@@ -2035,6 +2109,7 @@ impl EnvironmentRegistry {
         let placed = handle.block_on(pool.place(
             demand,
             &occupancy,
+            host,
             Arc::new(crate::substrate::report_download),
         ));
         let (vm, facts) = match placed {
@@ -2089,7 +2164,7 @@ impl EnvironmentRegistry {
             git.snapshot_worktree(&snapshot_ref)
                 .context("snapshotting the clone's uncommitted work before the move")?;
         }
-        let vm = self.place_by_capacity(Self::grant_of(&repo))?;
+        let vm = self.place_by_capacity(Self::grant_of(&repo), environment::Host::Local)?;
         let identity = self.place_in_vm(id, &repo, &vm)?;
         let keeper = self.keeper_for(&vm)?;
         if dirty {
@@ -2132,7 +2207,7 @@ impl EnvironmentRegistry {
         let supervisor = self
             .get(id)
             .with_context(|| format!("no environment {id}"))?;
-        let vm = self.place_by_capacity(supervisor.grant())?;
+        let vm = self.place_by_capacity(supervisor.grant(), environment::Host::Local)?;
         self.place_env_in(id, &vm)?;
         Ok(vm.domain)
     }
@@ -2373,7 +2448,14 @@ impl EnvironmentRegistry {
         Some((branch, tip))
     }
 
+    /// A new environment on this machine's pool.
     pub fn create(&self, id: EnvironmentId) -> Result<Arc<Supervisor>> {
+        self.create_on(id, environment::Host::Local)
+    }
+
+    /// A new environment on `host`: a VM of this machine's pool, or a host
+    /// in the project's cloud.
+    pub fn create_on(&self, id: EnvironmentId, host: environment::Host) -> Result<Arc<Supervisor>> {
         if id.is_primary() {
             bail!("the primary environment is the main checkout; it is never created");
         }
@@ -2405,7 +2487,7 @@ impl EnvironmentRegistry {
         // where the clone is the checkout.
         let identity = if self.substrate().vm_details().is_some() {
             let placed = self
-                .place_by_capacity(Self::grant_of(&repo))
+                .place_by_capacity(Self::grant_of(&repo), host)
                 .and_then(|vm| self.place_in_vm(&id, &repo, &vm));
             match placed {
                 Ok(identity) => identity,
@@ -2722,11 +2804,14 @@ impl EnvironmentRegistry {
         // their substrate; a VM the pool no longer has leaves its
         // environments to be placed anew below.
         if substrate.vm_details().is_some() {
+            // Not a cloud host: one is started when an environment in it is
+            // (`Self::wake_vm_of`), since it bills while it runs.
             let wanted: std::collections::BTreeSet<String> = self
                 .list()
                 .into_iter()
                 .filter_map(|s| s.checkout().vm().map(str::to_string))
                 .filter(|vm| self.substrate_of_vm(vm).is_none())
+                .filter(|vm| !pool.is_cloud_host(vm))
                 .collect();
             for domain in wanted {
                 match pool.ensure_vm(&domain).await {
@@ -2911,9 +2996,9 @@ impl EnvironmentRegistry {
                 .into_iter()
                 .filter(|s| !s.id().is_primary())
                 .filter(|s| {
-                    s.checkout()
-                        .vm()
-                        .is_some_and(|vm| self.substrate_of_vm(vm).is_none())
+                    s.checkout().vm().is_some_and(|vm| {
+                        self.substrate_of_vm(vm).is_none() && !pool.is_cloud_host(vm)
+                    })
                 })
                 .collect();
             // One toast per VM the environments came from, counting them,
@@ -3195,12 +3280,12 @@ impl EnvironmentRegistry {
             return;
         };
         let pool = self.pool();
-        let Ok(vms) = pool.vms().await else {
+        let Ok(vms) = pool.all_vms().await else {
             return;
         };
         let mut releases: BTreeMap<String, Option<String>> = BTreeMap::new();
         for vm in &vms {
-            releases.insert(vm.domain.clone(), pool.libvirt().release_of(vm).await);
+            releases.insert(vm.domain.clone(), pool.release_of(vm).await);
         }
         let now = now_secs();
         let mut idle = Vec::new();
@@ -3665,7 +3750,7 @@ impl EnvironmentRegistry {
             return;
         };
         let outcome = match migration.kind {
-            crate::migration::Kind::Guest => self.relocate_inner(env).await,
+            crate::migration::Kind::Guest => self.relocate_inner(env, self.host_of(env)).await,
             crate::migration::Kind::Packages => match self.get(env) {
                 Some(supervisor) => self
                     .refresh_image(&supervisor)
@@ -3740,12 +3825,207 @@ impl EnvironmentRegistry {
         }
     }
 
+    /// Whether this workspace can put environments in the cloud, and the
+    /// sentence that says how to set it up when it cannot.
+    pub fn cloud_available(&self) -> Result<String> {
+        self.pool().cloud().available()
+    }
+
+    /// Where `env` runs now: in a cloud host, or on this machine.
+    pub fn host_of(&self, env: &EnvironmentId) -> environment::Host {
+        match self
+            .get(env)
+            .and_then(|s| s.checkout().vm().map(str::to_string))
+        {
+            Some(vm) if self.pool().is_cloud_host(&vm) => environment::Host::Cloud,
+            _ => environment::Host::Local,
+        }
+    }
+
+    /// Bring up the VM `env`'s checkout is in, when it is not — a cloud
+    /// host stopped while nothing ran in it, or a local VM stopped from the
+    /// Resources view — and give it its substrate and files service:
+    /// what a start does first (`Supervisor::set_waker`). Blocking, from
+    /// the runtime's blocking pool.
+    pub fn wake_vm_of(&self, env: &EnvironmentId) -> Result<()> {
+        let Some(domain) = self
+            .get(env)
+            .and_then(|s| s.checkout().vm().map(str::to_string))
+        else {
+            return Ok(());
+        };
+        if self.substrate_of_vm(&domain).is_some() {
+            return Ok(());
+        }
+        let handle =
+            tokio::runtime::Handle::try_current().context("bringing a VM up needs the runtime")?;
+        self.note_vm(&domain, format!("{env}: starting the VM it is in"));
+        let (vm, facts) = handle
+            .block_on(self.pool().ensure_vm(&domain))
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
+            .with_context(|| format!("bringing up VM {domain}"))?;
+        self.register_vm(&vm, facts);
+        let keeper = self.keeper_for(&vm)?;
+        for supervisor in self.list() {
+            if supervisor.checkout().vm() == Some(domain.as_str()) {
+                supervisor.set_keeper(keeper.clone());
+            }
+        }
+        self.cloud_idle.lock().unwrap().remove(&domain);
+        Ok(())
+    }
+
+    /// Move `env` to `host` — this machine's pool, or the project's cloud —
+    /// keeping its checkout, its uncommitted work, and its agent's
+    /// conversation, and leave it running there: what the play buttons do
+    /// to an environment that is on the other kind of VM (David,
+    /// 2026-10-03: "If I 'cloud play' a non-cloud environment, migrate it.
+    /// If I 'regular/local play' a cloud environment, migrate it"). An
+    /// environment already on `host` is only started.
+    pub async fn move_to(
+        self: &Arc<Self>,
+        env: &EnvironmentId,
+        host: environment::Host,
+    ) -> Result<String> {
+        if env.is_primary() {
+            bail!(
+                "the primary environment is the folder you opened, mirrored both ways; it stays \
+                 on this machine"
+            );
+        }
+        let supervisor = self
+            .get(env)
+            .with_context(|| format!("no environment {env}"))?;
+        if host == environment::Host::Cloud {
+            self.pool().cloud().available()?;
+        }
+        if self.host_of(env) == host {
+            supervisor.reload().await?;
+            return Ok(format!("{env} started on {}", host.as_str()));
+        }
+        // The move reads the old VM — the snapshot, the home volume — so it
+        // is brought up first.
+        {
+            let (registry, id) = (self.clone(), env.clone());
+            tokio::task::spawn_blocking(move || registry.wake_vm_of(&id))
+                .await
+                .context("bringing its VM up did not finish")??;
+        }
+        if !self
+            .relocations_in_flight
+            .lock()
+            .unwrap()
+            .insert(env.clone())
+        {
+            bail!("{env} is already moving");
+        }
+        let moved = {
+            let _one_at_a_time = self.relocating.lock().await;
+            self.relocate_inner(env, host).await
+        };
+        self.relocations_in_flight.lock().unwrap().remove(env);
+        let target = moved?;
+        // Started where it now is, whether or not it was running: a play
+        // button was pressed.
+        if !supervisor.state().holds_a_container() {
+            supervisor.reload().await?;
+        }
+        let place = match host {
+            environment::Host::Cloud => format!("cloud host {target}"),
+            environment::Host::Local => format!("VM {target} on this machine"),
+        };
+        let note = format!("{env} moved to {place}");
+        taste_core::app_log::push("info", "environments", &note);
+        self.events.publish(Event::Toast(note.clone()));
+        self.events.publish(Event::MigrationNotice {
+            env: env.clone(),
+            audience: taste_core::MigrationAudience::Moved,
+            text: format!(
+                "Your environment moved to {place}. The checkout, uncommitted work, and this \
+                 conversation came with it. Continue where you left off."
+            ),
+        });
+        Ok(note)
+    }
+
+    /// How long a cloud host may hold no running container before the IDE
+    /// stops it: it bills while it runs, and starting it again is a minute.
+    pub const CLOUD_IDLE_STOP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+    /// Stop every cloud host that has held no running container for
+    /// [`Self::CLOUD_IDLE_STOP`]: its files service dropped, its
+    /// environments pointed at no substrate (so a start wakes it), the
+    /// instance stopped. Its disk keeps everything.
+    pub async fn stop_idle_cloud_hosts(self: &Arc<Self>) {
+        let pool = self.pool();
+        let now = std::time::Instant::now();
+        for domain in self.vm_domains() {
+            if !pool.is_cloud_host(&domain) {
+                continue;
+            }
+            let busy = self.list().iter().any(|s| {
+                s.checkout().vm() == Some(domain.as_str())
+                    && (s.state().holds_a_container()
+                        || matches!(s.state(), SupervisorState::Preparing { .. }))
+            }) || self
+                .relocations_in_flight
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|env| {
+                    self.get(env)
+                        .is_some_and(|s| s.checkout().vm() == Some(domain.as_str()))
+                });
+            let idle_since = {
+                let mut idle = self.cloud_idle.lock().unwrap();
+                if busy {
+                    idle.remove(&domain);
+                    continue;
+                }
+                *idle.entry(domain.clone()).or_insert(now)
+            };
+            if now.duration_since(idle_since) < Self::CLOUD_IDLE_STOP {
+                continue;
+            }
+            let Some(vm) = self
+                .substrate_of_vm(&domain)
+                .and_then(|s| s.vm_details().cloned())
+            else {
+                continue;
+            };
+            self.keepers.lock().unwrap().remove(&domain);
+            self.substrates.lock().unwrap().remove(&domain);
+            for supervisor in self.list() {
+                if supervisor.checkout().vm() == Some(domain.as_str()) {
+                    supervisor.set_substrate(self.substrate_for(&supervisor.checkout()));
+                }
+            }
+            self.cloud_idle.lock().unwrap().remove(&domain);
+            match pool.stop(&vm).await {
+                Ok(()) => {
+                    let note = format!(
+                        "cloud host {domain} ran nothing for {} minutes and was stopped; it \
+                         starts again with the next environment started in it",
+                        Self::CLOUD_IDLE_STOP.as_secs() / 60
+                    );
+                    self.note_vm(&domain, note.clone());
+                    taste_core::app_log::push("info", "environments", &note);
+                }
+                Err(e) => tracing::warn!("stopping idle cloud host {domain}: {e:#}"),
+            }
+        }
+    }
+
     /// The move itself: snapshot and stop, the agent's home volume carried
     /// out, a VM on the current release chosen or made, the volume and the
     /// checkout put there, the old copy removed — and the old VM with it
     /// once nothing of this workspace is left in it — then the container
     /// started again if it was running.
-    async fn relocate_inner(self: &Arc<Self>, env: &EnvironmentId) -> Result<String> {
+    async fn relocate_inner(
+        self: &Arc<Self>,
+        env: &EnvironmentId,
+        host: environment::Host,
+    ) -> Result<String> {
         let supervisor = self
             .get(env)
             .with_context(|| format!("no environment {env}"))?;
@@ -3762,7 +4042,15 @@ impl EnvironmentRegistry {
             .with_context(|| format!("VM {old_domain} is not brought up"))?;
         self.note_vm(
             &old_domain,
-            format!("{env}: moving to a VM on the current release"),
+            match (self.host_of(env), host) {
+                (environment::Host::Local, environment::Host::Cloud) => {
+                    format!("{env}: moving to a host in the cloud")
+                }
+                (environment::Host::Cloud, environment::Host::Local) => {
+                    format!("{env}: moving to a VM on this machine")
+                }
+                _ => format!("{env}: moving to a VM on the current release"),
+            },
         );
 
         // Nothing moves without a fresh snapshot: it is what carries the
@@ -3782,7 +4070,10 @@ impl EnvironmentRegistry {
         // where it was: a failure there puts it back as it stood — its
         // substrate the old VM's, its container started again — rather than
         // stopped and pointed at a VM it is not in.
-        match self.carry_and_place(env, &supervisor, &old_substrate).await {
+        match self
+            .carry_and_place(env, &supervisor, &old_substrate, host)
+            .await
+        {
             Ok(target) => {
                 self.finish_move(
                     env,
@@ -3815,6 +4106,7 @@ impl EnvironmentRegistry {
         env: &EnvironmentId,
         supervisor: &Arc<Supervisor>,
         old_substrate: &Arc<Substrate>,
+        host: environment::Host,
     ) -> Result<Vm> {
         let old_domain = old_substrate
             .vm_details()
@@ -3834,7 +4126,7 @@ impl EnvironmentRegistry {
         let target = {
             let registry = self.clone();
             let grant = supervisor.grant();
-            tokio::task::spawn_blocking(move || registry.place_by_capacity(grant))
+            tokio::task::spawn_blocking(move || registry.place_by_capacity(grant, host))
                 .await
                 .context("choosing a VM did not finish")??
         };
@@ -3902,12 +4194,12 @@ impl EnvironmentRegistry {
         if !still_used {
             let pool = self.pool();
             if let Some(vm) = pool
-                .vms()
+                .all_vms()
                 .await
                 .ok()
                 .and_then(|vms| vms.into_iter().find(|vm| vm.domain == old_domain))
             {
-                match pool.libvirt().destroy(&vm).await {
+                match pool.destroy(&vm).await {
                     Ok(()) => {
                         self.keepers.lock().unwrap().remove(&old_domain);
                         self.substrates.lock().unwrap().remove(&old_domain);
@@ -4283,6 +4575,7 @@ mod tests {
             ssh_port: 40022,
             workspace_root: fixture.workspace.path().to_path_buf(),
             state: crate::provision::DomainState::Running,
+            cloud: None,
         };
         let facts = crate::provision::VmFacts {
             running: true,

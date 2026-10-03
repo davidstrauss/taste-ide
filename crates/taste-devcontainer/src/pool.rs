@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::cloud::CloudSession;
 use crate::config::Grant;
 use crate::provision::{DomainState, LibvirtSession, Vm, VmFacts};
 use crate::sizing::{self, Sizing};
@@ -103,10 +104,12 @@ pub fn best_fit(
         })
 }
 
-/// One workspace's VMs.
+/// One workspace's VMs: the ones under libvirt on this host, and its
+/// cloud hosts ([`crate::cloud`]).
 #[derive(Debug, Clone)]
 pub struct Pool {
     libvirt: LibvirtSession,
+    cloud: CloudSession,
     workspace_root: PathBuf,
 }
 
@@ -114,19 +117,104 @@ impl Pool {
     pub fn new(workspace_root: &Path) -> Self {
         Self {
             libvirt: LibvirtSession::new(),
+            cloud: CloudSession::new(workspace_root),
             workspace_root: workspace_root.to_path_buf(),
         }
     }
 
-    /// The same pool, its provisioner telling each step to `sink`
+    /// The same pool, its provisioners telling each step to `sink`
     /// (`LibvirtSession::with_sink`).
     pub fn with_sink(mut self, sink: crate::provision::StepSink) -> Self {
-        self.libvirt = self.libvirt.with_sink(sink);
+        self.libvirt = self.libvirt.with_sink(sink.clone());
+        self.cloud = self.cloud.with_sink(sink);
         self
     }
 
     pub fn libvirt(&self) -> &LibvirtSession {
         &self.libvirt
+    }
+
+    pub fn cloud(&self) -> &CloudSession {
+        &self.cloud
+    }
+
+    /// Every VM of the workspace, local and cloud. [`Self::vms`] is the
+    /// local ones alone, which is what the host's own bookkeeping — its
+    /// memory, its stale and unowned domains, the window's stop — is
+    /// about.
+    pub async fn all_vms(&self) -> Result<Vec<Vm>> {
+        let mut vms = match self.vms().await {
+            Ok(vms) => vms,
+            // No libvirt on this host is not no pool: its cloud hosts are
+            // still its.
+            Err(_) if !self.cloud.list().is_empty() => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        vms.extend(self.cloud.list());
+        Ok(vms)
+    }
+
+    /// Whether `domain` is one of the workspace's cloud hosts.
+    pub fn is_cloud_host(&self, domain: &str) -> bool {
+        self.cloud.list().iter().any(|vm| vm.domain == domain)
+    }
+
+    /// A VM's state, from whichever provisioner made it.
+    pub async fn state(&self, vm: &Vm) -> Result<DomainState> {
+        if vm.is_cloud() {
+            self.cloud.state(vm).await
+        } else {
+            self.libvirt.state(vm).await
+        }
+    }
+
+    /// What a VM gives, from whichever provisioner made it.
+    pub async fn facts(&self, vm: &Vm) -> Result<VmFacts> {
+        if vm.is_cloud() {
+            self.cloud.facts(vm)
+        } else {
+            self.libvirt.facts(vm).await
+        }
+    }
+
+    /// The guest release a VM was made from.
+    pub async fn release_of(&self, vm: &Vm) -> Option<String> {
+        if vm.is_cloud() {
+            self.cloud.release_of(vm)
+        } else {
+            self.libvirt.release_of(vm).await
+        }
+    }
+
+    /// Stop a VM: an ACPI shutdown here, an instance stop in the cloud.
+    pub async fn stop(&self, vm: &Vm) -> Result<()> {
+        if vm.is_cloud() {
+            self.cloud.stop(vm).await
+        } else {
+            self.libvirt.stop(vm).await
+        }
+    }
+
+    /// Remove a VM and its disk.
+    pub async fn destroy(&self, vm: &Vm) -> Result<()> {
+        if vm.is_cloud() {
+            self.cloud.destroy(vm).await
+        } else {
+            self.libvirt.destroy(vm).await
+        }
+    }
+
+    /// Bring a VM up and say what it gives.
+    pub async fn bring_up(&self, vm: &Vm) -> Result<VmFacts> {
+        if vm.is_cloud() {
+            let cloud = self.cloud.clone();
+            let host = vm.domain.clone();
+            self.cloud
+                .ensure_running(vm, &move |line: &str| cloud.say(&host, line))
+                .await
+        } else {
+            self.libvirt.ensure_running(vm).await
+        }
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -223,10 +311,14 @@ impl Pool {
         &self,
         demand: Grant,
         occupancy: &std::collections::HashMap<String, Grant>,
+        host: taste_core::environment::Host,
         report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> std::result::Result<(Vm, VmFacts), PoolError> {
         if !Self::provisioning_allowed() {
             return Err(PoolError::Skipped);
+        }
+        if host == taste_core::environment::Host::Cloud {
+            return self.place_in_cloud(demand, occupancy).await;
         }
         self.libvirt
             .available()
@@ -300,10 +392,70 @@ impl Pool {
         Ok((vm, facts))
     }
 
+    /// A cloud host for one more environment, chosen by fit as a local VM
+    /// is: the fullest host the grant still fits in, or a new one. A host
+    /// that is stopped counts — starting it is cheaper than making
+    /// another, and its disk already holds the images.
+    async fn place_in_cloud(
+        &self,
+        demand: Grant,
+        occupancy: &std::collections::HashMap<String, Grant>,
+    ) -> std::result::Result<(Vm, VmFacts), PoolError> {
+        self.cloud.available().map_err(PoolError::Unavailable)?;
+        let mut candidates: Vec<(Vm, VmFacts, Grant)> = Vec::new();
+        for vm in self.cloud.list() {
+            let Ok(facts) = self.cloud.facts(&vm) else {
+                continue;
+            };
+            let used = occupancy.get(&vm.domain).copied().unwrap_or(Grant {
+                cpus: 0,
+                memory_mib: 0,
+            });
+            candidates.push((vm, facts, used));
+        }
+        let vm = match best_fit(demand, &candidates) {
+            Some((vm, _, _)) => vm.clone(),
+            None => {
+                let empty = Grant {
+                    cpus: 8,
+                    memory_mib: 30 * 1024,
+                }
+                .minus(sizing::GUEST_RESERVE);
+                if !demand.fits(empty) {
+                    return Err(PoolError::Failed {
+                        domain: None,
+                        error: anyhow::anyhow!(
+                            "a grant of {} does not fit a cloud host ({} after the guest's \
+                             reserve); lower the config's hostRequirements",
+                            demand.describe(),
+                            empty.describe()
+                        ),
+                    });
+                }
+                let cloud = self.cloud.clone();
+                self.cloud
+                    .create(&move |line: &str| cloud.say("cloud", line))
+                    .await
+                    .map_err(|error| PoolError::Failed {
+                        domain: None,
+                        error,
+                    })?
+            }
+        };
+        let facts = self
+            .bring_up(&vm)
+            .await
+            .map_err(|error| PoolError::Failed {
+                domain: Some(vm.domain.clone()),
+                error,
+            })?;
+        Ok((vm, facts))
+    }
+
     /// One VM of the pool by name, running, with its facts — for a VM that
     /// holds restored environments and is not the workspace's first.
     pub async fn ensure_vm(&self, domain: &str) -> std::result::Result<(Vm, VmFacts), PoolError> {
-        let vms = self.vms().await.map_err(PoolError::Unavailable)?;
+        let vms = self.all_vms().await.map_err(PoolError::Unavailable)?;
         let Some(vm) = vms.into_iter().find(|vm| vm.domain == domain) else {
             return Err(PoolError::Failed {
                 domain: Some(domain.to_string()),
@@ -311,8 +463,7 @@ impl Pool {
             });
         };
         let facts = self
-            .libvirt
-            .ensure_running(&vm)
+            .bring_up(&vm)
             .await
             .map_err(|error| PoolError::Failed {
                 domain: Some(vm.domain.clone()),
@@ -486,6 +637,7 @@ mod tests {
             ssh_port: 40001,
             workspace_root: "/work/proj".into(),
             state: DomainState::Running,
+            cloud: None,
         };
         let facts = VmFacts {
             running: true,
@@ -529,6 +681,7 @@ mod tests {
             ssh_port: 40001,
             workspace_root: "/definitely/not/here/proj".into(),
             state: DomainState::ShutOff,
+            cloud: None,
         };
         let unlabelled = Vm {
             workspace_root: PathBuf::new(),

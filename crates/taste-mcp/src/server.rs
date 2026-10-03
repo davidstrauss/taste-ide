@@ -310,6 +310,7 @@ impl McpServer {
             },
             "workspace": supervisor.checkout().path().display().to_string(),
             "main_checkout": self.workspace.root().display().to_string(),
+            "runs_on": self.environments.host_of(env).as_str(),
             "mode": situation.mode,
             "authority": situation.authority,
             "writable": situation.writable,
@@ -3074,6 +3075,58 @@ impl McpServer {
                 let said = self.environments.request_migration(env)?;
                 Ok(json!({ "state": "requested", "next": said }))
             }
+            "environment_move" => {
+                self.require_orchestrator(env, "environment_move")?;
+                let target = args
+                    .get("environment")
+                    .and_then(Value::as_str)
+                    .context("environment_move needs `environment`")?;
+                let target = EnvironmentId::parse(target)
+                    .map_err(|e| anyhow::anyhow!("{target} is not an environment id: {e}"))?;
+                let to = args
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .and_then(environment::Host::parse)
+                    .context("environment_move needs `to`: \"local\" or \"cloud\"")?;
+                if target.is_primary() {
+                    anyhow::bail!(
+                        "primary is the user's own folder, mirrored both ways; it stays local"
+                    );
+                }
+                if self.environments.get(&target).is_none() {
+                    anyhow::bail!("no environment {target}; issue_start makes one");
+                }
+                if to == environment::Host::Cloud {
+                    self.environments.cloud_available()?;
+                }
+                let from = self.environments.host_of(&target);
+                // A move takes minutes — a host may be made first — so it
+                // runs on, and is told: to the environment's own chat when
+                // it lands (`move_to`'s notice), to you if it fails.
+                let registry = self.environments.clone();
+                let events = self.workspace.events.clone();
+                let moving = target.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = registry.move_to(&moving, to).await {
+                        events.publish(taste_core::Event::Toast(format!("{moving}: {e:#}")));
+                        events.publish(taste_core::Event::MigrationNotice {
+                            env: moving.clone(),
+                            audience: taste_core::MigrationAudience::Coordinator,
+                            text: format!(
+                                "Moving environment {moving} to {} failed: {e:#}",
+                                to.as_str()
+                            ),
+                        });
+                    }
+                });
+                Ok(json!({
+                    "environment": target.as_str(),
+                    "from": from.as_str(),
+                    "to": to.as_str(),
+                    "state": if from == to { "starting" } else { "moving" },
+                    "next": "its chat is told when it lands; environment reports runs_on",
+                }))
+            }
             "environment_reinstantiate" => {
                 self.require_orchestrator(env, "environment_reinstantiate")?;
                 let target = args
@@ -3414,6 +3467,16 @@ impl McpServer {
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_string);
+        let host = match args["where"].as_str().map(str::trim) {
+            None | Some("") => environment::Host::Local,
+            Some(text) => environment::Host::parse(text)
+                .with_context(|| format!("`where` is \"local\" or \"cloud\", not {text:?}"))?,
+        };
+        // A cloud start in a project with no cloud set up is refused before
+        // anything is made, with the step that sets it up.
+        if host == environment::Host::Cloud {
+            self.environments.cloud_available()?;
+        }
         // The agent, checked before anything is made: a clone that was
         // made and a chat that failed on an unknown agent id is how a
         // start stranded (David, 2026-09-22).
@@ -3561,6 +3624,7 @@ impl McpServer {
                 env: env.clone(),
                 agent: agent.clone(),
                 model: model.clone(),
+                host,
             }
         };
         let reply = self
@@ -5075,6 +5139,46 @@ mod tests {
         .expect("a stalled probe must not stall the connection");
         assert_eq!(ping["id"], 2);
         wedged.abort();
+    }
+
+    /// The coordinator starts an issue where it says (`issue_start`'s
+    /// `where`) and moves one between this machine and the cloud
+    /// (`environment_move`), and a clone's socket is served neither write.
+    #[tokio::test]
+    async fn the_coordinator_can_start_and_move_environments_in_the_cloud() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        let (server, _workspace, _environments) = build_test_server(root);
+        let tools = server.tool_list(&EnvironmentId::primary());
+        let start = tools.iter().find(|t| t["name"] == "issue_start").unwrap();
+        assert_eq!(
+            start["inputSchema"]["properties"]["where"]["enum"],
+            json!(["local", "cloud"])
+        );
+        let moving = tools
+            .iter()
+            .find(|t| t["name"] == "environment_move")
+            .expect("the coordinator is served environment_move");
+        assert_eq!(
+            moving["inputSchema"]["required"],
+            json!(["environment", "to"])
+        );
+        assert!(crate::orchestration::is_write("environment_move"));
+        // A clone's socket reads; it does not move environments.
+        let clone_tools = server.tool_list(&EnvironmentId::parse("i-0001").unwrap());
+        assert!(!clone_tools.iter().any(|t| t["name"] == "environment_move"));
+        // A cloud start where no cloud is set up is refused before anything
+        // is made, naming the step that sets it up.
+        let refused = server
+            .call_tool(
+                &EnvironmentId::primary(),
+                "environment_move",
+                json!({ "environment": "i-0001", "to": "sideways" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{refused:#}").contains("\"local\" or \"cloud\""));
     }
 
     /// Every tool the IDE serves says what it does to the world.
@@ -6892,7 +6996,9 @@ mod tests {
                             {"environment": "calm-2", "name": "calm-2", "mode": "safe"},
                         ]))
                     }
-                    OrchestrationRequest::StartIssue { env, agent, model } => {
+                    OrchestrationRequest::StartIssue {
+                        env, agent, model, ..
+                    } => {
                         recorder
                             .lock()
                             .unwrap()

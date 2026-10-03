@@ -620,6 +620,36 @@ pub fn env_dir(workspace_root: &Path, env: &EnvironmentId) -> PathBuf {
         .join(env.as_str())
 }
 
+/// Where an environment runs: in a VM on this machine, or on a host in
+/// the project's cloud (David, 2026-10-03: a "cloud play" beside the play
+/// button, and either one moving an environment that is on the other).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Host {
+    #[default]
+    Local,
+    Cloud,
+}
+
+impl Host {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "local" => Some(Self::Local),
+            "cloud" => Some(Self::Cloud),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Cloud => "cloud",
+        }
+    }
+}
+
 /// Where an environment's **working copy** is, and therefore how its files
 /// are reached.
 ///

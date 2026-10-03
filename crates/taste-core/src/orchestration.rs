@@ -213,6 +213,9 @@ pub enum OrchestrationRequest {
         /// The answer says so ([`CreatedChat::model_pending`]) and
         /// [`ChatFacts`] carries the verdict.
         model: Option<String>,
+        /// Where the environment is made: this machine's pool, or the
+        /// project's cloud.
+        host: crate::environment::Host,
     },
     /// Finish a start that stranded: the environment exists — its clone
     /// was made by an earlier `StartIssue` — but its chat never opened,
@@ -540,6 +543,7 @@ mod tests {
             env: EnvironmentId::parse("i-0002").unwrap(),
             agent: Some("claude".into()),
             model: None,
+            host: crate::environment::Host::Local,
         }))
         .unwrap();
         match reply {

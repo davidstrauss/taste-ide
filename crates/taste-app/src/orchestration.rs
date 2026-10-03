@@ -60,6 +60,7 @@ pub fn attach(
                     env: id,
                     agent,
                     model,
+                    host,
                 } => {
                     if let Some(reopens) = chats.allowance_exhausted() {
                         let _ = reply
@@ -87,6 +88,7 @@ pub fn attach(
                     crate::environments::create(
                         environments.clone(),
                         id,
+                        host,
                         Box::new(move |outcome| match outcome {
                             Err(reason) => answer(OrchestrationReply::Error(format!(
                                 "the environment could not be created: {reason}"

@@ -107,6 +107,9 @@ pub struct EnvGit {
 #[derive(Debug, Clone)]
 pub struct EnvFacts {
     pub env: EnvironmentId,
+    /// Whether it runs on a host in the project's cloud rather than in a
+    /// VM on this machine.
+    pub cloud: bool,
     pub state: SupervisorState,
     /// Whose config the running container was built from. The second half
     /// of the mode: `Running` alone no longer means container mode, because
@@ -257,6 +260,8 @@ impl ReviewMark {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FleetRow {
     pub env: EnvironmentId,
+    /// See [`EnvFacts::cloud`].
+    pub cloud: bool,
     pub primary: bool,
     /// What to call it: the human name if there is one, else the slug.
     pub name: String,
@@ -597,6 +602,7 @@ pub fn assemble(
                     .unwrap_or_else(|| facts.env.to_string()),
                 named: named.is_some(),
                 published: counts.get(facts.env.as_str()).copied().unwrap_or(0),
+                cloud: facts.cloud,
                 env: facts.env,
                 state: facts.state,
                 authority: facts.authority,
@@ -753,6 +759,7 @@ mod tests {
 
     fn facts(slug: &str, state: SupervisorState) -> EnvFacts {
         EnvFacts {
+            cloud: false,
             env: env(slug),
             state,
             authority: ConfigAuthority::Project,
@@ -796,6 +803,7 @@ mod tests {
             vec![
                 facts("spry-2", SupervisorState::Stopped),
                 EnvFacts {
+                    cloud: false,
                     chat: Some(ChatBinding {
                         label: "Claude 2".into(),
                         busy: true,
@@ -1095,6 +1103,7 @@ mod tests {
             vec![
                 facts("primary", running()),
                 EnvFacts {
+                    cloud: false,
                     chat: Some(ChatBinding {
                         label: "Claude 2".into(),
                         busy: true,
@@ -1115,6 +1124,7 @@ mod tests {
                     ..facts("calm-1", running())
                 },
                 EnvFacts {
+                    cloud: false,
                     spend: Spend {
                         requests: 1,
                         input_tokens: 1_000,

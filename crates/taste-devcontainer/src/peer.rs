@@ -1517,6 +1517,7 @@ mod tests {
             ssh_port: 40022,
             workspace_root: "/work/proj".into(),
             state: crate::provision::DomainState::Running,
+            cloud: None,
         };
         assert_eq!(
             guest_url(&vm, Path::new("/var/home/core/taste/799f/i-0001")),

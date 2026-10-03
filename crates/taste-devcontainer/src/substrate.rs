@@ -851,6 +851,7 @@ mod tests {
             ssh_port: 40022,
             workspace_root: "/work/proj".into(),
             state: crate::provision::DomainState::Running,
+            cloud: None,
         };
         let substrate = Substrate::vm(
             &vm,
@@ -891,6 +892,7 @@ mod tests {
             ssh_port: 40022,
             workspace_root: "/work/proj".into(),
             state: crate::provision::DomainState::Running,
+            cloud: None,
         };
         let on_vm = Substrate::vm(
             &vm,

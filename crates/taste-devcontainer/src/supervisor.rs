@@ -618,6 +618,9 @@ pub struct Supervisor {
     /// rather than refusing, so Rebuild pressed while the VM is still
     /// coming up does what the user meant once it is up.
     placer: Mutex<Option<Placer>>,
+    /// What brings the VM this checkout is in back up, when a start finds
+    /// it down (`EnvironmentRegistry::wake_vm_of`).
+    waker: Mutex<Option<Placer>>,
     /// The grant the running container was started under, for the
     /// Resources row; `None` until one has been.
     applied_grant: Mutex<Option<crate::config::Grant>>,
@@ -891,6 +894,7 @@ impl Supervisor {
             lifecycle: tokio::sync::Mutex::new(()),
             checkout: Mutex::new(checkout),
             placer: Mutex::new(None),
+            waker: Mutex::new(None),
             applied_grant: Mutex::new(None),
             substrate: Mutex::new(substrate),
             files: Mutex::new(None),
@@ -942,6 +946,12 @@ impl Supervisor {
     /// The registry's: how to place this checkout where it can run
     /// (`EnvironmentRegistry::place_primary_now`). Blocking; run off the
     /// reactor by the start that needs it.
+    /// See [`Supervisor::waker`]'s field: called by a start whose VM is not
+    /// up, before anything else is tried.
+    pub fn set_waker(&self, waker: Placer) {
+        *self.waker.lock().unwrap() = Some(waker);
+    }
+
     pub fn set_placer(&self, placer: Placer) {
         *self.placer.lock().unwrap() = Some(placer);
     }
@@ -3335,6 +3345,25 @@ impl Supervisor {
                 });
                 self.set_pending(false);
                 return Ok(());
+            }
+            // A checkout in a VM that is down — a cloud host stopped while
+            // nothing ran in it — has its VM brought up first.
+            let waker = self.waker.lock().unwrap().clone();
+            if let Some(waker) = waker {
+                if matches!(self.checkout(), Checkout::Remote { .. }) {
+                    self.log("bringing up the VM this environment's checkout is in");
+                    self.set_state(SupervisorState::Preparing {
+                        what: "starting its VM".into(),
+                    });
+                    match tokio::task::spawn_blocking(move || waker()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(self.refuse_start(format!("{e:#}"))),
+                        Err(e) => {
+                            return Err(self
+                                .refuse_start(format!("bringing its VM up did not finish: {e}")))
+                        }
+                    }
+                }
             }
             // A checkout that can be put where it runs is put there first:
             // the primary's, pressed for before reconcile got to it.
