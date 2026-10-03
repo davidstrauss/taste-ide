@@ -294,7 +294,7 @@ impl GitWorkspace {
             // What the folder ignored before the checkout un-ignored it is
             // still the folder's own and stays here: a `.env` a `.gitignore`
             // change surfaced is not the user's edit to send.
-            here.retain(|path, _| !under_any(path, &held));
+            here.retain(|path, entry| !under_any(path, &held) && self.folder_owns(path, entry));
             let there = self.entries_between(baseline, target.id())?;
             // What the checkout holds because the folder sent it is the
             // folder's own, not a change of the checkout's.
@@ -635,8 +635,13 @@ impl GitWorkspace {
                     };
                     update.upsert(path, *oid, mode);
                 }
+                // Only what the base has: removing an absent path is an
+                // error in libgit2, and a removal recorded as sent can name
+                // a path the agreed tree never held.
                 None => {
-                    update.remove(path);
+                    if base.get_path(path).is_ok() {
+                        update.remove(path);
+                    }
                 }
             }
         }
@@ -684,10 +689,27 @@ impl GitWorkspace {
         let current_tree = self.repo.find_tree(current)?;
         let held = self.held_paths();
         self.entries_between(baseline, current)?
-            .keys()
-            .filter(|path| !under_any(path, &held))
-            .map(|path| self.change_at(&current_tree, path))
+            .iter()
+            .filter(|(path, entry)| !under_any(path, &held) && self.folder_owns(path, entry))
+            .map(|(path, _)| self.change_at(&current_tree, path))
             .collect()
+    }
+
+    /// Whether a difference between the baseline and the folder's working
+    /// copy is the folder's own change to send. Ignored paths never are,
+    /// in this direction as in the other ([`Self::write_tree_over`]): the
+    /// working copy's tree leaves them out, so a baseline that holds them —
+    /// one recorded from a checkout that did not ignore them yet — reads
+    /// every one as deleted here. And a removal is never sent for a path
+    /// still on this disk, whatever the rules say: absent from the tree is
+    /// not absent from the folder (2026-10-04: a Drupal install, ignored
+    /// here and not yet in the checkout, was deleted from the checkout
+    /// file by file).
+    fn folder_owns(&self, path: &Path, entry: &Option<(Oid, i32)>) -> bool {
+        if self.repo.is_path_ignored(path).unwrap_or(true) {
+            return false;
+        }
+        entry.is_some() || std::fs::symlink_metadata(self.workdir.join(path)).is_err()
     }
 
     fn change_at(&self, tree: &git2::Tree, path: &Path) -> Result<Change> {
@@ -1428,6 +1450,43 @@ mod tests {
                 .unwrap(),
             Mirror::Unchanged
         );
+    }
+
+    /// A directory the checkout held untracked, and the folder then came to
+    /// ignore, is never sent to the checkout as deleted: the files are
+    /// still in the folder, and ignored paths are not the mirror's in either
+    /// direction (2026-10-04: a Drupal install deleted from Personal).
+    #[test]
+    fn what_the_folder_ignores_is_never_sent_as_deleted() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::create_dir_all(vm.join("dep/sub")).unwrap();
+            fs::write(vm.join("dep/sub/x.txt"), "installed\n").unwrap();
+        });
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+        assert!(dir.path().join("dep/sub/x.txt").exists());
+
+        fs::write(dir.path().join(".gitignore"), "/dep/\n").unwrap();
+        let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::create_dir_all(vm.join("dep/sub")).unwrap();
+            fs::write(vm.join("dep/sub/x.txt"), "installed\n").unwrap();
+        });
+        match ws.mirror_from(&main, tip2, snap2, false).unwrap() {
+            Mirror::Outgoing { changes } => {
+                let paths: Vec<_> = changes.iter().map(|c| c.path.clone()).collect();
+                assert_eq!(paths, [PathBuf::from(".gitignore")]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(ws
+            .folder_changes()
+            .unwrap()
+            .iter()
+            .all(|c| !c.path.starts_with("dep")));
     }
 
     #[test]
