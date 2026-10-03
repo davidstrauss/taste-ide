@@ -248,6 +248,57 @@ impl Gcloud {
     }
 }
 
+impl Gcloud {
+    /// `gcloud args…` as one argv for a console tab, which can add to the
+    /// environment it inherits but not take from it: `env -u` strips
+    /// every other sign-in first, and the project's own configuration is
+    /// set after, so the tab is as isolated as [`Self::invocation`].
+    pub fn terminal_argv(&self, args: &[&str], as_user: bool) -> (String, Vec<String>) {
+        let mut argv: Vec<String> = Vec::new();
+        let mut strip = |name: String| {
+            argv.push("-u".into());
+            argv.push(name);
+        };
+        for name in FOREIGN_CREDENTIALS {
+            strip(name.to_string());
+        }
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy().into_owned();
+            if name.starts_with("CLOUDSDK_") && !FOREIGN_CREDENTIALS.contains(&name.as_str()) {
+                strip(name);
+            }
+        }
+        argv.push(format!("CLOUDSDK_CONFIG={}", self.config_dir.display()));
+        argv.push("CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true".into());
+        argv.push(format!("CLOUDSDK_CORE_PROJECT={}", self.project));
+        if let (false, Some(account)) = (as_user, &self.impersonate) {
+            argv.push(format!(
+                "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT={account}"
+            ));
+        }
+        argv.push(self.binary.display().to_string());
+        argv.extend(args.iter().map(|a| a.to_string()));
+        ("env".into(), argv)
+    }
+
+    /// The setup script as one argv for a console tab, run as the user
+    /// with this gcloud first on `PATH` — [`Self::setup`] for a tab.
+    pub fn setup_terminal_argv(&self, remove: bool) -> (String, Vec<String>) {
+        let (program, mut argv) = self.terminal_argv(&[], true);
+        argv.pop(); // the gcloud binary; bash runs instead, with it on PATH
+        let bin = self.binary.parent().unwrap_or(Path::new("."));
+        let path = std::env::var("PATH").unwrap_or_default();
+        argv.push(format!("PATH={}:{path}", bin.display()));
+        argv.extend(["bash".into(), "-c".into(), crate::setup::SCRIPT.into()]);
+        argv.push("gcp-setup.sh".into());
+        if remove {
+            argv.push("--remove".into());
+        }
+        argv.push(self.project.clone());
+        (program, argv)
+    }
+}
+
 /// How long a token from gcloud is used before asking again.
 pub const TOKEN_REUSE: Duration = Duration::from_secs(40 * 60);
 
@@ -361,6 +412,40 @@ mod tests {
                 "--zone=us-central1-a",
             ]
         );
+    }
+
+    #[test]
+    fn a_console_tab_is_isolated_the_same_way() {
+        let (program, argv) =
+            gcloud(Path::new("/state")).terminal_argv(&["auth", "login", "--brief"], true);
+        assert_eq!(program, "env");
+        let at = |s: &str| argv.iter().position(|a| a == s);
+        assert!(at("GOOGLE_APPLICATION_CREDENTIALS").is_some_and(|i| argv[i - 1] == "-u"));
+        assert!(argv.contains(&"CLOUDSDK_CONFIG=/state/config".to_string()));
+        assert!(!argv
+            .iter()
+            .any(|a| a.starts_with("CLOUDSDK_AUTH_IMPERSONATE")));
+        assert_eq!(
+            &argv[argv.len() - 4..],
+            ["/state/gcloud", "auth", "login", "--brief"]
+        );
+        // Every assignment comes after every removal, so none is undone.
+        let last_strip = argv.iter().rposition(|a| a == "-u").unwrap();
+        let first_set = argv.iter().position(|a| a.contains('=')).unwrap();
+        assert!(last_strip < first_set);
+    }
+
+    #[test]
+    fn the_setup_tab_runs_the_script_with_this_gcloud_first() {
+        let (program, argv) = gcloud(Path::new("/state")).setup_terminal_argv(false);
+        assert_eq!(program, "env");
+        let path = argv.iter().find(|a| a.starts_with("PATH=")).unwrap();
+        assert!(path.starts_with("PATH=/state:"), "{path}");
+        let bash = argv.iter().position(|a| a == "bash").unwrap();
+        assert_eq!(argv[bash + 1], "-c");
+        assert_eq!(argv[bash + 2], crate::setup::SCRIPT);
+        assert_eq!(&argv[bash + 3..], ["gcp-setup.sh", "my-project-1"]);
+        assert!(!argv.contains(&"/state/gcloud".to_string()));
     }
 
     #[test]

@@ -708,6 +708,9 @@ pub struct ChatPane {
     /// credential file, and nothing else ever provisions one (David,
     /// 2026-09-16: "It's not properly re-authing to Claude Code").
     credential_form: CredentialForm,
+    /// The project's Google Cloud sign-in and setup — the project's, not
+    /// this agent's, so in every chat's shade (`cloud_form`).
+    pub(crate) cloud_form: Rc<crate::cloud_form::CloudForm>,
     /// The window's issues by id, for the pills the transcript draws on
     /// issue references (`crate::issue_pill`). Shared with every other
     /// pane and refilled with the backlog.
@@ -1154,7 +1157,7 @@ type ControlsSignature = Vec<(String, Vec<String>)>;
 /// under it. The controls section gets it from its box's spacing; the
 /// groups built with no spacing of their own say it on the heading, so the
 /// shade's headings all stand the same distance off their lists.
-const HEADING_GAP: i32 = 6;
+pub(crate) const HEADING_GAP: i32 = 6;
 
 /// The agent's permission modes as a labelled row — "Permissions", the
 /// way "Model" labels its own — with the mode names as the values (they
@@ -1503,7 +1506,7 @@ struct PrivateForm {
 /// passed connection test is the same green as an environment that can
 /// work and a failed one the same red.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Verdict {
+pub(crate) enum Verdict {
     /// Something is in flight; the light is unlit.
     Pending,
     /// The server answered.
@@ -1516,7 +1519,7 @@ enum Verdict {
 }
 
 impl Verdict {
-    fn class(self) -> &'static str {
+    pub(crate) fn class(self) -> &'static str {
         match self {
             Verdict::Pending => "off",
             Verdict::Pass => "green",
@@ -2123,6 +2126,10 @@ impl ChatPane {
         // plain Claude Code, hidden on the private one, whose turns never
         // carry it.
         let credential_form = CredentialForm::new();
+        let cloud_form = crate::cloud_form::CloudForm::new(
+            taste_core::state::workspace_state_dir(workspace.root()),
+            workspace.events.clone(),
+        );
         // The designation. A switch, because the role is a state one chat
         // is in and any chat can be moved into — and one per workspace, so
         // turning it on here turns it off wherever it was.
@@ -2865,6 +2872,7 @@ impl ChatPane {
         controls_column.append(&session_list);
         controls_column.append(&credential_form.group);
         controls_column.append(&private_form.group);
+        controls_column.append(&cloud_form.group);
         controls_column.append(&standing_group);
         controls_column.append(&controls);
         controls_column.append(&auth_box);
@@ -2881,6 +2889,15 @@ impl ChatPane {
         // allocated at real width the whole time.
         controls_scroller.add_css_class("background");
         controls_scroller.set_visible(false);
+        // Where the project stands with Google is read when the shade
+        // appears — one gcloud run, off this thread — rather than once per
+        // chat at launch, when nobody is looking at it.
+        let weak_cloud = Rc::downgrade(&cloud_form);
+        controls_scroller.connect_map(move |_| {
+            if let Some(form) = weak_cloud.upgrade() {
+                form.sync();
+            }
+        });
         // The pinned prompt: a clamped copy of the last user card, floating
         // at the transcript's top edge while the real card is scrolled off
         // above. Clicking it jumps back to the card. Under the options
@@ -3112,6 +3129,7 @@ impl ChatPane {
             probe_identity: RefCell::new(None),
             private_form,
             credential_form,
+            cloud_form,
             issues,
             quota_bar,
             quota_fade: RefCell::new(None),
@@ -11021,6 +11039,47 @@ impl ChatPane {
             }
             Ok("standing") => self.seed_standing_for_probe(),
             Ok("controls") => self.seed_controls_for_probe(),
+            // `cloud`: the shade's Google Cloud group, posed in the state
+            // `TASTE_PROBE_CLOUD` names (`unset`, `fetching`, `signed-in`,
+            // `missing`, or ready by default), which otherwise needs a
+            // Google account and a project.
+            Ok("cloud") => {
+                self.stop_button.set_visible(false);
+                self.set_busy(false);
+                self.show_options(true);
+                let variant = std::env::var("TASTE_PROBE_CLOUD").unwrap_or_default();
+                self.cloud_form.pose_for_probe(&variant);
+                // The group is under the account group, off the bottom of
+                // the shade at the probe's height: park the shade with the
+                // group's last line in view — its verdict, which is what a
+                // pose is about — again whenever anything above or in it
+                // takes its size.
+                let panel = self.options_panel.clone();
+                let group = self.cloud_form.group.clone();
+                let park = move |adjustment: &gtk::Adjustment| {
+                    let Some(column) = panel.child() else { return };
+                    let Some(top) =
+                        group.compute_point(&column, &gtk::graphene::Point::new(0.0, 0.0))
+                    else {
+                        return;
+                    };
+                    let top = f64::from(top.y());
+                    let bottom = top + f64::from(group.height()) + 12.0;
+                    let page = adjustment.page_size();
+                    adjustment.set_value(if bottom - top > page {
+                        top
+                    } else {
+                        bottom - page
+                    });
+                };
+                let adjustment = self.options_panel.vadjustment();
+                adjustment.connect_upper_notify(park.clone());
+                adjustment.connect_page_size_notify(park.clone());
+                let settled = adjustment.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                    park(&settled)
+                });
+            }
             Ok(variant) => self.seed_permission_for_probe(variant),
             Err(_) => self.seed_permission_for_probe(""),
         }

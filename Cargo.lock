@@ -2876,6 +2876,7 @@ dependencies = [
  "taste-devcontainer",
  "taste-flatpak",
  "taste-fleetlink",
+ "taste-gcp",
  "taste-git",
  "taste-mcp",
  "taste-models",

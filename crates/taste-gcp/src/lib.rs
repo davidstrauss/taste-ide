@@ -24,6 +24,8 @@
 //!
 //! - [`gcloud`]: the IDE's own pinned copy of the gcloud CLI, signed in
 //!   per project — its tokens, and its IAP tunnel to the model's VM.
+//! - [`project`]: what one project keeps — its choices file and its own
+//!   gcloud configuration, in the workspace's IDE state.
 //! - [`rest`]: Google's APIs, with tokens renewed before they lapse,
 //!   failures read into a typed error, and Compute's operations awaited
 //!   to their end.
@@ -33,6 +35,7 @@
 
 pub mod gcloud;
 pub mod model;
+pub mod project;
 pub mod resources;
 pub mod rest;
 pub mod setup;

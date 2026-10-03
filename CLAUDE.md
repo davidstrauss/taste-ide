@@ -193,6 +193,11 @@ otherwise need a Pull over a remote that asks;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;
+`TASTE_PROBE_CHAT=cloud` opens the settings shade on its Google Cloud
+group (`cloud_form.rs`) and `TASTE_PROBE_CLOUD` poses it (`unset`,
+`fetching` — the IDE's own gcloud partway down —, `signed-in`, `missing`
+— a test that found the role short —, or ready by default), since every
+real state of it needs a Google account and a project;
 `TASTE_PROBE_PRIVATE=1` poses the chat as Claude Code (Private) — the
 header's identity naming it, its Plan gauge gone, and the settings shade's
 Private model group up — which otherwise needs a provisioned

@@ -1448,21 +1448,31 @@ want my IDE client to be able to access it").
   use re-stages it, saying so in the chat. "Remove from GCP" in the shade
   deletes everything the IDE created for this workspace, every resource
   carrying its label, and nothing else.
-- **Setting it up.** A Claude Code (GLM-5.3) chat's settings shade
-  carries a GCP group in the place the private variant's Private model
-  group sits: the project, the zone (defaulting to the first in the region
-  offering the chosen machine), the cap, "Sign in", and "Set up". Signing
-  in fetches the pinned gcloud if it is not there yet and runs its
-  browser sign-in into the project's own config. Setting up runs
-  `build-aux/gcp-setup.sh` with that gcloud, as the user: it enables the
-  APIs, creates the custom role and the keyless service account, grants
-  the one to the other, and lets the user impersonate it — every step
-  repeatable, `--remove` to undo, and runnable by hand or in Cloud Shell
-  just the same, since it is the same file. Then "Test" runs a preflight
-  before anything is created — a token as the service account, its
-  permissions (asked of the API by name with `testIamPermissions`), and
-  the regional vCPU quota for the machine — and reports each miss as a
-  sentence under the rows. Staging's progress is drawn where the guest
+- **Setting it up, in the IDE** (David, 2026-10-03: "I do want to be able
+  to run setup and, ideally, set up the restricted service account, and
+  finally impersonate it, directly in the IDE"). Every chat's settings
+  shade carries a **Google Cloud** group (`taste-app`'s `cloud_form`) —
+  every chat's, because the access is the project's rather than one
+  agent's, and serves cloud environments as well as the model — built as
+  the Anthropic account group is: a project row, three steps, and the
+  traffic-light verdict under them. **Sign in with Google** fetches the
+  pinned gcloud if it is not there yet, with its progress on the verdict
+  line, and runs gcloud's browser sign-in in a console tab into the
+  project's own config. **Set up the project** runs
+  `build-aux/gcp-setup.sh` in a console tab with that gcloud, as the
+  user: it enables the APIs, creates the custom role and the keyless
+  service account, grants the one to the other, and lets the user
+  impersonate it — every step repeatable, `--remove` to undo, and
+  runnable by hand or in Cloud Shell just the same, since it is the same
+  file. **Test** then asks Google, *as the service account* — the
+  impersonation every later call makes — which of the role's permissions
+  it holds (`testIamPermissions`, by name), and says ready, or names what
+  is missing; a setup that exits clean is followed by the test on its
+  own. The console steps run wrapped, in the IDE's own context and never
+  an environment's container, and their command line strips every
+  inherited sign-in first, since a tab can only add to its environment.
+  The zone, the monthly cap, and the regional vCPU quota join the group
+  with the machines. Staging's progress is drawn where the guest
   image's fetch is drawn, in the backlog's header, from the bytes the
   staging VM reports.
 - **What this protects, and what it does not.** It protects against the

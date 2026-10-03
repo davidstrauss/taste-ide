@@ -18,6 +18,7 @@ taste-fleetlink.workspace = true
 taste-mcp.workspace = true
 taste-voice.workspace = true
 taste-models.workspace = true
+taste-gcp.workspace = true
 taste-semantic.workspace = true
 
 agent-client-protocol = "2"

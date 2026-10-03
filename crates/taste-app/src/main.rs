@@ -17,6 +17,7 @@ mod chat;
 mod chat_column;
 mod chatdoc;
 mod chats;
+mod cloud_form;
 mod command_completion;
 mod compose;
 mod composer;

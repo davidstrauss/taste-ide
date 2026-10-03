@@ -4388,6 +4388,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         status,
                         tail,
                     } => {
+                        if title == crate::cloud_form::SIGN_IN_TITLE
+                            || title == crate::cloud_form::SETUP_TITLE
+                        {
+                            if let Some(pane) = chats.selected() {
+                                pane.cloud_form.step_finished(&title, status);
+                            }
+                        }
                         if title == "Sign In" {
                             // The sign-in terminal was opened from the chat
                             // the user is in; credentials are per agent, so
