@@ -976,6 +976,7 @@ staging="$1"
 branch="$2"
 folder_tree="$3"
 expected="$4"
+sent="${5:-}"
 cleanup() { git update-ref -d "$staging" 2>/dev/null || true; }
 # Every taste-ide-sync stash whose every file, as stashed, is the file as
 # some commit since the stash's base has it: work that reached history, so
@@ -1033,6 +1034,25 @@ if git ls-files -u | grep -q .; then
     echo "the checkout has unresolved conflicts in $(git ls-files -u | awk '{print $4}' | sort -u | tr '\n' ' ')- resolve or discard them in the file tree, and the folder's commits follow" >&2
     exit 5
   fi
+fi
+# A file the checkout still holds as the folder sent it, where the folder
+# has since changed it again, is the folder's stale copy and not Personal's
+# work: it goes back to its commit, and the folder's version comes with the
+# move or the mirror after it. Carried through the stash below instead, an
+# edit the folder had reverted came back out over the revert, which left
+# the file as it was before the edit and so took the stash cleanly
+# (2026-10-04: bootstrap.sh "modified" in Personal, clean in the folder).
+# `$sent` is "sent<TAB>now<TAB>path" a line, objects by id ("none": absent).
+if [ -n "$sent" ]; then
+  tab=$(printf '\t')
+  printf '%s\n' "$sent" | while IFS="$tab" read -r was now p; do
+    [ -n "$p" ] && [ "$was" != "$now" ] || continue
+    [ -L "$p" ] && continue
+    if [ -e "$p" ]; then here=$(git hash-object -- "$p"); else here=none; fi
+    [ "$here" = "$was" ] || continue
+    if git cat-file -e "HEAD:$p" 2>/dev/null; then git checkout -q HEAD -- "$p"
+    else rm -f -- "$p"; fi
+  done
 fi
 # The checkout's files are the folder's: move the branch, keep the files.
 if [ -n "$folder_tree" ]; then
@@ -1230,6 +1250,31 @@ struct Arrival<'a> {
     rewrite_from: Option<&'a str>,
 }
 
+/// What the folder has sent the checkout since the two last agreed, as the
+/// sync script's `$5`: "sent<TAB>now<TAB>path" a line
+/// (`GitWorkspace::sent_against_folder`). A path that would not survive
+/// the format — a tab or a newline in it — is left out, and keeps the old
+/// behaviour.
+fn sent_lines(peer: &Path) -> String {
+    let Some(git) = taste_git::GitWorkspace::discover(peer) else {
+        return String::new();
+    };
+    let Ok(sent) = git.sent_against_folder() else {
+        return String::new();
+    };
+    fn id(oid: Option<impl std::fmt::Display>) -> String {
+        oid.map_or_else(|| "none".to_string(), |o| o.to_string())
+    }
+    sent.into_iter()
+        .filter_map(|sent| {
+            let path = sent.path.to_str()?.to_string();
+            (!path.contains(['\t', '\n']))
+                .then(|| format!("{}\t{}\t{path}", id(sent.sent), id(sent.now)))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn push_ahead_into_checkout(
     peer: &Path,
     vm: &Vm,
@@ -1266,6 +1311,7 @@ fn push_ahead_into_checkout(
                 branch.to_string(),
                 folder_tree.unwrap_or_default().to_string(),
                 rewrite_from.unwrap_or_default().to_string(),
+                sent_lines(peer),
             ],
         )
         .with_context(|| format!("fast-forwarding {branch} in VM {}", vm.domain))?;
@@ -1336,6 +1382,12 @@ mod tests {
 
         /// [`Self::sync`] for a branch the folder rewrote, from `agreed`.
         fn sync_rewrite(&self, agreed: &str) -> i32 {
+            self.sync_with(agreed, "")
+        }
+
+        /// The sync, told what the folder has sent since the two last
+        /// agreed (`sent_lines`'s format).
+        fn sync_with(&self, agreed: &str, sent: &str) -> i32 {
             let folder = self.dir.join("folder").display().to_string();
             self.git(
                 "checkout",
@@ -1352,6 +1404,7 @@ mod tests {
                     "main",
                     &tree,
                     agreed,
+                    sent,
                 ])
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
@@ -1397,6 +1450,62 @@ mod tests {
         );
         // What shows as uncommitted is the folder's own uncommitted change.
         assert_eq!(pair.git("checkout", &["status", "--porcelain"]), "M a.txt");
+    }
+
+    /// An edit the folder sent, committed and then reverted in the folder
+    /// before the checkout took either commit, does not come back out of
+    /// the sync's stash over the revert (2026-10-04: bootstrap.sh showed as
+    /// modified in Personal while the folder was clean).
+    #[test]
+    fn a_reverted_edit_the_folder_sent_does_not_come_back() {
+        let pair = Pair::new("revert");
+        let blob = |side: &str, text: &str| {
+            std::fs::write(pair.dir.join(side).join(".probe"), text).unwrap();
+            let id = pair.git(side, &["hash-object", ".probe"]);
+            std::fs::remove_file(pair.dir.join(side).join(".probe")).unwrap();
+            id
+        };
+        // The edit, sent: the checkout holds it uncommitted …
+        pair.write("checkout", "a.txt", "two\n");
+        // … the folder commits it, then reverts it, and the revert has not
+        // been sent yet when the sync runs.
+        pair.write("folder", "a.txt", "two\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "the edit");
+        pair.write("folder", "a.txt", "one\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "revert the edit");
+        let sent = format!(
+            "{}\t{}\ta.txt",
+            blob("folder", "two\n"),
+            blob("folder", "one\n")
+        );
+        assert_eq!(pair.sync_with("", &sent), 0);
+        assert_eq!(
+            pair.git("checkout", &["rev-parse", "HEAD"]),
+            pair.git("folder", &["rev-parse", "HEAD"])
+        );
+        assert_eq!(pair.git("checkout", &["status", "--porcelain"]), "");
+        assert_eq!(
+            std::fs::read_to_string(pair.dir.join("checkout/a.txt")).unwrap(),
+            "one\n"
+        );
+    }
+
+    /// Personal's own work — a file the folder never sent — still rides
+    /// the stash through the move.
+    #[test]
+    fn personals_own_change_survives_the_move() {
+        let pair = Pair::new("own");
+        pair.write("checkout", "mine.txt", "agent's\n");
+        pair.write("folder", "a.txt", "two\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "folder work");
+        assert_eq!(pair.sync_with("", ""), 0);
+        assert_eq!(
+            std::fs::read_to_string(pair.dir.join("checkout/mine.txt")).unwrap(),
+            "agent's\n"
+        );
     }
 
     /// A rebase or an amend in the folder reaches the checkout while the

@@ -55,6 +55,17 @@ pub const MIRROR_REF: &str = "refs/taste/mirror/primary";
 /// over the user's own file).
 pub const SENT_REF: &str = "refs/taste/mirror/sent";
 
+/// One path the folder has sent the checkout since the two last agreed
+/// ([`GitWorkspace::sent_against_folder`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentPath {
+    pub path: PathBuf,
+    /// The object it was sent as; `None`, sent as removed.
+    pub sent: Option<Oid>,
+    /// The object the folder's working copy holds now; `None`, absent.
+    pub now: Option<Oid>,
+}
+
 /// How the mirror's baseline commit names the branch the folder was on
 /// when it was recorded.
 const RECORDED_ON: &str = "taste mirror on ";
@@ -464,6 +475,32 @@ impl GitWorkspace {
             }
         }
         Ok(update.create_updated(&self.repo, &base)?)
+    }
+
+    /// Each path the folder has sent the checkout since the two last
+    /// agreed ([`SENT_REF`]), with the object it was sent as and the one
+    /// the folder's working copy holds now (`None`: absent). A checkout
+    /// still holding what was sent, where the folder has since moved on —
+    /// reverted it, most often — holds the folder's stale copy rather than
+    /// work of its own; the sync drops it rather than carry it through its
+    /// stash (`taste_devcontainer::peer`'s sync script).
+    pub fn sent_against_folder(&self) -> Result<Vec<SentPath>> {
+        let (Some(sent), Some(agreed)) = (self.read_ref(SENT_REF)?, self.read_ref(MIRROR_REF)?)
+        else {
+            return Ok(Vec::new());
+        };
+        let sent = self.repo.find_commit(sent)?.tree_id();
+        let agreed = self.repo.find_commit(agreed)?.tree_id();
+        let current = self.repo.find_tree(self.worktree_tree()?)?;
+        Ok(self
+            .entries_between(agreed, sent)?
+            .into_iter()
+            .map(|(path, entry)| SentPath {
+                now: current.get_path(&path).ok().map(|e| e.id()),
+                sent: entry.map(|(oid, _)| oid),
+                path,
+            })
+            .collect())
     }
 
     /// Every path the folder changed since the last mirror, as the
