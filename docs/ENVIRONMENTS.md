@@ -1405,6 +1405,19 @@ want my IDE client to be able to access it").
   downloads are over, and their connections gone, before the window
   shuts. A serve that fails anywhere shuts the window on its way out, and
   every serve starts by shutting one an interrupted run left open.
+
+  Why a window rather than standing access to Google's APIs, which would
+  be simpler and was weighed (David, 2026-10-03: "I prefer simpler
+  methods if we can just bring up the VM with the correct isolation at
+  the start"; kept, same day): having no service account means the VM has
+  no credential, not that it has no way out. Google's APIs take whatever
+  credential a caller brings, so a server subverted by a crafted weights
+  file or prompt could carry an attacker's own key, or use a bucket
+  anyone may write, and upload the prompts — the user's code — there. No
+  firewall rule can say "this project's bucket only"; only VPC Service
+  Controls can, and that is an organization-level policy with an
+  exception for the IDE's own calls, which is more setup rather than
+  less. The window costs about ten seconds a wake.
 - **Reached only through IAP, so the model's machine faces nothing**
   (David, 2026-10-02: "My IP changes frequently as I move my laptop
   around"). The IDE runs `gcloud compute start-iap-tunnel` to the serving
