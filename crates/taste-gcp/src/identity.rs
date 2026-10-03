@@ -20,9 +20,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyUsagePurpose, SerialNumber,
+    Issuer, KeyIdMethod, KeyUsagePurpose, SerialNumber,
 };
 use rustls::pki_types::CertificateDer;
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::resources::Workspace;
@@ -96,11 +97,22 @@ fn random_serial() -> Result<SerialNumber> {
     Ok(SerialNumber::from_slice(&bytes))
 }
 
+/// A key's identifier, RFC 7093's first method: the leftmost 160 bits of
+/// SHA-256 over the public key. Stated rather than left to rcgen, whose
+/// default without its own crypto backend is an identifier zero bytes long
+/// — which RFC 5280 does not allow a CA, and which then empties every
+/// leaf's authority key identifier too.
+fn key_id(key: &dyn KeySigner) -> KeyIdMethod {
+    KeyIdMethod::PreSpecified(Sha256::digest(key.public_point())[..20].to_vec())
+}
+
 /// The CA's parameters. Rebuilt the same way at every renewal, because a
-/// leaf's issuer is named from them and has to match the certificate the
-/// provider trusts.
-fn ca_params(ws: &Workspace) -> CertificateParams {
+/// leaf's issuer is named from them, and its authority key identifier
+/// derived from them, and both have to match the certificate the provider
+/// trusts.
+fn ca_params(ws: &Workspace, ca: &dyn KeySigner) -> CertificateParams {
     let mut params = CertificateParams::default();
+    params.key_identifier_method = key_id(ca);
     let mut name = DistinguishedName::new();
     name.push(DnType::OrganizationName, "taste-ide");
     name.push(DnType::CommonName, format!("taste-{} CA", ws.id()));
@@ -113,7 +125,7 @@ fn ca_params(ws: &Workspace) -> CertificateParams {
 /// The workspace's CA certificate, self-signed by the CA key.
 pub fn issue_ca(ws: &Workspace, ca: &dyn KeySigner, now: SystemTime) -> Result<Issued> {
     let not_after = now + Duration::from_secs(CA_DAYS * DAY);
-    let mut params = ca_params(ws);
+    let mut params = ca_params(ws, ca);
     params.not_before = offset(now - BACKDATE)?;
     params.not_after = offset(not_after)?;
     params.serial_number = Some(random_serial()?);
@@ -158,10 +170,11 @@ pub fn issue_leaf(
     ];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     params.use_authority_key_identifier_extension = true;
+    params.key_identifier_method = key_id(key);
     params.not_before = offset(now - BACKDATE)?;
     params.not_after = offset(not_after)?;
     params.serial_number = Some(random_serial()?);
-    let issuer = Issuer::new(ca_params(ws), CertKey(ca));
+    let issuer = Issuer::new(ca_params(ws, ca), CertKey(ca));
     let cert = params
         .signed_by(&CertKey(key), &issuer)
         .context("issuing a leaf from the workspace CA")?;
@@ -253,5 +266,36 @@ mod tests {
         let ca = MemorySigner::generate();
         let cert = issue_ca(&ws(), &ca, SystemTime::now()).unwrap();
         crate::setup::cloud_shell_script(&ws(), "my-project-1", &cert.pem()).unwrap();
+    }
+
+    #[test]
+    fn key_identifiers_are_twenty_bytes_and_chain() {
+        let now = SystemTime::now();
+        let ca = MemorySigner::generate();
+        let key = MemorySigner::generate();
+        let ca_cert = issue_ca(&ws(), &ca, now).unwrap();
+        let leaf = issue_leaf(&ws(), &ca, &key, Leaf::Google, now).unwrap();
+        let ca_id = Sha256::digest(ca.public_point())[..20].to_vec();
+        let key_id = Sha256::digest(key.public_point())[..20].to_vec();
+        let contains = |der: &[u8], needle: &[u8]| der.windows(needle.len()).any(|w| w == needle);
+        // subjectKeyIdentifier: OID 2.5.29.14, an OCTET STRING of 20 bytes.
+        let ski = |id: &[u8]| {
+            [
+                &[0x06, 0x03, 0x55, 0x1d, 0x0e, 0x04, 0x16, 0x04, 0x14][..],
+                id,
+            ]
+            .concat()
+        };
+        assert!(contains(&ca_cert.der, &ski(&ca_id)));
+        assert!(contains(&leaf.der, &ski(&key_id)));
+        // The leaf's authorityKeyIdentifier carries the CA's.
+        assert!(contains(&leaf.der, &[&[0x80, 0x14][..], &ca_id].concat()));
+        // And no identifier anywhere is empty.
+        for der in [&ca_cert.der, &leaf.der] {
+            assert!(!contains(
+                der,
+                &[0x06, 0x03, 0x55, 0x1d, 0x0e, 0x04, 0x02, 0x04, 0x00]
+            ));
+        }
     }
 }
