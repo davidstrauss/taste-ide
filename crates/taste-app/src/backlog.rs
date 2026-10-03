@@ -333,6 +333,16 @@ fn is_current(env: &EnvironmentId, current: Option<&EnvironmentId>) -> bool {
     }
 }
 
+/// The rows a shift-click spans: every id from `from` to `to` inclusive,
+/// in the order the list shows them, whichever comes first. `None` when
+/// either is not listed — the anchor scrolled out under a filter, say —
+/// and the click then checks its one row.
+fn shift_range<'a>(ids: &'a [String], from: &str, to: &str) -> Option<&'a [String]> {
+    let a = ids.iter().position(|id| id == from)?;
+    let b = ids.iter().position(|id| id == to)?;
+    Some(&ids[a.min(b)..=a.max(b)])
+}
+
 /// Whether a Start for `host` would do anything to `row`: a queued issue
 /// with no environment is made one there; an issue whose environment is
 /// on the other kind of VM is moved there; one that is stopped where it
@@ -861,6 +871,8 @@ pub struct StartedIssue {
     pub host: taste_core::environment::Host,
 }
 type StartHook = Box<dyn Fn(StartedIssue)>;
+/// A write waiting its turn: it starts itself when called.
+type QueuedWrite = Box<dyn FnOnce(&Rc<BacklogPanel>)>;
 
 /// One built row, kept so the tick can redraw its sparkline and the
 /// probe can find it by id.
@@ -932,6 +944,12 @@ pub struct BacklogPanel {
     /// env/issue is checked, the whole set switches to showing the check
     /// boxes, whether checked or not").
     check_slots: RefCell<Vec<gtk::Stack>>,
+    /// The row whose box was last checked or unchecked: where a
+    /// shift-click's range starts.
+    check_anchor: RefCell<Option<String>>,
+    /// Shift was held on the press that is about to toggle a box — a
+    /// toggle carries no modifiers, so the box's own click says so first.
+    shift_toggle: Cell<bool>,
     start_button: gtk::Button,
     /// Start, in the project's cloud: the play glyph with a cloud badge.
     cloud_start_button: gtk::Button,
@@ -956,6 +974,9 @@ pub struct BacklogPanel {
     listed: RefCell<Vec<Listed>>,
     open_menu: RefCell<Option<glib::WeakRef<gtk::Popover>>>,
     writing: Cell<bool>,
+    /// Writes asked for while one was in flight, run in order as each
+    /// finishes ([`Self::write_then`]).
+    queued_writes: RefCell<std::collections::VecDeque<QueuedWrite>>,
     selecting: Cell<bool>,
     filling: Cell<bool>,
     /// A render asked for while a row's menu was open. The list is not
@@ -1357,6 +1378,8 @@ impl BacklogPanel {
             checked: RefCell::new(std::collections::HashSet::new()),
             intervention_bar: intervention_bar.clone(),
             check_slots: RefCell::new(Vec::new()),
+            check_anchor: RefCell::new(None),
+            shift_toggle: Cell::new(false),
             results: results.clone(),
             list_rows: Cell::new(1),
             start_button: start_button.clone(),
@@ -1375,6 +1398,7 @@ impl BacklogPanel {
             listed: RefCell::new(Vec::new()),
             open_menu: RefCell::new(None),
             writing: Cell::new(false),
+            queued_writes: RefCell::new(std::collections::VecDeque::new()),
             selecting: Cell::new(false),
             filling: Cell::new(false),
             render_deferred: Cell::new(false),
@@ -2289,14 +2313,41 @@ impl BacklogPanel {
             let id = row.id.clone();
             check.connect_toggled(move |check| {
                 let Some(panel) = weak.upgrade() else { return };
-                if check.is_active() {
+                let active = check.is_active();
+                if active {
                     panel.checked.borrow_mut().insert(id.clone());
                 } else {
                     panel.checked.borrow_mut().remove(&id);
                 }
+                // Shift held: every row from the last box touched to this
+                // one takes this one's new state, as a file manager's list
+                // does (David, 2026-10-04: "shift-click to range select
+                // from the most recently selected or deselected checkbox").
+                if panel.shift_toggle.replace(false) {
+                    let anchor = panel.check_anchor.borrow().clone();
+                    if let Some(anchor) = anchor {
+                        panel.check_range(&anchor, &id, active);
+                    }
+                }
+                *panel.check_anchor.borrow_mut() = Some(id.clone());
                 panel.sync_check_slots();
                 panel.sync_actions();
             });
+            // The press says whether shift is down before the box toggles.
+            let shift = gtk::GestureClick::builder()
+                .propagation_phase(gtk::PropagationPhase::Capture)
+                .build();
+            let weak = Rc::downgrade(self);
+            shift.connect_pressed(move |gesture, _, _, _| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.shift_toggle.set(
+                        gesture
+                            .current_event_state()
+                            .contains(gtk::gdk::ModifierType::SHIFT_MASK),
+                    );
+                }
+            });
+            check.add_controller(shift);
         }
         let slot = crate::filetree::leading_slot(&slot_stack);
         {
@@ -3244,10 +3295,38 @@ impl BacklogPanel {
         }
     }
 
+    /// Give every listed row from `from` to `to`, in the order the list
+    /// shows them, the state `checked` — the shift-click's range. The boxes
+    /// are redrawn after this handler returns, not inside it: the box being
+    /// toggled is one of the rows a render rebuilds.
+    fn check_range(self: &Rc<Self>, from: &str, to: &str, checked: bool) {
+        let ids: Vec<String> = self.listed.borrow().iter().map(|l| l.id.clone()).collect();
+        let Some(range) = shift_range(&ids, from, to) else {
+            return;
+        };
+        {
+            let mut set = self.checked.borrow_mut();
+            for id in range {
+                if checked {
+                    set.insert(id.clone());
+                } else {
+                    set.remove(id);
+                }
+            }
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(panel) = weak.upgrade() {
+                panel.rerender();
+            }
+        });
+    }
+
     /// Forget every check. Called when an intervention has run: the marks
     /// said what to act on, the acting is done, and leaving them set is how
     /// a second press acts on a batch nobody meant to name twice.
     fn clear_checks(self: &Rc<Self>) {
+        *self.check_anchor.borrow_mut() = None;
         if self.checked.borrow().is_empty() {
             return;
         }
@@ -3647,19 +3726,18 @@ impl BacklogPanel {
         D: FnOnce(&Rc<Self>, T) + 'static,
     {
         if self.writing.get() {
-            // Refusing is right — two compare-and-swaps on one ref is how
-            // an order gets decided by a race — but refusing SILENTLY is
-            // not: this used to swallow a filed issue whole, composer
-            // already closed, with nothing on screen to say so.
-            if let Some(toast) = self.on_toast.borrow().as_ref() {
-                toast(
-                    "The backlog is still saving the last change — try again in a moment.".into(),
-                );
-            }
-            if let Some(order) = revert_to {
-                *self.issues.borrow_mut() = order;
-                self.render();
-            }
+            // Two compare-and-swaps on one ref at once is how an order gets
+            // decided by a race, so a write never runs beside another — it
+            // waits its turn and runs when the one ahead finishes. It was
+            // refused instead, with a toast, and a Delete of several checked
+            // issues — one write each — deleted the first and refused the
+            // rest (David, 2026-10-04: "The backlog is still saving the last
+            // change — try again in a moment", then "wat").
+            self.queued_writes
+                .borrow_mut()
+                .push_back(Box::new(move |panel: &Rc<Self>| {
+                    panel.write_then(revert_to, op, then);
+                }));
             return;
         }
         self.writing.set(true);
@@ -3699,6 +3777,11 @@ impl BacklogPanel {
             panel.rerender();
             if let Some(value) = produced {
                 then(&panel, value);
+            }
+            // The next write in line, now this one has finished.
+            let next = panel.queued_writes.borrow_mut().pop_front();
+            if let Some(next) = next {
+                next(&panel);
             }
         });
     }
@@ -3925,6 +4008,19 @@ mod tests {
             working_on: None,
         });
         row
+    }
+
+    #[test]
+    fn a_shift_click_spans_from_the_last_box_touched_either_way() {
+        let ids: Vec<String> = ["primary", "i-1", "i-2", "i-3", "i-4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(shift_range(&ids, "i-1", "i-3").unwrap(), &ids[1..=3]);
+        // Upward from the anchor too.
+        assert_eq!(shift_range(&ids, "i-4", "i-2").unwrap(), &ids[2..=4]);
+        assert_eq!(shift_range(&ids, "i-2", "i-2").unwrap(), &ids[2..=2]);
+        assert!(shift_range(&ids, "gone", "i-2").is_none());
     }
 
     /// Each Start acts where it would change something: a queued issue is
