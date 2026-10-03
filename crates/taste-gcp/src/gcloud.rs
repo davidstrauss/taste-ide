@@ -236,12 +236,22 @@ impl Gcloud {
     /// `gcloud compute start-iap-tunnel` to `instance`'s `port`, listening
     /// on loopback at `local_port`, as the impersonated service account.
     /// The caller keeps the child running for as long as the tunnel is
-    /// wanted.
-    pub fn tunnel(&self, instance: &str, zone: &str, port: u16, local_port: u16) -> Command {
+    /// wanted, and it ends with its parent however the parent ends
+    /// (`PR_SET_PDEATHSIG`; gcloud's script execs its Python, so the
+    /// signal reaches the tunnel itself). Linux counts the THREAD that
+    /// spawned a child as its parent, so a tunnel meant to outlive one call
+    /// is spawned from a thread that lives as long as the process.
+    pub fn tunnel(
+        &self,
+        instance: &str,
+        zone: &str,
+        port: u16,
+        local_port: u16,
+    ) -> std::process::Command {
         let port = port.to_string();
         let local = format!("--local-host-port=127.0.0.1:{local_port}");
         let zone = format!("--zone={zone}");
-        let mut command = Command::from(self.invocation(
+        let mut command = self.invocation(
             &[
                 "compute",
                 "start-iap-tunnel",
@@ -251,8 +261,17 @@ impl Gcloud {
                 &zone,
             ],
             false,
-        ));
-        command.stdin(Stdio::null()).kill_on_drop(true);
+        );
+        command.stdin(Stdio::null());
+        // SAFETY: prctl is async-signal-safe, and the closure allocates
+        // nothing between fork and exec.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
         command
     }
 
@@ -444,7 +463,6 @@ mod tests {
             41234,
         );
         let args: Vec<_> = command
-            .as_std()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();

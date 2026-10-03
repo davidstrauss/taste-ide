@@ -151,12 +151,13 @@ async fn smoke(state: &Path, project: &str, zone: &str, keep: bool) -> Result<()
         .local_addr()?
         .port();
     eprintln!("opening the IAP tunnel on 127.0.0.1:{port}");
-    let tunnel = gcloud
+    let mut tunnel = gcloud
         .tunnel(&plan.names.serving, zone, model::SERVER_PORT, port)
         .spawn()
         .context("starting gcloud's IAP tunnel")?;
     let answer = ask(port, &key).await;
-    drop(tunnel);
+    let _ = tunnel.kill();
+    let _ = tunnel.wait();
     if !keep {
         eprintln!("deleting the serving VM; the weights stay in the bucket");
         lifecycle::stop(&gcp, &loc, &plan).await?;

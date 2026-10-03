@@ -75,9 +75,40 @@ pub const NOT_SET_UP: &str = "this project has no Google Cloud set up for enviro
      the project, sign in, and run Set Up Project in the title bar's cloud, then try again";
 
 /// The tunnels this process holds open, by host.
-fn tunnels() -> &'static Mutex<HashMap<String, tokio::process::Child>> {
-    static TUNNELS: OnceLock<Mutex<HashMap<String, tokio::process::Child>>> = OnceLock::new();
+fn tunnels() -> &'static Mutex<HashMap<String, std::process::Child>> {
+    static TUNNELS: OnceLock<Mutex<HashMap<String, std::process::Child>>> = OnceLock::new();
     TUNNELS.get_or_init(Default::default)
+}
+
+/// A spawn request for [`spawn_for_life`], and where its child goes.
+type Spawn = (
+    std::process::Command,
+    std::sync::mpsc::Sender<std::io::Result<std::process::Child>>,
+);
+
+/// Spawn `command` from a thread that lives as long as the process. A
+/// tunnel dies with its parent (`Gcloud::tunnel`), and Linux counts the
+/// thread that spawned it as that parent, so a tunnel spawned from one of
+/// the runtime's pool threads would die when the pool retired the thread —
+/// and one that outlived the IDE held a gcloud open with nobody to close
+/// it, which is how they used to accumulate.
+fn spawn_for_life(command: std::process::Command) -> std::io::Result<std::process::Child> {
+    static SPAWNER: OnceLock<std::sync::mpsc::Sender<Spawn>> = OnceLock::new();
+    let spawner = SPAWNER.get_or_init(|| {
+        let (asks, asked) = std::sync::mpsc::channel::<Spawn>();
+        let _ = std::thread::Builder::new()
+            .name("taste-tunnels".into())
+            .spawn(move || {
+                for (mut command, reply) in asked {
+                    let _ = reply.send(command.spawn());
+                }
+            });
+        asks
+    });
+    let gone = || std::io::Error::other("the tunnels' spawning thread is gone");
+    let (reply, answer) = std::sync::mpsc::channel();
+    spawner.send((command, reply)).map_err(|_| gone())?;
+    answer.recv().map_err(|_| gone())?
 }
 
 /// Each workspace's host records, read from its state once and written
@@ -412,9 +443,8 @@ impl CloudSession {
         command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(log));
-        let child = command
-            .spawn()
-            .context("starting gcloud's IAP tunnel to the cloud host")?;
+        let child =
+            spawn_for_life(command).context("starting gcloud's IAP tunnel to the cloud host")?;
         tunnels.insert(vm.domain.clone(), child);
         Ok(())
     }
@@ -422,7 +452,8 @@ impl CloudSession {
     /// Close a host's tunnel, if one is open.
     fn close_tunnel(&self, vm: &Vm) {
         if let Some(mut child) = tunnels().lock().unwrap().remove(&vm.domain) {
-            let _ = child.start_kill();
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
