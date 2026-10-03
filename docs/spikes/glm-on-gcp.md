@@ -269,7 +269,9 @@ included.
 ([Hyperdisk Balanced](https://docs.cloud.google.com/compute/docs/disks/hd-types/hyperdisk-balanced)).
 At the free 140 MiB/s a cold load takes ~95 minutes; at 2,400 MiB/s,
 ~5.5. Capacity alone is on the order of $50–100/month standing, plus
-whatever throughput is held while stopped.
+whatever throughput is held while stopped. (Corrected 2026-10-03 from the
+published prices: $68/month for 850 GiB, and $90/month more if 2,400
+MiB/s is held — $158 of a $300 cap. The next section is the alternative.)
 
 Two levers, each for Phase 2 to measure rather than assume: raising the
 disk's provisioned throughput before a start and lowering it after a stop
@@ -277,6 +279,135 @@ disk's provisioned throughput before a start and lowering it after a stop
 deleting the disk after a stretch unused and re-staging from Hugging Face
 on the next use (an ~800 GB download on a small VM, tens of minutes and
 well under a dollar of compute).
+
+## Weights from GCS instead of a disk (2026-10-03)
+
+Asked after the smoke test (David: "What's the need for the weights on
+disk, anyway? Couldn't we stream from GCS to memory?"). Researched, not
+yet measured; prices are us-central1, from the published pricing pages.
+
+**What the disk costs, and what it pins.** Hyperdisk Balanced is $0.08
+per GiB-month and $0.04 per MiB/s-month above the free 140 MiB/s, and its
+performance can change at most once every 4 hours
+([pricing](https://cloud.google.com/compute/disks-image-pricing),
+[Hyperdisk Balanced](https://docs.cloud.google.com/compute/docs/disks/hd-types/hyperdisk-balanced)).
+Standing at the loading throughput, that is $158/month. Dropping to the
+baseline while stopped saves $90, but a start inside the 4-hour window
+then loads at 140 MiB/s, ~95 minutes. The disk is zonal, so a stockout in
+its zone has no answer but another machine type in that zone — the smoke
+test met that twice in us-central1-b. It also has one writer, which is
+why staging removes the serving VM first.
+
+**What a bucket costs.** Standard storage is $0.02 per GiB-month: ~$15
+for the 746 GiB. Reads from a regional bucket into a VM in the same region
+carry no network charge, and the read operations come to cents
+([Cloud Storage pricing](https://cloud.google.com/storage/pricing)).
+Nearline halves the storage and charges $0.01 per GiB read, about $7.50
+a load, so Standard wins from the second load a month. The bucket is
+regional, so the VM can be placed in any zone of the region.
+
+**How fast it loads.** Network bandwidth is 100 Gbps by
+default on `c4-highmem-192` and `c4d-highmem-192` (200 with Tier_1), and
+ingress lands near egress
+([network bandwidth](https://docs.cloud.google.com/compute/docs/network-bandwidth)).
+GCS is read fastest by parallel ranged GETs, which `gcloud storage cp`
+does by default
+([sliced downloads](https://docs.cloud.google.com/storage/docs/sliced-object-downloads)).
+The project's default quota for GCS egress to Google services is 200 Gbps
+per region ([quotas](https://docs.cloud.google.com/storage/quotas)), which
+one VM does not reach. Google publishes no per-VM figure; a third party
+sustained 10.7 GB/s into one `c4-highcpu-144`
+([ZettaLane](https://zettalane.com/blog/mayanas-13gbps-gcs-throughput.html)).
+At 3–10 GB/s, 801 GB lands in ~1.5–4.5 minutes, and a SHA-256 of the 17
+shards in parallel, at ~1.5 GB/s per core, is another ~30 seconds.
+`g4-standard-192` was reported at 25 Gbps (unconfirmed), which would be
+~4.5 minutes at line rate. Each of these is to be measured.
+
+**Where it lands is the catch: llama.cpp copies Q8_0 out of the file on
+CPU.** The pinned build (b11371) converts Q8_0 to AMX tiles on Intel
+(`ggml/src/ggml-cpu/amx/common.h`, `qtype_has_amx_kernels`) and repacks
+it into interleaved blocks otherwise (`ggml-cpu/repack.cpp`), into
+buffers of its own. From a disk that is one copy in RAM, because the page
+cache gives way. From tmpfs it is two, because a tmpfs file's pages are
+the file and cannot be evicted: ~1.6 TB, past the 1,488 GB of
+`c4-highmem-192`, at the end of every load. Deleting the files after the
+load frees the second copy, but not before the peak. So one of:
+
+- **tmpfs and `--no-repack`** (`common/arg.cpp`: `-nr`, which turns off
+  every extra buffer type, AMX's included). One copy, mapped in place
+  (`--load-mode mmap`), and no added cost. What it gives up is AMX's
+  prompt reading; decoding is bound by memory bandwidth either way. How
+  much slower the prompt gets is unmeasured, and on a CPU the prompt is
+  most of a long task's time, so it may cost more per task than it saves.
+- **Local SSD as the landing.** `c4-highmem-192-lssd` carries 12,000
+  GiB of Titanium SSD reading at 20,000 MiB/s
+  ([Local SSD](https://docs.cloud.google.com/compute/docs/disks/local-ssd)).
+  The shards land there, and llama-server reads them with
+  `--load-mode none`, repacking as it does today. The SSD is billed with
+  the machine, ~$0.08 per GiB-month: ~$1.32/h on top of $12.51/h, about
+  10%. `g4-standard-192` has Titanium SSD in its own price, and needs it:
+  its 720 GiB of RAM cannot hold the weights in tmpfs at all.
+
+The bake-off decides between the two by cost per task, per machine.
+Either way the bucket is the store of record and nothing standing is a
+disk.
+
+**The load window, without trusting the guest.** The serving VM still
+has no service account and no external IP, and its DNS still goes to the
+black hole. For the load only, the IDE turns on Private Google Access
+for its subnet (`subnetworks.setPrivateIpGoogleAccess`) and adds an
+egress allow to `private.googleapis.com`, 199.36.153.8/30, tcp:443
+([Private Google Access](https://docs.cloud.google.com/vpc/docs/configure-private-google-access),
+[access options](https://docs.cloud.google.com/vpc/docs/private-access-options)),
+above the deny-all, which moves from priority 0 to 1. The guest reaches
+the bucket by address (`curl --resolve storage.googleapis.com:443:…`),
+with V4 signed URLs the IDE makes for exactly the shards and the server
+image: a GET each, an hour long, signed through IAM's `signBlob` by the
+`taste-ide` account
+([signed URLs](https://docs.cloud.google.com/storage/docs/access-control/signed-urls),
+[signing with IAM](https://docs.cloud.google.com/storage/docs/access-control/signing-urls-with-helpers)).
+Nothing that came from the model runs while the window is open: the
+guest's own script downloads and hashes inert bytes against the pinned
+manifest in its Ignition. Then the IDE closes the window: it removes the
+allow, turns Private Google Access off, and removes the URLs from the
+metadata. The guest starts llama-server only once the IDE says it is
+closed and a fresh connection to the VIP fails. The order matters: GCP's
+firewall tracks connections, and a rule change "is enforced only on new
+connections. Existing connections persist"
+([firewall rules](https://docs.cloud.google.com/vpc/docs/firewalls)), so
+the downloads must be finished, and their connections gone, before the
+window closes rather than as it closes.
+
+**What the open window could leak, if the guest were hostile.** Through
+`private.googleapis.com` any Google API is reachable, any bucket
+included, given credentials of an attacker's own. The guest is the IDE's
+FCOS image and the IDE's Ignition, and the model is not running, so
+nothing hostile runs to use it. `restricted.googleapis.com` narrows the
+APIs but not whose bucket, short of VPC Service Controls, which need an
+organization.
+
+**Staging becomes a mirror, made once.** A small VM with egress on 443
+streams each shard from Hugging Face, hashes it, and uploads it through a
+signed resumable upload
+([uploads](https://docs.cloud.google.com/storage/docs/uploads-downloads)).
+It needs no disk, and it never shares a writer with the serving VM. The
+bucket wants uniform access, public access prevention, and soft delete
+off, since otherwise a re-staged shard bills its old copy for seven days.
+Objects are named by repository, commit, and file, so a new pin stages
+beside the old one.
+
+**What it changes for the cap.** ~$15 standing instead of $68–158 leaves
+$50–140 more a month for running time: 4–11 more hours of
+`c4-highmem-192`. Loads cost the same or less, at ~1.5–4.5 minutes of a
+$12.51/h machine against the disk's ~5.5. With no disk, a stopped VM can
+also be deleted outright and made again in whichever zone has the
+machine.
+
+**Unconfirmed, for the first live run:** that a ranged GET works on a
+signed URL (it should, as `Range` is not a signed header), that Private
+Google Access takes effect at once on a running VM, the bandwidth of
+`g4-standard-192`, and the GB/s that actually lands in tmpfs and on
+Titanium SSD.
 
 ## Network lockdown: what GCP lets a firewall close, and what it does not
 
