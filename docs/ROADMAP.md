@@ -503,6 +503,42 @@ devcontainer that will not start.
    IAP, and David is not concerned by them (2026-10-03: "99% of the work
    is being done by the agent"). What is worth measuring is how far the
    folder trails a busy agent.
+8. **Option: Personal always local, on the folder itself** — noted, not
+   decided (David, 2026-10-04: "I am starting to doubt the wisdom of not
+   special-casing the personal env to (1) always run locally and (2) use
+   an efficient, local-only sharing mechanism to directly use the same
+   folder"). It reverses ENVIRONMENTS → "The topology: remote by default,
+   and only over the network", and it competes with item 7. The case for
+   it: the mirror is a two-way sync of two working trees, and it fails the
+   way sync engines do — a first commit deleting files, stale sent copies
+   returning, a detached HEAD pausing everything, and, on 2026-10-04,
+   some 26,600 ignored files deleted from Personal because the two sides
+   read different ignore rules (fixed in 87fd7b7, but the class remains).
+   One shared tree has no copies to get wrong. The shape:
+   - Personal runs only in a local VM; cloud stays for the others, and
+     item 7 becomes "hand the work to a cloud environment".
+   - The folder is shared into that VM over virtiofs, launched by the IDE
+     with **`.git` hidden from it** (virtiofsd in its own mount namespace,
+     `.git` covered). Not optional: hooks, or `core.fsmonitor` in
+     `.git/config`, run on the host the next time a shell prompt runs `git
+     status`. The working files expose nothing new, since the mirror
+     already writes agent-authored files into the folder.
+   - The VM keeps its own git directory over the shared tree, mounted at
+     `.git` in the guest. Only refs travel: when one side commits or
+     switches, the other fetches and moves HEAD and its index, writing no
+     files. The peer's fetch and push with the user's keys stays.
+   - The file mirror goes, for Personal.
+
+   The costs: metadata over virtiofs (`docs/spikes/vm-substrate.md`
+   measured about 0.9 s more per no-op cargo build; build outputs belong
+   on VM-local volumes, as they already do; `git status` over a 27k-file
+   dependency tree will be slower than on the VM's disk); no change
+   notifications into the guest, so a watcher in the container misses the
+   user's host-side edits and wants polling; and Personal can never move
+   to a cloud host. To spike first: whether session-mode libvirt takes an
+   externally launched virtiofsd (`<source socket=…/>`); keeping podman's
+   `:z` from relabelling host files (an `--xattrmap`, or a `context=`
+   mount in the guest); and timings on the Drupal tree.
 
 ## 2026 bets (superlean, hyperfunctional)
 
