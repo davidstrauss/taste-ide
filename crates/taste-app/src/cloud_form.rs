@@ -582,8 +582,8 @@ impl CloudForm {
                 Ok(None) => form.say(
                     Verdict::Attention,
                     &format!(
-                        "Signed in · Set Up Project creates {}, the account the IDE acts as, \
-                         which {project_id} does not have yet",
+                        "Signed in · Set Up Project creates service account {}, which the IDE \
+                         acts as and project {project_id} does not have yet",
                         setup::ACCOUNT
                     ),
                 ),
@@ -619,8 +619,9 @@ impl CloudForm {
                         form.say_more(
                             Verdict::Attention,
                             &format!(
-                                "Google is still applying your permission to act as {} — \
-                                 grants take up to seven minutes. Testing again in {}s.",
+                                "Google is still applying your permission to act as service \
+                                 account {} — grants take up to seven minutes. Testing again \
+                                 in {}s.",
                                 setup::ACCOUNT,
                                 APPLY_RETRY_EVERY.as_secs()
                             ),
@@ -638,9 +639,9 @@ impl CloudForm {
                     }
                     let advice = if still_applying(&whole) {
                         format!(
-                            "You still may not act as {} after seven minutes. Set Up Project \
-                             grants it — run it again, signed in as the account that should \
-                             use the IDE.",
+                            "You still may not act as service account {} after seven minutes. \
+                             Set Up Project grants it — run it again, signed in as the account \
+                             that should use the IDE.",
                             setup::ACCOUNT
                         )
                     } else {
@@ -719,8 +720,8 @@ impl CloudForm {
                 self.say(
                     Verdict::Attention,
                     &format!(
-                        "Signed in · Set Up Project creates {}, the account the IDE acts as, \
-                         which my-project-123 does not have yet",
+                        "Signed in · Set Up Project creates service account {}, which the IDE \
+                         acts as and project my-project-123 does not have yet",
                         setup::ACCOUNT
                     ),
                 );
@@ -779,8 +780,11 @@ impl CloudForm {
     }
 }
 
-/// The account by its id, `taste-ide`: its full address wraps a narrow
-/// popover mid-word, and what it is called says which account it is.
+/// The account by its id, `taste-ide`, called a service account outright:
+/// its full address wraps a narrow popover mid-word, and the bare id read
+/// as the IDE itself — the more so in a project also called taste-ide
+/// (David, 2026-10-04: "Make it clear that the initial 'taste-ide' is a
+/// Service Account and not the IDE itself").
 /// How often, and how many times, a test denied impersonation runs again
 /// on its own: Google applies an IAM grant within seven minutes.
 const APPLY_RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -855,7 +859,8 @@ mod quota_tests {
 
 fn ready_sentence(_account: &str, project_id: &str) -> String {
     format!(
-        "Ready · {} holds all {} permissions the IDE uses in {project_id}",
+        "Ready · Service account {} holds all {} permissions the IDE uses in project \
+         {project_id}",
         setup::ACCOUNT,
         setup::PERMISSIONS.len()
     )
