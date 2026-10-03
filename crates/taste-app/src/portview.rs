@@ -458,6 +458,14 @@ impl PortPage {
                 let Some(page) = weak.upgrade() else {
                     return false;
                 };
+                // A load cancelled is a load another one replaced — a second
+                // ask for the page before the first came back — and the
+                // newer one is under way. Drawing "Nothing answers" over it
+                // said the server was down while it was answering
+                // (2026-10-04, a Drupal site that loaded on Try Again).
+                if error.matches(webkit6::NetworkError::Cancelled) {
+                    return true;
+                }
                 let reason = error.message().to_string();
                 *page.failed_page.borrow_mut() = Some((uri.to_string(), reason.clone()));
                 page.alternate_loading.set(true);
