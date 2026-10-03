@@ -122,7 +122,7 @@ pub const GLM_5_3_Q8_0: Weights = Weights {
 };
 
 /// The smoke test's weights: OpenAI's gpt-oss-20b in its native MXFP4,
-/// the model this project's private-model route was first proved against,
+/// the model this project's custom-model route was first proved against,
 /// so a working answer here is a known answer.
 #[rustfmt::skip]
 pub const GPT_OSS_20B_MXFP4: Weights = Weights {

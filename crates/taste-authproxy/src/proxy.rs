@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 use taste_core::quota::QuotaSnapshot;
 
 use crate::credentials::{Credential, CredentialSource, X_API_KEY};
+use crate::custom::{CustomFacts, FileCustomUpstream};
 use crate::models::ModelListing;
-use crate::private::{FilePrivateUpstream, PrivateFacts};
 use crate::quota::{attach_refusal_message, harvest, MAX_REFUSAL_BODY};
 
 /// The API the proxy fronts when nothing else is configured.
@@ -36,36 +36,36 @@ pub const ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com";
 /// Which upstream an environment's placeholders reach.
 ///
 /// Which upstream a placeholder reaches: the API, or the user's own
-/// private server ([`crate::private`]).
+/// custom endpoint ([`crate::custom`]).
 ///
 /// A property of the **placeholder**, fixed when it is minted
 /// ([`Handle::issue_placeholder_for`]) and never changed afterwards. The
 /// spawn that mints it is an agent's — "Claude Code" gets an Anthropic
-/// placeholder, "Claude Code (Private)" a private one — so which host a
+/// placeholder, "Claude Code (Custom)" a custom one — so which host a
 /// chat spends on is decided by which agent it was opened as, and two
 /// chats in one environment can be on different hosts at once. It used to
 /// be a per-environment setting flipped from the model picker, which made
-/// the private model look like a model of Claude Code's when it is a
+/// the custom model look like a model of Claude Code's when it is a
 /// different place for the same agent to send its requests.
 ///
 /// [`Route::Anthropic`] is the default and the only value a placeholder
-/// minted without saying gets: the private upstream is reached because a
+/// minted without saying gets: the custom upstream is reached because a
 /// placeholder was minted for it, never because something was absent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Route {
     #[default]
     Anthropic,
-    Private,
+    Custom,
 }
 
 impl Route {
-    pub fn is_private(self) -> bool {
-        matches!(self, Route::Private)
+    pub fn is_custom(self) -> bool {
+        matches!(self, Route::Custom)
     }
 }
 
-/// A sentence about a private server being woken, and which
+/// A sentence about a custom endpoint being woken, and which
 /// environment's turn it concerns (`None` for the settings form's test).
 /// `(environment, key, text)`: the environment whose chat the note goes
 /// to (`None` is nobody's turn, a toast), a key under which a later note
@@ -120,17 +120,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// ends it with an error the agent can read.
 ///
 /// A stream that stops arriving is what an upstream that went away looks
-/// like — the machine running a private model went to sleep, a network
+/// like — the machine running a custom model went to sleep, a network
 /// path died — and TCP will hold the connection open for as long as
 /// nobody sends anything. Left alone, that is the agent's own ten-minute
 /// request timeout, and a chat saying "Working…" for ten minutes (David,
 /// 2026-09-16: "You should handle the API going away without hanging on
 /// Working"). Ninety seconds is long past any gap a live stream has: the
-/// API sends `ping` events every few seconds, and a private server
+/// API sends `ping` events every few seconds, and a custom endpoint
 /// streams each token, thinking included.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// How many idle windows a private stream may run to while its server
+/// How many idle windows a custom stream may run to while its server
 /// keeps answering health checks: the cap on "busy, not gone" — half an
 /// hour at the default window — after which the stream is ended anyway.
 const LIVENESS_WINDOWS_MAX: u32 = 20;
@@ -159,11 +159,11 @@ type ProxyBody = BoxBody<Bytes, hyper::Error>;
 /// Messages API's own `usage` object as it streams past — attribution the
 /// user can see, and the shape a future limit would be checked against.
 ///
-/// Both routes are counted. A turn against the user's own hardware costs
+/// Both routes are counted. A turn against the custom endpoint costs
 /// no money and no quota, but the question these counters answer is who
 /// drew and how much, and an environment that spent its afternoon on the
 /// free rung is exactly the thing worth being able to see. What the
-/// private route does not touch is [`Handle::quota`] — see `handle`.
+/// custom route does not touch is [`Handle::quota`] — see `handle`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Spend {
     /// Requests admitted and forwarded upstream.
@@ -194,12 +194,12 @@ struct ProxyState {
     /// one environment may be on two hosts); [`Handle::revoke`] drops all
     /// of an environment's at once.
     tokens: Mutex<HashMap<String, Issued>>,
-    /// The private upstream, when the user has provisioned one. `None` is
-    /// the ordinary case: most workspaces have one upstream, and a private
+    /// The custom upstream, when the user has provisioned one. `None` is
+    /// the ordinary case: most workspaces have one upstream, and a custom
     /// placeholder with nothing behind it fails the request rather than
     /// falling back to the API — a chat the user opened on their own
     /// hardware must not quietly spend their subscription instead.
-    private: Mutex<Option<Arc<FilePrivateUpstream>>>,
+    custom: Mutex<Option<Arc<FileCustomUpstream>>>,
     spend: Mutex<HashMap<String, Spend>>,
     /// The account's limit state, as the last response described it.
     ///
@@ -237,7 +237,7 @@ struct ProxyState {
     /// counting line in the chat reads, and what decides when the IDE
     /// stops trying (`crate::wake::GIVE_UP_AFTER`, `GIVE_UP_ATTEMPTS`).
     wakes: Mutex<HashMap<String, WakeRun>>,
-    /// Where the proxy says what it is doing about a sleeping private
+    /// Where the proxy says what it is doing about a sleeping custom
     /// server: the app routes it into the chat of the environment named,
     /// or to a toast when none is ([`Handle::set_notice`]).
     notice: Mutex<Option<Notice>>,
@@ -464,8 +464,8 @@ impl ProxyState {
         !recently_failed
     }
 
-    fn private_source(&self) -> Option<Arc<FilePrivateUpstream>> {
-        self.private.lock().ok()?.clone()
+    fn custom_source(&self) -> Option<Arc<FileCustomUpstream>> {
+        self.custom.lock().ok()?.clone()
     }
 
     fn record_request(&self, env: &str) {
@@ -549,7 +549,7 @@ impl Handle {
     /// touches no network. The route is decided by the spawn that mints
     /// the placeholder, which is to say by the agent (see [`Route`]); the
     /// agent itself is told nothing and needs nothing — see
-    /// [`crate::private`] for why the upstream is the only thing that
+    /// [`crate::custom`] for why the upstream is the only thing that
     /// differs between the two Claude Codes.
     pub fn issue_placeholder_for(&self, env_id: &str, route: Route) -> String {
         let counter = self.state.counter.fetch_add(1, Ordering::Relaxed);
@@ -587,7 +587,7 @@ impl Handle {
         }
     }
 
-    /// Where sentences about waking a private server go
+    /// Where sentences about waking a custom endpoint go
     /// (`crate::wake`). Without one they are logged.
     pub fn set_notice(&self, notice: Notice) {
         if let Ok(mut slot) = self.state.notice.lock() {
@@ -620,31 +620,31 @@ impl Handle {
             .map(|issued| issued.route)
     }
 
-    /// Install the private upstream this workspace was provisioned with.
+    /// Install the custom upstream this workspace was provisioned with.
     ///
     /// Separate from [`AuthProxy::spawn`] for the reason
     /// [`Self::refresh_models`] is: a proxy stood up for a test, or for a
-    /// workspace with no private model, should carry no second upstream at
+    /// workspace with no custom model, should carry no second upstream at
     /// all, and "none" is the ordinary case rather than a degraded one.
-    pub fn set_private_upstream(&self, source: Option<Arc<FilePrivateUpstream>>) {
-        if let Ok(mut private) = self.state.private.lock() {
-            *private = source;
+    pub fn set_custom_upstream(&self, source: Option<Arc<FileCustomUpstream>>) {
+        if let Ok(mut custom) = self.state.custom.lock() {
+            *custom = source;
         }
     }
 
-    /// Read the private-model file once, now, so the first chat pane to
+    /// Read the custom-model file once, now, so the first chat pane to
     /// build its model drop-down has something to put in it.
     ///
     /// Must be called within a tokio runtime context; the read runs on it
     /// and this returns at once. Every later read happens on the request
     /// path, where the file is re-read whenever it changes.
-    pub fn warm_private_upstream(&self) {
-        let Some(source) = self.state.private_source() else {
+    pub fn warm_custom_upstream(&self) {
+        let Some(source) = self.state.custom_source() else {
             return;
         };
         tokio::spawn(async move {
             if let Err(e) = source.upstream().await {
-                tracing::warn!("the private model could not be read: {e:#}");
+                tracing::warn!("the custom model could not be read: {e:#}");
             }
         });
     }
@@ -709,13 +709,19 @@ impl Handle {
         self.state.credentials.label()
     }
 
-    /// What the private server is, for a picker row or a header mark.
+    /// What the custom endpoint is, for a picker row or a header mark.
     ///
     /// A pure read, for the GTK thread: nothing here touches the disk, and
-    /// the key is not in what comes back. `None` means no private model is
+    /// the key is not in what comes back. `None` means no custom model is
     /// provisioned, or the file has not been read yet.
-    pub fn private_model(&self) -> Option<PrivateFacts> {
-        self.state.private_source()?.facts()
+    pub fn custom_model(&self) -> Option<CustomFacts> {
+        self.state.custom_source()?.facts()
+    }
+
+    /// [`Self::custom_model`], reading the file if nothing has yet — for
+    /// a spawn, which must know the model name before the agent sends one.
+    pub fn custom_model_for_spawn(&self) -> Option<CustomFacts> {
+        self.state.custom_source()?.facts_or_read()
     }
 
     /// The account's limit state as of the last response that mentioned it.
@@ -873,7 +879,7 @@ impl AuthProxy {
             credentials,
             client: build_client(),
             tokens: Mutex::new(HashMap::new()),
-            private: Mutex::new(None),
+            custom: Mutex::new(None),
             spend: Mutex::new(HashMap::new()),
             quota: Mutex::new(QuotaSnapshot::default()),
             models: Mutex::new(None),
@@ -983,10 +989,10 @@ pub struct AccountProbe {
     pub elapsed: Duration,
 }
 
-/// What one probe of the private server found: which model it says it is
+/// What one probe of the custom endpoint found: which model it says it is
 /// serving, if its answer named one, and how long the round trip took.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrivateProbe {
+pub struct CustomProbe {
     pub model: Option<String>,
     pub elapsed: Duration,
     /// What had to happen before the server could be asked — it was
@@ -994,66 +1000,71 @@ pub struct PrivateProbe {
     pub note: Option<String>,
 }
 
-/// How long a probe waits for the private server. Longer than a connect,
+/// How long a probe waits for the custom endpoint. Longer than a connect,
 /// because a `llama-server` that has just loaded a model can take a few
 /// seconds over its first tokens, and the probe wants an answer rather
 /// than a connection.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Handle {
-    /// Ask the private server for one short answer, exactly as an agent's
+    /// Ask the custom endpoint for one short answer, exactly as an agent's
     /// turn would reach it: `POST /v1/messages` at the stored endpoint,
     /// the stored key in the header the file names, and the same
     /// `anthropic-version` a forwarded request carries.
     ///
-    /// The one request the proxy makes of the private server for itself,
+    /// The one request the proxy makes of the custom endpoint for itself,
     /// and it is the settings form's "test connection": a saved endpoint
     /// nobody has spoken to is a setting, not a working one, and the
     /// first place a wrong host or key would otherwise surface is an
     /// agent's turn failing mid-conversation. A refused key drops the
     /// cached upstream the way a refused turn does, so the next request
     /// re-reads the file.
-    pub async fn probe_private(&self) -> Result<PrivateProbe> {
+    pub async fn probe_custom(&self) -> Result<CustomProbe> {
         let source = self
             .state
-            .private_source()
-            .context("no private model is provisioned for this project")?;
+            .custom_source()
+            .context("no custom model is provisioned for this project")?;
         let upstream = source.upstream().await?;
         let model = source
             .facts()
             .and_then(|facts| facts.model)
-            .unwrap_or_else(|| "private".to_string());
+            .unwrap_or_else(|| "custom".to_string());
         let requested: Uri = "/v1/messages".parse().expect("a static path");
         let uri = upstream_uri(&upstream.uri, &requested)?;
         // Asleep? Wake it first, and say so in the verdict. The test is
         // where a sleeping machine is most often met, and "unreachable"
         // with no attempt behind it would send the user to check cables.
+        // A hosted endpoint is not woken: it does not sleep.
+        let local = crate::wake::on_local_network(&upstream.uri).await;
         let wake_path = crate::wake::wake_path(source.path());
         let host = upstream
             .uri
             .host()
-            .unwrap_or("the private server")
+            .unwrap_or("the custom endpoint")
             .to_string();
-        // The user asked: a run the IDE had given up on starts over here.
-        let _ = self.state.wake_reset(&host);
-        let state = self.state.clone();
-        let woke = crate::wake::ensure_awake(
-            &upstream.uri,
-            &wake_path,
-            self.state.wake_wait(),
-            crate::wake::Attempts {
-                attempt: 1,
-                since: Duration::ZERO,
-            },
-            &move |text| state.notify(None, None, text),
-        )
-        .await;
-        let host = host.as_str();
-        if !woke.reached() {
-            self.state.wake_failed(host);
-            anyhow::bail!("{}", woke.note(host).unwrap_or_default());
-        }
-        let note = woke.note(host);
+        let note = if local {
+            // The user asked: a run the IDE had given up on starts over here.
+            let _ = self.state.wake_reset(&host);
+            let state = self.state.clone();
+            let woke = crate::wake::ensure_awake(
+                &upstream.uri,
+                &wake_path,
+                self.state.wake_wait(),
+                crate::wake::Attempts {
+                    attempt: 1,
+                    since: Duration::ZERO,
+                },
+                &move |text| state.notify(None, None, text),
+            )
+            .await;
+            if !woke.reached() {
+                self.state.wake_failed(&host);
+                anyhow::bail!("{}", woke.note(&host).unwrap_or_default());
+            }
+            woke.note(&host)
+        } else {
+            None
+        };
         let body = serde_json::json!({
             "model": model,
             "max_tokens": 8,
@@ -1101,11 +1112,13 @@ impl Handle {
             .ok()
             .and_then(|value| value.get("model")?.as_str().map(str::to_string));
         // It answered: now is when the neighbour table has its address.
-        let learn_uri = upstream.uri.clone();
-        tokio::spawn(async move {
-            crate::wake::learn(&learn_uri, &wake_path).await;
-        });
-        Ok(PrivateProbe {
+        if local {
+            let learn_uri = upstream.uri.clone();
+            tokio::spawn(async move {
+                crate::wake::learn(&learn_uri, &wake_path).await;
+            });
+        }
+        Ok(CustomProbe {
             model: answered_model,
             elapsed: started.elapsed(),
             note,
@@ -1114,9 +1127,9 @@ impl Handle {
 }
 
 /// Generic over the body: forwarded requests stream the agent's `Incoming`
-/// through; the proxy's own requests (the models listing, the private
+/// through; the proxy's own requests (the models listing, the custom
 /// probe) send a fixed one or none.
-fn build_client<B>() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, B>
+pub(crate) fn build_client<B>() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, B>
 where
     B: Body + Send + Unpin + 'static,
     B::Data: Send,
@@ -1181,11 +1194,11 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
     };
 
     // Which upstream, and whose credential. One decision, not two: a
-    // placeholder minted for the private server must never carry the
+    // placeholder minted for the custom endpoint must never carry the
     // Anthropic credential, and one minted for Anthropic must never reach
-    // the private server. Pairing them here is what makes that structural
+    // the custom endpoint. Pairing them here is what makes that structural
     // rather than a rule two branches have to remember.
-    let private = route.is_private().then(|| state.private_source()).flatten();
+    let custom = route.is_custom().then(|| state.custom_source()).flatten();
     let (target, credential) = match route {
         Route::Anthropic => match state.credentials.credential().await {
             Ok(credential) => (state.upstream.clone(), credential),
@@ -1216,20 +1229,20 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
                 );
             }
         },
-        // A private placeholder with nothing behind it fails the request.
+        // A custom placeholder with nothing behind it fails the request.
         // It does NOT fall back to the API: this chat was deliberately
-        // opened on the user's own hardware, and spending their
+        // opened on the custom endpoint, and spending their
         // subscription instead because a file went missing would be the
         // one outcome nobody asked for.
-        Route::Private => match &private {
+        Route::Custom => match &custom {
             Some(source) => match source.upstream().await {
                 Ok(upstream) => (upstream.uri, upstream.credential),
                 Err(e) => {
-                    tracing::warn!("auth proxy has no usable private model: {e:#}");
+                    tracing::warn!("auth proxy has no usable custom model: {e:#}");
                     return error_response(
                         StatusCode::BAD_GATEWAY,
                         "api_error",
-                        &format!("taste-ide auth proxy could not read the private model: {e}"),
+                        &format!("taste-ide auth proxy could not read the custom model: {e}"),
                     );
                 }
             },
@@ -1237,25 +1250,31 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
-                    "this chat runs on Claude Code (Private) and no private model is \
+                    "this chat runs on Claude Code (Custom) and no custom model is \
                      provisioned for this project; nothing was sent to the API",
                 )
             }
         },
     };
 
-    // A private server's machine may be asleep. Before the request goes,
+    // A custom endpoint's machine may be asleep. Before the request goes,
     // make sure something is listening — and if nothing is, wake it and
     // wait, saying so in the environment's chat as it happens. The check
     // comes before the request because a request's body is a stream that
     // cannot be sent twice; a connection refused after it was sent would
-    // be the turn lost, not retried.
-    let wake_path = private
+    // be the turn lost, not retried. Only on the user's own network: a
+    // hosted endpoint does not sleep (`wake::on_local_network`).
+    let local = match &custom {
+        Some(_) => crate::wake::on_local_network(&target).await,
+        None => false,
+    };
+    let wake_path = custom
         .as_ref()
+        .filter(|_| local)
         .map(|source| crate::wake::wake_path(source.path()));
     if let Some(path) = &wake_path {
         let env = env_id.clone();
-        let host = target.host().unwrap_or("the private server").to_string();
+        let host = target.host().unwrap_or("the custom endpoint").to_string();
         // One row in the chat per host, counting up, rather than a row per
         // retry the agent makes.
         let key = format!("wake:{host}");
@@ -1376,7 +1395,7 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         }
     };
 
-    // The private server answered: the one moment the neighbour table is
+    // The custom endpoint answered: the one moment the neighbour table is
     // sure to hold its address. Off this request's path, and a no-op while
     // what is on file is fresh (`wake::learn`).
     if let (Some(path), true) = (wake_path, upstream.status().is_success()) {
@@ -1389,9 +1408,9 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
     if upstream.status() == StatusCode::UNAUTHORIZED || upstream.status() == StatusCode::FORBIDDEN {
         // The stored credential is stale (expired, or rotated by a
         // re-login). Drop the cache so the next request re-reads — the
-        // one this request actually used, which on the private route is
-        // the private server's key and never the account's.
-        match &private {
+        // one this request actually used, which on the custom route is
+        // the custom endpoint's key and never the account's.
+        match &custom {
             Some(source) => source.invalidate(),
             None => {
                 state.credentials.invalidate();
@@ -1409,7 +1428,7 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
     // working turn here, not at start-up). The listing that could not be
     // read then is read now, off this request's path, and the app is told
     // if it changes the picker.
-    if !route.is_private() && upstream.status().is_success() {
+    if !route.is_custom() && upstream.status().is_success() {
         if let Ok(mut told) = state.unprovisioned_told.lock() {
             told.remove(&env_id);
         }
@@ -1423,18 +1442,18 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
     // these are hop-scoped, and the client gets them either way — this
     // proxy reads the mail, it does not intercept it.
     //
-    // The private route is skipped, and that is not an omission. A private
+    // The custom route is skipped, and that is not an omission. A custom
     // server's response says nothing about the subscription, and
     // `observe(None, served)` would read a turn it served as proof that a
     // closed Anthropic window had reopened — a gauge lying about a pool
     // this request never touched.
-    if !route.is_private() {
+    if !route.is_custom() {
         state.record_quota(upstream.status(), upstream.headers(), &env_id);
     }
 
     let (mut parts, body) = upstream.into_parts();
     strip_hop_by_hop(&mut parts.headers);
-    // A private server's stream is put in the documented block order on
+    // A custom endpoint's stream is put in the documented block order on
     // its way through (`crate::sse`); the API's already is, and its bytes
     // are not touched.
     let streaming = parts
@@ -1442,7 +1461,7 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream"));
-    let normalize = route.is_private() && streaming;
+    let normalize = route.is_custom() && streaming;
     if normalize {
         // The body that goes out is not the body that came in, so a
         // length the server declared for its own would be a lie hyper
@@ -1473,7 +1492,10 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         // reopens, and only the body says so. Bounded, and never kept
         // for any other status.
         refusal: (parts.status == StatusCode::TOO_MANY_REQUESTS).then(Vec::new),
-        liveness: (route.is_private() && streaming).then(|| target.clone()),
+        // Asked of a server on the user's own network only: a hosted API
+        // answers any path, so its `/health` would read every stalled
+        // stream as busy for half an hour.
+        liveness: (route.is_custom() && streaming && local).then(|| target.clone()),
         health: None,
         windows: 0,
     };
@@ -1510,7 +1532,7 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 }
 
 /// Point the agent's request at the real API, preserving path and query.
-fn upstream_uri(upstream: &Uri, requested: &Uri) -> Result<Uri> {
+pub(crate) fn upstream_uri(upstream: &Uri, requested: &Uri) -> Result<Uri> {
     let path = requested
         .path_and_query()
         .map(|p| p.as_str())
@@ -1546,7 +1568,7 @@ fn error_response(status: StatusCode, kind: &str, message: &str) -> Response<Pro
 /// The upstream body, passed through frame by frame while counting.
 ///
 /// Nothing is logged, and nothing is buffered beyond one incomplete event
-/// on the private route: each frame is measured, its bytes scanned for the
+/// on the custom route: each frame is measured, its bytes scanned for the
 /// Messages API's `usage` counters, and handed on — through the block
 /// normalizer when there is one (`crate::sse`), as they came otherwise.
 struct MeteredBody {
@@ -1556,7 +1578,7 @@ struct MeteredBody {
     usage: UsageScan,
     bytes: u64,
     flushed: bool,
-    /// The event-order normalizer, on a private server's stream only.
+    /// The event-order normalizer, on a custom endpoint's stream only.
     order: Option<crate::sse::BlockOrder>,
     /// The upstream has ended and said so; a finished `Incoming` is not
     /// polled again, whatever the normalizer still had to send.
@@ -1571,7 +1593,7 @@ struct MeteredBody {
     /// [`MAX_REFUSAL_BODY`]. `None` for every other response, which is
     /// every response that streams.
     refusal: Option<Vec<u8>>,
-    /// On the private route, where to ask whether a silent server is
+    /// On the custom route, where to ask whether a silent server is
     /// still there: the server's own `/health`. A local model prefilling a
     /// long prompt — auto mode's reviewer sends a second, different prompt
     /// for every tool call — is silent for longer than the idle window
@@ -1588,10 +1610,10 @@ struct MeteredBody {
     windows: u32,
 }
 
-/// Is the private server there? Any HTTP answer from its `/health` says
+/// Is the custom endpoint there? Any HTTP answer from its `/health` says
 /// yes — a busy server answers it at once — and no connection, or none in
 /// [`LIVENESS_TIMEOUT`], says no.
-async fn private_alive(base: Uri) -> bool {
+async fn custom_alive(base: Uri) -> bool {
     let mut parts = base.into_parts();
     parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/health"));
     let Ok(uri) = Uri::from_parts(parts) else {
@@ -1738,12 +1760,12 @@ impl Body for MeteredBody {
                     if silence.as_mut().poll(cx).is_pending() {
                         return Poll::Pending;
                     }
-                    // The window fired. A private server gets a second
+                    // The window fired. A custom endpoint gets a second
                     // opinion before its stream is ended: is it there?
                     if let Some(base) = this.liveness.clone() {
                         let health = this
                             .health
-                            .get_or_insert_with(|| tokio::spawn(private_alive(base)));
+                            .get_or_insert_with(|| tokio::spawn(custom_alive(base)));
                         let alive = match Pin::new(health).poll(cx) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(joined) => joined.unwrap_or(false),
@@ -1752,7 +1774,7 @@ impl Body for MeteredBody {
                         this.windows += 1;
                         if alive && this.windows < LIVENESS_WINDOWS_MAX {
                             tracing::info!(
-                                "auth proxy: the private server has sent nothing for {}s on {}'s \
+                                "auth proxy: the custom endpoint has sent nothing for {}s on {}'s \
                                  stream but answers health checks; still waiting",
                                 this.idle.as_secs() * u64::from(this.windows),
                                 this.env

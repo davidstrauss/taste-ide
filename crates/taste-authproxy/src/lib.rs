@@ -17,13 +17,13 @@
 //! counters however it arrived.
 //!
 //! **Two upstreams, chosen per request from the placeholder.** The API is
-//! one; a private, Anthropic-compatible server of the user's is the other
-//! ([`private`]). A placeholder is minted for one or the other
+//! one; a custom, Anthropic-compatible endpoint the user configured is the other
+//! ([`custom`]). A placeholder is minted for one or the other
 //! ([`Handle::issue_placeholder_for`]) by the spawn that hands it to the
 //! agent, so the choice is per chat — "Claude Code" and "Claude Code
-//! (Private)" are the same agent handed placeholders for different hosts,
+//! (Custom)" are the same agent handed placeholders for different hosts,
 //! and two chats in one environment can be on different hosts at once.
-//! [`Route::Anthropic`] is the default and the private server is reached
+//! [`Route::Anthropic`] is the default and the custom endpoint is reached
 //! only by a placeholder deliberately minted for it; the credential
 //! follows the route, so neither key is ever sent to the other host.
 //!
@@ -78,8 +78,8 @@
 //! retained.
 
 pub mod credentials;
+pub mod custom;
 pub mod models;
-pub mod private;
 pub mod proxy;
 pub mod quota;
 pub mod sse;
@@ -92,11 +92,12 @@ pub use credentials::{
     CredentialFuture, CredentialKind, CredentialSource, FileCredentials, IdeCredentials, StaticKey,
     StoredCredential,
 };
-pub use private::{
-    private_model_path, store as store_private_model, stored_key as stored_private_key,
-    FilePrivateUpstream, PrivateFacts, PrivateUpstream, StoredPrivateModel,
+pub use custom::{
+    custom_model_path, list_models as list_custom_models, store as store_custom_model,
+    stored_key as stored_custom_key, CustomFacts, CustomUpstream, FileCustomUpstream,
+    StoredCustomModel,
 };
 pub use proxy::{
-    AccountProbe, AuthProxy, Handle, ModelsListener, PrivateProbe, Route, Spend, ANTHROPIC_UPSTREAM,
+    AccountProbe, AuthProxy, CustomProbe, Handle, ModelsListener, Route, Spend, ANTHROPIC_UPSTREAM,
 };
 pub use taste_core::quota::QuotaSnapshot;

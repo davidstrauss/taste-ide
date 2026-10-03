@@ -262,7 +262,7 @@ pub enum Event {
     /// that issue — or its environment, once it has one — in the backlog.
     RevealIssueRequested(String),
     /// A sentence for one environment's chat from something that is not
-    /// the agent: the auth proxy waking a private server before its turn
+    /// the agent: the auth proxy waking the custom endpoint's server before its turn
     /// (`taste_authproxy::wake`). Drawn as a note in that chat's
     /// transcript.
     /// A note for one chat's transcript. With a `key`, a later notice

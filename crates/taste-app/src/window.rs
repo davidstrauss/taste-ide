@@ -402,7 +402,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // environment's (see chats.rs). There is no tab strip: choosing a
     // conversation IS choosing an environment, and that choice belongs to
     // the panel under the file tree.
-    // Where the proxy says what it is doing about a sleeping private
+    // Where the proxy says what it is doing about a sleeping custom
     // server (`taste_authproxy::wake`): into the chat whose turn it is,
     // or a toast when it is nobody's turn — the settings form's test says
     // its own piece in its verdict.
@@ -2600,27 +2600,36 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             if view == "utilization" || view.starts_with("consolidated") {
                 pane.seed_utilization_for_probe(view == "utilization");
             }
-            // `TASTE_PROBE_PRIVATE=1`: this chat is Claude Code (Private).
+            // `TASTE_PROBE_CUSTOM=1`: this chat is Claude Code (Custom).
             // Orthogonal to the view, because what it changes is the
             // header's identity and its Plan slot, and the header is in
-            // every one of them — the name says "(Private)", the gauge is
+            // every one of them — the name says "(Custom)", the gauge is
             // gone, and the settings shade carries the server's row. Last,
             // so it has the final word over the pool the utilization
             // fixture just seeded.
             // `TASTE_PROBE_CREDENTIAL=work`: this project is provisioned
             // with a credential the user named, so the Plan slot carries
             // whose plan it is and the Utilization tab names the account.
-            // Orthogonal to the view for the same reason the private
+            // Orthogonal to the view for the same reason the custom
             // fixture is — it changes one slot of a header every view has
-            // — and before the private one, which takes the Plan slot away
+            // — and before the custom one, which takes the Plan slot away
             // entirely and must have the last word.
             if let Ok(label) = std::env::var("TASTE_PROBE_CREDENTIAL") {
                 if !label.is_empty() {
                     pane.seed_credential_for_probe(&label);
                 }
             }
-            if std::env::var("TASTE_PROBE_PRIVATE").is_ok() {
-                pane.seed_private_upstream_for_probe();
+            if let Ok(custom) = std::env::var("TASTE_PROBE_CUSTOM") {
+                pane.seed_custom_upstream_for_probe();
+                if custom == "models" {
+                    let pane = pane.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(900),
+                        move || {
+                            pane.pose_custom_models_for_probe();
+                        },
+                    );
+                }
             }
         }
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
@@ -3440,6 +3449,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         &["window", "editor"]
                     } else if utilization_probe {
                         &["chat"]
+                    } else if std::env::var("TASTE_PROBE_CUSTOM").as_deref() == Ok("models") {
+                        // The chooser is a popover, its own surface.
+                        &["window", "window.custom-models"]
                     } else if std::env::var("TASTE_PROBE_SYNC").is_ok() {
                         // The popover is its own surface, so it is shot as
                         // a target of its own beside the window.
@@ -4446,7 +4458,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         filetree.reveal_issue(&id);
                     }
                     // The proxy telling one chat what it is doing about a
-                    // sleeping private server — a note in that transcript,
+                    // sleeping custom endpoint — a note in that transcript,
                     // where the turn it concerns is.
                     Event::ChatNotice { env, key, text } => match chats.pane_for(&env) {
                         Some(pane) => match key {

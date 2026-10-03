@@ -78,7 +78,7 @@ configuration:
 | Repo-level IDE config | `.taste.yaml` at the root — currently nothing needs it (state is not config and lives in `$XDG_STATE_HOME`); any future project-level setting that survives the convention-over-configuration bar goes here and nowhere else |
 | The Anthropic credential | `$XDG_STATE_HOME/taste-ide/workspaces/<name>-<hash of the root>/anthropic.json` — **this project's** IDE state, keyed by the checkout's root and never inside it, and never another program's storage (`taste_authproxy::credentials`) |
 | The account's model listing | `…/<name>-<hash>/models.json` beside it — a cache of the documented Models API, discarded on a version mismatch. Per project because it caches what *that credential's* account can run (`taste_authproxy::models`) |
-| A private model's endpoint and key | `…/<name>-<hash>/private-model.json` beside it, for the same reason: it holds a key, and an agent that could write it could aim the IDE's own requests at a host of its choosing (`taste_authproxy::private`, ENVIRONMENTS → The auth proxy) |
+| A custom model's endpoint and key | `…/<name>-<hash>/custom-model.json` beside it, for the same reason: it holds a key, and an agent that could write it could aim the IDE's own requests at a host of its choosing (`taste_authproxy::custom`, ENVIRONMENTS → The auth proxy) |
 
 The last three are **state, not configuration**, and the row above about
 `.taste.yaml` says why that matters: they are secrets and caches belonging

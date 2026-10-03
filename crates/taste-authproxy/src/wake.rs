@@ -1,6 +1,6 @@
-//! Wake the machine behind a private model when it has gone to sleep.
+//! Wake the machine behind a custom model when it has gone to sleep.
 //!
-//! A private server lives on a machine of the user's, and that machine
+//! A custom endpoint's server lives on a machine, and that machine
 //! sleeps. The idle timeout ([`crate::proxy`]) ends a stream the machine
 //! stopped feeding; this is the other half — the next turn, or the
 //! settings form's connection test, finds the server unreachable and,
@@ -16,8 +16,8 @@
 //! for it: the first time the server answers, the IDE reads the address
 //! the kernel already has for it — the neighbour table, `/proc/net/arp`,
 //! which records the MAC of every LAN host this machine has spoken to —
-//! and keeps it beside the private-model file
-//! (`private-model-wake.json`, IDE state, never the checkout). It is
+//! and keeps it beside the custom-model file
+//! (`custom-model-wake.json`, IDE state, never the checkout). It is
 //! re-learned once a day, so a machine whose address changed is caught
 //! up with. The table is read over netlink (`RTM_GETNEIGH`), which is
 //! the one way to read the IPv6 half: ARP is IPv4's protocol and
@@ -56,10 +56,10 @@ use anyhow::{Context, Result};
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
-/// What the IDE learned about the machine behind a private server.
+/// What the IDE learned about the machine behind a custom endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Neighbor {
-    /// The host as the private-model file names it.
+    /// The host as the custom-model file names it.
     pub host: String,
     /// The address it resolved to when the MAC was read.
     pub ip: IpAddr,
@@ -150,14 +150,14 @@ const RETRY_EVERY: Duration = Duration::from_secs(3);
 /// How old a learned address may be before it is read again.
 const RELEARN_AFTER: i64 = 24 * 60 * 60;
 
-/// Where the learned address lives: beside the private-model file it is
+/// Where the learned address lives: beside the custom-model file it is
 /// about.
-pub fn wake_path(private_model_path: &Path) -> PathBuf {
-    private_model_path.with_file_name("private-model-wake.json")
+pub fn wake_path(custom_model_path: &Path) -> PathBuf {
+    custom_model_path.with_file_name("custom-model-wake.json")
 }
 
 fn host_and_port(uri: &Uri) -> Result<(String, u16)> {
-    let host = uri.host().context("the private model's URL has no host")?;
+    let host = uri.host().context("the custom model's URL has no host")?;
     let port = uri
         .port_u16()
         .unwrap_or(if uri.scheme_str() == Some("https") {
@@ -166,6 +166,72 @@ fn host_and_port(uri: &Uri) -> Result<(String, u16)> {
             80
         });
     Ok((host.to_string(), port))
+}
+
+/// Is the endpoint on the user's own network — the only place a machine
+/// can be asleep, be woken by a broadcast, or be asked `/health` about a
+/// stream it went quiet on? A hosted API is none of those: probing it
+/// costs a connection per request, and on a network blip the chat would
+/// be told that wake-ups were going to a cloud (David, 2026-10-03, of a
+/// hosted endpoint on this route).
+///
+/// Names the LAN uses (`.lan`, `.local`, `.home.arpa`, `.internal`, a
+/// single label) count without a lookup, since mDNS is answered by the
+/// machine itself and a sleeping one answers nothing; an address counts
+/// when it is private, loopback, link-local, or CGNAT (a tailnet's); any
+/// other name counts when everything it resolves to does, and not when
+/// it does not resolve.
+pub async fn on_local_network(uri: &Uri) -> bool {
+    let Ok((host, port)) = host_and_port(uri) else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return is_local_address(ip);
+    }
+    let lower = host.to_ascii_lowercase();
+    if !lower.contains('.')
+        || [".lan", ".local", ".home.arpa", ".internal"]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+    {
+        return true;
+    }
+    let resolved = tokio::time::timeout(
+        CONNECT_PROBE,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await;
+    match resolved {
+        Ok(Ok(addresses)) => {
+            let addresses: Vec<SocketAddr> = addresses.collect();
+            !addresses.is_empty() && addresses.iter().all(|a| is_local_address(a.ip()))
+        }
+        _ => false,
+    }
+}
+
+fn is_local_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                // 100.64.0.0/10, shared address space: Tailscale's.
+                || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                // fc00::/7, unique local; fe80::/10, link-local.
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 /// Does the server accept a connection right now?
@@ -342,7 +408,7 @@ pub async fn ensure_awake(
     if reachable(uri).await {
         return Wake::Reachable;
     }
-    let host = uri.host().unwrap_or("the private server").to_string();
+    let host = uri.host().unwrap_or("the custom endpoint").to_string();
     let Some(neighbor) = remembered(path).await else {
         let outcome = Wake::NoNeighbor;
         if let Some(text) = outcome.note(&host) {
@@ -682,6 +748,36 @@ mod tests {
         assert!(note.contains("stopped sending"), "{note}");
     }
 
+    #[tokio::test]
+    async fn only_the_users_own_network_is_woken() {
+        for local in [
+            "http://192.168.1.20:9931",
+            "http://10.0.0.5:8080",
+            "http://100.101.102.103:9931",
+            "http://[fd00::1]:9931",
+            "http://[fe80::1]:9931",
+            "http://127.0.0.1:9931",
+            "http://tower.lan:9931",
+            "http://tower.local:9931",
+            "http://tower:9931",
+        ] {
+            assert!(
+                super::on_local_network(&local.parse().unwrap()).await,
+                "{local}"
+            );
+        }
+        for hosted in [
+            "https://8.8.8.8/inference",
+            "https://[2001:4860::8888]/inference",
+            "http://172.32.0.1:9931",
+        ] {
+            assert!(
+                !super::on_local_network(&hosted.parse().unwrap()).await,
+                "{hosted}"
+            );
+        }
+    }
+
     use super::*;
 
     /// A netlink dump reply, both families: complete entries come out
@@ -762,9 +858,9 @@ mod tests {
     }
 
     #[test]
-    fn the_learned_address_lives_beside_the_private_model_file() {
-        let path = wake_path(Path::new("/state/ws/private-model.json"));
-        assert_eq!(path, PathBuf::from("/state/ws/private-model-wake.json"));
+    fn the_learned_address_lives_beside_the_custom_model_file() {
+        let path = wake_path(Path::new("/state/ws/custom-model.json"));
+        assert_eq!(path, PathBuf::from("/state/ws/custom-model-wake.json"));
         let neighbor = Neighbor {
             host: "tower.local".into(),
             ip: IpAddr::V4(Ipv4Addr::new(192, 168, 86, 193)),
@@ -803,7 +899,7 @@ mod tests {
         drop(listener);
         let uri: Uri = format!("http://127.0.0.1:{port}").parse().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = wake_path(&dir.path().join("private-model.json"));
+        let path = wake_path(&dir.path().join("custom-model.json"));
         let said = std::sync::Mutex::new(Vec::new());
         let outcome = ensure_awake(
             &uri,

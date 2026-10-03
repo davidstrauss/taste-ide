@@ -19,7 +19,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use taste_authproxy::{
-    AuthProxy, CredentialSource, FileCredentials, FilePrivateUpstream, Handle, IdeCredentials,
+    AuthProxy, CredentialSource, FileCredentials, FileCustomUpstream, Handle, IdeCredentials,
     Route, StaticKey,
 };
 
@@ -183,7 +183,7 @@ async fn start_upstream() -> Upstream {
                                 .body(BodyExt::boxed(ChannelBody(rx)))
                                 .unwrap()
                         } else if interleaved {
-                            // A private server's stream as llama-server
+                            // A custom endpoint's stream as llama-server
                             // sends it: the thinking block left open under
                             // the text block, its signature and stop last.
                             Response::builder()
@@ -349,22 +349,22 @@ async fn the_model_listing_is_read_with_the_real_credential_and_cached() {
 /// hosts, and the right key on each.
 ///
 /// The negative half is the one that matters most. A placeholder minted
-/// without saying reaches the API and nothing else, so a private server
+/// without saying reaches the API and nothing else, so a custom endpoint
 /// is reached because a spawn chose it — never because a default fell
 /// through. Both placeholders are one environment's, deliberately: that
-/// is a "Claude Code" chat and a "Claude Code (Private)" chat open side
+/// is a "Claude Code" chat and a "Claude Code (Custom)" chat open side
 /// by side, which is the mix the agent split exists for.
 #[tokio::test]
 async fn two_placeholders_reach_two_upstreams_with_the_right_key_on_each() {
     let anthropic = start_upstream().await;
-    let private_server = start_upstream().await;
+    let custom_server = start_upstream().await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("private-model.json");
+    let path = dir.path().join("custom-model.json");
     std::fs::write(
         &path,
         format!(
             r#"{{"base_url":"{}","kind":"bearer","token":"llama-key","model":"gpt-oss-20b"}}"#,
-            private_server.uri()
+            custom_server.uri()
         ),
     )
     .unwrap();
@@ -374,24 +374,24 @@ async fn two_placeholders_reach_two_upstreams_with_the_right_key_on_each() {
         Arc::new(StaticKey::api_key("real-api-key")),
     )
     .unwrap();
-    handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
+    handle.set_custom_upstream(Some(Arc::new(FileCustomUpstream::new(&path))));
 
     let on_the_api = handle.issue_placeholder("i-0028");
-    let on_the_card = handle.issue_placeholder_for("i-0028", Route::Private);
+    let on_the_card = handle.issue_placeholder_for("i-0028", Route::Custom);
     // The route is the placeholder's, fixed at minting, and the agent that
     // holds it is told nothing.
-    assert_eq!(handle.route_of(&on_the_card), Some(Route::Private));
+    assert_eq!(handle.route_of(&on_the_card), Some(Route::Custom));
     assert_eq!(handle.route_of(&on_the_api), Some(Route::Anthropic));
     assert_eq!(handle.route_of("placeholder-nobody-issued"), None);
 
     let response = get(&handle, "/v1/messages", Some(&on_the_card)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = response.into_body().collect().await.unwrap();
-    assert_eq!(private_server.hits(), 1);
+    assert_eq!(custom_server.hits(), 1);
     assert_eq!(anthropic.hits(), 0, "the API must not have been called");
-    let seen = private_server.last();
+    let seen = custom_server.last();
     assert_eq!(seen.uri, "/v1/messages");
-    // The private server's own key, in the header the file named...
+    // The custom endpoint's own key, in the header the file named...
     assert_eq!(seen.header("authorization"), Some("Bearer llama-key"));
     // ...and no trace of the account's credential on a host that is not
     // Anthropic's. This is the whole point of a second upstream.
@@ -402,7 +402,7 @@ async fn two_placeholders_reach_two_upstreams_with_the_right_key_on_each() {
     let _ = response.into_body().collect().await.unwrap();
     assert_eq!(anthropic.hits(), 1);
     assert_eq!(
-        private_server.hits(),
+        custom_server.hits(),
         1,
         "a placeholder minted for the API stays on it"
     );
@@ -423,7 +423,7 @@ async fn two_placeholders_reach_two_upstreams_with_the_right_key_on_each() {
 
     // And what the settings row may say about it, having read the file
     // once.
-    let facts = handle.private_model().unwrap();
+    let facts = handle.custom_model().unwrap();
     assert_eq!(facts.label, "gpt-oss-20b");
     assert_eq!(facts.model.as_deref(), Some("gpt-oss-20b"));
 }
@@ -444,27 +444,27 @@ const LLAMA_ORDER: &str = concat!(
     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 );
 
-/// A private server's stream reaches the agent in the documented block
+/// A custom endpoint's stream reaches the agent in the documented block
 /// order — the thinking block stopped before the text block starts — and
 /// the API's own stream is not touched at all.
 #[tokio::test]
-async fn a_private_servers_stream_is_put_in_block_order_and_the_apis_is_not() {
+async fn a_custom_servers_stream_is_put_in_block_order_and_the_apis_is_not() {
     let anthropic = start_upstream().await;
-    let private_server = start_upstream().await;
+    let custom_server = start_upstream().await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("private-model.json");
+    let path = dir.path().join("custom-model.json");
     std::fs::write(
         &path,
         format!(
             r#"{{"base_url":"{}","token":"llama-key","model":"gpt-oss-20b"}}"#,
-            private_server.uri()
+            custom_server.uri()
         ),
     )
     .unwrap();
     let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
-    handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
+    handle.set_custom_upstream(Some(Arc::new(FileCustomUpstream::new(&path))));
 
-    let on_the_card = handle.issue_placeholder_for("i-0028", Route::Private);
+    let on_the_card = handle.issue_placeholder_for("i-0028", Route::Custom);
     let response = get(&handle, "/interleaved", Some(&on_the_card)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -501,7 +501,7 @@ async fn a_private_servers_stream_is_put_in_block_order_and_the_apis_is_not() {
 }
 
 /// An upstream that stops sending mid-stream — the machine running the
-/// private model went to sleep — does not leave the agent waiting on
+/// custom model went to sleep — does not leave the agent waiting on
 /// "Working…": after the idle window the proxy ends the stream with an
 /// `error` event in the API's own shape, and the connection completes.
 #[tokio::test]
@@ -533,25 +533,25 @@ async fn a_stream_that_falls_silent_is_ended_with_an_error_event() {
     assert_eq!(handle.spend("i-0028").requests, 1);
 }
 
-/// A private server that is silent but answering health checks is busy,
+/// A custom endpoint that is silent but answering health checks is busy,
 /// not gone — a local model prefilling auto mode's reviewer prompt — and
 /// its stream is left open past the idle window rather than ended.
 #[tokio::test]
-async fn a_silent_private_stream_stays_open_while_the_server_answers_health_checks() {
+async fn a_silent_custom_stream_stays_open_while_the_server_answers_health_checks() {
     let anthropic = start_upstream().await;
-    let private = start_upstream().await;
+    let custom = start_upstream().await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("private-model.json");
-    let host = private.uri().authority().unwrap().to_string();
+    let path = dir.path().join("custom-model.json");
+    let host = custom.uri().authority().unwrap().to_string();
     std::fs::write(
         &path,
         format!(r#"{{"base_url":"http://{host}","token":"k","model":"gpt-oss-20b"}}"#),
     )
     .unwrap();
     let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
-    handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
+    handle.set_custom_upstream(Some(Arc::new(FileCustomUpstream::new(&path))));
     handle.set_stream_idle_timeout(Duration::from_millis(150));
-    let placeholder = handle.issue_placeholder_for("i-0031", Route::Private);
+    let placeholder = handle.issue_placeholder_for("i-0031", Route::Custom);
 
     let response = get(&handle, "/stall", Some(&placeholder)).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -561,30 +561,30 @@ async fn a_silent_private_stream_stays_open_while_the_server_answers_health_chec
         tokio::time::timeout(Duration::from_millis(1200), response.into_body().collect()).await;
     assert!(
         still_open.is_err(),
-        "a private stream whose server answers health checks must not be ended by the idle window"
+        "a custom stream whose server answers health checks must not be ended by the idle window"
     );
 }
 
-/// A private server that is not there is not simply "unreachable": the
+/// A custom endpoint that is not there is not simply "unreachable": the
 /// proxy tries to wake its machine first and says what it could do. With
 /// nothing learned about the machine yet, that is that it cannot wake it
 /// and why — and nothing was sent to the API on the way.
 #[tokio::test]
-async fn an_unreachable_private_server_is_reported_with_the_wake_attempt() {
+async fn an_unreachable_custom_server_is_reported_with_the_wake_attempt() {
     let anthropic = start_upstream().await;
     // A port nothing listens on.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let closed = listener.local_addr().unwrap().port();
     drop(listener);
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("private-model.json");
+    let path = dir.path().join("custom-model.json");
     std::fs::write(
         &path,
         format!(r#"{{"base_url":"http://127.0.0.1:{closed}","token":"k","model":"m"}}"#),
     )
     .unwrap();
     let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
-    handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
+    handle.set_custom_upstream(Some(Arc::new(FileCustomUpstream::new(&path))));
     handle.set_wake_wait(Duration::from_millis(10));
     let said = Arc::new(Mutex::new(Vec::<(Option<String>, String)>::new()));
     let recorder = said.clone();
@@ -595,7 +595,7 @@ async fn an_unreachable_private_server_is_reported_with_the_wake_attempt() {
             .push((env.map(str::to_string), text));
     }));
 
-    let placeholder = handle.issue_placeholder_for("i-0028", Route::Private);
+    let placeholder = handle.issue_placeholder_for("i-0028", Route::Custom);
     let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -612,38 +612,38 @@ async fn an_unreachable_private_server_is_reported_with_the_wake_attempt() {
     }
 
     // The connection test says the same thing in its own verdict.
-    let err = handle.probe_private().await.unwrap_err().to_string();
+    let err = handle.probe_custom().await.unwrap_err().to_string();
     assert!(err.contains("cannot be woken yet"), "{err}");
 }
 
-/// The settings form's "test connection": one request to the private
+/// The settings form's "test connection": one request to the custom
 /// server, on the path an agent's turn takes, with the stored key in the
 /// header the file names — and nothing at all to the API.
 #[tokio::test]
-async fn probing_the_private_server_speaks_to_it_the_way_a_turn_would() {
+async fn probing_the_custom_server_speaks_to_it_the_way_a_turn_would() {
     let anthropic = start_upstream().await;
-    let private_server = start_upstream().await;
+    let custom_server = start_upstream().await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("private-model.json");
+    let path = dir.path().join("custom-model.json");
     std::fs::write(
         &path,
         format!(
             r#"{{"base_url":"{}","token":"llama-key","model":"gpt-oss-20b"}}"#,
-            private_server.uri()
+            custom_server.uri()
         ),
     )
     .unwrap();
     let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
 
     // Nothing provisioned: the probe says so rather than asking the API.
-    let err = handle.probe_private().await.unwrap_err().to_string();
-    assert!(err.contains("no private model is provisioned"), "{err}");
+    let err = handle.probe_custom().await.unwrap_err().to_string();
+    assert!(err.contains("no custom model is provisioned"), "{err}");
 
-    handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
-    let probe = handle.probe_private().await.unwrap();
-    assert_eq!(private_server.hits(), 1);
+    handle.set_custom_upstream(Some(Arc::new(FileCustomUpstream::new(&path))));
+    let probe = handle.probe_custom().await.unwrap();
+    assert_eq!(custom_server.hits(), 1);
     assert_eq!(anthropic.hits(), 0, "the API must not have been called");
-    let seen = private_server.last();
+    let seen = custom_server.last();
     assert_eq!(seen.method, "POST");
     assert_eq!(seen.uri, "/v1/messages");
     assert_eq!(seen.header("x-api-key"), Some("llama-key"));
@@ -652,21 +652,21 @@ async fn probing_the_private_server_speaks_to_it_the_way_a_turn_would() {
     assert_eq!(probe.model, None);
 }
 
-/// A private placeholder with nothing behind it is a failed request, never
+/// A custom placeholder with nothing behind it is a failed request, never
 /// a quiet turn on the user's subscription.
 #[tokio::test]
-async fn a_private_placeholder_with_no_private_model_never_falls_back_to_the_api() {
+async fn a_custom_placeholder_with_no_custom_model_never_falls_back_to_the_api() {
     let anthropic = start_upstream().await;
     let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
-    let placeholder = handle.issue_placeholder_for("i-0028", Route::Private);
-    assert_eq!(handle.private_model(), None);
+    let placeholder = handle.issue_placeholder_for("i-0028", Route::Custom);
+    assert_eq!(handle.custom_model(), None);
 
     let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(anthropic.hits(), 0, "the API must not have been called");
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("private model"), "{text}");
+    assert!(text.contains("custom model"), "{text}");
 }
 
 /// Revoking an environment takes its routes with it: they were the
@@ -676,7 +676,7 @@ async fn a_private_placeholder_with_no_private_model_never_falls_back_to_the_api
 async fn revoking_an_environment_forgets_where_it_was_pointed() {
     let anthropic = start_upstream().await;
     let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
-    let placeholder = handle.issue_placeholder_for("i-0028", Route::Private);
+    let placeholder = handle.issue_placeholder_for("i-0028", Route::Custom);
     handle.revoke("i-0028");
     assert_eq!(handle.route_of(&placeholder), None);
     assert_eq!(
@@ -1292,7 +1292,7 @@ fn isolate_state() {
         std::env::remove_var("TASTE_ANTHROPIC_CREDENTIALS");
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
-        std::env::remove_var("TASTE_PRIVATE_MODEL");
+        std::env::remove_var("TASTE_CUSTOM_MODEL");
         dir
     });
 }
@@ -1410,42 +1410,42 @@ async fn two_projects_resolve_two_credentials_and_neither_lends_to_the_other() {
     assert!(!expected.exists(), "and nothing copied it into the project");
 }
 
-/// The private model scopes the same way, and for the same reason: a
-/// server on the user's own hardware is a thing they chose for this work.
+/// The custom model scopes the same way, and for the same reason: the
+/// endpoint is a thing they chose for this work.
 #[tokio::test]
-async fn the_private_model_file_is_this_projects_too() {
+async fn the_custom_model_file_is_this_projects_too() {
     isolate_state();
     let with_a_server = std::path::Path::new("/projects/has-a-tower");
     let without = std::path::Path::new("/projects/has-none");
     provision(
         with_a_server,
-        "private-model.json",
+        "custom-model.json",
         r#"{"base_url":"http://tower.lan:9931","token":"k","model":"gpt-oss-20b"}"#,
     );
 
-    let source = taste_authproxy::private::discover(with_a_server).expect("this project has one");
+    let source = taste_authproxy::custom::discover(with_a_server).expect("this project has one");
     assert_eq!(
         source.upstream().await.unwrap().uri.to_string(),
         "http://tower.lan:9931/"
     );
     assert_eq!(source.facts().unwrap().label, "gpt-oss-20b");
 
-    // The neighbouring project has no private model, and does not inherit
-    // one: opening Claude Code (Private) there fails the request rather
+    // The neighbouring project has no custom model, and does not inherit
+    // one: opening Claude Code (Custom) there fails the request rather
     // than reaching somebody else's server.
     assert!(
-        taste_authproxy::private::discover(without).is_none(),
-        "a private model is provisioned per project, never machine-wide"
+        taste_authproxy::custom::discover(without).is_none(),
+        "a custom model is provisioned per project, never machine-wide"
     );
     assert_ne!(
-        taste_authproxy::private_model_path(with_a_server),
-        taste_authproxy::private_model_path(without)
+        taste_authproxy::custom_model_path(with_a_server),
+        taste_authproxy::custom_model_path(without)
     );
 
     let upstream = start_upstream().await;
     let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("k"))).unwrap();
-    handle.set_private_upstream(taste_authproxy::private::discover(without).map(Arc::new));
-    let placeholder = handle.issue_placeholder_for("primary", Route::Private);
+    handle.set_custom_upstream(taste_authproxy::custom::discover(without).map(Arc::new));
+    let placeholder = handle.issue_placeholder_for("primary", Route::Custom);
     let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(upstream.hits(), 0, "and nothing fell back to the API");

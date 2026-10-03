@@ -87,7 +87,7 @@ pub fn issue_brief(id: &str, title: &str, body: &str) -> String {
 /// invent one. Mirrors `taste_acp::registry::builtin_agents`, which a test
 /// there holds to this list; it lives here because the MCP server cannot
 /// depend on the ACP crate.
-pub const AGENT_IDS: &[&str] = &["claude-code", "claude-code-private", "copilot", "gemini"];
+pub const AGENT_IDS: &[&str] = &["claude-code", "claude-code-custom", "copilot", "gemini"];
 
 pub fn coordinator_brief() -> String {
     String::from(
@@ -139,11 +139,10 @@ pub fn coordinator_brief() -> String {
          mattered. Until then the issue is STARTING: a container being built, no agent \
          in it, the prompt held — nothing has been read or done, so say \"starting\", \
          never \"working on it\". Every issue row and chat_status answer carries `next`, \
-         the step its state calls for; take it. The agent `claude-code-private` is Claude Code on the user's own \
-         hardware: it spends none of their subscription and runs whatever model that \
-         server loaded (so it takes no `model`), which makes it the rung to reach for \
-         on scoped work and the wrong one for anything whose quality you would not want \
-         to re-do. The ceilings are yours to work \
+         the step its state calls for; take it. The agent `claude-code-custom` is Claude Code against the endpoint the user \
+         configured for this project (their own server or a hosted provider). It spends \
+         none of their subscription and runs the model configured there, so it takes no \
+         `model`. How capable it is depends on that model. The ceilings are yours to work \
          under and yours to clear: when the cap or the disk budget refuses a start, \
          propose a reclaim rather than sitting on it — review_list says which \
          environments the user has merged or rejected, environment_destroy is the only \

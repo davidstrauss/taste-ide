@@ -98,7 +98,7 @@ environment, forever.
 requirement.** A local clone's default is to hardlink the whole of
 `.git/objects` — libgit2 does it exactly as `git clone --local` does, and
 it is normally free. It is not free here. Every clone is bind-mounted into
-a container with `:Z`, and `:Z` means *relabel this tree with a private
+a container with `:Z`, and `:Z` means *relabel this tree with a custom
 SELinux MCS category*; a label belongs to the **inode**, so relabelling
 one end of a hardlink relabels the other. Starting one environment
 therefore rewrote the security label on the object store of every other
@@ -983,7 +983,7 @@ moves to the IDE:
   rather than joining it — that slot holds one caption, and its three
   states are the three true answers to "whose pool is this": the
   account's ("Plan"), a named account of yours ("work"), and not the
-  account at all ("Private"). "Plan · work" was tried and measured: at
+  account at all ("Custom"). "Plan · work" was tried and measured: at
   1440x900 with the divider where it sits by default the chat pane is
   about 410 wide, which is not two captions wide. The Utilization tab's
   Subscription section carries the same fact at full length, leading with
@@ -1018,7 +1018,7 @@ moves to the IDE:
   nothing can be committed (David: "I don't want it actually in the
   working copy, even as a hidden file, because it risks getting
   committed"). The three files the proxy reads — the credential, the
-  private model, and the account's model listing — are all keyed this way,
+  custom model, and the account's model listing — are all keyed this way,
   the listing because it is a cache of what *that account* can run.
 - **An existing machine-wide file is never read, not even to offer it.**
   A `$XDG_STATE_HOME/taste-ide/anthropic.json` from before this scope
@@ -1081,10 +1081,10 @@ moves to the IDE:
   chmod 600 "$dir/anthropic.json"
   ```
 
-### A private model, as the proxy's second upstream
+### A custom model, as the proxy's second upstream
 
-A Claude Code (Private) chat starts in **Accept edits**, not Auto. Auto
-mode asks a second model to judge every tool call, and on the private
+A Claude Code (Custom) chat starts in **Accept edits**, not Auto. Auto
+mode asks a second model to judge every tool call, and on the custom
 route that second model is the same small local server the turn runs on,
 prefilling a prompt it has never seen for every Write and Bash; the
 reviewer's own timeout gave up, and the agent reported "the environment
@@ -1093,11 +1093,11 @@ through and asks the user about commands, with no second model in the
 loop. The Permissions row keeps the user's own choice per chat, and says
 under itself why Auto costs what it costs here.
 
-A silent private stream is not ended by the idle window alone. A local
+A silent custom stream is not ended by the idle window alone. A local
 model prefilling a long prompt — auto mode's permission reviewer sends a
 second, different prompt for every tool call, which no prompt cache
 covers — is silent for longer than the window and is not gone, while a
-machine that went to sleep is. When the window fires on the private
+machine that went to sleep is. When the window fires on the custom
 route the proxy asks the server's own `/health`; any answer means busy,
 and the stream waits another window, up to half an hour; no answer means
 gone, and the stream ends with the `error` event as before (David,
@@ -1105,37 +1105,32 @@ gone, and the stream ends with the `error` event as before (David,
 the local model"). The account's route keeps the plain window: the API
 does not go to sleep.
 
-A llama.cpp server on a machine of the user's speaks the Anthropic
-Messages API, so a private model is not a new integration: it is a
+A llama.cpp server behind the custom endpoint speaks the Anthropic
+Messages API, so a custom model is not a new integration: it is a
 different *upstream* for the one hop the IDE already owns. The agent, the
 permission cards, and the transcript are unchanged, and the containers
 still reach nothing on the LAN — only the host-side proxy dials it, which
-is the boundary this codebase defends. README → "A private model on your
-own hardware" is the server half.
+is the boundary this codebase defends.
 
-- **Two agents, one adapter.** The private model is offered where agents
-  are offered: **Claude Code (Private)** is a second entry in the agent
-  registry (`taste_acp::registry`, id `claude-code-private`), the same
+- **Two agents, one adapter.** The custom model is offered where agents
+  are offered: **Claude Code (Custom)** is a second entry in the agent
+  registry (`taste_acp::registry`, id `claude-code-custom`), the same
   pinned adapter with the same home, differing in one field —
-  `AgentSpec::upstream`. Its spawn mints a placeholder for the private
+  `AgentSpec::upstream`. Its spawn mints a placeholder for the custom
   upstream (`Handle::issue_placeholder_for`) instead of the API, and the
   proxy reads the route off the placeholder per request. So which host a
   chat spends on is decided by which agent it was opened as, holds for
   the chat's life, and is per **chat** rather than per environment: one
-  environment can hold a plain Claude Code chat and a private one at
+  environment can hold a plain Claude Code chat and a custom one at
   once, which is the mix this exists for. `taste_authproxy::Route::Anthropic`
-  is the default: the private server is reached because a placeholder was
+  is the default: the custom endpoint is reached because a placeholder was
   minted for it, never because something was absent.
 
   It used to be a row in the model drop-down that flipped a
-  per-environment route. That made the private model look like a model of
+  per-environment route. That made the custom model look like a model of
   Claude Code's when it is a different place for Claude Code to send its
   requests, tangled the drop-down's remembered value with a value no agent
   advertised, and could not put two chats of one environment on two hosts.
-  A persisted chat from then (`model_value: "private"` on `claude-code`)
-  is restored as the private agent (`chat::migrate_private_entry`), so no
-  conversation the user put on their own hardware comes back on their
-  account.
 - **The credential follows the route**, so neither key is ever sent to the
   other host — one decision in one place rather than two branches that
   have to agree. A route with nothing behind it **fails the request** and
@@ -1143,21 +1138,21 @@ own hardware" is the server half.
   hardware must not quietly spend their subscription because a file went
   missing.
 - **The setting is IDE state**, beside the Anthropic credential and scoped
-  the same way, at `private-model.json` in this project's state directory
+  the same way, at `custom-model.json` in this project's state directory
 — never the checkout, never an environment variable the agent sees. The
-user configures it from a Claude Code (Private) chat's Settings, where a
-Private model group of rows — endpoint, key header, key, model name,
+user configures it from a Claude Code (Custom) chat's Settings, where a
+Custom model group of rows — endpoint, key header, key, model name,
 context window, Save and test connection — is shown on that variant only,
 filled from what is on file, the key included, or with the README's own
 defaults when nothing is (a key left blank keeps the stored one);
 saving writes the file `0600`, refreshes the proxy without restarting the
 IDE, the proxy, or an agent session, and then sends the server one short
 `/v1/messages` request through the proxy's own client
-(`Handle::probe_private`), so a wrong host or key surfaces under the rows
-rather than in an agent's turn — the placeholders live sessions hold were minted for the private
+(`Handle::probe_custom`), so a wrong host or key surfaces under the rows
+rather than in an agent's turn — the placeholders live sessions hold were minted for the custom
 upstream, whatever is behind it. It holds a key, and an agent that could
 write it could aim the IDE's own requests at a host of its choosing. Per project for the same reason the credential
-is: a server on the user's own hardware is a thing they chose for this
+is: the endpoint is a thing they chose for this
 work, and a project with none does not inherit another's.
 
   ```json
@@ -1182,7 +1177,7 @@ work, and a project with none does not inherit another's.
   actually exists rather than assuming Anthropic's 200k. The file is
   re-read whenever it changes, exactly as the credential file is, so a
   moved server or a rotated key lands on the next request.
-- **The private server's stream is put in the documented block order on
+- **The custom endpoint's stream is put in the documented block order on
   the way through** (`taste_authproxy::sse`). Anthropic stops one content
   block before it starts the next; `llama-server` leaves the thinking
   block open under the text block and closes it last, and that order made
@@ -1195,13 +1190,13 @@ work, and a project with none does not inherit another's.
   second stop). The API's own stream is never touched: it is already in
   order, and a transform on those bytes is a risk with nothing to buy.
 - **A stream that falls silent is ended, not waited out.** A machine
-  running a private model goes to sleep mid-answer and TCP holds the
+  running a custom model goes to sleep mid-answer and TCP holds the
   connection open indefinitely; left alone, the agent waits out its own
   ten-minute timeout with "Working…" on screen (David, 2026-09-16: "You
   should handle the API going away without hanging on Working"). The
   proxy watches every streaming response for silence and, after ninety
   seconds without a byte — long past any gap a live stream has, since
-  the API pings every few seconds and a private server streams each
+  the API pings every few seconds and a custom endpoint streams each
   token — ends it with the Messages API's own `error` event naming the
   silence, so the agent's client raises a readable failure
   (`taste_authproxy::proxy::STREAM_IDLE_TIMEOUT`). Both routes, because
@@ -1209,15 +1204,15 @@ work, and a project with none does not inherit another's.
   long the session has been quiet from twenty seconds on, and names Stop
   after a minute, which covers the silences the proxy cannot see.
 - **A sleeping machine is woken, not reported unreachable.** Before a
-  request goes to the private server the proxy checks that something is
+  request goes to the custom endpoint the proxy checks that something is
   listening; if nothing is, it sends a Wake-on-LAN packet to the machine
   and waits up to a minute for it to come up, then sends the request
   (`taste_authproxy::wake`). Nothing is configured: the machine's
   hardware address is read off the kernel's neighbour table — over
   netlink, both families in one dump, since IPv6's Neighbor Discovery
   entries have no `/proc` file the way ARP's do — the first time the
-  server answers from the LAN, kept beside the private-model
-  file as `private-model-wake.json`, and re-learned daily. Every step is
+  server answers from the LAN, kept beside the custom-model
+  file as `custom-model-wake.json`, and re-learned daily. Every step is
   said where the user is — a note in the chat whose turn it is
   (`Event::ChatNotice`), or the connection test's own verdict: not
   answering, wake-up sent to which address, answered after how long,
@@ -1229,20 +1224,20 @@ work, and a project with none does not inherit another's.
   interface for an IPv6 one; the machine's firmware and NIC have to
   allow wake from a magic packet.
 - **Spend is still the environment's; quota is not harvested.** A turn on
-  the user's own hardware costs no money and no allowance, but the
+  the custom endpoint costs no money and no allowance, but the
   question the counters answer is who drew and how much, and an
   environment that spent its afternoon on the free rung is worth being
   able to see. The account's rate-limit headers are a different matter:
-  a private server's response says nothing about the subscription, and
+  a custom endpoint's response says nothing about the subscription, and
   reading a turn it served as proof that a closed Anthropic window had
   reopened would be a gauge lying about a pool the request never touched.
 - **The chat header says which upstream a session is on.** On Claude Code
-  (Private) the identity at the row's start says so by name, and the
+  (Custom) the identity at the row's start says so by name, and the
   account's "Plan" gauge is not dimmed or zeroed — it is **hidden**, with
   nothing in its place, because there is no subscription figure to report
   for a conversation that is not drawing on one and the name beside the
   slot has already said why. The context gauge stays: that one is this
-  conversation's, and it is measured against the private server's own
+  conversation's, and it is measured against the custom endpoint's own
   window when the file names it. The variant shows no model drop-down —
   the server serves what it loaded whatever the request names, so the one
   choice there is to make is the server's configuration, and that is what
@@ -1303,7 +1298,7 @@ want my IDE client to be able to access it").
   one adapter" says above holds for three: the route is per chat, decided
   by which agent the chat was opened as, and a route with nothing behind
   it fails the request rather than falling back to the account. Like the
-  private variant it starts in Accept edits, for the same reason and more
+  custom variant it starts in Accept edits, for the same reason and more
   so — auto mode's reviewer would be the same slow model, prefilling a
   fresh prompt for every tool call — shows no model drop-down, measures
   its context gauge against the server's own window, and hides the Plan
@@ -1311,13 +1306,13 @@ want my IDE client to be able to access it").
   month's spend against the cap** ("$41 of $300"), because on this route
   the bill is the thing to watch.
 - **The upstream is the IDE's to manage, so there is no endpoint to
-  type.** `private-model.json` holds an address the user writes. Here the
+  type.** `custom-model.json` holds an address the user writes. Here the
   upstream is a loopback port the IDE's own IAP tunnel listens on, opened
   when the VM is ready, and the key llama-server checks is minted by the
   IDE at every start. What the user provides is a GCP project, a sign-in,
   and the few choices in `cloud-model.json` — the project, the zone, and
   the monthly cap — kept in this project's state directory, never the
-  checkout, for the reason the private model's file gives: an agent that
+  checkout, for the reason the custom model's file gives: an agent that
   could write them could aim the IDE's own requests, and its own GCP spend,
   wherever it liked.
 - **gcloud, the IDE's own, signed in per project** (David, 2026-10-03:
@@ -1373,7 +1368,7 @@ want my IDE client to be able to access it").
   - no external address at all, so nothing on the internet can reach it
     and it can reach nothing on the internet;
   - a deny-all egress rule above every allow but the window's, besides;
-  - a DNS server policy forwarding every query to an unassigned private
+  - a DNS server policy forwarding every query to an unassigned custom
     address, because the metadata server answers DNS and no firewall
     reaches the metadata server;
   - no Cloud NAT, and Private Google Access only while the window is
@@ -1388,7 +1383,7 @@ want my IDE client to be able to access it").
 - **The window: open to load, shut to serve.** The serving VM pulls the
   weights on every boot, so for that pull alone the IDE opens one way
   out: Private Google Access on its subnet, and an egress rule at
-  priority 0, above the deny, to `private.googleapis.com`
+  priority 0, above the deny, to `custom.googleapis.com`
   (199.36.153.8/30) on 443 (`model::window_firewall`). The VM still has
   no credential: it fetches with GET URLs the IDE signed for exactly the
   shards and the image, through IAM's `signBlob`, lasting 45 minutes. It
@@ -1453,7 +1448,7 @@ want my IDE client to be able to access it").
   the loader finds no way out and nothing worth taking; **not yet** — the
   smoke test runs it under root's podman, which the window and the
   lockdown still contain, and that is closed before GLM-5.3 is served.
-- **Waking is creating.** The private route's hook is the one this uses:
+- **Waking is creating.** The custom route's hook is the one this uses:
   before a request goes out, the proxy checks that something is listening,
   and on this route "wake" means create the VM rather than send a magic
   packet — nothing on one outlives its boot, so there is nothing to
@@ -1466,7 +1461,7 @@ want my IDE client to be able to access it").
   started: this month's GCP spend is $298 of the $300 cap" — because a turn
   that waits seven minutes in silence is a turn the user abandons. One wake
   at a time per workspace: several chats share one VM, and the second
-  waits on the first's start rather than issuing its own. The private
+  waits on the first's start rather than issuing its own. The custom
   route's silence rule applies unchanged: a stream quiet past the idle
   window is held while the server's `/health` answers, which on a CPU
   reading a long prompt it will be for minutes.
@@ -1586,7 +1581,7 @@ person.
 **Phase 2a — the smoke test.** Before the 800 GB model, the whole path
 is proved with a small one (David, 2026-10-03: "Let's start with a less
 ambitious model to test that things can work"): gpt-oss-20b, the model
-the private route was first proved against, pinned by commit and digest
+the custom route was first proved against, pinned by commit and digest
 like GLM-5.3 (`taste_gcp::model::GPT_OSS_20B`), mirrored into the bucket
 by the same staging VM, and served from an `n4-standard-8` with the same
 lockdown — no address, no route out but the window, no name resolution,
@@ -2524,23 +2519,23 @@ its transcript. Without that, a project provisioned after the IDE opened
 stopped at Opus until a restart (David, 2026-09-16: "Make it properly
 freshen the list once authorized to connect to Claude Code").
 
-**The private model is not in that list; it is an agent.** `issue_start`
-takes `agent: "claude-code-private"` for a chat on the user's own server
+**The custom model is not in that list; it is an agent.** `issue_start`
+takes `agent: "claude-code-custom"` for a chat on the endpoint configured for the project
 (above), and such a chat takes no `model`: `llama-server` serves the one
 model it loaded whatever name the request carries, so the model name in
 the request is not a choice anybody is making, and a value passed anyway
 is refused in the chat's transcript and in `chat_status` like any value
 an agent does not advertise. Which host a chat spends on is therefore
 decided once, when it is opened, and the orchestrator can mix the two
-freely — a private chat and a plain one in the same environment.
+freely — a custom chat and a plain one in the same environment.
 
 The alternative was available and was rejected. Claude Code's documented
-custom-picker variables would take a private id happily ("any string your
-API endpoint accepts"), so the private model *could* have been a value the
+custom-picker variables would take a custom id happily ("any string your
+API endpoint accepts"), so the custom model *could* have been a value the
 agent really advertised — but there is exactly one such row and the proxy
-already spends it on the account's top tier, so buying the private entry
-would cost the Fable entry, for every user who owns a private model and
-most of the time is not using it. The private variant gets no top-tier
+already spends it on the account's top tier, so buying the custom entry
+would cost the Fable entry, for every user who owns a custom model and
+most of the time is not using it. The custom variant gets no top-tier
 row either, since the account's listing says nothing about that server.
 
 Sub-chat permission prompts still surface in their own tabs to the user;
@@ -3261,7 +3256,7 @@ failure mode but still a failure. `taste-devcontainer::security` refuses
 repo-supplied binds outside the checkout for the same reason it always
 did, and the live suite is the tripwire for anything new staged on the
 host. One more thing a VM reads differently: a repo's mount that asks for
-a **private** SELinux label (`Z`, or `relabel=private`) is bound
+a **custom** SELinux label (`Z`, or `relabel=custom`) is bound
 **shared** there. On a host the private label is what keeps one
 environment's files from another container; in a VM the keeper is
 another container over the same files by design, and a private label
@@ -3574,13 +3569,13 @@ asked about and ruled out of scope (David, same day):
   snapshotting, and mirroring all travel as git, so a folder with no
   repository of its own is given one of the IDE's, in
   `$XDG_STATE_HOME/taste-ide/folders/<name>-<hash>.git` with the folder as
-  its `core.worktree` (`taste_git::private`): the folder never gains a
+  its `core.worktree` (`taste_git::custom`): the folder never gains a
   `.git`, its first commit is the folder as it was, and build output and
   caches are excluded from the start (and the checkout in the VM is given
   the same excludes). `GitWorkspace::discover` finds it and
-  `private::cli_prefix` names it on every `git` command line. A folder
+  `custom::cli_prefix` names it on every `git` command line. A folder
   over 50,000 files is refused, so a home directory opened by mistake is
-  not walked into a repository. Each launch sweeps the private
+  not walked into a repository. Each launch sweeps the custom
   repositories whose folder is gone or has since got a `.git` of its own.
 
 ### What does not meet it, and why the VM is the answer

@@ -1,4 +1,4 @@
-//! Put a private server's streaming events in the order the Messages API
+//! Put a custom endpoint's streaming events in the order the Messages API
 //! documents: a content block is stopped before the next one starts.
 //!
 //! # The fault this corrects
@@ -21,10 +21,10 @@
 //!
 //! # Why the proxy, and why only here
 //!
-//! The proxy is the one hop the IDE owns on the way to a private server,
+//! The proxy is the one hop the IDE owns on the way to a custom endpoint,
 //! and the streaming format is documented, so putting the events in the
 //! documented order is a gateway doing what a gateway is for — not a
-//! reading of anybody's internals. It runs on the private route only:
+//! reading of anybody's internals. It runs on the custom route only:
 //! Anthropic's own stream is already in this order, and a transform on
 //! bytes the API sent is a risk with nothing to buy.
 //!

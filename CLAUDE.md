@@ -205,12 +205,14 @@ the worse of the two;
 `TASTE_PROBE_CLOSING=1` poses the window as a close leaves it, the
 closing page over everything with its steps partway (`closing.rs`) —
 pair it with `TASTE_PROBE_SYNC=running` for a transfer in the frame;
-`TASTE_PROBE_PRIVATE=1` poses the chat as Claude Code (Private) — the
+`TASTE_PROBE_CUSTOM=1` poses the chat as Claude Code (Custom) — the
 header's identity naming it, its Plan gauge gone, and the settings shade's
-Private model group up — which otherwise needs a provisioned
-`private-model.json` and a server at the other end of it;
+Custom model group up — which otherwise needs a provisioned
+`custom-model.json` and a server at the other end of it;
 it is orthogonal to `TASTE_PROBE_VIEW`, because what it changes is the
-header every view has;
+header every view has; `=models` also opens the Model row's chooser on a
+hosted provider's list (pair it with `TASTE_PROBE_CHAT=controls` so the
+shade is open under it);
 `TASTE_PROBE_CREDENTIAL=work` poses this project as provisioned with a
 credential the user named, which is the third thing that slot carries —
 the name REPLACES "Plan", because the slot holds one

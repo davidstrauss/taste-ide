@@ -1,5 +1,5 @@
-//! `issue_start` with `agent: "claude-code-private"` produces a chat whose
-//! placeholder is routed privately.
+//! `issue_start` with `agent: "claude-code-custom"` produces a chat whose
+//! placeholder is routed customly.
 //!
 //! The sentence is the gate's, and this is as much of it as a headless
 //! test can hold. What `issue_start` does with an `agent` is hand it to
@@ -31,8 +31,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use taste_acp::authproxy::Route;
-use taste_acp::{builtin_agents, AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
-use taste_authproxy::{AuthProxy, FilePrivateUpstream, StaticKey};
+use taste_acp::{builtin_agents, AgentSpec, CLAUDE_CODE, CLAUDE_CODE_CUSTOM};
+use taste_authproxy::{AuthProxy, FileCustomUpstream, StaticKey};
 
 fn agent(id: &str) -> AgentSpec {
     builtin_agents()
@@ -110,29 +110,29 @@ async fn start_server() -> Server {
 }
 
 #[tokio::test]
-async fn a_chat_started_on_the_private_claude_code_spends_on_the_private_server() {
+async fn a_chat_started_on_the_custom_claude_code_spends_on_the_custom_server() {
     let anthropic = start_server().await;
-    let private_server = start_server().await;
+    let custom_server = start_server().await;
     let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("private-model.json");
+    let file = dir.path().join("custom-model.json");
     std::fs::write(
         &file,
         format!(
             r#"{{"base_url":"{}","token":"llama-key","model":"gpt-oss-20b"}}"#,
-            private_server.uri()
+            custom_server.uri()
         ),
     )
     .unwrap();
 
     let proxy =
         AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::oauth("account-token"))).unwrap();
-    proxy.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&file))));
+    proxy.set_custom_upstream(Some(Arc::new(FileCustomUpstream::new(&file))));
 
-    // What `issue_start {"issue": "i-0028", "agent": "claude-code-private"}`
+    // What `issue_start {"issue": "i-0028", "agent": "claude-code-custom"}`
     // amounts to by the time it reaches the proxy: one environment, one
     // placeholder, minted for the upstream that agent names.
     let environment = "i-0028";
-    let placeholder = proxy.issue_placeholder_for(environment, agent(CLAUDE_CODE_PRIVATE).upstream);
+    let placeholder = proxy.issue_placeholder_for(environment, agent(CLAUDE_CODE_CUSTOM).upstream);
 
     let response = Client::builder(TokioExecutor::new())
         .build(HttpConnector::new())
@@ -149,19 +149,15 @@ async fn a_chat_started_on_the_private_claude_code_spends_on_the_private_server(
     assert_eq!(response.status(), StatusCode::OK);
     let _ = response.into_body().collect().await.unwrap();
 
-    assert_eq!(
-        private_server.hits(),
-        1,
-        "the turn went to the private model"
-    );
+    assert_eq!(custom_server.hits(), 1, "the turn went to the custom model");
     assert_eq!(anthropic.hits(), 0, "and nowhere near the API");
     assert_eq!(
-        private_server.header("x-api-key").as_deref(),
+        custom_server.header("x-api-key").as_deref(),
         Some("llama-key"),
-        "the private server's own key, in the header its file named"
+        "the custom endpoint's own key, in the header its file named"
     );
     assert_eq!(
-        private_server.header("authorization"),
+        custom_server.header("authorization"),
         None,
         "the account's token must not reach a host that is not Anthropic's"
     );
@@ -177,9 +173,9 @@ async fn a_chat_started_on_the_private_claude_code_spends_on_the_private_server(
 /// because somebody opened it as the agent that does.
 #[test]
 fn every_other_agent_stays_on_the_api() {
-    assert_eq!(agent(CLAUDE_CODE_PRIVATE).upstream, Route::Private);
+    assert_eq!(agent(CLAUDE_CODE_CUSTOM).upstream, Route::Custom);
     for spec in builtin_agents() {
-        if spec.id != CLAUDE_CODE_PRIVATE {
+        if spec.id != CLAUDE_CODE_CUSTOM {
             assert_eq!(spec.upstream, Route::Anthropic, "{}", spec.id);
         }
     }

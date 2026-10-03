@@ -27,7 +27,7 @@
 //! **Which upstream a spawn ends up on is the agent's.** The placeholder
 //! minted below is bound to an environment AND to the upstream the agent
 //! spec names (`AgentSpec::upstream`): "Claude Code" gets one for the API,
-//! "Claude Code (Private)" one for the user's own server, and the proxy
+//! "Claude Code (Custom)" one for the endpoint configured for the project, and the proxy
 //! reads the route off the placeholder per request. What the spawn carries
 //! is otherwise identical — same adapter, same home, same two variables —
 //! and no lost conversation.
@@ -42,22 +42,22 @@ use std::sync::{Arc, OnceLock};
 
 use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 
-/// The private upstream's vocabulary, re-exported for the app: `taste-app`
+/// The custom upstream's vocabulary, re-exported for the app: `taste-app`
 /// reaches the proxy through this module and depends on no other part of
 /// `taste-authproxy`.
 pub use taste_authproxy::{
-    stored_private_key, AccountProbe, CredentialKind, PrivateFacts, PrivateProbe, Route,
-    StoredCredential, StoredPrivateModel,
+    stored_custom_key, AccountProbe, CredentialKind, CustomFacts, CustomProbe, Route,
+    StoredCredential, StoredCustomModel,
 };
 
-use crate::registry::{AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
+use crate::registry::{AgentSpec, CLAUDE_CODE, CLAUDE_CODE_CUSTOM};
 
 /// Agents whose client honours `ANTHROPIC_BASE_URL`: both Claude Codes,
 /// which are one adapter handed placeholders for different hosts. Gemini
 /// and Copilot each have their own auth and their own provider; a proxy
 /// for them is separate machinery, and until it exists they keep their
 /// credentials.
-const PROXIED_AGENTS: &[&str] = &[CLAUDE_CODE, CLAUDE_CODE_PRIVATE];
+const PROXIED_AGENTS: &[&str] = &[CLAUDE_CODE, CLAUDE_CODE_CUSTOM];
 
 /// Whether a relocated spawn of this agent needs the in-container
 /// forwarder — i.e. whether [`spawn_env`] would give it a base URL that
@@ -91,7 +91,7 @@ static PROXY: OnceLock<Option<Handle>> = OnceLock::new();
 ///
 /// **The root is an argument because the credential is the project's.**
 /// Everything this proxy reads off disk — the Anthropic credential, the
-/// private model, the account's model listing — is keyed by it
+/// custom model, the account's model listing — is keyed by it
 /// (`taste_authproxy::credentials`), and nothing falls back to a
 /// machine-wide file, so authenticating one project never authenticates
 /// another. One process per folder means the root is known once, here,
@@ -153,10 +153,10 @@ pub fn start(
                     // drop-down has a row to put in it; every read after
                     // that happens on the request path, where the file is
                     // re-read whenever it changes.
-                    handle.set_private_upstream(
-                        taste_authproxy::private::discover(workspace_root).map(std::sync::Arc::new),
+                    handle.set_custom_upstream(
+                        taste_authproxy::custom::discover(workspace_root).map(std::sync::Arc::new),
                     );
-                    handle.warm_private_upstream();
+                    handle.warm_custom_upstream();
                     Some(handle)
                 }
                 Err(e) => {
@@ -184,37 +184,37 @@ pub fn handle() -> Option<&'static Handle> {
     PROXY.get().and_then(|proxy| proxy.as_ref())
 }
 
-/// The private model this project was provisioned with, if it was.
+/// The custom model this project was provisioned with, if it was.
 ///
 /// A pure read, safe from the GTK thread, and free of the server's key —
 /// what comes back is a label, an endpoint, and a context window, which is
 /// everything the settings row and the header need. `None` means no
-/// private model: a "Claude Code (Private)" chat can still be opened, and
+/// custom model: a "Claude Code (Custom)" chat can still be opened, and
 /// its settings row says what is missing, but its first request fails at
 /// the proxy rather than reaching anything.
-pub fn private_model() -> Option<PrivateFacts> {
-    handle()?.private_model()
+pub fn custom_model() -> Option<CustomFacts> {
+    handle()?.custom_model()
 }
 
-/// Store the private model the user configured, and make it what every
-/// "Claude Code (Private)" chat reaches from its next request on.
+/// Store the custom model the user configured, and make it what every
+/// "Claude Code (Custom)" chat reaches from its next request on.
 ///
 /// The write is project-scoped IDE state. Replacing the proxy's source with
 /// one already holding the value makes the facts readable at once — no
 /// restart of the IDE, the proxy, or any agent session; the placeholders
-/// those sessions hold were minted for the private upstream, whatever is
+/// those sessions hold were minted for the custom upstream, whatever is
 /// behind it.
-pub async fn provision_private_model(
+pub async fn provision_custom_model(
     workspace_root: &std::path::Path,
-    stored: StoredPrivateModel,
-) -> anyhow::Result<PrivateFacts> {
-    let (stored, facts) = taste_authproxy::store_private_model(workspace_root, stored).await?;
-    let source = Arc::new(taste_authproxy::FilePrivateUpstream::provisioned(
-        taste_authproxy::private_model_path(workspace_root),
+    stored: StoredCustomModel,
+) -> anyhow::Result<CustomFacts> {
+    let (stored, facts) = taste_authproxy::store_custom_model(workspace_root, stored).await?;
+    let source = Arc::new(taste_authproxy::FileCustomUpstream::provisioned(
+        taste_authproxy::custom_model_path(workspace_root),
         &stored,
     )?);
     if let Some(handle) = handle() {
-        handle.set_private_upstream(Some(source));
+        handle.set_custom_upstream(Some(source));
     }
     Ok(facts)
 }
@@ -265,17 +265,17 @@ pub async fn stored_credential(workspace_root: &std::path::Path) -> Option<Store
     taste_authproxy::stored_credential(workspace_root).await
 }
 
-/// Speak to the private server once, the way an agent's turn would, and
-/// say what answered (`Handle::probe_private`). Must run on a tokio
+/// Speak to the custom endpoint once, the way an agent's turn would, and
+/// say what answered (`Handle::probe_custom`). Must run on a tokio
 /// runtime. Fails, naming the reason, when the proxy is off, nothing is
 /// provisioned, or the server refuses or does not answer.
-pub async fn test_private_model() -> anyhow::Result<PrivateProbe> {
+pub async fn test_custom_model() -> anyhow::Result<CustomProbe> {
     let handle = handle().ok_or_else(|| {
         anyhow::anyhow!(
             "the auth proxy is off (TASTE_AUTH_PROXY=0), so there is nothing to test through"
         )
     })?;
-    handle.probe_private().await
+    handle.probe_custom().await
 }
 
 /// What the user calls the identity this project is provisioned with —
@@ -322,7 +322,7 @@ pub fn set_models_listener(listener: impl Fn(Option<String>) + Send + Sync + 'st
 /// placeholder is minted against it, which is what makes the spend counters
 /// and `revoke` per environment rather than per process — and against the
 /// upstream the agent spec names, which is what makes "Claude Code
-/// (Private)" spend on the user's own server and nothing else.
+/// (Custom)" spend on the endpoint configured for the project and nothing else.
 ///
 /// The `ANTHROPIC_BASE_URL` here is the IDE's own loopback address, and it
 /// is correct for every topology but one: a relocated agent's container may
@@ -369,13 +369,54 @@ pub fn spawn_env(
             handle.issue_placeholder_for(environment, spec.upstream),
         ),
     ];
-    // The account's top tier is the account's: a private server serves
-    // the one model it loaded whatever the request names, so the row
-    // would be a choice with nothing behind it there.
-    if !spec.is_private() {
+    // The account's top tier is the account's, so it is no row on the
+    // custom endpoint; there, the model the settings name is every model
+    // Claude Code asks for.
+    if spec.is_custom() {
+        if let Some(model) = handle
+            .custom_model_for_spawn()
+            .and_then(|facts| facts.model)
+        {
+            env.extend(custom_model_env(&model));
+        }
+    } else {
         env.extend(top_tier_picker_row(handle.top_tier_model().as_ref()));
     }
     env
+}
+
+/// The custom endpoint's model as every name Claude Code sends, through
+/// its documented model variables: the main loop, each alias tier (the
+/// background calls go to the small one), and subagents. A server that
+/// loaded one model serves it whatever the name; a hosted provider routes
+/// by it and refuses a Claude name it does not serve.
+fn custom_model_env(model: &str) -> Vec<(String, String)> {
+    [
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    ]
+    .into_iter()
+    .map(|name| (name.to_string(), model.to_string()))
+    .collect()
+}
+
+/// The models the custom endpoint lists, for the settings form's chooser,
+/// asked with what the form holds — and with the key on file when the
+/// form's is blank, as a save would keep it. Must run on a tokio runtime.
+pub async fn list_custom_models(
+    workspace_root: &std::path::Path,
+    mut stored: StoredCustomModel,
+) -> anyhow::Result<Vec<String>> {
+    if stored.token.trim().is_empty() {
+        stored.token = taste_authproxy::stored_custom_key(workspace_root)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("enter the endpoint's key to list its models"))?;
+    }
+    taste_authproxy::list_custom_models(&stored).await
 }
 
 /// The one picker row the proxy costs the agent, given back.
@@ -453,6 +494,17 @@ mod tests {
     /// pane's slider reads the window off (`model_rank` finds the family in
     /// the value, so a full id ranks above Opus like the alias would).
     #[test]
+    fn the_custom_model_is_every_name_claude_code_sends() {
+        let env = custom_model_env("accounts/fireworks/models/glm-5p3");
+        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"ANTHROPIC_MODEL"));
+        assert!(names.contains(&"ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+        assert!(env
+            .iter()
+            .all(|(_, v)| v == "accounts/fireworks/models/glm-5p3"));
+    }
+
+    #[test]
     fn the_top_tier_row_is_claude_codes_own_custom_option() {
         let fable = taste_authproxy::ModelListing {
             id: "claude-fable-5-1".into(),
@@ -492,11 +544,11 @@ mod tests {
         // Whatever the gate says, only the agents whose provider the proxy
         // fronts get their env rewritten — and only they need the
         // in-container forwarder when they relocate. Both Claude Codes are
-        // in that set: the private one reaches its server through the
+        // in that set: the custom one reaches its server through the
         // proxy and nothing else, so a build that dropped it from the list
         // would spawn it against the API with the agent's own credential.
         assert!(PROXIED_AGENTS.contains(&CLAUDE_CODE));
-        assert!(PROXIED_AGENTS.contains(&CLAUDE_CODE_PRIVATE));
+        assert!(PROXIED_AGENTS.contains(&CLAUDE_CODE_CUSTOM));
         let root = std::path::Path::new("/work/project");
         for spec in builtin_agents() {
             if !PROXIED_AGENTS.contains(&spec.id.as_str()) {

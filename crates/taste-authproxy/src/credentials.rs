@@ -211,7 +211,7 @@ impl CredentialSource for StaticKey {
 /// Which of the two intended credentials the IDE was given.
 ///
 /// It doubles as the answer to "which header carries this key" for the
-/// private upstream ([`crate::private`]), where the words `api_key` and
+/// custom upstream ([`crate::custom`]), where the words `api_key` and
 /// `oauth_token` would be wrong about a llama.cpp server's key — hence the
 /// aliases, which are the same two headers under names that fit the other
 /// file.

@@ -3,7 +3,7 @@
 //!
 //! Both live in the workspace's IDE state directory
 //! (`taste_core::state::workspace_state_dir`), never the checkout, for the
-//! reason the private model's file gives: an agent that could write them
+//! reason the custom model's file gives: an agent that could write them
 //! could aim the IDE's own requests, and its GCP spend, wherever it liked.
 //! Neither is a secret by itself except the sign-in inside `gcloud/`,
 //! which is gcloud's own and is written by gcloud.

@@ -55,7 +55,7 @@ use agent_client_protocol::schema::v1::{
 /// agent process happens to be serving it right now.
 const DEFAULT_PERMISSION_MODE: &str = "auto";
 /// See `ChatPane::default_permission_mode`.
-const PRIVATE_DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
+const CUSTOM_DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
 
 /// A pasted essay should not become the transcript. Past either bound the
 /// box shows a clipped preview and a line that opens the whole thing in
@@ -665,6 +665,8 @@ pub struct ChatPane {
     /// (the proxy's wake-up count, ticking up on one line).
     keyed_notes: RefCell<HashMap<String, gtk::Label>>,
     client: RefCell<Option<AgentClient>>,
+    /// A probe filled the custom-model chooser; opening it asks nobody.
+    probe_posed_choices: Cell<bool>,
     pending_permission: RefCell<Option<PendingPermission>>,
     /// Requests that arrived while a card was already up, in arrival
     /// order. Each waits its turn rather than displacing the one on
@@ -703,12 +705,12 @@ pub struct ChatPane {
     /// (`TASTE_PROBE_CREDENTIAL`). `None` in every real run, where the
     /// answer comes from the proxy.
     probe_identity: RefCell<Option<String>>,
-    /// The private server's configuration, in the settings shade — shown
-    /// only while the agent is "Claude Code (Private)", because it is that
+    /// The custom endpoint's configuration, in the settings shade — shown
+    /// only while the agent is "Claude Code (Custom)", because it is that
     /// agent's one setting and nobody else's. Inline, not a dialog: it is
     /// a group of rows in the same shade as every other setting (David,
     /// 2026-09-16: "shouldn't require opening a modal").
-    private_form: PrivateForm,
+    custom_form: CustomForm,
     /// This project's Anthropic credential, in the same shade — shown on
     /// plain Claude Code, the agent that spends on it. The IDE-owned
     /// sign-in: a token pasted here is written to the project's own
@@ -1469,18 +1471,18 @@ fn context_limit_for(value: &str) -> u64 {
     }
 }
 
-/// The context window a "Claude Code (Private)" chat measures against: the
+/// The context window a "Claude Code (Custom)" chat measures against: the
 /// server's own, when the user recorded it (`llama-server -c`), because a
 /// 64k server must not get a gauge measuring it against Anthropic's 200k.
 /// A file that does not say, or no file yet, falls back to the ordinary
 /// assumption, which is the same guess every other value gets.
-fn private_context_limit(private: Option<&taste_acp::authproxy::PrivateFacts>) -> u64 {
-    private
+fn custom_context_limit(custom: Option<&taste_acp::authproxy::CustomFacts>) -> u64 {
+    custom
         .and_then(|facts| facts.context_tokens)
         .unwrap_or(200_000)
 }
 
-/// The private server's settings, as rows in the chat's settings shade.
+/// The custom endpoint's settings, as rows in the chat's settings shade.
 ///
 /// One group under the session controls — heading, a sentence of scope,
 /// and a boxed list — in the shape the shade's other groups wear, so it
@@ -1488,13 +1490,23 @@ fn private_context_limit(private: Option<&taste_acp::authproxy::PrivateFacts>) -
 /// key row is filled like the others, from the file, and what the user
 /// typed stays in it after a save (David, 2026-09-16: "Just leave it in
 /// the form"); a blank key on a save keeps the one on file
-/// (`taste_authproxy::private::store`).
-struct PrivateForm {
+/// (`taste_authproxy::custom::store`).
+struct CustomForm {
     group: gtk::Box,
     endpoint: adw::EntryRow,
     kind: adw::ComboRow,
     token: adw::PasswordEntryRow,
     model: adw::EntryRow,
+    /// The models the endpoint lists, asked for each time the chooser on
+    /// the Model row opens ([`ChatPane::list_custom_models`]): a filter
+    /// over a virtualized list, since a hosted provider lists hundreds.
+    choices: gtk::StringList,
+    /// The path every listed id shares (`accounts/fireworks/models/`),
+    /// said once above the list rather than on every row.
+    choices_prefix: Rc<RefCell<String>>,
+    chooser: gtk::Popover,
+    chooser_status: gtk::Label,
+    chooser_search: gtk::SearchEntry,
     context: adw::EntryRow,
     save: adw::ButtonRow,
     /// The verdict row: a traffic light in a square slot, and the sentence
@@ -1505,7 +1517,32 @@ struct PrivateForm {
     status_text: gtk::Label,
 }
 
-/// What the line under the private-model rows is saying, as a colour: the
+/// The leading path every id shares, up to and including its last `/`
+/// (`accounts/fireworks/models/`), or nothing when they share none or
+/// there is only one.
+fn shared_path(ids: &[String]) -> String {
+    let [first, rest @ ..] = ids else {
+        return String::new();
+    };
+    if rest.is_empty() {
+        return String::new();
+    }
+    let mut common = first.as_str();
+    for id in rest {
+        let length = common
+            .char_indices()
+            .zip(id.chars())
+            .take_while(|((_, a), b)| a == b)
+            .last()
+            .map_or(0, |((at, a), _)| at + a.len_utf8());
+        common = &common[..length];
+    }
+    common
+        .rfind('/')
+        .map_or(String::new(), |at| common[..=at].to_string())
+}
+
+/// What the line under the custom-model rows is saying, as a colour: the
 /// traffic light the environment rows already speak (`env-dot`), so a
 /// passed connection test is the same green as an environment that can
 /// work and a failed one the same red.
@@ -1533,10 +1570,10 @@ impl Verdict {
     }
 }
 
-impl PrivateForm {
+impl CustomForm {
     fn new() -> Self {
         let heading = gtk::Label::builder()
-            .label("Private model")
+            .label("Custom model")
             .css_classes(["dim-label", "caption-heading"])
             .xalign(0.0)
             .margin_start(8)
@@ -1545,8 +1582,9 @@ impl PrivateForm {
             .build();
         let scope = gtk::Label::builder()
             .label(
-                "The server this project's Claude Code (Private) chats run against. Stored in \
-                 the IDE's own state for this project, never in the checkout.",
+                "The endpoint this project's Claude Code (Custom) chats run against — your own \
+                 server or a hosted provider. Stored in the IDE's own state for this \
+                 project, never in the checkout.",
             )
             .css_classes(["caption", "dim-label"])
             .wrap(true)
@@ -1568,7 +1606,113 @@ impl PrivateForm {
             ]))
             .build();
         let token = adw::PasswordEntryRow::builder().title("API key").build();
-        let model = adw::EntryRow::builder().title("Model name").build();
+        let model = adw::EntryRow::builder().title("Model").build();
+        // The endpoint's own list, one click from the row, so a hosted
+        // provider's ids (`accounts/fireworks/models/glm-5p3`) are picked
+        // rather than typed (David, 2026-10-03: "Can you pull the model
+        // options down from Fireworks dynamically?"). The row stays a text
+        // field: a server that lists nothing is still named by hand.
+        let choices = gtk::StringList::new(&[]);
+        let filter = gtk::StringFilter::builder()
+            .expression(gtk::PropertyExpression::new(
+                gtk::StringObject::static_type(),
+                None::<gtk::Expression>,
+                "string",
+            ))
+            .match_mode(gtk::StringFilterMatchMode::Substring)
+            .ignore_case(true)
+            .build();
+        let filtered = gtk::FilterListModel::new(Some(choices.clone()), Some(filter.clone()));
+        let choices_prefix = Rc::new(RefCell::new(String::new()));
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let label = gtk::Label::builder()
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::Start)
+                .build();
+            item.set_child(Some(&label));
+        });
+        {
+            let prefix = choices_prefix.clone();
+            factory.connect_bind(move |_, item| {
+                let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let (Some(label), Some(id)) = (
+                    item.child().and_downcast::<gtk::Label>(),
+                    item.item().and_downcast::<gtk::StringObject>(),
+                ) else {
+                    return;
+                };
+                let id = id.string();
+                let shown = id.strip_prefix(prefix.borrow().as_str()).unwrap_or(&id);
+                label.set_label(shown);
+                label.set_tooltip_text(Some(&id));
+            });
+        }
+        let list = gtk::ListView::builder()
+            .model(&gtk::NoSelection::new(Some(filtered.clone())))
+            .factory(&factory)
+            .single_click_activate(true)
+            .css_classes(["navigation-sidebar"])
+            .build();
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&list)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .max_content_height(320)
+            .propagate_natural_height(true)
+            .build();
+        let chooser_search = gtk::SearchEntry::builder()
+            .placeholder_text("Filter models")
+            .build();
+        let chooser_status = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(44)
+            .xalign(0.0)
+            // The rows' own text inset (`navigation-sidebar`: the row's
+            // 6 and its label's 8, measured in the probe's dump), so the
+            // count reads as the list's heading.
+            .margin_start(14)
+            .build();
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .width_request(360)
+            .build();
+        content.append(&chooser_search);
+        content.append(&chooser_status);
+        content.append(&scroller);
+        let chooser = gtk::Popover::builder().child(&content).build();
+        // A probe target of its own: `window.custom-models`.
+        chooser.set_widget_name("custom-models");
+        let choose = gtk::MenuButton::builder()
+            .icon_name("view-list-bullet-symbolic")
+            .tooltip_text("Choose from the models the endpoint lists")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .popover(&chooser)
+            .build();
+        model.add_suffix(&choose);
+        {
+            let filter = filter.clone();
+            chooser_search.connect_search_changed(move |search| {
+                filter.set_search(Some(&search.text()));
+            });
+        }
+        {
+            let (model, chooser) = (model.clone(), chooser.clone());
+            list.connect_activate(move |_, position| {
+                if let Some(id) = filtered.item(position).and_downcast::<gtk::StringObject>() {
+                    model.set_text(&id.string());
+                    chooser.popdown();
+                }
+            });
+        }
         let context = adw::EntryRow::builder()
             .title("Context window (tokens)")
             .input_purpose(gtk::InputPurpose::Digits)
@@ -1648,6 +1792,11 @@ impl PrivateForm {
             kind,
             token,
             model,
+            choices,
+            choices_prefix,
+            chooser,
+            chooser_status,
+            chooser_search,
             context,
             save,
             status,
@@ -1667,10 +1816,10 @@ impl PrivateForm {
     /// followed it can Save without retyping what it told them to run.
     /// Only the rows the user has not touched: a half-typed form is not
     /// reset by the picker landing on this agent again.
-    fn fill(&self, facts: Option<&taste_acp::authproxy::PrivateFacts>) {
+    fn fill(&self, facts: Option<&taste_acp::authproxy::CustomFacts>) {
         match facts {
             Some(facts) => {
-                self.endpoint.set_text(&facts.endpoint);
+                self.endpoint.set_text(&facts.base_url);
                 self.kind.set_selected(match facts.kind {
                     taste_acp::authproxy::CredentialKind::OauthToken => 1,
                     _ => 0,
@@ -1684,15 +1833,9 @@ impl PrivateForm {
                 );
             }
             None => {
-                if self.model.text().is_empty() {
-                    self.model.set_text("gpt-oss-20b");
-                }
-                if self.context.text().is_empty() {
-                    self.context.set_text("65536");
-                }
                 self.say(
                     Verdict::Attention,
-                    "Not configured yet — enter the server's endpoint and key",
+                    "Not configured yet — enter the endpoint and its key, then choose a model",
                 );
             }
         }
@@ -1701,7 +1844,7 @@ impl PrivateForm {
     /// What the rows say, as the value to store — or the one sentence
     /// that stops it. A blank key is not that sentence: it means "keep
     /// the stored one", and the store says so if there is none.
-    fn read(&self) -> Result<taste_acp::authproxy::StoredPrivateModel, String> {
+    fn read(&self) -> Result<taste_acp::authproxy::StoredCustomModel, String> {
         let base_url = self.endpoint.text().trim().to_string();
         if base_url.is_empty() {
             return Err("Enter the server's endpoint, such as http://tower.lan:9931.".into());
@@ -1714,7 +1857,7 @@ impl PrivateForm {
             },
         };
         let model = self.model.text().trim().to_string();
-        Ok(taste_acp::authproxy::StoredPrivateModel {
+        Ok(taste_acp::authproxy::StoredCustomModel {
             base_url,
             kind: if self.kind.selected() == 1 {
                 taste_acp::authproxy::CredentialKind::OauthToken
@@ -1740,6 +1883,31 @@ impl PrivateForm {
 
     fn hush(&self) {
         self.status.set_visible(false);
+    }
+
+    /// Fill the chooser with what the endpoint listed, the filter cleared.
+    fn show_choices(&self, ids: &[String]) {
+        let prefix = shared_path(ids);
+        *self.choices_prefix.borrow_mut() = prefix.clone();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        self.choices.splice(0, self.choices.n_items(), &ids);
+        self.chooser_search.set_text("");
+        let count = match ids.len() {
+            1 => "1 model".to_string(),
+            n => format!("{n} models"),
+        };
+        self.chooser_status.set_label(&if prefix.is_empty() {
+            count
+        } else {
+            format!("{count} in {prefix}")
+        });
+    }
+
+    /// Say why the chooser has nothing to choose from, or that it is
+    /// asking.
+    fn chooser_says(&self, text: &str) {
+        self.choices.splice(0, self.choices.n_items(), &[]);
+        self.chooser_status.set_label(text);
     }
 }
 
@@ -1831,7 +1999,7 @@ impl CredentialForm {
         ] {
             list.append(&row);
         }
-        // The verdict line, built as the private model's is: a light in a
+        // The verdict line, built as the custom model's is: a light in a
         // square slot, the sentence in the wide column beside it.
         let status_dot = gtk::Box::builder().css_classes(["env-dot", "off"]).build();
         let status_slot = crate::filetree::leading_slot(&status_dot);
@@ -2021,7 +2189,7 @@ fn find_setup_token(text: &str) -> Option<String> {
     found
 }
 
-/// "Saved · …" as it reads after "private model ": the form's sentence and
+/// "Saved · …" as it reads after "custom model ": the form's sentence and
 /// the transcript's are one sentence, cased for where each sits.
 fn lowercase_first(text: &str) -> String {
     let mut chars = text.chars();
@@ -2029,30 +2197,6 @@ fn lowercase_first(text: &str) -> String {
         Some(first) => first.to_lowercase().chain(chars).collect(),
         None => String::new(),
     }
-}
-
-/// What a persisted chat from before the agent split meant, said in the
-/// terms after it.
-///
-/// The private model used to be a row in the model drop-down, remembered
-/// as the model value `private` on a plain Claude Code chat. That chat is
-/// a "Claude Code (Private)" chat now — and it has to come back as one,
-/// because the alternative is a conversation the user deliberately put on
-/// their own hardware, restored onto their paid account without a word.
-/// The value itself is dropped: it was never a model, and the private
-/// variant takes none.
-fn migrate_private_entry(mut entry: taste_core::state::ChatEntry) -> taste_core::state::ChatEntry {
-    const OLD_PRIVATE_VALUE: &str = "private";
-    if entry.model_value.as_deref() == Some(OLD_PRIVATE_VALUE) {
-        if matches!(
-            entry.agent_id.as_deref(),
-            None | Some(taste_acp::CLAUDE_CODE)
-        ) {
-            entry.agent_id = Some(taste_acp::CLAUDE_CODE_PRIVATE.to_string());
-        }
-        entry.model_value = None;
-    }
-    entry
 }
 
 impl ChatPane {
@@ -2121,13 +2265,13 @@ impl ChatPane {
             .title("New Session")
             .start_icon_name("view-refresh-symbolic")
             .build();
-        // The private server's settings, for the one agent that spends on
+        // The custom endpoint's settings, for the one agent that spends on
         // it — a group of its own below this list, shown on that agent
         // only (`sync_upstream_mark`): on plain Claude Code it would be a
         // setting for a thing this chat is not doing.
-        let private_form = PrivateForm::new();
+        let custom_form = CustomForm::new();
         // ...and the account's credential, for the other agent: shown on
-        // plain Claude Code, hidden on the private one, whose turns never
+        // plain Claude Code, hidden on the custom one, whose turns never
         // carry it.
         let credential_form = CredentialForm::new();
         // The designation. A switch, because the role is a state one chat
@@ -2589,10 +2733,10 @@ impl ChatPane {
         // that measures it (i-0036).
         //
         // **It REPLACES "Plan" rather than joining it**, exactly as
-        // "Private" below replaces both. This slot holds one caption, and
+        // "Custom" below replaces both. This slot holds one caption, and
         // its three states are the three true answers to "whose pool is
         // this": the account's ("Plan"), a named account of yours
-        // ("work"), and not the account at all ("Private"). "Plan · work"
+        // ("work"), and not the account at all ("Custom"). "Plan · work"
         // was tried first and measured: at 1440x900 with the divider where
         // it sits by default the chat pane is about 410 wide, which is not
         // two captions wide, so the frame read "Plan · wo…" — the common
@@ -2629,10 +2773,10 @@ impl ChatPane {
         quota_box.append(&quota_identity);
         quota_box.append(&quota_bar);
         // ...and the third state of that slot: this chat is not on
-        // Anthropic at all. A turn against the user's own hardware must
+        // Anthropic at all. A turn against the custom endpoint must
         // not look like a turn against the API, and the account's gauge is
         // exactly the thing that would make it look like one — so on
-        // "Claude Code (Private)" the marked gauge goes and nothing takes
+        // "Claude Code (Custom)" the marked gauge goes and nothing takes
         // its place, because the identity at the row's start already says
         // which agent this is (`sync_upstream_mark`).
         //
@@ -2657,8 +2801,8 @@ impl ChatPane {
         let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         usage_box.set_margin_start(6);
         usage_box.append(&usage_bar);
-        // On "Claude Code (Private)" the gauge is hidden and nothing
-        // takes its place: the identity beside it already says "Private",
+        // On "Claude Code (Custom)" the gauge is hidden and nothing
+        // takes its place: the identity beside it already says "Custom",
         // and the subscription is a pool that chat is not drawing on
         // (`sync_upstream_mark`).
         usage_box.append(&quota_box);
@@ -2871,7 +3015,7 @@ impl ChatPane {
         let controls_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         controls_column.append(&session_list);
         controls_column.append(&credential_form.group);
-        controls_column.append(&private_form.group);
+        controls_column.append(&custom_form.group);
         controls_column.append(&standing_group);
         controls_column.append(&controls);
         controls_column.append(&auth_box);
@@ -3107,6 +3251,7 @@ impl ChatPane {
             on_open_document: RefCell::new(None),
             on_focus_composer: RefCell::new(None),
             client: RefCell::new(None),
+            probe_posed_choices: Cell::new(false),
             pending_permission: RefCell::new(None),
             permission_queue: RefCell::new(std::collections::VecDeque::new()),
             pending_marks: RefCell::new(HashMap::new()),
@@ -3118,7 +3263,7 @@ impl ChatPane {
             quota_label: quota_label.clone(),
             quota_identity: quota_identity.clone(),
             probe_identity: RefCell::new(None),
-            private_form,
+            custom_form,
             credential_form,
             issues,
             quota_bar,
@@ -3413,9 +3558,17 @@ impl ChatPane {
         });
         {
             let weak = Rc::downgrade(&pane);
-            pane.private_form.save.connect_activated(move |_| {
+            pane.custom_form.save.connect_activated(move |_| {
                 if let Some(pane) = weak.upgrade() {
-                    pane.save_private_model();
+                    pane.save_custom_model();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&pane);
+            pane.custom_form.chooser.connect_show(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.list_custom_models();
                 }
             });
         }
@@ -3607,12 +3760,12 @@ impl ChatPane {
                 self.environment
             )
         };
-        // The private variant says where its turns go, since the header
+        // The custom variant says where its turns go, since the header
         // has no gauge to say what they are NOT drawing on.
-        if self.on_private_upstream() {
-            let detail = taste_acp::authproxy::private_model()
+        if self.on_custom_upstream() {
+            let detail = taste_acp::authproxy::custom_model()
                 .map(|facts| facts.describe())
-                .unwrap_or_else(|| "a private server not yet configured".to_string());
+                .unwrap_or_else(|| "a custom endpoint not yet configured".to_string());
             tooltip.push_str(&format!(
                 ". Its turns go to {detail}, nowhere near Anthropic, and draw on none of \
                  the subscription — so the account's gauge is not shown for it."
@@ -3868,25 +4021,58 @@ impl ChatPane {
         self.model_refused.borrow_mut().take();
     }
 
-    /// Write what the private-model rows say, off this thread, and say
+    /// Write what the custom-model rows say, off this thread, and say
     /// how it went under them.
     ///
     /// The key leaves the form for project-scoped IDE state and nowhere
     /// else; GTK gets back only the non-secret facts, which is what the
-    /// rows are refilled from. Every live "Claude Code (Private)" chat is
+    /// rows are refilled from. Every live "Claude Code (Custom)" chat is
     /// on the new value from its next request — their placeholders were
-    /// minted for the private upstream, whatever is behind it.
-    fn save_private_model(self: &Rc<Self>) {
-        let stored = match self.private_form.read() {
+    /// minted for the custom upstream, whatever is behind it.
+    /// Ask the endpoint the form names which models it serves, with the
+    /// key the form holds (or the saved one), and fill the chooser — off
+    /// this thread, as every request is.
+    fn list_custom_models(self: &Rc<Self>) {
+        if self.probe_posed_choices.get() {
+            return;
+        }
+        let stored = match self.custom_form.read() {
             Ok(stored) => stored,
             Err(why) => {
-                self.private_form.say(Verdict::Fail, &why);
+                self.custom_form.chooser_says(&why);
+                return;
+            }
+        };
+        self.custom_form
+            .chooser_says(&format!("Asking {} for its models…", stored.base_url));
+        let root = self.workspace.root().to_path_buf();
+        let ask = crate::runtime::runtime()
+            .spawn(async move { taste_acp::authproxy::list_custom_models(&root, stored).await });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = match ask.await {
+                Ok(result) => result,
+                Err(join) => Err(anyhow::anyhow!("the request did not finish: {join}")),
+            };
+            let Some(pane) = weak.upgrade() else { return };
+            match result {
+                Ok(ids) => pane.custom_form.show_choices(&ids),
+                Err(error) => pane.custom_form.chooser_says(&format!("{error:#}")),
+            }
+        });
+    }
+
+    fn save_custom_model(self: &Rc<Self>) {
+        let stored = match self.custom_form.read() {
+            Ok(stored) => stored,
+            Err(why) => {
+                self.custom_form.say(Verdict::Fail, &why);
                 return;
             }
         };
         let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
-        self.private_form.save.set_sensitive(false);
+        self.custom_form.save.set_sensitive(false);
         // The write is tokio's (`tokio::fs`), so it runs on the app's
         // runtime and only its outcome comes back to this thread: awaited
         // here directly, it panicked with "there is no reactor running",
@@ -3894,13 +4080,17 @@ impl ChatPane {
         // Then the test, on the same task: one request to what was just
         // saved, so what is reported is the setting as the proxy now holds
         // it rather than the form's idea of it.
-        self.private_form.say(
+        self.custom_form.say(
             Verdict::Pending,
             "Saving, then asking the server for one word…",
         );
+        // The model is set into the agent's environment at its spawn
+        // (`taste_acp::authproxy::spawn_env`), so a running agent keeps
+        // asking for the old one until it is spawned again.
+        let model_before = taste_acp::authproxy::custom_model().and_then(|facts| facts.model);
         let write = crate::runtime::runtime().spawn(async move {
-            let facts = taste_acp::authproxy::provision_private_model(&root, stored).await?;
-            let probe = taste_acp::authproxy::test_private_model().await;
+            let facts = taste_acp::authproxy::provision_custom_model(&root, stored).await?;
+            let probe = taste_acp::authproxy::test_custom_model().await;
             Ok::<_, anyhow::Error>((facts, probe))
         });
         glib::spawn_future_local(async move {
@@ -3909,7 +4099,15 @@ impl ChatPane {
                 Err(join) => Err(anyhow::anyhow!("the save did not finish: {join}")),
             };
             let Some(pane) = weak.upgrade() else { return };
-            pane.private_form.save.set_sensitive(true);
+            pane.custom_form.save.set_sensitive(true);
+            if let Ok((facts, _)) = &result {
+                if facts.model != model_before && pane.client.borrow().is_some() {
+                    pane.respawn_keeping_conversation(&format!(
+                        "the custom model is now {}",
+                        facts.model.as_deref().unwrap_or("the endpoint's default")
+                    ));
+                }
+            }
             match result {
                 Ok((facts, probe)) => {
                     // The key stays in its row as typed: clearing it read
@@ -3928,22 +4126,22 @@ impl ChatPane {
                                 facts.endpoint,
                                 probe.elapsed.as_secs_f64()
                             );
-                            pane.private_form.say(Verdict::Pass, &verdict);
-                            pane.note(&format!("private model {}", lowercase_first(&verdict)));
+                            pane.custom_form.say(Verdict::Pass, &verdict);
+                            pane.note(&format!("custom model {}", lowercase_first(&verdict)));
                         }
                         Err(error) => {
                             let verdict = format!(
                                 "Saved, but the server did not answer: {error:#}. Turns to \
                                  this chat will fail the same way until it does."
                             );
-                            pane.private_form.say(Verdict::Fail, &verdict);
-                            pane.note(&format!("private model {}", lowercase_first(&verdict)));
+                            pane.custom_form.say(Verdict::Fail, &verdict);
+                            pane.note(&format!("custom model {}", lowercase_first(&verdict)));
                         }
                     }
                 }
-                Err(error) => pane.private_form.say(
+                Err(error) => pane.custom_form.say(
                     Verdict::Fail,
-                    &format!("Couldn't save the private model: {error:#}"),
+                    &format!("Couldn't save the custom model: {error:#}"),
                 ),
             }
         });
@@ -3955,7 +4153,7 @@ impl ChatPane {
     /// rows the user has not started on.
     fn sync_credential_form(self: &Rc<Self>) {
         let spec = self.agent_spec();
-        let shown = taste_acp::authproxy::proxies(&spec) && !spec.is_private();
+        let shown = taste_acp::authproxy::proxies(&spec) && !spec.is_custom();
         self.credential_form.group.set_visible(shown);
         if !shown {
             return;
@@ -3981,7 +4179,7 @@ impl ChatPane {
     /// rows AND the listing that brings the top tier into every Claude
     /// Code picker here, through the same respawn a listing read after a
     /// turn causes (`on_models_refreshed`). Off this thread, for the same
-    /// reason as the private model's save.
+    /// reason as the custom model's save.
     fn save_credential(self: &Rc<Self>) {
         let stored = match self.credential_form.read() {
             Ok(stored) => stored,
@@ -4140,59 +4338,58 @@ impl ChatPane {
         agents[index].clone()
     }
 
-    /// Whether this chat is "Claude Code (Private)": the same agent,
-    /// spending on the user's own server (`taste_acp::AgentSpec::upstream`).
+    /// Whether this chat is "Claude Code (Custom)": the same agent,
+    /// spending on the endpoint configured for the project (`taste_acp::AgentSpec::upstream`).
     /// A fact about the picker rather than a flag kept beside it, so it
     /// cannot disagree with the agent the next spawn will be.
-    fn on_private_upstream(&self) -> bool {
-        self.agent_spec().is_private()
+    fn on_custom_upstream(&self) -> bool {
+        self.agent_spec().is_custom()
     }
 
     /// Say which upstream this chat spends on, everywhere it shows: the
-    /// settings shade's private-model row, the header's gauge, and the
+    /// settings shade's custom-model row, the header's gauge, and the
     /// context window the gauge beside it measures against.
     ///
-    /// On "Claude Code (Private)" the account's gauge is not dimmed or
+    /// On "Claude Code (Custom)" the account's gauge is not dimmed or
     /// zeroed — it is hidden, because there is no subscription figure to
     /// report for a conversation that is not drawing on one, and the
-    /// identity beside it already says which agent this is. The private
+    /// identity beside it already says which agent this is. The custom
     /// group appears, its rows filled from what is on file, or saying
     /// nothing is yet. On every other agent the group is hidden and
     /// `draw_quota_gauge` puts the account's gauge back. Called whenever
-    /// the picker moves, and after the private model is saved.
+    /// the picker moves, and after the custom model is saved.
     fn sync_upstream_mark(self: &Rc<Self>) {
-        let private = self.on_private_upstream();
-        self.private_form.group.set_visible(private);
+        let custom = self.on_custom_upstream();
+        self.custom_form.group.set_visible(custom);
         self.sync_credential_form();
-        if !private {
+        if !custom {
             self.draw_quota_gauge();
             return;
         }
-        let facts = taste_acp::authproxy::private_model();
-        self.private_form.hush();
-        self.private_form.fill(facts.as_ref());
+        let facts = taste_acp::authproxy::custom_model();
+        self.custom_form.hush();
+        self.custom_form.fill(facts.as_ref());
         // The key too, from the file, so the form shows the whole of what
         // is stored rather than every row but one. Off this thread, and
         // only into an empty row: a key being typed is not overwritten by
         // the one it is replacing.
-        if facts.is_some() && self.private_form.token.text().is_empty() {
+        if facts.is_some() && self.custom_form.token.text().is_empty() {
             let root = self.workspace.root().to_path_buf();
             let read = crate::runtime::runtime()
-                .spawn(async move { taste_acp::authproxy::stored_private_key(&root).await });
+                .spawn(async move { taste_acp::authproxy::stored_custom_key(&root).await });
             let weak = Rc::downgrade(self);
             glib::spawn_future_local(async move {
                 let Ok(Some(key)) = read.await else { return };
                 let Some(pane) = weak.upgrade() else { return };
-                if pane.private_form.token.text().is_empty() {
-                    pane.private_form.token.set_text(&key);
+                if pane.custom_form.token.text().is_empty() {
+                    pane.custom_form.token.set_text(&key);
                 }
             });
         }
         // The session may already have reported its real window
         // (`context_limit` is overwritten by the session's own figure), but
-        // a private server reports nothing, so the file is the only source.
-        self.context_limit
-            .set(private_context_limit(facts.as_ref()));
+        // a custom endpoint reports nothing, so the file is the only source.
+        self.context_limit.set(custom_context_limit(facts.as_ref()));
         self.quota_box.set_visible(false);
         self.set_context_gauge(self.context_used.get(), None);
     }
@@ -5133,7 +5330,7 @@ impl ChatPane {
     /// freshen the list once authorized to connect to Claude Code").
     ///
     /// Nothing happens for a pane with no process (its next spawn reads
-    /// the listing fresh), a private pane (its picker takes no row), or a
+    /// the listing fresh), a custom pane (its picker takes no row), or a
     /// pane whose spawn already had this row. A turn in flight is not
     /// interrupted for a picker: the respawn waits for it to end.
     pub fn on_models_refreshed(self: &Rc<Self>) {
@@ -5141,7 +5338,7 @@ impl ChatPane {
             return;
         }
         let spec = self.agent_spec();
-        if !taste_acp::authproxy::proxies(&spec) || spec.is_private() {
+        if !taste_acp::authproxy::proxies(&spec) || spec.is_custom() {
             return;
         }
         let now = taste_acp::authproxy::top_tier_model_id();
@@ -5287,7 +5484,7 @@ impl ChatPane {
     /// labels, not five agent processes; the conversation comes back when
     /// the user opens the tab, through exactly today's `ensure_client`.
     pub fn arm_from_entry(&self, entry: &taste_core::state::ChatEntry) {
-        let entry = migrate_private_entry(entry.clone());
+        let entry = entry.clone();
         if let Some(agent_id) = &entry.agent_id {
             let agents = builtin_agents();
             if let Some(index) = agents.iter().position(|a| a.id == *agent_id) {
@@ -5418,7 +5615,7 @@ impl ChatPane {
     /// world of its own if it wants one.
     pub fn inherit_settings(&self, from: &ChatPane) {
         // The agent is part of "same setup", and the upstream rides on it:
-        // a tab opened beside a "Claude Code (Private)" one is the private
+        // a tab opened beside a "Claude Code (Custom)" one is the custom
         // one too, and its own spawn mints its own placeholder for it.
         *self.model_value.borrow_mut() = from.model_value.borrow().clone();
         *self.permission_mode.borrow_mut() = from.permission_mode.borrow().clone();
@@ -5629,11 +5826,11 @@ impl ChatPane {
     /// "nothing spent"; nothing has been *asked* of the account yet, and
     /// only one of those is reassuring.
     fn draw_quota_gauge(self: &Rc<Self>) {
-        // ...and not at all while this chat is Claude Code (Private): the
+        // ...and not at all while this chat is Claude Code (Custom): the
         // subscription is a pool this conversation is not drawing on, and
         // the identity beside the slot already says so
         // (`sync_upstream_mark`).
-        if self.on_private_upstream() {
+        if self.on_custom_upstream() {
             self.quota_box.set_visible(false);
             return;
         }
@@ -5822,12 +6019,12 @@ impl ChatPane {
         // account's windows are the account's whatever one chat is doing,
         // and the fleet's breakdown below includes environments that ARE
         // spending — but a Subscription heading under a header reading
-        // "Claude Code (Private)" has to account for itself, or the tab
+        // "Claude Code (Custom)" has to account for itself, or the tab
         // quietly contradicts the row above it.
-        if self.on_private_upstream() {
+        if self.on_custom_upstream() {
             row(
                 "Not this conversation",
-                "This chat is Claude Code (Private), running against your own server, so \
+                "This chat is Claude Code (Custom), running against the endpoint configured for this project, so \
                  its turns draw on none of the windows below. They are the account's, \
                  which the rest of the fleet and your own Claude use still spend out of.",
             );
@@ -9101,14 +9298,14 @@ impl ChatPane {
         // surface mid-session (`ConfigOptionUpdate`), and both arrivals
         // come through this one function.
         //
-        // "Claude Code (Private)" advertises none, whatever the adapter
+        // "Claude Code (Custom)" advertises none, whatever the adapter
         // says: the server behind it serves the one model it loaded
         // whatever name the request carries, so a model row there would be
         // a choice with nothing behind it. What it has instead is the
         // server's configuration, in the shade's own group
-        // (`PrivateForm`).
-        let private = self.on_private_upstream();
-        *self.advertised_models.borrow_mut() = if private {
+        // (`CustomForm`).
+        let custom = self.on_custom_upstream();
+        *self.advertised_models.borrow_mut() = if custom {
             None
         } else {
             model_choices(&config_options)
@@ -9120,9 +9317,9 @@ impl ChatPane {
         if self.advertised_models.borrow().is_none() {
             let wanted = self.model_value.borrow_mut().take();
             if let Some(wanted) = wanted {
-                self.note(&if private {
+                self.note(&if custom {
                     format!(
-                        "{} runs whatever model the private server loaded, so {wanted:?} \
+                        "{} runs whatever model the custom endpoint loaded, so {wanted:?} \
                          was not set",
                         self.agent_name()
                     )
@@ -9260,10 +9457,10 @@ impl ChatPane {
                         continue;
                     }
                     if option.id.to_string().eq_ignore_ascii_case("model") {
-                        // Not on the private variant — see `advertised_models`
+                        // Not on the custom variant — see `advertised_models`
                         // above: the server serves what it loaded, and the
                         // shade shows that instead.
-                        if !private {
+                        if !custom {
                             self.build_model_controls(&option, &choices, &current_value);
                         }
                         continue;
@@ -9378,20 +9575,20 @@ impl ChatPane {
     }
 
     /// The mode a chat starts in before the user picks one. Auto for the
-    /// account's agents; Accept edits for the private one, because auto
+    /// account's agents; Accept edits for the custom one, because auto
     /// mode asks a SECOND model to judge every tool call, and on the
-    /// private route that second model is the same small local server the
+    /// custom route that second model is the same small local server the
     /// turn is running on — a long prompt it has never seen, prefilled from
     /// scratch, for every Write and Bash. The reviewer's own timeout gave
     /// up on it, the call was refused as unjudgeable, and the agent
     /// reported "the environment doesn't allow shell execution" (David,
-    /// 2026-09-16: "Why is the Claude Code (Private) chat attempting to use
-    /// Opus for a permissions check?"). Accept edits lets edits through
+    /// 2026-09-16, asking why a chat on this route was using Opus for a
+    /// permissions check). Accept edits lets edits through
     /// and asks the user about commands, with no second model in the loop.
     /// The Permissions row keeps the user's own choice per chat, as ever.
     fn default_permission_mode(&self) -> &'static str {
-        if self.on_private_upstream() {
-            PRIVATE_DEFAULT_PERMISSION_MODE
+        if self.on_custom_upstream() {
+            CUSTOM_DEFAULT_PERMISSION_MODE
         } else {
             DEFAULT_PERMISSION_MODE
         }
@@ -9575,7 +9772,7 @@ impl ChatPane {
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         // The section's heading, over the permissions AND the model rows
         // below it: one group, "Model and security", the way the account
-        // and the private model each have theirs (David, 2026-09-16). The
+        // and the custom model each have theirs (David, 2026-09-16). The
         // mode itself is a labelled row — "Permissions" beside its value,
         // as "Model" sits beside its own — rather than the bare dropdown
         // under a caption it once was: the caption said what the value was
@@ -9593,11 +9790,11 @@ impl ChatPane {
             .title("Permissions")
             .model(&gtk::StringList::new(&name_refs))
             .build();
-        if self.on_private_upstream() {
+        if self.on_custom_upstream() {
             // Said where the choice is made: why Auto is not this chat's
             // default, so a user who picks it anyway knows the cost.
             dropdown.set_subtitle(
-                "Auto asks a second model about every action — on a private server, the \
+                "Auto asks a second model about every action — on a custom endpoint, the \
                  same small model, prefilling a new prompt each time",
             );
         }
@@ -11271,17 +11468,47 @@ impl ChatPane {
         self.refresh_usage();
     }
 
-    /// `TASTE_PROBE_PRIVATE=1`: pose this chat as Claude Code (Private).
+    /// `TASTE_PROBE_CUSTOM=1`: pose this chat as Claude Code (Custom).
     ///
     /// The header and the settings shade are the surfaces that say a turn
     /// is not going to Anthropic, and the state they say it in is one no
     /// screenshot can reach otherwise — it needs a provisioned
-    /// private-model file and a server at the other end of it. This goes
+    /// custom-model file and a server at the other end of it. This goes
     /// through the real [`ChatPane::set_agent_id`], so what the frame shows
     /// is the rendering the running app would do for that agent, with no
     /// file behind it: the row says so.
-    pub fn seed_private_upstream_for_probe(&self) {
-        self.set_agent_id(taste_acp::CLAUDE_CODE_PRIVATE);
+    pub fn seed_custom_upstream_for_probe(&self) {
+        self.set_agent_id(taste_acp::CLAUDE_CODE_CUSTOM);
+    }
+
+    /// `TASTE_PROBE_CUSTOM=models`: the Model row's chooser open on a
+    /// hosted provider's list, which otherwise needs a provisioned key
+    /// and the provider answering. The ids are Fireworks' shape; nothing
+    /// is asked of anyone.
+    pub fn pose_custom_models_for_probe(&self) {
+        self.probe_posed_choices.set(true);
+        self.custom_form
+            .endpoint
+            .set_text("https://api.fireworks.ai/inference");
+        self.custom_form
+            .model
+            .set_text("accounts/fireworks/models/glm-5p3");
+        let ids: Vec<String> = [
+            "deepseek-v3p2",
+            "glm-5p2",
+            "glm-5p3",
+            "gpt-oss-120b",
+            "gpt-oss-20b",
+            "kimi-k2p6-instruct",
+            "llama4-maverick-instruct-basic",
+            "qwen3p5-coder-480b-a35b-instruct",
+            "qwen3p5-235b-a22b-thinking",
+        ]
+        .iter()
+        .map(|id| format!("accounts/fireworks/models/{id}"))
+        .collect();
+        self.custom_form.show_choices(&ids);
+        self.custom_form.chooser.popup();
     }
 
     /// `TASTE_PROBE_CREDENTIAL=work`: pose this project as provisioned
@@ -14280,9 +14507,26 @@ mod tests {
         assert_eq!(context_limit_for("gpt-5.6-terra"), 200_000);
     }
 
-    fn private_fixture(context: Option<u64>) -> taste_acp::authproxy::PrivateFacts {
-        taste_acp::authproxy::PrivateFacts {
+    #[test]
+    fn a_listings_shared_path_is_said_once() {
+        let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::shared_path(&ids(&[
+                "accounts/fireworks/models/glm-5p3",
+                "accounts/fireworks/models/gpt-oss-20b",
+            ])),
+            "accounts/fireworks/models/"
+        );
+        // Only whole path segments: "glm-5p" is not a prefix to strip.
+        assert_eq!(super::shared_path(&ids(&["glm-5p2", "glm-5p3"])), "");
+        assert_eq!(super::shared_path(&ids(&["a/b/c"])), "");
+        assert_eq!(super::shared_path(&[]), "");
+    }
+
+    fn custom_fixture(context: Option<u64>) -> taste_acp::authproxy::CustomFacts {
+        taste_acp::authproxy::CustomFacts {
             endpoint: "http://tower.lan:9931".into(),
+            base_url: "http://tower.lan:9931".into(),
             kind: taste_acp::authproxy::CredentialKind::ApiKey,
             model: Some("gpt-oss-20b".into()),
             label: "gpt-oss-20b".into(),
@@ -14294,47 +14538,13 @@ mod tests {
     /// 200k, and a file that does not say gets the same assumption every
     /// other value gets.
     #[test]
-    fn the_private_variants_window_is_the_servers_own() {
+    fn the_custom_variants_window_is_the_servers_own() {
         assert_eq!(
-            private_context_limit(Some(&private_fixture(Some(65_536)))),
+            custom_context_limit(Some(&custom_fixture(Some(65_536)))),
             65_536
         );
-        assert_eq!(private_context_limit(Some(&private_fixture(None))), 200_000);
-        assert_eq!(private_context_limit(None), 200_000);
-    }
-
-    /// A chat that was on the private model before it became an agent of
-    /// its own comes back as that agent, never as plain Claude Code on the
-    /// user's paid account.
-    #[test]
-    fn a_chat_remembered_on_the_old_private_row_restores_as_the_private_agent() {
-        let entry = |agent: Option<&str>, model: Option<&str>| taste_core::state::ChatEntry {
-            agent_id: agent.map(str::to_string),
-            model_value: model.map(str::to_string),
-            ..taste_core::state::ChatEntry::default()
-        };
-        let moved = migrate_private_entry(entry(Some(taste_acp::CLAUDE_CODE), Some("private")));
-        assert_eq!(
-            moved.agent_id.as_deref(),
-            Some(taste_acp::CLAUDE_CODE_PRIVATE)
-        );
-        assert_eq!(moved.model_value, None);
-        // An entry that never said which agent was Claude Code, the default.
-        let moved = migrate_private_entry(entry(None, Some("private")));
-        assert_eq!(
-            moved.agent_id.as_deref(),
-            Some(taste_acp::CLAUDE_CODE_PRIVATE)
-        );
-        // Every other remembered model is left exactly alone...
-        let kept = migrate_private_entry(entry(Some(taste_acp::CLAUDE_CODE), Some("opus[1m]")));
-        assert_eq!(kept.agent_id.as_deref(), Some(taste_acp::CLAUDE_CODE));
-        assert_eq!(kept.model_value.as_deref(), Some("opus[1m]"));
-        // ...and so is another agent's entry, whatever value it remembers:
-        // `private` was never a row in Copilot's list, so it is not a
-        // reason to change what agent that chat is.
-        let other = migrate_private_entry(entry(Some("copilot"), Some("private")));
-        assert_eq!(other.agent_id.as_deref(), Some("copilot"));
-        assert_eq!(other.model_value, None);
+        assert_eq!(custom_context_limit(Some(&custom_fixture(None))), 200_000);
+        assert_eq!(custom_context_limit(None), 200_000);
     }
 
     #[test]
