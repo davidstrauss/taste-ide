@@ -333,6 +333,28 @@ impl Gcp {
         }
     }
 
+    /// Delete a Cloud DNS policy. One still bound to a network cannot be,
+    /// so it is unbound first; one already gone is not an error.
+    pub async fn remove_dns_policy(&self, project: &str, name: &str) -> Result<()> {
+        let url = format!("{}/projects/{project}/policies/{name}", self.endpoints.dns);
+        match self
+            .call(
+                Method::PATCH,
+                &url,
+                Some(&serde_json::json!({ "networks": [] })),
+            )
+            .await
+        {
+            Err(e) if is_not_found(&e) => return Ok(()),
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
+        match self.call(Method::DELETE, &url, None).await {
+            Err(e) if !is_not_found(&e) => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     /// Which of `permissions` the identity holds on `project` — the
     /// preflight's question, asked by name before anything is created.
     pub async fn test_permissions(

@@ -1,7 +1,13 @@
-//! The GLM-5.3 machines: a staging VM that fetches the pinned weights,
-//! and a serving VM with no address, no way out, and one way in, IAP
+//! A model's machines: a staging VM that fetches the pinned weights, and a
+//! serving VM with no address, no way out, and one way in, IAP
 //! (ENVIRONMENTS → "A model on a cloud VM"; the evidence for every number
 //! here is `docs/spikes/glm-on-gcp.md`).
+//!
+//! Which model is a [`ModelSpec`]: GLM-5.3 is what the route is for, and
+//! [`GPT_OSS_20B`] is the small one the whole path is proved with first
+//! (David, 2026-10-03: "Let's start with a less ambitious model to test
+//! that things can work") — the same staging, the same lockdown, the same
+//! tunnel, at a twentieth of the disk and a cent of the time.
 //!
 //! The two live on separate networks because they need opposite DNS: the
 //! staging VM has to resolve Hugging Face, and the serving VM must resolve
@@ -22,6 +28,7 @@ use crate::rest::Gcp;
 /// One file of the pinned weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shard {
+    /// The file's name, which is also its name on the weights disk.
     pub file: &'static str,
     pub bytes: u64,
     /// Hex SHA-256, from the Hub's tree API at the pinned commit.
@@ -37,7 +44,9 @@ pub struct Shard {
 pub struct Weights {
     pub repo: &'static str,
     pub commit: &'static str,
-    pub quant: &'static str,
+    /// The directory in the repository the shards are in; empty for the
+    /// repository's root.
+    pub dir: &'static str,
     pub shards: &'static [Shard],
 }
 
@@ -47,9 +56,14 @@ impl Weights {
     }
 
     pub fn url(&self, shard: &Shard) -> String {
+        let dir = if self.dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", self.dir)
+        };
         format!(
-            "https://huggingface.co/{}/resolve/{}/{}/{}",
-            self.repo, self.commit, self.quant, shard.file
+            "https://huggingface.co/{}/resolve/{}/{dir}{}",
+            self.repo, self.commit, shard.file
         )
     }
 }
@@ -58,7 +72,7 @@ impl Weights {
 pub const GLM_5_3_Q8_0: Weights = Weights {
     repo: "unsloth/GLM-5.3-GGUF",
     commit: "346b3591c7f28d1a23716f97a065ecf12ec14771",
-    quant: "Q8_0",
+    dir: "Q8_0",
     shards: &[
         Shard { file: "GLM-5.3-Q8_0-00001-of-00017.gguf", bytes: 48305489632, sha256: "7fe0aacb07c33f113aed536300da6fb7fb1cf09e6202d67b6c178a2b878f4644" },
         Shard { file: "GLM-5.3-Q8_0-00002-of-00017.gguf", bytes: 49105526048, sha256: "ccc253748f43c3167a3801ab2178cead3042f2248c4624297b95c5aa62180873" },
@@ -77,6 +91,19 @@ pub const GLM_5_3_Q8_0: Weights = Weights {
         Shard { file: "GLM-5.3-Q8_0-00015-of-00017.gguf", bytes: 48843319392, sha256: "f8601930e67ca579556041f59356ae1ba66d8c9cae11252c3a60048038d7e2e6" },
         Shard { file: "GLM-5.3-Q8_0-00016-of-00017.gguf", bytes: 49155939904, sha256: "6c9b48a9d49082fa8fc329edf59a1db4eb90ef58f7e9cfcc6d06ac204cf023a7" },
         Shard { file: "GLM-5.3-Q8_0-00017-of-00017.gguf", bytes: 17556349216, sha256: "79cd14a05a4c1b867e7d56bf1faaea2f7a88b1063fd992e4f9983a6168f42cdd" },
+    ],
+};
+
+/// The smoke test's weights: OpenAI's gpt-oss-20b in its native MXFP4,
+/// the model this project's private-model route was first proved against,
+/// so a working answer here is a known answer.
+#[rustfmt::skip]
+pub const GPT_OSS_20B_MXFP4: Weights = Weights {
+    repo: "ggml-org/gpt-oss-20b-GGUF",
+    commit: "ef9b12f2ff56c69cf32153a02784e7a3c88bf524",
+    dir: "",
+    shards: &[
+        Shard { file: "gpt-oss-20b-MXFP4.gguf", bytes: 12109566624, sha256: "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901" },
     ],
 };
 
@@ -113,6 +140,57 @@ pub const CANDIDATES: &[Machine] = &[
 
 /// The staging VM only downloads and hashes, so it is small.
 pub const STAGING_MACHINE: &str = "n4-standard-8";
+
+/// The smoke test serves from the staging VM's shape: 32 GB holds a 12 GB
+/// model and its cache, at about $0.38 an hour on demand.
+pub const SMOKE_MACHINE: Machine = Machine {
+    name: "n4-standard-8",
+    vcpus: 8,
+    memory_gb: 32,
+    gpus: 0,
+};
+
+/// One model the route can run: its pinned weights, the disk they need,
+/// the machine it is served from unless the caller picks another, and
+/// what llama-server is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelSpec {
+    /// Names its weights disk, so two models' disks never collide.
+    pub slug: &'static str,
+    /// What the model is called where a person reads it.
+    pub label: &'static str,
+    pub weights: Weights,
+    pub disk_gib: u64,
+    /// What the weights disk is provisioned at while staging or loading.
+    pub disk_loading: DiskPerformance,
+    pub machine: Machine,
+    /// llama-server's `-c`, which the context gauge measures against.
+    pub context_tokens: u32,
+}
+
+/// What the route is for.
+pub const GLM_5_3: ModelSpec = ModelSpec {
+    slug: "glm-5-3",
+    label: "GLM-5.3",
+    weights: GLM_5_3_Q8_0,
+    disk_gib: WEIGHTS_DISK_GIB,
+    disk_loading: WEIGHTS_LOADING,
+    machine: CANDIDATES[0],
+    context_tokens: 200_000,
+};
+
+/// The smoke test: every part of the route, with a model a cheap machine
+/// can hold. 12 GB of weights on a 20 GiB disk at the free baseline, which
+/// stages in a minute and a half.
+pub const GPT_OSS_20B: ModelSpec = ModelSpec {
+    slug: "gpt-oss-20b",
+    label: "gpt-oss-20b",
+    weights: GPT_OSS_20B_MXFP4,
+    disk_gib: 20,
+    disk_loading: DiskPerformance::BASELINE,
+    machine: SMOKE_MACHINE,
+    context_tokens: 65_536,
+};
 
 const STAGE_CIDR: &str = "10.231.1.0/24";
 const SERVE_CIDR: &str = "10.231.2.0/24";
@@ -165,7 +243,7 @@ pub struct Names {
 }
 
 impl Names {
-    pub fn new(ws: &Workspace) -> Result<Self> {
+    pub fn new(ws: &Workspace, spec: &ModelSpec) -> Result<Self> {
         Ok(Self {
             stage_network: ws.name("stage")?,
             stage_subnetwork: ws.name("stage")?,
@@ -176,7 +254,7 @@ impl Names {
             serve_deny_egress: ws.name("serve-deny-egress")?,
             serve_allow_iap: ws.name("serve-allow-iap")?,
             serve_dns_policy: ws.name("serve-dns")?,
-            weights_disk: ws.name("weights")?,
+            weights_disk: ws.name(&format!("weights-{}", spec.slug))?,
             staging: ws.name("stage")?,
             serving: ws.name("serve")?,
         })
@@ -251,22 +329,25 @@ pub struct ModelPlan {
     pub serving: Value,
 }
 
-/// What the guests are told, which Phase 2 fills: each VM's Ignition
-/// config as `user-data`.
+/// What the guests are told: each VM's Ignition config as `user-data`
+/// (`guest`), and the key llama-server checks, which the serving VM reads
+/// from its own metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GuestConfigs {
     pub staging_user_data: Option<String>,
     pub serving_user_data: Option<String>,
+    pub serving_key: Option<String>,
 }
 
 pub fn plan(
     ws: &Workspace,
     loc: &Location,
     image: &ImageRef,
+    spec: &ModelSpec,
     machine: &Machine,
     guests: &GuestConfigs,
 ) -> Result<ModelPlan> {
-    let names = Names::new(ws)?;
+    let names = Names::new(ws, spec)?;
     let user_data = |config: &Option<String>| -> Vec<(String, String)> {
         config
             .iter()
@@ -311,7 +392,15 @@ pub fn plan(
         }],
         maintenance: machine.maintenance(),
         max_run: Some((SERVE_MAX_RUN_SECONDS, OnMaxRun::Stop)),
-        metadata: user_data(&guests.serving_user_data),
+        metadata: user_data(&guests.serving_user_data)
+            .into_iter()
+            .chain(
+                guests
+                    .serving_key
+                    .iter()
+                    .map(|key| (crate::guest::KEY_ATTRIBUTE.to_string(), key.clone())),
+            )
+            .collect(),
     };
     Ok(ModelPlan {
         networks: vec![
@@ -350,8 +439,8 @@ pub fn plan(
             loc,
             &DiskSpec {
                 name: names.weights_disk.clone(),
-                size_gib: WEIGHTS_DISK_GIB,
-                performance: WEIGHTS_LOADING,
+                size_gib: spec.disk_gib,
+                performance: spec.disk_loading,
                 role: "weights",
             },
         ),
@@ -408,7 +497,15 @@ mod tests {
             project: "fedora-coreos-cloud".into(),
             name: "fedora-coreos-44-20260829-3-1-gcp-x86-64".into(),
         };
-        plan(&ws, &loc, &image, machine, &GuestConfigs::default()).unwrap()
+        plan(
+            &ws,
+            &loc,
+            &image,
+            &GLM_5_3,
+            machine,
+            &GuestConfigs::default(),
+        )
+        .unwrap()
     }
 
     fn rules_on<'a>(plan: &'a ModelPlan, network: &str) -> Vec<&'a Value> {
@@ -417,6 +514,24 @@ mod tests {
             .iter()
             .filter(|r| r["network"] == url)
             .collect()
+    }
+
+    #[test]
+    fn each_model_has_its_own_disk_and_the_smoke_test_its_size() {
+        let ws = Workspace::new("0a1b2c3d").unwrap();
+        let glm = Names::new(&ws, &GLM_5_3).unwrap();
+        let small = Names::new(&ws, &GPT_OSS_20B).unwrap();
+        assert_ne!(glm.weights_disk, small.weights_disk);
+        assert_eq!(small.weights_disk, "taste-0a1b2c3d-weights-gpt-oss-20b");
+        assert!(GPT_OSS_20B.weights.total_bytes() < GPT_OSS_20B.disk_gib << 30);
+        assert_eq!(
+            GPT_OSS_20B.weights.url(&GPT_OSS_20B.weights.shards[0]),
+            "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/ef9b12f2ff56c69cf32153a02784e7a3c88bf524/gpt-oss-20b-MXFP4.gguf"
+        );
+        assert_eq!(
+            GLM_5_3.weights.url(&GLM_5_3.weights.shards[0]),
+            "https://huggingface.co/unsloth/GLM-5.3-GGUF/resolve/346b3591c7f28d1a23716f97a065ecf12ec14771/Q8_0/GLM-5.3-Q8_0-00001-of-00017.gguf"
+        );
     }
 
     #[test]

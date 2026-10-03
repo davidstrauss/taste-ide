@@ -6,6 +6,8 @@
 //! gcp-bringup sign-in STATE_DIR PROJECT
 //! gcp-bringup setup   STATE_DIR PROJECT
 //! gcp-bringup check   STATE_DIR PROJECT
+//! gcp-bringup smoke    STATE_DIR PROJECT ZONE [--keep]
+//! gcp-bringup teardown STATE_DIR PROJECT ZONE
 //! ```
 //!
 //! `install` fetches the pinned gcloud into the IDE's data directory —
@@ -17,6 +19,16 @@
 //! the service account, which of the role's permissions it holds; it
 //! creates nothing, so it costs nothing.
 //!
+//! `smoke` proves the whole model route with a small model, gpt-oss-20b
+//! (David, 2026-10-03: "Let's start with a less ambitious model to test
+//! that things can work"): it stages the pinned weights with a staging VM,
+//! brings the serving VM up with no address and no way out, opens gcloud's
+//! IAP tunnel to it, asks the model one question through the Messages API
+//! with the VM's key, prints the answer, and stops the VM (`--keep` leaves
+//! it running). About $0.40 an hour while anything runs, and well under a
+//! dollar for the whole test; the 20 GiB disk stays until `teardown`,
+//! which deletes everything the plan made.
+//!
 //! Build it in the devcontainer and run it on the host, where a browser
 //! is: `cargo build -p taste-gcp --example gcp-bringup`, then
 //! `target/debug/examples/gcp-bringup …`.
@@ -24,10 +36,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
 use taste_gcp::gcloud::{self, Gcloud};
+use taste_gcp::model::{self, GuestConfigs, ModelPlan};
+use taste_gcp::resources::Location;
 use taste_gcp::rest::{Endpoints, Gcp, TokenSource};
 use taste_gcp::setup::{self, PERMISSIONS};
+use taste_gcp::{guest, lifecycle};
 
 async fn installed() -> Result<PathBuf> {
     let root = gcloud::sdk_root();
@@ -57,6 +74,100 @@ fn project_gcloud(binary: PathBuf, state: &Path, project: &str) -> Result<Gcloud
         project: project.to_string(),
         impersonate: Some(setup::service_account(project)),
     })
+}
+
+/// A fresh key for llama-server, 32 random bytes as hex.
+fn random_key() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn smoke_plan(state: &Path, loc: &Location, key: Option<String>) -> Result<ModelPlan> {
+    let spec = &model::GPT_OSS_20B;
+    model::plan(
+        &taste_gcp::project::workspace(state)?,
+        loc,
+        &guest::fcos_image(guest::FCOS_RELEASE),
+        spec,
+        &spec.machine,
+        &GuestConfigs {
+            staging_user_data: Some(guest::staging_ignition(spec)),
+            serving_user_data: Some(guest::serving_ignition(spec)),
+            serving_key: key,
+        },
+    )
+}
+
+/// One question to the model through the tunnel's loopback end, retried
+/// while the tunnel finishes coming up.
+async fn ask(port: u16, key: &str) -> Result<String> {
+    let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http();
+    let body = lifecycle::smoke_request(model::GPT_OSS_20B.label).to_string();
+    let mut last = None;
+    for _ in 0..12 {
+        let request = http::Request::post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .body(Full::new(Bytes::from(body.clone())))?;
+        match client.request(request).await {
+            Ok(response) => {
+                let status = response.status();
+                let bytes = response.into_body().collect().await?.to_bytes();
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                if !status.is_success() {
+                    bail!("the model answered {status}: {text}");
+                }
+                return Ok(text);
+            }
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    bail!("the tunnel never carried the request: {:?}", last)
+}
+
+async fn smoke(state: &Path, project: &str, zone: &str, keep: bool) -> Result<()> {
+    let gcloud = project_gcloud(installed().await?, state, project)?;
+    let gcp = Gcp::new(
+        Arc::new(TokenSource::gcloud(gcloud.clone())),
+        Endpoints::default(),
+    );
+    let loc = Location::new(project, zone)?;
+    let plan = smoke_plan(state, &loc, Some(random_key()?))?;
+    let say = |line: &str| eprintln!("{line}");
+    lifecycle::stage(&gcp, &loc, &plan, &say).await?;
+    lifecycle::serve(&gcp, &loc, &plan, &say).await?;
+    let key = lifecycle::serving_key(&gcp, &loc, &plan).await?;
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    eprintln!("opening the IAP tunnel on 127.0.0.1:{port}");
+    let tunnel = gcloud
+        .tunnel(&plan.names.serving, zone, model::SERVER_PORT, port)
+        .spawn()
+        .context("starting gcloud's IAP tunnel")?;
+    let answer = ask(port, &key).await;
+    drop(tunnel);
+    if !keep {
+        eprintln!("stopping the serving VM; the weights disk stays for the next run");
+        lifecycle::stop(&gcp, &loc, &plan).await?;
+    }
+    println!("{}", answer?);
+    Ok(())
+}
+
+async fn teardown(state: &Path, project: &str, zone: &str) -> Result<()> {
+    let gcloud = project_gcloud(installed().await?, state, project)?;
+    let gcp = Gcp::new(Arc::new(TokenSource::gcloud(gcloud)), Endpoints::default());
+    let loc = Location::new(project, zone)?;
+    let plan = smoke_plan(state, &loc, None)?;
+    lifecycle::teardown(&gcp, &loc, &plan, &|line: &str| eprintln!("{line}")).await
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -105,9 +216,16 @@ async fn main() -> Result<()> {
                 PERMISSIONS.len()
             );
         }
+        ["smoke", state, project, zone] => smoke(Path::new(state), project, zone, false).await?,
+        ["smoke", state, project, zone, "--keep"] => {
+            smoke(Path::new(state), project, zone, true).await?
+        }
+        ["teardown", state, project, zone] => teardown(Path::new(state), project, zone).await?,
         _ => bail!(
             "usage: gcp-bringup install\n       \
-             gcp-bringup sign-in|setup|check STATE_DIR PROJECT"
+             gcp-bringup sign-in|setup|check STATE_DIR PROJECT\n       \
+             gcp-bringup smoke STATE_DIR PROJECT ZONE [--keep]\n       \
+             gcp-bringup teardown STATE_DIR PROJECT ZONE"
         ),
     }
     Ok(())

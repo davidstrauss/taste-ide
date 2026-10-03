@@ -14,9 +14,12 @@
 //!   instances look like as Compute API request bodies, built from typed
 //!   specs and named and labelled by one convention. Generic: nothing in
 //!   it knows about models or environments.
-//! - [`model`]: the GLM-5.3 machines, composed from those builders, with
-//!   the lockdown the design commits to stated as data so a test can read
-//!   it back before anything is created.
+//! - [`model`]: a model's machines, composed from those builders — GLM-5.3,
+//!   and the small model the route is proved with first — with the
+//!   lockdown the design commits to stated as data so a test can read it
+//!   back before anything is created.
+//! - [`guest`]: what those machines are told to do, as Ignition configs.
+//! - [`lifecycle`]: staging, serving, stopping, and tearing down.
 //! - [`setup`]: the one-time setup that grants the IDE its role, run as
 //!   the user with the project's own gcloud sign-in.
 //!
@@ -34,6 +37,8 @@
 //! the caller's business.
 
 pub mod gcloud;
+pub mod guest;
+pub mod lifecycle;
 pub mod model;
 pub mod project;
 pub mod resources;

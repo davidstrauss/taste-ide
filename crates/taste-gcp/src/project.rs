@@ -53,6 +53,20 @@ pub fn store(state_dir: &Path, choices: &CloudProject) -> Result<()> {
     Ok(())
 }
 
+/// The workspace a state directory is for. The directory is named
+/// `<name>-<hash of the root>` (`taste_core::state::workspace_state_dir`),
+/// and a workspace's GCP id is that hash's first eight digits, so the two
+/// are recognisably the same workspace.
+pub fn workspace(state_dir: &Path) -> Result<crate::resources::Workspace> {
+    let name = state_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("{} has no name", state_dir.display()))?;
+    let hash = name.rsplit('-').next().unwrap_or("");
+    crate::resources::Workspace::new(hash.get(..8).unwrap_or(hash))
+        .with_context(|| format!("{name} is not a workspace's state directory"))
+}
+
 /// The project's gcloud: the IDE's pinned copy at `binary`, this
 /// project's configuration, and its calls impersonating the IDE's service
 /// account there.
@@ -85,6 +99,13 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_state_directory_names_its_workspace() {
+        let ws = workspace(Path::new("/x/workspaces/taste-ide-f4ef24a9f365b5e2")).unwrap();
+        assert_eq!(ws.id(), "f4ef24a9");
+        assert!(workspace(Path::new("/x/workspaces/not-a-hash")).is_err());
     }
 
     #[test]

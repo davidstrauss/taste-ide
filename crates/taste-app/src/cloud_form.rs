@@ -728,6 +728,14 @@ mod tests {
     }
 
     #[test]
+    fn cloud_guests_boot_the_pools_release() {
+        assert_eq!(
+            taste_gcp::guest::FCOS_RELEASE,
+            taste_devcontainer::guest::RELEASE
+        );
+    }
+
+    #[test]
     fn the_worst_light_wins() {
         assert!(CloudLight::Failed > CloudLight::Waiting);
         assert!(CloudLight::Waiting > CloudLight::Quiet);

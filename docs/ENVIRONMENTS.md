@@ -1533,6 +1533,21 @@ token and tunnel do everything the plan needs. Gate: unit tests against
 a recorded mock of the API and a gcloud that records its calls; a live
 test gated on `TASTE_GCP_TESTS=1`, which spends money and is run by a
 person.
+**Phase 2a — the smoke test.** Before the 800 GB model, the whole path
+is proved with a small one (David, 2026-10-03: "Let's start with a less
+ambitious model to test that things can work"): gpt-oss-20b, the model
+the private route was first proved against, pinned by commit and digest
+like GLM-5.3 (`taste_gcp::model::GPT_OSS_20B`), staged by the same
+staging VM onto a 20 GiB disk, and served from an `n4-standard-8` with the
+same lockdown — no address, no route out, no name resolution, ingress
+from IAP alone. `examples/gcp-bringup smoke` runs it: stage, serve, open
+gcloud's IAP tunnel, ask one question through the Messages API with the
+VM's own key, print the answer, and stop the VM; `teardown` deletes
+everything the plan made. Well under a dollar a run. The guests are
+Fedora CoreOS at the local pool's own release, configured by Ignition
+(`taste_gcp::guest`), and say how far they have got only through guest
+attributes, written to the metadata server by IP.
+
 **Phase 2 — staging, and the bake-off.** Stage the pinned weights once,
 then run each candidate machine against them: load time, prompt-reading
 and writing rates at 2k, 32k, and 128k tokens of context, and cost per

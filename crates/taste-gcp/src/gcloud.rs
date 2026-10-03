@@ -595,19 +595,39 @@ mod tests {
     #[tokio::test]
     async fn a_missing_account_is_told_apart_from_an_unknowable_one() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("gcloud");
-        let write = |body: &str| {
+        // A stub written and run at once can meet "Text file busy": another
+        // test thread that forks while the file is open for writing holds
+        // it until that child execs. Each answer gets its own stub, and a
+        // busy one is run again, which is what the condition asks for.
+        async fn answer(body: &str) -> Option<bool> {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gcloud");
             std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
-        let g = gcloud(dir.path());
-        write("echo taste-ide@my-project-1.iam.gserviceaccount.com");
-        assert_eq!(g.service_account_exists().await.unwrap(), Some(true));
-        write("echo 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account' >&2; exit 1");
-        assert_eq!(g.service_account_exists().await.unwrap(), Some(false));
-        write("echo 'ERROR: PERMISSION_DENIED: Permission iam.serviceAccounts.get denied' >&2; exit 1");
-        assert_eq!(g.service_account_exists().await.unwrap(), None);
+            let g = gcloud(dir.path());
+            for _ in 0..20 {
+                match g.service_account_exists().await {
+                    Ok(answer) => return answer,
+                    Err(e) if format!("{e:#}").contains("busy") => {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await
+                    }
+                    Err(e) => panic!("{e:#}"),
+                }
+            }
+            panic!("the stub stayed busy");
+        }
+        assert_eq!(
+            answer("echo taste-ide@my-project-1.iam.gserviceaccount.com").await,
+            Some(true)
+        );
+        assert_eq!(
+            answer("echo 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account' >&2; exit 1").await,
+            Some(false)
+        );
+        assert_eq!(
+            answer("echo 'ERROR: PERMISSION_DENIED: Permission iam.serviceAccounts.get denied' >&2; exit 1").await,
+            None
+        );
     }
 
     #[test]

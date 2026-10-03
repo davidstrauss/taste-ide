@@ -11,6 +11,7 @@ testing = []
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 bytes.workspace = true
 # Unpacking the pinned gcloud archive in-process, so nothing depends on
 # the Flatpak runtime shipping a `tar`.
