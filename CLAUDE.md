@@ -158,7 +158,8 @@ poses the backlog's status filter on that button, through the toggle
 itself — the filtered list, and the panel's height, which a filter must
 not move;
 `TASTE_PROBE_SYNC=running` (or `conflict`, `failed`, `done`) poses the
-title bar's folder-sync status in that state with its transfers open;
+title bar's cloud — the folder's sync and the Google Cloud connection,
+one badge — in that state with its popover open;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
 `TASTE_PROBE_TASKS=none` leaves the Tasks section empty the same way (it
 otherwise poses more tasks than fit, namespaced ones among them),
@@ -193,11 +194,15 @@ otherwise need a Pull over a remote that asks;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;
-`TASTE_PROBE_CHAT=cloud` opens the settings shade on its Google Cloud
-group (`cloud_form.rs`) and `TASTE_PROBE_CLOUD` poses it (`unset`,
-`fetching` — the IDE's own gcloud partway down —, `signed-in`, `missing`
-— a test that found the role short —, or ready by default), since every
-real state of it needs a Google account and a project;
+`TASTE_PROBE_CLOUD` poses the Google Cloud section of the title bar's
+cloud popover (`cloud_form.rs`) and opens it (`unset`, `fetching` — the
+IDE's own gcloud partway down —, `missing` — a test that found the role
+short —, or ready by default), since every real state of it needs a
+Google account and a project; with `TASTE_PROBE_SYNC` the badge shows
+the worse of the two;
+`TASTE_PROBE_CLOSING=1` poses the window as a close leaves it, the
+closing page over everything with its steps partway (`closing.rs`) —
+pair it with `TASTE_PROBE_SYNC=running` for a transfer in the frame;
 `TASTE_PROBE_PRIVATE=1` poses the chat as Claude Code (Private) — the
 header's identity naming it, its Plan gauge gone, and the settings shade's
 Private model group up — which otherwise needs a provisioned

@@ -1259,13 +1259,36 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .tooltip_text("Main menu")
         .build();
     header.pack_end(&menu_button);
-    // The folder's sync with Personal's checkout: an icon, and on a click
-    // the transfers (syncstatus.rs). Shown once the folder mirrors a
-    // checkout in a VM.
+    // The title bar's cloud: the folder's sync with Personal's checkout
+    // and the project's Google Cloud connection, one badge for both and,
+    // on a click, one popover (syncstatus.rs, cloud_form.rs). The sync
+    // half speaks once the folder mirrors a checkout in a VM.
     let sync_status = crate::syncstatus::SyncStatus::new();
     header.pack_end(&sync_status.widget);
     if !supervisor.checkout().is_local() {
         sync_status.show();
+    }
+    let cloud_form = crate::cloud_form::CloudForm::new(
+        taste_core::state::workspace_state_dir(workspace.root()),
+        workspace.events.clone(),
+    );
+    sync_status.attach_cloud(&cloud_form);
+    // Where the connection stands, read once at launch — off this thread,
+    // and a test when there is a sign-in to test — so the badge is an
+    // answer from the start. A probe poses it instead.
+    match std::env::var("TASTE_PROBE_CLOUD") {
+        Ok(variant) => {
+            sync_status.show();
+            cloud_form.pose_for_probe(&variant);
+            let button = sync_status.widget.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
+                // A closing pose has taken the popover's content.
+                if std::env::var("TASTE_PROBE_CLOSING").is_err() {
+                    button.popup();
+                }
+            });
+        }
+        Err(_) => cloud_form.sync(),
     }
     // `TASTE_PROBE_SYNC=running|conflict|failed|done`: the sync status in
     // that state with its transfers open, which otherwise needs a folder
@@ -1297,7 +1320,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         }
         let button = sync_status.widget.clone();
         glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
-            button.popup();
+            // A closing pose has taken the popover's content.
+            if std::env::var("TASTE_PROBE_CLOSING").is_err() {
+                button.popup();
+            }
         });
     }
 
@@ -3903,6 +3929,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let prompt_agent = prompt_agent.clone();
         let refresh_tasks_for_events = refresh_tasks.clone();
         let sync_status_for_events = sync_status.clone();
+        let cloud_form_for_events = cloud_form.clone();
         let window_for_pad = window.downgrade();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
@@ -4388,13 +4415,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         status,
                         tail,
                     } => {
-                        if title == crate::cloud_form::SIGN_IN_TITLE
-                            || title == crate::cloud_form::SETUP_TITLE
-                        {
-                            if let Some(pane) = chats.selected() {
-                                pane.cloud_form.step_finished(&title, status);
-                            }
-                        }
+                        // The Google Cloud steps (cloud_form.rs) name their
+                        // own tabs and hear about them by name.
+                        cloud_form_for_events.step_finished(&title, status);
                         if title == "Sign In" {
                             // The sign-in terminal was opened from the chat
                             // the user is in; credentials are per agent, so
@@ -4765,6 +4788,30 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // closes, and the folder is free for the next window — including when
     // this process is killed, which is the whole reason the claim is an
     // flock and not a pid file.
+    // `TASTE_PROBE_CLOSING=1`: the window as a close leaves it while the
+    // folder is still being brought up to date — the closing page over the
+    // whole window, the cloud popover's content under its steps. Pair it
+    // with `TASTE_PROBE_SYNC=running` for a transfer in the frame. Nothing
+    // is saved or stopped: the steps are posed.
+    if std::env::var("TASTE_PROBE_CLOSING").is_ok() {
+        let (window, sync_status, cloud_form) =
+            (window.clone(), sync_status.clone(), cloud_form.clone());
+        glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+            use crate::closing::Step;
+            cloud_form.freeze();
+            let page = crate::closing::ClosingPage::new(&sync_status.take_over(), true);
+            window.set_content(Some(&page.widget));
+            page.finish(Step::Save, "4 tabs and 2 chats saved");
+            page.finish(
+                Step::StopVms,
+                "They stop in 2 minutes, unless this project opens again before then",
+            );
+            page.finish(Step::Snapshot, "Kept as a snapshot of Personal");
+            page.begin(Step::Sync, None);
+            std::mem::forget(page);
+        });
+    }
+
     if !probe_mode {
         let workspace = workspace.clone();
         let chats = chats.clone();
@@ -4792,6 +4839,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // new window (2026-10-02).
         let closing = Rc::new(Cell::new(false));
         let primary_for_close = supervisor.clone();
+        let sync_status_for_close = sync_status.clone();
+        let cloud_form_for_close = cloud_form.clone();
         window.connect_close_request(move |window| {
             if done.get() {
                 return glib::Propagation::Proceed;
@@ -4804,18 +4853,46 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let open = workspace.ide.open_files();
             let checkout = workspace.checkout_path();
             let chats_now = chats.snapshot();
+            let (tabs, chat_count) = (open.len(), chats_now.len());
             let root = root.clone();
             let supervisor = primary_for_close.clone();
             let remote = !supervisor.checkout().is_local();
             let window = window.clone();
             let done = done.clone();
+
+            // The rest of the close happens in front of the user: the
+            // cloud popover's content, and the steps it is waiting on,
+            // over the whole window (closing.rs).
+            cloud_form_for_close.freeze();
+            let page = crate::closing::ClosingPage::new(&sync_status_for_close.take_over(), remote);
+            window.set_content(Some(&page.widget));
+            page.begin(crate::closing::Step::Save, None);
+            page.begin(crate::closing::Step::StopVms, None);
+            // "Close Now": what is still to do is skipped. The save is
+            // short and the next window wants it, so a press during it
+            // closes as soon as it is done; after it, at once.
+            let skip = Rc::new(Cell::new(false));
+            let saved = Rc::new(Cell::new(false));
+            {
+                let (skip, saved, done, window) =
+                    (skip.clone(), saved.clone(), done.clone(), window.clone());
+                page.set_on_close_now(move || {
+                    skip.set(true);
+                    if saved.get() {
+                        done.set(true);
+                        window.close();
+                    }
+                });
+            }
+
             glib::spawn_future_local(async move {
+                use crate::closing::Step;
                 // Restore state has one owner too, for the same reason the
                 // containers do: two windows on one folder writing one file
                 // is whichever closed last deciding what the other had open.
                 let save = crate::runtime::runtime().spawn_blocking(move || {
                     if !granted {
-                        return;
+                        return None;
                     }
                     // The workspace's VMs stop with its window: their memory
                     // is committed for as long as they run, and nothing in
@@ -4825,12 +4902,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // not cost a shutdown and a boot. One sleeper for the
                     // workspace, detached, which lists its VMs itself when
                     // it fires.
-                    if let Err(e) = taste_devcontainer::LibvirtSession::new().shutdown_deferred(
-                        &root,
-                        taste_devcontainer::provision::CLOSE_SHUTDOWN_GRACE,
-                    ) {
-                        tracing::warn!("deferring the workspace's VM shutdown: {e}");
-                    }
+                    let vms = taste_devcontainer::LibvirtSession::new()
+                        .shutdown_deferred(
+                            &root,
+                            taste_devcontainer::provision::CLOSE_SHUTDOWN_GRACE,
+                        )
+                        .map_err(|e| {
+                            tracing::warn!("deferring the workspace's VM shutdown: {e}");
+                            format!("{e:#}")
+                        });
                     // Update in place: fields owned elsewhere survive
                     // untouched.
                     let mut state = taste_core::state::load(&root);
@@ -4848,31 +4928,110 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     state.open_files = open.iter().map(|f| home(&f.path)).collect();
                     state.active_file = open.iter().find(|f| f.active).map(|f| home(&f.path));
                     state.set_chats(chats_now);
-                    if let Err(e) = taste_core::state::save(&root, &state) {
+                    let saved = taste_core::state::save(&root, &state).map_err(|e| {
                         tracing::warn!("saving workspace state failed: {e:#}");
-                    }
-                });
-                let _ = save.await;
-                if remote {
-                    let flush = crate::runtime::runtime().spawn(async move {
-                        let work = tokio::task::spawn_blocking(move || {
-                            let _ = supervisor.snapshot_blocking();
-                            supervisor.sync_peer_blocking()
-                        });
-                        tokio::time::timeout(std::time::Duration::from_secs(20), work).await
+                        format!("{e:#}")
                     });
-                    match flush.await {
-                        Ok(Ok(Ok(Ok(())))) => {}
-                        Ok(Ok(Ok(Err(e)))) => {
-                            tracing::warn!("bringing the folder up to date on close: {e:#}")
+                    Some((vms, saved))
+                });
+                match save.await.ok().flatten() {
+                    None => {
+                        let other = "Another window on this folder keeps it";
+                        page.finish(Step::Save, other);
+                        page.finish(Step::StopVms, other);
+                    }
+                    Some((vms, state)) => {
+                        let plural = |n: usize, word: &str| {
+                            format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+                        };
+                        match state {
+                            Ok(()) => page.finish(
+                                Step::Save,
+                                &format!(
+                                    "{} and {} saved",
+                                    plural(tabs, "tab"),
+                                    plural(chat_count, "chat")
+                                ),
+                            ),
+                            Err(why) => page.fail(Step::Save, &why),
                         }
-                        _ => tracing::warn!(
-                            "bringing the folder up to date on close did not finish in 20s"
-                        ),
+                        match vms {
+                            Ok(()) => page.finish(
+                                Step::StopVms,
+                                &format!(
+                                    "They stop in {} minutes, unless this project opens again \
+                                     before then",
+                                    taste_devcontainer::provision::CLOSE_SHUTDOWN_GRACE.as_secs()
+                                        / 60
+                                ),
+                            ),
+                            Err(why) => page.fail(Step::StopVms, &why),
+                        }
                     }
                 }
-                done.set(true);
-                window.close();
+                saved.set(true);
+                if remote && !skip.get() {
+                    // One budget for both, so a VM that does not answer
+                    // cannot hold the window open longer than it did
+                    // before these were two steps.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                    let left =
+                        move || deadline.saturating_duration_since(std::time::Instant::now());
+                    page.begin(Step::Snapshot, None);
+                    let snapshotting = supervisor.clone();
+                    let snapshot = crate::runtime::runtime().spawn(async move {
+                        let work =
+                            tokio::task::spawn_blocking(move || snapshotting.snapshot_blocking());
+                        tokio::time::timeout(left(), work).await
+                    });
+                    match snapshot.await {
+                        Ok(Ok(Ok(Ok(Some(_))))) => {
+                            page.finish(Step::Snapshot, "Kept as a snapshot of Personal")
+                        }
+                        Ok(Ok(Ok(Ok(None)))) => {
+                            page.finish(Step::Snapshot, "Nothing uncommitted to keep")
+                        }
+                        Ok(Ok(Ok(Err(e)))) => page.fail(Step::Snapshot, &format!("{e:#}")),
+                        _ => page.fail(
+                            Step::Snapshot,
+                            "Did not finish in time — Personal still has the work",
+                        ),
+                    }
+                    if !skip.get() {
+                        page.begin(Step::Sync, None);
+                        let sync = crate::runtime::runtime().spawn(async move {
+                            let work = tokio::task::spawn_blocking(move || {
+                                supervisor.sync_peer_blocking()
+                            });
+                            tokio::time::timeout(left(), work).await
+                        });
+                        match sync.await {
+                            Ok(Ok(Ok(Ok(())))) => {
+                                page.finish(Step::Sync, "Your folder is up to date")
+                            }
+                            Ok(Ok(Ok(Err(e)))) => {
+                                tracing::warn!("bringing the folder up to date on close: {e:#}");
+                                page.fail(Step::Sync, &format!("{e:#}"));
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "bringing the folder up to date on close did not finish in 20s"
+                                );
+                                page.fail(
+                                    Step::Sync,
+                                    "Did not finish in time — your folder catches up next launch",
+                                );
+                            }
+                        }
+                    }
+                }
+                if !done.get() {
+                    // A moment on the finished list, so the close is seen
+                    // to have finished rather than to have vanished.
+                    glib::timeout_future(std::time::Duration::from_millis(600)).await;
+                    done.set(true);
+                    window.close();
+                }
             });
             glib::Propagation::Stop
         });

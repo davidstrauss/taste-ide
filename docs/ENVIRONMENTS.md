@@ -1450,31 +1450,50 @@ want my IDE client to be able to access it").
   carrying its label, and nothing else.
 - **Setting it up, in the IDE** (David, 2026-10-03: "I do want to be able
   to run setup and, ideally, set up the restricted service account, and
-  finally impersonate it, directly in the IDE"). Every chat's settings
-  shade carries a **Google Cloud** group (`taste-app`'s `cloud_form`) —
-  every chat's, because the access is the project's rather than one
-  agent's, and serves cloud environments as well as the model — built as
-  the Anthropic account group is: a project row, three steps, and the
-  traffic-light verdict under them. **Sign in with Google** fetches the
-  pinned gcloud if it is not there yet, with its progress on the verdict
-  line, and runs gcloud's browser sign-in in a console tab into the
-  project's own config. **Set up the project** runs
-  `build-aux/gcp-setup.sh` in a console tab with that gcloud, as the
-  user: it enables the APIs, creates the custom role and the keyless
-  service account, grants the one to the other, and lets the user
-  impersonate it — every step repeatable, `--remove` to undo, and
+  finally impersonate it, directly in the IDE"). The connection lives in
+  the **title bar's cloud** (`syncstatus.rs`), with the folder's sync,
+  not in any chat's settings (David, same day: "this GCP connection
+  doesn't belong in the chat settings"): one cloud icon whose badge is
+  the worse of the two — green when the folder is in step and the
+  connection is ready or was never set up, yellow while a pass has
+  something to move or the connection is under way or waiting on the
+  user, red on a conflict, a sync that failed, or a connection that did —
+  and one popover laid out as a GNOME popover menu is, the sync on top and
+  the **Google Cloud** section (`cloud_form.rs`) below a separator: the
+  project's ID, three actions as flat menu items, and the traffic-light
+  verdict. **Sign In with Google…** fetches the pinned gcloud if it is not
+  there yet, with its progress on the verdict line, and runs gcloud's
+  browser sign-in in a console tab into the project's own config. **Set
+  Up Project…** runs `build-aux/gcp-setup.sh` in a console tab with that
+  gcloud, as the user: it enables the APIs, creates the custom role and
+  the keyless service account, grants the one to the other, and lets the
+  user impersonate it — every step repeatable, `--remove` to undo, and
   runnable by hand or in Cloud Shell just the same, since it is the same
-  file. **Test** then asks Google, *as the service account* — the
+  file. **Test Connection** asks Google, *as the service account* — the
   impersonation every later call makes — which of the role's permissions
-  it holds (`testIamPermissions`, by name), and says ready, or names what
-  is missing; a setup that exits clean is followed by the test on its
-  own. The console steps run wrapped, in the IDE's own context and never
-  an environment's container, and their command line strips every
+  it holds (`testIamPermissions`, by name), and says ready or names what
+  is missing; it runs on its own after a clean setup, and at launch for a
+  project that is signed in, so the badge is an answer rather than a
+  guess. The console steps run wrapped, in the IDE's own context and
+  never an environment's container, and their command line strips every
   inherited sign-in first, since a tab can only add to its environment.
-  The zone, the monthly cap, and the regional vCPU quota join the group
-  with the machines. Staging's progress is drawn where the guest
-  image's fetch is drawn, in the backlog's header, from the bytes the
-  staging VM reports.
+  The zone, the monthly cap, and the regional vCPU quota join the section
+  with the machines.
+- **A close shows what it is finishing** (David, 2026-10-03: "On close,
+  I'd like the current sync/cloud status to take over the entire window
+  to show remaining work before shutdown"). The first close request
+  replaces the window's content with the closing page (`closing.rs`): the
+  steps the close is waiting on, in the startup page's own checklist rows
+  — save the tabs and chats, schedule the VMs to stop, keep Personal's
+  uncommitted work, bring the folder up to date — and under them the
+  cloud popover's content itself, moved rather than copied, so the
+  transfer under way keeps drawing and the connection's verdict stays in
+  view. The snapshot and the sync share the twenty seconds the close
+  already allowed them, so a VM that does not answer holds the window no
+  longer than before; "Close Now" skips what is left, which is safe,
+  since the work stays in Personal's checkout and the folder catches up
+  at the next launch. When the stopping of the model's VM exists, it is
+  one more step on this page.
 - **What this protects, and what it does not.** It protects against the
   serving stack — llama.cpp, its GGUF loader, and anything in the weights
   — sending the user's code or prompts anywhere: the machine has no

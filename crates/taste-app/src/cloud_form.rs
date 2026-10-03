@@ -1,40 +1,47 @@
-//! The settings shade's Google Cloud group: the project's own sign-in to
-//! GCP, its one-time setup, and a test of what the IDE may do there — all
-//! from inside the IDE (David, 2026-10-03: "I do want to be able to run
-//! setup and, ideally, set up the restricted service account, and finally
+//! The project's Google Cloud connection: its own sign-in to GCP, its
+//! one-time setup, and a test of what the IDE may do there — all from
+//! inside the IDE (David, 2026-10-03: "I do want to be able to run setup
+//! and, ideally, set up the restricted service account, and finally
 //! impersonate it, directly in the IDE").
+//!
+//! A section of the title bar's cloud popover, under the folder's sync
+//! (`syncstatus.rs`; David, same day: "this GCP connection doesn't belong
+//! in the chat settings"), laid out the way a GNOME popover menu is: a dim
+//! section header, the project's ID, three actions as flat menu items, and
+//! the verdict under them. What it says also lights the cloud's badge
+//! ([`CloudLight`]), so a connection that failed is red in the title bar
+//! without the popover open.
 //!
 //! Three steps, in the order a project needs them:
 //!
-//! - **Sign in with Google** fetches the IDE's own pinned gcloud if it is
+//! - **Sign In with Google…** fetches the IDE's own pinned gcloud if it is
 //!   not there yet (`taste_gcp::gcloud`, never the base system) and runs
 //!   its browser sign-in in a console tab, into this project's own gcloud
 //!   configuration.
-//! - **Set up the project** runs `build-aux/gcp-setup.sh` in a console tab
-//!   as the user: the APIs, the custom role, the keyless `taste-ide`
-//!   service account holding it, and the user's leave to act as it.
-//! - **Test** asks Google, *as that service account*, which of the role's
-//!   permissions it holds — the impersonation every later call makes.
+//! - **Set Up Project…** runs `build-aux/gcp-setup.sh` in a console tab as
+//!   the user: the APIs, the custom role, the keyless `taste-ide` service
+//!   account holding it, and the user's leave to act as it.
+//! - **Test Connection** asks Google, *as that service account*, which of
+//!   the role's permissions it holds — the impersonation every later call
+//!   makes. It also runs on its own at launch for a project that is signed
+//!   in, so the badge says how the connection stands rather than that
+//!   nobody has asked.
 //!
 //! Both console steps run wrapped (`RunInTerminal { wrapped: true }`), in
 //! the IDE's own context and never an environment's container: the
 //! sign-in is IDE state, and it must not land where an agent runs. The
 //! tabs run a command line that strips every inherited sign-in first
 //! (`Gcloud::terminal_argv`), since a tab can only add to its environment.
-//!
-//! The group is the project's rather than any one agent's, so it is in
-//! every chat's shade: what it sets up serves the GLM-5.3 route now and
-//! the substrate's cloud environments later.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use adw::prelude::*;
 use gtk::glib;
+use gtk::prelude::*;
 
-use crate::chat::{Verdict, HEADING_GAP};
+use crate::chat::Verdict;
 use taste_gcp::{gcloud, project, rest, setup};
 
 /// The console tab titles, which the window routes back here when the tab
@@ -42,18 +49,33 @@ use taste_gcp::{gcloud, project, rest, setup};
 pub const SIGN_IN_TITLE: &str = "Google Cloud Sign In";
 pub const SETUP_TITLE: &str = "Google Cloud Setup";
 
+/// What the connection contributes to the cloud's badge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CloudLight {
+    /// Ready, or never set up: nothing for the user to look at.
+    Quiet,
+    /// Under way, or waiting on the user.
+    Waiting,
+    /// The connection failed.
+    Failed,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
     SignIn,
     SetUp,
 }
 
+type LightHook = Rc<dyn Fn(CloudLight, &str)>;
+
 pub struct CloudForm {
-    pub group: gtk::Box,
-    project: adw::EntryRow,
-    sign_in: adw::ButtonRow,
-    set_up: adw::ButtonRow,
-    test: adw::ButtonRow,
+    pub widget: gtk::Box,
+    scope: gtk::Label,
+    actions: gtk::Box,
+    project: gtk::Entry,
+    sign_in: gtk::Button,
+    set_up: gtk::Button,
+    test: gtk::Button,
     status: gtk::Box,
     status_dot: gtk::Box,
     status_text: gtk::Label,
@@ -61,76 +83,72 @@ pub struct CloudForm {
     events: taste_core::EventBus,
     /// Who is signed in to the project's gcloud, as of the last look.
     account: RefCell<Option<String>>,
-    /// A step is running; the buttons wait for it.
+    /// A step is running; the actions wait for it.
     busy: Cell<bool>,
-    /// A probe has posed the group; nothing real overwrites it.
+    /// A probe has posed the section; nothing real overwrites it.
     posed: Cell<bool>,
+    on_light: RefCell<Option<LightHook>>,
+}
+
+/// One action, as a popover menu item is: flat, full width, an icon and a
+/// label at its start.
+fn menu_item(icon: &str, label: &str, tooltip: &str) -> gtk::Button {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    content.append(&gtk::Image::from_icon_name(icon));
+    content.append(&gtk::Label::builder().label(label).xalign(0.0).build());
+    gtk::Button::builder()
+        .child(&content)
+        .css_classes(["flat", "cloud-action"])
+        .tooltip_text(tooltip)
+        .build()
 }
 
 impl CloudForm {
     pub fn new(state_dir: PathBuf, events: taste_core::EventBus) -> Rc<Self> {
         let heading = gtk::Label::builder()
             .label("Google Cloud")
-            .css_classes(["dim-label", "caption-heading"])
+            .css_classes(["heading", "dim-label"])
             .xalign(0.0)
-            .margin_start(8)
-            .margin_top(12)
-            .margin_bottom(HEADING_GAP)
             .build();
         let scope = gtk::Label::builder()
             .label(
-                "This project's own sign-in, for its cloud machines. The IDE runs its own copy \
-                 of gcloud and keeps the sign-in in its state for this project, never in the \
-                 checkout.",
+                "This project's own sign-in, for its cloud machines. Kept in the IDE's state \
+                 for this project, never in the checkout.",
             )
             .css_classes(["caption", "dim-label"])
             .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(40)
+            .max_width_chars(34)
             .xalign(0.0)
-            .margin_start(8)
-            .margin_bottom(6)
             .build();
-        let project = adw::EntryRow::builder().title("Project ID").build();
-        let sign_in = adw::ButtonRow::builder()
-            .title("Sign in with Google")
-            .start_icon_name("avatar-default-symbolic")
-            .tooltip_text(
-                "Runs gcloud's browser sign-in in a console tab, into this project's own \
-                 configuration; fetches the IDE's own gcloud first if it is not there yet",
-            )
+        let project = gtk::Entry::builder()
+            .placeholder_text("Project ID, such as my-project-123")
             .build();
-        let set_up = adw::ButtonRow::builder()
-            .title("Set up the project")
-            .start_icon_name("emblem-system-symbolic")
-            .tooltip_text(
-                "Runs the setup (build-aux/gcp-setup.sh) in a console tab as you: the APIs, a \
-                 role of exactly what the IDE calls, and a keyless service account holding it \
-                 that you may act as",
-            )
-            .build();
-        let test = adw::ButtonRow::builder()
-            .title("Test")
-            .start_icon_name("checkbox-checked-symbolic")
-            .tooltip_text(
-                "Asks Google, as the IDE's service account, which of the permissions it needs \
-                 it holds; creates nothing",
-            )
-            .build();
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
-            .build();
-        for row in [
-            project.clone().upcast::<gtk::Widget>(),
-            sign_in.clone().upcast(),
-            set_up.clone().upcast(),
-            test.clone().upcast(),
-        ] {
-            list.append(&row);
-        }
-        // The verdict line the shade's other groups use: a light in a
-        // square slot, the sentence in the wide column beside it.
+        let sign_in = menu_item(
+            "avatar-default-symbolic",
+            "Sign In with Google…",
+            "Runs gcloud's browser sign-in in a console tab, into this project's own \
+             configuration; fetches the IDE's own gcloud first if it is not there yet",
+        );
+        let set_up = menu_item(
+            "emblem-system-symbolic",
+            "Set Up Project…",
+            "Runs the setup (build-aux/gcp-setup.sh) in a console tab as you: the APIs, a role \
+             of exactly what the IDE calls, and a keyless service account holding it that you \
+             may act as",
+        );
+        let test = menu_item(
+            "network-transmit-receive-symbolic",
+            "Test Connection",
+            "Asks Google, as the IDE's service account, which of the permissions it needs it \
+             holds; creates nothing",
+        );
+        let actions = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        actions.append(&sign_in);
+        actions.append(&set_up);
+        actions.append(&test);
+
+        // The verdict line the IDE's other forms use: a light in a square
+        // slot, the sentence in the wide column beside it.
         let status_dot = gtk::Box::builder().css_classes(["env-dot", "off"]).build();
         let status_slot = crate::filetree::leading_slot(&status_dot);
         status_slot.set_valign(gtk::Align::Center);
@@ -138,7 +156,7 @@ impl CloudForm {
             .css_classes(["caption", "dim-label"])
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(40)
+            .max_width_chars(34)
             .xalign(0.0)
             .hexpand(true)
             .selectable(true)
@@ -146,25 +164,23 @@ impl CloudForm {
         let status = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
-            .margin_start(8)
-            .margin_top(6)
             .visible(false)
             .build();
         status.append(&status_slot);
         status.append(&status_text);
-        let group = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_bottom(6)
-            .build();
-        group.append(&heading);
-        group.append(&scope);
-        group.append(&list);
-        group.append(&status);
+
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        widget.append(&heading);
+        widget.append(&scope);
+        widget.append(&project);
+        widget.append(&actions);
+        let (scope, actions) = (scope.clone(), actions.clone());
+        widget.append(&status);
 
         let form = Rc::new(Self {
-            group,
+            widget,
+            scope,
+            actions,
             project,
             sign_in,
             set_up,
@@ -177,6 +193,7 @@ impl CloudForm {
             account: RefCell::new(None),
             busy: Cell::new(false),
             posed: Cell::new(false),
+            on_light: RefCell::new(None),
         });
         let weak = Rc::downgrade(&form);
         form.project.connect_changed(move |_| {
@@ -185,19 +202,19 @@ impl CloudForm {
             }
         });
         let weak = Rc::downgrade(&form);
-        form.sign_in.connect_activated(move |_| {
+        form.sign_in.connect_clicked(move |_| {
             if let Some(form) = weak.upgrade() {
                 form.start(Step::SignIn);
             }
         });
         let weak = Rc::downgrade(&form);
-        form.set_up.connect_activated(move |_| {
+        form.set_up.connect_clicked(move |_| {
             if let Some(form) = weak.upgrade() {
                 form.start(Step::SetUp);
             }
         });
         let weak = Rc::downgrade(&form);
-        form.test.connect_activated(move |_| {
+        form.test.connect_clicked(move |_| {
             if let Some(form) = weak.upgrade() {
                 form.run_test();
             }
@@ -206,6 +223,41 @@ impl CloudForm {
         form
     }
 
+    /// The popover just opened, and GTK focused the project field and
+    /// selected all of it, which reads as a field about to be overwritten.
+    /// The caret goes to the end instead; the focus stays, for the keyboard.
+    pub fn popped_up(&self) {
+        let project = self.project.clone();
+        glib::idle_add_local_once(move || {
+            let end = project.text_length() as i32;
+            project.select_region(end, end);
+        });
+    }
+
+    /// The window is closing: the section shows where the connection
+    /// stands — its header and its verdict — and nothing that would start
+    /// anything new, which at a close is only noise.
+    pub fn freeze(&self) {
+        self.busy.set(true);
+        self.sync_sensitivity();
+        for part in [
+            self.scope.upcast_ref::<gtk::Widget>(),
+            self.project.upcast_ref(),
+            self.actions.upcast_ref(),
+        ] {
+            part.set_visible(false);
+        }
+        self.status_text.set_selectable(false);
+    }
+
+    /// Who hears what the connection is saying: the cloud's badge.
+    pub fn set_on_light(&self, hook: impl Fn(CloudLight, &str) + 'static) {
+        *self.on_light.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// Say one thing under the actions, and tell the badge what it means.
+    /// Asking for a project nobody has named is quiet: a project with no
+    /// cloud is not one with a problem.
     fn say(&self, verdict: Verdict, text: &str) {
         for class in ["off", "green", "red", "amber"] {
             self.status_dot.remove_css_class(class);
@@ -213,9 +265,20 @@ impl CloudForm {
         self.status_dot.add_css_class(verdict.class());
         self.status_text.set_label(text);
         self.status.set_visible(true);
+        let light = match verdict {
+            Verdict::Pass => CloudLight::Quiet,
+            Verdict::Fail => CloudLight::Failed,
+            Verdict::Pending => CloudLight::Waiting,
+            Verdict::Attention if self.project_id().is_some() => CloudLight::Waiting,
+            Verdict::Attention => CloudLight::Quiet,
+        };
+        let hook = self.on_light.borrow().clone();
+        if let Some(hook) = hook {
+            hook(light, text);
+        }
     }
 
-    /// The project row, if it names a project.
+    /// The project field, if it names a project.
     fn project_id(&self) -> Option<String> {
         let id = self.project.text().trim().to_string();
         setup::valid_project_id(&id).then_some(id)
@@ -238,7 +301,8 @@ impl CloudForm {
     }
 
     /// Read what is on file and who is signed in, off this thread, and say
-    /// where the project stands.
+    /// where the project stands — testing the connection when there is a
+    /// sign-in to test, so the badge is an answer rather than a guess.
     pub fn sync(self: &Rc<Self>) {
         if self.posed.get() || self.busy.get() {
             return;
@@ -280,15 +344,9 @@ impl CloudForm {
                 ),
                 (Some(_), None) => form.say(
                     Verdict::Attention,
-                    "Not signed in — Sign in with Google opens a console tab",
+                    "Not signed in — Sign In with Google opens a console tab",
                 ),
-                (Some(_), Some(account)) => form.say(
-                    Verdict::Attention,
-                    &format!(
-                        "Signed in as {account} · Test checks what the IDE's service account \
-                         may do"
-                    ),
-                ),
+                (Some(_), Some(_)) => form.run_test(),
             }
         });
     }
@@ -383,8 +441,8 @@ impl CloudForm {
     }
 
     /// A console step's tab exited (`Event::CommandTabExited`). A sign-in
-    /// is followed by a look at who signed in; a setup by the test, since
-    /// whether the setup took is what the test asks.
+    /// is followed by a look at who signed in, and a setup by the test,
+    /// since whether the setup took is what the test asks.
     pub fn step_finished(self: &Rc<Self>, title: &str, status: i32) {
         let step = match title {
             SIGN_IN_TITLE => Step::SignIn,
@@ -452,32 +510,24 @@ impl CloudForm {
                         .filter(|p| !held.iter().any(|h| h == p))
                         .collect();
                     if missing.is_empty() {
-                        form.say(
-                            Verdict::Pass,
-                            &format!(
-                                "Ready · {account} holds all {} permissions the IDE uses in \
-                                 {project_id}",
-                                setup::PERMISSIONS.len()
-                            ),
-                        );
+                        form.say(Verdict::Pass, &ready_sentence(&account, &project_id));
                     } else {
                         form.say(Verdict::Fail, &missing_sentence(&missing));
                     }
                 }
                 Err(error) => form.say(
                     Verdict::Fail,
-                    &format!("{error:#} — Set up the project, then test again"),
+                    &format!("{error:#} — Set Up Project, then test again"),
                 ),
             }
         });
     }
 
-    /// `TASTE_PROBE_CLOUD=<variant>`: the group posed in a state a shot
+    /// `TASTE_PROBE_CLOUD=<variant>`: the section posed in a state a shot
     /// otherwise needs a Google account for. Nothing is read or written.
     pub fn pose_for_probe(&self, variant: &str) {
         self.posed.set(true);
         self.project.set_text("my-project-123");
-        let account = "taste-ide@my-project-123.iam.gserviceaccount.com";
         match variant {
             "unset" => {
                 self.project.set_text("");
@@ -496,14 +546,6 @@ impl CloudForm {
                     ),
                 );
             }
-            "signed-in" => {
-                *self.account.borrow_mut() = Some("david@example.com".into());
-                self.say(
-                    Verdict::Attention,
-                    "Signed in as david@example.com · Test checks what the IDE's service \
-                     account may do",
-                );
-            }
             "missing" => {
                 *self.account.borrow_mut() = Some("david@example.com".into());
                 self.say(
@@ -519,16 +561,22 @@ impl CloudForm {
                 *self.account.borrow_mut() = Some("david@example.com".into());
                 self.say(
                     Verdict::Pass,
-                    &format!(
-                        "Ready · {account} holds all {} permissions the IDE uses in \
-                         my-project-123",
-                        setup::PERMISSIONS.len()
-                    ),
+                    &ready_sentence(&setup::service_account("my-project-123"), "my-project-123"),
                 );
             }
         }
         self.sync_sensitivity();
     }
+}
+
+/// The account by its id, `taste-ide`: its full address wraps a narrow
+/// popover mid-word, and what it is called says which account it is.
+fn ready_sentence(_account: &str, project_id: &str) -> String {
+    format!(
+        "Ready · {} holds all {} permissions the IDE uses in {project_id}",
+        setup::ACCOUNT,
+        setup::PERMISSIONS.len()
+    )
 }
 
 /// What a test that found permissions missing says: how many, the first
@@ -541,7 +589,7 @@ fn missing_sentence(missing: &[&str]) -> String {
         _ => format!("{}, and {more} more", shown.join(", ")),
     };
     format!(
-        "Missing {} of {}: {listed} — Set up the project again",
+        "Missing {} of {}: {listed} — Set Up Project again",
         missing.len(),
         setup::PERMISSIONS.len()
     )
@@ -556,10 +604,16 @@ mod tests {
         assert_eq!(
             missing_sentence(&["a.b.c", "d.e.f"]),
             format!(
-                "Missing 2 of {}: a.b.c, d.e.f — Set up the project again",
+                "Missing 2 of {}: a.b.c, d.e.f — Set Up Project again",
                 setup::PERMISSIONS.len()
             )
         );
         assert!(missing_sentence(&["a", "b", "c", "d", "e"]).contains("a, b, c, and 2 more"));
+    }
+
+    #[test]
+    fn the_worst_light_wins() {
+        assert!(CloudLight::Failed > CloudLight::Waiting);
+        assert!(CloudLight::Waiting > CloudLight::Quiet);
     }
 }

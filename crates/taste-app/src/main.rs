@@ -17,6 +17,7 @@ mod chat;
 mod chat_column;
 mod chatdoc;
 mod chats;
+mod closing;
 mod cloud_form;
 mod command_completion;
 mod compose;
@@ -797,6 +798,19 @@ fn main() -> glib::ExitCode {
                  .env-badge.green { background-color: @success_color; }\n\
                  .env-badge.amber { background-color: @warning_color; }\n\
                  .env-badge.red { background-color: @error_color; }\n\
+                 /* The title bar cloud's badge (syncstatus.rs): the \
+                    env-badge's shape, a pixel larger because it sits on a \
+                    16px glyph, ringed in the header bar's own background. */\n\
+                 .sync-badge { min-width: 6px; min-height: 6px; \
+                   border-radius: 999px; \
+                   box-shadow: 0 0 0 1.5px var(--headerbar-bg-color); }\n\
+                 .sync-badge.green { background-color: @success_color; }\n\
+                 .sync-badge.amber { background-color: @warning_color; }\n\
+                 .sync-badge.red { background-color: @error_color; }\n\
+                 /* The cloud popover's actions, as a popover menu's items \
+                    are (cloud_form.rs): flat, label at the start, a menu \
+                    item's weight and padding. */\n\
+                 .cloud-action { padding: 6px 8px; font-weight: normal; }\n\
                  .env-dot.green { background-color: @success_color; }\n\
                  .env-dot.amber { background-color: @warning_color; }\n\
                  .env-dot.red { background-color: @error_color; }\n\

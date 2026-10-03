@@ -124,15 +124,19 @@ impl Step {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Status {
+pub(crate) enum Status {
     Pending,
     Active,
     Done,
     Failed,
 }
 
-struct StepRow {
-    row: gtk::Box,
+/// One step of a checklist: a mark (a ring, a spinner, a check, or the
+/// error sign), the step's name, and under it what it is doing or what it
+/// came to. The closing page (`closing.rs`) lists its steps with it too,
+/// so a window's start and its end read as one kind of page.
+pub(crate) struct StepRow {
+    pub(crate) row: gtk::Box,
     icon: gtk::Image,
     spinner: gtk::Spinner,
     title: gtk::Label,
@@ -144,6 +148,10 @@ struct StepRow {
 
 impl StepRow {
     fn new(step: Step) -> Self {
+        Self::titled(step.title())
+    }
+
+    pub(crate) fn titled(name: &str) -> Self {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let mark = gtk::Stack::builder()
             .hhomogeneous(true)
@@ -160,7 +168,7 @@ impl StepRow {
         mark.set_visible_child_name("icon");
         let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let title = gtk::Label::builder()
-            .label(step.title())
+            .label(name)
             .xalign(0.0)
             .wrap(true)
             .hexpand(true)
@@ -191,7 +199,13 @@ impl StepRow {
         this
     }
 
-    fn set(&self, status: Status, detail: Option<&str>) {
+    /// What a checked step came to, shown under its check.
+    pub(crate) fn conclude(&self, text: &str) {
+        self.conclusion.replace(Some(text.to_string()));
+        self.set(Status::Done, None);
+    }
+
+    pub(crate) fn set(&self, status: Status, detail: Option<&str>) {
         self.status.set(status);
         let mark = self.icon.parent().and_downcast::<gtk::Stack>();
         for class in [

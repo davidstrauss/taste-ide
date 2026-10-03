@@ -1,49 +1,79 @@
-//! The title bar's sync status: the user's folder and Personal's checkout
-//! kept in step (`taste_git::mirror`), as one icon and, on a click, the
-//! transfers under way and the ones just done.
+//! The title bar's cloud: the user's folder and Personal's checkout kept
+//! in step (`taste_git::mirror`), and the project's Google Cloud
+//! connection (`cloud_form.rs`), as one icon with a coloured badge and, on
+//! a click, one popover with the sync on top and the connection below it.
 //!
-//! Modelled on the file operations button of GNOME Files (David,
-//! 2026-09-23: "Use the GNOME file browser's file transfer UI as the
-//! basis"): a pie that fills as a transfer goes, in the header; a popover
-//! of rows, each a bold status line, a dim detail line, and a progress
-//! bar. Where Files hides the button when nothing is moving, this one
-//! stays, because "in step" and "these disagree" are states worth seeing
-//! at a glance, and a mirror that stopped is exactly when the button must
-//! not be gone.
+//! The badge is the worse of the two (David, 2026-10-03: "a cloud with a
+//! green badge when all sync and auth is looking good. Change to yellow if
+//! sync needs to send data around still. Use red if sync has a conflict or
+//! if a cloud connection has failed"): green when the folder is in step
+//! and the connection is ready or was never set up, yellow while a pass
+//! has something to move or the connection is under way or waiting on the
+//! user, red on a conflict, a sync that failed, or a connection that did.
+//!
+//! The sync half is modelled on the file operations button of GNOME Files
+//! (David, 2026-09-23: "Use the GNOME file browser's file transfer UI as
+//! the basis"): rows of a bold status line, a dim detail line, and a
+//! progress bar. The popover as a whole is laid out the way a GNOME
+//! popover menu is, sections under dim headers with a separator between.
+//! The button is always there: the connection lives behind it whether or
+//! not the folder mirrors anything, and "in step" and "these disagree" are
+//! states worth seeing at a glance.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Instant;
 
 use adw::prelude::*;
-use gtk::glib;
 use taste_core::FolderSync;
+
+use crate::cloud_form::{CloudForm, CloudLight};
 
 /// Finished passes kept in the popover, newest first.
 const HISTORY: usize = 5;
 
-#[derive(Clone)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Face {
     /// Nothing has been heard yet, or the last pass moved nothing.
     InStep,
     Pending,
-    Running {
-        fraction: Option<f64>,
-    },
+    Running,
     Conflict,
     Failed,
 }
 
+impl Face {
+    fn light(self) -> CloudLight {
+        match self {
+            Face::InStep => CloudLight::Quiet,
+            Face::Pending | Face::Running => CloudLight::Waiting,
+            Face::Conflict | Face::Failed => CloudLight::Failed,
+        }
+    }
+
+    fn sentence(self) -> &'static str {
+        match self {
+            Face::InStep => "Your folder is in step with Personal",
+            Face::Pending => "A change was seen — syncing in a moment",
+            Face::Running => "Syncing your folder with Personal",
+            Face::Conflict => "Your folder and Personal disagree — click to resolve",
+            Face::Failed => "Your folder is not in step with Personal — click for why",
+        }
+    }
+}
+
 pub struct SyncStatus {
     pub widget: gtk::MenuButton,
-    pie: gtk::DrawingArea,
-    icon: gtk::Image,
-    face_stack: gtk::Stack,
-    face: RefCell<Face>,
-    /// The turning wedge's angle, for a pass with no count to fill by:
-    /// shared with the tick callback that turns it.
-    spin: Rc<Cell<f64>>,
-    ticking: RefCell<Option<gtk::TickCallbackId>>,
+    badge: gtk::Box,
+    face: Cell<Face>,
+    /// The folder mirrors a checkout in a VM, so the sync half has
+    /// something to say.
+    syncing: Cell<bool>,
+    sync_section: gtk::Box,
+    separator: gtk::Separator,
+    content: gtk::Box,
+    cloud_light: Cell<CloudLight>,
+    cloud_said: RefCell<String>,
     current_title: gtk::Label,
     current_detail: gtk::Label,
     current_bar: gtk::ProgressBar,
@@ -57,24 +87,29 @@ pub struct SyncStatus {
 
 impl SyncStatus {
     pub fn new() -> Rc<Self> {
-        let pie = gtk::DrawingArea::builder()
-            .content_width(16)
-            .content_height(16)
+        // The IDE's own cloud, with a dot over its lower right: the stock
+        // theme has no cloud with room for a badge.
+        let icon = gtk::Image::builder()
+            .icon_name("taste-cloud-symbolic")
+            .pixel_size(16)
             .build();
-        let icon = gtk::Image::builder().pixel_size(16).build();
-        let face_stack = gtk::Stack::new();
-        face_stack.add_named(&icon, Some("icon"));
-        face_stack.add_named(&pie, Some("pie"));
+        let badge = gtk::Box::builder()
+            .css_classes(["sync-badge", "green"])
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::End)
+            .can_target(false)
+            .build();
+        let face = gtk::Overlay::builder().child(&icon).build();
+        face.add_overlay(&badge);
         let widget = gtk::MenuButton::builder()
-            .child(&face_stack)
+            .child(&face)
             .css_classes(["flat", "sync-status"])
-            .visible(false)
             .build();
         widget.set_widget_name("sync-status");
 
         let heading = gtk::Label::builder()
             .label("Local ↔ Virtualized Container Sync")
-            .css_classes(["heading"])
+            .css_classes(["heading", "dim-label"])
             .xalign(0.0)
             .build();
 
@@ -122,6 +157,15 @@ impl SyncStatus {
 
         let history_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
 
+        let sync_section = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        sync_section.append(&heading);
+        sync_section.append(&conflict_row);
+        sync_section.append(&current_row);
+        sync_section.append(&history_box);
+        sync_section.set_visible(false);
+        let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+        separator.set_visible(false);
+
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -131,10 +175,8 @@ impl SyncStatus {
             .margin_end(12)
             .width_request(300)
             .build();
-        content.append(&heading);
-        content.append(&conflict_row);
-        content.append(&current_row);
-        content.append(&history_box);
+        content.append(&sync_section);
+        content.append(&separator);
         let popover = gtk::Popover::builder().child(&content).build();
         // A probe target of its own: `window.sync-transfers`.
         popover.set_widget_name("sync-transfers");
@@ -142,12 +184,14 @@ impl SyncStatus {
 
         let this = Rc::new(Self {
             widget,
-            pie,
-            icon,
-            face_stack,
-            face: RefCell::new(Face::InStep),
-            spin: Rc::new(Cell::new(0.0)),
-            ticking: RefCell::new(None),
+            badge,
+            face: Cell::new(Face::InStep),
+            syncing: Cell::new(false),
+            sync_section,
+            separator,
+            content,
+            cloud_light: Cell::new(CloudLight::Quiet),
+            cloud_said: RefCell::new(String::new()),
             current_title,
             current_detail,
             current_bar,
@@ -158,13 +202,6 @@ impl SyncStatus {
             history: RefCell::new(Vec::new()),
             on_resolve: RefCell::new(None),
         });
-        {
-            let weak = Rc::downgrade(&this);
-            this.pie.set_draw_func(move |area, cr, width, height| {
-                let Some(this) = weak.upgrade() else { return };
-                this.draw_pie(area, cr, width, height);
-            });
-        }
         {
             let weak = Rc::downgrade(&this);
             resolve.connect_clicked(move |button| {
@@ -191,14 +228,56 @@ impl SyncStatus {
         this
     }
 
+    /// The project's Google Cloud connection, as the popover's second
+    /// section, lighting the badge with what it says.
+    pub fn attach_cloud(self: &Rc<Self>, cloud: &Rc<CloudForm>) {
+        self.content.append(&cloud.widget);
+        if let Some(popover) = self.widget.popover() {
+            let cloud = Rc::downgrade(cloud);
+            popover.connect_show(move |_| {
+                if let Some(cloud) = cloud.upgrade() {
+                    cloud.popped_up();
+                }
+            });
+        }
+        let weak = Rc::downgrade(self);
+        cloud.set_on_light(move |light, said| {
+            if let Some(this) = weak.upgrade() {
+                this.cloud_light.set(light);
+                *this.cloud_said.borrow_mut() = said.to_string();
+                this.draw_badge();
+            }
+        });
+    }
+
+    /// The popover's content, for the closing page to show over the whole
+    /// window (`closing.rs`): the same widgets, so the transfer under way
+    /// keeps drawing where the user can see it. The button has nothing to
+    /// open after this, which is right, since the window is going.
+    pub fn take_over(&self) -> gtk::Widget {
+        if let Some(popover) = self.widget.popover() {
+            popover.popdown();
+            popover.set_child(None::<&gtk::Widget>);
+        }
+        self.content.set_width_request(-1);
+        self.content.set_margin_start(0);
+        self.content.set_margin_end(0);
+        self.content.clone().upcast()
+    }
+
     /// What Resolve… does: the window asks which side to keep.
     pub fn set_on_resolve(&self, hook: impl Fn() + 'static) {
         *self.on_resolve.borrow_mut() = Some(Rc::new(hook));
     }
 
-    /// The folder mirrors a checkout in a VM, so there is a sync to show.
+    /// The folder mirrors a checkout in a VM, so the sync half has
+    /// something to say.
     pub fn show(&self) {
-        self.widget.set_visible(true);
+        if !self.syncing.replace(true) {
+            self.sync_section.set_visible(true);
+            self.separator.set_visible(true);
+            self.draw_badge();
+        }
     }
 
     /// One moment of the sync.
@@ -206,7 +285,7 @@ impl SyncStatus {
         self.show();
         match event {
             FolderSync::Pending => {
-                if !matches!(*self.face.borrow(), Face::Running { .. } | Face::Conflict) {
+                if !matches!(self.face.get(), Face::Running | Face::Conflict) {
                     self.set_face(Face::Pending);
                 }
             }
@@ -225,8 +304,8 @@ impl SyncStatus {
                     }
                 }
                 self.current_row.set_visible(true);
-                if !matches!(*self.face.borrow(), Face::Conflict) {
-                    self.set_face(Face::Running { fraction });
+                if self.face.get() != Face::Conflict {
+                    self.set_face(Face::Running);
                 }
             }
             FolderSync::Done { summary } => {
@@ -234,14 +313,14 @@ impl SyncStatus {
                 if let Some(summary) = summary {
                     self.remember(summary.clone(), false);
                 }
-                if !matches!(*self.face.borrow(), Face::Conflict) {
+                if self.face.get() != Face::Conflict {
                     self.set_face(Face::InStep);
                 }
             }
             FolderSync::Failed { reason } => {
                 self.current_row.set_visible(false);
                 self.remember(format!("Not in step: {reason}"), true);
-                if !matches!(*self.face.borrow(), Face::Conflict) {
+                if self.face.get() != Face::Conflict {
                     self.set_face(Face::Failed);
                 }
             }
@@ -253,7 +332,7 @@ impl SyncStatus {
         self.show();
         if paths.is_empty() {
             self.conflict_row.set_visible(false);
-            if matches!(*self.face.borrow(), Face::Conflict) {
+            if self.face.get() == Face::Conflict {
                 self.set_face(Face::InStep);
             }
             return;
@@ -325,102 +404,44 @@ impl SyncStatus {
     }
 
     fn set_face(&self, face: Face) {
-        let (icon, tooltip, pie) = match &face {
-            Face::InStep => (
-                // The IDE's own: the stock theme has no sync emblem, and the
-                // one first reached for drew as the missing-icon placeholder.
-                "taste-sync-symbolic",
-                "Your folder is in step with Personal",
-                false,
-            ),
-            Face::Pending => ("", "A change was seen — syncing in a moment", true),
-            Face::Running { .. } => ("", "Syncing your folder with Personal", true),
-            Face::Conflict => (
-                "dialog-warning-symbolic",
-                "Your folder and Personal disagree — click to resolve",
-                false,
-            ),
-            Face::Failed => (
-                "dialog-error-symbolic",
-                "Your folder is not in step with Personal — click for why",
-                false,
-            ),
-        };
-        *self.face.borrow_mut() = face.clone();
-        self.widget.set_tooltip_text(Some(tooltip));
-        for class in ["warning", "error"] {
-            self.widget.remove_css_class(class);
-        }
-        match face {
-            Face::Conflict => self.widget.add_css_class("warning"),
-            Face::Failed => self.widget.add_css_class("error"),
-            _ => {}
-        }
-        if pie {
-            self.face_stack.set_visible_child_name("pie");
-            self.start_ticking();
-            self.pie.queue_draw();
+        self.face.set(face);
+        self.draw_badge();
+    }
+
+    /// The badge is the worse of the sync and the connection, and the
+    /// tooltip says both.
+    fn draw_badge(&self) {
+        let sync = if self.syncing.get() {
+            self.face.get().light()
         } else {
-            self.icon.set_icon_name(Some(icon));
-            self.face_stack.set_visible_child_name("icon");
-            self.stop_ticking();
-        }
-    }
-
-    /// The wedge turns while a pass has no count to fill the pie by.
-    fn start_ticking(&self) {
-        if self.ticking.borrow().is_some() {
-            return;
-        }
-        let spin = self.spin.clone();
-        let id = self.pie.add_tick_callback(move |area, clock| {
-            let seconds = clock.frame_time() as f64 / 1_000_000.0;
-            spin.set((seconds * 1.5) % std::f64::consts::TAU);
-            area.queue_draw();
-            glib::ControlFlow::Continue
-        });
-        *self.ticking.borrow_mut() = Some(id);
-    }
-
-    fn stop_ticking(&self) {
-        if let Some(id) = self.ticking.borrow_mut().take() {
-            id.remove();
-        }
-    }
-
-    fn draw_pie(&self, area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: i32) {
-        let color = area.color();
-        let (cx, cy) = (f64::from(w) / 2.0, f64::from(h) / 2.0);
-        let r = cx.min(cy) - 1.5;
-        cr.set_source_rgba(
-            f64::from(color.red()),
-            f64::from(color.green()),
-            f64::from(color.blue()),
-            0.3,
-        );
-        cr.set_line_width(1.5);
-        cr.arc(cx, cy, r, 0.0, std::f64::consts::TAU);
-        let _ = cr.stroke();
-        cr.set_source_rgba(
-            f64::from(color.red()),
-            f64::from(color.green()),
-            f64::from(color.blue()),
-            f64::from(color.alpha()),
-        );
-        let top = -std::f64::consts::FRAC_PI_2;
-        let (start, end) = match &*self.face.borrow() {
-            Face::Running { fraction: Some(f) } => {
-                (top, top + std::f64::consts::TAU * f.clamp(0.02, 1.0))
-            }
-            _ => {
-                let angle = self.spin.get();
-                (top + angle, top + angle + std::f64::consts::FRAC_PI_2)
-            }
+            CloudLight::Quiet
         };
-        cr.move_to(cx, cy);
-        cr.arc(cx, cy, r - 1.5, start, end);
-        cr.close_path();
-        let _ = cr.fill();
+        let light = sync.max(self.cloud_light.get());
+        for class in ["green", "amber", "red"] {
+            self.badge.remove_css_class(class);
+        }
+        self.badge.add_css_class(match light {
+            CloudLight::Quiet => "green",
+            CloudLight::Waiting => "amber",
+            CloudLight::Failed => "red",
+        });
+        let mut said = Vec::new();
+        if self.syncing.get() {
+            said.push(self.face.get().sentence().to_string());
+        }
+        let cloud = self.cloud_said.borrow();
+        let cloud = cloud
+            .split(" · ")
+            .next()
+            .and_then(|s| s.split(" — ").next())
+            .unwrap_or("");
+        if !cloud.is_empty() {
+            said.push(format!("Google Cloud: {cloud}"));
+        }
+        if said.is_empty() {
+            said.push("Sync and Google Cloud".into());
+        }
+        self.widget.set_tooltip_text(Some(&said.join("\n")));
     }
 }
 
