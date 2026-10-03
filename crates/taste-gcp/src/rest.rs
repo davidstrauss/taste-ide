@@ -63,6 +63,7 @@ pub struct Endpoints {
     /// the XML API's, on [`crate::signed::HOST`].
     pub storage: String,
     pub iam_credentials: String,
+    pub cloud_quotas: String,
 }
 
 impl Default for Endpoints {
@@ -73,6 +74,7 @@ impl Default for Endpoints {
             resource_manager: "https://cloudresourcemanager.googleapis.com/v1".into(),
             storage: "https://storage.googleapis.com/storage/v1".into(),
             iam_credentials: "https://iamcredentials.googleapis.com/v1".into(),
+            cloud_quotas: "https://cloudquotas.googleapis.com/v1".into(),
         }
     }
 }
@@ -171,6 +173,13 @@ impl ApiError {
             || said(&self.code)
             || (self.message.contains("machineType") && self.message.contains("does not exist"))
             || self.message.contains("does not have enough resources")
+    }
+
+    /// A quota stopped the create: Compute says which, and its limit.
+    pub fn is_quota_exceeded(&self) -> bool {
+        self.reason.as_deref() == Some("QUOTA_EXCEEDED")
+            || self.code.as_deref() == Some("QUOTA_EXCEEDED")
+            || self.message.contains("Quota '")
     }
 
     pub fn is_already_exists(&self) -> bool {
@@ -424,6 +433,28 @@ impl Gcp {
         }
     }
 
+    /// One Compute quota's limits, by its Cloud Quotas id, or `None` if
+    /// the API knows no such quota — which it says with a 400, "Quota id
+    /// not found" (G4's vCPUs, 2026-10-03), rather than a 404.
+    pub async fn quota_info(&self, project: &str, quota_id: &str) -> Result<Option<Value>> {
+        let url = format!(
+            "{}/projects/{project}/locations/global/services/compute.googleapis.com/quotaInfos/{quota_id}",
+            self.endpoints.cloud_quotas
+        );
+        match self.call(Method::GET, &url, None).await {
+            Ok(info) => Ok(Some(info)),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e)
+                if api_error(&e).is_some_and(|a| {
+                    a.status == 400 && a.message.contains("Quota id not found")
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// `payload`, signed with `account`'s Google-held key through IAM —
     /// no key ever leaves Google, and none is ever made.
     pub async fn sign_blob(&self, account: &str, payload: &[u8]) -> Result<Vec<u8>> {
@@ -517,6 +548,10 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
 
 pub fn is_unavailable_machine(e: &anyhow::Error) -> bool {
     api_error(e).is_some_and(ApiError::is_unavailable_machine)
+}
+
+pub fn is_quota_exceeded(e: &anyhow::Error) -> bool {
+    api_error(e).is_some_and(ApiError::is_quota_exceeded)
 }
 
 pub fn is_already_exists(e: &anyhow::Error) -> bool {
@@ -615,6 +650,7 @@ pub(crate) mod mock {
                 resource_manager: format!("{base}/v1"),
                 storage: format!("{base}/storage/v1"),
                 iam_credentials: format!("{base}/iam/v1"),
+                cloud_quotas: format!("{base}/quotas/v1"),
             },
             asked,
         }

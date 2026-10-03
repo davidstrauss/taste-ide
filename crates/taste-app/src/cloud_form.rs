@@ -23,9 +23,13 @@
 //!   account holding it, and the user's leave to act as it.
 //! - **Test Connection** asks Google, *as that service account*, which of
 //!   the role's permissions it holds — the impersonation every later call
-//!   makes. It also runs on its own at launch for a project that is signed
-//!   in, so the badge says how the connection stands rather than that
-//!   nobody has asked.
+//!   makes — and then whether the project's quotas let GLM-5.3's machines
+//!   be created at all (David, 2026-10-03: "I want to know, as a user, if
+//!   a quota is too low"), naming each one short with its limit and the
+//!   need, and offering **Request More Quota…**, Google's own page for
+//!   asking. It also runs on its own at launch for a project that is
+//!   signed in, so the badge says how the connection stands rather than
+//!   that nobody has asked.
 //!
 //! Both console steps run wrapped (`RunInTerminal { wrapped: true }`), in
 //! the IDE's own context and never an environment's container: the
@@ -42,7 +46,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::chat::Verdict;
-use taste_gcp::{gcloud, project, rest, setup};
+use taste_gcp::{gcloud, model, project, quota, rest, setup};
 
 /// The console tab titles, which the window routes back here when the tab
 /// exits (`Event::CommandTabExited`).
@@ -76,6 +80,8 @@ pub struct CloudForm {
     sign_in: gtk::Button,
     set_up: gtk::Button,
     test: gtk::Button,
+    /// Google's quota page, offered only when a quota is short.
+    request_quota: gtk::Button,
     status: gtk::Box,
     status_dot: gtk::Box,
     status_text: gtk::Label,
@@ -145,10 +151,18 @@ impl CloudForm {
             "Asks Google, as the IDE's service account, which of the permissions it needs it \
              holds; creates nothing",
         );
+        let request_quota = menu_item(
+            "web-browser-symbolic",
+            "Request More Quota…",
+            "Opens Google's quota page for this project in your browser, where an increase \
+             is asked for",
+        );
+        request_quota.set_visible(false);
         let actions = gtk::Box::new(gtk::Orientation::Vertical, 0);
         actions.append(&sign_in);
         actions.append(&set_up);
         actions.append(&test);
+        actions.append(&request_quota);
 
         // The verdict line the IDE's other forms use: a light in a square
         // slot, the sentence in the wide column beside it.
@@ -188,6 +202,7 @@ impl CloudForm {
             sign_in,
             set_up,
             test,
+            request_quota,
             status,
             status_dot,
             status_text,
@@ -238,6 +253,19 @@ impl CloudForm {
                 form.run_test();
             }
         });
+        let weak = Rc::downgrade(&form);
+        form.request_quota.connect_clicked(move |_| {
+            let Some(form) = weak.upgrade() else { return };
+            let Some(project_id) = form.project_id() else {
+                return;
+            };
+            let window = form.widget.root().and_downcast::<gtk::Window>();
+            gtk::UriLauncher::new(&quota::console_url(&project_id)).launch(
+                window.as_ref(),
+                gtk::gio::Cancellable::NONE,
+                |_| {},
+            );
+        });
         form.sync_sensitivity();
         form
     }
@@ -279,6 +307,7 @@ impl CloudForm {
     /// gcloud's errors run to a paragraph, and a popover's status line is
     /// a sentence.
     fn say_more(&self, verdict: Verdict, text: &str, whole: Option<&str>) {
+        self.request_quota.set_visible(false);
         self.status_text.set_tooltip_text(whole);
         for class in ["off", "green", "red", "amber"] {
             self.status_dot.remove_css_class(class);
@@ -523,9 +552,23 @@ impl CloudForm {
             }
             let tokens = rest::TokenSource::gcloud(gcloud);
             let gcp = rest::Gcp::new(Arc::new(tokens), rest::Endpoints::default());
-            gcp.test_permissions(&project_for_task, setup::PERMISSIONS)
-                .await
-                .map(Some)
+            let held = gcp
+                .test_permissions(&project_for_task, setup::PERMISSIONS)
+                .await?;
+            let all_held = setup::PERMISSIONS
+                .iter()
+                .all(|p| held.iter().any(|h| h == p));
+            // The quotas are asked only of a role that may ask them.
+            let quotas = if all_held {
+                Some(
+                    glm_quotas(&gcp, &project_for_task)
+                        .await
+                        .map_err(|e| format!("{e:#}")),
+                )
+            } else {
+                None
+            };
+            Ok(Some((held, quotas)))
         });
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -544,17 +587,26 @@ impl CloudForm {
                         setup::ACCOUNT
                     ),
                 ),
-                Ok(Some(held)) => {
+                Ok(Some((held, quotas))) => {
                     let missing: Vec<&str> = setup::PERMISSIONS
                         .iter()
                         .copied()
                         .filter(|p| !held.iter().any(|h| h == p))
                         .collect();
                     form.retries.set(0);
-                    if missing.is_empty() {
-                        form.say(Verdict::Pass, &ready_sentence(&account, &project_id));
-                    } else {
+                    if !missing.is_empty() {
                         form.say(Verdict::Fail, &missing_sentence(&missing));
+                        return;
+                    }
+                    match quotas {
+                        Some(Ok(machines)) => form.say_quotas(&project_id, &machines),
+                        Some(Err(why)) => form.say_more(
+                            Verdict::Attention,
+                            "Ready, but the quotas could not be read — Set Up Project again, \
+                             which turns on the API they are read through",
+                            Some(&why),
+                        ),
+                        None => form.say(Verdict::Pass, &ready_sentence(&account, &project_id)),
                     }
                 }
                 Err(error) => {
@@ -603,6 +655,41 @@ impl CloudForm {
         });
     }
 
+    /// The test's last word when the permissions are all held: ready, or
+    /// ready but with quotas too low for the model's first machine — each
+    /// one short named in the line, every candidate's in its tooltip, and
+    /// Google's page for asking one click away.
+    fn say_quotas(&self, project_id: &str, machines: &[(String, Vec<quota::Shortfall>)]) {
+        let Some((first, short)) = machines.first() else {
+            self.say(Verdict::Pass, &ready_sentence("", project_id));
+            return;
+        };
+        if short.is_empty() {
+            self.say(Verdict::Pass, &ready_sentence("", project_id));
+            return;
+        }
+        let whole: Vec<String> = machines
+            .iter()
+            .map(|(machine, short)| {
+                if short.is_empty() {
+                    format!("{machine} fits the quotas.")
+                } else {
+                    format!("{}.", quota::sentence(machine, short))
+                }
+            })
+            .chain(std::iter::once(format!(
+                "Ask for more at {}",
+                quota::console_url(project_id)
+            )))
+            .collect();
+        self.say_more(
+            Verdict::Attention,
+            &quota_sentence(first, short),
+            Some(&whole.join("\n")),
+        );
+        self.request_quota.set_visible(true);
+    }
+
     /// `TASTE_PROBE_CLOUD=<variant>`: the section posed in a state a shot
     /// otherwise needs a Google account for. Nothing is read or written.
     pub fn pose_for_probe(&self, variant: &str) {
@@ -635,6 +722,34 @@ impl CloudForm {
                          which my-project-123 does not have yet",
                         setup::ACCOUNT
                     ),
+                );
+            }
+            "quota" => {
+                *self.account.borrow_mut() = Some("david@example.com".into());
+                let short = |label: &str, limit, amount| quota::Shortfall {
+                    need: quota::Need {
+                        quota_id: String::new(),
+                        dimensions: Vec::new(),
+                        amount,
+                        label: label.into(),
+                    },
+                    limit,
+                };
+                self.say_quotas(
+                    "my-project-123",
+                    &[
+                        (
+                            "c4-highmem-192".into(),
+                            vec![
+                                short("vCPUs in all regions", 32, 192),
+                                short("C4 vCPUs in us-central1", 24, 192),
+                            ],
+                        ),
+                        (
+                            "g4-standard-192".into(),
+                            vec![short("NVIDIA RTX PRO 6000 GPUs in us-central1", 0, 4)],
+                        ),
+                    ],
                 );
             }
             "missing" => {
@@ -671,6 +786,62 @@ const APPLY_RETRIES: u32 = 21;
 /// account — what a grant Google has not applied yet looks like.
 fn still_applying(said: &str) -> bool {
     said.contains("iam.serviceAccounts.getAccessToken") && said.contains("PERMISSION_DENIED")
+}
+
+/// GLM-5.3's machines, first choice first, each with the quotas too low
+/// for it in the region the machines go to.
+async fn glm_quotas(
+    gcp: &rest::Gcp,
+    project_id: &str,
+) -> anyhow::Result<Vec<(String, Vec<quota::Shortfall>)>> {
+    let spec = &model::GLM_5_3;
+    let mut machines = Vec::new();
+    for machine in std::iter::once(spec.machine.name).chain(spec.fallbacks.iter().copied()) {
+        let short = quota::shortfalls(gcp, project_id, model::DEFAULT_REGION, machine).await?;
+        machines.push((machine.to_string(), short));
+    }
+    Ok(machines)
+}
+
+/// The line for quotas too low: the machine, and each quota as its limit
+/// against the need, short enough for a popover. The machine's hyphens
+/// are non-breaking, since the line wraps by character and would
+/// otherwise split `c4-highmem-192` at one.
+fn quota_sentence(machine: &str, short: &[quota::Shortfall]) -> String {
+    let listed: Vec<String> = short
+        .iter()
+        .map(|s| format!("{}: {}, needs {}", s.need.label, s.limit, s.need.amount))
+        .collect();
+    format!(
+        "Ready, but quotas are too low for {} on {}. {}",
+        model::GLM_5_3.label,
+        machine.replace('-', "\u{2011}"),
+        listed.join("; ")
+    )
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_quota_says_its_limit_and_the_need() {
+        let short = quota::Shortfall {
+            need: quota::Need {
+                quota_id: "CPUS-ALL-REGIONS-per-project".into(),
+                dimensions: Vec::new(),
+                amount: 192,
+                label: "vCPUs in all regions".into(),
+            },
+            limit: 32,
+        };
+        let said = quota_sentence("c4-highmem-192", &[short]);
+        assert_eq!(
+            said,
+            "Ready, but quotas are too low for GLM-5.3 on c4\u{2011}highmem\u{2011}192. \
+             vCPUs in all regions: 32, needs 192"
+        );
+    }
 }
 
 fn ready_sentence(_account: &str, project_id: &str) -> String {

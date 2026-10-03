@@ -27,6 +27,7 @@ pub fn service_account(project: &str) -> String {
 /// The APIs the IDE calls.
 pub const SERVICES: &[&str] = &[
     "cloudbilling.googleapis.com",
+    "cloudquotas.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "compute.googleapis.com",
     "dns.googleapis.com",
@@ -39,12 +40,13 @@ pub const SERVICES: &[&str] = &[
 /// Exactly what the IDE calls: the model's networks, rules, DNS policy,
 /// instances and their boot disks, the window's Private Google Access, the
 /// weights bucket and its objects, the operations it waits on, the quota
-/// and machine facts the preflight reads, and the IAP tunnel to the
-/// model's VM. Signing URLs is not here: it is granted on the account
+/// limits and machine facts read before a machine is created, and the IAP
+/// tunnel to the model's VM. Signing URLs is not here: it is granted on the account
 /// itself, by the setup, and nowhere else.
 /// `testIamPermissions` asks for this same list, so a role that has
 /// drifted is named before anything fails.
 pub const PERMISSIONS: &[&str] = &[
+    "cloudquotas.quotas.get",
     "compute.disks.create",
     "compute.disks.delete",
     "compute.disks.get",

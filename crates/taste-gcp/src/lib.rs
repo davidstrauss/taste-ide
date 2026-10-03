@@ -22,6 +22,8 @@
 //!   back before anything is created.
 //! - [`guest`]: what those machines are told to do, as Ignition configs.
 //! - [`lifecycle`]: staging, serving, stopping, and tearing down.
+//! - [`quota`]: whether the project's quotas let a machine be created,
+//!   asked before it is, so a limit too low is named rather than met.
 //! - [`setup`]: the one-time setup that grants the IDE its role, run as
 //!   the user with the project's own gcloud sign-in.
 //!
@@ -45,6 +47,7 @@ pub mod guest;
 pub mod lifecycle;
 pub mod model;
 pub mod project;
+pub mod quota;
 pub mod resources;
 pub mod rest;
 pub mod setup;

@@ -18,8 +18,8 @@
 # - A custom role, `tasteIde`, of exactly the calls the IDE makes: the
 #   machines' networks, firewall rules, DNS policy, and instances, the
 #   Private Google Access the model's VM loads its weights through, the
-#   weights bucket and its objects, the operations, quotas, and machine
-#   facts it reads, and tunnelling to the model's VM through IAP. Nothing
+#   weights bucket and its objects, the operations, quota limits, and
+#   machine facts it reads, and tunnelling to the model's VM through IAP. Nothing
 #   in it touches billing, IAM, or a service account, so whatever holds it
 #   can spend money only by running machines and storing weights, which
 #   the IDE's cap meters, and cannot widen its own reach.
@@ -53,6 +53,7 @@ ACCOUNT=taste-ide
 # test that reads this file.
 SERVICES=(
   cloudbilling.googleapis.com
+  cloudquotas.googleapis.com
   cloudresourcemanager.googleapis.com
   compute.googleapis.com
   dns.googleapis.com
@@ -66,6 +67,7 @@ SERVICES=(
 # `taste_gcp::setup::PERMISSIONS` by a test that reads this file, and the
 # IDE's preflight asks `testIamPermissions` for the same list.
 PERMISSIONS=(
+  cloudquotas.quotas.get
   compute.disks.create
   compute.disks.delete
   compute.disks.get

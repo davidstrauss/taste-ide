@@ -254,6 +254,11 @@ pub const GOOGLE_APIS_ADDRESS: &str = "199.36.153.8";
 /// wins a tie, so the one allow that ever outranks it has to be above it.
 pub const SERVE_DENY_PRIORITY: u16 = 1;
 
+/// Where the machines go until the zone is one of the project's choices
+/// (`project::CloudProject`): what the connection test checks the quotas
+/// in.
+pub const DEFAULT_REGION: &str = "us-central1";
+
 pub const BOOT_DISK_GIB: u64 = 20;
 /// The staging VM's boot disk: the system, the largest shard while it is
 /// checked and uploaded, and the server image saved beside it.

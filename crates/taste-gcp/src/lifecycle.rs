@@ -23,8 +23,9 @@ use crate::guest::{
 use crate::model::{
     bucket_name, ensure_foundation, ModelPlan, ModelSpec, Shard, SERVE_DENY_PRIORITY,
 };
+use crate::quota;
 use crate::resources::Location;
-use crate::rest::{is_not_found, is_unavailable_machine, Gcp};
+use crate::rest::{is_not_found, is_quota_exceeded, is_unavailable_machine, Gcp};
 use crate::setup::service_account;
 use crate::signed;
 
@@ -90,7 +91,10 @@ pub async fn status(gcp: &Gcp, loc: &Location, name: &str) -> Result<Option<Stri
 /// Create the instance `body` describes, trying `machines` in order while
 /// the zone cannot supply one (David, 2026-10-02: "I'd rather not play
 /// capacity games" — so the IDE plays them, and says which machine it
-/// got). Returns the machine that was created.
+/// got). A machine the project's quotas do not allow is passed over before
+/// it is tried, and when none is allowed the error names each quota that
+/// is short, its limit, and the need (`quota`). Returns the machine that
+/// was created.
 pub async fn create_instance(
     gcp: &Gcp,
     loc: &Location,
@@ -98,9 +102,36 @@ pub async fn create_instance(
     machines: &[&str],
     report: &(dyn Fn(&str) + Sync),
 ) -> Result<String> {
+    let mut allowed = Vec::new();
+    let mut refused: Option<String> = None;
+    for machine in machines {
+        match quota::shortfalls(gcp, &loc.project, &loc.region, machine).await {
+            Ok(short) if short.is_empty() => allowed.push(*machine),
+            Ok(short) => {
+                let said = quota::sentence(machine, &short);
+                report(&format!("{said}; passing it over"));
+                refused.get_or_insert(said);
+            }
+            Err(e) => {
+                // The check is advice, not a gate: Compute refuses a create
+                // the quotas do not allow, and says which.
+                report(&format!(
+                    "could not read the quotas ({e:#}); trying {machine} anyway"
+                ));
+                allowed.push(*machine);
+            }
+        }
+    }
+    if allowed.is_empty() {
+        bail!(
+            "{} — ask Google for more at {}",
+            refused.unwrap_or_else(|| "no machine to try".into()),
+            quota::console_url(&loc.project)
+        );
+    }
     let collection = format!("projects/{}/zones/{}/instances", loc.project, loc.zone);
     let mut last = None;
-    for machine in machines {
+    for machine in allowed {
         let mut body = body.clone();
         body["machineType"] = json!(loc.machine_type_url(machine));
         match gcp.ensure_compute(&collection, &body).await {
@@ -111,6 +142,15 @@ pub async fn create_instance(
                     loc.zone
                 ));
                 last = Some(e);
+            }
+            Err(e) if is_quota_exceeded(&e) => {
+                // Within the limit on paper, but machines already running
+                // hold the rest of it.
+                report(&format!("{machine}: {e}; trying the next"));
+                last = Some(e.context(format!(
+                    "a quota is too low — ask Google for more at {}",
+                    quota::console_url(&loc.project)
+                )));
             }
             Err(e) => return Err(e),
         }
