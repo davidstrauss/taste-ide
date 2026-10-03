@@ -1355,28 +1355,56 @@ want my IDE client to be able to access it").
   and set aside in favour of this; commits `0822020` through `ee549e2`)
   would have removed. It never reaches an agent: it is IDE state on the
   host, and agents run in VMs.
-- **Two machines, and only one of them ever has a way out.** The weights
-  are fetched by a **staging VM**: small, on its own network, with egress
-  to port 443 and ordinary DNS. It formats the weights disk, downloads the
-  pinned shards and the pinned llama.cpp server image onto it, checks
-  every digest, reports progress through guest attributes, and powers off;
-  the IDE then deletes it and keeps the disk. It runs nothing from the
-  weights — a download and a hash are all it does with them. The
-  **serving VM** is the one the model runs on, on a second network that
-  has:
+- **Two machines, and the weights in a bucket rather than on a disk**
+  (David, 2026-10-03: "What's the need for the weights on disk, anyway?";
+  the spike's "Weights from GCS instead of a disk"). The weights are
+  mirrored once into the project's bucket, `taste-weights-<project>`, by a
+  **staging VM**: small, on its own network, with egress to port 443 and
+  ordinary DNS. It downloads each pinned shard the bucket lacks, checks
+  its digest, and uploads it through a resumable upload the IDE signed
+  for that object and that digest; then the pinned llama.cpp server
+  image, checked by its image ID. It reports through guest attributes and
+  powers off, and the IDE deletes it and checks the bucket itself. It
+  runs nothing from the weights — a download, a hash, and an upload are
+  all it does with them. Nothing standing is a disk: the bucket costs
+  ~$15 a month for GLM-5.3 where the disk was $68–158, and a bucket is
+  regional where a disk is zonal. The **serving VM** is the one the model
+  runs on, on a second network that has:
   - no external address at all, so nothing on the internet can reach it
     and it can reach nothing on the internet;
-  - a deny-all egress rule above every allow, besides;
+  - a deny-all egress rule above every allow but the window's, besides;
   - a DNS server policy forwarding every query to an unassigned private
     address, because the metadata server answers DNS and no firewall
     reaches the metadata server;
-  - no Cloud NAT and no Private Google Access;
+  - no Cloud NAT, and Private Google Access only while the window is
+    open;
   - no service account, so the metadata server mints it no credentials;
   - no SSH (no rule admits port 22, project keys are blocked, and OS
     Login is off) and no serial console;
   - one ingress rule: IAP's own range, `35.235.240.0/20`, to llama-server's
     port, and nothing else;
-  - the weights disk attached read-only, and Shielded VM's secure boot.
+  - no disk but its boot disk, the weights being in memory, and Shielded
+    VM's secure boot.
+- **The window: open to load, shut to serve.** The serving VM pulls the
+  weights on every boot, so for that pull alone the IDE opens one way
+  out: Private Google Access on its subnet, and an egress rule at
+  priority 0, above the deny, to `private.googleapis.com`
+  (199.36.153.8/30) on 443 (`model::window_firewall`). The VM still has
+  no credential: it fetches with GET URLs the IDE signed for exactly the
+  shards and the image, through IAM's `signBlob`, lasting 45 minutes. It
+  dials them by address, its DNS being the black hole, with parallel
+  ranged GETs into a tmpfs, and says when it is done; the IDE then
+  deletes the rule, turns Private Google Access off, removes the URLs
+  from its metadata, and only then tells it the window is shut. The
+  guest checks every shard against the digests pinned in its own
+  Ignition, so a tampered bucket feeds it nothing, and starts the server
+  only once a fresh connection to Google's APIs fails — so nothing from
+  the model ever runs while there is a way out, and the IDE's word is
+  not taken for it. The order matters because GCP's firewall tracks
+  connections and lets an established one outlive a rule change: the
+  downloads are over, and their connections gone, before the window
+  shuts. A serve that fails anywhere shuts the window on its way out, and
+  every serve starts by shutting one an interrupted run left open.
 - **Reached only through IAP, so the model's machine faces nothing**
   (David, 2026-10-02: "My IP changes frequently as I move my laptop
   around"). The IDE runs `gcloud compute start-iap-tunnel` to the serving
@@ -1398,23 +1426,30 @@ want my IDE client to be able to access it").
   metadata already carries the GCP image ID for the release), configured
   by Ignition through `provision::ignition`'s builder, never
   self-updating (Zincati off — and with no egress it could not anyway).
-  Its units mount the weights disk read-only, load the staged image by
-  digest, run llama-server on the VM's internal address (with `--jinja`,
-  the context window the gauge measures against, the key from the
-  metadata, and `--load-mode none` (no mmap), so that "ready" means loaded rather than
-  "will page in on the first request"), publish `taste/ready` with the
-  boot id once `/health` answers, and keep the idle watchdog. The
-  container runs rootless, with a read-only root filesystem and no
-  capabilities, so a weights file crafted to exploit the loader finds no
-  way out and nothing worth taking.
-- **Waking is starting.** The private route's hook is the one this uses:
+  Its units pull the weights into a tmpfs through the window, check them,
+  load the image and check its ID, wait for the window to shut and prove
+  it, run llama-server on the VM's internal address (with `--jinja`, the
+  context window the gauge measures against, the key from the metadata,
+  and `--load-mode mmap --no-repack`: tmpfs pages are resident, so
+  "ready" means loaded, and cannot be evicted, so a repacked copy would
+  hold the weights twice — whether Titanium SSD with repacking is the
+  better landing for GLM-5.3 is the bake-off's question), publish
+  `taste/ready` with the boot id once `/health` answers, and keep the idle
+  watchdog. The container is to run rootless, with a read-only root
+  filesystem and no capabilities, so a weights file crafted to exploit
+  the loader finds no way out and nothing worth taking; **not yet** — the
+  smoke test runs it under root's podman, which the window and the
+  lockdown still contain, and that is closed before GLM-5.3 is served.
+- **Waking is creating.** The private route's hook is the one this uses:
   before a request goes out, the proxy checks that something is listening,
-  and on this route "wake" means start the VM rather than send a magic
-  packet. In order: check the cap; mint the key and write it; start; wait
-  for RUNNING; wait for `taste/ready`; open the IAP tunnel; send. Every
+  and on this route "wake" means create the VM rather than send a magic
+  packet — nothing on one outlives its boot, so there is nothing to
+  start. In order: check the cap; mint the key; open the window; create;
+  wait for the pull; shut the window; wait for `taste/ready`; open the
+  IAP tunnel; send. Every
   step is a sentence in the chat whose turn it is (`Event::ChatNotice`), as
   Wake-on-LAN's are — "Starting GLM-5.3 on c4-highmem-192 ($12.51/h); the
-  weights take about six minutes to load", "ready after 6m40s", "not
+  weights take a few minutes to load", "ready after 4m10s", "not
   started: this month's GCP spend is $298 of the $300 cap" — because a turn
   that waits seven minutes in silence is a turn the user abandons. One wake
   at a time per workspace: several chats share one VM, and the second
@@ -1423,18 +1458,18 @@ want my IDE client to be able to access it").
   window is held while the server's `/health` answers, which on a CPU
   reading a long prompt it will be for minutes.
 - **Stopping, in three layers, so that no one failure leaves it running.**
-  The IDE stops the VM after fifteen minutes with no request in flight —
+  The IDE deletes the VM after fifteen minutes with no request in flight —
   it sees every request — and when the window quits. The guest powers
   itself off after the same span, judged from the terminator's own log,
   which is the dead man's switch for an IDE that crashed or a laptop that
   closed. And the instance is created with a maximum run duration and
-  STOP as its termination action, which GCP enforces even against a hung
-  guest. The first two never interrupt a turn in flight; the third is the
+  DELETE as its termination action, which GCP enforces even against a
+  hung guest. The first two never interrupt a turn in flight; the third is the
   backstop and can.
 - **The ledger, and the one setting.** What the VM has cost is computed
   from the Compute API's own start and stop timestamps, so a crash loses
   nothing, at the SKU prices the Cloud Billing Catalog API reports, with
-  the disks' standing cost prorated in (`cloud-ledger.json`, IDE state).
+  the bucket's standing cost prorated in (`cloud-ledger.json`, IDE state).
   The monthly cap is the one thing on this route that is configuration,
   because it is the user's money: $300 by default, standing costs
   included. At the cap the VM is not started, and the chat says why; a
@@ -1443,11 +1478,13 @@ want my IDE client to be able to access it").
   Billing's — and the settings shade recommends a budget alert on the
   billing account, which the IDE does not create, because the federated
   identity is given no billing permissions.
-- **Parking.** A weights disk nobody has started against for fourteen
-  days is deleted, since it is most of the standing cost, and the next
-  use re-stages it, saying so in the chat. "Remove from GCP" in the shade
-  deletes everything the IDE created for this workspace, every resource
-  carrying its label, and nothing else.
+- **Nothing to park.** Parking — deleting a weights disk nobody had used
+  for a fortnight — existed because the disk was most of the standing
+  cost; the bucket is ~$15 a month, so the weights stay. "Remove from
+  GCP" in the shade deletes everything the IDE created for this
+  workspace, every resource carrying its label, and nothing else; the
+  bucket is the project's, shared by its workspaces, and the setup's
+  `--remove` lists it.
 - **Setting it up, in the IDE** (David, 2026-10-03: "I do want to be able
   to run setup and, ideally, set up the restricted service account, and
   finally impersonate it, directly in the IDE"). The connection lives in
@@ -1537,13 +1574,16 @@ person.
 is proved with a small one (David, 2026-10-03: "Let's start with a less
 ambitious model to test that things can work"): gpt-oss-20b, the model
 the private route was first proved against, pinned by commit and digest
-like GLM-5.3 (`taste_gcp::model::GPT_OSS_20B`), staged by the same
-staging VM onto a 20 GiB disk, and served from an `n4-standard-8` with the
-same lockdown — no address, no route out, no name resolution, ingress
-from IAP alone. `examples/gcp-bringup smoke` runs it: stage, serve, open
-gcloud's IAP tunnel, ask one question through the Messages API with the
-VM's own key, print the answer, and stop the VM; `teardown` deletes
-everything the plan made. Well under a dollar a run. The guests are
+like GLM-5.3 (`taste_gcp::model::GPT_OSS_20B`), mirrored into the bucket
+by the same staging VM, and served from an `n4-standard-8` with the same
+lockdown — no address, no route out but the window, no name resolution,
+ingress from IAP alone. `examples/gcp-bringup smoke` runs it: stage,
+serve, open gcloud's IAP tunnel, ask one question through the Messages
+API with the VM's own key, print the answer, and delete the VM;
+`teardown` deletes everything else the plan made. Well under a dollar a
+run. Done 2026-10-03, first from a disk and then from the bucket: the
+12.4 GB arrived in 6.2 s on a `c4-standard-8`, 2.0 GB/s, and the model
+answered through the tunnel once the window was shut. The guests are
 Fedora CoreOS at the local pool's own release, configured by Ignition
 (`taste_gcp::guest`), and say how far they have got only through guest
 attributes, written to the metadata server by IP.
@@ -1555,9 +1595,10 @@ task on one fixed replay of a real session. From inside the serving VM,
 verify what the lockdown claims: a public name does not resolve, an
 outbound connection does not complete, the metadata server mints no
 token, and llama.cpp's load log names the indexer. Pin the llama.cpp
-build and its image by digest, settle whether the disk's throughput can
-be lowered while stopped, write the numbers into the spike, and choose the
-machine. Gate: the spike's estimates are all replaced by measurements.
+build and its image by digest, measure the bucket's load rate on each
+machine and the two landings — tmpfs without repacking, and Titanium SSD
+with it — write the numbers into the spike, and choose the machine and
+the landing. Gate: the spike's estimates are all replaced by measurements.
 The bake-off costs on the order of a hundred dollars, which is the
 estimate it exists to replace.
 

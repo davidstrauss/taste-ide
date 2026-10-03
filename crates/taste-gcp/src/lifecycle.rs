@@ -1,11 +1,11 @@
-//! Driving a model's machines: stage the weights, serve them, stop the
-//! serving VM, and take everything down.
+//! Driving a model's machines: mirror the weights into the bucket, serve
+//! them, stop the serving VM, and take everything down.
 //!
 //! Every step is repeatable, as the resource calls under it are
 //! (`rest::Gcp::ensure_compute`): staging again finds the shards already
-//! checked on the disk and fetches none of them, serving a VM that is up
-//! waits only for it to say so, and tearing down what is already gone is
-//! not an error. How far a VM has got is read from the guest attributes it
+//! in the bucket and fetches none of them, serving a VM that is up
+//! answers at once, and tearing down what is already gone is not an
+//! error. How far a VM has got is read from the guest attributes it
 //! writes (`guest`), through the Compute API — the VMs have no other way
 //! to say anything, and the IDE no other way to ask.
 
@@ -16,16 +16,27 @@ use anyhow::{bail, Context, Result};
 use http::Method;
 use serde_json::{json, Value};
 
-use crate::guest::{KEY_ATTRIBUTE, NAMESPACE};
-use crate::model::{ensure_foundation, ModelPlan};
+use crate::guest::{
+    image_object, FETCH_ATTRIBUTE, IMAGE_FILE, KEY_ATTRIBUTE, NAMESPACE, UPLOADS_ATTRIBUTE,
+    WINDOW_ATTRIBUTE,
+};
+use crate::model::{
+    bucket_name, ensure_foundation, ModelPlan, ModelSpec, Shard, SERVE_DENY_PRIORITY,
+};
 use crate::resources::Location;
 use crate::rest::{is_not_found, is_unavailable_machine, Gcp};
+use crate::setup::service_account;
+use crate::signed;
 
 /// How often a VM is asked how far it has got.
 const POLL: Duration = Duration::from_secs(10);
-/// How long serving may take to answer: boot, image load, and a model
-/// read off the disk.
-const SERVE_DEADLINE: Duration = Duration::from_secs(45 * 60);
+/// How long the serving VM may take to boot and pull the weights, which
+/// is also the longest the window can stay open on its account.
+const FETCH_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// How long a fetch URL lasts: past the deadline, and no further.
+const FETCH_URL_LIFETIME: Duration = Duration::from_secs(45 * 60);
+/// How long the server may take to answer once the window is shut.
+const SERVE_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 fn instance_path(loc: &Location, name: &str) -> String {
     format!(
@@ -113,24 +124,41 @@ pub async fn create_instance(
         )))
 }
 
-async fn act(gcp: &Gcp, loc: &Location, name: &str, verb: &str) -> Result<()> {
-    let url = format!(
-        "{}/{}/{verb}",
-        gcp.endpoints.compute,
-        instance_path(loc, name)
-    );
-    let operation = gcp.call(Method::POST, &url, None).await?;
-    gcp.wait(operation).await?;
-    Ok(())
+/// The shards the bucket does not yet hold, by name, size, and the digest
+/// they were uploaded with; and whether it lacks the server image.
+pub async fn missing<'a>(
+    gcp: &Gcp,
+    bucket: &str,
+    spec: &'a ModelSpec,
+) -> Result<(Vec<&'a Shard>, Option<u64>)> {
+    let objects = gcp.list_objects(bucket, "").await?;
+    let find = |name: &str| objects.iter().find(|o| o["name"] == name);
+    let shards = spec
+        .weights
+        .shards
+        .iter()
+        .filter(|shard| {
+            !find(&spec.weights.object(shard)).is_some_and(|o| {
+                o["size"].as_str() == Some(&shard.bytes.to_string())
+                    && o["metadata"]["sha256"] == shard.sha256
+            })
+        })
+        .collect();
+    let image = find(&image_object())
+        .and_then(|o| o["size"].as_str())
+        .and_then(|size| size.parse().ok());
+    Ok((shards, image))
 }
 
-/// Fetch and check the weights onto their disk with a staging VM, which
-/// is deleted once it has said it is done. `report` hears each step.
+/// Mirror the pinned weights and the server image into the project's
+/// bucket with a staging VM, which is deleted once it has said it is done.
+/// Only what the bucket lacks is fetched, so staging a pin that is there
+/// creates nothing. `report` hears each step.
 pub async fn stage(
     gcp: &Gcp,
     loc: &Location,
     plan: &ModelPlan,
-    spec: &crate::model::ModelSpec,
+    spec: &ModelSpec,
     report: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
     let machines: Vec<&str> = std::iter::once(crate::model::STAGING_MACHINE)
@@ -141,52 +169,84 @@ pub async fn stage(
                 .filter(|m| *m != crate::model::STAGING_MACHINE),
         )
         .collect();
-    report("creating the networks, rules, and the weights disk");
+    report("creating the networks, rules, and the bucket");
     ensure_foundation(gcp, loc, plan).await?;
-    let disk_path = format!(
-        "projects/{}/zones/{}/disks/{}",
-        loc.project, loc.zone, plan.names.weights_disk
-    );
-    let staged = crate::guest::staged_label(spec);
-    if let Some(disk) = gcp.get_compute(&disk_path).await? {
-        if disk["labels"][crate::guest::STAGED_LABEL] == staged.as_str() {
-            report("the weights disk already holds this pin; nothing to stage");
-            return Ok(());
-        }
-    }
-    // Staging writes the disk, and Hyperdisk Balanced has one writer: a
-    // serving VM still holding it goes first. It is replaced anyway, since
-    // what it was serving is what is being staged anew.
-    if status(gcp, loc, &plan.names.serving).await?.is_some() {
-        report("removing the serving VM so the disk can be staged");
-        gcp.remove_compute(&instance_path(loc, &plan.names.serving))
-            .await?;
+    gcp.ensure_bucket(&loc.project, &plan.bucket).await?;
+    let bucket = bucket_name(&loc.project);
+    let (shards, image) = missing(gcp, &bucket, spec).await?;
+    if shards.is_empty() && image.is_some() {
+        report("the bucket already holds this pin; nothing to stage");
+        return Ok(());
     }
     let name = &plan.names.staging;
-    // A staging VM left from a run that did not finish is replaced: the
-    // disk keeps whatever it already checked, so nothing is fetched twice.
-    if let Some(status) = status(gcp, loc, name).await? {
-        if status != "RUNNING" {
-            gcp.remove_compute(&instance_path(loc, name)).await?;
-        }
+    // A staging VM left from a run that did not finish holds URLs for
+    // what was missing then; it is replaced.
+    gcp.remove_compute(&instance_path(loc, name)).await?;
+
+    // An upload URL for each missing object, signed for the digest it must
+    // arrive with and for as long as the staging VM may live.
+    let account = service_account(&loc.project);
+    let expires = Duration::from_secs(crate::model::STAGE_MAX_RUN_SECONDS + 3600);
+    let mut uploads = String::new();
+    for shard in &shards {
+        let object = spec.weights.object(shard);
+        let url = signed::sign(
+            gcp,
+            &account,
+            &signed::Request {
+                method: "POST",
+                bucket: &bucket,
+                object: &object,
+                headers: vec![
+                    ("x-goog-resumable".into(), "start".into()),
+                    ("x-goog-meta-sha256".into(), shard.sha256.into()),
+                ],
+                expires,
+            },
+        )
+        .await?;
+        uploads.push_str(&format!("{} {url}\n", shard.file));
     }
-    report("starting the staging VM");
-    let machine = create_instance(gcp, loc, &plan.staging, &machines, report).await?;
+    if image.is_none() {
+        let object = image_object();
+        let url = signed::sign(
+            gcp,
+            &account,
+            &signed::Request {
+                method: "POST",
+                bucket: &bucket,
+                object: &object,
+                headers: vec![("x-goog-resumable".into(), "start".into())],
+                expires,
+            },
+        )
+        .await?;
+        uploads.push_str(&format!("{IMAGE_FILE} {url}\n"));
+    }
+    let mut body = plan.staging.clone();
+    push_metadata(&mut body, UPLOADS_ATTRIBUTE, &uploads);
+
+    report(&format!(
+        "starting the staging VM for {} shard{}{}",
+        shards.len(),
+        if shards.len() == 1 { "" } else { "s" },
+        if image.is_none() {
+            " and the server image"
+        } else {
+            ""
+        }
+    ));
+    let machine = create_instance(gcp, loc, &body, &machines, report).await?;
     report(&format!("staging on {machine}"));
     let mut said = String::new();
     loop {
         tokio::time::sleep(POLL).await;
         let attributes = guest_attributes(gcp, loc, name).await?;
         let stage = attributes.get("stage").cloned().unwrap_or_default();
-        let progress = attributes
-            .get("progress")
-            .and_then(|p| p.split_once('/'))
-            .and_then(|(done, total)| Some((done.parse::<u64>().ok()?, total.parse::<u64>().ok()?)))
-            .map(|(done, total)| format!(" · {} of {} MiB", done >> 20, total >> 20))
-            .unwrap_or_default();
         let now = format!(
-            "staging: {}{progress}",
-            if stage.is_empty() { "booting" } else { &stage }
+            "staging: {}{}",
+            if stage.is_empty() { "booting" } else { &stage },
+            progress(&attributes)
         );
         if now != said {
             report(&now);
@@ -202,94 +262,298 @@ pub async fn stage(
             bail!("the staging VM stopped before it was done (last said: {stage})");
         }
     }
-    report("deleting the staging VM; the disk keeps the weights");
+    report("deleting the staging VM; the bucket keeps the weights");
     gcp.remove_compute(&instance_path(loc, name)).await?;
-    // The disk says what it holds, so the next run need not ask a VM.
-    if let Some(disk) = gcp.get_compute(&disk_path).await? {
-        let mut labels = disk["labels"].clone();
-        labels[crate::guest::STAGED_LABEL] = json!(staged);
-        let url = format!("{}/{disk_path}/setLabels", gcp.endpoints.compute);
-        let operation = gcp
-            .call(
-                Method::POST,
-                &url,
-                Some(&json!({
-                    "labels": labels,
-                    "labelFingerprint": disk["labelFingerprint"],
-                })),
-            )
-            .await?;
-        gcp.wait(operation).await?;
+    // The bucket is the authority on what it holds, not the VM's word.
+    let (shards, image) = missing(gcp, &bucket, spec).await?;
+    if let Some(shard) = shards.first() {
+        bail!(
+            "staging finished, but the bucket still lacks {}",
+            shard.file
+        );
+    }
+    if image.is_none() {
+        bail!("staging finished, but the bucket still lacks the server image");
     }
     Ok(())
 }
 
-/// Bring the serving VM up — created, started, or already running — and
-/// wait until llama-server answers on it.
+/// " · 10 of 20 MiB" from a guest's `progress` attribute, or nothing.
+fn progress(attributes: &HashMap<String, String>) -> String {
+    attributes
+        .get("progress")
+        .and_then(|p| p.split_once('/'))
+        .and_then(|(done, total)| Some((done.parse::<u64>().ok()?, total.parse::<u64>().ok()?)))
+        .map(|(done, total)| format!(" · {} of {} MiB", done >> 20, total >> 20))
+        .unwrap_or_default()
+}
+
+fn push_metadata(body: &mut Value, key: &str, value: &str) {
+    if let Some(items) = body["metadata"]["items"].as_array_mut() {
+        items.push(json!({ "key": key, "value": value }));
+    }
+}
+
+fn firewall_path(loc: &Location, name: &str) -> String {
+    format!("projects/{}/global/firewalls/{name}", loc.project)
+}
+
+fn subnetwork_path(loc: &Location, name: &str) -> String {
+    format!(
+        "projects/{}/regions/{}/subnetworks/{name}",
+        loc.project, loc.region
+    )
+}
+
+/// Open the serving network's window onto Google's APIs: Private Google
+/// Access on its subnet, and the one rule that outranks the deny.
+pub async fn open_window(gcp: &Gcp, loc: &Location, plan: &ModelPlan) -> Result<()> {
+    // A foundation made before the window existed holds the deny at 0,
+    // where it would win the tie with the window's rule.
+    let deny = firewall_path(loc, &plan.names.serve_deny_egress);
+    if let Some(rule) = gcp.get_compute(&deny).await? {
+        if rule["priority"] != json!(SERVE_DENY_PRIORITY) {
+            gcp.patch_compute(&deny, &json!({ "priority": SERVE_DENY_PRIORITY }))
+                .await?;
+        }
+    }
+    gcp.act_compute(
+        &subnetwork_path(loc, &plan.names.serve_subnetwork),
+        "setPrivateIpGoogleAccess",
+        Some(&json!({ "privateIpGoogleAccess": true })),
+    )
+    .await?;
+    gcp.ensure_compute(
+        &format!("projects/{}/global/firewalls", loc.project),
+        &plan.window,
+    )
+    .await
+}
+
+/// Shut the window: the rule first, since it is what admits a connection,
+/// then Private Google Access. Shutting a shut window is not an error, so
+/// every serve starts by shutting one an interrupted run left open.
+pub async fn close_window(gcp: &Gcp, loc: &Location, plan: &ModelPlan) -> Result<()> {
+    gcp.remove_compute(&firewall_path(loc, &plan.names.serve_window))
+        .await?;
+    gcp.act_compute(
+        &subnetwork_path(loc, &plan.names.serve_subnetwork),
+        "setPrivateIpGoogleAccess",
+        Some(&json!({ "privateIpGoogleAccess": false })),
+    )
+    .await
+}
+
+/// Set and remove keys in a running instance's metadata, against the
+/// fingerprint it was read with.
+async fn set_metadata(
+    gcp: &Gcp,
+    loc: &Location,
+    name: &str,
+    set: &[(&str, &str)],
+    remove: &[&str],
+) -> Result<()> {
+    let path = instance_path(loc, name);
+    let instance = gcp
+        .get_compute(&path)
+        .await?
+        .with_context(|| format!("{name} is gone"))?;
+    let mut items: Vec<Value> = instance["metadata"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| {
+            let key = item["key"].as_str().unwrap_or_default();
+            !remove.contains(&key) && !set.iter().any(|(k, _)| *k == key)
+        })
+        .collect();
+    items.extend(
+        set.iter()
+            .map(|(key, value)| json!({ "key": key, "value": value })),
+    );
+    gcp.act_compute(
+        &path,
+        "setMetadata",
+        Some(&json!({
+            "fingerprint": instance["metadata"]["fingerprint"],
+            "items": items,
+        })),
+    )
+    .await
+}
+
+/// What the serving VM said once its downloads were done: how many bytes,
+/// in how many seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fetched {
+    pub bytes: u64,
+    pub seconds: f64,
+}
+
+impl Fetched {
+    fn parse(said: &str) -> Option<Self> {
+        let mut words = said.split_whitespace().skip(1);
+        Some(Self {
+            bytes: words.next()?.parse().ok()?,
+            seconds: words.next()?.parse().ok()?,
+        })
+    }
+
+    pub fn gigabytes_per_second(&self) -> f64 {
+        self.bytes as f64 / 1e9 / self.seconds.max(0.1)
+    }
+}
+
+/// Create the serving VM with its fetch list, and wait until it says its
+/// downloads are done.
+async fn create_and_fetch(
+    gcp: &Gcp,
+    loc: &Location,
+    plan: &ModelPlan,
+    spec: &ModelSpec,
+    fetch: &str,
+    report: &(dyn Fn(&str) + Sync),
+) -> Result<Fetched> {
+    let name = &plan.names.serving;
+    let mut body = plan.serving.clone();
+    push_metadata(&mut body, FETCH_ATTRIBUTE, fetch);
+    let chosen = body["machineType"]
+        .as_str()
+        .and_then(|url| url.rsplit('/').next())
+        .unwrap_or(spec.machine.name)
+        .to_string();
+    let machines: Vec<&str> = std::iter::once(chosen.as_str())
+        .chain(spec.fallbacks.iter().copied().filter(|m| *m != chosen))
+        .collect();
+    report("creating the serving VM");
+    let machine = create_instance(gcp, loc, &body, &machines, report).await?;
+    report(&format!("serving on {machine}"));
+    let deadline = Instant::now() + FETCH_DEADLINE;
+    let mut said = String::new();
+    loop {
+        tokio::time::sleep(POLL).await;
+        let attributes = guest_attributes(gcp, loc, name).await?;
+        if let Some(fetched) = attributes.get("fetched").and_then(|f| Fetched::parse(f)) {
+            return Ok(fetched);
+        }
+        if let Some(why) = attributes
+            .get("serve")
+            .and_then(|said| said.strip_prefix("failed: "))
+        {
+            bail!("the serving VM failed: {why}");
+        }
+        let now = format!(
+            "serving: {}{}",
+            attributes
+                .get("serve")
+                .map(String::as_str)
+                .unwrap_or("booting"),
+            progress(&attributes)
+        );
+        if now != said {
+            report(&now);
+            said = now;
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "the serving VM had not fetched the weights after {} minutes",
+                FETCH_DEADLINE.as_secs() / 60
+            );
+        }
+    }
+}
+
+/// Bring the serving VM up and wait until llama-server answers on it:
+/// the window opened, the VM created with signed URLs for what it pulls,
+/// the window shut the moment it has pulled them — whatever else went
+/// wrong — and only then the guest told so.
 pub async fn serve(
     gcp: &Gcp,
     loc: &Location,
     plan: &ModelPlan,
-    spec: &crate::model::ModelSpec,
+    spec: &ModelSpec,
     report: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
     let name = &plan.names.serving;
-    // A serving VM booted from another config is replaced: Ignition runs on
-    // a machine's first boot only, so a fix to the guest would otherwise
-    // never reach the VM that is already there.
+    ensure_foundation(gcp, loc, plan).await?;
+    close_window(gcp, loc, plan).await?;
+    let bucket = bucket_name(&loc.project);
+    let (shards, image) = missing(gcp, &bucket, spec).await?;
+    let Some(image_bytes) = image.filter(|_| shards.is_empty()) else {
+        bail!("the bucket does not hold this pin yet; stage it first");
+    };
+
     if let Some(instance) = gcp.get_compute(&instance_path(loc, name)).await? {
         let wanted = metadata_value(&plan.serving, crate::guest::CONFIG_ATTRIBUTE);
         let has = metadata_value(&instance, crate::guest::CONFIG_ATTRIBUTE);
-        let failed = guest_attributes(gcp, loc, name)
+        let ready = guest_attributes(gcp, loc, name)
             .await?
-            .get("serve")
-            .is_some_and(|said| said.starts_with("failed: "));
-        if wanted.is_some() && wanted != has {
-            report("the serving VM was booted from another config; replacing it");
-            gcp.remove_compute(&instance_path(loc, name)).await?;
-        } else if failed {
-            // Its service has exited and will not come back by itself; a
-            // fresh boot is the retry.
-            report("the serving VM failed last time; replacing it");
-            gcp.remove_compute(&instance_path(loc, name)).await?;
+            .contains_key("ready");
+        if instance["status"] == "RUNNING" && wanted == has && ready {
+            report("the serving VM is already up");
+            return Ok(());
         }
+        // Anything else is a VM that cannot become ready by itself: its
+        // weights went with its last boot, or it is from another config.
+        report("replacing the serving VM");
+        gcp.remove_compute(&instance_path(loc, name)).await?;
     }
-    let before = guest_attributes(gcp, loc, name)
-        .await?
-        .get("ready")
-        .cloned();
-    match status(gcp, loc, name).await?.as_deref() {
-        None => {
-            report("creating the serving VM");
-            let chosen = plan.serving["machineType"]
-                .as_str()
-                .and_then(|url| url.rsplit('/').next())
-                .unwrap_or(spec.machine.name)
-                .to_string();
-            let machines: Vec<&str> = std::iter::once(chosen.as_str())
-                .chain(spec.fallbacks.iter().copied().filter(|m| *m != chosen))
-                .collect();
-            let machine = create_instance(gcp, loc, &plan.serving, &machines, report).await?;
-            report(&format!("serving on {machine}"));
+
+    let account = service_account(&loc.project);
+    let get = |object: String| {
+        let account = account.clone();
+        let bucket = bucket.clone();
+        async move {
+            signed::sign(
+                gcp,
+                &account,
+                &signed::Request {
+                    method: "GET",
+                    bucket: &bucket,
+                    object: &object,
+                    headers: Vec::new(),
+                    expires: FETCH_URL_LIFETIME,
+                },
+            )
+            .await
         }
-        Some("RUNNING") => {
-            if before.is_some() {
-                report("the serving VM is already up");
-                return Ok(());
-            }
-        }
-        Some(_) => {
-            report("starting the serving VM");
-            act(gcp, loc, name, "start").await?;
-        }
+    };
+    let mut fetch = String::new();
+    for shard in spec.weights.shards {
+        let url = get(spec.weights.object(shard)).await?;
+        fetch.push_str(&format!("{} {} {url}\n", shard.file, shard.bytes));
     }
+    let url = get(image_object()).await?;
+    fetch.push_str(&format!("{IMAGE_FILE} {image_bytes} {url}\n"));
+
+    report("opening the window to the bucket");
+    open_window(gcp, loc, plan).await?;
+    let fetched = create_and_fetch(gcp, loc, plan, spec, &fetch, report).await;
+    report("closing the window");
+    close_window(gcp, loc, plan).await?;
+    let fetched = fetched?;
+    report(&format!(
+        "fetched {:.1} GB in {:.1} s: {:.2} GB/s",
+        fetched.bytes as f64 / 1e9,
+        fetched.seconds,
+        fetched.gigabytes_per_second()
+    ));
+    set_metadata(
+        gcp,
+        loc,
+        name,
+        &[(WINDOW_ATTRIBUTE, "closed")],
+        &[FETCH_ATTRIBUTE],
+    )
+    .await?;
+
     let deadline = Instant::now() + SERVE_DEADLINE;
     let mut said = String::new();
     loop {
         tokio::time::sleep(POLL).await;
         let attributes = guest_attributes(gcp, loc, name).await?;
-        let ready = attributes.get("ready");
-        if ready.is_some() && ready != before.as_ref() {
+        if attributes.contains_key("ready") {
             report("the model answers");
             return Ok(());
         }
@@ -347,18 +611,17 @@ pub async fn serving_key(gcp: &Gcp, loc: &Location, plan: &ModelPlan) -> Result<
         .context("the serving VM has no key in its metadata")
 }
 
-/// Stop the serving VM, if it is running. Its disks stay; a stopped VM
-/// bills for nothing else.
+/// Stop serving: the VM is deleted, since nothing on it outlives its boot
+/// and a stopped one would keep only a disk to pay for. The weights stay
+/// in the bucket.
 pub async fn stop(gcp: &Gcp, loc: &Location, plan: &ModelPlan) -> Result<()> {
-    let name = &plan.names.serving;
-    if status(gcp, loc, name).await?.as_deref() == Some("RUNNING") {
-        act(gcp, loc, name, "stop").await?;
-    }
-    Ok(())
+    gcp.remove_compute(&instance_path(loc, &plan.names.serving))
+        .await
 }
 
-/// Delete everything the plan creates, last made first. What is already
-/// gone is skipped.
+/// Delete everything the plan creates for this workspace, last made
+/// first. What is already gone is skipped. The bucket stays: it is the
+/// project's, and every workspace in it reads the same weights.
 pub async fn teardown(
     gcp: &Gcp,
     loc: &Location,
@@ -370,12 +633,8 @@ pub async fn teardown(
         report(&format!("deleting {name}"));
         gcp.remove_compute(&instance_path(loc, name)).await?;
     }
-    report(&format!("deleting {}", plan.names.weights_disk));
-    gcp.remove_compute(&format!(
-        "projects/{project}/zones/{}/disks/{}",
-        loc.zone, plan.names.weights_disk
-    ))
-    .await?;
+    gcp.remove_compute(&firewall_path(loc, &plan.names.serve_window))
+        .await?;
     report(&format!("deleting {}", plan.names.serve_dns_policy));
     gcp.remove_dns_policy(project, &plan.names.serve_dns_policy)
         .await?;

@@ -3001,6 +3001,7 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "taste-models",
  "tempfile",

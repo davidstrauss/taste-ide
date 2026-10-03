@@ -16,13 +16,18 @@
 #
 # - The APIs the IDE calls.
 # - A custom role, `tasteIde`, of exactly the calls the IDE makes: the
-#   machines' networks, firewall rules, DNS policy, disks, and instances,
-#   the operations, quotas, and machine facts it reads, and tunnelling to
-#   the model's VM through IAP. Nothing in it touches billing, IAM, or a
-#   service account, so whatever holds it can spend money only by running
-#   machines, which the IDE's cap meters, and cannot widen its own reach.
+#   machines' networks, firewall rules, DNS policy, and instances, the
+#   Private Google Access the model's VM loads its weights through, the
+#   weights bucket and its objects, the operations, quotas, and machine
+#   facts it reads, and tunnelling to the model's VM through IAP. Nothing
+#   in it touches billing, IAM, or a service account, so whatever holds it
+#   can spend money only by running machines and storing weights, which
+#   the IDE's cap meters, and cannot widen its own reach.
 # - A service account, `taste-ide@PROJECT.iam.gserviceaccount.com`, with
 #   no keys, holding that role. The IDE's own calls run as it.
+# - Permission for that account to sign as itself (Service Account Token
+#   Creator, on itself alone): the signed URLs a VM with no credential
+#   reads and writes the bucket with. It can sign as no other account.
 # - Permission for you — whoever runs this — to act as that account
 #   (Service Account Token Creator, on that one account), which is how
 #   the IDE's calls, made with your sign-in, run with its privileges and
@@ -54,6 +59,7 @@ SERVICES=(
   iam.googleapis.com
   iamcredentials.googleapis.com
   iap.googleapis.com
+  storage.googleapis.com
 )
 
 # Exactly what the IDE calls. Kept equal to
@@ -97,6 +103,7 @@ PERMISSIONS=(
   compute.subnetworks.delete
   compute.subnetworks.get
   compute.subnetworks.list
+  compute.subnetworks.setPrivateIpGoogleAccess
   compute.subnetworks.use
   compute.subnetworks.useExternalIp
   compute.zoneOperations.get
@@ -109,6 +116,12 @@ PERMISSIONS=(
   dns.policies.update
   iap.tunnelInstances.accessViaIAP
   resourcemanager.projects.get
+  storage.buckets.create
+  storage.buckets.get
+  storage.objects.create
+  storage.objects.delete
+  storage.objects.get
+  storage.objects.list
 )
 
 usage() {
@@ -164,6 +177,8 @@ if [[ "$MODE" == remove ]]; then
     --filter="labels.taste-workspace:*" --format='value(name,zone,status)'
   gcloud compute disks list --project="$PROJECT" \
     --filter="labels.taste-workspace:*" --format='value(name,zone,sizeGb)'
+  gcloud storage buckets list --project="$PROJECT" \
+    --filter="labels.taste-role:weights" --format='value(name)'
   exit 0
 fi
 
@@ -192,6 +207,11 @@ retry gcloud iam service-accounts add-iam-policy-binding "$EMAIL" \
   --project="$PROJECT" --condition=None \
   --role=roles/iam.serviceAccountTokenCreator \
   --member="$ME_MEMBER" >/dev/null
+
+retry gcloud iam service-accounts add-iam-policy-binding "$EMAIL" \
+  --project="$PROJECT" --condition=None \
+  --role=roles/iam.serviceAccountTokenCreator \
+  --member="serviceAccount:$EMAIL" >/dev/null
 
 echo
 echo "Done. The IDE acts in $PROJECT as $EMAIL, which $ME may act as."

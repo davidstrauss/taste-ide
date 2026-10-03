@@ -7,7 +7,17 @@
 //! [`GPT_OSS_20B`] is the small one the whole path is proved with first
 //! (David, 2026-10-03: "Let's start with a less ambitious model to test
 //! that things can work") — the same staging, the same lockdown, the same
-//! tunnel, at a twentieth of the disk and a cent of the time.
+//! tunnel, at a sixtieth of the bytes and a cent of the time.
+//!
+//! The weights live in the project's bucket, mirrored there once from
+//! Hugging Face, and nothing standing is a disk (the spike's "Weights
+//! from GCS instead of a disk"): the serving VM pulls them into memory on
+//! each boot through a **window** — Private Google Access on its subnet and
+//! one egress rule to `private.googleapis.com` — that the IDE opens before
+//! the VM exists and closes before the server starts. The window's rule is
+//! [`window_firewall`], kept out of the standing rules so that what stands
+//! is "reaches nothing", and what the window adds is one rule, created and
+//! deleted.
 //!
 //! The two live on separate networks because they need opposite DNS: the
 //! staging VM has to resolve Hugging Face, and the serving VM must resolve
@@ -20,8 +30,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::resources::{
-    self, Action, Attached, Direction, DiskPerformance, DiskSpec, FirewallSpec, ImageRef,
-    InstanceSpec, Location, Maintenance, OnMaxRun, Traffic, Workspace,
+    self, Action, Direction, FirewallSpec, ImageRef, InstanceSpec, Location, Maintenance, OnMaxRun,
+    Traffic, Workspace,
 };
 use crate::rest::Gcp;
 
@@ -53,6 +63,23 @@ pub struct Weights {
 impl Weights {
     pub fn total_bytes(&self) -> u64 {
         self.shards.iter().map(|s| s.bytes).sum()
+    }
+
+    /// The shard's name in the bucket: repository, commit, and file, so a
+    /// new pin is mirrored beside the old one rather than over it.
+    pub fn object(&self, shard: &Shard) -> String {
+        let dir = if self.dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", self.dir)
+        };
+        format!("{}/{}/{dir}{}", self.repo, self.commit, shard.file)
+    }
+
+    /// The largest shard, which is what a staging VM's disk must hold at
+    /// once.
+    pub fn largest(&self) -> u64 {
+        self.shards.iter().map(|s| s.bytes).max().unwrap_or(0)
     }
 
     pub fn url(&self, shard: &Shard) -> String {
@@ -143,9 +170,8 @@ pub const STAGING_MACHINE: &str = "n4-standard-8";
 
 /// Machines of one size, in order of preference, for when a zone cannot
 /// supply the first: every one takes Hyperdisk, which is what the plan's
-/// disks are, so the same request fits any of them. The zone is fixed by
-/// the weights disk, which is zonal, so the IDE tries another machine
-/// there rather than another zone (`lifecycle::create_instance`).
+/// boot disks are, so the same request fits any of them
+/// (`lifecycle::create_instance`).
 pub const SMALL_MACHINES: &[&str] = &[
     "n4-standard-8",
     "c4-standard-8",
@@ -167,19 +193,15 @@ pub const SMOKE_MACHINE: Machine = Machine {
     gpus: 0,
 };
 
-/// One model the route can run: its pinned weights, the disk they need,
-/// the machine it is served from unless the caller picks another, and
-/// what llama-server is told.
+/// One model the route can run: its pinned weights, the machine it is
+/// served from unless the caller picks another, and what llama-server is
+/// told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSpec {
-    /// Names its weights disk, so two models' disks never collide.
     pub slug: &'static str,
     /// What the model is called where a person reads it.
     pub label: &'static str,
     pub weights: Weights,
-    pub disk_gib: u64,
-    /// What the weights disk is provisioned at while staging or loading.
-    pub disk_loading: DiskPerformance,
     pub machine: Machine,
     /// Machines to try, in order, when a zone cannot supply `machine`.
     pub fallbacks: &'static [&'static str],
@@ -192,22 +214,18 @@ pub const GLM_5_3: ModelSpec = ModelSpec {
     slug: "glm-5-3",
     label: "GLM-5.3",
     weights: GLM_5_3_Q8_0,
-    disk_gib: WEIGHTS_DISK_GIB,
-    disk_loading: WEIGHTS_LOADING,
     machine: CANDIDATES[0],
     fallbacks: &["c4d-highmem-192", "g4-standard-192"],
     context_tokens: 200_000,
 };
 
 /// The smoke test: every part of the route, with a model a cheap machine
-/// can hold. 12 GB of weights on a 20 GiB disk at the free baseline, which
-/// stages in a minute and a half.
+/// can hold twice over — 12 GB of weights in memory, and the server's own
+/// buffers beside them.
 pub const GPT_OSS_20B: ModelSpec = ModelSpec {
     slug: "gpt-oss-20b",
     label: "gpt-oss-20b",
     weights: GPT_OSS_20B_MXFP4,
-    disk_gib: 20,
-    disk_loading: DiskPerformance::BASELINE,
     machine: SMOKE_MACHINE,
     fallbacks: SMALL_MACHINES,
     context_tokens: 65_536,
@@ -225,26 +243,37 @@ pub const SERVER_PORT: u16 = 8080;
 /// documented range for it, and the only source the serving VM admits.
 pub const IAP_RANGE: &str = "35.235.240.0/20";
 
-/// 801 GB of weights on an XFS volume, with room to spare.
-pub const WEIGHTS_DISK_GIB: u64 = 850;
+/// `private.googleapis.com`: the four addresses Private Google Access
+/// answers on for every Google API, and the only place the window opens
+/// to (<https://docs.cloud.google.com/vpc/docs/configure-private-google-access>).
+pub const GOOGLE_APIS_RANGE: &str = "199.36.153.8/30";
+/// The first of them, which the guest dials by address, its DNS being
+/// the black hole.
+pub const GOOGLE_APIS_ADDRESS: &str = "199.36.153.8";
+/// The serving network's deny-all. Not 0, which is the window's: a deny
+/// wins a tie, so the one allow that ever outranks it has to be above it.
+pub const SERVE_DENY_PRIORITY: u16 = 1;
+
 pub const BOOT_DISK_GIB: u64 = 20;
-/// What the weights disk is provisioned at while staging or loading.
-/// Phase 2 settles both numbers, and whether the disk can drop to
-/// [`DiskPerformance::BASELINE`] while the VM is stopped: at the free
-/// 140 MiB/s a cold load takes ~95 minutes, and every MiB/s above it is
-/// billed whether or not anything reads.
-pub const WEIGHTS_LOADING: DiskPerformance = DiskPerformance {
-    iops: 10_000,
-    throughput_mibps: 2_400,
-};
-/// GCP's own ceiling on one run of the serving VM: ten hours, then STOP,
-/// whatever the guest or the IDE is doing.
+/// The staging VM's boot disk: the system, the largest shard while it is
+/// checked and uploaded, and the server image saved beside it.
+pub fn staging_boot_gib(spec: &ModelSpec) -> u64 {
+    BOOT_DISK_GIB + spec.weights.largest().div_ceil(1 << 30) + 4
+}
+/// GCP's own ceiling on one run of the serving VM: ten hours, then it is
+/// deleted, whatever the guest or the IDE is doing. Nothing on it outlives
+/// a boot — the weights are in memory — so a stop would keep only a disk
+/// to pay for.
 pub const SERVE_MAX_RUN_SECONDS: u64 = 10 * 60 * 60;
-/// The staging VM deletes itself after six hours whatever happened; the
-/// disk it filled is not auto-deleted with it.
+/// The staging VM deletes itself after six hours whatever happened.
 pub const STAGE_MAX_RUN_SECONDS: u64 = 6 * 60 * 60;
-/// The guest's name for the weights disk: `/dev/disk/by-id/google-weights`.
-pub const WEIGHTS_DEVICE: &str = "weights";
+
+/// The project's bucket for weights, shared by every workspace in it:
+/// what is mirrored once is read by all of them. Bucket names are global,
+/// and a project id is too.
+pub fn bucket_name(project: &str) -> String {
+    format!("taste-weights-{project}")
+}
 
 /// Every resource name the model uses, derived once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,14 +286,14 @@ pub struct Names {
     pub stage_deny_egress: String,
     pub serve_deny_egress: String,
     pub serve_allow_iap: String,
+    pub serve_window: String,
     pub serve_dns_policy: String,
-    pub weights_disk: String,
     pub staging: String,
     pub serving: String,
 }
 
 impl Names {
-    pub fn new(ws: &Workspace, spec: &ModelSpec) -> Result<Self> {
+    pub fn new(ws: &Workspace) -> Result<Self> {
         Ok(Self {
             stage_network: ws.name("stage")?,
             stage_subnetwork: ws.name("stage")?,
@@ -274,8 +303,8 @@ impl Names {
             stage_deny_egress: ws.name("stage-deny-egress")?,
             serve_deny_egress: ws.name("serve-deny-egress")?,
             serve_allow_iap: ws.name("serve-allow-iap")?,
+            serve_window: ws.name("serve-window")?,
             serve_dns_policy: ws.name("serve-dns")?,
-            weights_disk: ws.name(&format!("weights-{}", spec.slug))?,
             staging: ws.name("stage")?,
             serving: ws.name("serve")?,
         })
@@ -308,14 +337,14 @@ pub fn firewall_specs(names: &Names) -> Vec<FirewallSpec> {
             traffic: Traffic::All,
             what: "staging reaches nothing else",
         },
-        // Serving reaches nothing. A deny at priority 0 is above every
-        // allow there could be, and wins a tie with one.
+        // Serving reaches nothing. The deny is above every allow but the
+        // window's, which exists only while the weights load.
         FirewallSpec {
             name: names.serve_deny_egress.clone(),
             network: names.serve_network.clone(),
             direction: Direction::Egress,
             action: Action::Deny,
-            priority: 0,
+            priority: SERVE_DENY_PRIORITY,
             ranges: everywhere(),
             traffic: Traffic::All,
             what: "the model's machine reaches nothing",
@@ -337,6 +366,23 @@ pub fn firewall_specs(names: &Names) -> Vec<FirewallSpec> {
     ]
 }
 
+/// The window: the serving VM's one way out, to Google's APIs on 443,
+/// while it pulls the weights. Created before the VM exists and deleted
+/// before the server starts (`lifecycle::serve`); never part of the
+/// standing rules.
+pub fn window_firewall(names: &Names) -> FirewallSpec {
+    FirewallSpec {
+        name: names.serve_window.clone(),
+        network: names.serve_network.clone(),
+        direction: Direction::Egress,
+        action: Action::Allow,
+        priority: 0,
+        ranges: vec![GOOGLE_APIS_RANGE.to_string()],
+        traffic: Traffic::Tcp(vec![443]),
+        what: "the weights, from the bucket, while they load",
+    }
+}
+
 /// Everything the model needs, as request bodies in creation order.
 #[derive(Debug, Clone)]
 pub struct ModelPlan {
@@ -345,7 +391,9 @@ pub struct ModelPlan {
     pub subnetworks: Vec<Value>,
     pub firewalls: Vec<Value>,
     pub dns_policy: Value,
-    pub weights_disk: Value,
+    /// The window's rule, made and removed around each load.
+    pub window: Value,
+    pub bucket: Value,
     pub staging: Value,
     pub serving: Value,
 }
@@ -368,7 +416,7 @@ pub fn plan(
     machine: &Machine,
     guests: &GuestConfigs,
 ) -> Result<ModelPlan> {
-    let names = Names::new(ws, spec)?;
+    let names = Names::new(ws)?;
     let user_data = |config: &Option<String>| -> Vec<(String, String)> {
         config
             .iter()
@@ -380,16 +428,13 @@ pub fn plan(
         role: "stage",
         machine_type: STAGING_MACHINE.to_string(),
         image: image.clone(),
-        boot_disk_gib: BOOT_DISK_GIB,
+        boot_disk_gib: staging_boot_gib(spec),
         network: names.stage_network.clone(),
         subnetwork: names.stage_subnetwork.clone(),
-        // Its way out to Hugging Face, there being no Cloud NAT.
+        // Its way out to Hugging Face and the bucket, there being no
+        // Cloud NAT.
         external_address: true,
-        attached: vec![Attached {
-            disk: names.weights_disk.clone(),
-            device_name: WEIGHTS_DEVICE.to_string(),
-            read_only: false,
-        }],
+        attached: Vec::new(),
         maintenance: Maintenance::Migrate,
         max_run: Some((STAGE_MAX_RUN_SECONDS, OnMaxRun::Delete)),
         metadata: user_data(&guests.staging_user_data),
@@ -403,20 +448,14 @@ pub fn plan(
         network: names.serve_network.clone(),
         subnetwork: names.serve_subnetwork.clone(),
         // None: the IDE reaches it through IAP, and with no address and no
-        // NAT it has no route to the internet, before the priority-0 deny
-        // even applies.
+        // NAT it has no route to the internet, before the deny even
+        // applies. The window reaches Google's APIs by Private Google
+        // Access, which needs no address either.
         external_address: false,
-        // Read-write to GCP, because Hyperdisk Balanced refuses a read-only
-        // attachment (the first live run, 2026-10-03); read-only where it
-        // counts, because the guest mounts it `ro` and hands it to the
-        // server's container `:ro` (`guest::serving_script`).
-        attached: vec![Attached {
-            disk: names.weights_disk.clone(),
-            device_name: WEIGHTS_DEVICE.to_string(),
-            read_only: false,
-        }],
+        // Nothing but its boot disk: the weights are in memory.
+        attached: Vec::new(),
         maintenance: machine.maintenance(),
-        max_run: Some((SERVE_MAX_RUN_SECONDS, OnMaxRun::Stop)),
+        max_run: Some((SERVE_MAX_RUN_SECONDS, OnMaxRun::Delete)),
         metadata: user_data(&guests.serving_user_data)
             .into_iter()
             .chain(guests.serving_user_data.iter().map(|config| {
@@ -465,16 +504,8 @@ pub fn plan(
             &names.serve_network,
             DNS_BLACKHOLE,
         ),
-        weights_disk: resources::disk(
-            ws,
-            loc,
-            &DiskSpec {
-                name: names.weights_disk.clone(),
-                size_gib: spec.disk_gib,
-                performance: spec.disk_loading,
-                role: "weights",
-            },
-        ),
+        window: resources::firewall(ws, loc, &window_firewall(&names)),
+        bucket: resources::bucket(&bucket_name(&loc.project), &loc.region),
         staging: resources::instance(ws, loc, &staging),
         serving: resources::instance(ws, loc, &serving),
         names,
@@ -482,7 +513,7 @@ pub fn plan(
 }
 
 /// Create everything the machines stand on — networks, subnets, rules,
-/// the DNS black hole, and the weights disk — in an order where no way out
+/// and the DNS black hole — in an order where no way out
 /// exists even for a moment: each network's deny rule is created before
 /// the rule that admits anything. Every step is an `ensure`, so running it
 /// again finishes what a failure interrupted. It does not repair a
@@ -508,11 +539,6 @@ pub async fn ensure_foundation(gcp: &Gcp, loc: &Location, plan: &ModelPlan) -> R
             .await?;
     }
     gcp.ensure_dns_policy(project, &plan.dns_policy).await?;
-    gcp.ensure_compute(
-        &format!("projects/{project}/zones/{}/disks", loc.zone),
-        &plan.weights_disk,
-    )
-    .await?;
     Ok(())
 }
 
@@ -548,13 +574,20 @@ mod tests {
     }
 
     #[test]
-    fn each_model_has_its_own_disk_and_the_smoke_test_its_size() {
-        let ws = Workspace::new("0a1b2c3d").unwrap();
-        let glm = Names::new(&ws, &GLM_5_3).unwrap();
-        let small = Names::new(&ws, &GPT_OSS_20B).unwrap();
-        assert_ne!(glm.weights_disk, small.weights_disk);
-        assert_eq!(small.weights_disk, "taste-0a1b2c3d-weights-gpt-oss-20b");
-        assert!(GPT_OSS_20B.weights.total_bytes() < GPT_OSS_20B.disk_gib << 30);
+    fn each_pin_has_its_own_objects() {
+        assert_eq!(
+            GPT_OSS_20B.weights.object(&GPT_OSS_20B.weights.shards[0]),
+            "ggml-org/gpt-oss-20b-GGUF/ef9b12f2ff56c69cf32153a02784e7a3c88bf524/gpt-oss-20b-MXFP4.gguf"
+        );
+        assert_eq!(
+            GLM_5_3.weights.object(&GLM_5_3.weights.shards[16]),
+            "unsloth/GLM-5.3-GGUF/346b3591c7f28d1a23716f97a065ecf12ec14771/Q8_0/GLM-5.3-Q8_0-00017-of-00017.gguf"
+        );
+        assert_eq!(bucket_name("taste-ide"), "taste-weights-taste-ide");
+        // A staging disk holds the largest shard, with room for the image.
+        assert!(
+            staging_boot_gib(&GLM_5_3) << 30 > GLM_5_3.weights.largest() + (BOOT_DISK_GIB << 30)
+        );
         assert_eq!(
             GPT_OSS_20B.weights.url(&GPT_OSS_20B.weights.shards[0]),
             "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/ef9b12f2ff56c69cf32153a02784e7a3c88bf524/gpt-oss-20b-MXFP4.gguf"
@@ -569,7 +602,6 @@ mod tests {
     fn the_pin_adds_up_to_the_spikes_total() {
         assert_eq!(GLM_5_3_Q8_0.shards.len(), 17);
         assert_eq!(GLM_5_3_Q8_0.total_bytes(), 801_357_677_216);
-        assert!(GLM_5_3_Q8_0.total_bytes() < WEIGHTS_DISK_GIB << 30);
         for shard in GLM_5_3_Q8_0.shards {
             assert_eq!(shard.sha256.len(), 64, "{}", shard.file);
         }
@@ -583,15 +615,35 @@ mod tests {
             .iter()
             .find(|r| r["direction"] == "EGRESS" && r.get("denied").is_some())
             .expect("a deny-all egress rule");
-        assert_eq!(deny["priority"], json!(0));
+        assert_eq!(deny["priority"], json!(SERVE_DENY_PRIORITY));
         assert_eq!(deny["denied"], json!([{ "IPProtocol": "all" }]));
         assert_eq!(deny["destinationRanges"], json!(["0.0.0.0/0"]));
         assert!(
             !rules
                 .iter()
                 .any(|r| r["direction"] == "EGRESS" && r.get("allowed").is_some()),
-            "no egress allow on the serving network"
+            "no standing egress allow on the serving network"
         );
+    }
+
+    #[test]
+    fn the_window_opens_onto_googles_apis_alone() {
+        let plan = fixture(&CANDIDATES[0]);
+        let window = &plan.window;
+        assert_eq!(window["direction"], "EGRESS");
+        assert_eq!(window["destinationRanges"], json!([GOOGLE_APIS_RANGE]));
+        assert_eq!(
+            window["allowed"],
+            json!([{ "IPProtocol": "tcp", "ports": ["443"] }])
+        );
+        // Above the deny, which would otherwise win.
+        assert!(window["priority"].as_u64().unwrap() < u64::from(SERVE_DENY_PRIORITY));
+        assert_eq!(
+            window["network"],
+            format!("projects/proj/global/networks/{}", plan.names.serve_network)
+        );
+        assert!(!plan.firewalls.contains(window), "never a standing rule");
+        assert!(GOOGLE_APIS_RANGE.starts_with(GOOGLE_APIS_ADDRESS));
     }
 
     #[test]
@@ -678,23 +730,20 @@ mod tests {
     }
 
     #[test]
-    fn the_weights_disk_outlives_both_machines() {
+    fn nothing_standing_is_a_disk() {
         let plan = fixture(&CANDIDATES[0]);
-        let weights = |vm: &Value| {
-            vm["disks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|d| d["deviceName"] == WEIGHTS_DEVICE)
-                .cloned()
-                .unwrap()
-        };
-        // Hyperdisk Balanced takes no read-only attachment; the serving
-        // guest mounts it read-only instead, which `guest`'s tests hold.
-        assert_eq!(weights(&plan.serving)["mode"], "READ_WRITE");
-        assert_eq!(weights(&plan.staging)["mode"], "READ_WRITE");
-        assert_eq!(weights(&plan.serving)["autoDelete"], json!(false));
-        assert_eq!(weights(&plan.staging)["autoDelete"], json!(false));
+        for vm in [&plan.serving, &plan.staging] {
+            let disks = vm["disks"].as_array().unwrap();
+            assert_eq!(disks.len(), 1, "only the boot disk");
+            assert_eq!(disks[0]["autoDelete"], json!(true));
+        }
+        let bucket = &plan.bucket;
+        assert_eq!(bucket["location"], "US-CENTRAL1");
+        assert_eq!(
+            bucket["iamConfiguration"]["publicAccessPrevention"],
+            "enforced"
+        );
+        assert_eq!(bucket["softDeletePolicy"]["retentionDurationSeconds"], "0");
     }
 
     #[test]
@@ -706,7 +755,7 @@ mod tests {
         );
         assert_eq!(
             plan.serving["scheduling"]["instanceTerminationAction"],
-            "STOP"
+            "DELETE"
         );
         assert_eq!(
             plan.staging["scheduling"]["instanceTerminationAction"],
@@ -732,7 +781,7 @@ mod tests {
     #[test]
     fn every_labelled_resource_names_the_workspace() {
         let plan = fixture(&CANDIDATES[0]);
-        for labelled in [&plan.weights_disk, &plan.staging, &plan.serving] {
+        for labelled in [&plan.staging, &plan.serving] {
             assert_eq!(labelled["labels"][resources::WORKSPACE_LABEL], "0a1b2c3d");
         }
     }
@@ -797,12 +846,6 @@ mod tests {
                 done(),
             ),
             ("POST", "/dns/v1/projects/proj/policies", 200, json!({})),
-            (
-                "POST",
-                "/compute/v1/projects/proj/zones/us-central1-a/disks",
-                200,
-                done(),
-            ),
         ])
         .await;
         let plan = fixture(&CANDIDATES[0]);
@@ -823,9 +866,5 @@ mod tests {
             .iter()
             .all(|r| r.get("denied").is_some()));
         assert_eq!(first_allow, 2, "both denies before either allow");
-        assert_eq!(
-            asked.last().unwrap().body.as_ref(),
-            Some(&plan.weights_disk)
-        );
     }
 }

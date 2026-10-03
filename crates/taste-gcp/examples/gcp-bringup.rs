@@ -21,13 +21,15 @@
 //!
 //! `smoke` proves the whole model route with a small model, gpt-oss-20b
 //! (David, 2026-10-03: "Let's start with a less ambitious model to test
-//! that things can work"): it stages the pinned weights with a staging VM,
-//! brings the serving VM up with no address and no way out, opens gcloud's
-//! IAP tunnel to it, asks the model one question through the Messages API
-//! with the VM's key, prints the answer, and stops the VM (`--keep` leaves
-//! it running). About $0.40 an hour while anything runs, and well under a
-//! dollar for the whole test; the 20 GiB disk stays until `teardown`,
-//! which deletes everything the plan made.
+//! that things can work"): it mirrors the pinned weights into the
+//! project's bucket with a staging VM (once), brings the serving VM up
+//! with no address, pulling the weights into memory through the window
+//! and saying how fast, opens gcloud's IAP tunnel to it once the window
+//! is shut, asks the model one question through the Messages API with
+//! the VM's key, prints the answer, and deletes the VM (`--keep` leaves it
+//! running). About $0.40 an hour while anything runs, and well under a
+//! dollar for the whole test; the bucket's 12 GB, about 25 cents a month,
+//! stays, and `teardown` deletes everything else the plan made.
 //!
 //! Build it in the devcontainer and run it on the host, where a browser
 //! is: `cargo build -p taste-gcp --example gcp-bringup`, then
@@ -155,7 +157,7 @@ async fn smoke(state: &Path, project: &str, zone: &str, keep: bool) -> Result<()
     let answer = ask(port, &key).await;
     drop(tunnel);
     if !keep {
-        eprintln!("stopping the serving VM; the weights disk stays for the next run");
+        eprintln!("deleting the serving VM; the weights stay in the bucket");
         lifecycle::stop(&gcp, &loc, &plan).await?;
     }
     println!("{}", answer?);

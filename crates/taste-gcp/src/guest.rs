@@ -2,19 +2,27 @@
 //! for the Fedora CoreOS the local pool boots too, so a guest in GCP and a
 //! guest under libvirt are the same system.
 //!
-//! The **staging VM** formats the weights disk if it is new, downloads
-//! every pinned shard (resuming a partial one), checks each against its
-//! SHA-256, pulls the pinned llama.cpp server image by digest and saves it
-//! to the disk, reports how far it has got through guest attributes, and
-//! powers off. It has egress to port 443 and nothing else, and nothing in
-//! it runs the weights — a download and a hash are all it does with them.
+//! The **staging VM** mirrors the pinned weights into the project's
+//! bucket, once: it downloads each shard the IDE says is missing, checks
+//! it against its SHA-256, and uploads it through a signed resumable
+//! upload the IDE made for exactly that object and digest; then the same
+//! for the pinned llama.cpp server image, checked by its image ID. It has
+//! egress to port 443 and nothing else, no credential of its own, and
+//! nothing in it runs the weights — a download, a hash, and an upload are
+//! all it does with them.
 //!
-//! The **serving VM** mounts the weights disk read-only, loads the image
-//! the staging VM saved, and runs llama-server on its internal address
-//! with the key the IDE wrote into the instance's metadata, reporting
-//! `taste/ready` once `/health` answers. It has no address on the internet
-//! and no route out, so everything it needs is on that disk or in its own
-//! image: no package, no pull, and no name to resolve.
+//! The **serving VM** pulls the weights into memory on every boot (the
+//! spike's "Weights from GCS instead of a disk"): parallel ranged GETs of
+//! signed URLs into a tmpfs, by address, through the window the IDE opened
+//! for it (`model::window_firewall`). It says how long that took, checks
+//! every shard against the pinned digests in its own Ignition — so a
+//! bucket that was tampered with feeds it nothing — and loads the image,
+//! checked by ID. Then it waits: the server starts only once the IDE has
+//! closed the window AND a fresh connection to Google's APIs fails, so
+//! nothing that came from the model runs while there is a way out. It runs
+//! llama-server on its internal address with the key the IDE wrote into
+//! the instance's metadata, and reports `taste/ready` once `/health`
+//! answers.
 //!
 //! Both report by writing guest attributes to the metadata server **by
 //! IP**, since the serving network resolves no names at all
@@ -25,35 +33,34 @@
 use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::model::{ModelSpec, SERVER_PORT};
+use crate::model::{ModelSpec, GOOGLE_APIS_ADDRESS, SERVER_PORT};
+use crate::signed::HOST;
 
 /// The llama.cpp server, CPU build, pinned by its amd64 manifest digest:
 /// release `b11371` (2026-10-03), after the GLM indexer work (#25407).
 pub const SERVER_IMAGE: &str =
     "ghcr.io/ggml-org/llama.cpp@sha256:5d58fdc8b2cadfad36c89ecf38b4a50069653500551a6842b0157a2d82d065f3";
 
+/// That image's ID — the digest of its config, which `podman save` and
+/// `podman load` leave as it was, unlike the manifest's. Read from the
+/// registry's manifest for [`SERVER_IMAGE`] (its `config.digest`). Both
+/// guests check it: staging before it uploads, serving after it loads.
+pub const SERVER_IMAGE_ID: &str =
+    "400a06a24bc582ed4a8ae5bbaac185e1d16ae269e0dd206ce464022c54ccc69e";
+
+/// The server image's name in the bucket.
+pub fn image_object() -> String {
+    format!("images/llama.cpp/{SERVER_IMAGE_ID}.tar")
+}
+
+/// What the archive is called on the guests, and in the lists the IDE
+/// gives them.
+pub const IMAGE_FILE: &str = "llama-server.tar";
+
 /// The Fedora CoreOS release the cloud guests boot: the local pool's own
 /// (`taste_devcontainer::guest::RELEASE`), held equal to it by a test in
 /// `taste-app`, so a guest in GCP and one under libvirt are one system.
 pub const FCOS_RELEASE: &str = "44.20260829.3.1";
-
-/// The weights volume's filesystem label. XFS allows twelve characters,
-/// and a longer one fails `mkfs.xfs` outright (the first live staging
-/// run, 2026-10-03, with `taste-weights`).
-pub const VOLUME_LABEL: &str = "weights";
-
-/// What a staged disk holds, as one label value: a hash of every pinned
-/// shard digest and the server image, so a disk staged for this pin is
-/// known without a VM, and a pin that moved is staged again.
-pub fn staged_label(spec: &ModelSpec) -> String {
-    // The whole staging script, which names every shard's digest and the
-    // image, and also how they are put on the disk: a change to that is a
-    // change to what the disk holds (an image saved the old way would not
-    // load), so it stages again — which costs only the image, since the
-    // shards already checked are skipped. Not a security boundary; an
-    // identity for what was staged.
-    config_hash(&staging_script(spec))
-}
 
 /// A stable hash of a guest's Ignition config, kept in the instance's
 /// metadata (`CONFIG_ATTRIBUTE`), so a VM booted from an older config is
@@ -70,16 +77,24 @@ pub fn config_hash(ignition: &str) -> String {
 /// The metadata key [`config_hash`] is kept under.
 pub const CONFIG_ATTRIBUTE: &str = "taste-config";
 
-/// The disk label that records [`staged_label`].
-pub const STAGED_LABEL: &str = "taste-staged";
-
-/// What the server image is called once the staging VM has saved it.
+/// What the server image is called once a guest has it.
 pub const LOCAL_TAG: &str = "localhost/taste-llama-server:pinned";
 
 /// The guest attribute namespace both VMs write to.
 pub const NAMESPACE: &str = "taste";
 /// The metadata key llama-server's API key is read from.
 pub const KEY_ATTRIBUTE: &str = "taste-key";
+/// The staging VM's list of what to upload: `file url` a line, each URL a
+/// signed resumable-upload start for one object.
+pub const UPLOADS_ATTRIBUTE: &str = "taste-uploads";
+/// The serving VM's list of what to fetch: `file bytes url` a line, each
+/// URL a signed GET, good for this boot's window.
+pub const FETCH_ATTRIBUTE: &str = "taste-fetch";
+/// Set to `closed` by the IDE once the window is shut.
+pub const WINDOW_ATTRIBUTE: &str = "taste-window";
+
+/// How much of an object one ranged GET asks for.
+pub const SLICE_BYTES: u64 = 256 << 20;
 
 /// Fedora CoreOS's GCP image for a release, by the project's naming
 /// convention: `44.20260829.3.1` is `fedora-coreos-44-20260829-3-1-gcp-x86-64`
@@ -91,7 +106,8 @@ pub fn fcos_image(release: &str) -> crate::resources::ImageRef {
     }
 }
 
-/// The shell every unit starts with: a way to say how far it has got.
+/// The shell every unit starts with: a way to say how far it has got, and
+/// a way to read what the IDE said.
 const PREAMBLE: &str = r#"#!/bin/bash
 set -euo pipefail
 MD=http://169.254.169.254/computeMetadata/v1/instance
@@ -100,14 +116,16 @@ say() {
   curl -sf -X PUT -H "Metadata-Flavor: Google" --data "$2" \
     "$MD/guest-attributes/taste/$1" >/dev/null || true
 }
+# One metadata value, or nothing.
+md() {
+  curl -sf -H "Metadata-Flavor: Google" "$MD/attributes/$1" || true
+}
 WEIGHTS=/var/mnt/weights
-DEV=/dev/disk/by-id/google-weights
 "#;
 
-/// The staging script: fetch, check, save, report, power off.
-pub fn staging_script(spec: &ModelSpec) -> String {
-    let manifest: String = spec
-        .weights
+/// The pinned shards as `sha256 bytes file url` lines.
+fn manifest(spec: &ModelSpec) -> String {
+    spec.weights
         .shards
         .iter()
         .map(|shard| {
@@ -119,87 +137,199 @@ pub fn staging_script(spec: &ModelSpec) -> String {
                 spec.weights.url(shard)
             )
         })
-        .collect();
-    let total = spec.weights.total_bytes();
+        .collect()
+}
+
+/// The staging script: fetch, check, upload, report, power off.
+pub fn staging_script(spec: &ModelSpec) -> String {
+    let manifest = manifest(spec);
     format!(
         r#"{PREAMBLE}
 fail() {{ say stage "failed: $1"; poweroff; exit 1; }}
 trap 'fail "line $LINENO: $BASH_COMMAND"' ERR
-say stage "formatting"
-[ -e "$DEV" ] || fail "no weights disk at $DEV"
-blkid "$DEV" >/dev/null 2>&1 || mkfs.xfs -q -L {VOLUME_LABEL} "$DEV"
-mkdir -p "$WEIGHTS"
-mountpoint -q "$WEIGHTS" || mount "$DEV" "$WEIGHTS"
-cd "$WEIGHTS"
+WORK=/var/lib/taste-stage
+mkdir -p "$WORK"
+cd "$WORK"
+md {UPLOADS_ATTRIBUTE} > uploads
+[ -s uploads ] || fail "the IDE listed nothing to upload"
+cat > manifest <<'MANIFEST'
+{manifest}MANIFEST
 
-# Bytes on disk so far, reported every ten seconds while files arrive.
-TOTAL={total}
-( while sleep 10; do
-    done=$(du -cb --apparent-size *.gguf *.gguf.part 2>/dev/null | tail -1 | cut -f1 || true)
-    say progress "${{done:-0}}/$TOTAL"
-  done ) &
-REPORTER=$!
+# Start a resumable upload with the signed URL, then send the file to the
+# session it opens. The headers are the ones the IDE signed, value for
+# value, or Google refuses the signature.
+upload() {{
+  local file=$1 url=$2 sha=${{3:-}} session
+  local -a meta=()
+  [ -z "$sha" ] || meta=(-H "x-goog-meta-sha256: $sha")
+  session=$(curl -sS -f -X POST -H "x-goog-resumable: start" "${{meta[@]}}" \
+    -H "Content-Length: 0" -D - -o /dev/null "$url" \
+    | tr -d '\r' | sed -n 's/^[Ll]ocation: //p')
+  [ -n "$session" ] || fail "no upload session for $file"
+  curl -sS -f -T "$file" -o /dev/null "$session" || fail "uploading $file"
+}}
 
-# sha256 bytes file url, one shard a line.
-while read -r sha bytes file url; do
-  if [ -f "$file.ok" ] && [ "$(stat -c %s "$file")" = "$bytes" ]; then
-    continue
-  fi
+TOTAL=$(awk 'NR == FNR {{ want[$1]; next }} ($3 in want) {{ t += $2 }} END {{ print t + 0 }}' uploads manifest)
+DONE=0
+say progress "0/$TOTAL"
+# sha256 bytes file url, one shard a line; only those the IDE listed.
+while read -r sha bytes file url <&3; do
+  dest=$(awk -v f="$file" '$1 == f {{ print $2 }}' uploads)
+  [ -n "$dest" ] || continue
   say stage "fetching $file"
   curl -fL --retry 8 --retry-delay 10 --retry-all-errors -C - -o "$file.part" "$url" \
     || fail "downloading $file"
-  echo "$sha  $file.part" | sha256sum -c --status - || {{ rm -f "$file.part"; fail "$file does not match its digest"; }}
-  mv "$file.part" "$file"
-  touch "$file.ok"
-done <<'MANIFEST'
-{manifest}MANIFEST
-kill $REPORTER || true
-say progress "$TOTAL/$TOTAL"
+  echo "$sha  $file.part" | sha256sum -c --status - \
+    || {{ rm -f "$file.part"; fail "$file does not match its digest"; }}
+  say stage "uploading $file"
+  upload "$file.part" "$dest" "$sha"
+  rm -f "$file.part"
+  DONE=$((DONE + bytes))
+  say progress "$DONE/$TOTAL"
+done 3< manifest
 
-say stage "saving the server image"
-podman pull {SERVER_IMAGE}
-podman image inspect --format '{{{{.Id}}}}' {SERVER_IMAGE} > image.id
-# Saved under a plain local tag: `podman save` writes the manifest anew,
-# so an archive named by the pulled digest no longer matches it and will
-# not load (the first live serving run, 2026-10-03). The serving VM runs
-# the image by its ID, which the save leaves as it was.
-podman tag {SERVER_IMAGE} {LOCAL_TAG}
-rm -f llama-server.tar
-podman save --format oci-archive -o llama-server.tar {LOCAL_TAG}
+dest=$(awk '$1 == "{IMAGE_FILE}" {{ print $2 }}' uploads)
+if [ -n "$dest" ]; then
+  say stage "saving the server image"
+  podman pull {SERVER_IMAGE}
+  [ "$(podman image inspect --format '{{{{.Id}}}}' {SERVER_IMAGE})" = {SERVER_IMAGE_ID} ] \
+    || fail "the server image is not the pinned one"
+  # Saved under a plain local tag: `podman save` writes the manifest anew,
+  # so an archive named by the pulled digest no longer matches it and will
+  # not load (the first live serving run, 2026-10-03). The ID survives.
+  podman tag {SERVER_IMAGE} {LOCAL_TAG}
+  rm -f {IMAGE_FILE}
+  podman save --format oci-archive -o {IMAGE_FILE} {LOCAL_TAG}
+  say stage "uploading the server image"
+  upload {IMAGE_FILE} "$dest"
+  rm -f {IMAGE_FILE}
+fi
 
-sync
-cd /
-umount "$WEIGHTS"
 say stage "done"
 poweroff
 "#
     )
 }
 
-/// The serving script: mount, load, serve.
+/// The serving script: pull into memory, check, wait for the window to
+/// close, serve.
 pub fn serving_script(spec: &ModelSpec) -> String {
     let model = spec.weights.shards[0].file;
     let context = spec.context_tokens;
+    // The weights and the image archive, which is removed once loaded.
+    let tmpfs_bytes = spec.weights.total_bytes() + (2 << 30);
+    let checks: String = spec
+        .weights
+        .shards
+        .iter()
+        .map(|shard| format!("{} {}\n", shard.sha256, shard.file))
+        .collect();
     format!(
         r#"{PREAMBLE}
 # A failure is said, not left as the last thing that was said: the IDE
 # waits on these attributes and would otherwise wait out its deadline.
 trap 'say serve "failed: line $LINENO: $BASH_COMMAND"' ERR
-say serve "mounting the weights"
+die() {{ say serve "failed: $1"; exit 1; }}
+BOOT=$(cat /proc/sys/kernel/random/boot_id)
+KEY=$(md {KEY_ATTRIBUTE})
+[ -n "$KEY" ] || die "no key in the metadata"
+md {FETCH_ATTRIBUTE} > /run/taste-fetch
+[ -s /run/taste-fetch ] || die "the IDE listed nothing to fetch"
+
+say serve "making room for the weights"
 mkdir -p "$WEIGHTS"
-mountpoint -q "$WEIGHTS" || mount -o ro "$DEV" "$WEIGHTS"
-KEY=$(curl -sf -H "Metadata-Flavor: Google" "$MD/attributes/{KEY_ATTRIBUTE}")
-IMAGE=$(cat "$WEIGHTS/image.id")
-podman image exists "$IMAGE" || {{ say serve "loading the server image"; podman load -q -i "$WEIGHTS/llama-server.tar"; }}
+mountpoint -q "$WEIGHTS" || mount -t tmpfs -o size={tmpfs_bytes},mode=0755 tmpfs "$WEIGHTS"
+cd "$WEIGHTS"
+
+# One byte range of one object, written in place. Retried whole rather
+# than by curl, since a retry inside curl would append to what the pipe
+# has already written; and a 200 is a failure, since it would be the
+# whole object at this slice's offset.
+slice() {{
+  local url=$1 file=$2 from=$3 to=$4 try hdr
+  hdr=$(mktemp)
+  for try in 1 2 3 4 5; do
+    if curl -sS -f --connect-timeout 10 --resolve "{HOST}:443:{GOOGLE_APIS_ADDRESS}" \
+         -r "$from-$to" -D "$hdr" "$url" \
+       | dd of="$file" bs=4M seek="$from" oflag=seek_bytes conv=notrunc iflag=fullblock status=none \
+       && grep -q '^HTTP/[0-9.]* 206' "$hdr"; then
+      rm -f "$hdr"
+      return 0
+    fi
+    sleep $((try * 2))
+  done
+  echo "$file at $from: $(head -1 "$hdr")" >&2
+  rm -f "$hdr"
+  return 1
+}}
+verify() {{
+  echo "$1  $2" | sha256sum -c --status - || {{ echo "$2 does not match its digest" >&2; return 1; }}
+}}
+export -f slice verify
+
+while read -r file bytes url; do
+  truncate -s "$bytes" "$file"
+  from=0
+  while [ "$from" -lt "$bytes" ]; do
+    to=$((from + {SLICE_BYTES} - 1))
+    [ "$to" -lt "$bytes" ] || to=$((bytes - 1))
+    echo "$url $file $from $to"
+    from=$((to + 1))
+  done
+done < /run/taste-fetch > /run/taste-slices
+TOTAL=$(awk '{{ t += $2 }} END {{ print t + 0 }}' /run/taste-fetch)
+PARALLEL=$(( $(nproc) * 4 ))
+[ "$PARALLEL" -le 64 ] || PARALLEL=64
+
+say serve "fetching the weights"
+( while sleep 5; do
+    landed=$(du -s --block-size=1 "$WEIGHTS" | cut -f1)
+    say progress "$landed/$TOTAL"
+  done ) &
+REPORTER=$!
+START=$(date +%s.%N)
+xargs -P "$PARALLEL" -L 1 bash -c 'set -o pipefail; slice "$@"' _ \
+  < /run/taste-slices 2> /run/taste-fetch.err \
+  || die "fetching: $(tail -1 /run/taste-fetch.err)"
+END=$(date +%s.%N)
+kill $REPORTER || true
+say progress "$TOTAL/$TOTAL"
+# Done with the network: the IDE closes the window on this.
+say fetched "$BOOT $TOTAL $(awk -v a="$START" -v b="$END" 'BEGIN {{ printf "%.1f", b - a }}')"
+
+say serve "checking the weights"
+xargs -P "$PARALLEL" -L 1 bash -c 'verify "$@"' _ 2> /run/taste-verify.err <<'CHECKS' \
+  || die "$(tail -1 /run/taste-verify.err)"
+{checks}CHECKS
+
+say serve "loading the server image"
+podman load -q -i {IMAGE_FILE}
+rm -f {IMAGE_FILE}
+[ "$(podman image inspect --format '{{{{.Id}}}}' {LOCAL_TAG})" = {SERVER_IMAGE_ID} ] \
+  || die "the server image is not the pinned one"
+
+# The IDE says the window is shut, and this checks it: a fresh connection
+# to Google's APIs has to fail before anything from the model runs.
+say serve "waiting for the window to close"
+until [ "$(md {WINDOW_ATTRIBUTE})" = closed ]; do sleep 2; done
+for try in $(seq 30); do
+  curl -s -o /dev/null --connect-timeout 3 --resolve "{HOST}:443:{GOOGLE_APIS_ADDRESS}" \
+    "https://{HOST}/" || break
+  [ "$try" -lt 30 ] || die "the window to Google's APIs is still open"
+  sleep 2
+done
+
 say serve "loading the model"
 # Not exec'd: the server exiting is a failure to say too, and an exec'd
-# shell is not there to say it. Its own last line is the reason.
+# shell is not there to say it. Its own last line is the reason. Mapped
+# in place and not repacked: tmpfs pages cannot be evicted, so a copy
+# into the server's own buffers would hold the weights twice.
 trap - ERR
 rc=0
 podman run --rm --name llama --network host --security-opt label=disable \
-  -v "$WEIGHTS:/models:ro" "$IMAGE" \
+  -v "$WEIGHTS:/models:ro" {SERVER_IMAGE_ID} \
   -m "/models/{model}" --host 0.0.0.0 --port {SERVER_PORT} \
-  --jinja -c {context} --load-mode none --api-key "$KEY" || rc=$?
+  --jinja -c {context} --load-mode mmap --no-repack --api-key "$KEY" || rc=$?
 said=$(journalctl -q -u taste-serve.service -n 1 -o cat || true)
 say serve "failed: the server exited ($rc): ${{said#*: }}"
 exit 1
@@ -261,7 +391,7 @@ pub fn staging_ignition(spec: &ModelSpec) -> String {
         )],
         vec![unit(
             "taste-stage.service",
-            "Fetch and check the pinned weights",
+            "Mirror the pinned weights into the bucket",
             "/usr/local/bin/taste-stage",
             "",
             "oneshot",
@@ -302,7 +432,7 @@ pub fn serving_ignition(spec: &ModelSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{GLM_5_3, GPT_OSS_20B, WEIGHTS_DEVICE};
+    use crate::model::{GLM_5_3, GPT_OSS_20B};
 
     fn decoded(ignition: &str, path: &str) -> String {
         let config: Value = serde_json::from_str(ignition).unwrap();
@@ -334,32 +464,67 @@ mod tests {
             );
         }
         assert!(script.contains("sha256sum -c"));
+        // Uploaded with the digest the IDE signed, never before the check.
+        let check = script.find("sha256sum -c").unwrap();
+        let upload = script.find("upload \"$file.part\"").unwrap();
+        assert!(check < upload);
+        assert!(script.contains("x-goog-meta-sha256: $sha"));
         assert!(script.contains(&format!("podman pull {SERVER_IMAGE}")));
+        assert!(script.contains(SERVER_IMAGE_ID));
         // Saved by a plain tag, never by the digest it was pulled as.
         assert!(script.contains(&format!(
-            "podman save --format oci-archive -o llama-server.tar {LOCAL_TAG}"
+            "podman save --format oci-archive -o {IMAGE_FILE} {LOCAL_TAG}"
         )));
         assert!(script.trim_end().ends_with("poweroff"));
     }
 
     #[test]
-    fn serving_reaches_for_nothing_outside_its_disk() {
+    fn serving_reaches_only_the_bucket_and_only_by_address() {
         let script = decoded(
             &serving_ignition(&GPT_OSS_20B),
             "/usr/local/bin/taste-serve",
         );
-        // No pull, no package, no download: the VM has no way out.
-        for forbidden in ["podman pull", "dnf ", "rpm-ostree", "https://"] {
+        for forbidden in [
+            "podman pull",
+            "dnf ",
+            "rpm-ostree",
+            "huggingface",
+            "metadata.google.internal",
+        ] {
             assert!(!script.contains(forbidden), "{forbidden}");
         }
-        // Read-only here, since GCP cannot attach Hyperdisk Balanced so.
-        assert!(script.contains("mount -o ro"));
+        // Every https:// is to Google's APIs, dialled by address.
+        for (at, _) in script.match_indices("https://") {
+            assert!(
+                script[at..].starts_with(&format!("https://{HOST}/")),
+                "{}",
+                &script[at..at + 40]
+            );
+        }
+        assert!(script.contains(&format!("--resolve \"{HOST}:443:{GOOGLE_APIS_ADDRESS}\"")));
         assert!(script.contains(":/models:ro"));
         assert!(script.contains("--api-key \"$KEY\""));
         assert!(script.contains("-c 65536"));
         assert!(script.contains("/models/gpt-oss-20b-MXFP4.gguf"));
-        // The metadata server by IP, never by name.
-        assert!(!script.contains("metadata.google.internal"));
+        assert!(script.contains("--no-repack"));
+        assert!(script.contains("mount -t tmpfs"));
+    }
+
+    #[test]
+    fn nothing_from_the_model_runs_before_the_window_is_shut() {
+        let script = serving_script(&GPT_OSS_20B);
+        let fetched = script.find("say fetched").unwrap();
+        let verified = script.find("checking the weights").unwrap();
+        let closed = script.find("= closed ]").unwrap();
+        let probed = script.find("still open").unwrap();
+        let served = script.find("podman run").unwrap();
+        assert!(fetched < verified && verified < closed && closed < probed && probed < served);
+        // Every shard is checked against the digest pinned here, not one
+        // the bucket supplies.
+        for shard in GPT_OSS_20B.weights.shards {
+            assert!(script.contains(&format!("{} {}\n", shard.sha256, shard.file)));
+        }
+        assert!(script.contains(SERVER_IMAGE_ID));
     }
 
     #[test]
@@ -383,7 +548,9 @@ mod tests {
         let ready = format!("{PREAMBLE}{}", READY_SCRIPT.replace("PORT", "8080"));
         for (name, script) in [
             ("staging", staging_script(&GLM_5_3)),
-            ("serving", serving_script(&GPT_OSS_20B)),
+            ("staging (smoke)", staging_script(&GPT_OSS_20B)),
+            ("serving", serving_script(&GLM_5_3)),
+            ("serving (smoke)", serving_script(&GPT_OSS_20B)),
             ("ready", ready),
         ] {
             let checked = std::process::Command::new("bash")
@@ -399,12 +566,52 @@ mod tests {
     }
 
     #[test]
-    fn the_staged_label_is_stable_and_names_the_pin() {
-        let small = staged_label(&GPT_OSS_20B);
-        assert_eq!(small, staged_label(&GPT_OSS_20B));
-        assert_ne!(small, staged_label(&GLM_5_3));
-        assert_eq!(small.len(), 16);
-        assert!(small.bytes().all(|b| b.is_ascii_hexdigit()));
+    fn a_slice_is_fetched_and_written_where_it_belongs() {
+        // The slice function on its own, against a stand-in curl that
+        // serves a range of a local file the way GCS answers a ranged GET.
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("object");
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&object, &data).unwrap();
+        crate::testing::install_stub(
+            &dir.path().join("curl"),
+            r#"#!/usr/bin/env bash
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -r) range=$2; shift ;;
+    -D) hdr=$2; shift ;;
+    --resolve|--connect-timeout) shift ;;
+  esac
+  shift
+done
+from=${range%-*}; to=${range#*-}
+echo "HTTP/1.1 206 Partial Content" > "$hdr"
+tail -c +$((from + 1)) "$OBJECT" | head -c $((to - from + 1))
+"#,
+        );
+        let script = serving_script(&GPT_OSS_20B);
+        let start = script.find("slice() {").unwrap();
+        let end = script[start..].find("\n}\n").unwrap() + start + 3;
+        let function = &script[start..end];
+        let out = dir.path().join("out");
+        let run = format!(
+            "set -euo pipefail\n{function}\ntruncate -s 10000 {out}\n\
+             slice u {out} 4096 9999\nslice u {out} 0 4095\n",
+            out = out.display()
+        );
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let status = std::process::Command::new("bash")
+            .args(["-c", &run])
+            .env("PATH", path)
+            .env("OBJECT", &object)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(&out).unwrap(), data);
     }
 
     #[test]
@@ -429,22 +636,11 @@ mod tests {
     }
 
     #[test]
-    fn the_volume_label_fits_xfs() {
-        assert!(VOLUME_LABEL.len() <= 12);
-        assert!(staging_script(&GPT_OSS_20B).contains(&format!("-L {VOLUME_LABEL} ")));
-    }
-
-    #[test]
-    fn the_scripts_find_the_disk_the_plan_attaches() {
-        // `/dev/disk/by-id/google-<device name>` is GCP's own naming.
-        assert!(PREAMBLE.contains(&format!("/dev/disk/by-id/google-{WEIGHTS_DEVICE}")));
-    }
-
-    #[test]
     fn the_image_name_follows_the_release() {
         assert_eq!(
             fcos_image("44.20260829.3.1").url(),
             "projects/fedora-coreos-cloud/global/images/fedora-coreos-44-20260829-3-1-gcp-x86-64"
         );
+        assert!(image_object().ends_with(&format!("{SERVER_IMAGE_ID}.tar")));
     }
 }

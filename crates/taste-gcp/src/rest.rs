@@ -59,6 +59,10 @@ pub struct Endpoints {
     pub compute: String,
     pub dns: String,
     pub resource_manager: String,
+    /// Cloud Storage's JSON API, for buckets and listings. Signed URLs are
+    /// the XML API's, on [`crate::signed::HOST`].
+    pub storage: String,
+    pub iam_credentials: String,
 }
 
 impl Default for Endpoints {
@@ -67,6 +71,8 @@ impl Default for Endpoints {
             compute: "https://compute.googleapis.com/compute/v1".into(),
             dns: "https://dns.googleapis.com/dns/v1".into(),
             resource_manager: "https://cloudresourcemanager.googleapis.com/v1".into(),
+            storage: "https://storage.googleapis.com/storage/v1".into(),
+            iam_credentials: "https://iamcredentials.googleapis.com/v1".into(),
         }
     }
 }
@@ -353,6 +359,93 @@ impl Gcp {
         }
     }
 
+    /// Change some of a Compute resource's fields in place, and wait.
+    pub async fn patch_compute(&self, path: &str, body: &Value) -> Result<()> {
+        let url = format!("{}/{path}", self.endpoints.compute);
+        let operation = self.call(Method::PATCH, &url, Some(body)).await?;
+        self.wait(operation).await?;
+        Ok(())
+    }
+
+    /// A Compute action on a resource — `start`, `setMetadata`,
+    /// `setPrivateIpGoogleAccess` — waited to its end.
+    pub async fn act_compute(&self, path: &str, verb: &str, body: Option<&Value>) -> Result<()> {
+        let url = format!("{}/{path}/{verb}", self.endpoints.compute);
+        let operation = self.call(Method::POST, &url, body).await?;
+        self.wait(operation).await?;
+        Ok(())
+    }
+
+    /// Create a Cloud Storage bucket, which answers at once. One that
+    /// already exists is not an error if it is this project's to read; a
+    /// name another project holds is, since bucket names are global.
+    pub async fn ensure_bucket(&self, project: &str, body: &Value) -> Result<()> {
+        let url = format!("{}/b?project={project}", self.endpoints.storage);
+        match self.call(Method::POST, &url, Some(body)).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_already_exists(&e) => {
+                let name = body["name"].as_str().unwrap_or_default();
+                let url = format!("{}/b/{name}", self.endpoints.storage);
+                self.call(Method::GET, &url, None).await.with_context(|| {
+                    format!("the bucket name {name} is held by another project")
+                })?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Every object in `bucket` whose name starts with `prefix`, with its
+    /// size and custom metadata, page by page.
+    pub async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<Value>> {
+        let mut objects = Vec::new();
+        let mut page: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "{}/b/{bucket}/o?prefix={}&fields=items(name,size,metadata),nextPageToken",
+                self.endpoints.storage,
+                crate::signed::encode(prefix)
+            );
+            if let Some(token) = &page {
+                url.push_str(&format!("&pageToken={}", crate::signed::encode(token)));
+            }
+            let answer = match self.call(Method::GET, &url, None).await {
+                Ok(answer) => answer,
+                Err(e) if is_not_found(&e) => return Ok(objects),
+                Err(e) => return Err(e),
+            };
+            if let Some(items) = answer["items"].as_array() {
+                objects.extend(items.iter().cloned());
+            }
+            match answer["nextPageToken"].as_str() {
+                Some(token) => page = Some(token.to_string()),
+                None => return Ok(objects),
+            }
+        }
+    }
+
+    /// `payload`, signed with `account`'s Google-held key through IAM —
+    /// no key ever leaves Google, and none is ever made.
+    pub async fn sign_blob(&self, account: &str, payload: &[u8]) -> Result<Vec<u8>> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let url = format!(
+            "{}/projects/-/serviceAccounts/{account}:signBlob",
+            self.endpoints.iam_credentials
+        );
+        let answer = self
+            .call(
+                Method::POST,
+                &url,
+                Some(&serde_json::json!({ "payload": b64.encode(payload) })),
+            )
+            .await?;
+        let signed = answer["signedBlob"]
+            .as_str()
+            .context("signBlob answered without a signature")?;
+        Ok(b64.decode(signed)?)
+    }
+
     /// Create a Cloud DNS policy, which unlike Compute answers at once
     /// rather than with an operation. Already there is not an error.
     pub async fn ensure_dns_policy(&self, project: &str, body: &Value) -> Result<()> {
@@ -520,6 +613,8 @@ pub(crate) mod mock {
                 compute: format!("{base}/compute/v1"),
                 dns: format!("{base}/dns/v1"),
                 resource_manager: format!("{base}/v1"),
+                storage: format!("{base}/storage/v1"),
+                iam_credentials: format!("{base}/iam/v1"),
             },
             asked,
         }

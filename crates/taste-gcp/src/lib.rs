@@ -4,8 +4,10 @@
 //!
 //! Two things are built on this crate, and it is shaped so that neither
 //! owns it. The first is the GLM-5.3 route (ENVIRONMENTS → "A model on a
-//! cloud VM"): a staging VM that fetches pinned weights, and a serving VM
-//! with no way out that only the IDE can reach. The second is the
+//! cloud VM"): a staging VM that mirrors pinned weights into the
+//! project's bucket, and a serving VM with no way out that only the IDE
+//! can reach, which pulls them into memory through a window the IDE opens
+//! and closes. The second is the
 //! substrate's cloud provisioner (ENVIRONMENTS → "Phase 3 — cloud
 //! provisioners"), which places environments in GCP the way the local
 //! pool places them under libvirt. So the layering is:
@@ -29,6 +31,8 @@
 //!   per project — its tokens, and its IAP tunnel to the model's VM.
 //! - [`project`]: what one project keeps — its choices file and its own
 //!   gcloud configuration, in the workspace's IDE state.
+//! - [`signed`]: V4 signed URLs, signed through IAM, which is how a VM
+//!   with no credential of its own reads or writes one object.
 //! - [`rest`]: Google's APIs, with tokens renewed before they lapse,
 //!   failures read into a typed error, and Compute's operations awaited
 //!   to their end.
@@ -44,6 +48,7 @@ pub mod project;
 pub mod resources;
 pub mod rest;
 pub mod setup;
+pub mod signed;
 
 /// What the tests share.
 #[cfg(test)]

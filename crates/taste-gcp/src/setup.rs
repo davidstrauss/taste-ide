@@ -33,11 +33,15 @@ pub const SERVICES: &[&str] = &[
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
     "iap.googleapis.com",
+    "storage.googleapis.com",
 ];
 
 /// Exactly what the IDE calls: the model's networks, rules, DNS policy,
-/// disks, and instances, the operations it waits on, the quota and machine
-/// facts the preflight reads, and the IAP tunnel to the model's VM.
+/// instances and their boot disks, the window's Private Google Access, the
+/// weights bucket and its objects, the operations it waits on, the quota
+/// and machine facts the preflight reads, and the IAP tunnel to the
+/// model's VM. Signing URLs is not here: it is granted on the account
+/// itself, by the setup, and nowhere else.
 /// `testIamPermissions` asks for this same list, so a role that has
 /// drifted is named before anything fails.
 pub const PERMISSIONS: &[&str] = &[
@@ -78,6 +82,7 @@ pub const PERMISSIONS: &[&str] = &[
     "compute.subnetworks.delete",
     "compute.subnetworks.get",
     "compute.subnetworks.list",
+    "compute.subnetworks.setPrivateIpGoogleAccess",
     "compute.subnetworks.use",
     "compute.subnetworks.useExternalIp",
     "compute.zoneOperations.get",
@@ -90,6 +95,12 @@ pub const PERMISSIONS: &[&str] = &[
     "dns.policies.update",
     "iap.tunnelInstances.accessViaIAP",
     "resourcemanager.projects.get",
+    "storage.buckets.create",
+    "storage.buckets.get",
+    "storage.objects.create",
+    "storage.objects.delete",
+    "storage.objects.get",
+    "storage.objects.list",
 ];
 
 /// GCP project ids: 6–30 characters, a lowercase letter first, then
@@ -215,6 +226,10 @@ exit 0
         ));
         assert!(calls.contains(
             "--role=roles/iam.serviceAccountTokenCreator --member=user:david@example.com"
+        ));
+        // The account signs its own URLs, and only its own.
+        assert!(calls.contains(
+            "iam service-accounts add-iam-policy-binding taste-ide@my-project-1.iam.gserviceaccount.com --project=my-project-1 --condition=None --role=roles/iam.serviceAccountTokenCreator --member=serviceAccount:taste-ide@my-project-1.iam.gserviceaccount.com"
         ));
         assert!(!calls.contains("keys create"), "no key is ever made");
         let enabled = calls

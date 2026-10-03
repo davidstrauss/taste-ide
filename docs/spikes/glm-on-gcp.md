@@ -403,11 +403,21 @@ $12.51/h machine against the disk's ~5.5. With no disk, a stopped VM can
 also be deleted outright and made again in whichever zone has the
 machine.
 
-**Unconfirmed, for the first live run:** that a ranged GET works on a
-signed URL (it should, as `Range` is not a signed header), that Private
-Google Access takes effect at once on a running VM, the bandwidth of
-`g4-standard-192`, and the GB/s that actually lands in tmpfs and on
-Titanium SSD.
+**Measured, 2026-10-03, with the smoke model** (`examples/gcp-bringup
+smoke`, the 12.1 GB gpt-oss-20b and its 0.3 GB server image): staging
+mirrored both into the bucket from a `c3-standard-8`, and the serving VM,
+a `c4-standard-8`, pulled 12.4 GB into tmpfs in **6.2 s, 2.0 GB/s**, in
+256 MiB ranged GETs 32 at a time. A ranged GET on a signed URL answers
+206; Private Google Access, turned on while the VM was still being
+created, carried the pull without a restart; and once the IDE had
+deleted the rule and turned it off, the guest's fresh connection to
+`private.googleapis.com` failed and the server started. 2.0 GB/s is a
+little under what an 8-vCPU machine's bandwidth allows, so 801 GB on a
+100 Gbps machine is a measurement still to make, as are
+`g4-standard-192`'s bandwidth and the rate onto Titanium SSD. One
+setup-time fact: the service account's grant to sign as itself took two
+to three minutes to apply after the setup made it, during which
+`signBlob` was refused.
 
 ## Network lockdown: what GCP lets a firewall close, and what it does not
 

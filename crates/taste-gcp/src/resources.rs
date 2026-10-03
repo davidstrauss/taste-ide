@@ -1,4 +1,5 @@
-//! A workspace's GCP resources as Compute and Cloud DNS request bodies.
+//! A workspace's GCP resources as Compute, Cloud DNS, and Cloud Storage
+//! request bodies.
 //!
 //! Everything here is a pure function from a typed spec to the JSON the
 //! API takes, so what the IDE is about to create can be read, and
@@ -286,6 +287,25 @@ pub fn disk(ws: &Workspace, loc: &Location, spec: &DiskSpec) -> Value {
         "provisionedIops": spec.performance.iops.to_string(),
         "provisionedThroughput": spec.performance.throughput_mibps.to_string(),
         "labels": ws.labels(spec.role),
+    })
+}
+
+/// A regional Cloud Storage bucket that only IAM can open: uniform
+/// access (no object ACLs), public access prevented, and no soft delete,
+/// since otherwise every object replaced or removed is billed for seven
+/// days more. It belongs to the project rather than one workspace, so it
+/// carries the role label alone.
+pub fn bucket(name: &str, region: &str) -> Value {
+    json!({
+        "name": name,
+        "location": region.to_ascii_uppercase(),
+        "storageClass": "STANDARD",
+        "iamConfiguration": {
+            "uniformBucketLevelAccess": { "enabled": true },
+            "publicAccessPrevention": "enforced",
+        },
+        "softDeletePolicy": { "retentionDurationSeconds": "0" },
+        "labels": { ROLE_LABEL: "weights" },
     })
 }
 
