@@ -1279,8 +1279,12 @@ enum EnvReading {
 /// know nothing of the outcome, it has no idea it can pick work back
 /// up"). Mode, writability, and the next step ride in the orientation
 /// ahead of the same prompt, so they are not said twice.
+/// How a rebuild report begins: what tells one held in the queue from
+/// anything else there.
+const REBUILD_REPORT_HEAD: &str = "REBUILD RESULT (you called devcontainer_reload)\n";
+
 fn rebuild_report(ok: bool, message: &str, failure: Option<&str>) -> String {
-    let mut text = String::from("REBUILD RESULT (you called devcontainer_reload)\n");
+    let mut text = String::from(REBUILD_REPORT_HEAD);
     match (ok, failure) {
         (true, None) => text.push_str(
             "Outcome: the environment rebuilt and started, and the project's \
@@ -5315,9 +5319,41 @@ impl ChatPane {
             .get(&self.environment)
             .and_then(|supervisor| supervisor.situation().failure);
         let text = rebuild_report(ok, message, failure.as_deref());
+        // One outcome waits for the agent, the latest: two rebuilds while it
+        // was down — a fault, then the fix rebuilt — queued two reports,
+        // and the first would have told it of a fault already gone (David,
+        // 2026-10-04: "Why is this queued twice?").
+        self.withdraw_held_rebuild_reports();
         if self.submit_prompt(text.clone()).is_err() {
             self.note(&text);
         }
+    }
+
+    /// Take every rebuild report still held for the agent out of the
+    /// queue and the transcript. Never a message a person typed.
+    fn withdraw_held_rebuild_reports(&self) {
+        let withdrawn: Vec<QueuedSend> = {
+            let mut queue = self.revive_queue.borrow_mut();
+            let (stale, kept): (Vec<_>, Vec<_>) = queue
+                .drain(..)
+                .partition(|held| !held.typed && held.text.starts_with(REBUILD_REPORT_HEAD));
+            queue.extend(kept);
+            stale
+        };
+        for held in withdrawn {
+            if let Some(row) = held.card.parent() {
+                if row.is_ancestor(&self.transcript) {
+                    if let Ok(row) = row.downcast::<gtk::ListBoxRow>() {
+                        self.transcript.remove(&row);
+                        self.transcript_rows
+                            .set(self.transcript_rows.get().saturating_sub(1));
+                        continue;
+                    }
+                }
+            }
+            held.card.unparent();
+        }
+        self.sync_revive_bar();
     }
 
     /// The proxy read the account's model listing and the top tier
