@@ -1,5 +1,5 @@
 //! The GLM-5.3 machines: a staging VM that fetches the pinned weights,
-//! and a serving VM with no way out that only the IDE can reach
+//! and a serving VM with no address, no way out, and one way in, IAP
 //! (ENVIRONMENTS → "A model on a cloud VM"; the evidence for every number
 //! here is `docs/spikes/glm-on-gcp.md`).
 //!
@@ -119,10 +119,12 @@ const SERVE_CIDR: &str = "10.231.2.0/24";
 /// Where the serving network's DNS goes: inside the VPC's private range
 /// but in no subnet, so no VM ever holds it and nothing answers.
 pub const DNS_BLACKHOLE: &str = "10.231.255.254";
-/// The one port the serving VM listens on to the world, and only for a
-/// TLS handshake that presents this workspace's client certificate. 443
-/// because it is the port a café's network least often blocks.
-pub const TLS_PORT: u16 = 443;
+/// llama-server's port on the serving VM's internal address, the one port
+/// anything may reach, and only through IAP.
+pub const SERVER_PORT: u16 = 8080;
+/// Where Identity-Aware Proxy's TCP forwarding connects from: Google's
+/// documented range for it, and the only source the serving VM admits.
+pub const IAP_RANGE: &str = "35.235.240.0/20";
 
 /// 801 GB of weights on an XFS volume, with room to spare.
 pub const WEIGHTS_DISK_GIB: u64 = 850;
@@ -155,7 +157,7 @@ pub struct Names {
     pub stage_allow_https: String,
     pub stage_deny_egress: String,
     pub serve_deny_egress: String,
-    pub serve_allow_tls: String,
+    pub serve_allow_iap: String,
     pub serve_dns_policy: String,
     pub weights_disk: String,
     pub staging: String,
@@ -172,7 +174,7 @@ impl Names {
             stage_allow_https: ws.name("stage-allow-https")?,
             stage_deny_egress: ws.name("stage-deny-egress")?,
             serve_deny_egress: ws.name("serve-deny-egress")?,
-            serve_allow_tls: ws.name("serve-allow-tls")?,
+            serve_allow_iap: ws.name("serve-allow-iap")?,
             serve_dns_policy: ws.name("serve-dns")?,
             weights_disk: ws.name("weights")?,
             staging: ws.name("stage")?,
@@ -219,18 +221,19 @@ pub fn firewall_specs(names: &Names) -> Vec<FirewallSpec> {
             traffic: Traffic::All,
             what: "the model's machine reaches nothing",
         },
-        // From anywhere, because the IDE's address changes as the laptop
-        // moves; what admits a connection is the client certificate, which
-        // the TLS terminator demands before anything else happens.
+        // Only IAP's forwarders, and only to llama-server. IAP admits a
+        // connection only for a principal IAM lets tunnel to this VM, so
+        // the laptop's address never matters and the VM needs none of its
+        // own.
         FirewallSpec {
-            name: names.serve_allow_tls.clone(),
+            name: names.serve_allow_iap.clone(),
             network: names.serve_network.clone(),
             direction: Direction::Ingress,
             action: Action::Allow,
             priority: 1000,
-            ranges: everywhere(),
-            traffic: Traffic::Tcp(vec![TLS_PORT]),
-            what: "mutual TLS from the IDE",
+            ranges: vec![IAP_RANGE.to_string()],
+            traffic: Traffic::Tcp(vec![SERVER_PORT]),
+            what: "llama-server, through IAP only",
         },
     ]
 }
@@ -297,9 +300,10 @@ pub fn plan(
         boot_disk_gib: BOOT_DISK_GIB,
         network: names.serve_network.clone(),
         subnetwork: names.serve_subnetwork.clone(),
-        // The address the IDE dials. Outbound it goes nowhere: the
-        // priority-0 deny sees to that.
-        external_address: true,
+        // None: the IDE reaches it through IAP, and with no address and no
+        // NAT it has no route to the internet, before the priority-0 deny
+        // even applies.
+        external_address: false,
         attached: vec![Attached {
             disk: names.weights_disk.clone(),
             device_name: WEIGHTS_DEVICE.to_string(),
@@ -445,20 +449,33 @@ mod tests {
     }
 
     #[test]
-    fn serving_admits_only_tls_and_never_ssh() {
+    fn serving_admits_only_iap_to_the_server_and_never_ssh() {
         let plan = fixture(&CANDIDATES[0]);
         let ingress: Vec<_> = rules_on(&plan, &plan.names.serve_network)
             .into_iter()
             .filter(|r| r["direction"] == "INGRESS")
             .collect();
         assert_eq!(ingress.len(), 1);
+        assert_eq!(ingress[0]["sourceRanges"], json!([IAP_RANGE]));
         assert_eq!(
             ingress[0]["allowed"],
-            json!([{ "IPProtocol": "tcp", "ports": ["443"] }])
+            json!([{ "IPProtocol": "tcp", "ports": ["8080"] }])
         );
         for rule in &plan.firewalls {
             assert!(!rule.to_string().contains("\"22\""), "{rule}");
         }
+    }
+
+    #[test]
+    fn serving_has_no_address_on_the_internet() {
+        let plan = fixture(&CANDIDATES[0]);
+        assert!(plan.serving["networkInterfaces"][0]
+            .get("accessConfigs")
+            .is_none());
+        // Staging keeps one: it is the only way out to Hugging Face.
+        assert!(plan.staging["networkInterfaces"][0]
+            .get("accessConfigs")
+            .is_some());
     }
 
     #[test]

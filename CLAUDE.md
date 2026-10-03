@@ -74,17 +74,14 @@ content-addressed on the config's bytes, so two projects with identical
 configs share one image and the `taste.workspace` label names only whoever
 built it last — and it touches nothing outside `taste-img-*`.
 
-`build-aux/gcp-setup.sh PROJECT WORKSPACE ca.pem` is the one-time GCP
-setup for the cloud machines (ENVIRONMENTS → "A model on a cloud VM"):
-the APIs, a custom role of exactly the calls the IDE makes, and a
-Workload Identity provider trusting the workspace's TPM-held CA, run as
-the user in Cloud Shell; `--remove` takes a workspace back out. The IDE
-hands out the same file with the values filled in (`taste_gcp::setup`),
-and a test holds its permission list equal to the crate's.
-`TASTE_TPM_TESTS=1` runs the TPM backend's live test against a software
-TPM; the devcontainer has neither `swtpm` nor `tpm2-tools`, so build the
-test binary there (`cargo test -p taste-gcp --no-run`) and run it on a
-host that has both, `TASTE_TPM_TESTS=1 target/debug/deps/taste_gcp-… --ignored tpm`.
+`build-aux/gcp-setup.sh PROJECT` is the one-time GCP setup for the cloud
+machines (ENVIRONMENTS → "A model on a cloud VM"): the APIs, a custom
+role of exactly the calls the IDE makes, and a keyless `taste-ide`
+service account holding it that the user may impersonate, run as the
+user with gcloud signed in; `--remove` takes it back out. The IDE runs
+the same file with its own pinned gcloud (`taste_gcp::setup`), never one
+installed on the base system, and a test holds its permission list equal
+to the crate's.
 
 `cargo test --workspace` runs headless the same way. Running the GUI needs
 `--env` forwarding of `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` plus the socket

@@ -319,7 +319,37 @@ ten tasks a month, and each session also pays ~$4.50 of overhead (a
 regular use; it stays the default until Phase 2's measurements say what a
 task actually costs.
 
-## Credentials and the tunnel (2026-10-02)
+## What other projects do (2026-10-03)
+
+Asked before settling the access design, and it settled it. The tools
+that provision cloud VMs from a user's own machine authenticate with the
+gcloud CLI's sign-in or a service-account key file, and reach their
+machines over SSH to a public address or, when they care, through IAP:
+
+| Project | Credentials | Reaching the machine |
+| --- | --- | --- |
+| SkyPilot (GPU VMs for LLM serving) | the existing gcloud credentials, or a key file in `GOOGLE_APPLICATION_CREDENTIALS` (recommended, to avoid user-login refresh errors); its minimal role includes `iam.serviceAccounts.actAs` and `serviceusage.services.enable` ([docs](https://docs.skypilot.ai/en/latest/cloud-setup/cloud-permissions/gcp.html)) | SSH to a public address by default; internal addresses through IAP |
+| dstack | `gcloud auth application-default login`, or a key file ([docs](https://dstack.ai/docs/concepts/backends/)) | SSH |
+| DevPod's GCP provider | the ambient gcloud sign-in, shelled out to | a public address, or IAP through `gcloud` with public addresses off ([#37](https://github.com/loft-sh/devpod-provider-gcloud/pull/37), [#847](https://github.com/loft-sh/devpod/issues/847)) |
+| Google Cloud Workstations | the gcloud sign-in, authorized by IAM | `gcloud workstations start-tcp-tunnel`, nothing exposed ([docs](https://docs.cloud.google.com/workstations/docs/develop-code-using-local-vscode-editor)) |
+
+Nobody in this space holds a hardware-bound credential. Google's own
+mechanism for one, the Enterprise Certificate Proxy (a gcloud component
+reading a device certificate through PKCS#11 on Linux), belongs to
+Chrome Enterprise Premium's certificate-based access, layered on a normal
+sign-in rather than replacing it
+([ECP](https://github.com/googleapis/enterprise-certificate-proxy)).
+
+**Chosen:** the convention, with this project's rules applied to it —
+gcloud from the IDE's own pinned copy rather than the base system, signed
+in per project, impersonating a keyless least-privilege service account,
+and IAP as the only way in. The TPM identity below was built and works
+(measured against a software TPM, commits `0822020` through `ee549e2`);
+it was set aside for setup friction (the `tss` group, a C-free but
+bespoke crypto path) and because IAP, which only gcloud speaks, is a
+better network posture than any port facing the internet.
+
+## Credentials and the tunnel (2026-10-02, superseded 2026-10-03)
 
 Two requests from David reshaped the access design: "My IP changes
 frequently as I move my laptop around", and "Would there also be a way to

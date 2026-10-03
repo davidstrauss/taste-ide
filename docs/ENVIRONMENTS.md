@@ -1312,71 +1312,61 @@ want my IDE client to be able to access it").
   the bill is the thing to watch.
 - **The upstream is the IDE's to manage, so there is no endpoint to
   type.** `private-model.json` holds an address the user writes. Here the
-  address is the VM's ephemeral one, different at every start, the key is
-  minted by the IDE at every start, and the certificate is the VM's own,
-  generated at every boot. What the user provides is a GCP project and a
-  one-time setup, and the few choices in `cloud-model.json` — the project,
-  the zone, and the monthly cap — kept with the identity's certificates
-  in this project's state directory, never the checkout, for the reason
-  the private model's file gives: an agent that could write them could aim
-  the IDE's own requests, and its own GCP spend, wherever it liked. **Per
-  project, with no fallback, and never imported**: the IDE does not read
-  gcloud's application-default credentials, `GOOGLE_APPLICATION_CREDENTIALS`,
-  or anything under `~/.config/gcloud` (David, 2026-09-16: "Always require
-  project-level creds").
-- **The IDE's identity lives in the TPM, and no key exists anywhere
-  else** (David, 2026-10-02: "Would there also be a way to use the TPM or
-  a security key instead of a service account key"). Setup creates three
-  non-exportable keys in this machine's TPM: a certificate authority for
-  this workspace, a leaf that authenticates to Google, and a leaf that
-  authenticates to the VM. The IDE builds their certificates; the private
-  halves never leave the chip. What is written to disk is each key's
-  public half and its private half *wrapped by the TPM* — encrypted under
-  a key that never leaves the chip, so the file is useless on any other
-  machine and to anyone who copies it (`taste_gcp::tpm`). To
-  Google the identity is **Workload Identity Federation with X.509
-  certificates**: the IDE exchanges its leaf over mutual TLS at
-  `sts.mtls.googleapis.com` for an access token good for an hour, and the
-  federated principal holds a least-privilege role on this one project —
-  directly, or through a service account it may impersonate where a
-  service does not accept federated principals. No service-account key
-  is created or uploaded, which matters twice over: organizations created
-  since May 2024 forbid both by default, and a key file is exactly the
-  thing a stolen disk would yield. The setup the user runs is a block of
-  commands the IDE writes out for Cloud Shell — enable the APIs, create the
-  pool and its X.509 provider with this workspace's CA as the trust
-  anchor, grant the role — so the user's own credentials never pass
-  through the IDE at all. The Google leaf lives at most 390 days, the
-  provider's limit, and the IDE renews it before then with the CA key
-  that is still in the TPM, which leaves the provider's trust store
-  unchanged. What it costs: the TPM is reachable only by the `tss` group
-  (`/dev/tpmrm0` is `root:tss 0660`), so the user joins it once — on an
-  rpm-ostree host, after copying the group's line from `/usr/lib/group`
-  into `/etc/group`, since `usermod` reads only the latter — and a new
-  machine, or a cleared TPM, is a new enrollment rather than a restore,
-  which is the point. A PIV security key (a YubiKey 5, not a FIDO2-only
-  key, which cannot sign a TLS handshake) can hold the same three keys
-  instead, at the price of a touch whenever a token renews; the TPM is the
-  default because the attacker this answers is the one with a copy of
-  the disk. The setup is `build-aux/gcp-setup.sh`, checked in and
-  documented there, runnable by hand (`gcp-setup.sh PROJECT WORKSPACE
-  ca.pem`, and `--remove` to take a workspace back out), and it is the
-  same file the IDE hands out with the three values filled in
-  (`taste_gcp::setup`, embedded at build time), so the copy pasted into
-  Cloud Shell and the copy reviewed in the tree cannot differ; a test
-  holds its permission list equal to the one the preflight asks about.
-  Its role is the one the substrate's cloud provisioner will widen when
-  environments are placed in GCP, rather than a second grant.
+  upstream is a loopback port the IDE's own IAP tunnel listens on, opened
+  when the VM is ready, and the key llama-server checks is minted by the
+  IDE at every start. What the user provides is a GCP project, a sign-in,
+  and the few choices in `cloud-model.json` — the project, the zone, and
+  the monthly cap — kept in this project's state directory, never the
+  checkout, for the reason the private model's file gives: an agent that
+  could write them could aim the IDE's own requests, and its own GCP spend,
+  wherever it liked.
+- **gcloud, the IDE's own, signed in per project** (David, 2026-10-03:
+  "Let's go with gcloud, but don't make me install it to the base
+  system"). The IDE talks to GCP the way the tools around it do —
+  SkyPilot, DevPod's GCP provider, and Google's own Cloud Workstations all
+  use the gcloud CLI and its sign-in (docs/spikes/glm-on-gcp.md → "What
+  other projects do") — with three differences this project's rules
+  require:
+  - **It is not installed on the host.** Google's Linux archive is
+    self-contained (it bundles its own Python), so the IDE fetches it,
+    pinned by version and SHA-256, into `$XDG_DATA_HOME/taste-ide/gcloud/`
+    and runs it from there, inside its own sandbox — a pinned artifact
+    fetched once and checked, exactly as the VM guest image is
+    (`taste_models::fetch_pinned`). Nothing is layered onto the base
+    system and nothing needs root.
+  - **Its credentials are this project's.** Every invocation sets
+    `CLOUDSDK_CONFIG` to `gcloud/` in the workspace's state directory and
+    strips `GOOGLE_APPLICATION_CREDENTIALS` and every inherited
+    `CLOUDSDK_*` variable, so the user signs in once per project and
+    nothing reads `~/.config/gcloud` or any machine-wide login (David,
+    2026-09-16: "Always require project-level creds").
+  - **What it does is least privilege.** The IDE's calls run as a keyless
+    service account, `taste-ide@<project>`, that holds only the custom
+    role of exactly the calls the IDE makes; the user's sign-in is used to
+    impersonate it (`auth/impersonate_service_account`) and for the setup,
+    and nothing else. Its access tokens are what the IDE's REST client
+    sends (`gcloud auth print-access-token`), so the resource plans and
+    their tests are unchanged by the choice.
+
+  What this accepts, stated plainly: the sign-in leaves a refresh token on
+  disk, in the project's state directory, that carries the user's own
+  GCP authority until it is revoked — the risk every tool above accepts,
+  and the one a TPM-held identity (built, measured against a software TPM,
+  and set aside in favour of this; commits `0822020` through `ee549e2`)
+  would have removed. It never reaches an agent: it is IDE state on the
+  host, and agents run in VMs.
 - **Two machines, and only one of them ever has a way out.** The weights
   are fetched by a **staging VM**: small, on its own network, with egress
   to port 443 and ordinary DNS. It formats the weights disk, downloads the
-  pinned shards and the pinned container images (the llama.cpp server and
-  a TLS terminator) onto it, checks every digest, reports progress through
-  guest attributes, and powers off; the IDE then deletes it and keeps the
-  disk. It runs nothing from the weights — a download and a hash are all
-  it does with them. The **serving VM** is the one the model runs on, on a
-  second network that has:
-  - a deny-all egress rule above every allow;
+  pinned shards and the pinned llama.cpp server image onto it, checks
+  every digest, reports progress through guest attributes, and powers off;
+  the IDE then deletes it and keeps the disk. It runs nothing from the
+  weights — a download and a hash are all it does with them. The
+  **serving VM** is the one the model runs on, on a second network that
+  has:
+  - no external address at all, so nothing on the internet can reach it
+    and it can reach nothing on the internet;
+  - a deny-all egress rule above every allow, besides;
   - a DNS server policy forwarding every query to an unassigned private
     address, because the metadata server answers DNS and no firewall
     reaches the metadata server;
@@ -1384,66 +1374,54 @@ want my IDE client to be able to access it").
   - no service account, so the metadata server mints it no credentials;
   - no SSH (no rule admits port 22, project keys are blocked, and OS
     Login is off) and no serial console;
-  - ingress on one port only, from anywhere — answered by a TLS handshake
-    that completes only for this workspace's client certificate;
+  - one ingress rule: IAP's own range, `35.235.240.0/20`, to llama-server's
+    port, and nothing else;
   - the weights disk attached read-only, and Shielded VM's secure boot.
-- **How the IDE knows it is talking to its VM, and the VM knows it is the
-  IDE: mutual TLS, with no address in it** (David, 2026-10-02: "My IP
-  changes frequently as I move my laptop around"). The **client
-  certificate**: the TLS terminator completes a handshake only for a
-  certificate issued by this workspace's CA, whose key, like the leaf's,
-  is in the TPM — so reaching the model takes this machine's chip, not a
-  file. The **pinned server certificate**: the VM generates its key and a
-  self-signed certificate in `/run` at every boot, so its private key
-  never leaves it either, and publishes the certificate's SHA-256 as a
-  guest attribute; the IDE reads the fingerprint through the
-  authenticated Compute API — so the pin comes from Google's API under
-  the federated identity, never from the network it protects — and the
-  proxy's verifier accepts that certificate and nothing else. The
-  **rotating key**: 256 random bits the IDE writes into the instance's
-  metadata before each start, which llama-server checks too, so a
-  misconfigured terminator is not an open door. Roaming costs nothing:
-  every request is its own connection from wherever the laptop is. What
-  faces the internet before authentication is the terminator's TLS
-  handshake, and that is the residual this design accepts in exchange
-  for the address allowlist it replaced. Three other tunnels were weighed
-  and set aside: SSH, because a key in the TPM would need `tpm2-pkcs11`
-  layered onto the host, and anything else leaves a key on disk; IAP's
-  TCP forwarding, because its protocol is documented only as `gcloud`'s
-  behaviour, which "Intended interfaces only" rules out; and WireGuard,
-  which answers nothing unauthenticated and so would hide even the
-  handshake, but needs a WireGuard and TCP stack inside the IDE — the
-  hardening to reach for if the residual ever has to go.
+- **Reached only through IAP, so the model's machine faces nothing**
+  (David, 2026-10-02: "My IP changes frequently as I move my laptop
+  around"). The IDE runs `gcloud compute start-iap-tunnel` to the serving
+  VM's llama-server port, as the impersonated service account, and the
+  proxy dials the tunnel's loopback end. Google's Identity-Aware Proxy
+  admits the connection only for a principal holding
+  `iap.tunnelInstances.accessViaIAP` on the project — which the service
+  account does, and the internet does not — so there is no port anyone
+  can scan, the laptop's address does not matter, and the VM never has a
+  public address to be found at. llama-server still checks the key the IDE
+  writes into the instance's metadata before each start, so a firewall
+  rule widened by mistake is not an open door. This is the posture
+  DevPod's private mode and Cloud Workstations take; the earlier designs
+  here — an address allowlist, then mutual TLS on a port open to the world
+  — each faced the internet with something, and this faces it with
+  nothing.
 - **The guest is the pool's guest.** Fedora CoreOS from the same pinned
   stream the local pool boots (`taste_devcontainer::guest`; the stream
   metadata already carries the GCP image ID for the release), configured
   by Ignition through `provision::ignition`'s builder, never
   self-updating (Zincati off — and with no egress it could not anyway).
-  Its units mount the weights disk read-only, load the staged images by
-  digest, generate the certificate, run llama-server on loopback (with
-  `--jinja`, the context window the gauge measures against, and
-  `--no-mmap`, so that "ready" means loaded rather than "will page in on
-  the first request"), run the TLS terminator in front of it, publish
-  `taste/ready` with the boot id once `/health` answers, and keep the
-  idle watchdog. Both containers run rootless, with read-only root
-  filesystems and no capabilities, so a weights file crafted to exploit
-  the loader finds no way out and nothing worth taking.
+  Its units mount the weights disk read-only, load the staged image by
+  digest, run llama-server on the VM's internal address (with `--jinja`,
+  the context window the gauge measures against, the key from the
+  metadata, and `--no-mmap`, so that "ready" means loaded rather than
+  "will page in on the first request"), publish `taste/ready` with the
+  boot id once `/health` answers, and keep the idle watchdog. The
+  container runs rootless, with a read-only root filesystem and no
+  capabilities, so a weights file crafted to exploit the loader finds no
+  way out and nothing worth taking.
 - **Waking is starting.** The private route's hook is the one this uses:
   before a request goes out, the proxy checks that something is listening,
   and on this route "wake" means start the VM rather than send a magic
   packet. In order: check the cap; mint the key and write it; start; wait
-  for RUNNING; wait for `taste/ready`; read and pin the certificate;
-  send. Every step is a sentence in the chat whose turn
-  it is (`Event::ChatNotice`), as Wake-on-LAN's are — "Starting GLM-5.3
-  on c4-highmem-192 ($12.51/h); the weights take about six minutes to
-  load", "ready after 6m40s", "not started: this month's GCP spend is $298
-  of the $300 cap" — because a turn that waits seven minutes in silence is
-  a turn the user abandons. One wake at a time per workspace: several
-  chats share one VM, and the second waits on the first's start rather
-  than issuing its own. The private route's silence rule applies
-  unchanged: a stream quiet past the idle window is held while the
-  server's `/health` answers, which on a CPU reading a long prompt it
-  will be for minutes.
+  for RUNNING; wait for `taste/ready`; open the IAP tunnel; send. Every
+  step is a sentence in the chat whose turn it is (`Event::ChatNotice`), as
+  Wake-on-LAN's are — "Starting GLM-5.3 on c4-highmem-192 ($12.51/h); the
+  weights take about six minutes to load", "ready after 6m40s", "not
+  started: this month's GCP spend is $298 of the $300 cap" — because a turn
+  that waits seven minutes in silence is a turn the user abandons. One wake
+  at a time per workspace: several chats share one VM, and the second
+  waits on the first's start rather than issuing its own. The private
+  route's silence rule applies unchanged: a stream quiet past the idle
+  window is held while the server's `/health` answers, which on a CPU
+  reading a long prompt it will be for minutes.
 - **Stopping, in three layers, so that no one failure leaves it running.**
   The IDE stops the VM after fifteen minutes with no request in flight —
   it sees every request — and when the window quits. The guest powers
@@ -1473,19 +1451,26 @@ want my IDE client to be able to access it").
 - **Setting it up.** A Claude Code (GLM-5.3) chat's settings shade
   carries a GCP group in the place the private variant's Private model
   group sits: the project, the zone (defaulting to the first in the region
-  offering the chosen machine), the cap, and "Set up". Setting up enrolls
-  the TPM identity, says plainly when the TPM cannot be opened and why,
-  and writes out the Cloud Shell commands with a copy button; once they
-  have run, "Test" runs a preflight before anything is created — a token
-  from the federated identity, its permissions (asked of the API by name
-  with `testIamPermissions`), and the regional vCPU quota for the machine
-  — and reports each miss as a sentence under the rows. Staging's progress is drawn where the guest image's fetch is
-  drawn, in the backlog's header, from the bytes the staging VM reports.
+  offering the chosen machine), the cap, "Sign in", and "Set up". Signing
+  in fetches the pinned gcloud if it is not there yet and runs its
+  browser sign-in into the project's own config. Setting up runs
+  `build-aux/gcp-setup.sh` with that gcloud, as the user: it enables the
+  APIs, creates the custom role and the keyless service account, grants
+  the one to the other, and lets the user impersonate it — every step
+  repeatable, `--remove` to undo, and runnable by hand or in Cloud Shell
+  just the same, since it is the same file. Then "Test" runs a preflight
+  before anything is created — a token as the service account, its
+  permissions (asked of the API by name with `testIamPermissions`), and
+  the regional vCPU quota for the machine — and reports each miss as a
+  sentence under the rows. Staging's progress is drawn where the guest
+  image's fetch is drawn, in the backlog's header, from the bytes the
+  staging VM reports.
 - **What this protects, and what it does not.** It protects against the
   serving stack — llama.cpp, its GGUF loader, and anything in the weights
-  — sending the user's code or prompts anywhere: the machine has no route
-  out, no name resolution, and no credentials, and only the IDE can
-  reach it. It does not protect against:
+  — sending the user's code or prompts anywhere: the machine has no
+  address on the internet, no route out, no name resolution, and no
+  credentials, and only a principal IAP admits can reach it. It does not
+  protect against:
   - **the model's outputs.** They become tool calls in the user's
     environment, and that environment has egress, so a model that wants
     to exfiltrate asks the agent to `curl` something. Phase 5 below closes
@@ -1493,44 +1478,32 @@ want my IDE client to be able to access it").
   - **a model that writes subtly wrong code.** That is review's job, and
     the acceptance test's for the parts of it that are the engine's
     fault;
-  - **Google**, whose machine it is;
-  - **the project's own IAM principals**, who can read the rotating key
-    from the instance's metadata. They can also delete the instance, so
-    it is no new power;
-  - **malware running as the user on this machine**, which can ask the
-    TPM to sign while it runs. It cannot carry the key away, so it loses
-    the identity when it loses the machine.
-
+  - **Google**, whose machine it is, and whose proxy carries the traffic;
+  - **the project's own IAM principals**, who can read the key from the
+    instance's metadata. They can also delete the instance, so it is no
+    new power;
+  - **a copy of the project's state directory**, which holds the gcloud
+    sign-in and with it the user's GCP authority until it is revoked.
 #### The plan
 
 Each phase ends at a gate it can be judged by, and Phase 4's gate can end
 the plan.
 
-**Phase 1 — `taste-gcp`, the client and the identity.** A crate with no
-GTK: the federated grant (the token exchange at `sts.mtls.googleapis.com`
-over a rustls client whose certificate key signs through a hardware
-signer rather than a key in memory), the TPM identity (the three keys,
-the CA, the certificates, the renewal, and the Cloud Shell commands),
-REST over the hyper and rustls stack the proxy uses, and the Compute,
-Cloud DNS, Billing Catalog, and IAM permission calls the lifecycle
-needs. Two things are settled by the first live setup rather than
-guessed: whether Compute Engine accepts the federated principal directly
-or wants a service account impersonated, and whether the access token
-can be bound to the certificate so that a token lifted from memory is
-useless elsewhere. A third is settled already (2026-10-03): the TPM is
-reached through the host's `tpm2-tools`, the TSS's documented command
-line, through `host_argv` like every other host program, because linking
-the TSS would put a C library into the Rust build and, in the Flatpak,
-need `--device=all`, the sandbox's broadest grant, to open one device;
-the price is a few process spawns per signature, and signatures come
-about hourly and once per connection to the VM. Plus the resource plan as data — names, labels, networks,
-rules, the policy, the disks, the instances — so what the IDE will create
-can be read and tested before it is created. The same client is what
-"Phase 3 — cloud provisioners" in the substrate plan needs to place
-environments in GCP, and it is written once for both. Gate: unit tests
-against a recorded mock of the API; a live test gated on
-`TASTE_GCP_TESTS=1`, which spends money and is run by a person.
-
+**Phase 1 — `taste-gcp`, the client.** A crate with no GTK: the pinned
+gcloud (fetched, checked, and run with the project's own config and no
+inherited credentials), its access tokens, its IAP tunnel, REST over the
+hyper and rustls stack the proxy uses, and the Compute, Cloud DNS,
+Billing Catalog, and IAM permission calls the lifecycle needs. Plus the
+resource plan as data — names, labels, networks, rules, the policy, the
+disks, the instances — so what the IDE will create can be read and
+tested before it is created. The same client is what "Phase 3 — cloud
+provisioners" in the substrate plan needs to place environments in GCP,
+and it is written once for both. One thing is settled by the first live
+setup rather than guessed: that the impersonated service account's
+token and tunnel do everything the plan needs. Gate: unit tests against
+a recorded mock of the API and a gcloud that records its calls; a live
+test gated on `TASTE_GCP_TESTS=1`, which spends money and is run by a
+person.
 **Phase 2 — staging, and the bake-off.** Stage the pinned weights once,
 then run each candidate machine against them: load time, prompt-reading
 and writing rates at 2k, 32k, and 128k tokens of context, and cost per
@@ -1538,21 +1511,19 @@ task on one fixed replay of a real session. From inside the serving VM,
 verify what the lockdown claims: a public name does not resolve, an
 outbound connection does not complete, the metadata server mints no
 token, and llama.cpp's load log names the indexer. Pin the llama.cpp
-build and both images by digest, settle whether the disk's throughput can
+build and its image by digest, settle whether the disk's throughput can
 be lowered while stopped, write the numbers into the spike, and choose the
 machine. Gate: the spike's estimates are all replaced by measurements.
 The bake-off costs on the order of a hundred dollars, which is the
 estimate it exists to replace.
 
 **Phase 3 — the route and the lifecycle.** `Route::Cloud` in the proxy,
-its pinned-certificate verifier and client certificate, waking as
-starting with its notices, the three stopping layers, and the ledger and
-cap. Gate: the proxy against a local TLS fixture with a self-signed
-certificate (the pin accepted, any other certificate refused, the client
-certificate demanded and presented, a rotated key honoured), and the lifecycle
+dialing the IAP tunnel's loopback end, waking as starting with its
+notices, the three stopping layers, and the ledger and cap. Gate: the
+proxy against a local fixture standing in for the tunnel (the key
+honoured, a rotated key honoured, a stale one refused), and the lifecycle
 against the mock — including the IDE crashing mid-session, which the
 guest's watchdog has to cover.
-
 **Phase 4 — the acceptance test, against Z.ai's own stack.** The same
 public tasks run through the real route and through Z.ai's hosted
 GLM-5.3, which is served on the reference stack; only public material
@@ -1591,14 +1562,16 @@ at before it ships. The drop-down offers it only in an environment Phase
 state table gains `cloud-model.json`, `cloud-ledger.json`, and the
 identity's certificates in the same change.
 
-**Settled since the plan was first written (2026-10-02).** The address
-allowlist is gone, replaced by mutual TLS, because the laptop's address
-changes as it moves; the service-account key is gone, replaced by the
-TPM-held federated identity, which also disposes of the 2024 key
-policies; and Claude Code's background requests (titles, summaries)
-landing on the VM and keeping it awake is accepted as they are (David:
-"I don't see a problem with background requests").
-
+**Settled since the plan was first written.** 2026-10-02: the address
+allowlist and the service-account key went, the first because the
+laptop's address changes as it moves, the second because organizations
+created since May 2024 forbid such keys, and Claude Code's background
+requests (titles, summaries) landing on the VM and keeping it awake were
+accepted as they are (David: "I don't see a problem with background
+requests"). 2026-10-03: a TPM-held identity with mutual TLS replaced
+them, was built, and was then set aside for the gcloud CLI the tools
+around this one use, run from the IDE's own pinned copy rather than the
+base system, with IAP in place of any port facing the internet.
 ### Subscription usage
 
 The credential the IDE holds is billed to a subscription, and a

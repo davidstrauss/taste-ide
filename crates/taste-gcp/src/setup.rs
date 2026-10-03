@@ -1,26 +1,28 @@
-//! The one-time setup the user runs, and what it grants.
+//! The one-time setup that grants the IDE its role, and what it grants.
 //!
 //! The setup is `build-aux/gcp-setup.sh`, checked in, documented there,
-//! and runnable by hand. The IDE hands out that same file with the
-//! workspace's three values filled in ([`cloud_shell_script`]), embedded
-//! at build time, so the copy a user pastes and the copy reviewed in the
-//! tree cannot differ. The constants below are the IDE's half of the same
-//! facts — the preflight asks `testIamPermissions` for [`PERMISSIONS`] —
-//! and a test reads the script and holds the two equal.
+//! and runnable by hand or in Cloud Shell. The IDE runs that same file,
+//! embedded at build time, with its own pinned gcloud signed in to the
+//! project's configuration ([`crate::gcloud::Gcloud::setup`]), so what a
+//! person reviews in the tree is what runs. The constants below are the
+//! IDE's half of the same facts — the preflight asks `testIamPermissions`
+//! for [`PERMISSIONS`] — and a test reads the script and holds the two
+//! equal.
 //!
-//! The IDE never holds the user's own Google credentials, not even to set
-//! itself up: the script runs where gcloud is signed in as the user, and
-//! what it grants is a role of exactly the calls the IDE makes, to the
-//! federated identity whose key is in this machine's TPM.
+//! The setup runs as the user. What it grants is a custom role of exactly
+//! the calls the IDE makes, held by a keyless service account the user may
+//! act as, so the IDE's calls carry that role's reach and no more of the
+//! user's.
 
-use anyhow::{bail, Result};
-
-use crate::resources::Workspace;
-
-/// The Workload Identity pool, shared by every workspace in a project.
-pub const POOL: &str = "taste-ide";
-/// The custom role, shared the same way.
+/// The custom role, one per project.
 pub const ROLE: &str = "tasteIde";
+/// The service account's id, one per project.
+pub const ACCOUNT: &str = "taste-ide";
+
+/// The service account the IDE's calls run as in `project`.
+pub fn service_account(project: &str) -> String {
+    format!("{ACCOUNT}@{project}.iam.gserviceaccount.com")
+}
 
 /// The APIs the IDE calls.
 pub const SERVICES: &[&str] = &[
@@ -30,13 +32,14 @@ pub const SERVICES: &[&str] = &[
     "dns.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
-    "sts.googleapis.com",
+    "iap.googleapis.com",
 ];
 
 /// Exactly what the IDE calls: the model's networks, rules, DNS policy,
-/// disks, and instances, the operations it waits on, and the quota and
-/// machine facts the preflight reads. `testIamPermissions` asks for this
-/// same list, so a role that has drifted is named before anything fails.
+/// disks, and instances, the operations it waits on, the quota and machine
+/// facts the preflight reads, and the IAP tunnel to the model's VM.
+/// `testIamPermissions` asks for this same list, so a role that has
+/// drifted is named before anything fails.
 pub const PERMISSIONS: &[&str] = &[
     "compute.disks.create",
     "compute.disks.delete",
@@ -85,50 +88,12 @@ pub const PERMISSIONS: &[&str] = &[
     "dns.policies.get",
     "dns.policies.list",
     "dns.policies.update",
+    "iap.tunnelInstances.accessViaIAP",
     "resourcemanager.projects.get",
 ];
 
-/// The subject the Google leaf's certificate carries, mapped to
-/// `google.subject` and nothing else.
-pub fn subject(ws: &Workspace) -> String {
-    format!("taste-{}", ws.id())
-}
-
-/// This workspace's provider in the pool.
-pub fn provider(ws: &Workspace) -> String {
-    format!("taste-{}", ws.id())
-}
-
-/// Where a federated identity is, which is what the token exchange names
-/// as its audience. It needs the project's number, which Cloud Shell
-/// prints at the end of the setup, because nothing can be asked of the
-/// project before the identity exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Federation {
-    pub project_number: u64,
-    pub provider: String,
-}
-
-impl Federation {
-    pub fn new(ws: &Workspace, project_number: u64) -> Self {
-        Self {
-            project_number,
-            provider: provider(ws),
-        }
-    }
-
-    /// The `audience` of the token exchange.
-    pub fn audience(&self) -> String {
-        format!(
-            "//iam.googleapis.com/projects/{}/locations/global/workloadIdentityPools/{POOL}/providers/{}",
-            self.project_number, self.provider
-        )
-    }
-}
-
 /// GCP project ids: 6–30 characters, a lowercase letter first, then
-/// lowercase letters, digits, and hyphens, not ending in a hyphen. Checked
-/// here because the id is pasted into a shell script.
+/// lowercase letters, digits, and hyphens, not ending in a hyphen.
 pub fn valid_project_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     (6..=30).contains(&bytes.len())
@@ -142,56 +107,9 @@ pub fn valid_project_id(id: &str) -> bool {
 /// The setup script, as checked in.
 pub const SCRIPT: &str = include_str!("../../../build-aux/gcp-setup.sh");
 
-/// The line that ends the pasted block; nothing in [`SCRIPT`] is that line.
-const END: &str = "TASTE_SETUP";
-
-/// [`SCRIPT`] with this workspace's values filled in, wrapped to be pasted
-/// into Cloud Shell: run as `bash -c`, so its `set -e` ends a child shell
-/// rather than the user's session and gcloud keeps the terminal as its
-/// input. `ca_pem` is the workspace's CA certificate, which is public.
-pub fn cloud_shell_script(ws: &Workspace, project: &str, ca_pem: &str) -> Result<String> {
-    if !valid_project_id(project) {
-        bail!("{project:?} is not a GCP project id");
-    }
-    let ca_pem = ca_pem.trim();
-    let lines: Vec<&str> = ca_pem.lines().collect();
-    let body_ok = lines.len() > 2
-        && lines[1..lines.len() - 1].iter().all(|line| {
-            !line.is_empty()
-                && line
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
-        });
-    if lines.first() != Some(&"-----BEGIN CERTIFICATE-----")
-        || lines.last() != Some(&"-----END CERTIFICATE-----")
-        || !body_ok
-    {
-        bail!("the trust anchor must be exactly one PEM certificate");
-    }
-    let (shebang, rest) = SCRIPT
-        .split_once('\n')
-        .expect("the script has a first line");
-    debug_assert!(!SCRIPT.lines().any(|line| line == END));
-    Ok(format!(
-        "bash -c \"$(cat <<'{END}'\n{shebang}\n\
-         TASTE_PROJECT={project}\n\
-         TASTE_WORKSPACE={id}\n\
-         TASTE_CA_PEM='{ca_pem}'\n\
-         {rest}{END}\n)\"\n",
-        id = ws.id(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const CA: &str =
-        "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\nabc+/=\n-----END CERTIFICATE-----\n";
-
-    fn ws() -> Workspace {
-        Workspace::new("0a1b2c3d").unwrap()
-    }
 
     /// The words of a bash array assignment `NAME=( … )` in the script.
     fn script_array(name: &str) -> Vec<String> {
@@ -207,8 +125,8 @@ mod tests {
     fn the_script_and_the_ide_agree() {
         assert_eq!(script_array("PERMISSIONS"), PERMISSIONS);
         assert_eq!(script_array("SERVICES"), SERVICES);
-        assert!(SCRIPT.contains(&format!("\nPOOL={POOL}\n")));
         assert!(SCRIPT.contains(&format!("\nROLE={ROLE}\n")));
+        assert!(SCRIPT.contains(&format!("\nACCOUNT={ACCOUNT}\n")));
     }
 
     #[test]
@@ -240,90 +158,100 @@ mod tests {
     }
 
     #[test]
-    fn what_goes_into_the_shell_is_checked() {
-        assert!(cloud_shell_script(&ws(), "my-project-1; rm -rf ~", CA).is_err());
-        assert!(cloud_shell_script(&ws(), "My-Project", CA).is_err());
-        assert!(cloud_shell_script(&ws(), "my-project-1", "not a pem").is_err());
-        let two = format!("{CA}{CA}");
-        assert!(cloud_shell_script(&ws(), "my-project-1", &two).is_err());
-        let quoted = CA.replace("abc", "a'b");
-        assert!(cloud_shell_script(&ws(), "my-project-1", &quoted).is_err());
-        // A body line spelling the pasted block's terminator never gets in.
-        let ended = CA.replace("abc", "TASTE_SETUP");
-        assert!(cloud_shell_script(&ws(), "my-project-1", &ended).is_err());
+    fn project_ids_are_checked() {
+        assert!(valid_project_id("my-project-1"));
+        assert!(!valid_project_id("My-Project"));
+        assert!(!valid_project_id("my-project-1; rm -rf ~"));
+        assert!(!valid_project_id("short"));
+        assert!(!valid_project_id("ends-with-"));
     }
 
-    #[test]
-    fn the_audience_names_the_pool_and_this_provider() {
-        assert_eq!(
-            Federation::new(&ws(), 123456789).audience(),
-            "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/taste-ide/providers/taste-0a1b2c3d"
-        );
-    }
-
-    /// Run what the IDE hands out, against a gcloud that records its
-    /// arguments, as a project where nothing exists yet.
-    #[test]
-    fn the_pasted_script_creates_the_provider_and_grants_the_role() {
-        let Ok(bash) = std::process::Command::new("bash").arg("--version").output() else {
-            eprintln!("no bash; skipping");
-            return;
-        };
-        assert!(bash.status.success());
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("calls");
-        let stub = dir.path().join("gcloud");
+    /// A gcloud that records its arguments, answers as a signed-in user in
+    /// a project where nothing exists yet, and succeeds at everything else.
+    fn stub(dir: &std::path::Path) {
+        let path = dir.join("gcloud");
         std::fs::write(
-            &stub,
+            &path,
             r#"#!/usr/bin/env bash
 echo "$*" >> "$GCLOUD_LOG"
 case "$*" in
-  "projects describe"*) echo 123456789 ;;
+  "config get-value account") echo david@example.com ;;
   *" describe "*) exit 1 ;;
-  *create-x509*)
-    for arg in "$@"; do
-      [[ $arg == --trust-store-config-path=* ]] && cp "${arg#*=}" "$GCLOUD_LOG.trust"
-    done ;;
 esac
 exit 0
 "#,
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
-        let script = cloud_shell_script(&ws(), "my-project-1", CA).unwrap();
-        let path = format!(
-            "{}:{}",
-            dir.path().display(),
-            std::env::var("PATH").unwrap()
-        );
+    fn run(dir: &std::path::Path, args: &[&str]) -> (std::process::Output, String) {
+        let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
+        let log = dir.join("calls");
         let out = std::process::Command::new("bash")
             .arg("-c")
-            .arg(&script)
+            .arg(SCRIPT)
+            .arg("gcp-setup.sh")
+            .args(args)
             .env("PATH", path)
             .env("GCLOUD_LOG", &log)
             .output()
             .unwrap();
+        (out, std::fs::read_to_string(log).unwrap_or_default())
+    }
+
+    #[test]
+    fn the_setup_makes_a_keyless_account_and_lets_the_user_act_as_it() {
+        let dir = tempfile::tempdir().unwrap();
+        stub(dir.path());
+        let (out, calls) = run(dir.path(), &["my-project-1"]);
         assert!(
             out.status.success(),
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(String::from_utf8_lossy(&out.stdout).contains("project number: 123456789"));
-
-        let calls = std::fs::read_to_string(&log).unwrap();
         assert!(calls.contains("iam roles create tasteIde --project=my-project-1"));
-        assert!(calls.contains("iam workload-identity-pools create taste-ide"));
-        assert!(calls.contains("providers create-x509 taste-0a1b2c3d"));
-        assert!(calls.contains("--attribute-condition=assertion.subject.dn.cn == 'taste-0a1b2c3d'"));
+        assert!(calls.contains("iam service-accounts create taste-ide --project=my-project-1"));
         assert!(calls.contains(
-            "--member=principal://iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/taste-ide/subject/taste-0a1b2c3d"
+            "projects add-iam-policy-binding my-project-1 --condition=None --role=projects/my-project-1/roles/tasteIde --member=serviceAccount:taste-ide@my-project-1.iam.gserviceaccount.com"
         ));
-        let trust = std::fs::read_to_string(dir.path().join("calls.trust")).unwrap();
-        assert_eq!(
-            trust,
-            "trustStore:\n  trustAnchors:\n  - pemCertificate: |\n      -----BEGIN CERTIFICATE-----\n      MIIBszCCAVmgAwIBAgIU\n      abc+/=\n      -----END CERTIFICATE-----\n"
+        assert!(calls.contains(
+            "--role=roles/iam.serviceAccountTokenCreator --member=user:david@example.com"
+        ));
+        assert!(!calls.contains("keys create"), "no key is ever made");
+        let enabled = calls
+            .lines()
+            .find(|l| l.starts_with("services enable"))
+            .unwrap();
+        for service in SERVICES {
+            assert!(enabled.contains(service), "{service}");
+        }
+    }
+
+    #[test]
+    fn remove_takes_the_account_away_and_lists_what_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        stub(dir.path());
+        let (out, calls) = run(dir.path(), &["--remove", "my-project-1"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
         );
+        assert!(calls.contains(
+            "iam service-accounts delete taste-ide@my-project-1.iam.gserviceaccount.com"
+        ));
+        assert!(calls.contains("compute instances list"));
+        assert!(calls.contains("compute disks list"));
+    }
+
+    #[test]
+    fn a_bad_project_id_never_reaches_gcloud() {
+        let dir = tempfile::tempdir().unwrap();
+        stub(dir.path());
+        let (out, calls) = run(dir.path(), &["my-project-1;rm"]);
+        assert!(!out.status.success());
+        assert!(calls.is_empty());
     }
 }

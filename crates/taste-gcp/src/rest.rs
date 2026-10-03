@@ -1,4 +1,4 @@
-//! Calling Google's APIs as the workspace's federated identity.
+//! Calling Google's APIs as the IDE's service account.
 //!
 //! A small JSON client over the same hyper and rustls stack the proxy
 //! uses, with three things every caller would otherwise get wrong: a
@@ -20,11 +20,38 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use rustls::pki_types::CertificateDer;
-use rustls::ClientConfig;
 use serde_json::Value;
 
-use crate::sts::{self, AccessToken};
+use crate::gcloud::Gcloud;
+
+/// How long before its stated expiry a token stops being used, so no
+/// request goes out with one that lapses on the way.
+pub const EXPIRY_MARGIN: Duration = Duration::from_secs(5 * 60);
+
+/// A bearer token for Google's APIs, and when it lapses.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccessToken {
+    pub token: String,
+    pub expires_at: SystemTime,
+}
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessToken")
+            .field("token", &"…")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl AccessToken {
+    /// Usable for another [`EXPIRY_MARGIN`] at least.
+    pub fn is_fresh(&self, now: SystemTime) -> bool {
+        self.expires_at
+            .duration_since(now)
+            .is_ok_and(|left| left > EXPIRY_MARGIN)
+    }
+}
 
 /// Where each API is. Fixed in the product; a test points them at a mock.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,38 +72,24 @@ impl Default for Endpoints {
 }
 
 enum Source {
-    Federated {
-        config: Box<ClientConfig>,
-        endpoint: String,
-        audience: String,
-        leaf: CertificateDer<'static>,
-    },
+    Gcloud(Gcloud),
     #[cfg(any(test, feature = "testing"))]
     Fixed(String),
 }
 
-/// Access tokens for the workspace's identity, exchanged when the last one
-/// is within [`sts::EXPIRY_MARGIN`] of lapsing and not before.
+/// Access tokens for the IDE's calls, asked for again when the last one is
+/// within [`EXPIRY_MARGIN`] of lapsing and not before.
 pub struct TokenSource {
     source: Source,
     cached: tokio::sync::Mutex<Option<AccessToken>>,
 }
 
 impl TokenSource {
-    /// Tokens from Google's token service for `leaf`, over `config`
-    /// ([`sts::mutual_tls_config`] with the leaf and its key).
-    pub fn federated(
-        config: ClientConfig,
-        audience: String,
-        leaf: CertificateDer<'static>,
-    ) -> Self {
+    /// Tokens from the project's own gcloud, as the service account it
+    /// impersonates.
+    pub fn gcloud(gcloud: Gcloud) -> Self {
         Self {
-            source: Source::Federated {
-                config: Box::new(config),
-                endpoint: sts::STS_MTLS_ENDPOINT.to_string(),
-                audience,
-                leaf,
-            },
+            source: Source::Gcloud(gcloud),
             cached: tokio::sync::Mutex::new(None),
         }
     }
@@ -96,12 +109,7 @@ impl TokenSource {
             return Ok(token.token.clone());
         }
         let fresh = match &self.source {
-            Source::Federated {
-                config,
-                endpoint,
-                audience,
-                leaf,
-            } => sts::exchange((**config).clone(), endpoint, audience, leaf).await?,
+            Source::Gcloud(gcloud) => gcloud.access_token().await?,
             #[cfg(any(test, feature = "testing"))]
             Source::Fixed(token) => AccessToken {
                 token: token.clone(),
@@ -607,6 +615,18 @@ mod tests {
             asked[0].body,
             Some(json!({ "permissions": ["compute.instances.get", "compute.instances.create"] }))
         );
+    }
+
+    #[test]
+    fn a_token_is_stale_inside_the_margin_and_never_printed() {
+        let now = SystemTime::now();
+        let token = AccessToken {
+            token: "ya29.secret".into(),
+            expires_at: now + EXPIRY_MARGIN,
+        };
+        assert!(!token.is_fresh(now));
+        assert!(token.is_fresh(now - Duration::from_secs(1)));
+        assert!(!format!("{token:?}").contains("secret"));
     }
 
     #[test]

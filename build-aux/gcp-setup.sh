@@ -1,56 +1,48 @@
 #!/usr/bin/env bash
-# Set a GCP project up for one taste-ide workspace, or take it back out.
+# Set a GCP project up for taste-ide's cloud machines, or take it back out.
 #
 # This is the whole of what a project owner does for the IDE's cloud
-# machines (ENVIRONMENTS → "A model on a cloud VM"), and it is the only
-# place the user's own Google credentials are ever used: the IDE never
-# holds them, not even to set itself up. Run it where gcloud is signed in
-# as you — Cloud Shell is the easy place — and it is safe to run again,
-# which is how a re-enrolled workspace or a role that gained a permission
-# is repaired.
+# machines (ENVIRONMENTS → "A model on a cloud VM"). It runs as you, with
+# gcloud signed in: the IDE runs this same file with its own pinned gcloud,
+# signed in to the project's own configuration (`taste_gcp::gcloud`), never
+# one installed on the base system, and it runs just the same by hand or
+# in Cloud Shell. It is safe to run again, which is how a role that gained
+# a permission is repaired.
 #
-#   build-aux/gcp-setup.sh PROJECT WORKSPACE CA_PEM_FILE
-#   build-aux/gcp-setup.sh --remove PROJECT WORKSPACE
-#
-# WORKSPACE is the eight hex digits that end the workspace's state
-# directory (`…/taste-ide/workspaces/<name>-<WORKSPACE>/`), and the CA is
-# the certificate the IDE enrolled for it, whose key never leaves that
-# machine's TPM. The IDE also hands this same file out with the three
-# values filled in above the first command (`taste_gcp::setup`), so the
-# copy you are given and the copy reviewed here cannot differ.
+#   build-aux/gcp-setup.sh PROJECT
+#   build-aux/gcp-setup.sh --remove PROJECT
 #
 # ## What it creates, and what it grants
 #
 # - The APIs the IDE calls.
 # - A custom role, `tasteIde`, of exactly the calls the IDE makes: the
 #   machines' networks, firewall rules, DNS policy, disks, and instances,
-#   and the operations, quotas, and machine facts it reads. Nothing in it
-#   touches billing, IAM, or a service account, so the identity can spend
-#   money only by running machines, which the IDE's cap meters, and it
-#   cannot widen its own reach. Shared by every workspace in the project.
-# - A Workload Identity pool, `taste-ide`, shared the same way.
-# - An X.509 provider for this workspace, `taste-<WORKSPACE>`, whose only
-#   trust anchor is the workspace's CA and which admits one subject,
-#   `taste-<WORKSPACE>`.
-# - The role, granted to that one federated principal.
+#   the operations, quotas, and machine facts it reads, and tunnelling to
+#   the model's VM through IAP. Nothing in it touches billing, IAM, or a
+#   service account, so whatever holds it can spend money only by running
+#   machines, which the IDE's cap meters, and cannot widen its own reach.
+# - A service account, `taste-ide@PROJECT.iam.gserviceaccount.com`, with
+#   no keys, holding that role. The IDE's own calls run as it.
+# - Permission for you — whoever runs this — to act as that account
+#   (Service Account Token Creator, on that one account), which is how
+#   the IDE's calls, made with your sign-in, run with its privileges and
+#   no more of yours.
 #
-# No service account and no key: organizations created since May 2024
-# forbid creating or uploading service-account keys by default, and a
-# key file is exactly what a copied disk would hand over.
+# No key is ever created: organizations created since May 2024 forbid
+# service-account keys by default, and a key file is exactly what a copied
+# disk would hand over.
 #
 # ## --remove
 #
-# Deletes the workspace's provider and its grant; the shared pool and
-# role stay for other workspaces. Then it lists whatever the workspace's
-# machines and disks are still in the project, because removing the
-# identity stops the IDE managing them, and anything left running keeps
-# costing. GCP keeps a deleted provider for 30 days; setting the same
-# workspace up again inside them restores it rather than failing.
+# Deletes the service account and its grant, so the IDE can no longer act
+# in the project from any workspace; the role stays, inert without a
+# holder. Then it lists whatever of the IDE's machines and disks are still
+# in the project, because anything left running keeps costing.
 set -euo pipefail
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
-POOL=taste-ide
 ROLE=tasteIde
+ACCOUNT=taste-ide
 
 # The APIs the IDE calls. Kept equal to `taste_gcp::setup::SERVICES` by a
 # test that reads this file.
@@ -61,7 +53,7 @@ SERVICES=(
   dns.googleapis.com
   iam.googleapis.com
   iamcredentials.googleapis.com
-  sts.googleapis.com
+  iap.googleapis.com
 )
 
 # Exactly what the IDE calls. Kept equal to
@@ -115,67 +107,64 @@ PERMISSIONS=(
   dns.policies.get
   dns.policies.list
   dns.policies.update
+  iap.tunnelInstances.accessViaIAP
   resourcemanager.projects.get
 )
 
 usage() {
-  echo "usage: $0 PROJECT WORKSPACE CA_PEM_FILE" >&2
-  echo "       $0 --remove PROJECT WORKSPACE" >&2
+  echo "usage: $0 [--remove] PROJECT" >&2
   exit 2
 }
 
 MODE=setup
-if [[ -z "${TASTE_PROJECT:-}" ]]; then
-  if [[ "${1:-}" == "--remove" ]]; then
-    MODE=remove
-    shift
-    [[ $# -eq 2 ]] || usage
-  else
-    [[ $# -eq 3 ]] || usage
-    TASTE_CA_PEM=$(<"$3")
-  fi
-  TASTE_PROJECT=$1
-  TASTE_WORKSPACE=$2
+if [[ "${1:-}" == "--remove" ]]; then
+  MODE=remove
+  shift
 fi
-
-if [[ ! "$TASTE_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
-  echo "$TASTE_PROJECT is not a GCP project id" >&2
-  exit 2
-fi
-if [[ ! "$TASTE_WORKSPACE" =~ ^[0-9a-f]{8}$ ]]; then
-  echo "$TASTE_WORKSPACE is not a workspace id (eight lowercase hex digits)" >&2
+[[ $# -eq 1 ]] || usage
+PROJECT=$1
+if [[ ! "$PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+  echo "$PROJECT is not a GCP project id" >&2
   exit 2
 fi
 
-PROJECT=$TASTE_PROJECT
-PROVIDER=taste-$TASTE_WORKSPACE
-SUBJECT=taste-$TASTE_WORKSPACE
-PROJECT_NUMBER=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
-MEMBER="principal://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL/subject/$SUBJECT"
+EMAIL="$ACCOUNT@$PROJECT.iam.gserviceaccount.com"
+ME=$(gcloud config get-value account 2>/dev/null || true)
+if [[ -z "$ME" ]]; then
+  echo "gcloud is not signed in; run 'gcloud auth login' first" >&2
+  exit 1
+fi
+if [[ "$ME" == *.gserviceaccount.com ]]; then
+  ME_MEMBER="serviceAccount:$ME"
+else
+  ME_MEMBER="user:$ME"
+fi
+
+# A service account just created takes a little while to be visible to
+# IAM, so grants to it are retried rather than failed.
+retry() {
+  local tries=0
+  until "$@"; do
+    tries=$((tries + 1))
+    if [[ $tries -ge 6 ]]; then
+      return 1
+    fi
+    sleep 10
+  done
+}
 
 if [[ "$MODE" == remove ]]; then
   gcloud projects remove-iam-policy-binding "$PROJECT" --condition=None \
-    --role="projects/$PROJECT/roles/$ROLE" --member="$MEMBER" >/dev/null 2>&1 || true
-  gcloud iam workload-identity-pools providers delete "$PROVIDER" \
-    --location=global --workload-identity-pool="$POOL" --project="$PROJECT" 2>/dev/null || true
-  echo "Workspace $TASTE_WORKSPACE no longer has access to $PROJECT."
+    --role="projects/$PROJECT/roles/$ROLE" \
+    --member="serviceAccount:$EMAIL" >/dev/null 2>&1 || true
+  gcloud iam service-accounts delete "$EMAIL" --project="$PROJECT" 2>/dev/null || true
+  echo "The IDE can no longer act in $PROJECT."
   echo "Its machines and disks still in the project, which keep costing until deleted:"
   gcloud compute instances list --project="$PROJECT" \
-    --filter="labels.taste-workspace=$TASTE_WORKSPACE" --format='value(name,zone,status)'
+    --filter="labels.taste-workspace:*" --format='value(name,zone,status)'
   gcloud compute disks list --project="$PROJECT" \
-    --filter="labels.taste-workspace=$TASTE_WORKSPACE" --format='value(name,zone,sizeGb)'
+    --filter="labels.taste-workspace:*" --format='value(name,zone,sizeGb)'
   exit 0
-fi
-
-# One PEM certificate and nothing else, since it is written into a YAML
-# file below.
-PEM_LINES=$(printf '%s\n' "$TASTE_CA_PEM")
-if [[ "$(head -n1 <<<"$PEM_LINES")" != "-----BEGIN CERTIFICATE-----" ]] \
-  || [[ "$(tail -n1 <<<"$PEM_LINES")" != "-----END CERTIFICATE-----" ]] \
-  || [[ "$(grep -c -- '-----BEGIN' <<<"$PEM_LINES")" != 1 ]] \
-  || grep -qvE '^(-----(BEGIN|END) CERTIFICATE-----|[A-Za-z0-9+/=]+)$' <<<"$PEM_LINES"; then
-  echo "the CA must be exactly one PEM certificate" >&2
-  exit 2
 fi
 
 gcloud services enable "${SERVICES[@]}" --project="$PROJECT"
@@ -190,41 +179,19 @@ else
     --permissions="$PERMISSION_LIST" >/dev/null
 fi
 
-gcloud iam workload-identity-pools describe "$POOL" --location=global \
-  --project="$PROJECT" >/dev/null 2>&1 \
-  || gcloud iam workload-identity-pools create "$POOL" --location=global \
-    --project="$PROJECT" --display-name="taste-ide"
+gcloud iam service-accounts describe "$EMAIL" --project="$PROJECT" >/dev/null 2>&1 \
+  || gcloud iam service-accounts create "$ACCOUNT" --project="$PROJECT" \
+    --display-name="taste-ide" \
+    --description="What the taste-ide cloud machines run as; it has no keys"
 
-TRUST=$(mktemp)
-trap 'rm -f "$TRUST"' EXIT
-{
-  echo "trustStore:"
-  echo "  trustAnchors:"
-  echo "  - pemCertificate: |"
-  sed 's/^/      /' <<<"$PEM_LINES"
-} >"$TRUST"
+retry gcloud projects add-iam-policy-binding "$PROJECT" --condition=None \
+  --role="projects/$PROJECT/roles/$ROLE" \
+  --member="serviceAccount:$EMAIL" >/dev/null
 
-STATE=$(gcloud iam workload-identity-pools providers describe "$PROVIDER" \
-  --location=global --workload-identity-pool="$POOL" --project="$PROJECT" \
-  --format='value(state)' 2>/dev/null || true)
-if [[ "$STATE" == DELETED ]]; then
-  gcloud iam workload-identity-pools providers undelete "$PROVIDER" \
-    --location=global --workload-identity-pool="$POOL" --project="$PROJECT"
-fi
-if [[ -n "$STATE" ]]; then
-  gcloud iam workload-identity-pools providers update-x509 "$PROVIDER" \
-    --location=global --workload-identity-pool="$POOL" --project="$PROJECT" \
-    --trust-store-config-path="$TRUST"
-else
-  gcloud iam workload-identity-pools providers create-x509 "$PROVIDER" \
-    --location=global --workload-identity-pool="$POOL" --project="$PROJECT" \
-    --trust-store-config-path="$TRUST" \
-    --attribute-mapping="google.subject=assertion.subject.dn.cn" \
-    --attribute-condition="assertion.subject.dn.cn == '$SUBJECT'"
-fi
-
-gcloud projects add-iam-policy-binding "$PROJECT" --condition=None \
-  --role="projects/$PROJECT/roles/$ROLE" --member="$MEMBER" >/dev/null
+retry gcloud iam service-accounts add-iam-policy-binding "$EMAIL" \
+  --project="$PROJECT" --condition=None \
+  --role=roles/iam.serviceAccountTokenCreator \
+  --member="$ME_MEMBER" >/dev/null
 
 echo
-echo "Done. Give the IDE this project number: $PROJECT_NUMBER"
+echo "Done. The IDE acts in $PROJECT as $EMAIL, which $ME may act as."

@@ -1,6 +1,6 @@
 //! Google Cloud, as the IDE uses it: one workspace's resources in the
-//! user's own project, created under an identity that lives in this
-//! machine's TPM.
+//! user's own project, created as a keyless, least-privilege service
+//! account the user's per-project gcloud sign-in impersonates.
 //!
 //! Two things are built on this crate, and it is shaped so that neither
 //! owns it. The first is the GLM-5.3 route (ENVIRONMENTS → "A model on a
@@ -17,33 +17,22 @@
 //! - [`model`]: the GLM-5.3 machines, composed from those builders, with
 //!   the lockdown the design commits to stated as data so a test can read
 //!   it back before anything is created.
-//! - [`setup`]: the one-time Cloud Shell commands the user runs, which
-//!   are how the IDE gets permission without ever holding the user's own
-//!   credentials.
+//! - [`setup`]: the one-time setup that grants the IDE its role, run as
+//!   the user with the project's own gcloud sign-in.
 //!
-//! And the identity those permissions are granted to:
+//! And how the IDE acts on them:
 //!
-//! - [`signer`]: a P-256 key that signs where it lives — in the product,
-//!   the TPM — and is never anywhere else, with the adapters that let
-//!   certificate building and TLS use it.
-//! - [`tpm`]: those keys in this machine's TPM, through the host's
-//!   `tpm2-tools`.
-//! - [`identity`]: the workspace's CA and its two leaves, one for Google
-//!   and one for the model's VM.
-//! - [`sts`]: trading the Google leaf for an access token over mutual TLS
-//!   (Workload Identity Federation with X.509 certificates).
-//! - [`rest`]: Google's APIs as that identity — tokens renewed before they
-//!   lapse, failures read into a typed error, and Compute's operations
-//!   awaited to their end.
+//! - [`gcloud`]: the IDE's own pinned copy of the gcloud CLI, signed in
+//!   per project — its tokens, and its IAP tunnel to the model's VM.
+//! - [`rest`]: Google's APIs, with tokens renewed before they lapse,
+//!   failures read into a typed error, and Compute's operations awaited
+//!   to their end.
 //!
 //! No GTK, and no IO in the builders: a plan is values, and creating it is
 //! the caller's business.
 
-pub mod identity;
+pub mod gcloud;
 pub mod model;
 pub mod resources;
 pub mod rest;
 pub mod setup;
-pub mod signer;
-pub mod sts;
-pub mod tpm;
