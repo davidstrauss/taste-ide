@@ -109,7 +109,7 @@ and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `quiet` — `busy` silent for over a minute, the
 working line saying for how long and naming Stop —, `starting` — the line above the composer while the environment comes up,
 a message waiting on it —, `replies` — the turn over on a question, the agent's suggested replies
-under it as buttons —, `stopped` — the same turn stopped, the steps it left running settled on their hollow "never reported finishing" dot —, `acts` — the coordinator's transcript, its
+under it as buttons —, `stopped` — the same turn stopped, the steps it left running settled on their hollow "never reported finishing" dot —, `rebuild` — the agent's own rebuild call coming back as the connection closing, drawn finished rather than failed, the IDE's note under it —, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,
 `permission-edit`, `permission-standing`, `standing`,
 `none` — no chat seeded at all —,

@@ -8002,15 +8002,36 @@ impl ChatPane {
             // reporting progress must not keep the colour it wore.
             let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
             card.running.set(running);
+            // A rebuild the agent asked for stops the container the agent
+            // lives in, and its call to the IDE goes with it: "Connection
+            // closed" is that rebuild under way, not a failure of it (David,
+            // 2026-10-04: "This shouldn't be a red line. It's expected").
+            // How the rebuild itself ends is the startup page's and the
+            // row's to say. A refusal the IDE returned has words of its
+            // own and stays red.
+            let rebuild_took_the_agent = status == ToolCallStatus::Failed
+                && mcp_tool_name(&card.title_full.borrow()).as_deref()
+                    == Some("devcontainer_reload")
+                && (self.environment_in_transition()
+                    || raw_output.is_some_and(|out| {
+                        out.to_string()
+                            .to_ascii_lowercase()
+                            .contains("connection closed")
+                    }));
             card.tone.set(match status {
                 ToolCallStatus::Completed => "ok",
+                ToolCallStatus::Failed if rebuild_took_the_agent => "ok",
                 ToolCallStatus::Failed => "fail",
                 _ => "live",
             });
             card.paint_dot();
             // A status after all: the "never reported" hover is no longer
             // true.
-            card.dot.set_tooltip_text(None);
+            card.dot.set_tooltip_text(rebuild_took_the_agent.then_some(
+                "The rebuild started, and stopped this agent's container as a rebuild does — \
+                 the call's connection went with it. The agent comes back when the rebuild \
+                 finishes.",
+            ));
             card.status_spinner.set_visible(running);
             card.dot.set_visible(!running);
             if running {
@@ -11008,6 +11029,27 @@ impl ChatPane {
             Ok("stopped") => {
                 self.settle_running_steps();
                 self.meta_row("stopped");
+                self.stop_button.set_visible(false);
+                self.set_busy(false);
+            }
+            // `rebuild`: the agent rebuilt its own container, so its call
+            // came back as the connection closing — finished, not failed —
+            // and the IDE's note under it.
+            Ok("rebuild") => {
+                let mut rebuild =
+                    ToolCall::new("probe-rebuild", "mcp__taste-ide__devcontainer_reload");
+                rebuild.kind = ToolKind::Other;
+                rebuild.status = ToolCallStatus::Failed;
+                rebuild.raw_output = Some(serde_json::json!("Connection closed"));
+                rebuild.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                    TextContent::new("Connection closed"),
+                )))];
+                self.render_update(SessionUpdate::ToolCall(rebuild));
+                self.settle_running_steps();
+                self.note(
+                    "the agent stopped with its container — it comes back when the rebuild \
+                     finishes",
+                );
                 self.stop_button.set_visible(false);
                 self.set_busy(false);
             }
