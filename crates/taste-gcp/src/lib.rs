@@ -44,3 +44,36 @@ pub mod project;
 pub mod resources;
 pub mod rest;
 pub mod setup;
+
+/// What the tests share.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::io::Write;
+    use std::path::Path;
+
+    /// Write an executable stub at `path` from a short-lived `sh`, so this
+    /// process never holds a file open for writing that it will later run.
+    /// Written here, a stub could meet "Text file busy" at its first run:
+    /// another test thread forking while the file was open hands the child
+    /// that descriptor until the child execs, and the kernel refuses to run
+    /// a file anyone has open for writing.
+    pub fn install_stub(path: &Path, script: &str) {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(
+            child.wait().unwrap().success(),
+            "installing {}",
+            path.display()
+        );
+    }
+}

@@ -140,8 +140,8 @@ async fn smoke(state: &Path, project: &str, zone: &str, keep: bool) -> Result<()
     let loc = Location::new(project, zone)?;
     let plan = smoke_plan(state, &loc, Some(random_key()?))?;
     let say = |line: &str| eprintln!("{line}");
-    lifecycle::stage(&gcp, &loc, &plan, &say).await?;
-    lifecycle::serve(&gcp, &loc, &plan, &say).await?;
+    lifecycle::stage(&gcp, &loc, &plan, &model::GPT_OSS_20B, &say).await?;
+    lifecycle::serve(&gcp, &loc, &plan, &model::GPT_OSS_20B, &say).await?;
     let key = lifecycle::serving_key(&gcp, &loc, &plan).await?;
 
     let port = std::net::TcpListener::bind("127.0.0.1:0")?

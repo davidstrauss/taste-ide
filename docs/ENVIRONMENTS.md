@@ -1401,7 +1401,7 @@ want my IDE client to be able to access it").
   Its units mount the weights disk read-only, load the staged image by
   digest, run llama-server on the VM's internal address (with `--jinja`,
   the context window the gauge measures against, the key from the
-  metadata, and `--no-mmap`, so that "ready" means loaded rather than
+  metadata, and `--load-mode none` (no mmap), so that "ready" means loaded rather than
   "will page in on the first request"), publish `taste/ready` with the
   boot id once `/health` answers, and keep the idle watchdog. The
   container runs rootless, with a read-only root filesystem and no

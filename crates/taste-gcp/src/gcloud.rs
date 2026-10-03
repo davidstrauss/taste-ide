@@ -518,9 +518,9 @@ mod tests {
     /// matter, and prints a token.
     fn stub(dir: &Path, token: &str) -> PathBuf {
         let path = dir.join("gcloud");
-        std::fs::write(
+        crate::testing::install_stub(
             &path,
-            format!(
+            &format!(
                 "#!/usr/bin/env bash\n\
                  echo \"$* | config=$CLOUDSDK_CONFIG as=${{CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-me}} gac=${{GOOGLE_APPLICATION_CREDENTIALS:-none}}\" >> \"{log}\"\n\
                  case \"$*\" in\n\
@@ -529,10 +529,7 @@ mod tests {
                  esac\n",
                 log = dir.join("calls").display(),
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path
     }
 
@@ -563,13 +560,10 @@ mod tests {
     async fn no_token_is_a_failure_in_gclouds_words() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gcloud");
-        std::fs::write(
+        crate::testing::install_stub(
             &path,
             "#!/usr/bin/env bash\necho 'ERROR: (gcloud.auth.print-access-token) You do not currently have an active account selected.' >&2\nexit 1\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let error = gcloud(dir.path())
             .access_token()
             .await
@@ -594,27 +588,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_account_is_told_apart_from_an_unknowable_one() {
-        use std::os::unix::fs::PermissionsExt;
-        // A stub written and run at once can meet "Text file busy": another
-        // test thread that forks while the file is open for writing holds
-        // it until that child execs. Each answer gets its own stub, and a
-        // busy one is run again, which is what the condition asks for.
         async fn answer(body: &str) -> Option<bool> {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("gcloud");
-            std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let g = gcloud(dir.path());
-            for _ in 0..20 {
-                match g.service_account_exists().await {
-                    Ok(answer) => return answer,
-                    Err(e) if format!("{e:#}").contains("busy") => {
-                        tokio::time::sleep(std::time::Duration::from_millis(25)).await
-                    }
-                    Err(e) => panic!("{e:#}"),
-                }
-            }
-            panic!("the stub stayed busy");
+            crate::testing::install_stub(&path, &format!("#!/usr/bin/env bash\n{body}\n"));
+            gcloud(dir.path()).service_account_exists().await.unwrap()
         }
         assert_eq!(
             answer("echo taste-ide@my-project-1.iam.gserviceaccount.com").await,

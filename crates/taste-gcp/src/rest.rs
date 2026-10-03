@@ -151,6 +151,22 @@ impl ApiError {
         self.status == 404 || self.code.as_deref() == Some("NOT_FOUND")
     }
 
+    /// The zone could not supply the machine right now, or does not offer
+    /// it at all: either way, another machine of the same size may do.
+    pub fn is_unavailable_machine(&self) -> bool {
+        let said = |text: &Option<String>| {
+            text.as_deref().is_some_and(|t| {
+                t.contains("RESOURCE_POOL_EXHAUSTED")
+                    || t.contains("STOCKOUT")
+                    || t.contains("UNSUPPORTED_OPERATION")
+            })
+        };
+        said(&self.reason)
+            || said(&self.code)
+            || (self.message.contains("machineType") && self.message.contains("does not exist"))
+            || self.message.contains("does not have enough resources")
+    }
+
     pub fn is_already_exists(&self) -> bool {
         self.status == 409
             || self.code.as_deref() == Some("ALREADY_EXISTS")
@@ -235,7 +251,15 @@ impl Gcp {
                 request = request.header(http::header::CONTENT_TYPE, "application/json");
                 Bytes::from(body.to_string())
             }
-            None => Bytes::new(),
+            None => {
+                // Google refuses a write with no stated length (411), and an
+                // empty body is sent with none: Compute's `wait`, `start`,
+                // and `stop` are all POSTs with nothing in them.
+                if method != Method::GET && method != Method::DELETE {
+                    request = request.header(http::header::CONTENT_LENGTH, "0");
+                }
+                Bytes::new()
+            }
         };
         let request = request.body(Full::new(payload))?;
         let response = tokio::time::timeout(CALL_TIMEOUT, self.http.request(request))
@@ -245,7 +269,13 @@ impl Gcp {
         let status = response.status();
         let bytes = response.into_body().collect().await?.to_bytes();
         if !status.is_success() {
-            return Err(ApiError::from_body(status.as_u16(), &bytes).into());
+            let mut error = ApiError::from_body(status.as_u16(), &bytes);
+            if error.code.is_none() && error.reason.is_none() {
+                // Nothing of Google's own to say, so at least say to what.
+                let path = url.split_once("googleapis.com").map_or(url, |(_, p)| p);
+                error.message = format!("{} to {method} {path}", error.message);
+            }
+            return Err(error.into());
         }
         if bytes.is_empty() {
             return Ok(Value::Null);
@@ -390,6 +420,10 @@ fn api_error(e: &anyhow::Error) -> Option<&ApiError> {
 
 pub fn is_not_found(e: &anyhow::Error) -> bool {
     api_error(e).is_some_and(ApiError::is_not_found)
+}
+
+pub fn is_unavailable_machine(e: &anyhow::Error) -> bool {
+    api_error(e).is_some_and(ApiError::is_unavailable_machine)
 }
 
 pub fn is_already_exists(e: &anyhow::Error) -> bool {
@@ -649,6 +683,44 @@ mod tests {
         assert!(!token.is_fresh(now));
         assert!(token.is_fresh(now - Duration::from_secs(1)));
         assert!(!format!("{token:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn a_write_with_nothing_in_it_still_states_its_length() {
+        // The mock is plain HTTP/1.1 like Google's front end in this
+        // respect: it is the request that carries the header, so read it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0u8; 4096];
+            let n = tcp.read(&mut buffer).await.unwrap();
+            let head = String::from_utf8_lossy(&buffer[..n]).to_lowercase();
+            tcp.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            head
+        });
+        let gcp = Gcp::new(Arc::new(TokenSource::fixed("t")), Endpoints::default());
+        gcp.call(Method::POST, &format!("http://{address}/x/start"), None)
+            .await
+            .unwrap();
+        assert!(seen.await.unwrap().contains("content-length: 0"));
+    }
+
+    #[test]
+    fn a_stockout_is_told_from_a_fault() {
+        let stockout = ApiError::from_operation(&json!({ "errors": [{
+            "code": "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+            "message": "The zone 'projects/p/zones/z' does not have enough resources available to fulfill the request.",
+        }] }));
+        assert!(stockout.is_unavailable_machine());
+        let fault = ApiError::from_operation(&json!({ "errors": [{
+            "code": "QUOTA_EXCEEDED",
+            "message": "Quota 'N4_CPUS' exceeded.",
+        }] }));
+        assert!(!fault.is_unavailable_machine());
     }
 
     #[test]

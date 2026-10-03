@@ -141,6 +141,23 @@ pub const CANDIDATES: &[Machine] = &[
 /// The staging VM only downloads and hashes, so it is small.
 pub const STAGING_MACHINE: &str = "n4-standard-8";
 
+/// Machines of one size, in order of preference, for when a zone cannot
+/// supply the first: every one takes Hyperdisk, which is what the plan's
+/// disks are, so the same request fits any of them. The zone is fixed by
+/// the weights disk, which is zonal, so the IDE tries another machine
+/// there rather than another zone (`lifecycle::create_instance`).
+pub const SMALL_MACHINES: &[&str] = &[
+    "n4-standard-8",
+    "c4-standard-8",
+    "n4d-standard-8",
+    "c4d-standard-8",
+    // The generation before, which also takes Hyperdisk Balanced and is
+    // less contended: us-central1-b had none of the four above to give on
+    // 2026-10-03.
+    "c3-standard-8",
+    "c3d-standard-8",
+];
+
 /// The smoke test serves from the staging VM's shape: 32 GB holds a 12 GB
 /// model and its cache, at about $0.38 an hour on demand.
 pub const SMOKE_MACHINE: Machine = Machine {
@@ -164,6 +181,8 @@ pub struct ModelSpec {
     /// What the weights disk is provisioned at while staging or loading.
     pub disk_loading: DiskPerformance,
     pub machine: Machine,
+    /// Machines to try, in order, when a zone cannot supply `machine`.
+    pub fallbacks: &'static [&'static str],
     /// llama-server's `-c`, which the context gauge measures against.
     pub context_tokens: u32,
 }
@@ -176,6 +195,7 @@ pub const GLM_5_3: ModelSpec = ModelSpec {
     disk_gib: WEIGHTS_DISK_GIB,
     disk_loading: WEIGHTS_LOADING,
     machine: CANDIDATES[0],
+    fallbacks: &["c4d-highmem-192", "g4-standard-192"],
     context_tokens: 200_000,
 };
 
@@ -189,6 +209,7 @@ pub const GPT_OSS_20B: ModelSpec = ModelSpec {
     disk_gib: 20,
     disk_loading: DiskPerformance::BASELINE,
     machine: SMOKE_MACHINE,
+    fallbacks: SMALL_MACHINES,
     context_tokens: 65_536,
 };
 
@@ -385,15 +406,25 @@ pub fn plan(
         // NAT it has no route to the internet, before the priority-0 deny
         // even applies.
         external_address: false,
+        // Read-write to GCP, because Hyperdisk Balanced refuses a read-only
+        // attachment (the first live run, 2026-10-03); read-only where it
+        // counts, because the guest mounts it `ro` and hands it to the
+        // server's container `:ro` (`guest::serving_script`).
         attached: vec![Attached {
             disk: names.weights_disk.clone(),
             device_name: WEIGHTS_DEVICE.to_string(),
-            read_only: true,
+            read_only: false,
         }],
         maintenance: machine.maintenance(),
         max_run: Some((SERVE_MAX_RUN_SECONDS, OnMaxRun::Stop)),
         metadata: user_data(&guests.serving_user_data)
             .into_iter()
+            .chain(guests.serving_user_data.iter().map(|config| {
+                (
+                    crate::guest::CONFIG_ATTRIBUTE.to_string(),
+                    crate::guest::config_hash(config),
+                )
+            }))
             .chain(
                 guests
                     .serving_key
@@ -647,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn serving_holds_the_weights_read_only_and_staging_writes_them() {
+    fn the_weights_disk_outlives_both_machines() {
         let plan = fixture(&CANDIDATES[0]);
         let weights = |vm: &Value| {
             vm["disks"]
@@ -658,7 +689,9 @@ mod tests {
                 .cloned()
                 .unwrap()
         };
-        assert_eq!(weights(&plan.serving)["mode"], "READ_ONLY");
+        // Hyperdisk Balanced takes no read-only attachment; the serving
+        // guest mounts it read-only instead, which `guest`'s tests hold.
+        assert_eq!(weights(&plan.serving)["mode"], "READ_WRITE");
         assert_eq!(weights(&plan.staging)["mode"], "READ_WRITE");
         assert_eq!(weights(&plan.serving)["autoDelete"], json!(false));
         assert_eq!(weights(&plan.staging)["autoDelete"], json!(false));

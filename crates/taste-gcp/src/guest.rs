@@ -37,6 +37,45 @@ pub const SERVER_IMAGE: &str =
 /// `taste-app`, so a guest in GCP and one under libvirt are one system.
 pub const FCOS_RELEASE: &str = "44.20260829.3.1";
 
+/// The weights volume's filesystem label. XFS allows twelve characters,
+/// and a longer one fails `mkfs.xfs` outright (the first live staging
+/// run, 2026-10-03, with `taste-weights`).
+pub const VOLUME_LABEL: &str = "weights";
+
+/// What a staged disk holds, as one label value: a hash of every pinned
+/// shard digest and the server image, so a disk staged for this pin is
+/// known without a VM, and a pin that moved is staged again.
+pub fn staged_label(spec: &ModelSpec) -> String {
+    // The whole staging script, which names every shard's digest and the
+    // image, and also how they are put on the disk: a change to that is a
+    // change to what the disk holds (an image saved the old way would not
+    // load), so it stages again — which costs only the image, since the
+    // shards already checked are skipped. Not a security boundary; an
+    // identity for what was staged.
+    config_hash(&staging_script(spec))
+}
+
+/// A stable hash of a guest's Ignition config, kept in the instance's
+/// metadata (`CONFIG_ATTRIBUTE`), so a VM booted from an older config is
+/// known and replaced: Ignition runs only on a machine's first boot.
+pub fn config_hash(ignition: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in ignition.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// The metadata key [`config_hash`] is kept under.
+pub const CONFIG_ATTRIBUTE: &str = "taste-config";
+
+/// The disk label that records [`staged_label`].
+pub const STAGED_LABEL: &str = "taste-staged";
+
+/// What the server image is called once the staging VM has saved it.
+pub const LOCAL_TAG: &str = "localhost/taste-llama-server:pinned";
+
 /// The guest attribute namespace both VMs write to.
 pub const NAMESPACE: &str = "taste";
 /// The metadata key llama-server's API key is read from.
@@ -85,9 +124,10 @@ pub fn staging_script(spec: &ModelSpec) -> String {
     format!(
         r#"{PREAMBLE}
 fail() {{ say stage "failed: $1"; poweroff; exit 1; }}
-trap 'fail "line $LINENO"' ERR
+trap 'fail "line $LINENO: $BASH_COMMAND"' ERR
 say stage "formatting"
-blkid "$DEV" >/dev/null 2>&1 || mkfs.xfs -q -L taste-weights "$DEV"
+[ -e "$DEV" ] || fail "no weights disk at $DEV"
+blkid "$DEV" >/dev/null 2>&1 || mkfs.xfs -q -L {VOLUME_LABEL} "$DEV"
 mkdir -p "$WEIGHTS"
 mountpoint -q "$WEIGHTS" || mount "$DEV" "$WEIGHTS"
 cd "$WEIGHTS"
@@ -119,8 +159,13 @@ say progress "$TOTAL/$TOTAL"
 say stage "saving the server image"
 podman pull {SERVER_IMAGE}
 podman image inspect --format '{{{{.Id}}}}' {SERVER_IMAGE} > image.id
+# Saved under a plain local tag: `podman save` writes the manifest anew,
+# so an archive named by the pulled digest no longer matches it and will
+# not load (the first live serving run, 2026-10-03). The serving VM runs
+# the image by its ID, which the save leaves as it was.
+podman tag {SERVER_IMAGE} {LOCAL_TAG}
 rm -f llama-server.tar
-podman save --format oci-archive -o llama-server.tar {SERVER_IMAGE}
+podman save --format oci-archive -o llama-server.tar {LOCAL_TAG}
 
 sync
 cd /
@@ -137,6 +182,9 @@ pub fn serving_script(spec: &ModelSpec) -> String {
     let context = spec.context_tokens;
     format!(
         r#"{PREAMBLE}
+# A failure is said, not left as the last thing that was said: the IDE
+# waits on these attributes and would otherwise wait out its deadline.
+trap 'say serve "failed: line $LINENO: $BASH_COMMAND"' ERR
 say serve "mounting the weights"
 mkdir -p "$WEIGHTS"
 mountpoint -q "$WEIGHTS" || mount -o ro "$DEV" "$WEIGHTS"
@@ -144,10 +192,17 @@ KEY=$(curl -sf -H "Metadata-Flavor: Google" "$MD/attributes/{KEY_ATTRIBUTE}")
 IMAGE=$(cat "$WEIGHTS/image.id")
 podman image exists "$IMAGE" || {{ say serve "loading the server image"; podman load -q -i "$WEIGHTS/llama-server.tar"; }}
 say serve "loading the model"
-exec podman run --rm --name llama --network host --security-opt label=disable \
+# Not exec'd: the server exiting is a failure to say too, and an exec'd
+# shell is not there to say it. Its own last line is the reason.
+trap - ERR
+rc=0
+podman run --rm --name llama --network host --security-opt label=disable \
   -v "$WEIGHTS:/models:ro" "$IMAGE" \
   -m "/models/{model}" --host 0.0.0.0 --port {SERVER_PORT} \
-  --jinja -c {context} --no-mmap --api-key "$KEY"
+  --jinja -c {context} --load-mode none --api-key "$KEY" || rc=$?
+said=$(journalctl -q -u taste-serve.service -n 1 -o cat || true)
+say serve "failed: the server exited ($rc): ${{said#*: }}"
+exit 1
 "#
     )
 }
@@ -155,6 +210,7 @@ exec podman run --rm --name llama --network host --security-opt label=disable \
 /// Readiness: `/health` on loopback, reported once with the boot it is
 /// for, so a ready from the last run is never read as this one's.
 const READY_SCRIPT: &str = r#"
+trap 'say serve "failed: line $LINENO: $BASH_COMMAND"' ERR
 until curl -sf -o /dev/null "http://127.0.0.1:PORT/health"; do sleep 5; done
 say ready "$(cat /proc/sys/kernel/random/boot_id)"
 say serve "ready"
@@ -174,7 +230,8 @@ fn unit(name: &str, description: &str, exec: &str, after: &str, kind: &str) -> V
         "contents": format!(
             "[Unit]\nDescription={description}\nWants=network-online.target\n\
              After=network-online.target{after}\n\n\
-             [Service]\nType={kind}\nExecStart={exec}\nRestart=no\n\n\
+             [Service]\nType={kind}\nExecStart={exec}\nRestart=no\n\
+             StandardOutput=journal+console\nStandardError=journal+console\n\n\
              [Install]\nWantedBy=multi-user.target\n"
         ),
     })
@@ -278,6 +335,10 @@ mod tests {
         }
         assert!(script.contains("sha256sum -c"));
         assert!(script.contains(&format!("podman pull {SERVER_IMAGE}")));
+        // Saved by a plain tag, never by the digest it was pulled as.
+        assert!(script.contains(&format!(
+            "podman save --format oci-archive -o llama-server.tar {LOCAL_TAG}"
+        )));
         assert!(script.trim_end().ends_with("poweroff"));
     }
 
@@ -291,7 +352,9 @@ mod tests {
         for forbidden in ["podman pull", "dnf ", "rpm-ostree", "https://"] {
             assert!(!script.contains(forbidden), "{forbidden}");
         }
+        // Read-only here, since GCP cannot attach Hyperdisk Balanced so.
         assert!(script.contains("mount -o ro"));
+        assert!(script.contains(":/models:ro"));
         assert!(script.contains("--api-key \"$KEY\""));
         assert!(script.contains("-c 65536"));
         assert!(script.contains("/models/gpt-oss-20b-MXFP4.gguf"));
@@ -333,6 +396,42 @@ mod tests {
                 String::from_utf8_lossy(&checked.stderr)
             );
         }
+    }
+
+    #[test]
+    fn the_staged_label_is_stable_and_names_the_pin() {
+        let small = staged_label(&GPT_OSS_20B);
+        assert_eq!(small, staged_label(&GPT_OSS_20B));
+        assert_ne!(small, staged_label(&GLM_5_3));
+        assert_eq!(small.len(), 16);
+        assert!(small.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn every_guest_says_when_it_fails_and_writes_to_the_console() {
+        for config in [
+            staging_ignition(&GPT_OSS_20B),
+            serving_ignition(&GPT_OSS_20B),
+        ] {
+            let value: Value = serde_json::from_str(&config).unwrap();
+            for unit in value["systemd"]["units"].as_array().unwrap() {
+                if let Some(contents) = unit["contents"].as_str() {
+                    assert!(
+                        contents.contains("StandardOutput=journal+console"),
+                        "{}",
+                        unit["name"]
+                    );
+                }
+            }
+        }
+        assert!(serving_script(&GPT_OSS_20B).contains("say serve \"failed:"));
+        assert!(staging_script(&GPT_OSS_20B).contains("fail \"line $LINENO"));
+    }
+
+    #[test]
+    fn the_volume_label_fits_xfs() {
+        assert!(VOLUME_LABEL.len() <= 12);
+        assert!(staging_script(&GPT_OSS_20B).contains(&format!("-L {VOLUME_LABEL} ")));
     }
 
     #[test]

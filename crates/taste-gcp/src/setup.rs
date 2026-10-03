@@ -170,7 +170,7 @@ mod tests {
     /// a project where nothing exists yet, and succeeds at everything else.
     fn stub(dir: &std::path::Path) {
         let path = dir.join("gcloud");
-        std::fs::write(
+        crate::testing::install_stub(
             &path,
             r#"#!/usr/bin/env bash
 echo "$*" >> "$GCLOUD_LOG"
@@ -180,10 +180,7 @@ case "$*" in
 esac
 exit 0
 "#,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
     }
 
     fn run(dir: &std::path::Path, args: &[&str]) -> (std::process::Output, String) {
