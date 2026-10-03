@@ -666,6 +666,13 @@ pub struct ChatPane {
     keyed_notes: RefCell<HashMap<String, gtk::Label>>,
     client: RefCell<Option<AgentClient>>,
     pending_permission: RefCell<Option<PendingPermission>>,
+    /// Requests that arrived while a card was already up, in arrival
+    /// order. Each waits its turn rather than displacing the one on
+    /// screen: a displaced request is answered "cancelled", and Claude
+    /// Code reports a cancelled call to its model as the user refusing it
+    /// — so two calls made at once used to cost one of them a refusal
+    /// nobody gave.
+    permission_queue: RefCell<std::collections::VecDeque<PendingPermission>>,
     /// Context queued for the next prompt (files, selections, images).
     composer: Rc<crate::composer::Composer>,
     send_button: gtk::Button,
@@ -3101,6 +3108,7 @@ impl ChatPane {
             on_focus_composer: RefCell::new(None),
             client: RefCell::new(None),
             pending_permission: RefCell::new(None),
+            permission_queue: RefCell::new(std::collections::VecDeque::new()),
             pending_marks: RefCell::new(HashMap::new()),
             composer: composer.clone(),
             send_button: send.clone(),
@@ -8546,229 +8554,7 @@ impl ChatPane {
                 self.stash_update(&update);
                 self.render_update(update)
             }
-            SessionEvent::Permission { request, reply } => {
-                self.finalize_stream();
-                let title = permission_title(&request);
-                let note = single_line(&title, 120);
-                // The project has already settled this one. Checked FIRST,
-                // before the skip-all-prompts override and before the card:
-                // a standing answer is the user's own decision about this
-                // exact tool, and a specific instruction outranks a blanket
-                // one — which matters in the direction that counts, since a
-                // standing NO must not be overridden by a switch that says
-                // yes to everything.
-                //
-                // It answers with the one-shot option, exactly as the
-                // override does. The standing answer is the IDE's, and
-                // approving a call is not rewriting the agent's own policy.
-                // A tool whose whole effect lands in the VM and is reported
-                // when it ends asks nobody: the IDE answers yes before any
-                // card, and says so in the transcript
-                // (`taste_mcp::asks_nobody`).
-                if let Some(tool) = standing_tool(&request).filter(|t| taste_mcp::asks_nobody(t)) {
-                    if let Some(option) = allow_option(&request.options) {
-                        let _ = reply.send(outcome_for(option));
-                        self.note_permission(
-                            request.tool_call.tool_call_id.to_string(),
-                            "changes-allow-symbolic",
-                            format!(
-                                "Allowed “{}” — {tool} runs in the VM and reports when it ends",
-                                option.name
-                            ),
-                        );
-                        self.workspace.ide.record_permission(
-                            &note,
-                            "approved",
-                            &format!(
-                                "{tool} asks nobody: its effect is in the VM and it is reported"
-                            ),
-                        );
-                        return;
-                    }
-                }
-                if let Some((tool, answer)) = self.settled_answer(&request) {
-                    let taken = match answer {
-                        taste_core::StandingAnswer::Allow => allow_option(&request.options),
-                        taste_core::StandingAnswer::Deny => reject_option(&request.options),
-                    };
-                    // An agent that offered no way to say it gets the card
-                    // instead: a policy is not a reason to answer a
-                    // question nobody asked.
-                    if let Some(option) = taken {
-                        let allowed = matches!(answer, taste_core::StandingAnswer::Allow);
-                        let _ = reply.send(outcome_for(option));
-                        self.note_permission(
-                            request.tool_call.tool_call_id.to_string(),
-                            if allowed {
-                                "changes-allow-symbolic"
-                            } else {
-                                "changes-prevent-symbolic"
-                            },
-                            format!(
-                                "{} “{}” — this project's standing answer for {tool}",
-                                if allowed { "Allowed" } else { "Refused" },
-                                option.name
-                            ),
-                        );
-                        self.workspace.ide.record_permission(
-                            &note,
-                            if allowed { "approved" } else { "denied" },
-                            &format!(
-                                "this project's standing answer for {tool}; given on a \
-                                 permission card and revocable in the chat's settings"
-                            ),
-                        );
-                        return;
-                    }
-                }
-                // Auto-approve only when there is something to approve
-                // WITH. A request carrying no allow option is a real
-                // question, and answering it by taking whatever came first
-                // is how a refusal came to be announced as an approval.
-                let automatic = self
-                    .auto_approve()
-                    .then(|| allow_option(&request.options).map(|o| o.name.clone()))
-                    .flatten();
-                if let Some(name) = automatic {
-                    let _ = reply.send(first_allow_outcome(&request));
-                    // Name the option that was taken — "approved" was a
-                    // claim about intent, and intent is not what the agent
-                    // got.
-                    self.note_permission(
-                        request.tool_call.tool_call_id.to_string(),
-                        "changes-allow-symbolic",
-                        format!("Auto-approved “{name}”"),
-                    );
-                    self.workspace.ide.record_permission(
-                        &note,
-                        "approved",
-                        &format!("auto-approve is on; took the “{name}” option"),
-                    );
-                } else {
-                    // The call's own step goes amber while the question is
-                    // open: the timeline says where the turn stopped.
-                    self.mark_waiting(&request.tool_call.tool_call_id.to_string(), true);
-                    if self.auto_approve() {
-                        // Falling back to the bar beats refusing silently:
-                        // the user can see options we have no answer for.
-                        self.meta_row(&format!(
-                            "auto-approve found no allow option — asking: {note}"
-                        ));
-                    }
-                    // The card must show enough to decide on: the question,
-                    // who is asking and where it lands, then the literal
-                    // thing — with the whole of it a hover away.
-                    let face =
-                        permission_face(&request, &self.agent_name(), self.environment.as_str());
-                    self.permission_icon.set_icon_name(Some(face.icon));
-                    self.permission_label.set_label(&face.title);
-                    self.permission_label.set_tooltip_text(Some(&title));
-                    self.permission_subtitle.set_label(&face.subtitle);
-                    // What the card is called when it is heard rather than
-                    // seen: the agent's own phrasing of the ask, which is
-                    // more than the kind-derived question above says.
-                    if let Some(card) = self.permission_bar.child() {
-                        card.update_property(&[gtk::accessible::Property::Label(&title)]);
-                    }
-                    // One button per answer the agent offered, saying what
-                    // the AGENT calls it rather than a generic Allow/Deny —
-                    // "don't ask again" is a different answer from "yes,
-                    // this once" and must not read alike, or go missing.
-                    self.build_permission_answers(&request);
-                    clear_children(&self.permission_detail);
-                    // The specifics get said once. A request carrying a diff
-                    // has already named its file in the diff's own header,
-                    // and repeating the path above it is two answers to one
-                    // question.
-                    let has_diff =
-                        request
-                            .tool_call
-                            .fields
-                            .content
-                            .as_ref()
-                            .is_some_and(|content| {
-                                content
-                                    .iter()
-                                    .any(|item| matches!(item, ToolCallContent::Diff(_)))
-                            });
-                    if let Some(code) = face.code.filter(|_| !has_diff) {
-                        self.permission_detail
-                            .append(&permission_code_widget(&code));
-                    }
-                    if let Some(content) = &request.tool_call.fields.content {
-                        for item in content {
-                            match item {
-                                ToolCallContent::Diff(diff) => {
-                                    let edit = edit_from(diff);
-                                    let view = crate::chatdoc::diff_view(
-                                        &edit,
-                                        Some(DIFF_CLIP_LINES),
-                                        crate::chatdoc::Layout::Auto,
-                                    );
-                                    self.permission_detail.append(&crate::chatdoc::diff_header(
-                                        &edit,
-                                        view.added,
-                                        view.removed,
-                                        None,
-                                    ));
-                                    self.permission_detail.append(&view.widget);
-                                }
-                                // A prompt names consequences, and this is
-                                // where an agent puts them — dropping it on
-                                // the floor left the user consenting to a
-                                // title. Set as prose, under the question it
-                                // qualifies.
-                                ToolCallContent::Content(block) => {
-                                    if let Some(text) = content_text(&block.content) {
-                                        self.permission_detail.append(
-                                            &gtk::Label::builder()
-                                                .label(text.trim())
-                                                .attributes(&no_hyphens())
-                                                .wrap(true)
-                                                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                                                .max_width_chars(40)
-                                                .xalign(0.0)
-                                                .lines(8)
-                                                .ellipsize(gtk::pango::EllipsizeMode::End)
-                                                .css_classes(["caption", "dim-label"])
-                                                .build()
-                                                .full_text_on_hover(),
-                                        );
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    self.notify(crate::notify::Moment::PermissionRequested {
-                        chat: self.notify_chat(),
-                        detail: note.clone(),
-                    });
-                    // A newer request displaces an unanswered one: its
-                    // dropped reply goes out as Cancelled, and that must
-                    // not read as a user refusal on the agent's side.
-                    let displaced = self
-                        .pending_permission
-                        .borrow_mut()
-                        .replace((request, reply));
-                    if let Some((displaced, _)) = displaced {
-                        self.workspace.ide.record_permission(
-                            &single_line(&permission_title(&displaced), 120),
-                            "cancelled",
-                            "a newer permission request arrived before the user \
-                             answered this one; nobody refused it",
-                        );
-                    }
-                    self.permission_bar.set_reveal_child(true);
-                    // The row in the environment panel lights now, not at
-                    // the next refresh.
-                    self.note_activity();
-                    // Nothing is running while this is up: the working line
-                    // steps aside for the card that says what is really
-                    // happening.
-                    self.sync_busy_row();
-                }
-            }
+            SessionEvent::Permission { request, reply } => self.on_permission(request, reply),
             SessionEvent::PromptFailed { message } => {
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
@@ -8877,6 +8663,15 @@ impl ChatPane {
                         &single_line(&permission_title(&request), 120),
                         "cancelled",
                         "its turn ended before the user answered; nobody refused it",
+                    );
+                }
+                let waiting: Vec<_> = self.permission_queue.borrow_mut().drain(..).collect();
+                for (request, _) in waiting {
+                    self.workspace.ide.record_permission(
+                        &single_line(&permission_title(&request), 120),
+                        "cancelled",
+                        "its turn ended while it waited behind another question; nobody \
+                         refused it",
                     );
                 }
                 if !more_queued {
@@ -11552,6 +11347,259 @@ impl ChatPane {
         }
     }
 
+    /// One permission request from the agent: settled by the IDE if it can
+    /// be (never refused, asks nobody, a standing answer, auto-approve),
+    /// put on the card otherwise — or, when a card is already up, queued
+    /// behind it ([`ChatPane::permission_queue`]).
+    fn on_permission(
+        self: &Rc<Self>,
+        request: RequestPermissionRequest,
+        reply: taste_acp::PermissionReply,
+    ) {
+        self.finalize_stream();
+        let title = permission_title(&request);
+        let note = single_line(&title, 120);
+        // Reading where it runs is never refused (David, 2026-10-03: "We
+        // should never deny 'read where it is running'"): it carries
+        // nothing of the user's, it is how an agent orients itself, and a
+        // refusal leaves it guessing where its commands land. Answered yes
+        // before the standing answers and before any card, so neither a
+        // standing no nor a question the user has not reached can turn it
+        // down (`taste_mcp::never_refused`).
+        if let Some(tool) = standing_tool(&request).filter(|t| taste_mcp::never_refused(t)) {
+            if let Some(option) = allow_option(&request.options) {
+                let _ = reply.send(outcome_for(option));
+                self.workspace.ide.record_permission(
+                    &note,
+                    "approved",
+                    &format!("{tool} reads where the agent runs, which is never refused"),
+                );
+                return;
+            }
+        }
+        // The project has already settled this one. Checked FIRST,
+        // before the skip-all-prompts override and before the card:
+        // a standing answer is the user's own decision about this
+        // exact tool, and a specific instruction outranks a blanket
+        // one — which matters in the direction that counts, since a
+        // standing NO must not be overridden by a switch that says
+        // yes to everything.
+        //
+        // It answers with the one-shot option, exactly as the
+        // override does. The standing answer is the IDE's, and
+        // approving a call is not rewriting the agent's own policy.
+        // A tool whose whole effect lands in the VM and is reported
+        // when it ends asks nobody: the IDE answers yes before any
+        // card, and says so in the transcript
+        // (`taste_mcp::asks_nobody`).
+        if let Some(tool) = standing_tool(&request).filter(|t| taste_mcp::asks_nobody(t)) {
+            if let Some(option) = allow_option(&request.options) {
+                let _ = reply.send(outcome_for(option));
+                self.note_permission(
+                    request.tool_call.tool_call_id.to_string(),
+                    "changes-allow-symbolic",
+                    format!(
+                        "Allowed “{}” — {tool} runs in the VM and reports when it ends",
+                        option.name
+                    ),
+                );
+                self.workspace.ide.record_permission(
+                    &note,
+                    "approved",
+                    &format!("{tool} asks nobody: its effect is in the VM and it is reported"),
+                );
+                return;
+            }
+        }
+        if let Some((tool, answer)) = self.settled_answer(&request) {
+            let taken = match answer {
+                taste_core::StandingAnswer::Allow => allow_option(&request.options),
+                taste_core::StandingAnswer::Deny => reject_option(&request.options),
+            };
+            // An agent that offered no way to say it gets the card
+            // instead: a policy is not a reason to answer a
+            // question nobody asked.
+            if let Some(option) = taken {
+                let allowed = matches!(answer, taste_core::StandingAnswer::Allow);
+                let _ = reply.send(outcome_for(option));
+                self.note_permission(
+                    request.tool_call.tool_call_id.to_string(),
+                    if allowed {
+                        "changes-allow-symbolic"
+                    } else {
+                        "changes-prevent-symbolic"
+                    },
+                    format!(
+                        "{} “{}” — this project's standing answer for {tool}",
+                        if allowed { "Allowed" } else { "Refused" },
+                        option.name
+                    ),
+                );
+                self.workspace.ide.record_permission(
+                    &note,
+                    if allowed { "approved" } else { "denied" },
+                    &format!(
+                        "this project's standing answer for {tool}; given on a \
+                         permission card and revocable in the chat's settings"
+                    ),
+                );
+                return;
+            }
+        }
+        // Auto-approve only when there is something to approve
+        // WITH. A request carrying no allow option is a real
+        // question, and answering it by taking whatever came first
+        // is how a refusal came to be announced as an approval.
+        let automatic = self
+            .auto_approve()
+            .then(|| allow_option(&request.options).map(|o| o.name.clone()))
+            .flatten();
+        if let Some(name) = automatic {
+            let _ = reply.send(first_allow_outcome(&request));
+            // Name the option that was taken — "approved" was a
+            // claim about intent, and intent is not what the agent
+            // got.
+            self.note_permission(
+                request.tool_call.tool_call_id.to_string(),
+                "changes-allow-symbolic",
+                format!("Auto-approved “{name}”"),
+            );
+            self.workspace.ide.record_permission(
+                &note,
+                "approved",
+                &format!("auto-approve is on; took the “{name}” option"),
+            );
+        } else {
+            // The call's own step goes amber while the question is
+            // open: the timeline says where the turn stopped.
+            self.mark_waiting(&request.tool_call.tool_call_id.to_string(), true);
+            if self.auto_approve() {
+                // Falling back to the bar beats refusing silently:
+                // the user can see options we have no answer for.
+                self.meta_row(&format!(
+                    "auto-approve found no allow option — asking: {note}"
+                ));
+            }
+            // The card must show enough to decide on: the question,
+            // who is asking and where it lands, then the literal
+            // thing — with the whole of it a hover away.
+            // A card is already up: this one waits its turn behind it, and
+            // comes back through this function when that one is answered —
+            // so an answer given there ("don't ask again") can settle it.
+            if self.pending_permission.borrow().is_some() {
+                self.permission_queue
+                    .borrow_mut()
+                    .push_back((request, reply));
+                return;
+            }
+            let face = permission_face(&request, &self.agent_name(), self.environment.as_str());
+            self.permission_icon.set_icon_name(Some(face.icon));
+            self.permission_label.set_label(&face.title);
+            self.permission_label.set_tooltip_text(Some(&title));
+            self.permission_subtitle.set_label(&face.subtitle);
+            // What the card is called when it is heard rather than
+            // seen: the agent's own phrasing of the ask, which is
+            // more than the kind-derived question above says.
+            if let Some(card) = self.permission_bar.child() {
+                card.update_property(&[gtk::accessible::Property::Label(&title)]);
+            }
+            // One button per answer the agent offered, saying what
+            // the AGENT calls it rather than a generic Allow/Deny —
+            // "don't ask again" is a different answer from "yes,
+            // this once" and must not read alike, or go missing.
+            self.build_permission_answers(&request);
+            clear_children(&self.permission_detail);
+            // The specifics get said once. A request carrying a diff
+            // has already named its file in the diff's own header,
+            // and repeating the path above it is two answers to one
+            // question.
+            let has_diff = request
+                .tool_call
+                .fields
+                .content
+                .as_ref()
+                .is_some_and(|content| {
+                    content
+                        .iter()
+                        .any(|item| matches!(item, ToolCallContent::Diff(_)))
+                });
+            if let Some(code) = face.code.filter(|_| !has_diff) {
+                self.permission_detail
+                    .append(&permission_code_widget(&code));
+            }
+            if let Some(content) = &request.tool_call.fields.content {
+                for item in content {
+                    match item {
+                        ToolCallContent::Diff(diff) => {
+                            let edit = edit_from(diff);
+                            let view = crate::chatdoc::diff_view(
+                                &edit,
+                                Some(DIFF_CLIP_LINES),
+                                crate::chatdoc::Layout::Auto,
+                            );
+                            self.permission_detail.append(&crate::chatdoc::diff_header(
+                                &edit,
+                                view.added,
+                                view.removed,
+                                None,
+                            ));
+                            self.permission_detail.append(&view.widget);
+                        }
+                        // A prompt names consequences, and this is
+                        // where an agent puts them — dropping it on
+                        // the floor left the user consenting to a
+                        // title. Set as prose, under the question it
+                        // qualifies.
+                        ToolCallContent::Content(block) => {
+                            if let Some(text) = content_text(&block.content) {
+                                self.permission_detail.append(
+                                    &gtk::Label::builder()
+                                        .label(text.trim())
+                                        .attributes(&no_hyphens())
+                                        .wrap(true)
+                                        .wrap_mode(gtk::pango::WrapMode::WordChar)
+                                        .max_width_chars(40)
+                                        .xalign(0.0)
+                                        .lines(8)
+                                        .ellipsize(gtk::pango::EllipsizeMode::End)
+                                        .css_classes(["caption", "dim-label"])
+                                        .build()
+                                        .full_text_on_hover(),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            self.notify(crate::notify::Moment::PermissionRequested {
+                chat: self.notify_chat(),
+                detail: note.clone(),
+            });
+            *self.pending_permission.borrow_mut() = Some((request, reply));
+            self.permission_bar.set_reveal_child(true);
+            // The row in the environment panel lights now, not at
+            // the next refresh.
+            self.note_activity();
+            // Nothing is running while this is up: the working line
+            // steps aside for the card that says what is really
+            // happening.
+            self.sync_busy_row();
+        }
+    }
+
+    /// The card was answered: the next request waiting behind it, if any,
+    /// goes through [`Self::on_permission`] from the top.
+    fn next_permission(self: &Rc<Self>) {
+        if self.pending_permission.borrow().is_some() {
+            return;
+        }
+        let next = self.permission_queue.borrow_mut().pop_front();
+        if let Some((request, reply)) = next {
+            self.on_permission(request, reply);
+        }
+    }
+
     /// Answer the open request by taking the option of exactly this kind.
     ///
     /// The kind comes from the button that was clicked, so what goes over
@@ -11559,7 +11607,7 @@ impl ChatPane {
     /// preferring `allow_option`, which would answer "don't ask again" with
     /// "yes, this once" and leave the user clicking a button that visibly
     /// did nothing.
-    fn answer_permission(&self, kind: PermissionOptionKind) {
+    fn answer_permission(self: &Rc<Self>, kind: PermissionOptionKind) {
         self.clear_notification("permission");
         self.permission_bar.set_reveal_child(false);
         let answered = self.pending_permission.borrow_mut().take();
@@ -11643,6 +11691,7 @@ impl ChatPane {
             };
             let _ = reply.send(outcome);
         }
+        self.next_permission();
     }
 
     /// What this project has already said about the tool this request is

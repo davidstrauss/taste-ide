@@ -1517,6 +1517,22 @@ it, and carries its actions.
   card, because a specific instruction outranks a blanket one — which is
   the direction that counts for a standing *no*.
 
+  Two things come before even that. **Reading where it runs is never
+  refused** (`taste_mcp::never_refused`; David, 2026-10-03: "We should
+  never deny 'read where it is running'"): the `environment` tool carries
+  nothing of the user's and is how an agent orients itself, so the IDE
+  answers it yes before any standing answer or card, and no standing no
+  can stand in its way. And **a question waits its turn**: a request that
+  arrives while a card is up queues behind it, and comes back through the
+  whole path — never refused, asks nobody, standing answer, card — when
+  that one is answered, so a "don't ask again" given on the first can
+  settle the second. It used to displace the card on screen instead,
+  whose dropped reply went out as cancelled, which Claude Code reports to
+  its model as the user refusing the call: two tool calls made at once
+  cost one of them a refusal nobody gave. A turn that ends with questions
+  still waiting cancels them all, and the permission log says that nobody
+  refused them.
+
   The other candidate was for the IDE to write `.claude/settings.json`'s
   `permissions.allow`, and it is **not** built. It would work: `.claude`
   is in `policy::agent_context_scope` and is bound into every agent's

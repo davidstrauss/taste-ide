@@ -316,6 +316,15 @@ pub fn asks_nobody(tool: &str) -> bool {
     )
 }
 
+/// Whether the IDE answers this tool's permission request yes, always,
+/// before a standing answer or a card: reading where the agent runs. It
+/// carries nothing of the user's, it is how an agent orients itself, and a
+/// refusal of it only leaves the agent guessing where its commands land
+/// (David, 2026-10-03: "We should never deny 'read where it is running'").
+pub fn never_refused(tool: &str) -> bool {
+    matches!(tool, "environment" | "ide_environment")
+}
+
 /// Whether the IDE may remember a standing **allow** for this tool.
 ///
 /// Two refusals, both of them the point rather than caution:
@@ -370,4 +379,22 @@ pub fn tool_result(value: &Value, is_error: bool) -> Value {
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,
     })
+}
+
+#[cfg(test)]
+mod never_refused_tests {
+    use super::*;
+
+    #[test]
+    fn reading_where_it_runs_is_ours_and_never_refused() {
+        for tool in ["environment", "ide_environment"] {
+            // The chat finds the tool through `is_ide_tool`; one that is
+            // not recognised as ours would never reach `never_refused`.
+            assert!(is_ide_tool(tool), "{tool}");
+            assert!(never_refused(tool), "{tool}");
+            assert_eq!(effect(tool), Effect::Read, "{tool}");
+        }
+        assert!(!never_refused("ide_exec"));
+        assert!(!never_refused("devcontainer_reload"));
+    }
 }
