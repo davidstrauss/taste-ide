@@ -496,8 +496,13 @@ devcontainer that will not start.
    cloud Start on Personal's row, saying it moves your working copy and
    what it costs; (4) the close's snapshot and folder sync over the
    tunnel, whose 20-second budget may want raising. The mirror itself
-   works over any ssh; each save and each agent edit is a round trip
-   through IAP, which is the cost to measure first.
+   works over any ssh. Latency is not the worry: the agent runs in the
+   host beside the checkout, so its edits — nearly all the work — never
+   cross the tunnel, and only the mirror carries them back to the folder,
+   in the background; the user's own saves are the round trips through
+   IAP, and David is not concerned by them (2026-10-03: "99% of the work
+   is being done by the agent"). What is worth measuring is how far the
+   folder trails a busy agent.
 
 ## 2026 bets (superlean, hyperfunctional)
 
