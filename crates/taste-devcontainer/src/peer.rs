@@ -435,6 +435,66 @@ pub const PRIMARY_SYNC_REFSPECS: [&str; 3] = [
     "+refs/taste/snapshot/*:refs/taste/vm-snapshot/*",
 ];
 
+/// The remote every other environment's checkout has for Personal: its
+/// branches, as the folder last fetched them (`refs/taste/vm/*`), pushed
+/// in by the IDE whenever they move ([`share_personal`]), so a plain `git
+/// pull` there takes what was committed in Personal. The checkout reaches
+/// nothing to fetch from — no host, no other VM — so the remote is the
+/// checkout itself (`url = .`), its fetch mapping the IDE-filled
+/// `refs/remotes/personal/*` onto themselves: `git status` counts against
+/// Personal before anyone fetches, and `git pull` merges what is there
+/// (David, 2026-10-04: "When I commit something to my personal env, I'd
+/// like to be able to easily pull it into a secondary/agent env with a
+/// simple pull").
+pub const PERSONAL_REMOTE: &str = "personal";
+
+/// Where [`share_personal`] puts Personal's branches in a checkout. One
+/// destination: a push writes a source ref to one of them only.
+pub const PERSONAL_SHARE_REFSPECS: [&str; 1] = ["+refs/taste/vm/*:refs/remotes/personal/*"];
+
+/// Run in an environment's checkout after [`PERSONAL_SHARE_REFSPECS`] have
+/// been pushed: the `personal` remote, and — when the branch checked out
+/// has no upstream of its own and Personal has a branch of that name, which
+/// is how an environment starts (`EnvironmentRegistry::create_on`) — that
+/// branch as its upstream. An upstream the user or the agent set is kept.
+pub const PERSONAL_REMOTE_SCRIPT: &str = r#"set -e
+git config remote.personal.url .
+git config remote.personal.fetch '+refs/remotes/personal/*:refs/remotes/personal/*'
+branch=$(git symbolic-ref --short -q HEAD) || exit 0
+git config "branch.$branch.remote" >/dev/null && exit 0
+git rev-parse -q --verify "refs/remotes/personal/$branch" >/dev/null || exit 0
+git config "branch.$branch.remote" personal
+git config "branch.$branch.merge" "refs/remotes/personal/$branch"
+"#;
+
+/// Push Personal's branches from the folder (`folder`, the primary's peer)
+/// into the checkout at `path` in `vm`, pruning what Personal no longer
+/// has, then set its `personal` remote up ([`PERSONAL_REMOTE_SCRIPT`]).
+pub fn share_personal(
+    folder: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+) -> Result<()> {
+    let mut args = vec!["push".to_string(), "--prune".into(), guest_url(vm, path)];
+    args.extend(PERSONAL_SHARE_REFSPECS.iter().map(|s| s.to_string()));
+    git_streaming(folder, keys, &args, &mut |_| {})
+        .with_context(|| format!("giving {} Personal's branches", path.display()))?;
+    let out = files.exec(
+        path,
+        &["sh".into(), "-c".into(), PERSONAL_REMOTE_SCRIPT.into()],
+    )?;
+    if !out.success() {
+        bail!(
+            "setting up the personal remote in {}: {}",
+            path.display(),
+            out.stderr_utf8().trim()
+        );
+    }
+    Ok(())
+}
+
 /// The ref Personal's detached HEAD is pinned to in the checkout, so a
 /// fetch can bring its commit, and where it lands in the folder.
 const CHECKOUT_HEAD_PIN: &str = "refs/taste/head";
@@ -1701,6 +1761,83 @@ mod tests {
         assert_eq!(
             pair.git("checkout", &["rev-parse", "HEAD"]),
             pair.git("folder", &["rev-parse", "HEAD"])
+        );
+    }
+
+    /// An environment's checkout, given Personal's branches the way the IDE
+    /// gives them, pulls Personal's new commit with a plain `git pull`; a
+    /// branch Personal no longer has goes from the remote; and an upstream
+    /// set in the environment is kept.
+    #[test]
+    fn a_plain_pull_in_an_environment_takes_personals_commit() {
+        let pair = Pair::new("personal");
+        // The environment's checkout, made as `place_in_vm` makes it.
+        pair.git(".", &["init", "-q", "-b", "main", "env"]);
+        pair.git(
+            "env",
+            &["config", "receive.denyCurrentBranch", "updateInstead"],
+        );
+        let env = pair.dir.join("env").display().to_string();
+        pair.git(
+            "folder",
+            &["push", "-q", &env, "+refs/heads/*:refs/heads/*"],
+        );
+        let share = || {
+            // The folder's copy of Personal's branches, as the sync keeps it.
+            let tip = pair.git("folder", &["rev-parse", "main"]);
+            pair.git("folder", &["update-ref", "refs/taste/vm/main", &tip]);
+            let mut args = vec!["push", "-q", "--prune", &env];
+            args.extend(PERSONAL_SHARE_REFSPECS);
+            pair.git("folder", &args);
+            let out = std::process::Command::new("sh")
+                .current_dir(pair.dir.join("env"))
+                .args(["-c", PERSONAL_REMOTE_SCRIPT])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        pair.git("folder", &["update-ref", "refs/taste/vm/gone", "HEAD"]);
+        share();
+        assert_eq!(
+            pair.git("env", &["rev-parse", "--abbrev-ref", "main@{upstream}"]),
+            "personal/main"
+        );
+
+        // Personal commits; the IDE shares; the environment pulls.
+        pair.write("folder", "b.txt", "personal's\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "committed in Personal");
+        pair.git("folder", &["update-ref", "-d", "refs/taste/vm/gone"]);
+        share();
+        assert!(pair.git("env", &["status", "-sb"]).contains("[behind 1]"));
+        pair.git("env", &["pull", "-q", "--ff-only"]);
+        assert_eq!(
+            pair.git("env", &["log", "-1", "--format=%s"]),
+            "committed in Personal"
+        );
+        assert_eq!(
+            pair.git(
+                "env",
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/remotes/personal/"
+                ]
+            ),
+            "refs/remotes/personal/main",
+            "a branch Personal no longer has is pruned"
+        );
+
+        // An upstream the environment chose stays its own.
+        pair.git("env", &["config", "branch.main.remote", "elsewhere"]);
+        share();
+        assert_eq!(
+            pair.git("env", &["config", "branch.main.remote"]),
+            "elsewhere"
         );
     }
 

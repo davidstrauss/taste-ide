@@ -725,6 +725,22 @@ between two repos only the IDE can see as a pair:
 - **Refresh** (user → agent): an `update_from_main` tool (and fleet-view
   action) fetches the main checkout's branches into the env clone's
   remote-tracking refs; the agent rebases inside its own world.
+- **Personal's branches, kept** (user → environment, 2026-10-04): every
+  other environment's checkout has a remote named `personal` holding
+  Personal's branches as the folder last fetched them, pushed in by the
+  IDE whenever they move — after each of Personal's syncs, at placement,
+  and after the environment's own sync for one whose VM was down
+  (`crate::peer::share_personal`, `EnvironmentRegistry::share_personal`).
+  The branch an environment starts on is Personal's, and it tracks
+  `personal/<branch>` unless an upstream was set there, so a plain `git
+  pull` takes what was committed in Personal (David: "When I commit
+  something to my personal env, I'd like to be able to easily pull it into
+  a secondary/agent env with a simple pull"). The checkout can reach
+  nothing to fetch from, so the remote is the checkout itself (`url =
+  .`), its fetch mapping `refs/remotes/personal/*` onto themselves:
+  `git status` counts against Personal before anything is fetched. Where
+  `update_from_main` is asked for and lands in `origin/*`, this is
+  automatic and lands in `personal/*`.
 - Inside a container, the clone's `origin` points at a host path that is
   not mounted; fetch/push from inside simply fail. The existing
   `agent_git_config` push-blocks stay as defense-in-depth.

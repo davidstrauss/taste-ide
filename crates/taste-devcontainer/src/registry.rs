@@ -364,6 +364,10 @@ pub struct EnvironmentRegistry {
     /// Since when each cloud host has held no running container, for
     /// [`Self::stop_idle_cloud_hosts`].
     cloud_idle: Mutex<BTreeMap<String, std::time::Instant>>,
+    /// Per environment, Personal's branches as last given to it
+    /// ([`Self::share_personal`]), so a sync that moved none of them pushes
+    /// nothing.
+    personal_shared: Mutex<BTreeMap<EnvironmentId, String>>,
     /// Per environment and published port, bytes through it over the last
     /// five minutes (`crate::ports`), and the last raw counters for the
     /// differences.
@@ -498,6 +502,7 @@ impl EnvironmentRegistry {
             vm_meter_started: AtomicBool::new(false),
             me: std::sync::OnceLock::new(),
             cloud_idle: Mutex::new(BTreeMap::new()),
+            personal_shared: Mutex::new(BTreeMap::new()),
             port_traffic: Mutex::new(BTreeMap::new()),
             port_counters_last: Mutex::new(BTreeMap::new()),
             vm_logs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -563,6 +568,17 @@ impl EnvironmentRegistry {
                     registry.wake_vm_of(&id)
                 }));
             }
+        }
+        // Personal's commits reach every other environment as its
+        // `personal` remote: given to all of them when Personal syncs, and
+        // to one when it syncs, which is how one whose VM was down catches
+        // up (`crate::peer::PERSONAL_REMOTE`).
+        if let Some(me) = self.me.get().cloned() {
+            let id = supervisor.id().clone();
+            supervisor.set_sharer(Arc::new(move || {
+                let registry = me.upgrade().context("the environment registry is gone")?;
+                registry.share_personal((!id.is_primary()).then_some(&id))
+            }));
         }
         supervisor
     }
@@ -1934,6 +1950,9 @@ impl EnvironmentRegistry {
             checkout,
             files,
         });
+        if let Err(e) = self.share_personal(None) {
+            tracing::info!("Personal's branches not shared with every environment: {e:#}");
+        }
         Ok(sync)
     }
 
@@ -2322,6 +2341,11 @@ impl EnvironmentRegistry {
             checkout,
             files: Files::Remote(keeper),
         });
+        // A checkout made anew has none of what the old one was given.
+        self.personal_shared.lock().unwrap().remove(id);
+        if let Err(e) = self.share_personal(Some(id)) {
+            tracing::info!("environment {id}: Personal's branches not shared yet: {e:#}");
+        }
         Ok(())
     }
 
@@ -2519,7 +2543,62 @@ impl EnvironmentRegistry {
         if let Err(e) = self.watch_config(&supervisor) {
             tracing::warn!("environment {id} watcher failed: {e:#}");
         }
+        if let Err(e) = self.share_personal(Some(&id)) {
+            tracing::info!("environment {id}: Personal's branches not shared yet: {e:#}");
+        }
         Ok(supervisor)
+    }
+
+    /// Give other environments Personal's branches, as the `personal`
+    /// remote in their checkouts (`crate::peer::share_personal`): `only`
+    /// that one, or every environment but Personal. What the folder last
+    /// fetched from Personal (`refs/taste/vm/*`) is what goes, and an
+    /// environment already given exactly that is skipped, as is one whose
+    /// checkout is not in a VM that is up — it is given them when it next
+    /// syncs. Blocking. The first failure is returned once every
+    /// environment has been tried.
+    pub fn share_personal(&self, only: Option<&EnvironmentId>) -> Result<()> {
+        let folder = self.workspace_root.clone();
+        let Some(git) = taste_git::GitWorkspace::discover(&folder) else {
+            return Ok(());
+        };
+        let branches = git.refs_under("refs/taste/vm/")?;
+        if branches.is_empty() {
+            return Ok(());
+        }
+        let fingerprint = branches
+            .iter()
+            .map(|(name, oid)| format!("{name} {oid}\n"))
+            .collect::<String>();
+        let keys = crate::keys::Keys::for_workspace(&folder);
+        let mut first_error = None;
+        for supervisor in self.list() {
+            let id = supervisor.id().clone();
+            if id.is_primary() || only.is_some_and(|only| *only != id) {
+                continue;
+            }
+            let Checkout::Remote { path, .. } = supervisor.checkout() else {
+                continue;
+            };
+            let Some(vm) = supervisor.substrate().vm_details().cloned() else {
+                continue;
+            };
+            if self.personal_shared.lock().unwrap().get(&id) == Some(&fingerprint) {
+                continue;
+            }
+            match crate::peer::share_personal(&folder, &vm, &keys, &supervisor.files(), &path) {
+                Ok(()) => {
+                    self.personal_shared
+                        .lock()
+                        .unwrap()
+                        .insert(id, fingerprint.clone());
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e.context(format!("environment {id}")));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Destroy an environment — but say what it held first.

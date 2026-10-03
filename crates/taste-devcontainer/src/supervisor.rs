@@ -621,6 +621,11 @@ pub struct Supervisor {
     /// What brings the VM this checkout is in back up, when a start finds
     /// it down (`EnvironmentRegistry::wake_vm_of`).
     waker: Mutex<Option<Placer>>,
+    /// What gives the other environments Personal's branches
+    /// (`EnvironmentRegistry::share_personal`): run by the primary after
+    /// each sync with the folder, and by any other environment after it
+    /// syncs its peer, so one whose VM was down catches up when it is back.
+    sharer: Mutex<Option<Placer>>,
     /// The grant the running container was started under, for the
     /// Resources row; `None` until one has been.
     applied_grant: Mutex<Option<crate::config::Grant>>,
@@ -895,6 +900,7 @@ impl Supervisor {
             checkout: Mutex::new(checkout),
             placer: Mutex::new(None),
             waker: Mutex::new(None),
+            sharer: Mutex::new(None),
             applied_grant: Mutex::new(None),
             substrate: Mutex::new(substrate),
             files: Mutex::new(None),
@@ -943,15 +949,32 @@ impl Supervisor {
         }
     }
 
-    /// The registry's: how to place this checkout where it can run
-    /// (`EnvironmentRegistry::place_primary_now`). Blocking; run off the
-    /// reactor by the start that needs it.
     /// See [`Supervisor::waker`]'s field: called by a start whose VM is not
     /// up, before anything else is tried.
     pub fn set_waker(&self, waker: Placer) {
         *self.waker.lock().unwrap() = Some(waker);
     }
 
+    /// See [`Supervisor::sharer`]'s field.
+    pub fn set_sharer(&self, sharer: Placer) {
+        *self.sharer.lock().unwrap() = Some(sharer);
+    }
+
+    /// Run the sharer, if there is one, logging rather than failing: a
+    /// sync that worked is not undone by an environment that could not be
+    /// given Personal's branches this time.
+    fn share_personal(&self) {
+        let sharer = self.sharer.lock().unwrap().clone();
+        if let Some(sharer) = sharer {
+            if let Err(e) = sharer() {
+                tracing::info!("{}: Personal's branches not shared: {e:#}", self.env.id);
+            }
+        }
+    }
+
+    /// The registry's: how to place this checkout where it can run
+    /// (`EnvironmentRegistry::place_primary_now`). Blocking; run off the
+    /// reactor by the start that needs it.
     pub fn set_placer(&self, placer: Placer) {
         *self.placer.lock().unwrap() = Some(placer);
     }
@@ -1370,6 +1393,7 @@ impl Supervisor {
                 &crate::peer::PEER_REFSPECS,
             )?;
         }
+        self.share_personal();
         Ok(())
     }
 
