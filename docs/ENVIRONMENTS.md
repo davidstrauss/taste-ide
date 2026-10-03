@@ -3902,7 +3902,9 @@ environment, migrate it."
   from the peer and the snapshot, the old copy removed (and the old VM,
   once it holds nothing of the workspace), and the container started where
   it now is. The primary stays local: it is the folder you opened,
-  mirrored both ways.
+  mirrored both ways (David, 2026-10-03: "Keep the personal env local
+  for now, but I'll eventually want a way to run it on the cloud"; what
+  that takes is ROADMAP → "Personal in the cloud").
 - **The two Starts.** The backlog's bar has Start and, beside it, the same
   glyph with a cloud badge. Each makes a queued issue's environment on its
   side, moves one that is on the other side, and starts one stopped where

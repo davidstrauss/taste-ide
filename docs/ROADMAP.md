@@ -482,6 +482,22 @@ devcontainer that will not start.
    held to a monthly cap. Six phases, the fourth an acceptance test
    against Z.ai's own stack that can end the plan, and the option offered
    only in environments whose egress is cut.
+7. **Personal in the cloud** — wanted, not yet (David, 2026-10-03: "Keep
+   the personal env local for now, but I'll eventually want a way to run
+   it on the cloud"). Every other environment moves both ways with the
+   two Starts (ENVIRONMENTS → "Cloud hosts, as built"); Personal does not,
+   because it is the folder you opened, mirrored both ways, and four
+   things assume it is on this machine. To do it: (1) the launch ladder
+   follows a Personal pinned to a cloud host — starts that host and
+   places Personal there, where today it looks among local VMs only and
+   would place the folder into one again; (2) the idle stop never stops
+   the host Personal is on, since Personal always runs, which makes it
+   billed for as long as the IDE is open (about $0.40 an hour); (3) the
+   cloud Start on Personal's row, saying it moves your working copy and
+   what it costs; (4) the close's snapshot and folder sync over the
+   tunnel, whose 20-second budget may want raising. The mirror itself
+   works over any ssh; each save and each agent edit is a round trip
+   through IAP, which is the cost to measure first.
 
 ## 2026 bets (superlean, hyperfunctional)
 
