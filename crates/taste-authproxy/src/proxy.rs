@@ -1071,6 +1071,7 @@ impl Handle {
             "messages": [{"role": "user", "content": "Reply with the single word: ready"}],
         })
         .to_string();
+        let asked = uri.clone();
         let mut request = Request::post(uri)
             .header("anthropic-version", "2023-06-01")
             .header(http::header::CONTENT_TYPE, "application/json")
@@ -1101,8 +1102,7 @@ impl Handle {
         }
         anyhow::ensure!(
             status.is_success(),
-            "{} answered {status}: {}",
-            upstream.uri,
+            "{asked} answered {status}: {}",
             String::from_utf8_lossy(&bytes)
                 .chars()
                 .take(200)

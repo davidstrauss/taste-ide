@@ -4115,7 +4115,10 @@ impl ChatPane {
             match result {
                 Ok((facts, probe)) => {
                     // The key stays in its row as typed: clearing it read
-                    // as the save having lost it.
+                    // as the save having lost it. The endpoint shows what
+                    // was stored, which is the base — a pasted
+                    // `/v1/messages` comes off it.
+                    pane.custom_form.endpoint.set_text(&facts.base_url);
                     pane.sync_upstream_mark();
                     match probe {
                         Ok(probe) => {

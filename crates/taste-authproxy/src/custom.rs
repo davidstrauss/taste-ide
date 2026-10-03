@@ -317,12 +317,28 @@ fn parse(bytes: &[u8], path: &Path) -> Result<StoredCustomModel> {
     Ok(stored)
 }
 
+/// The base URL an endpoint as written stands for. Claude Code adds
+/// `/v1/messages` to its base itself, and a provider's documentation gives
+/// the whole of that — `https://api.example.com/v1/messages` — or its `/v1`,
+/// which, kept, sent every request to `/v1/messages/v1/messages` and got a
+/// 404 back (2026-10-04). Both come off; a path before them, a router's
+/// `/api`, stays.
+pub fn base_url_of(written: &str) -> String {
+    let mut base = written.trim().trim_end_matches('/');
+    for suffix in ["/v1/messages", "/v1"] {
+        // Never to nothing: a bare `/v1` is refused for its missing host.
+        if let Some(rest) = base.strip_suffix(suffix).filter(|rest| !rest.is_empty()) {
+            base = rest.trim_end_matches('/');
+            break;
+        }
+    }
+    base.to_string()
+}
+
 /// Turn the file into the two things the rest of the crate wants: a
 /// request's destination and credential, and a sentence about it.
 fn compose(stored: &StoredCustomModel, path: &Path) -> Result<(CustomUpstream, CustomFacts)> {
-    let uri: Uri = stored
-        .base_url
-        .trim()
+    let uri: Uri = base_url_of(&stored.base_url)
         .parse()
         .with_context(|| format!("{} holds a base_url that is not a URI", path.display()))?;
     anyhow::ensure!(
@@ -350,7 +366,7 @@ fn compose(stored: &StoredCustomModel, path: &Path) -> Result<(CustomUpstream, C
         },
         CustomFacts {
             endpoint,
-            base_url: stored.base_url.trim().to_string(),
+            base_url: base_url_of(&stored.base_url),
             kind: stored.kind,
             model: stored.model.clone(),
             label,
@@ -399,6 +415,7 @@ async fn store_at(
             "no API key is stored for this project's custom model yet; enter the server's key",
         )?;
     }
+    stored.base_url = base_url_of(&stored.base_url);
     let (_, facts) = compose(&stored, path)?;
     let bytes = serde_json::to_vec_pretty(&stored).context("serializing custom model")?;
     let parent = path
@@ -554,6 +571,22 @@ mod tests {
         assert_eq!(model_ids(anthropic).unwrap(), ["claude-x"]);
         assert_eq!(model_ids(llama).unwrap(), ["gpt-oss-20b-MXFP4.gguf"]);
         assert_eq!(model_ids(b"<html>"), None);
+    }
+
+    #[test]
+    fn an_endpoint_written_whole_stands_for_its_base() {
+        for (written, base) in [
+            (
+                "https://api.abliteration.ai/v1/messages",
+                "https://api.abliteration.ai",
+            ),
+            ("https://api.example.com/v1/", "https://api.example.com"),
+            ("https://openrouter.ai/api/v1", "https://openrouter.ai/api"),
+            ("https://openrouter.ai/api", "https://openrouter.ai/api"),
+            (" http://tower.lan:9931/ ", "http://tower.lan:9931"),
+        ] {
+            assert_eq!(base_url_of(written), base, "{written}");
+        }
     }
 
     #[test]
