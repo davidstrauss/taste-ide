@@ -976,22 +976,53 @@ impl Supervisor {
         }
     }
 
-    /// The ports something listens on in the VM this checkout is in —
-    /// another environment's container, most of all — for
-    /// [`Self::publish_ports`]. Empty for a checkout on this host, and when
-    /// the VM cannot be asked, which leaves this host's word alone.
-    async fn ports_taken_in_vm(&self) -> std::collections::HashSet<u16> {
-        let Checkout::Remote { path, .. } = self.checkout() else {
-            return Default::default();
-        };
-        let files = self.files();
-        let asked =
-            tokio::task::spawn_blocking(move || files.exec(&path, &["ss".into(), "-ltnH".into()]))
-                .await;
-        match asked {
-            Ok(Ok(out)) if out.success() => listening_ports(&out.stdout_utf8()),
-            _ => Default::default(),
+    /// The ports spoken for where this environment's container publishes,
+    /// for [`Self::publish_ports`]: what listens in its VM, and what this
+    /// workspace's other running containers publish — a container whose
+    /// pasta has not bound yet is not listening, and its label says what it
+    /// will hold. A stopped one holds nothing, and is made again rather than
+    /// restarted, so its label is not counted: an old one would push
+    /// Personal off its own port. Whatever cannot be asked is left out,
+    /// which leaves the other checks their word.
+    async fn ports_taken_elsewhere(&self) -> std::collections::HashSet<u16> {
+        let mut taken = std::collections::HashSet::new();
+        if let Checkout::Remote { path, .. } = self.checkout() {
+            let files = self.files();
+            let asked = tokio::task::spawn_blocking(move || {
+                files.exec(&path, &["ss".into(), "-ltnH".into()])
+            })
+            .await;
+            if let Ok(Ok(out)) = asked {
+                if out.success() {
+                    taken.extend(listening_ports(&out.stdout_utf8()));
+                }
+            }
         }
+        let key = environment::workspace_key(&self.env.workspace_root);
+        let listed = self
+            .podman(&[
+                "ps".into(),
+                "--filter".into(),
+                format!("label={LABEL_WORKSPACE}={key}"),
+                "--format".into(),
+                format!("{{{{.Names}}}}\t{{{{index .Labels \"{LABEL_PORTS}\"}}}}"),
+            ])
+            .output()
+            .await;
+        if let Ok(out) = listed {
+            if out.status.success() {
+                let own = self.container_name();
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let Some((name, label)) = line.split_once('\t') else {
+                        continue;
+                    };
+                    if name != own {
+                        taken.extend(parse_ports_label(label).into_iter().map(|(_, host)| host));
+                    }
+                }
+            }
+        }
+        taken
     }
 
     /// See [`Supervisor::sharer`]'s field.
@@ -1943,16 +1974,38 @@ impl Supervisor {
     /// Free means free on BOTH ends of the way in: this host's loopback,
     /// where the tunnel listens, and the VM's, where the container is
     /// published — the tunnel uses one number for both (`Keys::
-    /// ssh_tunnel_argv`). `taken_in_vm` is the VM's side, asked of it at
-    /// start; two environments in one VM forwarding the same port collided
-    /// there while this host saw it free (2026-10-04: "Couldn't listen on
-    /// requested ports", pasta in the guest).
+    /// ssh_tunnel_argv`). `taken` is the far side, asked at start
+    /// ([`Self::ports_taken_elsewhere`]); two environments in one VM
+    /// forwarding the same port collided there while this host saw it free
+    /// (2026-10-04: "Couldn't listen on requested ports", pasta in the
+    /// guest).
+    ///
+    /// **A config's own numbers are Personal's.** Every environment of a
+    /// project forwards the same ports, and the one the user means by
+    /// `localhost:8080` is their own — so any other environment starts at
+    /// the next number up, whether or not Personal is running, and the
+    /// two can never race for it (2026-10-04: Personal fell to safe mode
+    /// because an agent's environment came up on its port first).
+    ///
+    /// The choice is made under one lock for the whole process, and kept
+    /// there ([`claimed_ports`]): environments starting at once see each
+    /// other's picks, which neither `ss` nor a container label can say
+    /// before the containers exist.
     fn publish_ports(
         &self,
         config: &DevcontainerConfig,
-        taken_in_vm: &std::collections::HashSet<u16>,
+        taken: &std::collections::HashSet<u16>,
     ) -> Vec<(u16, u16)> {
-        let free = |port: u16| !taken_in_vm.contains(&port) && port_is_free(port);
+        let mut claims = claimed_ports().lock().unwrap_or_else(|e| e.into_inner());
+        let own = self.container_name();
+        let claimed: std::collections::HashSet<u16> = claims
+            .iter()
+            .filter(|(name, _)| **name != own)
+            .flat_map(|(_, ports)| ports.iter().copied())
+            .collect();
+        let taken: std::collections::HashSet<u16> = taken.union(&claimed).copied().collect();
+        let primary = self.env.id.is_primary();
+        let free = |port: u16| primary && !taken.contains(&port) && port_is_free(port);
         let specs = config.ports();
         let declared: std::collections::HashSet<u16> = specs.iter().map(|s| s.port).collect();
         let mut assigned: std::collections::HashSet<u16> = std::collections::HashSet::new();
@@ -1965,23 +2018,32 @@ impl Supervisor {
                     next_free_port_above(spec.port, |candidate| {
                         !declared.contains(&candidate)
                             && !assigned.contains(&candidate)
-                            && !taken_in_vm.contains(&candidate)
+                            && !taken.contains(&candidate)
                     })
                     .unwrap_or(spec.port)
                 };
                 assigned.insert(host);
                 if host != spec.port {
-                    self.log(format!(
-                        "port {} is in use on this machine or in the VM (another \
-                         environment's container, or a server of the user's), so it is \
-                         published on localhost:{host} instead",
-                        spec.port
-                    ));
+                    self.log(if primary {
+                        format!(
+                            "port {} is in use on this machine or in the VM (another \
+                             environment's container, or a server of the user's), so it is \
+                             published on localhost:{host} instead",
+                            spec.port
+                        )
+                    } else {
+                        format!(
+                            "port {} is Personal's, so this environment's is published on \
+                             localhost:{host}",
+                            spec.port
+                        )
+                    });
                 }
                 (spec.port, host)
             })
             .collect();
         *self.published_ports.lock().unwrap() = pairs.iter().copied().collect();
+        claims.insert(own, pairs.iter().map(|(_, host)| *host).collect());
         pairs
     }
 
@@ -3747,8 +3809,8 @@ impl Supervisor {
         // forwardPorts: published on localhost only — services in the
         // container become reachable from the host without exposing them
         // to the network.
-        let taken_in_vm = self.ports_taken_in_vm().await;
-        let published = self.publish_ports(&config, &taken_in_vm);
+        let taken = self.ports_taken_elsewhere().await;
+        let published = self.publish_ports(&config, &taken);
         for (port, host) in &published {
             args.push("-p".into());
             args.push(format!("127.0.0.1:{host}:{port}"));
@@ -4791,6 +4853,16 @@ fn keep_id_flag(run_args: &[String], uid: u32, gid: u32) -> Option<String> {
     Some(format!("--userns=keep-id:uid={uid},gid={gid}"))
 }
 
+/// The ports each container this process has started publishes, by
+/// container name, kept for the life of the process: what
+/// [`Supervisor::publish_ports`] chose last, so the next choice, made for
+/// another environment, steers clear of it.
+fn claimed_ports() -> &'static Mutex<std::collections::HashMap<String, Vec<u16>>> {
+    static CLAIMED: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Vec<u16>>>> =
+        std::sync::OnceLock::new();
+    CLAIMED.get_or_init(Default::default)
+}
+
 /// The TCP ports listening in `ss -ltnH`'s output, any address.
 fn listening_ports(ss: &str) -> std::collections::HashSet<u16> {
     ss.lines()
@@ -4986,6 +5058,52 @@ mod tests {
     /// on the nearest free number above it, said in the log, and
     /// remembered for the rows; a free one stays where the config put it.
     /// The label carries the pairs to an adopting IDE and back.
+    /// A config's own port is Personal's: another environment publishes on
+    /// the next number up even while it is free, and two environments
+    /// choosing in turn never land on one number, before either container
+    /// exists to say so.
+    #[test]
+    fn an_agents_environment_leaves_the_configs_port_to_personal() {
+        let dir = tempfile::tempdir().unwrap();
+        // A free number, and a few free above it, in a range no other test
+        // holds.
+        let port = (20_000..60_000)
+            .step_by(97)
+            .find(|p| (0..4).all(|i| port_is_free(p + i)))
+            .unwrap();
+        let config_path = dir.path().join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            format!(r#"{{"image": "x", "forwardPorts": [{port}]}}"#),
+        )
+        .unwrap();
+        let config = DevcontainerConfig::load(&config_path).unwrap();
+        let agent = |id: &str| {
+            make_env(
+                dir.path(),
+                EnvironmentIdentity::local_at(
+                    dir.path(),
+                    EnvironmentId::parse(id).unwrap(),
+                    dir.path().to_path_buf(),
+                ),
+            )
+        };
+        let personal = make(dir.path()).publish_ports(&config, &Default::default());
+        assert_eq!(personal, [(port, port)]);
+        let first = agent("i-0901").publish_ports(&config, &Default::default());
+        let second = agent("i-0902").publish_ports(&config, &Default::default());
+        assert!(first[0].1 > port, "{first:?}");
+        assert!(second[0].1 > port, "{second:?}");
+        assert_ne!(first[0].1, second[0].1, "two environments, one port");
+        // A port another container was made with counts as taken.
+        let taken = std::collections::HashSet::from([first[0].1, second[0].1, port + 1]);
+        let third = agent("i-0903").publish_ports(&config, &taken);
+        assert!(
+            !taken.contains(&third[0].1) && third[0].1 != port,
+            "{third:?}"
+        );
+    }
+
     #[test]
     fn a_taken_port_is_published_elsewhere_and_the_label_says_where() {
         let dir = tempfile::tempdir().unwrap();
