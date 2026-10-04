@@ -181,6 +181,8 @@ pub struct Composer {
     row: gtk::Box,
     chips: gtk::FlowBox,
     placeholder: gtk::Label,
+    /// The speech model's download meter, beside the microphone; shown
+    /// only while the model is being fetched.
     level: gtk::LevelBar,
     attachments: RefCell<Vec<Attachment>>,
     workspace: Workspace,
@@ -926,23 +928,22 @@ impl Composer {
                     stop_on_release: false,
                     at_cursor,
                 };
+                // The button says it is recording. The bar beside it is the
+                // speech model's download meter and nothing else: shown as
+                // a level meter here as well, it read as the model being
+                // fetched again on every press (David, 2026-10-04: "Don't
+                // show the voice download bar every time I use the mic
+                // button if it's already downloaded and fresh").
                 self.mic.add_css_class("recording");
-                self.level.set_value(0.0);
-                self.level.set_visible(true);
                 let weak = Rc::downgrade(self);
                 glib::timeout_add_local(Duration::from_millis(50), move || {
                     let Some(composer) = weak.upgrade() else {
                         return glib::ControlFlow::Break;
                     };
-                    let (level, over) = match &*composer.voice.borrow() {
-                        Voice::Recording {
-                            recorder, since, ..
-                        } => (recorder.level(), since.elapsed() >= MAX_RECORDING),
+                    let over = match &*composer.voice.borrow() {
+                        Voice::Recording { since, .. } => since.elapsed() >= MAX_RECORDING,
                         _ => return glib::ControlFlow::Break,
                     };
-                    // RMS of speech sits around 0.05–0.2; scale so a normal
-                    // voice fills most of the bar.
-                    composer.level.set_value(f64::from((level * 6.0).min(1.0)));
                     if over {
                         composer.stop_recording();
                         return glib::ControlFlow::Break;
