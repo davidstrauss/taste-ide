@@ -163,6 +163,9 @@ pub struct Row {
     pub updated: i64,
     pub note: Option<String>,
     pub live: Option<Live>,
+    /// The launch has not read its environments back yet, so a missing one
+    /// may only not be back yet: said so, rather than that there is none.
+    pub restoring: bool,
     /// Body and comments, for the query; never drawn.
     pub haystack: String,
     /// Triaged and meant to happen — the step between filed and started
@@ -204,6 +207,9 @@ impl Row {
     pub fn tooltip(&self) -> String {
         let Some(live) = &self.live else {
             let second = match self.started_by.as_deref() {
+                Some(who) if !self.work.is_resolved() && self.restoring => {
+                    format!("started by {who} · its environment is being brought back")
+                }
                 Some(who) if !self.work.is_resolved() => {
                     format!("started by {who} · no environment for it on this machine")
                 }
@@ -268,6 +274,7 @@ impl Row {
                         Some(note) => format!("declined — {note}"),
                         None => format!("declined · {age}"),
                     },
+                    _ if self.restoring => "started · being brought back".to_string(),
                     _ => match self.started_by.as_deref() {
                         Some(who) => format!("started by {who} · not on this machine"),
                         None => "started · not on this machine".to_string(),
@@ -415,6 +422,7 @@ fn primary_row(fleet: &[FleetRow], current: Option<&EnvironmentId>) -> Row {
         updated: 0,
         note: None,
         live: Some(live),
+        restoring: false,
         haystack: String::new(),
         // The user's own checkout is not an issue and was never triaged.
         approved: false,
@@ -449,6 +457,7 @@ pub fn rows(issues: &[Issue], fleet: &[FleetRow], current: Option<&EnvironmentId
                 updated: issue.updated,
                 note: decline_note(issue),
                 live: env.map(|row| live_of(row, current)),
+                restoring: false,
                 haystack: {
                     let mut text = issue.body.clone();
                     for comment in &issue.comments {
@@ -969,6 +978,10 @@ pub struct BacklogPanel {
     activity: Activity,
     issues: RefCell<Vec<Issue>>,
     fleet: RefCell<Vec<FleetRow>>,
+    /// Whether this launch has read its environments back from disk yet:
+    /// before it has, an issue's environment missing from the fleet may only
+    /// not be back yet.
+    restored: Cell<bool>,
     current: RefCell<Option<EnvironmentId>>,
     shown: RefCell<Vec<Row>>,
     listed: RefCell<Vec<Listed>>,
@@ -1393,6 +1406,7 @@ impl BacklogPanel {
             activity,
             issues: RefCell::new(Vec::new()),
             fleet: RefCell::new(Vec::new()),
+            restored: Cell::new(false),
             current: RefCell::new(None),
             shown: RefCell::new(Vec::new()),
             listed: RefCell::new(Vec::new()),
@@ -1832,6 +1846,14 @@ impl BacklogPanel {
         }
     }
 
+    /// Say whether the environments on disk have been read back yet; see
+    /// [`Self::restored`]'s field.
+    pub fn set_restored(self: &Rc<Self>, restored: bool) {
+        if self.restored.replace(restored) != restored {
+            self.render();
+        }
+    }
+
     pub fn set_fleet(self: &Rc<Self>, fleet: &[FleetRow]) {
         if self.fleet.borrow().as_slice() == fleet {
             return;
@@ -1958,11 +1980,16 @@ impl BacklogPanel {
     }
 
     fn render(self: &Rc<Self>) {
-        let rows = rows(
+        let mut rows = rows(
             &self.issues.borrow(),
             &self.fleet.borrow(),
             self.current.borrow().as_ref(),
         );
+        if !self.restored.get() {
+            for row in &mut rows {
+                row.restoring = true;
+            }
+        }
         if *self.shown.borrow() == rows && !self.list_is_empty_but_should_not_be(&rows) {
             return;
         }
@@ -3924,6 +3951,7 @@ mod tests {
             updated: 0,
             note: None,
             live: None,
+            restoring: false,
             haystack: String::new(),
             approved: false,
         }

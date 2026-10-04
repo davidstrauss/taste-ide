@@ -442,6 +442,10 @@ pub struct Console {
     /// state events arrive constantly and rebuilding rows under an open
     /// menu is how a popover loses its anchor.
     rows: RefCell<Vec<FleetRow>>,
+    /// Whether the environments on disk had been read back at the last
+    /// announcement: the rows are announced again when that changes, since
+    /// what a missing environment means changes with it.
+    restored_seen: Cell<bool>,
     /// The environment the panel below the list is showing.
     selected: RefCell<EnvironmentId>,
     /// Per-environment facts too expensive to compute on a render: git
@@ -635,6 +639,7 @@ impl Console {
             tab_bar: tab_bar.clone(),
             new_tab_button: new_tab_button.clone(),
             rows: RefCell::new(Vec::new()),
+            restored_seen: Cell::new(false),
             selected: RefCell::new(EnvironmentId::primary()),
             git_facts: RefCell::new(HashMap::new()),
             claim_facts: RefCell::new(HashMap::new()),
@@ -1417,7 +1422,8 @@ impl Console {
         let published = self.published.borrow();
         let rows = fleet::assemble(facts, &self.state.borrow(), &published);
         drop(published);
-        if *self.rows.borrow() != rows {
+        let restored = self.environments.restored();
+        if *self.rows.borrow() != rows || self.restored_seen.replace(restored) != restored {
             *self.rows.borrow_mut() = rows;
             self.refresh_env_glance();
             self.announce_fleet();

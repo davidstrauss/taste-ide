@@ -2271,6 +2271,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let window_for_notice = window.downgrade();
         let fleet_cache = fleet_rows.clone();
         let filetree_for_strip = filetree.clone();
+        let environments_for_strip = environments.clone();
         {
             // The queue itself, to the one surface that draws it. The
             // console reads the ref (that is where the off-thread git
@@ -2287,6 +2288,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // The environment panel is a fifth renderer of the same rows:
             // its lights and its names come from the assembly, never from
             // a second read of podman and git.
+            filetree_for_strip
+                .backlog()
+                .set_restored(environments_for_strip.restored());
             filetree_for_strip.set_fleet(rows);
             let snapshot = crate::fleet::snapshot(rows, &workspace_name, open_issues);
             service.publish(snapshot.clone());

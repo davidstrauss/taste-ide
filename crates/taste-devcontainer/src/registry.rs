@@ -354,6 +354,9 @@ pub struct EnvironmentRegistry {
     placing_primary: Mutex<()>,
     /// Held for the length of a `reconcile`.
     reconciling: tokio::sync::Mutex<()>,
+    /// Whether the environments on disk have been read back yet
+    /// ([`Self::restored`]).
+    restored: AtomicBool,
     /// Per VM, what `virsh domstats` has said every five seconds
     /// (`start_vm_meter`), as the Resources view's sparklines read it.
     vm_meters: Mutex<BTreeMap<String, VmMeter>>,
@@ -498,6 +501,7 @@ impl EnvironmentRegistry {
             substrates: Mutex::new(BTreeMap::new()),
             placing_primary: Mutex::new(()),
             reconciling: tokio::sync::Mutex::new(()),
+            restored: AtomicBool::new(false),
             vm_meters: Mutex::new(BTreeMap::new()),
             vm_meter_started: AtomicBool::new(false),
             me: std::sync::OnceLock::new(),
@@ -2752,6 +2756,13 @@ impl EnvironmentRegistry {
     /// clones back up, and remove what the single-environment naming scheme
     /// left behind. The sweep reports itself once through the event bus and
     /// the app log — a reset the user is not told about looks like a bug.
+    /// Whether this launch has read its environments back from disk. Until
+    /// it has, an environment missing from [`Self::list`] may only not be
+    /// back yet — which is not the same as there being none.
+    pub fn restored(&self) -> bool {
+        self.restored.load(Ordering::SeqCst)
+    }
+
     pub async fn reconcile(self: &Arc<Self>) -> ReconcileReport {
         // One at a time: Refresh re-runs this when the ladder never resolved,
         // and two reconciles placing the same checkouts would be two of
@@ -2895,6 +2906,7 @@ impl EnvironmentRegistry {
             restored: self.restore_from_disk(),
             swept,
         };
+        self.restored.store(true, Ordering::SeqCst);
         report.restored.sort();
 
         // The pool's other VMs: every VM a restored environment's checkout
