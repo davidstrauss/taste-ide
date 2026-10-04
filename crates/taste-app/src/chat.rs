@@ -11125,6 +11125,7 @@ impl ChatPane {
                 self.set_busy(false);
             }
             Ok("standing") => self.seed_standing_for_probe(),
+            Ok("table") => self.seed_table_for_probe(),
             Ok("ask") => self.seed_questions_for_probe(),
             Ok("controls") => self.seed_controls_for_probe(),
             Ok(variant) => self.seed_permission_for_probe(variant),
@@ -11203,6 +11204,55 @@ impl ChatPane {
             ),
         };
         self.opener(key, doc)();
+    }
+
+    /// TASTE_PROBE_CHECK only: a finished answer with a three-column table
+    /// of sentence-long cells, long enough to be clipped — the reply whose
+    /// row once stood a page tall below its last line (2026-10-04).
+    #[doc(hidden)]
+    fn seed_table_for_probe(self: &Rc<Self>) {
+        let mut text = String::from(
+            "Re-ran the red-team set against both rule files:\n\n\
+             | Request | Original rules | New rules |\n|---|---|---|\n",
+        );
+        for (name, before, after) in [
+            ("rt1 token in query string", "403", "403"),
+            ("rt2 token in JSON body", "403", "403"),
+            ("rt3 token split across two parameters", "403", "403"),
+            ("rt9 malformed multipart", "403", "403"),
+            (
+                "rt10 token in benign value",
+                "403 (intended FP)",
+                "403 (intended FP)",
+            ),
+            (
+                "rt11 invalid JSON, no token",
+                "200 — passes to Drupal",
+                "403 (rule 1750003)",
+            ),
+        ] {
+            text.push_str(&format!("| {name} | {before} | {after} |\n"));
+        }
+        text.push_str(
+            "\nThe only request the original let through and the new one blocks is rt11 — \
+             syntactically invalid JSON with no token in it. That's a malformed request, not \
+             an exploit; Drupal just answers it with an empty preview.\n\n\
+             So the new rules' value is **not** that they fix a bypass — the red-team \
+             conclusion was that the original had none. What they buy is structural, and it \
+             matters for how you'd phrase it to the security team:\n\n",
+        );
+        for n in 1..=8 {
+            text.push_str(&format!(
+                "{n}. A point about the rules' structure, long enough to wrap in a narrow \
+                 column, number {n}.\n"
+            ));
+        }
+        self.render_update(SessionUpdate::AgentMessageChunk(
+            agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                TextContent::new(text),
+            )),
+        ));
+        self.finalize_stream();
     }
 
     /// TASTE_PROBE_CHECK only: the agent's questions on the card — two, as

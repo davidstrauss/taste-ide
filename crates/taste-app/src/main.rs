@@ -64,6 +64,7 @@ mod startup;
 mod stripes;
 mod syncstatus;
 mod tabfamily;
+mod table;
 mod tasks;
 mod textline;
 mod ui_probe;

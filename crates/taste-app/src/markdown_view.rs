@@ -663,15 +663,15 @@ fn code_card(code: &str, reflow: bool) -> gtk::Widget {
 /// scrolling (David, 2026-09-22: "use a real table" — it was a monospace
 /// grid in a code card). Plain text in the cells, as the parser hands
 /// them over.
+///
+/// Laid out by [`crate::table::Table`], not a `GtkGrid`: the grid measured
+/// its height as though every column were a word wide, and a transcript row
+/// kept the difference as a page of empty space.
 fn table_card(alignments: &[pulldown_cmark::Alignment], rows: &[Vec<String>]) -> gtk::Widget {
-    let grid = gtk::Grid::builder()
-        .css_classes(["markdown-table"])
-        .column_spacing(0)
-        .row_spacing(0)
-        .build();
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0) as i32;
-    let mut grid_row = 0;
+    let mut cells: Vec<Vec<gtk::Widget>> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
+        let mut line = Vec::new();
         for column in 0..columns {
             let text = row.get(column as usize).map(String::as_str).unwrap_or("");
             let xalign = match alignments.get(column as usize) {
@@ -695,16 +695,17 @@ fn table_card(alignments: &[pulldown_cmark::Alignment], rows: &[Vec<String>]) ->
                     vec!["markdown-table-cell"]
                 })
                 .build();
-            grid.attach(&label, column, grid_row, 1, 1);
+            line.push(label.upcast());
         }
-        grid_row += 1;
-        if index == 0 {
-            let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
-            grid.attach(&rule, 0, grid_row, columns.max(1), 1);
-            grid_row += 1;
-        }
+        cells.push(line);
     }
-    grid.upcast()
+    let table = crate::table::Table::new(cells);
+    table.add_css_class("markdown-table");
+    // As wide as its columns, never stretched: its border and its striped
+    // rows are the columns' own width, and a wide pane leaves the rest
+    // empty beside it rather than inside it.
+    table.set_halign(gtk::Align::Start);
+    table.upcast()
 }
 
 fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverlay> {
