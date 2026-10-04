@@ -8035,8 +8035,21 @@ impl ChatPane {
             // called it. The raw name stays on the tooltip and in
             // `title_full`, which is what the IN/OUT matcher compares a
             // shell card's output against.
-            let shown =
-                tool_headline(&title, raw_input).unwrap_or_else(|| single_line(&title, 200));
+            // An act is worded as one from its first appearance too: the
+            // working line takes this title the moment the call starts,
+            // and read `mcp__taste-ide__issue_update` for as long as the
+            // call ran (David, 2026-10-04: "This should be human friendly
+            // text").
+            let shown = match act_kind(&title) {
+                Some(kind) => act_headline(
+                    kind,
+                    raw_input,
+                    raw_output.and_then(act_output_json).as_ref(),
+                ),
+                None => {
+                    tool_headline(&title, raw_input).unwrap_or_else(|| single_line(&title, 200))
+                }
+            };
             card.title_label.set_markup(&self.pillify_headline(&shown));
             card.title_label.set_tooltip_text(Some(&title));
             *card.title_full.borrow_mut() = title.clone();
@@ -8112,7 +8125,13 @@ impl ChatPane {
                 card.status_spinner.stop();
                 // This call is done; whether another is running or the model
                 // is writing, "Working…" is the most we can honestly claim.
-                self.busy_label.set_label(BUSY_IDLE);
+                // Through the activity, not the label: the line redraws
+                // from the activity every second to keep its "silent for"
+                // current, and the label alone put the finished call's name
+                // straight back — a call that had answered read as one still
+                // hanging (David, 2026-10-04: "It seems to be hanging on the
+                // issue update").
+                self.set_activity("");
             }
         }
         if let Some(kind) = kind {
@@ -8353,6 +8372,11 @@ impl ChatPane {
             let headline = act_headline(kind, input.as_ref(), output.as_ref());
             card.title_label
                 .set_markup(&self.pillify_headline(&headline));
+            // The working line follows the act's wording as its input
+            // arrives — "Updating an issue…" becomes "Updating i-0007…".
+            if card.running.get() {
+                self.set_activity(&headline);
+            }
             // The whole sentence on hover, since the row ellipsizes it.
             card.title_label.set_tooltip_text(Some(&headline));
             let (icon, tone) = act_icon(kind, input.as_ref(), output.as_ref());
@@ -13298,7 +13322,11 @@ fn act_headline(
             line
         }
         ActKind::Updated => {
-            let id = field(input, "id").unwrap_or_else(|| "an issue".into());
+            // `id` in the tool's schema; `issue`, as the other issue tools
+            // name it, is what agents also send.
+            let id = field(input, "id")
+                .or_else(|| field(input, "issue"))
+                .unwrap_or_else(|| "an issue".into());
             match field(input, "state").as_deref() {
                 Some("completed") | Some("closed") => {
                     if output.is_some() {
@@ -13307,9 +13335,16 @@ fn act_headline(
                         format!("Completing {id}…")
                     }
                 }
+                // Under way until it answers, done once it has.
+                Some("declined") if output.is_none() => format!("Declining {id}…"),
                 Some("declined") => format!("Declined {id}"),
+                Some("active") | Some("open") if output.is_none() => format!("Reopening {id}…"),
                 Some("active") | Some("open") => format!("Reopened {id}"),
+                _ if field(input, "comment").is_some() && output.is_none() => {
+                    format!("Commenting on {id}…")
+                }
                 _ if field(input, "comment").is_some() => format!("Commented on {id}"),
+                _ if output.is_none() => format!("Updating {id}…"),
                 _ => format!("Updated {id}"),
             }
         }
