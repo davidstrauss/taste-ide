@@ -75,19 +75,51 @@ pub enum Listing {
     },
 }
 
-/// `task`, under whichever of its two names the image has, with `args`:
-/// the program and argv to resolve in the container.
+/// The Task the IDE brings when the image has none: pinned, fetched into
+/// each VM beside the agent's node and checked against these sums, and
+/// mounted read-only into every container at [`IDE_TASK_DIR`]
+/// (`taste_devcontainer::agentnode`). Task is one static binary, so it runs
+/// whatever the image's C library. Bump all three from
+/// `https://github.com/go-task/task/releases/download/v<version>/task_checksums.txt`.
+pub const IDE_TASK_VERSION: &str = "3.54.0";
+/// `task_linux_amd64.tar.gz`.
+pub const IDE_TASK_SHA256_AMD64: &str =
+    "680859dbb4d881a9c72d4d9a8f510825450849af8567deacd7302c01124416fb";
+/// `task_linux_arm64.tar.gz`.
+pub const IDE_TASK_SHA256_ARM64: &str =
+    "d7189d439d4a6058e39e1b2acd7c8b27acd4856691b408f23b242e4294e1df5b";
+/// Where the IDE's runtime directory is in a container.
+pub const IDE_TASK_DIR: &str = "/opt/taste-agent";
+
+/// A shell line setting `t` to the Task to run: the image's own, under
+/// either of its names, first — a project that installs Task chose its
+/// version — and the IDE's otherwise (David, 2026-10-04: "Can I have tasks
+/// always work in devcontainers, similarly to how agents always work by
+/// the IDE loading in the support?"). `t` is empty when there is none.
 ///
 /// Fedora packages Task as `go-task`, binary and all, so an image that
 /// installed it the obvious way had no `task` and the section said it was
 /// not installed — a dead end an agent met writing a devcontainer, with the
-/// tool sitting right there (2026-09-23). The shell finds either and hands
-/// over with `exec`, so there is one process, and exits 127 when neither
-/// exists, which is what "not installed" is read from.
+/// tool sitting right there (2026-09-23).
+pub fn locate_task() -> String {
+    format!(
+        "t=$(command -v task || command -v go-task || for f in \
+         {IDE_TASK_DIR}/task-v{IDE_TASK_VERSION}-linux-*/task; do \
+         if [ -x \"$f\" ]; then echo \"$f\"; break; fi; done)"
+    )
+}
+
+/// `task`, wherever [`locate_task`] finds it, with `args`: the program and
+/// argv to resolve in the container. The shell hands over with `exec`, so
+/// there is one process, and exits 127 when there is no Task at all, which
+/// is what "not installed" is read from.
 fn task_command(args: &[&str]) -> (&'static str, Vec<String>) {
     let mut argv = vec![
         "-c".to_string(),
-        "t=$(command -v task || command -v go-task) || exit 127; exec \"$t\" \"$@\"".to_string(),
+        format!(
+            "{}; [ -n \"$t\" ] || exit 127; exec \"$t\" \"$@\"",
+            locate_task()
+        ),
         "task".to_string(),
     ];
     argv.extend(args.iter().map(|arg| arg.to_string()));
@@ -125,8 +157,10 @@ pub fn list(exec: &ExecContext, files: &Files, root: &Path) -> Listing {
             Ok(out) => {
                 let said = String::from_utf8_lossy(&out.stderr);
                 if said.contains("executable file not found") || out.status.code() == Some(127) {
-                    "task is not installed in the environment (as task, or as Fedora's \
-                     go-task); add it to the devcontainer's image to list and run these tasks"
+                    "task is not in the environment's image (as task, or as Fedora's \
+                     go-task), and the IDE's own Task is not deployed in its VM — the \
+                     Virtual Machine log says why; add Task to the image to list and run \
+                     these tasks"
                         .to_string()
                 } else {
                     format!(
@@ -547,6 +581,22 @@ mod tests {
         let found = run(dir.path());
         assert!(found.status.success(), "{found:?}");
         assert_eq!(String::from_utf8_lossy(&found.stdout), "--list-all|a b|");
+    }
+
+    /// The IDE's Task is looked for where it is mounted, at the pinned
+    /// version, and only after the image's own under either name.
+    #[test]
+    fn the_ides_task_is_the_last_one_looked_for() {
+        let line = locate_task();
+        let ide = line
+            .find(&format!("{IDE_TASK_DIR}/task-v{IDE_TASK_VERSION}-linux-"))
+            .expect(&line);
+        assert!(line.find("command -v task").unwrap() < ide);
+        assert!(line.find("command -v go-task").unwrap() < ide);
+        for sum in [IDE_TASK_SHA256_AMD64, IDE_TASK_SHA256_ARM64] {
+            assert_eq!(sum.len(), 64);
+            assert!(sum.chars().all(|c| c.is_ascii_hexdigit()));
+        }
     }
 
     #[test]

@@ -25,6 +25,13 @@
 //!   cannot run on — the official build is glibc's, and an Alpine (musl)
 //!   image falls back to its own node or, lacking one, keeps the agent
 //!   out, saying why. Alpine is not supported yet, by decision.
+//! - **Task rides along** (`taste_core::tasks::IDE_TASK_VERSION`): one
+//!   static binary, pinned and summed the same way, fetched in the same
+//!   pass, so the Tasks section lists and runs a project's Taskfile whatever
+//!   its image carries — the image's own Task first, this one otherwise
+//!   (David, 2026-10-04: "Can I have tasks always work in devcontainers,
+//!   similarly to how agents always work by the IDE loading in the
+//!   support?").
 //! - **Versions accumulate.** A bump fetches the new build beside the old
 //!   one rather than replacing it, because an agent already running holds
 //!   the old path; a VM is disposable, so the old ones go with it.
@@ -65,33 +72,61 @@ pub fn mount_arg(workspace_root: &Path) -> String {
 /// prints the build's directory name. The directory is made first and
 /// whatever happens after, because an environment's container mounts it
 /// and podman refuses a bind whose source is missing.
+///
+/// Task comes with it (`taste_core::tasks::IDE_TASK_VERSION`, arguments five
+/// to seven), into `task-v<version>-linux-<arch>/task` beside the node, so
+/// the project's tasks list and run whatever its image carries. A Task that
+/// does not arrive says so on stderr and leaves the node's deploy alone.
 const FETCH: &str = r#"set -eu
-dir="$1"; ver="$2"
+dir="$1"; ver="$2"; tver="$5"
 mkdir -p "$dir"
 case "$(uname -m)" in
-  x86_64) arch=x64; sum="$3" ;;
-  aarch64) arch=arm64; sum="$4" ;;
+  x86_64) arch=x64; sum="$3"; tarch=amd64; tsum="$6" ;;
+  aarch64) arch=arm64; sum="$4"; tarch=arm64; tsum="$7" ;;
   *) echo "no node build for $(uname -m)" >&2; exit 3 ;;
 esac
 name="node-v$ver-linux-$arch"
-if [ -x "$dir/$name/bin/node" ]; then echo "$name"; exit 0; fi
+tname="task-v$tver-linux-$tarch"
+if [ -x "$dir/$name/bin/node" ] && [ -x "$dir/$tname/task" ]; then echo "$name"; exit 0; fi
 tmp=$(mktemp -d "$dir/.fetch.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-curl -fsSL --retry 3 -o "$tmp/node.tar.gz" "https://nodejs.org/dist/v$ver/$name.tar.gz"
-echo "$sum  $tmp/node.tar.gz" | sha256sum -c --quiet -
-tar -xzf "$tmp/node.tar.gz" -C "$tmp"
-mv "$tmp/$name" "$dir/$name" || [ -x "$dir/$name/bin/node" ]
+if [ ! -x "$dir/$name/bin/node" ]; then
+  curl -fsSL --retry 3 -o "$tmp/node.tar.gz" "https://nodejs.org/dist/v$ver/$name.tar.gz"
+  echo "$sum  $tmp/node.tar.gz" | sha256sum -c --quiet -
+  tar -xzf "$tmp/node.tar.gz" -C "$tmp"
+  mv "$tmp/$name" "$dir/$name" || [ -x "$dir/$name/bin/node" ]
+fi
+if [ ! -x "$dir/$tname/task" ]; then
+  mkdir -p "$tmp/$tname" &&
+    curl -fsSL --retry 3 -o "$tmp/task.tar.gz" \
+      "https://github.com/go-task/task/releases/download/v$tver/task_linux_$tarch.tar.gz" &&
+    echo "$tsum  $tmp/task.tar.gz" | sha256sum -c --quiet - &&
+    tar -xzf "$tmp/task.tar.gz" -C "$tmp/$tname" task &&
+    { mv "$tmp/$tname" "$dir/$tname" || [ -x "$dir/$tname/task" ]; } ||
+    echo "task $tver was not deployed" >&2
+fi
 echo "$name"
 "#;
 
-/// Make sure the VM at `ssh_port` has the pinned node in [`guest_dir`],
-/// fetching it the first time. Blocking; the build's directory name back.
-pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<String> {
+/// Make sure the VM at `ssh_port` has the pinned node and Task in
+/// [`guest_dir`], fetching them the first time. Blocking; the node build's
+/// directory name back, and what the fetch said on its way — Task not
+/// arriving, which the node's deploy goes on without.
+pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Option<String>)> {
     let keys = crate::keys::Keys::for_workspace(workspace_root);
     let dir = guest_dir(workspace_root).display().to_string();
     // ssh joins its arguments into one line for the guest's shell, so each
     // must be a token that shell leaves alone; all of them are ours.
-    for token in [&dir, NODE_VERSION, NODE_SHA256_X64, NODE_SHA256_ARM64] {
+    use taste_core::tasks::{IDE_TASK_SHA256_AMD64, IDE_TASK_SHA256_ARM64, IDE_TASK_VERSION};
+    for token in [
+        &dir,
+        NODE_VERSION,
+        NODE_SHA256_X64,
+        NODE_SHA256_ARM64,
+        IDE_TASK_VERSION,
+        IDE_TASK_SHA256_AMD64,
+        IDE_TASK_SHA256_ARM64,
+    ] {
         if !token
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_'))
@@ -109,6 +144,9 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<String> {
             NODE_VERSION.into(),
             NODE_SHA256_X64.into(),
             NODE_SHA256_ARM64.into(),
+            IDE_TASK_VERSION.into(),
+            IDE_TASK_SHA256_AMD64.into(),
+            IDE_TASK_SHA256_ARM64.into(),
         ],
     );
     let mut child = Command::new(program)
@@ -130,7 +168,9 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Ok((name, (!said.is_empty()).then_some(said)))
 }
 
 /// Run in an environment's container: the `bin` directory of the pinned
@@ -170,7 +210,8 @@ mod tests {
     }
 
     /// The fetch script, run for real against a directory that already
-    /// holds the build: it answers with the name and fetches nothing.
+    /// holds the node and the Task: it answers with the name and fetches
+    /// nothing.
     #[test]
     fn a_vm_that_has_the_build_is_not_fetched_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -179,12 +220,20 @@ mod tests {
             "aarch64" => "arm64",
             _ => return,
         };
+        use taste_core::tasks::{IDE_TASK_SHA256_AMD64, IDE_TASK_SHA256_ARM64, IDE_TASK_VERSION};
+        let tarch = if arch == "x64" { "amd64" } else { "arm64" };
         let name = format!("node-v{NODE_VERSION}-linux-{arch}");
         let bin = dir.path().join(&name).join("bin");
+        let task_dir = dir
+            .path()
+            .join(format!("task-v{IDE_TASK_VERSION}-linux-{tarch}"));
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("node"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(&task_dir).unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for exe in [bin.join("node"), task_dir.join("task")] {
+            std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let out = Command::new("sh")
             .args(["-c", FETCH, "fetch"])
             .args([
@@ -192,6 +241,9 @@ mod tests {
                 NODE_VERSION,
                 NODE_SHA256_X64,
                 NODE_SHA256_ARM64,
+                IDE_TASK_VERSION,
+                IDE_TASK_SHA256_AMD64,
+                IDE_TASK_SHA256_ARM64,
             ])
             // No network in this test: a fetch would fail, which is the
             // point — none is made.

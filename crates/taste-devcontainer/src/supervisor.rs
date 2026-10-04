@@ -3930,7 +3930,10 @@ impl Supervisor {
             .any(|file| self.exists_in_checkout(&self.checkout().path().join(file)));
         if has_taskfile {
             let found = self
-                .podman(&exec("command -v task || command -v go-task"))
+                .podman(&exec(&format!(
+                    "{}; [ -n \"$t\" ]",
+                    taste_core::tasks::locate_task()
+                )))
                 .output()
                 .await
                 .is_ok_and(|out| out.status.success());
@@ -3940,8 +3943,9 @@ impl Supervisor {
             ));
             if !found {
                 gaps.push(
-                    "task (taskfile.dev) is not in the image, as task or as Fedora's go-task; \
-                     install it in the Containerfile (Fedora: dnf install go-task)"
+                    "task (taskfile.dev) is not in the image, as task or as Fedora's go-task, \
+                     and the IDE's own Task is not deployed in the VM; install it in the \
+                     Containerfile (Fedora: dnf install go-task)"
                         .to_string(),
                 );
             }

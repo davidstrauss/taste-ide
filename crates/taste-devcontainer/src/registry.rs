@@ -2054,10 +2054,14 @@ impl EnvironmentRegistry {
         // runs on the image's own node or says why it cannot.
         let deploying = std::time::Instant::now();
         match crate::agentnode::ensure_in_vm(vm.ssh_port, &self.workspace_root) {
-            Ok(build) => self.note_vm(
+            Ok((build, said)) => self.note_vm(
                 &vm.domain,
                 format!(
-                    "the agent's node is {build} ({} ms)",
+                    "the agent's node is {build}, {} ({} ms)",
+                    match said {
+                        None => format!("Task {} beside it", taste_core::tasks::IDE_TASK_VERSION),
+                        Some(said) => format!("and the IDE's Task is not: {said}"),
+                    },
                     deploying.elapsed().as_millis().max(1)
                 ),
             ),
