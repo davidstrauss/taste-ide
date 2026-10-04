@@ -638,6 +638,10 @@ pub struct Supervisor {
     /// config rechecks there in place of inotify. Dropped with the
     /// supervisor.
     remote_watch: Mutex<Option<crate::keeper::WatchHandle>>,
+    /// Whether the panes are aimed at this environment, which is when its
+    /// checkout's changes in a VM become the panes' events
+    /// ([`Self::set_panes_watching`]). Always true for the primary.
+    panes_watching: Arc<AtomicBool>,
     /// A recheck the watch has asked for and not yet run: several events
     /// in a burst make one recheck.
     recheck_pending: Arc<AtomicBool>,
@@ -770,7 +774,10 @@ impl TreeEvents {
         "build-aux/flatpak/.build",
     ];
 
-    fn start(events: EventBus, root: PathBuf) -> Self {
+    /// `watching` gates the publishing: a batch that ends while the panes
+    /// are aimed elsewhere is dropped, and aiming them here reads the
+    /// checkout afresh anyway.
+    fn start(events: EventBus, root: PathBuf, watching: Arc<AtomicBool>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
         std::thread::Builder::new()
             .name("taste-keeper-tree-events".into())
@@ -783,6 +790,9 @@ impl TreeEvents {
                         .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                     {
                         batch.push(more);
+                    }
+                    if !watching.load(Ordering::SeqCst) {
+                        continue;
                     }
                     let mut git = false;
                     let mut tree = false;
@@ -865,6 +875,7 @@ impl Supervisor {
         inside: bool,
     ) -> Arc<Self> {
         let checkout = env.checkout.clone();
+        let env_is_primary = env.id.is_primary();
         Arc::new(Self {
             env,
             events,
@@ -905,6 +916,7 @@ impl Supervisor {
             substrate: Mutex::new(substrate),
             files: Mutex::new(None),
             remote_watch: Mutex::new(None),
+            panes_watching: Arc::new(AtomicBool::new(env_is_primary)),
             recheck_pending: Arc::new(AtomicBool::new(false)),
             snapshot_pending: Arc::new(AtomicBool::new(false)),
             tunnel: Mutex::new(None),
@@ -953,6 +965,15 @@ impl Supervisor {
     /// up, before anything else is tried.
     pub fn set_waker(&self, waker: Placer) {
         *self.waker.lock().unwrap() = Some(waker);
+    }
+
+    /// Say whether the panes are aimed at this environment, which is when
+    /// its checkout's changes in a VM are published for them. The primary's
+    /// always are; this is for the others.
+    pub fn set_panes_watching(&self, watching: bool) {
+        if !self.env.id.is_primary() {
+            self.panes_watching.store(watching, Ordering::SeqCst);
+        }
     }
 
     /// See [`Supervisor::sharer`]'s field.
@@ -1069,20 +1090,22 @@ impl Supervisor {
         if primary {
             self.watch_folder();
         }
-        // The primary's tree is what the panes show, so its changes over
-        // there become the events inotify would have raised here — the
-        // editor reloads, the tree restyles, the dots move. Debounced the
-        // way `taste_core::watcher` debounces, and never for an agent
-        // environment's clone, whose churn belongs to no pane.
-        let tree_events = self
-            .env
-            .id
-            .is_primary()
-            .then(|| TreeEvents::start(self.events.clone(), path.clone()));
+        // The tree the panes show has its changes over there become the
+        // events inotify would have raised here — the editor reloads, the
+        // tree restyles, the dots move — debounced the way
+        // `taste_core::watcher` debounces. The primary's always; another
+        // environment's while the panes are aimed at it and not a moment
+        // longer, since an agent's churn belongs to no pane until someone
+        // is looking (David, 2026-10-04: "The file tree should update
+        // whenever the files change" — a pull in an agent environment's
+        // shell never reached its tree).
+        let tree_events = TreeEvents::start(
+            self.events.clone(),
+            path.clone(),
+            self.panes_watching.clone(),
+        );
         let watch = keeper.watch(&path, move |event, name| {
-            if let Some(tree) = &tree_events {
-                tree.saw(&event, &name);
-            }
+            tree_events.saw(&event, &name);
             // A ref moved — HEAD, a branch, the packed refs: a commit, a
             // checkout, a reset, by the tree, the agent, or a shell. The
             // snapshot and the peer sync follow two seconds later, once
@@ -4816,6 +4839,38 @@ mod tests {
 
     /// A repo's private label is shared in a VM, and nothing else in the
     /// mount changes.
+    /// A VM checkout's changes reach the panes while they are aimed at its
+    /// environment, and not while they are aimed elsewhere.
+    #[test]
+    fn tree_events_reach_the_panes_only_while_they_watch() {
+        let events = EventBus::new();
+        let seen = events.subscribe();
+        let watching = Arc::new(AtomicBool::new(false));
+        let tree = TreeEvents::start(events.clone(), PathBuf::from("/c"), watching.clone());
+        tree.saw("rename", "pulled.txt");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(seen.try_recv().is_err(), "published while nobody watched");
+        watching.store(true, Ordering::SeqCst);
+        tree.saw("rename", "pulled.txt");
+        tree.saw("change", ".git/HEAD");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let mut got = Vec::new();
+        while let Ok(event) = seen.try_recv() {
+            got.push(event);
+        }
+        assert!(
+            got.iter().any(|e| matches!(e, Event::FileTreeChanged)),
+            "{got:?}"
+        );
+        assert!(
+            got.iter().any(|e| matches!(e, Event::GitStatusChanged)),
+            "{got:?}"
+        );
+        assert!(got
+            .iter()
+            .any(|e| matches!(e, Event::FileChanged(p) if p == Path::new("/c/pulled.txt"))));
+    }
+
     #[test]
     fn a_repo_mounts_private_label_is_shared_in_a_vm() {
         assert_eq!(

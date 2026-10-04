@@ -517,8 +517,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // checkout wherever it is — a VM's, through that
                     // environment's own files service — and the refs views
                     // at its peer on this host. A checkout on this host
-                    // also gets a watcher; one in a VM is re-read on the
-                    // tree's own cadence.
+                    // also gets a watcher; one in a VM, its keeper's watch.
                     Some(supervisor) => Some(crate::filetree::Aim {
                         env: env.clone(),
                         checkout: supervisor.checkout(),
@@ -547,6 +546,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     .as_ref()
                     .and_then(|aim| aim.checkout.local_path().map(std::path::Path::to_path_buf)),
             );
+            // One in a VM has the keeper's watch, which reaches the panes
+            // while they are aimed at it, by the same rule.
+            for supervisor in environments.list() {
+                supervisor.set_panes_watching(*supervisor.id() == env);
+            }
             filetree.aim_at(target);
             // Each environment owns its editor tabs: switching stows the
             // ones on screen and brings back the ones this environment had,
