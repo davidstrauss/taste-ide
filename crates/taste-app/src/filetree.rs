@@ -2282,16 +2282,21 @@ impl FileTree {
     /// is the user's to do from here (David, 2026-10-04: "I ought to be able
     /// to use the GUI pull button in these envs, too"), and it moves the
     /// environment's branch onto `personal/<branch>` without a byte of the
-    /// user's own editing. And **Push is not offered at all**: an
-    /// environment's work reaches the user's branch by being published and
-    /// reviewed, never by a push into it, so a Push there — even greyed —
-    /// named a thing that does not exist ("Why am I being offered the
-    /// (grayed out) ability to push to my own branch?").
+    /// user's own editing. Push stays, disabled like the rest, but without
+    /// the tooltip a snapshot gives it — "Push 1 commit to origin/main"
+    /// offered to push the environment's branch into the user's own, which
+    /// is not a thing this view does (David, 2026-10-04: "I just want it
+    /// disabled without such a dumb message"); an environment's work
+    /// reaches the user's branch by being published and reviewed.
     fn apply_view_permissions(&self) {
         let read_only = self.read_only();
         if read_only {
-            self.init_button.set_sensitive(false);
-            self.push_button.set_visible(false);
+            for button in [&self.push_button, &self.init_button] {
+                button.set_sensitive(false);
+            }
+            self.push_button.set_tooltip_text(Some(
+                "An environment's work reaches your branch by Publish and review",
+            ));
             self.branch_label.set_sensitive(false);
             self.branch_label
                 .set_tooltip_text(Some("Read-only: this is another environment's checkout"));
