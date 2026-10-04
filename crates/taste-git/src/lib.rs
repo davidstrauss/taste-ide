@@ -1240,6 +1240,55 @@ mod tests {
         );
     }
 
+    /// An environment's peer pulls from Personal: the branch's upstream is
+    /// `personal/<branch>`, read from the folder's copy of Personal's
+    /// branches, its push still goes to `origin`, and Sync counts and
+    /// rebases against Personal.
+    #[test]
+    fn an_environment_branch_pulls_from_personal_and_pushes_where_it_did() {
+        let (folder, folder_ws) = temp_repo();
+        std::fs::write(folder.path().join("a.txt"), "one\n").unwrap();
+        folder_ws.stage(Path::new("a.txt")).unwrap();
+        folder_ws.commit("first").unwrap();
+        let main = folder_ws.branch_name().unwrap();
+        let peer = tempfile::tempdir().unwrap();
+        Repository::clone(folder.path().to_str().unwrap(), peer.path()).unwrap();
+        let ws = GitWorkspace::discover(peer.path()).unwrap();
+        // Personal commits: the folder's copy of its branch moves, the
+        // folder's own branch does not.
+        std::fs::write(folder.path().join("b.txt"), "personal's\n").unwrap();
+        folder_ws.stage(Path::new("b.txt")).unwrap();
+        let second = folder_ws.commit("in Personal").unwrap();
+        let first = folder_ws
+            .repo
+            .find_commit(second)
+            .unwrap()
+            .parent_id(0)
+            .unwrap();
+        folder_ws
+            .set_ref(&format!("refs/taste/vm/{main}"), second)
+            .unwrap();
+        folder_ws
+            .set_ref(&format!("refs/heads/{main}"), first)
+            .unwrap();
+
+        assert!(ws.track_personal(folder.path(), &main).unwrap());
+        let sync = ws.sync_status_of(&main).unwrap();
+        assert_eq!(
+            sync.base.as_deref(),
+            Some(format!("personal/{main}").as_str())
+        );
+        assert_eq!(sync.behind, 1, "{sync:?}");
+        assert_eq!(
+            ws.rebase_target_of(&main).as_deref(),
+            Some(format!("refs/remotes/personal/{main}").as_str())
+        );
+        assert_eq!(ws.push_target(&main).remote, "origin");
+        // Again: nothing changes, and a branch Personal lacks is left be.
+        assert!(ws.track_personal(folder.path(), &main).unwrap());
+        assert!(!ws.track_personal(folder.path(), "elsewhere").unwrap());
+    }
+
     /// The named-remote fork setup git describes: upstream `origin/<main>`,
     /// push remote the fork. ↑ counts against the fork's tracking ref, ↓
     /// against upstream, and the push never rewrites the upstream.

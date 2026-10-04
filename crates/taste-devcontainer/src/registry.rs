@@ -2583,6 +2583,21 @@ impl EnvironmentRegistry {
             let Some(vm) = supervisor.substrate().vm_details().cloned() else {
                 continue;
             };
+            // The peer pulls from Personal too, which is what the file
+            // tree's Pull reads and rebases by: its branch, the one the
+            // checkout has out, upstream of `personal/<branch>`.
+            let branch = supervisor
+                .files()
+                .read_to_string(&path.join(".git/HEAD"))
+                .ok()
+                .and_then(|head| taste_git::mirror::Head::parse(&head));
+            if let (Some(taste_git::mirror::Head::Branch(branch)), Some(peer)) =
+                (branch, taste_git::GitWorkspace::discover(supervisor.peer()))
+            {
+                if let Err(e) = peer.track_personal(&folder, &branch) {
+                    first_error.get_or_insert(e.context(format!("environment {id}'s peer")));
+                }
+            }
             if self.personal_shared.lock().unwrap().get(&id) == Some(&fingerprint) {
                 continue;
             }

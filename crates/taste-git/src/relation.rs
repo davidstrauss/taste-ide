@@ -26,6 +26,7 @@
 //! `push.default`, read as git reads them.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
@@ -162,6 +163,55 @@ impl GitWorkspace {
             .find_reference(&format!("refs/remotes/{}/HEAD", self.default_remote()))
             .ok()?;
         head.symbolic_target().map(str::to_string)
+    }
+
+    /// Make Personal's `branch` what an environment's `branch` pulls from,
+    /// in that environment's peer: a remote `personal` reading the folder's
+    /// copy of Personal's branches (`refs/taste/vm/*` in `folder`), fetched
+    /// now, and — as git's fork setup has it — that remote as the branch's
+    /// upstream with its push remote kept where it was. The file tree's
+    /// Pull then counts and rebases against `personal/<branch>`, and its
+    /// Push goes where it went. A branch whose upstream someone chose — any
+    /// remote but the clone's own `origin`, or one with a push remote of
+    /// its own — is left alone, as is one Personal does not have. Says
+    /// whether the branch now pulls from Personal.
+    pub fn track_personal(&self, folder: &Path, branch: &str) -> Result<bool> {
+        const REMOTE: &str = "personal";
+        const FETCH: &str = "+refs/taste/vm/*:refs/remotes/personal/*";
+        let url = folder.to_string_lossy().to_string();
+        match self.repo.find_remote(REMOTE) {
+            Ok(remote) if remote.url() == Some(url.as_str()) => {}
+            Ok(_) => self.repo.remote_set_url(REMOTE, &url)?,
+            Err(_) => {
+                self.repo.remote_with_fetch(REMOTE, &url, FETCH)?;
+            }
+        }
+        self.update_refs_from(folder, &[FETCH])?;
+        if self
+            .repo
+            .find_reference(&format!("refs/remotes/{REMOTE}/{branch}"))
+            .is_err()
+            || self.repo.find_branch(branch, BranchType::Local).is_err()
+        {
+            return Ok(false);
+        }
+        let remote = self.config_string(&format!("branch.{branch}.remote"));
+        let push_remote = self.config_string(&format!("branch.{branch}.pushRemote"));
+        match (remote.as_deref(), push_remote) {
+            (Some(REMOTE), _) => return Ok(true),
+            (None, _) | (Some("origin"), None) => {}
+            _ => return Ok(false),
+        }
+        let mut config = self.repo.config()?;
+        if let Some(remote) = &remote {
+            config.set_str(&format!("branch.{branch}.pushRemote"), remote)?;
+        }
+        config.set_str(&format!("branch.{branch}.remote"), REMOTE)?;
+        config.set_str(
+            &format!("branch.{branch}.merge"),
+            &format!("refs/taste/vm/{branch}"),
+        )?;
+        Ok(true)
     }
 
     /// The ref Sync rebases `branch` onto: its base when it has one, its
