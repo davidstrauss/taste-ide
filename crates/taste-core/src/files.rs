@@ -122,6 +122,11 @@ impl ExecOutput {
 pub trait RemoteFiles: Send + Sync + fmt::Debug {
     /// One phrase naming where the files are, for errors and the log.
     fn describe(&self) -> String;
+    /// Whether this arm reaches files at all; only the stand-in for a
+    /// files service not connected yet says no.
+    fn connected(&self) -> bool {
+        true
+    }
     fn stat(&self, path: &Path) -> io::Result<Stat>;
     fn list(&self, path: &Path) -> io::Result<Vec<Entry>>;
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
@@ -178,6 +183,9 @@ impl RemoteFiles for Unavailable {
     fn describe(&self) -> String {
         self.reason.clone()
     }
+    fn connected(&self) -> bool {
+        false
+    }
     fn stat(&self, _: &Path) -> io::Result<Stat> {
         Err(self.err())
     }
@@ -207,6 +215,16 @@ impl RemoteFiles for Unavailable {
 impl Files {
     pub fn is_local(&self) -> bool {
         matches!(self, Files::Local)
+    }
+
+    /// Whether the files can be reached at all. A files service not
+    /// connected yet answers "no such file" for everything a question like
+    /// `is_file` asks, which is not the same as the file being absent.
+    pub fn is_connected(&self) -> bool {
+        match self {
+            Files::Local => true,
+            Files::Remote(remote) => remote.connected(),
+        }
     }
 
     /// A remote arm that is not connected: every call fails with `reason`.

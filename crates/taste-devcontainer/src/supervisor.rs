@@ -1333,6 +1333,11 @@ impl Supervisor {
         let mirror = self.config_root();
         let root = self.checkout().path().to_path_buf();
         self.with_files(|files| -> Result<()> {
+            // Not connected yet — the VM still coming up — reads as a
+            // checkout with no config at all; the last copy stays instead.
+            if !files.is_connected() {
+                bail!("{}", files.describe());
+            }
             let _ = std::fs::remove_dir_all(&mirror);
             std::fs::create_dir_all(&mirror)
                 .with_context(|| format!("creating the config mirror {}", mirror.display()))?;
@@ -1732,7 +1737,13 @@ impl Supervisor {
         let resolved = self.resolve_config_uncached();
         if let Ok(resolved) = &resolved {
             *self.declared_ports.lock().unwrap() = resolved.config.ports();
-            self.note_passed_over(resolved.reason.clone());
+            // Nothing is said about a config that could not be looked at:
+            // with the files service not connected yet, every reason is a
+            // guess (2026-10-04: "the user's checkout has a devcontainer
+            // config that is not committed", toasted while the VM came up).
+            if self.files().is_connected() {
+                self.note_passed_over(resolved.reason.clone());
+            }
         }
         resolved
     }
@@ -1984,9 +1995,18 @@ impl Supervisor {
         };
 
         if let Err(e) = self.refresh_config_mirror() {
-            return baseline(Some(format!(
-                "the project config could not be read from its VM: {e:#}"
-            )));
+            // The last copy, while the files service is still connecting:
+            // what the checkout had when it was last reachable.
+            let kept = !self.files().is_connected()
+                && matches!(
+                    DevcontainerConfig::discover(&self.config_root()),
+                    Ok(Some(_))
+                );
+            if !kept {
+                return baseline(Some(format!(
+                    "the project config could not be read from its VM: {e:#}"
+                )));
+            }
         }
         let config = match DevcontainerConfig::discover(&self.config_root()) {
             Ok(Some(config)) => config,
@@ -5523,6 +5543,40 @@ mod tests {
         let reason = resolved.reason.expect("a refusal is worth explaining");
         assert!(reason.contains("refused"), "{reason}");
         assert!(reason.contains("security-opt"), "{reason}");
+    }
+
+    /// While its VM's files service is still connecting, an environment's
+    /// config is not judged: the last copy of it stays, and nothing says it
+    /// was passed over — not "not committed", which is what reading an
+    /// unreachable checkout as an empty one claimed.
+    #[test]
+    fn a_config_that_cannot_be_reached_yet_is_not_called_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_dc = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&main_dc).unwrap();
+        std::fs::write(main_dc.join("devcontainer.json"), r#"{"image": "img"}"#).unwrap();
+        let identity = EnvironmentIdentity {
+            id: EnvironmentId::parse("i-0001").unwrap(),
+            workspace_root: dir.path().to_path_buf(),
+            checkout: Checkout::Remote {
+                vm: "taste-x".into(),
+                path: PathBuf::from("/var/home/core/taste/x/i-0001"),
+            },
+            peer: dir.path().join("peer"),
+        };
+        let remote = make_env(dir.path(), identity);
+        assert!(!remote.files().is_connected());
+        let seen = remote.events.subscribe();
+        let kept = remote.config_root().join(".devcontainer/devcontainer.json");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, r#"{"image": "img"}"#).unwrap();
+
+        remote.resolve_config().unwrap();
+        assert!(kept.exists(), "the last copy was wiped");
+        assert_eq!(remote.config_passed_over(), None);
+        while let Ok(event) = seen.try_recv() {
+            assert!(!matches!(event, Event::Toast(_)), "{event:?}");
+        }
     }
 
     /// In a VM the binds carry the shared label, so the keeper — another
