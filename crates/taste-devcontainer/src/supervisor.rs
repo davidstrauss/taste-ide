@@ -2953,6 +2953,23 @@ impl Supervisor {
         // Resolve against the same ladder a reload would take, so the drift
         // comparison is like-for-like.
         let resolved = self.resolve_config().ok()?;
+        // Personal's baseline left running beside a project config that is
+        // usable now — the last launch's stand-in for a build that failed —
+        // is not adopted: the baseline is for a config absent or broken,
+        // and adopting it put Personal in safe mode behind a Rebuild button
+        // (David, 2026-10-04: "I shouldn't see this!!!!"). Not adopted,
+        // Personal reads as a config not yet built, and the window's own
+        // bring-up builds it (`reload_baseline`), replacing this container.
+        if self.env.id.is_primary()
+            && authority == ConfigAuthority::Baseline
+            && resolved.authority == ConfigAuthority::Project
+        {
+            self.log(format!(
+                "{name} is the baseline, left running beside a project config that is \
+                 usable now; the project's environment is built instead"
+            ));
+            return None;
+        }
         // The adopted container's working directory is the one its OWN
         // config gave it, which its authority label names: the baseline's
         // `/workspace` for a baseline container, the project's
