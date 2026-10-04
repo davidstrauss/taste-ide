@@ -21,7 +21,7 @@ taste-models.workspace = true
 taste-gcp.workspace = true
 taste-semantic.workspace = true
 
-agent-client-protocol = "2"
+agent-client-protocol = { version = "2", features = ["unstable_elicitation"] }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_8"] }
 sourceview5 = "0.11"

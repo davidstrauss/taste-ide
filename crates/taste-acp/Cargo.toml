@@ -10,7 +10,7 @@ taste-core.workspace = true
 taste-git.workspace = true
 # unstable_end_turn_token_usage: the utilization display needs per-turn
 # Usage; re-evaluate when it stabilizes.
-agent-client-protocol = { version = "2", features = ["unstable_end_turn_token_usage", "unstable_auth_methods"] }
+agent-client-protocol = { version = "2", features = ["unstable_end_turn_token_usage", "unstable_auth_methods", "unstable_elicitation"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

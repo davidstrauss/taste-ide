@@ -74,6 +74,7 @@ fn describe(event: &SessionEvent) -> String {
         SessionEvent::Update(_) => "Update".into(),
         SessionEvent::TurnEnded { .. } => "TurnEnded".into(),
         SessionEvent::Permission { .. } => "Permission".into(),
+        SessionEvent::Elicitation { .. } => "Elicitation".into(),
         SessionEvent::ModeChangeFailed { message, .. } => format!("ModeChangeFailed({message})"),
         SessionEvent::CommandFailed { message } => format!("CommandFailed({message})"),
         SessionEvent::PromptFailed { message } => format!("PromptFailed({message})"),

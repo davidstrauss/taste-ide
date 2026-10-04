@@ -15,16 +15,17 @@ use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
     AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification, ContentBlock,
-    CreateTerminalRequest, CreateTerminalResponse, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
-    PermissionOption, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
-    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
-    SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalOutputRequest,
-    TextContent, Usage, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
+    CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
+    ElicitationFormCapabilities, InitializeRequest, KillTerminalRequest, KillTerminalResponse,
+    LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest, PermissionOption,
+    PermissionOptionKind, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TerminalOutputRequest, TextContent, Usage, WaitForTerminalExitRequest,
+    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo};
@@ -34,6 +35,10 @@ use crate::AgentSpec;
 
 /// The user's answer to an agent permission request.
 pub type PermissionReply = tokio::sync::oneshot::Sender<RequestPermissionOutcome>;
+
+/// The user's answer to an agent's questions (an ACP form elicitation).
+/// Dropped unanswered, it goes back as `cancel`.
+pub type ElicitationReply = tokio::sync::oneshot::Sender<CreateElicitationResponse>;
 
 /// Instructions from the UI to the session task.
 pub enum Command {
@@ -79,6 +84,13 @@ pub enum SessionEvent {
     Permission {
         request: RequestPermissionRequest,
         reply: PermissionReply,
+    },
+    /// The agent asked the user questions — Claude Code's AskUserQuestion,
+    /// which the adapter sends as a form elicitation, or an MCP server's own
+    /// form; answer through `reply`.
+    Elicitation {
+        request: CreateElicitationRequest,
+        reply: ElicitationReply,
     },
     /// A turn finished, with the agent's session-cumulative token usage
     /// when it reports one.
@@ -521,6 +533,7 @@ impl AgentClient {
 
         let events_for_notify = event_tx.clone();
         let events_for_perm = event_tx.clone();
+        let events_for_elicit = event_tx.clone();
         let events_for_close = event_tx.clone();
         // The IDE mediates the agent's filesystem, always. Reads were
         // once gated on a UI being attached; writes cannot be, because
@@ -671,6 +684,39 @@ impl AgentClient {
                                 RequestPermissionOutcome::Cancelled
                             };
                             responder.respond(RequestPermissionResponse::new(outcome))?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: CreateElicitationRequest,
+                                responder,
+                                cx: ConnectionTo<Agent>| {
+                        // Questions for the user. Answered out-of-band like a
+                        // permission: the user may take a while, and the
+                        // dispatch loop must stay free meanwhile. Anything
+                        // that ends the wait without an answer — the pane
+                        // gone, the turn over — goes back as `cancel`.
+                        let (reply_tx, reply_rx) =
+                            tokio::sync::oneshot::channel::<CreateElicitationResponse>();
+                        let forwarded = events_for_elicit
+                            .send(SessionEvent::Elicitation {
+                                request,
+                                reply: reply_tx,
+                            })
+                            .await
+                            .is_ok();
+                        cx.spawn(async move {
+                            let cancelled =
+                                || CreateElicitationResponse::new(ElicitationAction::Cancel);
+                            let response = if forwarded {
+                                reply_rx.await.unwrap_or_else(|_| cancelled())
+                            } else {
+                                cancelled()
+                            };
+                            responder.respond(response)?;
                             Ok(())
                         })?;
                         Ok(())
@@ -936,6 +982,16 @@ async fn run_session(
         // The window in between — a container dying under a live session —
         // is covered by the handlers refusing per request.
         request.client_capabilities.terminal = serves_terminals;
+        // Questions in a form (ACP elicitation, form mode). The pinned
+        // Claude Code adapter turns its AskUserQuestion tool OFF for a
+        // client that does not say this, and the model reached for it
+        // anyway: a failed call in the transcript, then the question asked
+        // again in prose. Said, the adapter sends the questions here and the
+        // chat poses them on a card (`chat.rs`, `crate::elicit`). URL mode
+        // is not offered: it opens a page in a browser, for an MCP server's
+        // sign-in, and none is wired here.
+        request.client_capabilities.elicitation =
+            Some(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
         // The same fact, in the dialect the pinned Claude Code adapter
         // actually reads. It never calls `terminal/create`; it reports the
         // Bash commands it ran itself, and only to a client that asks for

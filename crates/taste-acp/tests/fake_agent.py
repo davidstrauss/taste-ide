@@ -33,6 +33,11 @@ exit status and what the command printed. "/termcap" reports whether the
 client advertised the capability at all, which is what makes the
 container-mode/safe-mode split testable from the agent's side.
 
+"/ask" puts a question to the user the way the pinned Claude adapter does
+with AskUserQuestion — an `elicitation/create` form, sent only to a client
+that advertised form elicitation — and replies with the client's answer as
+JSON, or "ask unsupported" when the capability is absent.
+
 "/termhold COMMAND" creates a terminal and returns its id WITHOUT waiting,
 so a test can watch a long-running command while it runs — the case the
 console's Kill button exists for. "/termstatus ID" and "/termrelease ID"
@@ -222,6 +227,28 @@ while True:
             continue
         if prompt.startswith("/mcp "):
             reply(call_mcp(prompt[len("/mcp "):].strip()))
+            continue
+        if prompt == "/ask":
+            if (client_capabilities.get("elicitation") or {}).get("form") is None:
+                reply("ask unsupported")
+                continue
+            answered = call_client("elicitation/create", {
+                "sessionId": session_id,
+                "mode": "form",
+                "toolCallId": "toolu_ask",
+                "message": "Which install?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "question_0": {
+                            "type": "string",
+                            "oneOf": [{"const": "Replace", "title": "Replace"},
+                                      {"const": "Separate", "title": "Separate"}],
+                        },
+                    },
+                },
+            })
+            reply("ask " + json.dumps(answered, sort_keys=True))
             continue
         if prompt == "/termcap":
             # Exactly the check a real adapter makes before it prefers a

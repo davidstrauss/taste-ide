@@ -94,6 +94,10 @@ pub enum Moment {
     /// *blocking*: nothing proceeds until the user says yes or no.
     /// `detail` is the question, as the permission bar states it.
     PermissionRequested { chat: Chat, detail: String },
+    /// The agent asked the user questions on a card (AskUserQuestion);
+    /// `detail` is the question. Persistent, like a permission: the turn
+    /// waits on it.
+    QuestionAsked { chat: Chat, detail: String },
     /// A turn finished. Informational — it withdraws itself when the user
     /// comes back, and it never fires while the window has focus at all,
     /// whichever tab is forward (see the module prose).
@@ -218,6 +222,21 @@ pub fn decide(moment: &Moment, attention: &Attention, scope: &str) -> Option<Not
                 surface: Surface::Chat(chat.key.clone()),
                 // Stays put: the question is still unanswered whether or
                 // not the user glanced at the window.
+                informational: false,
+            })
+        }
+        Moment::QuestionAsked { chat, detail } => {
+            if looking_at(attention.chat_on_screen) {
+                return None;
+            }
+            Some(Notice {
+                id: notification_id(scope, "question", &chat.key),
+                title: format!("{} has a question", chat.label),
+                body: match first_line(detail) {
+                    "" => "Waiting for your answer".to_string(),
+                    question => question.to_string(),
+                },
+                surface: Surface::Chat(chat.key.clone()),
                 informational: false,
             })
         }

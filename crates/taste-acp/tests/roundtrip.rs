@@ -38,6 +38,7 @@ async fn full_session_roundtrip() {
             SessionEvent::TurnEnded { .. } => "TurnEnded".to_string(),
             SessionEvent::Ready { .. } => unreachable!(),
             SessionEvent::Permission { .. } => "Permission".to_string(),
+            SessionEvent::Elicitation { .. } => "Elicitation".to_string(),
             SessionEvent::ModeChangeFailed { message, .. } => {
                 format!("ModeChangeFailed({message})")
             }
@@ -326,4 +327,60 @@ async fn an_unresolvable_session_falls_back_and_admits_it() {
             _ => {}
         }
     }
+}
+
+/// The agent's questions reach the chat as an elicitation, and the user's
+/// answer goes back as the agent reads it: the client says it takes forms
+/// (or the adapter switches AskUserQuestion off), forwards the request, and
+/// returns what the reply carries — `cancel` when nobody answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agents_questions_come_to_the_chat_and_the_answer_goes_back() {
+    use agent_client_protocol::schema::v1::{
+        CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction,
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    let client =
+        AgentClient::spawn_unconfined_for_tests(fake_agent_spec(), workspace.path().to_path_buf());
+    assert!(matches!(
+        next_event(&client).await,
+        SessionEvent::Ready { .. }
+    ));
+    async fn ask(client: &AgentClient, answer: Option<CreateElicitationResponse>) -> String {
+        client.prompt("/ask").unwrap();
+        let mut answer = answer;
+        loop {
+            match next_event(client).await {
+                SessionEvent::Elicitation { request, reply } => {
+                    assert_eq!(request.message, "Which install?");
+                    match answer.take() {
+                        Some(response) => {
+                            let _ = reply.send(response);
+                        }
+                        None => drop(reply),
+                    }
+                }
+                SessionEvent::Update(SessionUpdate::AgentMessageChunk(chunk)) => {
+                    let ContentBlock::Text(text) = &chunk.content else {
+                        panic!("expected text content");
+                    };
+                    return text.text.clone();
+                }
+                SessionEvent::Closed(error) => panic!("connection closed early: {error:?}"),
+                _ => {}
+            }
+        }
+    }
+    let content = std::collections::BTreeMap::from([("question_0".to_string(), "Separate".into())]);
+    let accepted = ask(
+        &client,
+        Some(CreateElicitationResponse::new(ElicitationAction::Accept(
+            ElicitationAcceptAction::new().content(content),
+        ))),
+    )
+    .await;
+    assert_eq!(
+        accepted,
+        r#"ask {"action": "accept", "content": {"question_0": "Separate"}}"#
+    );
+    assert_eq!(ask(&client, None).await, r#"ask {"action": "cancel"}"#);
 }

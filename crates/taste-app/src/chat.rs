@@ -375,6 +375,11 @@ const TRANSCRIPT_FOOT: i32 = PANE_BAR_INSET;
 /// than by two numbers that happen to agree today.
 const PERMISSION_ICON: i32 = 20;
 const PERMISSION_ICON_GAP: i32 = 12;
+/// How tall the question card's fields grow before they scroll inside it.
+const QUESTION_CARD_MAX_HEIGHT: i32 = 360;
+/// How far an option's words sit below the top of its indicator, so the
+/// title's first line is centred on it (`TASTE_PROBE_CHAT=ask`'s dump).
+const QUESTION_TITLE_DROP: i32 = 4;
 
 /// The keyboard contract, where a tooltip can carry it: a label under the
 /// composer would be chrome the user reads once and then looks past forever.
@@ -401,6 +406,20 @@ const MAX_TRANSCRIPT_MIRROR_LINES: usize = 200;
 const TRANSCRIPT_LINE_CHARS: usize = 400;
 
 type PendingPermission = (RequestPermissionRequest, taste_acp::PermissionReply);
+
+/// Questions waiting their turn behind a card already up.
+type QueuedQuestions = (
+    agent_client_protocol::schema::v1::CreateElicitationRequest,
+    taste_acp::ElicitationReply,
+);
+
+/// The question card's open form: what was asked (`crate::elicit`), where
+/// the answer goes, and how to read the card's fields back.
+struct PendingQuestions {
+    form: crate::elicit::Form,
+    reply: taste_acp::ElicitationReply,
+    read: Rc<dyn Fn() -> std::collections::BTreeMap<String, crate::elicit::Answer>>,
+}
 
 /// The chat column's hooks into one chat: "my restorable state changed"
 /// (persist it) and "a turn is / is not in flight" (the environment's busy
@@ -675,6 +694,14 @@ pub struct ChatPane {
     /// — so two calls made at once used to cost one of them a refusal
     /// nobody gave.
     permission_queue: RefCell<std::collections::VecDeque<PendingPermission>>,
+    /// The agent's questions on the card (AskUserQuestion, as an ACP form
+    /// elicitation), when they are what is up. The card is the permission
+    /// card's — one place above the composer where the turn waits on the
+    /// user — filled with the questions instead.
+    pending_questions: RefCell<Option<PendingQuestions>>,
+    /// Questions that arrived while a card was up, in arrival order, like
+    /// [`Self::permission_queue`].
+    question_queue: RefCell<std::collections::VecDeque<QueuedQuestions>>,
     /// Context queued for the next prompt (files, selections, images).
     composer: Rc<crate::composer::Composer>,
     send_button: gtk::Button,
@@ -3258,6 +3285,8 @@ impl ChatPane {
             probe_posed_choices: Cell::new(false),
             pending_permission: RefCell::new(None),
             permission_queue: RefCell::new(std::collections::VecDeque::new()),
+            pending_questions: RefCell::new(None),
+            question_queue: RefCell::new(std::collections::VecDeque::new()),
             pending_marks: RefCell::new(HashMap::new()),
             composer: composer.clone(),
             send_button: send.clone(),
@@ -3840,7 +3869,7 @@ impl ChatPane {
         use taste_core::orchestration::{ChatFacts, ChatState, UsageSummary};
         let state = if self.client.borrow().is_none() {
             ChatState::Disconnected
-        } else if self.pending_permission.borrow().is_some() {
+        } else if self.card_up() {
             // Ahead of `busy` deliberately: a chat waiting on the user IS
             // mid-turn, and reporting that as "streaming" is how an
             // orchestrator waits forever for a turn only a person can
@@ -4599,7 +4628,7 @@ impl ChatPane {
     /// orchestrator branches on, and widening that token is a change to the
     /// tool surface rather than to this panel.
     pub fn awaits_user(&self) -> bool {
-        self.pending_permission.borrow().is_some() || self.needs_auth.get()
+        self.card_up() || self.needs_auth.get()
     }
 
     /// Where this chat's next agent gets spawned: its environment's
@@ -6558,6 +6587,7 @@ impl ChatPane {
             self.auth_box.set_visible(false);
         }
         self.permission_bar.set_reveal_child(false);
+        self.drop_questions();
         self.stop_button.set_visible(false);
         self.set_busy(false);
         self.current_agent.borrow_mut().take();
@@ -7047,7 +7077,7 @@ impl ChatPane {
     /// things up. The card itself is the honest indicator meanwhile, so the
     /// row goes away rather than spinning beside it.
     fn sync_busy_row(&self) {
-        let waiting = self.pending_permission.borrow().is_some();
+        let waiting = self.card_up();
         self.busy_row.set_visible(self.busy.get() && !waiting);
     }
 
@@ -8812,6 +8842,7 @@ impl ChatPane {
                 self.render_update(update)
             }
             SessionEvent::Permission { request, reply } => self.on_permission(request, reply),
+            SessionEvent::Elicitation { request, reply } => self.on_questions(request, reply),
             SessionEvent::PromptFailed { message } => {
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
@@ -8922,6 +8953,7 @@ impl ChatPane {
                         "its turn ended before the user answered; nobody refused it",
                     );
                 }
+                self.drop_questions();
                 let waiting: Vec<_> = self.permission_queue.borrow_mut().drain(..).collect();
                 for (request, _) in waiting {
                     self.workspace.ide.record_permission(
@@ -11093,6 +11125,7 @@ impl ChatPane {
                 self.set_busy(false);
             }
             Ok("standing") => self.seed_standing_for_probe(),
+            Ok("ask") => self.seed_questions_for_probe(),
             Ok("controls") => self.seed_controls_for_probe(),
             Ok(variant) => self.seed_permission_for_probe(variant),
             Err(_) => self.seed_permission_for_probe(""),
@@ -11170,6 +11203,67 @@ impl ChatPane {
             ),
         };
         self.opener(key, doc)();
+    }
+
+    /// TASTE_PROBE_CHECK only: the agent's questions on the card — two, as
+    /// the pinned adapter sends an AskUserQuestion of them (one choice with
+    /// described options, one of several), behind the call's own step —
+    /// through `handle_event`, as the permission probe goes.
+    #[doc(hidden)]
+    fn seed_questions_for_probe(self: &Rc<Self>) {
+        let mut ask =
+            agent_client_protocol::schema::v1::ToolCall::new("probe-ask", "Asking for your input");
+        ask.kind = ToolKind::Other;
+        ask.status = ToolCallStatus::InProgress;
+        self.render_update(SessionUpdate::ToolCall(ask));
+        let other = |question: &str| {
+            serde_json::json!({
+                "type": "string",
+                "title": "Other",
+                "_meta": {"_askUserQuestionCustomAnswer":
+                    {"questionId": question, "isCustomAnswer": true}}
+            })
+        };
+        let request = serde_json::from_value(serde_json::json!({
+            "mode": "form",
+            "sessionId": "probe-session",
+            "toolCallId": "probe-ask",
+            "message": "Please answer the following questions.",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "question_0": {
+                        "type": "string",
+                        "title": "Install shape",
+                        "description": "Should the exploitable stack replace the clean install, \
+                                        or sit alongside it?",
+                        "oneOf": [
+                            {"const": "Replace install", "title": "Replace install",
+                             "description": "task install builds the vulnerable stack behind \
+                                             the WAF. One site, one code path."},
+                            {"const": "Separate target", "title": "Separate target",
+                             "description": "Keep task install clean and add \
+                                             task install:vulnerable beside it."}
+                        ]
+                    },
+                    "question_0_custom": other("question_0"),
+                    "question_1": {
+                        "type": "array",
+                        "title": "Gadgets",
+                        "description": "Which gadget modules go in?",
+                        "items": {"anyOf": [
+                            {"const": "ui_icons", "title": "ui_icons 2.0.0"},
+                            {"const": "gadget_chain", "title": "gadget_chain",
+                             "description": "The deserialization chain the rule blocks."}
+                        ]}
+                    },
+                    "question_1_custom": other("question_1")
+                }
+            }
+        }))
+        .expect("the probe's form is well formed");
+        let (reply, _) = tokio::sync::oneshot::channel();
+        self.handle_event(SessionEvent::Elicitation { request, reply });
     }
 
     /// TASTE_PROBE_CHECK only: put a real permission request on screen.
@@ -11794,12 +11888,16 @@ impl ChatPane {
             // A card is already up: this one waits its turn behind it, and
             // comes back through this function when that one is answered —
             // so an answer given there ("don't ask again") can settle it.
-            if self.pending_permission.borrow().is_some() {
+            if self.card_up() {
                 self.permission_queue
                     .borrow_mut()
                     .push_back((request, reply));
                 return;
             }
+            // The card's scope line is a permission's: what a standing
+            // answer would bind. A question card left it in the error
+            // colour it uses.
+            self.permission_scope.remove_css_class("error");
             let face = permission_face(&request, &self.agent_name(), self.environment.as_str());
             self.permission_icon.set_icon_name(Some(face.icon));
             self.permission_label.set_label(&face.title);
@@ -11899,13 +11997,392 @@ impl ChatPane {
     /// The card was answered: the next request waiting behind it, if any,
     /// goes through [`Self::on_permission`] from the top.
     fn next_permission(self: &Rc<Self>) {
-        if self.pending_permission.borrow().is_some() {
+        if self.card_up() {
             return;
         }
         let next = self.permission_queue.borrow_mut().pop_front();
         if let Some((request, reply)) = next {
             self.on_permission(request, reply);
+            return;
         }
+        let questions = self.question_queue.borrow_mut().pop_front();
+        if let Some((request, reply)) = questions {
+            self.on_questions(request, reply);
+        }
+    }
+
+    /// Whether the card above the composer is up — a permission or the
+    /// agent's questions — which is the turn waiting on the user.
+    fn card_up(&self) -> bool {
+        self.pending_permission.borrow().is_some() || self.pending_questions.borrow().is_some()
+    }
+
+    /// The agent's questions — Claude Code's AskUserQuestion, which the
+    /// adapter sends as an ACP form elicitation — on the card above the
+    /// composer: each question its options, with their descriptions, and
+    /// its "Other" box; Answer sends what is filled in, Skip tells the
+    /// agent the user passed (`crate::elicit`). Queued behind a card
+    /// already up.
+    fn on_questions(
+        self: &Rc<Self>,
+        request: agent_client_protocol::schema::v1::CreateElicitationRequest,
+        reply: taste_acp::ElicitationReply,
+    ) {
+        self.finalize_stream();
+        let Some(form) = crate::elicit::form(&request) else {
+            // A page to open (URL mode) is not offered, so an agent sending
+            // one is told no rather than left waiting.
+            let _ = reply.send(
+                agent_client_protocol::schema::v1::CreateElicitationResponse::new(
+                    agent_client_protocol::schema::v1::ElicitationAction::Decline,
+                ),
+            );
+            self.meta_row(&format!(
+                "declined — the agent asked for something this chat cannot show: {}",
+                single_line(&request.message, 120)
+            ));
+            return;
+        };
+        if self.card_up() {
+            self.question_queue.borrow_mut().push_back((request, reply));
+            return;
+        }
+        if let Some(id) = &form.tool_call {
+            self.mark_waiting(id, true);
+        }
+        let several = form.fields.len() > 1;
+        self.permission_icon
+            .set_icon_name(Some("dialog-question-symbolic"));
+        self.permission_label.set_label(&form.message);
+        self.permission_label.set_tooltip_text(Some(&form.message));
+        self.permission_subtitle.set_label(&format!(
+            "{} · {}",
+            self.agent_name(),
+            self.environment.as_str()
+        ));
+        if let Some(card) = self.permission_bar.child() {
+            card.update_property(&[gtk::accessible::Property::Label(&form.message)]);
+        }
+        clear_children(&self.permission_detail);
+        let fields = gtk::Box::new(gtk::Orientation::Vertical, 14);
+        let mut readers: Vec<(String, Box<dyn Fn() -> crate::elicit::Answer>)> = Vec::new();
+        let answer_now: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        for field in &form.fields {
+            let group = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            // The field's short name, and — when the card asks several
+            // things — the question itself, which the card's title cannot
+            // be for all of them at once.
+            if let Some(title) = field.title.as_ref().filter(|_| several) {
+                group.append(
+                    &gtk::Label::builder()
+                        .label(title)
+                        .xalign(0.0)
+                        .wrap(true)
+                        .css_classes(["caption-heading"])
+                        .build(),
+                );
+            }
+            if let Some(description) = field.description.as_ref().filter(|_| several) {
+                group.append(
+                    &gtk::Label::builder()
+                        .label(description)
+                        .xalign(0.0)
+                        .wrap(true)
+                        .wrap_mode(gtk::pango::WrapMode::WordChar)
+                        .attributes(&no_hyphens())
+                        .build(),
+                );
+            }
+            let key = field.key.clone();
+            let reader: Box<dyn Fn() -> crate::elicit::Answer> = match &field.kind {
+                crate::elicit::Kind::One { choices, other }
+                | crate::elicit::Kind::Many { choices, other } => {
+                    let many = matches!(field.kind, crate::elicit::Kind::Many { .. });
+                    let mut buttons: Vec<(gtk::CheckButton, String)> = Vec::new();
+                    let mut leader: Option<gtk::CheckButton> = None;
+                    for choice in choices {
+                        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                        text.set_hexpand(true);
+                        // The title's first line centred on the indicator:
+                        // the check is 26px tall and a body line's centre
+                        // is 9px down its label (the probe's geometry dump,
+                        // `first_line`), so the words start 13 - 9 lower.
+                        text.set_margin_top(QUESTION_TITLE_DROP);
+                        let title = gtk::Label::builder()
+                            .label(&choice.title)
+                            .xalign(0.0)
+                            .wrap(true)
+                            .wrap_mode(gtk::pango::WrapMode::WordChar)
+                            .build();
+                        text.append(&title);
+                        if let Some(description) = &choice.description {
+                            text.append(
+                                &gtk::Label::builder()
+                                    .label(description)
+                                    .xalign(0.0)
+                                    .wrap(true)
+                                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                                    .attributes(&no_hyphens())
+                                    .css_classes(["caption", "dim-label"])
+                                    .build(),
+                            );
+                        }
+                        // The indicator beside the option's TITLE, not
+                        // centred on title and description together, which
+                        // is where a check button puts it: so the button is
+                        // only the indicator, at the top of the row, and a
+                        // click on the words picks it too.
+                        let button = gtk::CheckButton::builder()
+                            .valign(gtk::Align::Start)
+                            .build();
+                        button.update_relation(&[gtk::accessible::Relation::LabelledBy(&[
+                            title.upcast_ref()
+                        ])]);
+                        if !many {
+                            match &leader {
+                                Some(leader) => button.set_group(Some(leader)),
+                                None => leader = Some(button.clone()),
+                            }
+                        }
+                        let click = gtk::GestureClick::new();
+                        {
+                            let button = button.clone();
+                            click.connect_released(move |_, _, _, _| {
+                                button.set_active(!many || !button.is_active());
+                            });
+                        }
+                        text.add_controller(click);
+                        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                        row.add_css_class("question-option");
+                        row.append(&button);
+                        row.append(&text);
+                        group.append(&row);
+                        buttons.push((button, choice.value.clone()));
+                    }
+                    let other_entry = other.as_ref().map(|_| {
+                        let entry = gtk::Entry::builder()
+                            .placeholder_text(if many {
+                                "Add your own (optional)"
+                            } else {
+                                "Your own answer, or a note on your pick (optional)"
+                            })
+                            .build();
+                        let answer_now = answer_now.clone();
+                        entry.connect_activate(move |_| {
+                            let go = answer_now.borrow().clone();
+                            if let Some(go) = go {
+                                go();
+                            }
+                        });
+                        group.append(&entry);
+                        entry
+                    });
+                    Box::new(move || {
+                        let typed = other_entry
+                            .as_ref()
+                            .map(|entry| entry.text().to_string())
+                            .unwrap_or_default();
+                        let picked: Vec<String> = buttons
+                            .iter()
+                            .filter(|(button, _)| button.is_active())
+                            .map(|(_, value)| value.clone())
+                            .collect();
+                        if many {
+                            crate::elicit::Answer::Many(picked, typed)
+                        } else {
+                            crate::elicit::Answer::One(picked.into_iter().next(), typed)
+                        }
+                    })
+                }
+                crate::elicit::Kind::Text { .. } | crate::elicit::Kind::Number { .. } => {
+                    let number = matches!(field.kind, crate::elicit::Kind::Number { .. });
+                    let entry = gtk::Entry::new();
+                    match &field.kind {
+                        crate::elicit::Kind::Number {
+                            default: Some(n), ..
+                        } => entry.set_text(&n.to_string()),
+                        crate::elicit::Kind::Text {
+                            default: Some(text),
+                        } => entry.set_text(text),
+                        _ => {}
+                    }
+                    if number {
+                        entry.set_input_purpose(gtk::InputPurpose::Number);
+                    }
+                    if !several {
+                        if let Some(title) = &field.title {
+                            entry.set_placeholder_text(Some(title));
+                        }
+                    }
+                    let answer_now = answer_now.clone();
+                    entry.connect_activate(move |_| {
+                        let go = answer_now.borrow().clone();
+                        if let Some(go) = go {
+                            go();
+                        }
+                    });
+                    group.append(&entry);
+                    Box::new(move || {
+                        let text = entry.text().to_string();
+                        if number {
+                            crate::elicit::Answer::Number(text)
+                        } else {
+                            crate::elicit::Answer::Text(text)
+                        }
+                    })
+                }
+                crate::elicit::Kind::Toggle { default } => {
+                    let button = gtk::CheckButton::builder()
+                        .label(field.title.as_deref().unwrap_or("Yes"))
+                        .active(*default)
+                        .build();
+                    group.append(&button);
+                    Box::new(move || crate::elicit::Answer::Toggle(button.is_active()))
+                }
+                crate::elicit::Kind::Unsupported(kind) => {
+                    group.append(
+                        &gtk::Label::builder()
+                            .label(format!("A {kind} field this card cannot show; left empty."))
+                            .xalign(0.0)
+                            .wrap(true)
+                            .css_classes(["caption", "dim-label"])
+                            .build(),
+                    );
+                    Box::new(|| crate::elicit::Answer::Text(String::new()))
+                }
+            };
+            readers.push((key, reader));
+            fields.append(&group);
+        }
+        // Tall forms scroll inside the card rather than push the composer
+        // off the window: four questions of four described options is a
+        // page.
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&fields)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(QUESTION_CARD_MAX_HEIGHT)
+            .build();
+        self.permission_detail.append(&scroller);
+        let read: Rc<dyn Fn() -> std::collections::BTreeMap<String, crate::elicit::Answer>> =
+            Rc::new(move || {
+                readers
+                    .iter()
+                    .map(|(key, read)| (key.clone(), read()))
+                    .collect()
+            });
+        self.permission_answers.remove_all();
+        let skip = gtk::Button::builder()
+            .label("Skip")
+            .css_classes(["pill-action"])
+            .tooltip_text("Tell the agent you passed on these")
+            .build();
+        let answer = gtk::Button::builder()
+            .label("Answer")
+            .css_classes(["suggested-action", "pill-action"])
+            .build();
+        {
+            let weak = Rc::downgrade(self);
+            skip.connect_clicked(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.answer_questions(false);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            let go: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(pane) = weak.upgrade() {
+                    pane.answer_questions(true);
+                }
+            });
+            *answer_now.borrow_mut() = Some(go.clone());
+            answer.connect_clicked(move |_| go());
+        }
+        self.permission_answers.append(&skip);
+        self.permission_answers.append(&answer);
+        self.permission_scope.set_visible(false);
+        self.permission_scope.remove_css_class("error");
+        self.notify(crate::notify::Moment::QuestionAsked {
+            chat: self.notify_chat(),
+            detail: form.message.clone(),
+        });
+        *self.pending_questions.borrow_mut() = Some(PendingQuestions { form, reply, read });
+        self.permission_bar.set_reveal_child(true);
+        self.note_activity();
+        self.sync_busy_row();
+    }
+
+    /// The question card answered — `accept` with what is filled in, or
+    /// skipped. An answer the form refuses (a required field empty, a
+    /// number that is not one) keeps the card up and says why under it.
+    fn answer_questions(self: &Rc<Self>, accept: bool) {
+        let response = {
+            let pending = self.pending_questions.borrow();
+            let Some(pending) = pending.as_ref() else {
+                return;
+            };
+            let answers = (pending.read)();
+            if accept {
+                match crate::elicit::accept(&pending.form, &answers) {
+                    Ok(response) => {
+                        Some((response, crate::elicit::summary(&pending.form, &answers)))
+                    }
+                    Err(why) => {
+                        self.permission_scope.set_label(&why);
+                        self.permission_scope.add_css_class("error");
+                        self.permission_scope.set_visible(true);
+                        return;
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        let Some(pending) = self.pending_questions.borrow_mut().take() else {
+            return;
+        };
+        self.clear_notification("question");
+        self.permission_bar.set_reveal_child(false);
+        self.permission_scope.remove_css_class("error");
+        self.sync_busy_row();
+        if let Some(id) = &pending.form.tool_call {
+            self.mark_waiting(id, false);
+        }
+        self.note_activity();
+        let (response, said) = match response {
+            Some((response, lines)) if !lines.is_empty() => (response, lines.join("\n")),
+            Some((response, _)) => (response, "Answered with nothing filled in".to_string()),
+            None => (crate::elicit::decline(), "Skipped".to_string()),
+        };
+        match &pending.form.tool_call {
+            Some(id) => self.note_permission(
+                id.clone(),
+                if accept {
+                    "dialog-question-symbolic"
+                } else {
+                    "action-unavailable-symbolic"
+                },
+                said,
+            ),
+            None => self.meta_row(&said),
+        }
+        let _ = pending.reply.send(response);
+        self.next_permission();
+    }
+
+    /// Take the question card down unanswered, and the questions waiting
+    /// behind it: their replies dropped go back as `cancel`, which is what
+    /// a turn that ended, or an agent that went, leaves them.
+    fn drop_questions(&self) {
+        if let Some(pending) = self.pending_questions.borrow_mut().take() {
+            self.clear_notification("question");
+            self.permission_bar.set_reveal_child(false);
+            if let Some(id) = &pending.form.tool_call {
+                self.mark_waiting(id, false);
+            }
+        }
+        self.question_queue.borrow_mut().clear();
     }
 
     /// Answer the open request by taking the option of exactly this kind.

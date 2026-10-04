@@ -27,6 +27,7 @@ mod controller;
 mod coordinator;
 mod devcontainer_ui;
 mod editor;
+mod elicit;
 mod env_channel;
 mod environments;
 mod file_icons;
