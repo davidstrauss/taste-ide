@@ -713,10 +713,19 @@ pub fn ensure_container(
             "--filter".into(),
             format!("name=^{name}$"),
             "--format".into(),
-            "{{.State}}".into(),
+            format!("{{{{.State}}}} {{{{index .Labels \"{KEEPER_LABEL}\"}}}}"),
         ],
     )?;
-    match state.trim() {
+    let (state, revision) = state.trim().split_once(' ').unwrap_or((state.trim(), ""));
+    // One made with other options than these is made again: its options
+    // are set at `run` and nothing after changes them.
+    let state = if !state.is_empty() && revision != KEEPER_REVISION {
+        podman_capture(substrate, &["rm".into(), "-f".into(), name.clone()])?;
+        ""
+    } else {
+        state
+    };
+    match state {
         "running" => return Ok(name),
         "" => {}
         _ => {
@@ -740,7 +749,17 @@ pub fn ensure_container(
             "--label".into(),
             format!("{}={key}", taste_core::environment::LABEL_WORKSPACE),
             "--label".into(),
-            "taste.keeper=1".into(),
+            format!("{KEEPER_LABEL}={KEEPER_REVISION}"),
+            // Every category, so a file labelled for one container alone
+            // is still read here. A file moved into the checkout keeps the
+            // private label it was made with — written in a container's
+            // /tmp and moved — and the keeper, with categories of its own,
+            // was refused it: the snapshot failed on it, and with it the
+            // close (2026-10-04, `open("waf/rules/…"): Permission denied`).
+            // The low end stays s0, so what the keeper creates carries the
+            // shared label every environment container reads.
+            "--security-opt".into(),
+            "label=level:s0-s0:c0.c1023".into(),
             // core in the guest is uid 1000, and so is the baseline's
             // user: the files the keeper writes are core's, which is what
             // every environment container in the guest expects to find.
@@ -758,6 +777,12 @@ pub fn ensure_container(
     .context("starting the keeper container")?;
     Ok(name)
 }
+
+/// The label that marks the keeper, and the revision of the options it is
+/// started with: bumped when they change, so an existing keeper made with
+/// the old ones is made again.
+const KEEPER_LABEL: &str = "taste.keeper";
+const KEEPER_REVISION: &str = "2";
 
 fn podman_capture(substrate: &crate::substrate::Substrate, args: &[String]) -> Result<String> {
     let output = substrate
