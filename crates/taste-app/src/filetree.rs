@@ -1939,6 +1939,8 @@ impl FileTree {
         *self.search_view.borrow_mut() = None;
         self.status.borrow_mut().clear();
         self.stashed.borrow_mut().clear();
+        // The counts were the old checkout's.
+        self.clear_sync_counts();
         // Force the next status snapshot through the unchanged-guard: the
         // maps above are empty now, so anything the new checkout has is a
         // change, and an EMPTY one still has to repaint the rows.
@@ -2320,6 +2322,22 @@ impl FileTree {
                     "The IDE's own log is the same for every environment; read it from Personal",
                 ));
             }
+        }
+    }
+
+    /// Push and Pull with nothing to count against: disabled, at zero,
+    /// and saying nothing. Their faces and tooltips are otherwise only ever
+    /// written by a snapshot WITH an upstream, so what the last such one
+    /// said stayed — another environment's "Push 1 commit to origin/main"
+    /// shown on Personal, which has no remote at all (David, 2026-10-04:
+    /// "the push button on my personal env showed that I had 1 commit to
+    /// push to *myself*").
+    fn clear_sync_counts(&self) {
+        self.push_face.set_label("↑ 0");
+        self.pull_face.set_label("↓ 0");
+        for button in [&self.push_button, &self.pull_button] {
+            button.set_sensitive(false);
+            button.set_tooltip_text(None);
         }
     }
 
@@ -4705,11 +4723,13 @@ impl FileTree {
                                 }
                                 None => {
                                     self.set_sync_label("no upstream");
-                                    self.push_button.set_sensitive(false);
-                                    self.pull_button.set_sensitive(false);
+                                    self.clear_sync_counts();
                                 }
                             },
-                            None => self.set_sync_label(""),
+                            None => {
+                                self.set_sync_label("");
+                                self.clear_sync_counts();
+                            }
                         }
                     }
                 }
