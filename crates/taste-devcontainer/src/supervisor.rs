@@ -976,6 +976,24 @@ impl Supervisor {
         }
     }
 
+    /// The ports something listens on in the VM this checkout is in —
+    /// another environment's container, most of all — for
+    /// [`Self::publish_ports`]. Empty for a checkout on this host, and when
+    /// the VM cannot be asked, which leaves this host's word alone.
+    async fn ports_taken_in_vm(&self) -> std::collections::HashSet<u16> {
+        let Checkout::Remote { path, .. } = self.checkout() else {
+            return Default::default();
+        };
+        let files = self.files();
+        let asked =
+            tokio::task::spawn_blocking(move || files.exec(&path, &["ss".into(), "-ltnH".into()]))
+                .await;
+        match asked {
+            Ok(Ok(out)) if out.success() => listening_ports(&out.stdout_utf8()),
+            _ => Default::default(),
+        }
+    }
+
     /// See [`Supervisor::sharer`]'s field.
     pub fn set_sharer(&self, sharer: Placer) {
         *self.sharer.lock().unwrap() = Some(sharer);
@@ -1910,27 +1928,42 @@ impl Supervisor {
     /// services"). Numbers this config forwards itself, and numbers this
     /// pass has already handed out, are skipped, so one config's 8000 and
     /// 8001 cannot land on each other.
-    fn publish_ports(&self, config: &DevcontainerConfig) -> Vec<(u16, u16)> {
+    ///
+    /// Free means free on BOTH ends of the way in: this host's loopback,
+    /// where the tunnel listens, and the VM's, where the container is
+    /// published — the tunnel uses one number for both (`Keys::
+    /// ssh_tunnel_argv`). `taken_in_vm` is the VM's side, asked of it at
+    /// start; two environments in one VM forwarding the same port collided
+    /// there while this host saw it free (2026-10-04: "Couldn't listen on
+    /// requested ports", pasta in the guest).
+    fn publish_ports(
+        &self,
+        config: &DevcontainerConfig,
+        taken_in_vm: &std::collections::HashSet<u16>,
+    ) -> Vec<(u16, u16)> {
+        let free = |port: u16| !taken_in_vm.contains(&port) && port_is_free(port);
         let specs = config.ports();
         let declared: std::collections::HashSet<u16> = specs.iter().map(|s| s.port).collect();
         let mut assigned: std::collections::HashSet<u16> = std::collections::HashSet::new();
         let pairs: Vec<(u16, u16)> = specs
             .into_iter()
             .map(|spec| {
-                let host = if port_is_free(spec.port) {
+                let host = if free(spec.port) {
                     spec.port
                 } else {
                     next_free_port_above(spec.port, |candidate| {
-                        !declared.contains(&candidate) && !assigned.contains(&candidate)
+                        !declared.contains(&candidate)
+                            && !assigned.contains(&candidate)
+                            && !taken_in_vm.contains(&candidate)
                     })
                     .unwrap_or(spec.port)
                 };
                 assigned.insert(host);
                 if host != spec.port {
                     self.log(format!(
-                        "port {} is in use on this machine (another environment's \
-                         container, or a server of the user's), so it is published on \
-                         localhost:{host} instead",
+                        "port {} is in use on this machine or in the VM (another \
+                         environment's container, or a server of the user's), so it is \
+                         published on localhost:{host} instead",
                         spec.port
                     ));
                 }
@@ -3694,7 +3727,8 @@ impl Supervisor {
         // forwardPorts: published on localhost only — services in the
         // container become reachable from the host without exposing them
         // to the network.
-        let published = self.publish_ports(&config);
+        let taken_in_vm = self.ports_taken_in_vm().await;
+        let published = self.publish_ports(&config, &taken_in_vm);
         for (port, host) in &published {
             args.push("-p".into());
             args.push(format!("127.0.0.1:{host}:{port}"));
@@ -4733,6 +4767,14 @@ fn keep_id_flag(run_args: &[String], uid: u32, gid: u32) -> Option<String> {
     Some(format!("--userns=keep-id:uid={uid},gid={gid}"))
 }
 
+/// The TCP ports listening in `ss -ltnH`'s output, any address.
+fn listening_ports(ss: &str) -> std::collections::HashSet<u16> {
+    ss.lines()
+        .filter_map(|line| line.split_whitespace().nth(3))
+        .filter_map(|local| local.rsplit(':').next()?.parse().ok())
+        .collect()
+}
+
 /// Whether nothing on this machine holds `port` on loopback right now: a
 /// bind that succeeds, released at once. Another environment's published
 /// port, or a server of the user's, makes it fail.
@@ -4839,6 +4881,20 @@ mod tests {
 
     /// A repo's private label is shared in a VM, and nothing else in the
     /// mount changes.
+    /// What `ss` in the guest says is listening, on any address, is taken.
+    #[test]
+    fn ports_listening_in_the_vm_are_read_from_ss() {
+        let ss = "LISTEN 0 4096 0.0.0.0:5355 0.0.0.0:*\n\
+                  LISTEN 0 128 127.0.0.1:8080 0.0.0.0:*\n\
+                  LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\n\
+                  LISTEN 0 128 [::]:22 [::]:*\n";
+        let ports = super::listening_ports(ss);
+        for port in [5355, 8080, 53, 22] {
+            assert!(ports.contains(&port), "{port}: {ports:?}");
+        }
+        assert_eq!(ports.len(), 4);
+    }
+
     /// A VM checkout's changes reach the panes while they are aimed at its
     /// environment, and not while they are aimed elsewhere.
     #[test]
@@ -4922,7 +4978,7 @@ mod tests {
         .unwrap();
         let config = DevcontainerConfig::load(&config_path).unwrap();
         *sup.declared_ports.lock().unwrap() = config.ports();
-        let published = sup.publish_ports(&config);
+        let published = sup.publish_ports(&config, &Default::default());
         let (moved, stayed) = if published[0].0 == taken {
             (published[0], published[1])
         } else {
@@ -4981,7 +5037,7 @@ mod tests {
         )
         .unwrap();
         let config = DevcontainerConfig::load(&config_path).unwrap();
-        let published = sup.publish_ports(&config);
+        let published = sup.publish_ports(&config, &Default::default());
         let host_of = |port: u16| published.iter().find(|(p, _)| *p == port).unwrap().1;
         assert_eq!(host_of(upper), upper, "{published:?}");
         assert!(host_of(taken) > upper, "{published:?}");
