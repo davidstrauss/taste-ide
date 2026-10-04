@@ -2272,23 +2272,26 @@ impl FileTree {
         self.backlog.focus();
     }
 
-    /// Everything that writes is disabled — never hidden — while watching.
+    /// Everything that writes is disabled — never hidden — while watching,
+    /// with two exceptions.
     ///
     /// Disabled controls still say what the pane can do; hiding them would
     /// make a watched checkout look like a different, smaller application.
+    /// But **Fetch and Pull work**, and the Abort and Continue of the rebase
+    /// a Pull can pause on: taking Personal's commits into an environment
+    /// is the user's to do from here (David, 2026-10-04: "I ought to be able
+    /// to use the GUI pull button in these envs, too"), and it moves the
+    /// environment's branch onto `personal/<branch>` without a byte of the
+    /// user's own editing. And **Push is not offered at all**: an
+    /// environment's work reaches the user's branch by being published and
+    /// reviewed, never by a push into it, so a Push there — even greyed —
+    /// named a thing that does not exist ("Why am I being offered the
+    /// (grayed out) ability to push to my own branch?").
     fn apply_view_permissions(&self) {
         let read_only = self.read_only();
         if read_only {
-            for button in [
-                &self.push_button,
-                &self.pull_button,
-                &self.sync_button,
-                &self.abort_button,
-                &self.continue_button,
-                &self.init_button,
-            ] {
-                button.set_sensitive(false);
-            }
+            self.init_button.set_sensitive(false);
+            self.push_button.set_visible(false);
             self.branch_label.set_sensitive(false);
             self.branch_label
                 .set_tooltip_text(Some("Read-only: this is another environment's checkout"));
@@ -4770,7 +4773,7 @@ impl FileTree {
             return;
         }
         // Whatever the git state said about what is possible, a watched
-        // environment is read-only: this has the last word.
+        // environment is read-only but for its Pull: this has the last word.
         self.apply_view_permissions();
         // Views refresh only now, with the fresh map in place — and only
         // if something actually changed.
@@ -6294,9 +6297,6 @@ impl FileTree {
     /// ref, and the counts redrawn. Push stays a separate, deliberate
     /// action.
     fn sync(self: &Rc<Self>, rebase: bool) {
-        if self.refuse_read_only() {
-            return;
-        }
         // The working tree's branch, as the push has it: for a checkout in
         // a VM, not this repository's HEAD, whose upstream is main's.
         let branch = self.status_branch.borrow().clone();
@@ -6454,9 +6454,6 @@ impl FileTree {
     }
 
     fn abort_rebase(self: &Rc<Self>) {
-        if self.refuse_read_only() {
-            return;
-        }
         if self.git.borrow().is_none() {
             return;
         }
@@ -6472,9 +6469,6 @@ impl FileTree {
     /// (everything resolved and marked), and its refusal — usually
     /// "unmerged files" — comes through as the toast.
     fn continue_rebase(self: &Rc<Self>) {
-        if self.refuse_read_only() {
-            return;
-        }
         if self.git.borrow().is_none() {
             return;
         }
