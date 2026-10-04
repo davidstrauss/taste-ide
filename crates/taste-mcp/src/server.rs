@@ -236,7 +236,9 @@ impl McpServer {
              REPLIES. When a turn ends on a question or a choice for the user — confirm \
              this, pick one of these — call suggest_replies last, with the replies they \
              are likeliest to give, so they can answer with a click. Each reply names \
-             what it chooses, so it reads right with only the question above it.",
+             what it chooses, so it reads right with only the question above it. \
+             AskUserQuestion does not exist in this IDE: ask in your message, then \
+             suggest_replies.",
         );
         if env.is_primary() {
             // The brief is one text, kept in taste-core, because the chat
@@ -1059,7 +1061,8 @@ impl McpServer {
                      TEST-26 only\", \"File it as a bug\"), never point at your text (\"all \
                      of it\", \"option 2\", \"the first one\"). Call it last, after your answer \
                      and the question are written: the buttons stand under them. The user \
-                     can still type anything instead.",
+                     can still type anything instead. This is how a choice is put to the user \
+                     here; there is no AskUserQuestion.",
                     json!({
                         "type": "object",
                         "properties": {
