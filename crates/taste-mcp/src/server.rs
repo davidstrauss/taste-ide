@@ -192,7 +192,13 @@ impl McpServer {
     /// seen (David, 2026-09-06).
     fn instructions(&self, env: &EnvironmentId) -> String {
         let mut text = String::from(
-            "You are running inside taste-ide: its chat pane hosts you, and this MCP \
+            // First, so it survives any cut: an agent that reached for its
+            // own Read out of habit had the call fail in the user's
+            // transcript (2026-10-05).
+            "FILES: read and change files with ide_read_file (text, images, PDF pages), \
+             ide_edit_file, and ide_write_file. Your own Read, Edit, Write, and MultiEdit \
+             are turned off here, and a call to one fails.\n\n\
+             You are running inside taste-ide: its chat pane hosts you, and this MCP \
              server IS the IDE. You work in ONE of the workspace's environments — its \
              own checkout, its own devcontainer, its own mode — and this connection is \
              bound to it: every tool that names a checkout, a container or a shell \
