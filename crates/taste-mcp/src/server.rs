@@ -776,6 +776,14 @@ impl McpServer {
                 // The non-JSON tools: a screenshot's payload, and an issue's
                 // image attachment, are MCP image content blocks, not
                 // JSON-as-text.
+                if name == "ide_read_file" {
+                    return match self.read_file_tool(env, &args).await {
+                        Ok(result) => Response::ok(id, result),
+                        Err(e) => {
+                            Response::ok(id, tool_result(&json!({"error": format!("{e:#}")}), true))
+                        }
+                    };
+                }
                 if name == "ide_screenshot" || name == "issue_attachment" {
                     let result = if name == "ide_screenshot" {
                         self.screenshot_tool(args).await
@@ -865,6 +873,59 @@ impl McpServer {
                         },
                         "lines": { "type": "integer", "description": "log lines when log is included (default 100)" }
                     }
+                }),
+            ),
+            // The workspace's files the way the editor has them: a file the
+            // user has open is read from, and changed in, the buffer they
+            // are looking at — their unsaved typing included, each change
+            // one step of their undo history — and saved; one they have
+            // not is read and written on the disk. They stand in for the
+            // agent's own file tools, which reach the disk behind the
+            // buffer (David, 2026-10-05).
+            tool(
+                "ide_read_file",
+                "Read a file: its text with line numbers, from the user's editor when \
+                 it is open there (unsaved edits included), else from disk. Images \
+                 come back as images. Use this before ide_edit_file.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "workspace-relative or absolute path" },
+                        "offset": { "type": "integer", "minimum": 1, "description": "first line to return (default 1)" },
+                        "limit": { "type": "integer", "minimum": 1, "description": "lines to return (default 2000)" }
+                    },
+                    "required": ["path"]
+                }),
+            ),
+            tool(
+                "ide_edit_file",
+                "Replace exact text in a file, in the user's open editor buffer when it is \
+                 open, and save. old_string must occur once (add surrounding lines to make \
+                 it unique) unless replace_all is true. Copy it from ide_read_file without \
+                 the line numbers.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "workspace-relative or absolute path" },
+                        "old_string": { "type": "string", "description": "the exact text to replace" },
+                        "new_string": { "type": "string", "description": "the text to put in its place" },
+                        "replace_all": { "type": "boolean", "description": "replace every occurrence (default false)" }
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }),
+            ),
+            tool(
+                "ide_write_file",
+                "Write a whole file — create it, or replace all of its text — in the \
+                 user's open editor buffer when it is open, and save. For a change to part \
+                 of a file, use ide_edit_file.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "workspace-relative or absolute path" },
+                        "content": { "type": "string", "description": "the file's whole new text" }
+                    },
+                    "required": ["path", "content"]
                 }),
             ),
             tool(
@@ -1642,34 +1703,9 @@ impl McpServer {
                              instead, arrives as their next message.",
                 }))
             }
+            "ide_edit_file" | "ide_write_file" => self.write_file_tool(env, name, &args).await,
             "ide_open_file" => {
-                let raw = arg(&args, &["path", "file"]).as_str().context(
-                    "ide_open_file needs a `path`: a workspace-relative or absolute file \
-                     path, e.g. one from ide_list_files",
-                )?;
-                // Against this environment's checkout, which is what the
-                // panes read — never the folder on this host, where a file
-                // the folder ignores (a `.env`) or a link the mirror
-                // carried home would open from the user's disk, and an
-                // `ide_screenshot` of the editor would carry it back
-                // (review, 2026-09-23).
-                let root = self.checkout_path(env)?;
-                let requested = PathBuf::from(raw);
-                let path = if requested.is_absolute() {
-                    requested
-                } else {
-                    root.join(requested)
-                };
-                let climbs = path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir));
-                if !path.starts_with(&root) || climbs {
-                    anyhow::bail!(
-                        "{raw} is outside the workspace {}; ide_open_file shows workspace \
-                         files only, so pass a path under it",
-                        root.display()
-                    );
-                }
+                let path = self.checkout_file(env, &args, "ide_open_file")?;
                 let line = args["line"].as_u64().map(|l| l as u32);
                 self.workspace
                     .events
@@ -4269,6 +4305,243 @@ impl McpServer {
 
     /// Ask the GTK side, bounded: a wedged main thread must come back as a
     /// tool error, never as a hung agent.
+    /// The file an agent named in `args`, in this environment's checkout,
+    /// which is what the panes read — never the folder on this host, where
+    /// a file the folder ignores (a `.env`) or a link the mirror carried
+    /// home would be read from the user's disk, and an `ide_screenshot` of
+    /// the editor would carry it back (review, 2026-09-23).
+    fn checkout_file(&self, env: &EnvironmentId, args: &Value, tool: &str) -> Result<PathBuf> {
+        let raw = arg(args, &["path", "file_path", "file"])
+            .as_str()
+            .with_context(|| {
+                format!(
+                    "{tool} needs a `path`: a workspace-relative or absolute file path, e.g. \
+                     one from ide_list_files"
+                )
+            })?;
+        let root = self.checkout_path(env)?;
+        let requested = PathBuf::from(raw);
+        let path = if requested.is_absolute() {
+            requested
+        } else {
+            root.join(requested)
+        };
+        let climbs = path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+        if !path.starts_with(&root) || climbs {
+            anyhow::bail!(
+                "{raw} is outside the workspace {}; {tool} takes workspace files only, so \
+                 pass a path under it",
+                root.display()
+            );
+        }
+        Ok(path)
+    }
+
+    /// `ide_read_file`: the user's buffer when the file is open in the
+    /// editor, else the disk, as numbered lines; an image as an image.
+    async fn read_file_tool(&self, env: &EnvironmentId, args: &Value) -> Result<Value> {
+        use base64::Engine;
+        use taste_core::ui_probe::{UiReply, UiRequest};
+        let path = self.checkout_file(env, args, "ide_read_file")?;
+        let files = self.supervisor(env)?.files();
+        let shown = path.display().to_string();
+        let image = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .and_then(|ext| match ext.as_str() {
+                "png" => Some("image/png"),
+                "jpg" | "jpeg" => Some("image/jpeg"),
+                "gif" => Some("image/gif"),
+                "webp" => Some("image/webp"),
+                _ => None,
+            });
+        let read = {
+            let (files, path) = (files.clone(), path.clone());
+            move || files.read(&path)
+        };
+        if let Some(mime) = image {
+            let bytes = tokio::task::spawn_blocking(read)
+                .await
+                .context("the read did not finish")?
+                .with_context(|| format!("reading {shown}"))?;
+            return Ok(json!({
+                "content": [
+                    {
+                        "type": "image",
+                        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        "mimeType": mime,
+                    },
+                    { "type": "text", "text": format!("{shown}: {} bytes", bytes.len()) },
+                ]
+            }));
+        }
+        // The buffer first, briefly: a window slow to answer is a read
+        // from the disk, never a failure.
+        let buffered = if self.workspace.ui.is_attached() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.workspace
+                    .ui
+                    .request(UiRequest::BufferText { path: path.clone() }),
+            )
+            .await
+            {
+                Ok(Ok(UiReply::BufferText(text))) => text,
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let text = match buffered {
+            Some(text) => text,
+            None => {
+                let bytes = tokio::task::spawn_blocking(read)
+                    .await
+                    .context("the read did not finish")?
+                    .with_context(|| format!("reading {shown}"))?;
+                String::from_utf8(bytes).map_err(|_| {
+                    anyhow::anyhow!(
+                        "{shown} is not text. For a PDF, run `pdftotext FILE -` with ide_exec"
+                    )
+                })?
+            }
+        };
+        let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(2000).max(1) as usize;
+        let (mut body, total) = taste_core::agentedit::numbered(&text, offset, limit);
+        let last = (offset - 1 + limit).min(total);
+        if total == 0 {
+            body = format!("{shown} is empty\n");
+        } else if last < total || offset > 1 {
+            body.push_str(&format!(
+                "[lines {offset}-{last} of {total}{}]\n",
+                if last < total {
+                    format!("; pass offset {} for more", last + 1)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        Ok(json!({ "content": [{ "type": "text", "text": body }] }))
+    }
+
+    /// `ide_edit_file` and `ide_write_file`: the change made through the
+    /// editor, so a file open in it changes in its buffer and is saved;
+    /// with no window, on the disk through the editor's own save code.
+    async fn write_file_tool(
+        &self,
+        env: &EnvironmentId,
+        name: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        use taste_core::ui_probe::{UiReply, UiRequest};
+        let path = self.checkout_file(env, args, name)?;
+        let root = self.checkout_path(env)?;
+        let safe_mode = self.safe_mode(env)?;
+        let shown = path.display().to_string();
+        if !taste_core::policy::write_allowed(&root, safe_mode, &path) {
+            anyhow::bail!(if safe_mode {
+                format!(
+                    "{shown} is read-only in safe mode; .devcontainer/ is writable. See \
+                     ide_write_policy"
+                )
+            } else {
+                format!("{shown} is not writable (never .git). See ide_write_policy")
+            });
+        }
+        let edit = if name == "ide_edit_file" {
+            Some((
+                args["old_string"]
+                    .as_str()
+                    .context("ide_edit_file needs `old_string`: the exact text to replace")?
+                    .to_string(),
+                args["new_string"]
+                    .as_str()
+                    .context("ide_edit_file needs `new_string`: the text to put in its place")?
+                    .to_string(),
+                args["replace_all"].as_bool().unwrap_or(false),
+            ))
+        } else {
+            None
+        };
+        let content = match &edit {
+            Some(_) => String::new(),
+            None => args["content"]
+                .as_str()
+                .context("ide_write_file needs `content`: the file's whole new text")?
+                .to_string(),
+        };
+        let done = if self.workspace.ui.is_attached() {
+            let request = match &edit {
+                Some((old, new, all)) => UiRequest::BufferEdit {
+                    path: path.clone(),
+                    old: old.clone(),
+                    new: new.clone(),
+                    all: *all,
+                },
+                None => UiRequest::BufferWrite {
+                    path: path.clone(),
+                    content: content.clone(),
+                },
+            };
+            // No second try on the disk after a timeout: the editor may
+            // have applied it already, and writing behind it would put
+            // the buffer and the file at odds.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.workspace.ui.request(request),
+            )
+            .await
+            {
+                Ok(Ok(UiReply::BufferEdit(result))) => result.map(Some),
+                Ok(Ok(UiReply::BufferWrite(result))) => result.map(|()| None),
+                Ok(Ok(UiReply::Error(e))) => Err(e),
+                Ok(Ok(_)) => Err("the editor answered with something else".into()),
+                Ok(Err(e)) => Err(format!("{e:#}")),
+                Err(_) => Err(format!(
+                    "the editor did not answer within 10s; the change may or may not have \
+                     landed. Read {shown} back before trying again"
+                )),
+            }
+        } else {
+            let files = self.supervisor(env)?.files();
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                let (text, format) = taste_core::textfile::load_via(&files, &path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                let (next, done) = match &edit {
+                    Some((old, new, all)) => {
+                        let done = taste_core::agentedit::replace(&text, old, new, *all)?;
+                        (done.text.clone(), Some(done))
+                    }
+                    None => (content, None),
+                };
+                taste_core::textfile::save_via(&files, &root, safe_mode, &path, &next, &format)
+                    .map(|_| done)
+            })
+            .await
+            .context("the write did not finish")?
+        }
+        .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(match done {
+            Some(done) => {
+                let changed = args["new_string"]
+                    .as_str()
+                    .unwrap_or("")
+                    .lines()
+                    .count()
+                    .max(1);
+                let from = done.first_line.saturating_sub(3).max(1);
+                let (snippet, _) = taste_core::agentedit::numbered(&done.text, from, changed + 6);
+                json!({ "edited": shown, "replaced": done.count, "around": snippet })
+            }
+            None => json!({ "written": shown }),
+        })
+    }
+
     async fn probe(
         &self,
         request: taste_core::ui_probe::UiRequest,
@@ -6500,6 +6773,17 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
+    /// A tool's whole result, for the tools whose content is not JSON.
+    async fn call_tool_raw(stream: &mut UnixStream, name: &str, arguments: Value) -> Value {
+        roundtrip(
+            stream,
+            json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                   "params": {"name": name, "arguments": arguments}}),
+        )
+        .await["result"]
+            .clone()
+    }
+
     #[tokio::test]
     async fn write_policy_explains_safe_mode_and_checks_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -6639,6 +6923,81 @@ mod tests {
         assert_eq!(content[0]["data"], "iQ=="); // base64 of [137]
         let meta: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
         assert_eq!(meta["width"], 640);
+    }
+
+    /// With no window, the file tools read and change the disk through
+    /// the editor's own save code, under the same write policy: here, a
+    /// safe-mode checkout, where `.devcontainer/` is writable and the rest
+    /// is not.
+    #[tokio::test]
+    async fn the_file_tools_read_and_edit_without_a_window() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devcontainer")).unwrap();
+        std::fs::write(
+            dir.path().join(".devcontainer/devcontainer.json"),
+            "{\n  \"image\": \"old\"\n}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let (socket, _workspace) = start_test_server(dir.path()).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let read = call_tool_raw(
+            &mut stream,
+            "ide_read_file",
+            json!({"path": ".devcontainer/devcontainer.json", "offset": 2, "limit": 1}),
+        )
+        .await;
+        let text = read["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("     2\t  \"image\": \"old\""), "{text}");
+        assert!(text.contains("of 3; pass offset 3"), "{text}");
+
+        let edited = call_tool(
+            &mut stream,
+            "ide_edit_file",
+            json!({
+                "path": ".devcontainer/devcontainer.json",
+                "old_string": "\"old\"",
+                "new_string": "\"new\""
+            }),
+        )
+        .await;
+        assert_eq!(edited["replaced"], 1, "{edited}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".devcontainer/devcontainer.json")).unwrap(),
+            "{\n  \"image\": \"new\"\n}\n"
+        );
+
+        let missing = call_tool(
+            &mut stream,
+            "ide_edit_file",
+            json!({
+                "path": ".devcontainer/devcontainer.json",
+                "old_string": "\"old\"",
+                "new_string": "\"x\""
+            }),
+        )
+        .await;
+        assert!(
+            missing["error"].as_str().unwrap().contains("not found"),
+            "{missing}"
+        );
+
+        let refused = call_tool(
+            &mut stream,
+            "ide_write_file",
+            json!({"path": "src/main.rs", "content": "fn main() { }\n"}),
+        )
+        .await;
+        assert!(
+            refused["error"].as_str().unwrap().contains("safe mode"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
     }
 
     #[tokio::test]

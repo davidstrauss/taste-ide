@@ -40,6 +40,13 @@ pub type BufferLookup = std::rc::Rc<dyn Fn(&std::path::Path) -> Option<String>>;
 /// text and saves, through the user's own buffer when they have one open.
 pub type BufferWriter = std::rc::Rc<dyn Fn(&std::path::Path, &str) -> Result<(), String>>;
 
+/// The editor's exact-replacement path (`ide_edit_file`): `old` for `new`,
+/// every occurrence when the flag says so, through the user's own buffer
+/// when they have one open.
+pub type BufferEditor = std::rc::Rc<
+    dyn Fn(&std::path::Path, &str, &str, bool) -> Result<taste_core::agentedit::Replaced, String>,
+>;
+
 /// Start answering probe requests on the main thread. `registry` maps the
 /// stable pane names to their root widgets.
 pub fn attach(
@@ -47,6 +54,7 @@ pub fn attach(
     registry: Vec<(&'static str, gtk::Widget)>,
     buffer_text: BufferLookup,
     buffer_write: BufferWriter,
+    buffer_edit: BufferEditor,
 ) {
     let requests = workspace.ui.requests();
     glib::spawn_future_local(async move {
@@ -76,6 +84,12 @@ pub fn attach(
                 UiRequest::BufferWrite { path, content } => {
                     Ok(UiReply::BufferWrite(buffer_write(path, content)))
                 }
+                UiRequest::BufferEdit {
+                    path,
+                    old,
+                    new,
+                    all,
+                } => Ok(UiReply::BufferEdit(buffer_edit(path, old, new, *all))),
                 // Taken by the branch above, which answers off this loop.
                 UiRequest::Confirm { .. } => unreachable!("confirmations are spawned"),
             };

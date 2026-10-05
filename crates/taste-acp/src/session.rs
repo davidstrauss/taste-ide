@@ -1421,11 +1421,12 @@ async fn write_text_file(
             )
         });
     }
-    // The editor applies a write to a file it could have open — one on
-    // this host. A checkout in a VM has no buffers here yet, so its writes
-    // go straight through the files service, as does any write with no
-    // window to ask.
-    let editor_applies = probe.filter(|_| files.is_local());
+    // The editor applies every write it can be asked to: a file it has
+    // open — on this host or in a checkout in a VM, whose tabs read it
+    // through the files service — changes in its buffer, and one it has
+    // not is saved by the editor's own code. Only a write with no window
+    // to ask goes straight through the files service.
+    let editor_applies = probe.filter(|probe| probe.is_attached());
     let Some(probe) = editor_applies else {
         // Off-thread because this is blocking IO and the caller is a
         // protocol dispatch task — the same rule the GTK side lives by.

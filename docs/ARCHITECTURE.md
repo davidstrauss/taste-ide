@@ -1720,15 +1720,29 @@ it, and carries its actions.
     agent reads what the user sees, unsaved edits included. Falls back to
     the disk; a read degrades to slightly-stale, never to failure.
   - `fs/write_text_file` — checked against `write_allowed`, then applied by
-    the editor. A clean open file takes the edit through the user's own
-    buffer, so it lands in their undo stack and their view updates. A file
-    with **unsaved** edits is never clobbered: the write goes to disk and
-    the watcher raises the same conflict banner an edit from a terminal or
-    a container build would ("Reload takes the disk version, Save keeps
-    yours"). Unlike a read, a write does not fall back on timeout — the
-    editor may already have applied it, and the honest answer is an error
-    the agent can retry (the request carries whole file contents, so a
-    retry is idempotent).
+    the editor. An open file takes the edit through the user's own buffer
+    — as the lines that differ, one step of their undo history, their
+    unsaved typing kept — and is saved, typing and all: the agent read
+    that typing, so the disk then holds what it believes it wrote, and its
+    next shell command reads that. This is how VS Code's own agent edits
+    (David, 2026-10-05); until then a file with unsaved edits had its disk
+    written behind it and the conflict bar asked. Unlike a read, a write
+    does not fall back on timeout — the editor may already have applied
+    it, and the honest answer is an error the agent can retry (the request
+    carries whole file contents, so a retry is idempotent).
+
+  The pinned Claude Code adapter calls neither: it reads and writes with
+  Claude Code's own tools, natively. So the same two paths are also MCP
+  tools — `ide_read_file`, `ide_edit_file` (an exact replacement, the
+  contract of Claude Code's Edit), and `ide_write_file` — and Claude
+  Code's own Read, Edit, Write, and MultiEdit are turned off through its
+  documented `permissions.deny` setting, merged into the agent's
+  `~/.claude/settings.json` as it starts (`taste_acp::relocate`). An edit
+  through them is drawn as Claude Code's own edit is, a diff, and asks
+  as one does: unasked in a mode that accepts edits, on the card
+  otherwise. What still reaches a file behind the editor's back — a
+  `sed`, a `git checkout`, a build — arrives through the watcher, and an
+  open file it changes is reloaded the same way, as one undoable step.
   - Permission requests (surfaced in the chat pane) and terminal creation
     (surfaced as console tabs).
 
@@ -1985,6 +1999,11 @@ Tool surface:
   tabs with dirty state, and the current selection with its line range.
 - `ide_open_file` — direct the user's attention to a file:line
   (workspace-confined, non-destructive).
+- `ide_read_file` / `ide_edit_file` / `ide_write_file` — the workspace's
+  files as the editor has them: read from, and changed in, the buffer the
+  user has open (unsaved edits included, each change one undo step, then
+  saved), the disk otherwise; an image is read as an image. They stand in
+  for Claude Code's own file tools (Client-side services, above).
 - `ide_list_files` / `ide_search` — the agent's `ls` and `grep`. The
   workspace is not mounted where the agent runs, so the IDE enumerates and
   searches it: `.gitignore` honored, `.git` and binaries skipped, absolute

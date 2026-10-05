@@ -225,6 +225,25 @@ fn exec_in_environment(
 
     args.push(relocation.container.clone());
     let inner = inner_command(spec, relocation.auth.as_ref());
+    // Claude Code reads and changes files through the IDE's tools, so a
+    // file open in the editor is read from, and changed in, its buffer;
+    // its own file tools are turned off in its settings first.
+    if is_claude_code(spec) {
+        args.extend([
+            "sh".into(),
+            "-c".into(),
+            CLAUDE_PRELUDE.into(),
+            "taste-agent".into(),
+            relocation
+                .node_bin
+                .as_ref()
+                .map(|bin| bin.display().to_string())
+                .unwrap_or_default(),
+            claude_settings_script(),
+        ]);
+        args.extend(inner);
+        return relocation.podman.argv(args);
+    }
     match &relocation.node_bin {
         // Prepended in the container's own shell rather than set with
         // `--env`, which would replace the image's `PATH` wholesale, and
@@ -243,6 +262,53 @@ fn exec_in_environment(
         None => args.extend(inner),
     }
     relocation.podman.argv(args)
+}
+
+/// Claude Code's own file tools, turned off for an agent the IDE runs: it
+/// reads and changes the workspace's files through `ide_read_file`,
+/// `ide_edit_file`, and `ide_write_file` instead, which read from, and
+/// change, the buffer the user has open (David, 2026-10-05: "The file
+/// watcher isn't sufficient to ensure the agent is reading and writing
+/// from/to my buffer when a file is open for editing"). The adapter writes
+/// with these natively and never asks the client (ACP `fs/*`), so this is
+/// the one place the choice can be made, through Claude Code's documented
+/// `permissions.deny` setting. Search (Glob, Grep) and the shell stay.
+pub const CLAUDE_DENIED_TOOLS: [&str; 4] = ["Read", "Edit", "Write", "MultiEdit"];
+
+/// And the IDE's read, allowed without asking, as Read was.
+pub const CLAUDE_ALLOWED_TOOLS: [&str; 1] = ["mcp__taste-ide__ide_read_file"];
+
+/// Run before the agent: `$1` a directory for the front of `PATH` (empty
+/// for none), `$2` the settings script, the agent's command after. A
+/// settings file that cannot be merged leaves the agent with its own
+/// tools, which still work, so a failure there does not stop the start.
+const CLAUDE_PRELUDE: &str =
+    r#"[ -n "$1" ] && PATH="$1:$PATH"; export PATH; node -e "$2" || true; shift 2; exec "$@""#;
+
+fn is_claude_code(spec: &AgentSpec) -> bool {
+    spec.id == crate::registry::CLAUDE_CODE || spec.id == crate::registry::CLAUDE_CODE_CUSTOM
+}
+
+/// The node program that merges [`CLAUDE_DENIED_TOOLS`] and
+/// [`CLAUDE_ALLOWED_TOOLS`] into `~/.claude/settings.json` — the agent's
+/// own home, its environment's volume — keeping whatever else is there.
+/// A file that does not parse is left alone rather than replaced.
+fn claude_settings_script() -> String {
+    let list = |tools: &[&str]| serde_json::to_string(tools).unwrap_or_else(|_| "[]".into());
+    format!(
+        "const fs=require('fs'),path=require('path');\
+         const f=path.join(process.env.HOME,'.claude','settings.json');\
+         let s={{}};\
+         if(fs.existsSync(f)){{try{{s=JSON.parse(fs.readFileSync(f,'utf8'))}}catch(e){{process.exit(0)}}}}\
+         const p=s.permissions=s.permissions||{{}};\
+         const add=(k,v)=>{{p[k]=[...new Set([...(p[k]||[]),...v])]}};\
+         add('deny',{deny});add('allow',{allow});\
+         fs.mkdirSync(path.dirname(f),{{recursive:true}});\
+         fs.writeFileSync(f+'.taste-part',JSON.stringify(s,null,2)+'\\n');\
+         fs.renameSync(f+'.taste-part',f);",
+        deny = list(&CLAUDE_DENIED_TOOLS),
+        allow = list(&CLAUDE_ALLOWED_TOOLS),
+    )
 }
 
 #[cfg(test)]
@@ -282,7 +348,10 @@ mod tests {
     fn the_injected_node_goes_first_on_the_images_path() {
         let mut relocation = relocation();
         relocation.node_bin = Some("/opt/taste-agent/node-v24.21.0-linux-x64/bin".into());
-        let (_, args) = relocated_agent_command(&spec(), Path::new("/w"), &relocation);
+        let mut spec = spec();
+        spec.id = "another-agent".into();
+        let spec = &spec;
+        let (_, args) = relocated_agent_command(spec, Path::new("/w"), &relocation);
         let container = args
             .iter()
             .position(|a| a == "taste-abc123-review")
@@ -297,7 +366,7 @@ mod tests {
             args[container + 5],
             "/opt/taste-agent/node-v24.21.0-linux-x64/bin"
         );
-        let (_, plain) = relocated_agent_command(&spec(), Path::new("/w"), &self::relocation());
+        let (_, plain) = relocated_agent_command(spec, Path::new("/w"), &self::relocation());
         let tail = &plain[plain
             .iter()
             .position(|a| a == "taste-abc123-review")
@@ -369,7 +438,10 @@ mod tests {
             .iter()
             .position(|a| a == "taste-abc123-review")
             .unwrap();
-        assert_eq!(args[container + 1], "node", "the forwarder wraps the agent");
+        // Claude Code's settings prelude first, then the forwarder
+        // wrapping the agent.
+        assert_eq!(args[container + 3], CLAUDE_PRELUDE);
+        assert_eq!(args[container + 7], "node", "the forwarder wraps the agent");
         assert!(args[container..].contains(&"npx".to_string()));
     }
 
@@ -519,6 +591,7 @@ mod tests {
     fn without_the_proxy_the_agent_is_exec_d_directly() {
         let mut spec = spec();
         spec.env.clear();
+        spec.id = "another-agent".into();
         let (_, args) = relocated_agent_command(
             &spec,
             Path::new("/work/p"),
@@ -533,5 +606,82 @@ mod tests {
         let container = args.iter().position(|a| a == "c").unwrap();
         assert_eq!(&args[container + 1..], ["npx", "acp"]);
         assert!(!args.iter().any(|a| a.contains("createServer")));
+    }
+
+    /// Claude Code starts behind the prelude: the IDE's node first on the
+    /// path when there is one, its settings merged, then the same command.
+    #[test]
+    fn claude_code_starts_with_its_file_tools_turned_off() {
+        let mut relocation = relocation();
+        relocation.node_bin = Some("/opt/taste-agent/bin".into());
+        let (_, args) = relocated_agent_command(&spec(), Path::new("/w"), &relocation);
+        let container = args
+            .iter()
+            .position(|a| a == "taste-abc123-review")
+            .unwrap();
+        assert_eq!(args[container + 3], CLAUDE_PRELUDE);
+        assert_eq!(args[container + 5], "/opt/taste-agent/bin");
+        assert!(args[container + 6].contains("\"Edit\""), "{args:?}");
+        let (_, plain) = relocated_agent_command(&spec(), Path::new("/w"), &self::relocation());
+        assert_eq!(
+            plain[container + 5],
+            "",
+            "no node of the IDE's: nothing prepended"
+        );
+        assert_eq!(&args[container + 7..], &plain[container + 7..]);
+    }
+
+    /// The merge, run by node against a home of its own: the rules join
+    /// whatever the file holds, twice is once, and a file that does not
+    /// parse is left as it was.
+    #[test]
+    fn the_settings_merge_keeps_what_is_there() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: no node on this machine");
+            return;
+        }
+        let home = std::env::temp_dir().join(format!("taste-claude-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let file = home.join(".claude/settings.json");
+        std::fs::write(
+            &file,
+            r#"{"model":"opus","permissions":{"deny":["Bash(rm:*)"],"allow":["Bash(ls:*)"]}}"#,
+        )
+        .unwrap();
+        let run = || {
+            let out = std::process::Command::new("node")
+                .arg("-e")
+                .arg(claude_settings_script())
+                .env("HOME", &home)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run();
+        run();
+        let merged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(merged["model"], "opus");
+        assert_eq!(
+            merged["permissions"]["deny"],
+            serde_json::json!(["Bash(rm:*)", "Read", "Edit", "Write", "MultiEdit"])
+        );
+        assert_eq!(
+            merged["permissions"]["allow"],
+            serde_json::json!(["Bash(ls:*)", "mcp__taste-ide__ide_read_file"])
+        );
+        std::fs::write(&file, "{ not json").unwrap();
+        run();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ not json");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -485,6 +485,39 @@ fn restore_scroll(view: &sourceview5::View, scroller: &gtk::ScrolledWindow, held
     });
 }
 
+/// Make `buffer`, which holds `old`, hold `new` by changing only the lines
+/// that differ, as one user action: one step of the undo history, and
+/// every mark — the cursor, a selection, a bookmark — left with the text
+/// around it rather than thrown to wherever a wholesale `set_text` leaves
+/// it. The ranges are applied last first, so each one's line numbers are
+/// still the old text's when it is reached.
+fn apply_minimal(buffer: &sourceview5::Buffer, old: &str, new: &str) {
+    if old == new {
+        return;
+    }
+    let diff = similar::TextDiff::from_lines(old, new);
+    let fresh = diff.new_slices();
+    let line_start = |line: usize| -> gtk::TextIter {
+        i32::try_from(line)
+            .ok()
+            .filter(|&l| l < buffer.line_count())
+            .and_then(|l| buffer.iter_at_line(l))
+            .unwrap_or_else(|| buffer.end_iter())
+    };
+    buffer.begin_user_action();
+    for op in diff.ops().iter().rev() {
+        let (tag, was, now) = op.as_tag_tuple();
+        if tag == similar::DiffTag::Equal {
+            continue;
+        }
+        let mut start = line_start(was.start);
+        let mut end = line_start(was.end);
+        buffer.delete(&mut start, &mut end);
+        buffer.insert(&mut start, &fresh[now].concat());
+    }
+    buffer.end_user_action();
+}
+
 /// `view:<path>` — the surface key a viewer tab is filed under: its path,
 /// in a namespace no other surface's key is in.
 fn viewer_key(path: &Path) -> PathBuf {
@@ -2601,13 +2634,25 @@ impl Editor {
             let (content, prepared) = match handle.await {
                 Ok(Ok(ready)) => ready,
                 Ok(Err(e)) => {
-                    // Failures speak: silence here cost a confused click.
-                    editor_events.publish(taste_core::Event::Toast(format!(
-                        "Cannot open {}: {e}",
-                        path.file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default()
-                    )));
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    // Failures speak: silence here cost a confused click. A
+                    // folder reached here is a submodule the Dirty list
+                    // names because the commit it is at moved, which has
+                    // no text to open.
+                    editor_events.publish(taste_core::Event::Toast(
+                        if e.kind() == std::io::ErrorKind::IsADirectory
+                            || e.to_string().contains("EISDIR")
+                        {
+                            format!(
+                                "{name} is a submodule at a new commit; committing the parent records it"
+                            )
+                        } else {
+                            format!("Cannot open {name}: {e}")
+                        },
+                    ));
                     return;
                 }
                 Err(_) => return,
@@ -3630,41 +3675,65 @@ impl Editor {
 
     /// Replace `path`'s contents and save.
     ///
-    /// Unsaved user edits are never clobbered. When the agent writes a file
-    /// the user has open and dirty, this writes the DISK and leaves their
-    /// buffer alone — the watcher then raises the same conflict banner an
-    /// edit from a terminal or a container build would ("Reload takes the
-    /// disk version, Save keeps yours"). That is the pre-existing contract
-    /// for outside writes, and routing the agent through the IDE must not
-    /// quietly cost the user their work.
+    /// A file the user has open takes the change in the buffer they are
+    /// looking at, as the lines that differ — one step of their undo
+    /// history — and the buffer is saved, their unsaved typing with it.
+    /// The agent read that typing (`buffer_text`), so what it wrote was
+    /// written with it in view, and the disk then holds what the agent
+    /// believes it does, which is what its next shell command reads. This
+    /// is how VS Code's own agent edits, and the choice David made
+    /// (2026-10-05). Until then an open, unsaved file had its DISK written
+    /// behind it, and the conflict bar asked the user to choose.
     pub fn buffer_write(self: &Rc<Self>, path: &Path, text: &str) -> Result<(), String> {
         if let Some(page) = self.pages.borrow().get(path).cloned() {
-            if page.buffer.is_modified() {
-                textfile::save_via(
-                    &page.files,
-                    &page.origin_root,
-                    self.safe_mode_of(&page),
-                    path,
-                    text,
-                    &page.file_format(),
-                )?;
-                self.workspace
-                    .events
-                    .publish(taste_core::Event::GitStatusChanged);
-                return Ok(());
-            }
-            // Clean: go through the buffer the user is looking at, so the
-            // edit lands in their undo stack and their view updates.
-            //
+            let (start, end) = page.buffer.bounds();
+            let current = page.buffer.text(&start, &end, true).to_string();
+            apply_minimal(&page.buffer, &current, text);
             // `persist_page`, not `save_page`: an agent writing a file in
             // its OWN environment is not the user editing a file they are
             // watching, and the read-only rule is about the second. The
             // agent's authority was already checked against its own
             // environment before this request was made.
-            page.buffer.set_text(text);
             return self.persist_page(path, &page);
         }
-        self.write_headless(path, |buffer| buffer.text = text.to_string())
+        // Read afresh: a copy kept from an earlier call would be written
+        // over whatever changed on the disk since.
+        self.headless.borrow_mut().remove(path);
+        self.write_headless(path, |buffer| {
+            buffer.text = text.to_string();
+            Ok(())
+        })
+    }
+
+    /// Replace one exact string in `path` and save
+    /// (`taste_core::agentedit::replace`): matched against the buffer the
+    /// user is looking at when the file is open, and applied there as
+    /// [`Self::buffer_write`] applies a whole text; against the disk
+    /// otherwise.
+    pub fn buffer_edit(
+        self: &Rc<Self>,
+        path: &Path,
+        old: &str,
+        new: &str,
+        all: bool,
+    ) -> Result<taste_core::agentedit::Replaced, String> {
+        if let Some(page) = self.pages.borrow().get(path).cloned() {
+            let (start, end) = page.buffer.bounds();
+            let current = page.buffer.text(&start, &end, true).to_string();
+            let done = taste_core::agentedit::replace(&current, old, new, all)?;
+            apply_minimal(&page.buffer, &current, &done.text);
+            self.persist_page(path, &page)?;
+            return Ok(done);
+        }
+        self.headless.borrow_mut().remove(path);
+        let mut outcome = None;
+        self.write_headless(path, |buffer| {
+            let done = taste_core::agentedit::replace(&buffer.text, old, new, all)?;
+            buffer.text = done.text.clone();
+            outcome = Some(done);
+            Ok(())
+        })?;
+        outcome.ok_or_else(|| "the edit did not run".to_string())
     }
 
     /// Persist what is in the buffer now without changing it — the "save
@@ -3673,7 +3742,7 @@ impl Editor {
         if let Some(page) = self.pages.borrow().get(path).cloned() {
             return self.save_page(path, &page);
         }
-        self.write_headless(path, |_| {})
+        self.write_headless(path, |_| Ok(()))
     }
 
     /// Drop unsaved edits and take what is on disk — the "stash it" half.
@@ -3703,7 +3772,7 @@ impl Editor {
     fn write_headless(
         &self,
         path: &Path,
-        edit: impl FnOnce(&mut HeadlessBuffer),
+        edit: impl FnOnce(&mut HeadlessBuffer) -> Result<(), String>,
     ) -> Result<(), String> {
         let files = files_among(path, &self.access());
         let mut headless = self.headless.borrow_mut();
@@ -3719,7 +3788,7 @@ impl Editor {
                     .or_insert(HeadlessBuffer { text, format })
             }
         };
-        edit(buffer);
+        edit(buffer)?;
         // Same rule as an open page: the file's own checkout bounds the
         // write. An agent in `calm-1` writing a file it has not asked the
         // user to open still writes inside `calm-1`.
@@ -3864,15 +3933,17 @@ impl Editor {
             }
             page.crlf.set(crlf);
             page.bom.set(bom);
-            let mark = page.buffer.get_insert();
-            let offset = page.buffer.iter_at_mark(&mark).offset();
             let held = hold_scroll(&page.view, &page.scroller);
             dismiss_suggestion(&page);
             // Re-evaluate the performance guard: an agent may have rewritten
             // a small file into a huge one (or vice versa).
             let was_plain = page.plain.get();
             page.plain.set(!highlighting_ok(&content));
-            page.buffer.set_text(&content);
+            // As the lines that differ, in one step Ctrl+Z takes back — a
+            // `sed`, a `git checkout`, or a tool run in the container is
+            // as undoable as an edit the agent made through the IDE — and
+            // the cursor, like every mark, stays with the text it was in.
+            apply_minimal(&page.buffer, current.as_str(), &content);
             page.buffer.set_modified(false);
             editor.note_unseen_change(&page.page);
             // The reload resolves any earlier conflict warning.
@@ -3881,9 +3952,6 @@ impl Editor {
                 page.page.set_indicator_icon(gtk::gio::Icon::NONE);
                 page.page.set_tooltip(&path.display().to_string());
             }
-            let end = page.buffer.char_count();
-            page.buffer
-                .place_cursor(&page.buffer.iter_at_offset(offset.min(end)));
             restore_scroll(&page.view, &page.scroller, held);
             if was_plain != page.plain.get() || editor.wysiwyg_active(&path, &page) {
                 editor.refresh_markdown_mode(&path, &page);
@@ -4318,6 +4386,38 @@ pub(crate) fn apply_scheme_for_style(buffer: &sourceview5::Buffer) {
 
 #[cfg(test)]
 mod tests {
+    /// A change applied to a buffer is the lines that differ, as one step
+    /// of the undo history, and the cursor stays with the text it was in:
+    /// how an agent's edit and a reload from the disk both land.
+    #[test]
+    fn a_change_lands_as_one_undo_step_and_the_cursor_stays_put() {
+        crate::gtk_test::on_gtk_thread("apply_minimal: no display — skipped", || {
+            use gtk::prelude::*;
+            let buffer = sourceview5::Buffer::new(None);
+            let old = "one\ntwo\nthree\nfour\nfive\n";
+            buffer.set_text(old);
+            // The cursor in "four", which no change touches.
+            let at = buffer.iter_at_line_offset(3, 2).unwrap();
+            buffer.place_cursor(&at);
+            let new = "zero\none\nTWO\nthree\nfour\nfive";
+            super::apply_minimal(&buffer, old, new);
+            let text = |b: &sourceview5::Buffer| {
+                let (start, end) = b.bounds();
+                b.text(&start, &end, true).to_string()
+            };
+            assert_eq!(text(&buffer), new);
+            let cursor = buffer.iter_at_mark(&buffer.get_insert());
+            assert_eq!(
+                (cursor.line(), cursor.line_offset()),
+                (4, 2),
+                "still in \"four\""
+            );
+            assert!(buffer.can_undo());
+            buffer.undo();
+            assert_eq!(text(&buffer), old, "one undo takes the whole change back");
+        });
+    }
+
     use super::highlighting_ok;
 
     /// Every checkout with a tab open gets a pass, and none gets two.

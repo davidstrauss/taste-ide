@@ -154,6 +154,10 @@ pub fn effect(tool: &str) -> Effect {
         // `readOnlyHint` protects is the user's work, and this cannot
         // reach it.
         "ide_open_file" => Effect::Read,
+        // The workspace's files, read and changed the way the editor
+        // does: from the buffer the user has open when there is one.
+        "ide_read_file" => Effect::Read,
+        "ide_edit_file" | "ide_write_file" => Effect::Write,
         // Draws buttons under the agent's own message; touches nothing, and
         // a click is the user choosing, which is the opposite of a
         // permission it would need.
@@ -319,12 +323,14 @@ pub fn asks_nobody(tool: &str) -> bool {
 }
 
 /// Whether the IDE answers this tool's permission request yes, always,
-/// before a standing answer or a card: reading where the agent runs. It
+/// before a standing answer or a card: reading where the agent runs, and
+/// reading the workspace's files, which Claude Code's own Read — the tool
+/// `ide_read_file` stands in for — never asked about. It
 /// carries nothing of the user's, it is how an agent orients itself, and a
 /// refusal of it only leaves the agent guessing where its commands land
 /// (David, 2026-10-03: "We should never deny 'read where it is running'").
 pub fn never_refused(tool: &str) -> bool {
-    matches!(tool, "environment" | "ide_environment")
+    matches!(tool, "environment" | "ide_environment" | "ide_read_file")
 }
 
 /// Whether the IDE may remember a standing **allow** for this tool.

@@ -27,16 +27,29 @@ pub enum UiRequest {
     /// rather than the stale disk.
     BufferText { path: std::path::PathBuf },
     /// Replace a file's contents *through the editor*. A file the user
-    /// has open takes the edit into the buffer they are looking at, so it
-    /// lands in their undo stack and their tab stays put; a file they have
-    /// not opened is written through the same [`crate::textfile`] code the
-    /// editor's own saves use. Serves ACP `fs/write_text_file`.
+    /// has open takes the edit into the buffer they are looking at — as
+    /// the lines that differ, one step of their undo history, unsaved
+    /// typing and all — and is saved; a file they have not opened is
+    /// written through the same [`crate::textfile`] code the editor's own
+    /// saves use. Serves ACP `fs/write_text_file` and `ide_write_file`.
     ///
     /// The caller has already checked [`crate::policy::write_allowed`] —
     /// this asks the UI to *apply* a write, it does not authorize one.
     BufferWrite {
         path: std::path::PathBuf,
         content: String,
+    },
+    /// Replace one exact string in a file *through the editor*
+    /// ([`crate::agentedit::replace`]): in the buffer when the file is
+    /// open — the user's unsaved typing included, one step of their undo
+    /// history — and saved; through the files service when it is not.
+    /// Serves `ide_edit_file`. The caller has checked
+    /// [`crate::policy::write_allowed`], as for [`Self::BufferWrite`].
+    BufferEdit {
+        path: std::path::PathBuf,
+        old: String,
+        new: String,
+        all: bool,
     },
     /// Ask the user to approve something an agent set in motion.
     ///
@@ -68,6 +81,8 @@ pub enum UiReply {
     /// would strand the user's open buffer showing text the file no
     /// longer has.
     BufferWrite(Result<(), String>),
+    /// The edit landed, with what it came to, or why it did not.
+    BufferEdit(Result<crate::agentedit::Replaced, String>),
     /// The user answer. False covers denied, dismissed, and never asked.
     Confirm(bool),
     /// The UI could not answer (unknown target, widget not rendered).
@@ -106,6 +121,12 @@ impl UiProbe {
     pub fn requests(&self) -> async_channel::Receiver<Envelope> {
         self.attached.store(true, Ordering::Release);
         self.rx.clone()
+    }
+
+    /// Whether a window is answering — which decides whether a file
+    /// change goes through the editor or straight to the disk.
+    pub fn is_attached(&self) -> bool {
+        self.attached.load(Ordering::Acquire)
     }
 
     /// Ask the UI and await its answer. Callers add their own timeout —

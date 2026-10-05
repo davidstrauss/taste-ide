@@ -5,6 +5,7 @@
 //! ever crosses this boundary.
 
 pub mod activity;
+pub mod agentedit;
 pub mod app_log;
 pub mod capped;
 pub mod chatarchive;

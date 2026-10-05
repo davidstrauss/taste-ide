@@ -3889,6 +3889,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 editor.buffer_write(path, text)
             })
         },
+        {
+            let editor = editor.clone();
+            std::rc::Rc::new(
+                move |path: &std::path::Path, old: &str, new: &str, all: bool| {
+                    editor.buffer_edit(path, old, new, all)
+                },
+            )
+        },
     );
 
     // Agent URL bridge: sandboxed sign-in flows (e.g. Claude Code's OAuth)

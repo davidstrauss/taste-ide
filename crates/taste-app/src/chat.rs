@@ -850,6 +850,10 @@ pub struct ChatPane {
     /// the answer has arrived is the pane lying about what it is doing.
     current_thought_header: RefCell<Option<(gtk::Expander, std::time::Instant)>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
+    /// The calls made through the IDE's own edit tools, by id, with their
+    /// titles: drawn as edits ([`ide_edit_shape`]), and their results kept
+    /// from replacing the diff.
+    ide_edit_calls: RefCell<HashMap<String, String>>,
     /// Each document a step can open (by its key), and the step's row —
     /// lit while that document is the editor's tab in front
     /// (`highlight_document`).
@@ -3337,6 +3341,7 @@ impl ChatPane {
             plan_card: RefCell::new(None),
             plan_snapshot: RefCell::new(None),
             tool_cards: RefCell::new(HashMap::new()),
+            ide_edit_calls: RefCell::new(HashMap::new()),
             command_provider,
             transcript_rows: Cell::new(0),
             client_generation: Cell::new(0),
@@ -5700,6 +5705,16 @@ impl ChatPane {
         self.approval_picker.is_active()
     }
 
+    /// Whether the session's permission mode lets an edit in the working
+    /// tree run without asking.
+    fn edits_run_unasked(&self) -> bool {
+        self.last_modes.borrow().as_ref().is_some_and(|modes| {
+            ["acceptEdits", "auto", "bypassPermissions"]
+                .iter()
+                .any(|mode| modes.current_mode_id == SessionModeId::from(mode.to_string()))
+        })
+    }
+
     /// Whether the IDE may respawn this chat when a wake-up goes
     /// unanswered in silence. Read by `crate::coordinator` before it arms
     /// a deadline at all.
@@ -7200,14 +7215,57 @@ impl ChatPane {
             .css_classes(["flat"])
             .tooltip_text("Jump to this prompt, further down")
             .halign(gtk::Align::Center)
+            .hexpand(true)
             .margin_top(4)
             .margin_bottom(4)
-            .margin_start(12)
-            .margin_end(12)
             .build();
+        // The prompt ended the timeline here, and it has moved on: between
+        // two steps the line runs on through the marker, which stands
+        // beside the rail as a step's content does (David, 2026-10-05:
+        // "This shouldn't break the line between the bullets on the
+        // left"). The step above gets back the line the prompt took from
+        // it; the one below already runs up from the top of its row.
+        let above = origin
+            .prev_sibling()
+            .and_downcast::<gtk::ListBoxRow>()
+            .and_then(|row| step_rail_line(&row));
+        let below = origin
+            .next_sibling()
+            .and_downcast::<gtk::ListBoxRow>()
+            .and_then(|row| step_rail_line(&row));
+        let through = above.is_some() && below.is_some();
+        if let Some(line) = above.filter(|_| through) {
+            if let Some(bottom) = line.last_child() {
+                bottom.set_visible(true);
+            }
+        }
+        // Vertical, so the line is given the column's width to be centred
+        // in, as a step's is; never expanding, or the column takes the
+        // row's spare width and the line leaves the rail.
+        let rail = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .width_request(RAIL_WIDTH)
+            .hexpand(false)
+            .build();
+        rail.append(
+            &gtk::Box::builder()
+                .css_classes(["rail-line"])
+                .halign(gtk::Align::Center)
+                .vexpand(true)
+                .visible(through)
+                .build(),
+        );
+        let seat_row = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
+        seat_row.set_margin_start(ROW_OWN_SIDE);
+        seat_row.set_margin_end(ROW_OWN_SIDE);
+        seat_row.append(&rail);
+        seat_row.append(&marker);
         // Setting the marker as the child unparents the card, which is what
         // frees it to be seated again at the end.
-        origin.set_child(Some(&marker));
+        origin.set_child(Some(&seat_row));
+        // Seated again as a prompt is: the timeline above ends at its last
+        // dot, and the next step's line runs up from the box.
+        self.end_steps();
         let seat = self.append_row(card);
         // The pin mirrors the newest prompt, and that is now this row.
         *self.last_prompt_row.borrow_mut() = Some(seat.clone());
@@ -10461,7 +10519,20 @@ impl ChatPane {
                     }
                 }
             }
-            SessionUpdate::ToolCall(call) => {
+            SessionUpdate::ToolCall(mut call) => {
+                // An edit through the IDE's tools reads as the edit it is.
+                if is_ide_edit_title(&call.title) {
+                    self.ide_edit_calls
+                        .borrow_mut()
+                        .insert(call.tool_call_id.to_string(), call.title.clone());
+                    call.kind = ToolKind::Edit;
+                    if let Some((content, path)) =
+                        ide_edit_shape(&call.title, call.raw_input.as_ref())
+                    {
+                        call.content = content;
+                        call.title = edit_title(&call.title, &path);
+                    }
+                }
                 // Close the streaming text block first: narration after
                 // this call must start a NEW block below the card, so the
                 // transcript reads as interleaved progress (text, tool,
@@ -10479,7 +10550,38 @@ impl ChatPane {
                     call.raw_output.as_ref(),
                 );
             }
-            SessionUpdate::ToolCallUpdate(update) => {
+            SessionUpdate::ToolCallUpdate(mut update) => {
+                let id = update.tool_call_id.to_string();
+                if let Some(title) = update
+                    .fields
+                    .title
+                    .as_deref()
+                    .filter(|t| is_ide_edit_title(t))
+                {
+                    self.ide_edit_calls
+                        .borrow_mut()
+                        .insert(id.clone(), title.to_string());
+                }
+                let edit_title_seen = self.ide_edit_calls.borrow().get(&id).cloned();
+                if let Some(title) = edit_title_seen {
+                    update.fields.kind = Some(ToolKind::Edit);
+                    match ide_edit_shape(&title, update.fields.raw_input.as_ref()) {
+                        Some((content, path)) => {
+                            update.fields.content = Some(content);
+                            update.fields.title = Some(edit_title(&title, &path));
+                        }
+                        // The tool's own answer is a line of JSON: the diff
+                        // it was drawn with stays, unless the edit failed,
+                        // when what went wrong is the thing to show.
+                        None if update.fields.status != Some(ToolCallStatus::Failed) => {
+                            update.fields.content = None;
+                            if update.fields.title.is_some() {
+                                update.fields.title = None;
+                            }
+                        }
+                        None => {}
+                    }
+                }
                 self.upsert_tool_card(
                     update.tool_call_id.to_string(),
                     update.fields.title.clone(),
@@ -10727,6 +10829,38 @@ impl ChatPane {
     /// is merged, since completing is verified), declined, moved, prompted
     /// — with the arguments and answers the real tools carry, so the
     /// headlines are written by the same code that writes them live.
+    fn seed_reseat_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::{ContentChunk, ToolCall, ToolCallStatus, ToolKind};
+        let say = |text: &str| {
+            self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(text)),
+            )));
+            self.finalize_stream();
+        };
+        let call = |id: &str, title: &str, kind: ToolKind| {
+            let mut call = ToolCall::new(id.to_string(), title.to_string());
+            call.kind = kind;
+            call.status = ToolCallStatus::Completed;
+            self.render_update(SessionUpdate::ToolCall(call));
+        };
+        self.user_card("Sync the template submodule and check what changed.", &[]);
+        say("Looking at the submodule first.");
+        call(
+            "probe-status",
+            "git status --short --untracked-files=all; find amutable-typst-template",
+            ToolKind::Execute,
+        );
+        let card = self.user_card("And keep the old file names as aliases.", &[]);
+        call(
+            "probe-read",
+            "Read amutable-typst-template/lib.typ",
+            ToolKind::Read,
+        );
+        say("The template has one modified file and nothing untracked.");
+        self.reseat_accepted_prompt(&card);
+        say("Kept the old names as aliases in lib.typ.");
+    }
+
     fn seed_acts_for_probe(self: &Rc<Self>) {
         use agent_client_protocol::schema::v1::{ContentChunk, ToolCall};
         use serde_json::json;
@@ -10912,6 +11046,13 @@ impl ChatPane {
         // major things it does, each as the card the user sees it by.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("acts") {
             self.seed_acts_for_probe();
+            return;
+        }
+        // `TASTE_PROBE_CHAT=reseat` is a prompt sent mid-turn and taken
+        // after it: the marker left where it was typed, between two steps
+        // the rail runs through, and the prompt seated below the turn.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("reseat") {
+            self.seed_reseat_for_probe();
             return;
         }
         // `TASTE_PROBE_CHAT=stash` is the conversation this machine kept
@@ -11840,10 +11981,30 @@ impl ChatPane {
     /// behind it ([`ChatPane::permission_queue`]).
     fn on_permission(
         self: &Rc<Self>,
-        request: RequestPermissionRequest,
+        mut request: RequestPermissionRequest,
         reply: taste_acp::PermissionReply,
     ) {
         self.finalize_stream();
+        // An edit through the IDE's tools asks as an edit does: "Edit a
+        // file?", with the file. Its title stays the tool's, which is what
+        // a standing answer is kept by.
+        if let Some(title) = request
+            .tool_call
+            .fields
+            .title
+            .clone()
+            .filter(|t| is_ide_edit_title(t))
+        {
+            request.tool_call.fields.kind = Some(ToolKind::Edit);
+            if let Some((content, path)) =
+                ide_edit_shape(&title, request.tool_call.fields.raw_input.as_ref())
+            {
+                request.tool_call.fields.content = Some(content);
+                request.tool_call.fields.locations = Some(vec![
+                    agent_client_protocol::schema::v1::ToolCallLocation::new(path),
+                ]);
+            }
+        }
         let title = permission_title(&request);
         let note = single_line(&title, 120);
         // Reading where it runs is never refused (David, 2026-10-03: "We
@@ -11929,6 +12090,34 @@ impl ChatPane {
                         "this project's standing answer for {tool}; given on a \
                          permission card and revocable in the chat's settings"
                     ),
+                );
+                return;
+            }
+        }
+        // An edit through the IDE's tools runs unasked wherever Claude
+        // Code's own edits do — accepting edits, auto, or bypassing — as
+        // its Edit did before these tools stood in for it.
+        let edit = request
+            .tool_call
+            .fields
+            .title
+            .as_deref()
+            .is_some_and(is_ide_edit_title);
+        if edit && self.edits_run_unasked() {
+            if let Some(option) = allow_option(&request.options) {
+                let _ = reply.send(outcome_for(option));
+                self.note_permission(
+                    request.tool_call.tool_call_id.to_string(),
+                    "changes-allow-symbolic",
+                    format!(
+                        "Allowed “{}” — edits run without asking in this mode",
+                        option.name
+                    ),
+                );
+                self.workspace.ide.record_permission(
+                    &note,
+                    "approved",
+                    "an edit, in a permission mode where edits run without asking",
                 );
                 return;
             }
@@ -12730,6 +12919,61 @@ impl ChatPane {
 /// says: a bare title is read as a tool name, so a command that happened
 /// to be called `devcontainer_reload` would otherwise take that tool's
 /// standing answer, or pass as one that asks nobody (review, 2026-09-23).
+/// The rail line of a step's row (`ChatPane::append_step`) — its top
+/// segment, the break for the spinner, and its bottom segment, in that
+/// order — or `None` for a row that is not a step.
+fn step_rail_line(row: &gtk::ListBoxRow) -> Option<gtk::Box> {
+    row.child()
+        .and_downcast::<gtk::Box>()?
+        .first_child()
+        .and_downcast::<gtk::Overlay>()?
+        .child()
+        .and_downcast::<gtk::Box>()
+}
+
+/// Whether a call's title is one of the IDE's edit tools.
+fn is_ide_edit_title(title: &str) -> bool {
+    mcp_tool_name(title).is_some_and(|tool| tool == "ide_edit_file" || tool == "ide_write_file")
+}
+
+/// An edit made through the IDE's own tools (`ide_edit_file`,
+/// `ide_write_file`), shaped as the edit Claude Code's own tools reported:
+/// its diff, and the file — so the transcript draws a diff and the
+/// permission card asks "Edit a file?", where an MCP call would otherwise
+/// be a step showing its arguments. `None` until the call's input says
+/// what it changes.
+fn ide_edit_shape(
+    title: &str,
+    raw_input: Option<&serde_json::Value>,
+) -> Option<(Vec<ToolCallContent>, std::path::PathBuf)> {
+    let input = raw_input?;
+    let path = std::path::PathBuf::from(
+        input["path"]
+            .as_str()
+            .or_else(|| input["file_path"].as_str())?,
+    );
+    let diff = match mcp_tool_name(title)?.as_str() {
+        "ide_edit_file" => {
+            let mut diff = Diff::new(path.clone(), input["new_string"].as_str()?.to_string());
+            diff.old_text = Some(input["old_string"].as_str()?.to_string());
+            diff
+        }
+        "ide_write_file" => Diff::new(path.clone(), input["content"].as_str()?.to_string()),
+        _ => return None,
+    };
+    Some((vec![ToolCallContent::Diff(diff)], path))
+}
+
+/// The title an edit through the IDE's tools is drawn with, as Claude
+/// Code's own edits are titled: what it did, and to which file.
+fn edit_title(title: &str, path: &std::path::Path) -> String {
+    let verb = match mcp_tool_name(title).as_deref() {
+        Some("ide_write_file") => "Write",
+        _ => "Edit",
+    };
+    format!("{verb} {}", path.display())
+}
+
 fn standing_tool(request: &RequestPermissionRequest) -> Option<String> {
     if request.tool_call.fields.kind == Some(ToolKind::Execute) {
         return None;
@@ -14784,6 +15028,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An edit through the IDE's tools is shaped as Claude Code's own: a
+    /// diff of what it replaces, a title naming the file; a whole-file
+    /// write is a diff with nothing before it.
+    #[test]
+    fn an_ide_edit_is_drawn_as_an_edit() {
+        let input = serde_json::json!({
+            "path": "/w/STYLE.md", "old_string": "a", "new_string": "b"
+        });
+        let (content, path) =
+            ide_edit_shape("mcp__taste-ide__ide_edit_file", Some(&input)).unwrap();
+        assert_eq!(path, std::path::Path::new("/w/STYLE.md"));
+        match &content[0] {
+            ToolCallContent::Diff(diff) => {
+                assert_eq!(diff.old_text.as_deref(), Some("a"));
+                assert_eq!(diff.new_text, "b");
+            }
+            other => panic!("not a diff: {other:?}"),
+        }
+        assert_eq!(
+            edit_title("mcp__taste-ide__ide_edit_file", &path),
+            "Edit /w/STYLE.md"
+        );
+        let write = serde_json::json!({ "path": "/w/new.md", "content": "x" });
+        let (content, _) = ide_edit_shape("mcp__taste-ide__ide_write_file", Some(&write)).unwrap();
+        assert!(matches!(&content[0], ToolCallContent::Diff(d) if d.old_text.is_none()));
+        assert!(ide_edit_shape("mcp__taste-ide__ide_edit_file", None).is_none());
+        assert!(!is_ide_edit_title("mcp__taste-ide__ide_read_file"));
     }
 
     #[test]
