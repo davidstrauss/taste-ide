@@ -595,6 +595,10 @@ pub struct FileTree {
     /// keeper nor the log is hammered (David, 2026-09-21: "Rate-limit
     /// messages like this"). Cleared by the next status that answers.
     unreachable: Cell<bool>,
+    /// Since when git beside a checkout in a VM has refused the status, for
+    /// [`FileTree::apply_git_refused`]; cleared by the next status that
+    /// works.
+    git_refused_since: RefCell<Option<std::time::Instant>>,
     unreachable_retry_armed: Cell<bool>,
 }
 
@@ -1476,6 +1480,7 @@ impl FileTree {
             expanded_dirs: RefCell::new(HashSet::new()),
             refresh: RefreshGate::default(),
             unreachable: Cell::new(false),
+            git_refused_since: RefCell::new(None),
             unreachable_retry_armed: Cell::new(false),
         });
         // The icon set swaps a few icons between the schemes (`file_icons`),
@@ -4462,6 +4467,14 @@ impl FileTree {
                 // which holds the remote-tracking refs the user fetched.
                 let status = match worktree.status() {
                     Ok(status) => status,
+                    // git itself said no, beside the files: the VM is
+                    // answering, so this is not `Unreachable`.
+                    Err(e)
+                        if e.downcast_ref::<taste_devcontainer::worktree::GitFailed>()
+                            .is_some() =>
+                    {
+                        return Err(StatusFail::Git(format!("{e}")));
+                    }
                     Err(e) => {
                         // A checkout on this host that is not a repository
                         // says so quietly; one in a VM that cannot be read
@@ -4486,9 +4499,9 @@ impl FileTree {
                                     root.display()
                                 );
                             }
-                            return Err(true);
+                            return Err(StatusFail::Unreachable);
                         }
-                        return Err(false);
+                        return Err(StatusFail::NotRepo);
                     }
                 };
                 // The branch the WORKING TREE is on, asked of the repository
@@ -4531,8 +4544,9 @@ impl FileTree {
             let Some(tree) = weak.upgrade() else { return };
             match snapshot {
                 Ok(Ok(snapshot)) => tree.apply_status(&root_for_apply, Some(snapshot)),
-                Ok(Err(false)) => tree.apply_status(&root_for_apply, None),
-                Ok(Err(true)) => tree.apply_unreachable(&root_for_apply),
+                Ok(Err(StatusFail::NotRepo)) => tree.apply_status(&root_for_apply, None),
+                Ok(Err(StatusFail::Unreachable)) => tree.apply_unreachable(&root_for_apply),
+                Ok(Err(StatusFail::Git(said))) => tree.apply_git_refused(&root_for_apply, &said),
                 Err(_) => {}
             }
             // Every exit from a query has to release the gate, or the tree
@@ -4551,12 +4565,38 @@ impl FileTree {
     /// under these circumstances. I stopped the VM"). The next status
     /// that succeeds puts everything back.
     fn apply_unreachable(self: &Rc<Self>, root: &Path) {
+        self.apply_blocked(root, "Checkout unreachable — its VM is not answering");
+    }
+
+    /// git, beside a checkout in a VM, refused the status: the VM is
+    /// answering, so it is not unreachable. A refusal is often a moment's
+    /// — a container's hook cloning a submodule writes paths git outside
+    /// the container cannot follow, and takes them away again when it is
+    /// done (2026-10-05: "This VM error shouldn't show during startup") —
+    /// so the rows stay as last seen and nothing is said; only a refusal
+    /// that outlasts [`GIT_REFUSAL_GRACE`] takes the header, in git's own
+    /// words.
+    fn apply_git_refused(self: &Rc<Self>, root: &Path, said: &str) {
+        if self.view_root() != root {
+            return;
+        }
+        let since = *self
+            .git_refused_since
+            .borrow_mut()
+            .get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() >= GIT_REFUSAL_GRACE {
+            self.apply_blocked(root, &format!("git: {}", single_line_note(said)));
+        }
+    }
+
+    /// The branch and sync tools give way to one insensitive line saying
+    /// why; the rows stay as last seen.
+    fn apply_blocked(self: &Rc<Self>, root: &Path, why: &str) {
         if self.view_root() != root {
             return;
         }
         self.unreachable.set(true);
-        self.init_button
-            .set_label("Checkout unreachable — its VM is not answering");
+        self.init_button.set_label(why);
         self.init_button.set_sensitive(false);
         self.init_button.set_visible(true);
         self.branch_label.set_visible(false);
@@ -4575,6 +4615,7 @@ impl FileTree {
 
     fn apply_status(self: &Rc<Self>, root: &Path, snapshot: Option<StatusSnapshot>) {
         self.unreachable.set(false);
+        self.git_refused_since.borrow_mut().take();
         let is_repo = snapshot.is_some();
         // A safe ↔ container flip restyles every row (the read-only locks)
         // even when git status is identical — starting the devcontainer
@@ -7830,6 +7871,32 @@ fn fill_dir_store_async(
     });
 }
 
+/// Why a status query came back empty-handed.
+enum StatusFail {
+    /// A checkout on this host that is not a repository.
+    NotRepo,
+    /// A checkout in a VM whose files service does not answer.
+    Unreachable,
+    /// git, beside a checkout in a VM, refused; what it said.
+    Git(String),
+}
+
+/// How long git may refuse a VM checkout's status before the header says
+/// so: past a container hook's moment, short of a real fault going unsaid.
+const GIT_REFUSAL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// git's refusal as one line for the header: its own words, the `fatal:`
+/// it opens on dropped, cut to a header's length.
+fn single_line_note(said: &str) -> String {
+    let line = said.lines().next().unwrap_or(said).trim();
+    let line = line.strip_prefix("fatal: ").unwrap_or(line);
+    let mut short: String = line.chars().take(80).collect();
+    if line.chars().count() > 80 {
+        short.push('…');
+    }
+    short
+}
+
 /// The ghost rows of one rebuild, found once and shared by every listing
 /// it makes — the root's and each folder's as it opens — on whichever
 /// blocking thread asks first (`fill_dir_store_async`), never on the main
@@ -7940,6 +8007,18 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::files_reached;
+
+    /// git's refusal reads as git's, one line, its `fatal:` dropped.
+    #[test]
+    fn a_git_refusal_is_one_line_in_its_own_words() {
+        assert_eq!(
+            super::single_line_note(
+                "fatal: not a git repository: /workspace/.git/modules/amutable-typst-template\nmore"
+            ),
+            "not a git repository: /workspace/.git/modules/amutable-typst-template"
+        );
+        assert!(super::single_line_note(&"x".repeat(200)).ends_with('…'));
+    }
 
     /// A ghost `.devcontainer/` opens onto ghosts of the files it is for:
     /// listed as the tree lists a folder it opens, the folder that is not

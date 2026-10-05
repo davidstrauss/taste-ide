@@ -34,6 +34,22 @@ use taste_core::environment::Checkout;
 use taste_core::files::{ExecOutput, Files};
 use taste_git::{FileState, GitWorkspace, StashEntry};
 
+/// git ran beside the files and said no — as distinct from the files
+/// service not answering, which is an error of its own kind. The file tree
+/// tells the two apart: a VM that is not answering is one thing to say, and
+/// git refusing for a moment while a container's hook rewrites a submodule
+/// under it is another (2026-10-05).
+#[derive(Debug)]
+pub struct GitFailed(pub String);
+
+impl std::fmt::Display for GitFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GitFailed {}
+
 /// The working tree of one environment, on this host or in a VM.
 #[derive(Clone)]
 pub enum Worktree {
@@ -237,7 +253,7 @@ impl Worktree {
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or("git failed")
                 .to_string();
-            bail!("{last}");
+            return Err(GitFailed(last).into());
         }
         Ok(out.stdout_utf8())
     }
