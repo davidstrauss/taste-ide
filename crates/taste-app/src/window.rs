@@ -4760,20 +4760,26 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // stat, and over the files service a round trip — and the tabs open in
     // their saved order once it has answered, the active one last so it
     // ends up in front.
+    //
+    // One the folder does not hold — an ignored file, which the mirror
+    // never brings here, so it is only in Personal's checkout in the VM —
+    // waits for that checkout, and opens there once it has arrived
+    // (`Editor::await_checkout`).
     {
         let files = workspace.files();
+        let base = workspace.checkout_path();
         let mut wanted: Vec<PathBuf> = persisted.open_files.iter().map(|p| rehome(p)).collect();
-        if let Some(active) = &persisted.active_file {
-            wanted.push(rehome(active));
+        let active = persisted.active_file.as_ref().map(|p| rehome(p));
+        if let Some(active) = &active {
+            wanted.push(active.clone());
         }
         let editor = editor.clone();
         glib::spawn_future_local(async move {
-            let present = crate::runtime::runtime()
+            let (present, missing) = crate::runtime::runtime()
                 .spawn_blocking(move || {
                     wanted
                         .into_iter()
-                        .filter(|path| files.is_file(path))
-                        .collect::<Vec<_>>()
+                        .partition::<Vec<_>, _>(|path| files.is_file(path))
                 })
                 .await
                 .unwrap_or_default();
@@ -4781,6 +4787,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 editor.open_at(path, None);
             }
             editor.sync_git_state();
+            let in_checkout = |path: &PathBuf| {
+                path.strip_prefix(&base)
+                    .ok()
+                    .map(std::path::Path::to_path_buf)
+            };
+            let mut rels: Vec<PathBuf> = Vec::new();
+            for rel in missing.iter().filter_map(in_checkout) {
+                if !rels.contains(&rel) {
+                    rels.push(rel);
+                }
+            }
+            let active = active
+                .filter(|a| missing.contains(a))
+                .and_then(|a| in_checkout(&a));
+            editor.await_checkout(&base, rels, active);
         });
     }
     // Seven days of stashed conversations is the policy; this is where it

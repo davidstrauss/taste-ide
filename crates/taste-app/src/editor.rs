@@ -594,6 +594,12 @@ pub struct Editor {
     mode_menu: gtk::MenuButton,
     mode_popover: gtk::Popover,
     pages: RefCell<HashMap<PathBuf, Rc<EditorPage>>>,
+    /// Tabs the last session had open that the folder does not hold —
+    /// files the mirror never carries, the ignored ones, which exist only
+    /// in Personal's checkout in the VM — by their path in the checkout,
+    /// with the one that was in front: opened when the checkout arrives
+    /// ([`Self::relocate_checkout`]), where they are.
+    awaiting: RefCell<(Vec<PathBuf>, Option<PathBuf>)>,
     /// The tabs that are not files: logs and ports (see [`SurfaceEntry`]).
     surfaces: RefCell<HashMap<PathBuf, Rc<SurfaceEntry>>>,
     /// Each open task tab's Prompt Agent, by the tab's key, for a run's
@@ -783,6 +789,7 @@ impl Editor {
             mode_menu: mode_menu.clone(),
             mode_popover: mode_popover.clone(),
             pages: RefCell::new(HashMap::new()),
+            awaiting: RefCell::new((Vec::new(), None)),
             surfaces: RefCell::new(HashMap::new()),
             task_prompts: RefCell::new(HashMap::new()),
             on_prompt_task: RefCell::new(None),
@@ -3361,6 +3368,56 @@ impl Editor {
     /// unsaved edits stays where it is — the edits are the user's, and a
     /// reopen would lose them — and saves to the old place; the folder is
     /// the peer, so what lands there is not lost either.
+    /// The last session's tabs that `base` — the checkout as it was when
+    /// they were looked for — did not hold, by their paths in it, `active`
+    /// among them when it was the tab in front: opened once the checkout
+    /// is somewhere else, and at once if it already is (David,
+    /// 2026-10-05: "It doesn't seem to remember what I had open if it was
+    /// an ignored file").
+    pub fn await_checkout(
+        self: &Rc<Self>,
+        base: &Path,
+        missing: Vec<PathBuf>,
+        active: Option<PathBuf>,
+    ) {
+        if missing.is_empty() {
+            return;
+        }
+        if self.workspace.checkout_path() != base {
+            self.open_in_checkout(missing, active);
+            return;
+        }
+        *self.awaiting.borrow_mut() = (missing, active);
+    }
+
+    /// Open `rels` — paths in the checkout — where it is now, those it
+    /// holds, `active` last so it is in front.
+    fn open_in_checkout(self: &Rc<Self>, rels: Vec<PathBuf>, active: Option<PathBuf>) {
+        let root = self.workspace.checkout_path();
+        let files = self.workspace.files();
+        let active = active.map(|rel| root.join(rel));
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let present = crate::runtime::runtime()
+                .spawn_blocking(move || {
+                    rels.into_iter()
+                        .map(|rel| root.join(rel))
+                        .filter(|path| files.is_file(path))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+            let Some(editor) = weak.upgrade() else { return };
+            for path in present.iter().filter(|p| Some(*p) != active.as_ref()) {
+                editor.open_at(path, None);
+            }
+            if let Some(active) = active.filter(|a| present.contains(a)) {
+                editor.open_at(&active, None);
+            }
+            editor.sync_git_state();
+        });
+    }
+
     pub fn relocate_checkout(self: &Rc<Self>, from: &Path, to: &Path) {
         let moves: Vec<(PathBuf, PathBuf, Option<u32>, Rc<EditorPage>)> = self
             .pages
@@ -3389,6 +3446,12 @@ impl Editor {
             if let Some((_, new, _, _)) = moves.iter().find(|(old, _, _, _)| *old == selected) {
                 self.open_at(new, None);
             }
+        }
+        // The last session's tabs the folder could not hold, where the
+        // checkout now is.
+        let (missing, active) = std::mem::take(&mut *self.awaiting.borrow_mut());
+        if !missing.is_empty() {
+            self.open_in_checkout(missing, active);
         }
         self.sync_git_state();
     }
@@ -4423,6 +4486,53 @@ pub(crate) fn apply_scheme_for_style(buffer: &sourceview5::Buffer) {
 
 #[cfg(test)]
 mod tests {
+    /// A tab the folder could not hold — an ignored file, only in the
+    /// checkout — opens once the checkout has arrived, and in front when
+    /// it was; and one handed over after the checkout moved opens at once.
+    #[test]
+    fn a_tab_the_folder_lacks_opens_when_the_checkout_arrives() {
+        crate::gtk_test::on_gtk_thread("await_checkout: no display — skipped", || {
+            let dir = std::env::temp_dir().join(format!("taste-await-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let folder = dir.join("folder");
+            let checkout = dir.join("checkout");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::create_dir_all(&checkout).unwrap();
+            std::fs::write(checkout.join(".env"), "SECRET=1\n").unwrap();
+            std::fs::write(checkout.join("notes.md"), "notes\n").unwrap();
+            let workspace = taste_core::Workspace::open(folder.clone());
+            let editor = super::Editor::new(workspace.clone());
+            let wait_for = |path: &std::path::Path| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !editor.pages.borrow().contains_key(path)
+                    && std::time::Instant::now() < deadline
+                {
+                    gtk::glib::MainContext::default().iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                editor.pages.borrow().contains_key(path)
+            };
+            editor.await_checkout(&folder, vec![".env".into()], Some(".env".into()));
+            assert!(
+                editor.pages.borrow().is_empty(),
+                "nothing opens before the checkout moves"
+            );
+            workspace.set_checkout(
+                taste_core::environment::Checkout::Local(checkout.clone()),
+                taste_core::files::Files::Local,
+            );
+            editor.relocate_checkout(&folder, &checkout);
+            assert!(
+                wait_for(&checkout.join(".env")),
+                "the held tab opens in the checkout"
+            );
+            // Handed over late, after the move: opened at once.
+            editor.await_checkout(&folder, vec!["notes.md".into()], None);
+            assert!(wait_for(&checkout.join("notes.md")));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     /// A change applied to a buffer is the lines that differ, as one step
     /// of the undo history, and the cursor stays with the text it was in:
     /// how an agent's edit and a reload from the disk both land.
