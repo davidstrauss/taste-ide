@@ -282,7 +282,16 @@ impl Worktree {
                 // the parent's answer as it is.
                 if status.values().any(|s| *s == FileState::Modified) {
                     if let Ok(subs) = self.git_ok(&taste_git::SUBMODULE_STATUS_ARGS) {
-                        status.extend(taste_git::status_from_submodule_porcelain(&subs));
+                        let subs = taste_git::status_from_submodule_porcelain(&subs);
+                        // A submodule whose files are listed is not listed
+                        // itself as well: that row is a folder posing as a
+                        // file, which opened as "EISDIR" from the Dirty list.
+                        status.retain(|path, _| {
+                            !subs
+                                .keys()
+                                .any(|inner| inner != path && inner.starts_with(path))
+                        });
+                        status.extend(subs);
                     }
                 }
                 Ok(status)
