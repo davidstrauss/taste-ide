@@ -332,6 +332,10 @@ fn main() -> glib::ExitCode {
                    color: @accent_color; }\n\
                  button.suggested-reply.suggested-reply-first { \
                    background-color: alpha(@accent_bg_color, 0.18); }\n\
+                 /* A pill at one line, a rounded box when a long reply \
+                    wraps to two — a capsule stretched that tall reads as \
+                    a blob. */\n\
+                 button.suggested-reply.pill-action { border-radius: 15px; }\n\
                  .review-bar { padding: 4px 10px; background-color: \
                    color-mix(in srgb, currentColor 5%, transparent); }\n\
                  /* A log bar's one action (a failed task's Prompt Agent): \

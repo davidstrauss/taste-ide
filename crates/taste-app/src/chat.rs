@@ -7000,8 +7000,17 @@ impl ChatPane {
             }
         }
         for (index, reply) in replies.iter().enumerate() {
-            let button = gtk::Button::builder()
+            // A label of its own, wrapping: a button's own label never
+            // wraps, so a reply longer than the column was cut off at its
+            // edge (David, 2026-10-05: "Long options cut off").
+            let label = gtk::Label::builder()
                 .label(reply)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .justify(gtk::Justification::Center)
+                .build();
+            let button = gtk::Button::builder()
+                .child(&label)
                 .tooltip_text(format!("Reply “{reply}”"))
                 .css_classes(if index == 0 {
                     vec!["pill-action", "suggested-reply", "suggested-reply-first"]
@@ -11115,10 +11124,12 @@ impl ChatPane {
             Ok("replies") => {
                 self.stop_button.set_visible(false);
                 self.set_busy(false);
+                // A long one among them: a reply wider than the column
+                // wraps rather than running off its edge.
                 self.offer_replies(vec![
                     "File it".to_string(),
                     "Change the title first".to_string(),
-                    "Start it on Sonnet".to_string(),
+                    "Use × for the no-marker too; change the template and record it".to_string(),
                 ]);
             }
             Ok("stopped") => {
