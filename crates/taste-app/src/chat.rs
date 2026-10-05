@@ -11263,6 +11263,27 @@ impl ChatPane {
             // `replies`: the turn over on a question, the agent's suggested
             // answers under it as buttons (`suggest_replies`).
             Ok("replies") => {
+                // The call that offered them, opened: its answer is a field
+                // whose value wraps, the row that once stood a page tall
+                // under its last line (2026-10-05).
+                let mut offered = ToolCall::new("probe-replies", "mcp__taste-ide__suggest_replies");
+                offered.kind = ToolKind::Other;
+                offered.status = ToolCallStatus::Completed;
+                offered.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                    TextContent::new(
+                        serde_json::json!({
+                            "shown": 3,
+                            "next": "The buttons appear under your last message when your \
+                                     turn ends. If your answer or the question is not \
+                                     written yet, write it now; then end your turn. The \
+                                     user's pick, or whatever they type instead, arrives as \
+                                     their next message."
+                        })
+                        .to_string(),
+                    ),
+                )))];
+                self.render_update(SessionUpdate::ToolCall(offered));
+                self.expand_tool_card_for_probe("probe-replies");
                 self.stop_button.set_visible(false);
                 self.set_busy(false);
                 // A long one among them: a reply wider than the column
@@ -13505,26 +13526,32 @@ fn json_fields(text: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// [`json_fields`] as a two-column list: the key dim, the value beside it.
-fn fields_grid(fields: &[(String, String)]) -> gtk::Grid {
-    let grid = gtk::Grid::builder()
-        .column_spacing(10)
-        .row_spacing(2)
+///
+/// Rows of boxes, the keys in one size group so the values stand in one
+/// column — not a `GtkGrid`, which measured a wrapping value's height at
+/// the value's narrowest, a character a line, whatever width it was then
+/// given: a two-field answer whose value was a paragraph stood eighteen
+/// hundred pixels tall under seventy-two pixels of text (David,
+/// 2026-10-05: "gigantic whitespace").
+fn fields_grid(fields: &[(String, String)]) -> gtk::Box {
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
         .css_classes(["result-fields"])
         .build();
-    for (row, (key, value)) in fields.iter().enumerate() {
-        grid.attach(
-            &gtk::Label::builder()
-                .label(key)
-                .xalign(0.0)
-                .yalign(0.0)
-                .css_classes(["caption", "dim-label"])
-                .build(),
-            0,
-            row as i32,
-            1,
-            1,
-        );
-        grid.attach(
+    let keys = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    for (key, value) in fields {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let key = gtk::Label::builder()
+            .label(key)
+            .xalign(0.0)
+            .yalign(0.0)
+            .valign(gtk::Align::Start)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        keys.add_widget(&key);
+        row.append(&key);
+        row.append(
             &gtk::Label::builder()
                 .label(value)
                 .xalign(0.0)
@@ -13536,13 +13563,10 @@ fn fields_grid(fields: &[(String, String)]) -> gtk::Grid {
                 .hexpand(true)
                 .css_classes(["caption"])
                 .build(),
-            1,
-            row as i32,
-            1,
-            1,
         );
+        list.append(&row);
     }
-    grid
+    list
 }
 
 /// An MCP tool's answer as the agent reports it: an object already, JSON
