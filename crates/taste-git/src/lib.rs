@@ -652,6 +652,19 @@ impl GitWorkspace {
         Ok(())
     }
 
+    /// The submodules `.gitmodules` declares: each one's name and path,
+    /// in the order the file gives them.
+    pub fn submodules(&self) -> Vec<(String, PathBuf)> {
+        self.repo
+            .submodules()
+            .map(|subs| {
+                subs.iter()
+                    .filter_map(|sub| Some((sub.name()?.to_string(), sub.path().to_path_buf())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn branch_name(&self) -> Option<String> {
         let head = self.repo.head().ok()?;
         head.shorthand().map(str::to_owned)
