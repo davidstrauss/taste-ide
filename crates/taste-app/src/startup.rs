@@ -510,9 +510,21 @@ impl StartupPage {
     /// one that was active is done, and the ones that never announced
     /// themselves were already true — and the log below switches to the
     /// one this step writes.
+    ///
+    /// Never backwards: a step announced after a later one has begun is
+    /// one that has already happened, said late — lit again, it spun above
+    /// a step that had finished after it (2026-10-05: "How did you connect
+    /// to the files service when it's still starting?").
     fn activate(self: &Rc<Self>, step: Step, detail: Option<&str>) {
         if !self.underway.get() || self.settled.get() {
             self.begin();
+        }
+        let passed = Step::ALL
+            .iter()
+            .filter(|s| **s > step)
+            .any(|later| matches!(self.row(*later).status.get(), Status::Active | Status::Done));
+        if passed {
+            return;
         }
         for earlier in Step::ALL.iter().filter(|s| **s < step) {
             let row = self.row(*earlier);
@@ -1054,6 +1066,28 @@ mod tests {
             substep_words("RUN dnf -y install        golang go-task just      nodejs"),
             "RUN dnf -y install golang go-task just nodejs"
         );
+    }
+
+    /// A step said late — after a later one has begun — is not lit again:
+    /// the files service's image announced once its connection had begun
+    /// spun above the finished step (2026-10-05).
+    #[test]
+    fn a_step_announced_late_does_not_light_again() {
+        crate::gtk_test::on_gtk_thread("startup steps: no display — skipped", || {
+            let page = super::StartupPage::new();
+            let preparing = |what: &str| taste_core::event::DevcontainerStateEvent::Preparing {
+                what: what.into(),
+            };
+            page.on_state(&preparing("connecting the files service"), false);
+            page.on_state(&preparing("placing the checkout in the VM"), false);
+            page.on_state(
+                &preparing("building the files service image (once per VM)"),
+                false,
+            );
+            assert_eq!(page.row(Step::ServiceImage).status.get(), Status::Done);
+            assert_eq!(page.row(Step::Files).status.get(), Status::Done);
+            assert_eq!(page.row(Step::Place).status.get(), Status::Active);
+        });
     }
 
     #[test]

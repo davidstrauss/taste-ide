@@ -2003,21 +2003,23 @@ impl EnvironmentRegistry {
         // VM").
         let baseline = crate::baseline::ensure_baseline_config()?;
         let building = !crate::image::image_exists(&substrate, &baseline);
-        if building {
-            self.primary()
-                .announce_preparing("building the files service image (once per VM)");
-            self.note_vm(
-                &vm.domain,
-                "building the files service image in the guest — once per VM, minutes the first time",
-            );
-        }
-        let domain = vm.domain.clone();
         // The primary's VM is the one the startup page is about.
         let primarys = self
             .substrate()
             .vm_details()
             .map(|v| v.domain.as_str() == vm.domain)
             == Some(true);
+        if building && primarys {
+            self.primary()
+                .announce_preparing("building the files service image (once per VM)");
+        }
+        if building {
+            self.note_vm(
+                &vm.domain,
+                "building the files service image in the guest — once per VM, minutes the first time",
+            );
+        }
+        let domain = vm.domain.clone();
         let started = std::time::Instant::now();
         let container =
             crate::keeper::ensure_container(&substrate, vm, &self.workspace_root, &|line| {
@@ -2035,6 +2037,10 @@ impl EnvironmentRegistry {
                     "Already built in this VM.".to_string()
                 },
             );
+        }
+        if primarys {
+            self.primary()
+                .announce_preparing("connecting the files service");
         }
         let connecting = std::time::Instant::now();
         let keeper = Keeper::in_container(&substrate, &container, format!("VM {}", vm.domain))?;
@@ -2878,12 +2884,16 @@ impl EnvironmentRegistry {
         // AdwApplicationWindow height", 2026-09-21). The VM's name is in
         // the Resources view for whoever wants it.
         if let Some(vm) = substrate.vm_details() {
+            // The files service's steps are announced by `keeper_for`, in
+            // their order: its image first, then the connection. Said here
+            // too, "connecting" came before "building the image", and the
+            // startup page lit a step it had already passed (2026-10-05:
+            // "How did you connect to the files service when it's still
+            // starting?").
             self.note_vm(
                 &vm.domain,
-                "the ladder resolved onto this VM; connecting the files service",
+                "the ladder resolved onto this VM; starting the files service",
             );
-            self.primary()
-                .announce_preparing("connecting the files service");
         }
         // The legacy scheme's containers were made before any checkout
         // could be in a VM, so they are wherever a local checkout runs.
