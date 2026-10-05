@@ -369,6 +369,31 @@ impl GitWorkspace {
         Ok(())
     }
 
+    /// Whether the IDE was the last to move `name`: its reflog's newest
+    /// entry is the IDE's (`taste-ide: …`, as [`Self::set_ref`] and the
+    /// mirror write them) and the ref is still where that entry left it.
+    /// A commit, a reset, a rebase, or a pull of the user's writes an entry
+    /// of its own, so a ref this says yes to holds nothing the user put
+    /// there — the checkout's copy of a branch, which may follow the
+    /// checkout wherever it goes, rewrites included (David, 2026-10-05: a
+    /// submodule rebased in Personal whose folder copy stayed on the old
+    /// commit, its files carried and its branch not). No reflog, or an
+    /// empty one, says no: nothing is known about who moved it.
+    pub fn moved_only_by_ide(&self, name: &str) -> Result<bool> {
+        let Some(now) = self.read_ref(name)? else {
+            return Ok(false);
+        };
+        let Ok(reflog) = self.repo.reflog(name) else {
+            return Ok(false);
+        };
+        Ok(reflog.get(0).is_some_and(|entry| {
+            entry.id_new() == now
+                && entry
+                    .message()
+                    .is_some_and(|message| message.starts_with("taste-ide"))
+        }))
+    }
+
     /// The first parent of `commit`, or `None` for a root commit. A
     /// snapshot commit's first parent is the HEAD it was taken on.
     pub fn first_parent(&self, commit: Oid) -> Result<Option<Oid>> {
@@ -500,6 +525,38 @@ impl GitWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ref the IDE set, and nobody moved since, is the IDE's; one the
+    /// user committed to is theirs.
+    #[test]
+    fn a_ref_last_moved_by_the_ide_is_known_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tree = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree).unwrap();
+        let first = repo
+            .commit(Some("HEAD"), &sig, &sig, "first", &tree, &[])
+            .unwrap();
+        let ws = crate::GitWorkspace::discover(dir.path()).unwrap();
+        ws.set_ref("refs/heads/side", first).unwrap();
+        assert!(ws.moved_only_by_ide("refs/heads/side").unwrap());
+        let parent = repo.find_commit(first).unwrap();
+        repo.commit(
+            Some("refs/heads/side"),
+            &sig,
+            &sig,
+            "mine",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        assert!(
+            !ws.moved_only_by_ide("refs/heads/side").unwrap(),
+            "the user committed"
+        );
+        assert!(!ws.moved_only_by_ide("refs/heads/none").unwrap());
+    }
     use std::fs;
     use std::path::Path;
 

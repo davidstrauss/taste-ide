@@ -888,6 +888,12 @@ pub fn sync_primary_peer_with(
                         }
                     } else if (ahead == 0 && behind > 0) || branch.starts_with("agents/") {
                         git.set_ref(&local, oid)?;
+                    } else if git.moved_only_by_ide(&local)? {
+                        // Rewritten in Personal — an agent's rebase — and
+                        // the folder's copy is the one the IDE last put
+                        // there, holding nothing of the user's: it follows,
+                        // as a branch checked out here would (2026-10-05).
+                        git.set_ref(&local, oid)?;
                     } else if ahead > 0 {
                         sync.note = Some(format!(
                             "this folder's {branch} has {ahead} commit(s) the checkout in the VM \
@@ -959,7 +965,8 @@ pub fn sync_primary_peer_with(
             // fast-forward (David, 2026-10-02: a finished rebase in the VM
             // sat as "diverged: 9 commit(s) here, 8282 there" while the
             // folder had not moved). The old tip stays in the reflog.
-            _ if checkout_branch.is_some() && git.unmoved_since_mirror(branch)? => {}
+            _ if checkout_branch.is_some()
+                && (git.unmoved_since_mirror(branch)? || git.moved_only_by_ide(&local)?) => {}
             // Diverged the other way: the folder rewrote the branch and the
             // checkout has not moved since the two last agreed, so the
             // rewrite goes there — the same rule, from this side.
@@ -1472,7 +1479,7 @@ fn mirror_into_folder(
         // ...unless the folder made none of them: a branch rewritten in the
         // checkout leaves the folder's old commits "ahead" of it, and they
         // are the checkout's own, from before the rebase.
-        if mine != tip && !git.unmoved_since_mirror(branch)? {
+        if mine != tip && !git.unmoved_since_mirror(branch)? && !git.moved_only_by_ide(&local)? {
             let (ahead, _) = git.ahead_behind(&local, &vm_ref)?;
             if ahead > 0 {
                 sync.note = Some(format!(
@@ -2589,6 +2596,86 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(folder.join("trace.log")).unwrap(),
             "log"
+        );
+    }
+
+    /// A branch rewritten in Personal — an agent's rebase — follows into
+    /// the folder when the folder's copy is the one the IDE last put
+    /// there; one the user has committed to since stays as it is.
+    #[test]
+    fn a_branch_rebased_in_personal_follows_where_the_folder_holds_nothing_of_its_own() {
+        let pair = Pair::new("rebased");
+        pair.git(
+            "checkout",
+            &["config", "receive.denyCurrentBranch", "updateInstead"],
+        );
+        let ssh = pair.dir.join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\nfor last; do :; done\nexec sh -c \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let keys = Keys::at(pair.dir.join("keys")).with_ssh_for_tests(&ssh);
+        let vm = Vm {
+            domain: "test".into(),
+            ssh_port: 22,
+            workspace_root: pair.dir.join("folder"),
+            state: crate::provision::DomainState::Running,
+            cloud: None,
+        };
+        let files = Files::Local;
+        let folder = pair.dir.join("folder");
+        let checkout = pair.dir.join("checkout");
+        let sync = || {
+            snapshot_in_checkout(&files, &checkout).unwrap();
+            sync_primary_peer_with(&folder, &vm, &keys, &files, &checkout, false, &|_, _, _| {})
+                .unwrap()
+        };
+        // Personal makes a branch; the folder is given its copy.
+        pair.git("checkout", &["branch", "side"]);
+        pair.git("checkout", &["switch", "-q", "side"]);
+        pair.write("checkout", "b.txt", "on the side\n");
+        pair.git("checkout", &["add", "-A"]);
+        pair.commit("checkout", "side work");
+        pair.git("checkout", &["switch", "-q", "main"]);
+        sync();
+        let before = pair.git("checkout", &["rev-parse", "side"]);
+        assert_eq!(pair.git("folder", &["rev-parse", "side"]), before);
+        // The agent rewrites it there.
+        pair.git("checkout", &["switch", "-q", "side"]);
+        pair.git(
+            "checkout",
+            &["commit", "-q", "--amend", "-m", "side work, rebased"],
+        );
+        pair.git("checkout", &["switch", "-q", "main"]);
+        let pass = sync();
+        let after = pair.git("checkout", &["rev-parse", "side"]);
+        assert_ne!(before, after);
+        assert_eq!(
+            pair.git("folder", &["rev-parse", "side"]),
+            after,
+            "the IDE's copy follows the rewrite: {pass:?}"
+        );
+        // The user commits to the folder's copy; the next rewrite leaves it.
+        pair.git("folder", &["switch", "-q", "side"]);
+        pair.write("folder", "c.txt", "mine\n");
+        pair.git("folder", &["add", "c.txt"]);
+        pair.commit("folder", "my own");
+        let mine = pair.git("folder", &["rev-parse", "side"]);
+        pair.git("folder", &["switch", "-q", "main"]);
+        pair.git("checkout", &["switch", "-q", "side"]);
+        pair.git(
+            "checkout",
+            &["commit", "-q", "--amend", "-m", "rewritten again"],
+        );
+        pair.git("checkout", &["switch", "-q", "main"]);
+        sync();
+        assert_eq!(
+            pair.git("folder", &["rev-parse", "side"]),
+            mine,
+            "the user's commit stays"
         );
     }
 
