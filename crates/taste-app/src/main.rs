@@ -42,6 +42,7 @@ mod hover;
 mod inset;
 mod intervention;
 mod issue_pill;
+mod languages;
 mod logview;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
@@ -233,6 +234,8 @@ fn main() -> glib::ExitCode {
         }
         gtk::Window::set_default_icon_name(APP_ID);
         crate::file_icons::init();
+        // Before any editor asks for a language (languages.rs).
+        crate::languages::register();
         // App-level styling: the chat prompt entry (transparent TextView in
         // an entry-shaped container, matching GNOME chat apps).
         // The composer wears the same treatment a selected tab gets, and
