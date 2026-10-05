@@ -104,8 +104,14 @@ struct EditorPage {
     /// How this file's bytes are reached: this host's filesystem, or the
     /// service of the VM its checkout is in.
     files: Files,
-    /// That checkout's mode, for the write policy.
-    origin_safe_mode: bool,
+    /// Another environment's checkout's mode, for the write policy, as it
+    /// was when the tab opened; `None` for the workspace's own file, whose
+    /// mode is asked at each write ([`Editor::safe_mode_of`]). Captured for
+    /// those too, it outlived the moment: a tab opened while the safe-mode
+    /// baseline stood in at startup went on refusing saves as "read-only in
+    /// safe mode" after the project's container came up (David,
+    /// 2026-10-05: "But I'm not in safe mode").
+    origin_safe_mode: Option<bool>,
     /// Set when this tab is a REVIEW of a branch rather than a file on
     /// disk: the two sides come out of the object database, and there is
     /// nothing here to save, reload or edit.
@@ -3086,10 +3092,7 @@ impl Editor {
                 .map(|(_, root, _)| root.clone())
                 .unwrap_or_else(|| self.workspace.checkout_path()),
             files: files_among(path, &self.access()),
-            origin_safe_mode: match &owner {
-                Some((_, _, safe_mode)) => *safe_mode,
-                None => !self.workspace.exec.is_container(),
-            },
+            origin_safe_mode: owner.as_ref().map(|(_, _, safe_mode)| *safe_mode),
             review,
             judgment,
         });
@@ -3564,7 +3567,7 @@ impl Editor {
                 textfile::save_via(
                     &page.files,
                     &page.origin_root,
-                    page.origin_safe_mode,
+                    self.safe_mode_of(&page),
                     path,
                     text,
                     &page.file_format(),
@@ -3812,6 +3815,14 @@ impl Editor {
     /// another environment's checkout is refused here, by name, before any
     /// bytes are rendered. The agent's own writes to that file do not come
     /// through here — see `persist_page`.
+    /// The mode a write to this tab's file is judged under, now: the
+    /// workspace's own as it stands at this moment, or another
+    /// environment's as the tab recorded it.
+    fn safe_mode_of(&self, page: &EditorPage) -> bool {
+        page.origin_safe_mode
+            .unwrap_or_else(|| !self.workspace.exec.is_container())
+    }
+
     fn save_page(&self, path: &Path, page: &EditorPage) -> Result<(), String> {
         // A review tab is a pair of blobs, not a file. There is nowhere for
         // a save to go, and the key it is filed under is not a path.
@@ -3853,7 +3864,7 @@ impl Editor {
         match textfile::save_via(
             &page.files,
             &page.origin_root,
-            page.origin_safe_mode,
+            self.safe_mode_of(page),
             path,
             &text,
             &page.file_format(),
