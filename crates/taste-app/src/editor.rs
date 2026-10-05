@@ -752,6 +752,11 @@ impl Editor {
         let weak = Rc::downgrade(&editor);
         editor.tabs.connect_selected_page_notify(move |tabs| {
             let Some(editor) = weak.upgrade() else { return };
+            // A change that landed while the tab was elsewhere has been
+            // seen now (`note_unseen_change`).
+            if let Some(page) = tabs.selected_page() {
+                page.set_needs_attention(false);
+            }
             // While a start is on screen it is the current tab, whatever
             // was clicked: the other tabs stay, dimmed, and take the
             // selection back when the start is over.
@@ -2681,7 +2686,26 @@ impl Editor {
             if let Ok(variant) = std::env::var("TASTE_PROBE_CHANGED") {
                 if std::env::var_os("TASTE_PROBE_CHECK").is_some() {
                     let surface = editor.surfaces.borrow().get(&viewer_key(&path)).cloned();
-                    if let Some(SurfaceKind::View(page)) = surface.as_ref().map(|s| &s.kind) {
+                    if variant == "unseen" {
+                        // Another tab in front, then a change to this one:
+                        // the mark a background tab wears.
+                        if let Some(surface) = surface {
+                            let other = path.with_file_name("sample.typ");
+                            editor.open_at(&other, None);
+                            let weak = Rc::downgrade(&editor);
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(800),
+                                move || {
+                                    let Some(editor) = weak.upgrade() else { return };
+                                    if let SurfaceKind::View(page) = &surface.kind {
+                                        page.pose_for_probe("pending");
+                                    }
+                                    editor.note_unseen_change(&surface.tab);
+                                },
+                            );
+                        }
+                    } else if let Some(SurfaceKind::View(page)) = surface.as_ref().map(|s| &s.kind)
+                    {
                         page.pose_for_probe(&variant);
                     }
                 }
@@ -3703,13 +3727,14 @@ impl Editor {
                 .borrow()
                 .get(&viewer_key(path))
                 .and_then(|surface| match &surface.kind {
-                    SurfaceKind::View(page) => Some(page.clone()),
+                    SurfaceKind::View(page) => Some((page.clone(), surface.tab.clone())),
                     _ => None,
                 });
-        if let Some(page) = viewer {
+        if let Some((page, tab)) = viewer {
             let files = files_among(path, &self.access());
             let read_path = path.to_path_buf();
             let weak = Rc::downgrade(&page);
+            let editor = Rc::downgrade(self);
             glib::spawn_future_local(async move {
                 let handle = crate::runtime::runtime().spawn_blocking(move || {
                     files
@@ -3720,7 +3745,11 @@ impl Editor {
                     return;
                 };
                 if let Some(page) = weak.upgrade() {
-                    page.file_changed(fingerprint);
+                    if page.file_changed(fingerprint) {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.note_unseen_change(&tab);
+                        }
+                    }
                 }
             });
             return;
@@ -3766,6 +3795,7 @@ impl Editor {
                 page.conflict_bar
                     .set_title("This file changed on disk while you have unsaved edits");
                 page.conflict_bar.set_revealed(true);
+                editor.note_unseen_change(&page.page);
                 return;
             }
             // The buffer will now mirror these bytes: a later write of the
@@ -3791,6 +3821,7 @@ impl Editor {
             page.plain.set(!highlighting_ok(&content));
             page.buffer.set_text(&content);
             page.buffer.set_modified(false);
+            editor.note_unseen_change(&page.page);
             // The reload resolves any earlier conflict warning.
             if page.warned.replace(false) {
                 page.conflict_bar.set_revealed(false);
@@ -3815,6 +3846,21 @@ impl Editor {
     /// another environment's checkout is refused here, by name, before any
     /// bytes are rendered. The agent's own writes to that file do not come
     /// through here — see `persist_page`.
+    /// A tab's file changed — reloaded by itself, or waiting on the user —
+    /// while the tab was not the one in front: it needs attention, which
+    /// the tab bar draws as a line under the tab, or lights the bar's edge
+    /// when the tab is scrolled out of sight (`AdwTabPage:needs-attention`,
+    /// the way GNOME Console marks a terminal's activity). Selecting the
+    /// tab clears it. A tab in front is being looked at, and gets nothing
+    /// (David, 2026-10-05: "Tabs with (1) changes to the file outside the
+    /// IDE or (2) where the IDE has auto-reloaded the file but it hasn't
+    /// been viewed yet should have some sort of indicator or badge").
+    fn note_unseen_change(&self, tab: &adw::TabPage) {
+        if self.tabs.selected_page().as_ref() != Some(tab) {
+            tab.set_needs_attention(true);
+        }
+    }
+
     /// The mode a write to this tab's file is judged under, now: the
     /// workspace's own as it stands at this moment, or another
     /// environment's as the tab recorded it.

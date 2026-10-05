@@ -315,7 +315,9 @@ impl ViewerPage {
                     auto.set_active(true);
                 }
             }
-            _ => self.file_changed(self.shown.get().wrapping_add(1)),
+            _ => {
+                self.file_changed(self.shown.get().wrapping_add(1));
+            }
         }
     }
 
@@ -342,10 +344,11 @@ impl ViewerPage {
     /// The file on disk now has bytes of `fingerprint`: when they are not
     /// the ones shown, reload — by itself, when the bar's toggle is on — or
     /// say so and offer it. An event about the file that changed nothing —
-    /// a touch, its creation seen late — does nothing.
-    pub fn file_changed(&self, fingerprint: u64) {
+    /// a touch, its creation seen late — does nothing. Says whether the
+    /// file had changed.
+    pub fn file_changed(&self, fingerprint: u64) -> bool {
         if fingerprint == self.shown.get() {
-            return;
+            return false;
         }
         if self.auto.get() {
             self.reload_now();
@@ -353,6 +356,7 @@ impl ViewerPage {
             self.pending.set(true);
             self.sync_bar();
         }
+        true
     }
 
     /// Show `loaded`, replacing whatever was shown; nothing waits now.
