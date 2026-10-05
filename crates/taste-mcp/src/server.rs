@@ -201,7 +201,7 @@ impl McpServer {
              You are confined outside the IDE's process space (see \
              $TASTE_IDE_CONFINEMENT) — never infer IDE state from your own /proc; ask \
              the environment tool instead (it answering at all proves the IDE is alive). \
-             Your tools are the ones this server lists plus your file tools; there are \
+             Your tools are the ones this server lists plus your agent's own; there are \
              no skills, slash commands, or plugins here. Verify UI changes with ide_screenshot and \
              ide_widget_geometry rather than asking the user what rendered; check \
              ide_app_log for GTK warnings after UI work; check ide_permission_log \
@@ -212,8 +212,8 @@ impl McpServer {
              finds code by what it MEANS, so ask it in words when you do not know the \
              words the code uses), ide_exec is your shell (it runs in your environment's \
              devcontainer, so your build is the user's build), and files are read and \
-             written over ACP fs/read_text_file and fs/write_text_file, which see the \
-             user's unsaved editor buffers. INSPECT THROUGH THOSE CALLS, NEVER \
+             changed with ide_read_file, ide_edit_file, and ide_write_file, which work \
+             in the user's open editor buffers, unsaved edits included. INSPECT THROUGH THOSE CALLS, NEVER \
              THROUGH THE SHELL: ide_exec is for RUNNING things — builds, tests, probes, \
              git — and reaching into it for cat, sed, head, grep, or find to look at \
              this project's files is wrong twice over, because the user supervises this \
@@ -238,6 +238,8 @@ impl McpServer {
              are likeliest to give, so they can answer with a click. Each reply names \
              what it chooses, so it reads right with only the question above it.",
         );
+        text.push_str("\n\n");
+        text.push_str(&self.memory_section());
         if env.is_primary() {
             // The brief is one text, kept in taste-core, because the chat
             // puts it before the coordinator's first prompt as well: not
@@ -246,6 +248,34 @@ impl McpServer {
             text.push_str(&taste_core::orchestration::coordinator_brief());
         }
         text
+    }
+
+    /// The project's memory as an agent starts with it: what the tools are
+    /// for, and the index of the notes kept so far (`taste_core::memory`),
+    /// read once per connection, which is once per session.
+    fn memory_section(&self) -> String {
+        let index = self.memory().index();
+        let mut text = String::from(
+            "MEMORY. This project keeps notes for you across sessions and environments, \
+             on the user's machine. memory_save keeps something worth knowing next time \
+             (a name, a one-line description, the note); memory_read reads one; \
+             memory_delete removes one that is wrong. One fact to a note: update a note \
+             rather than adding a second.",
+        );
+        if index.is_empty() {
+            text.push_str(
+                " There are none yet. If you kept notes before under \
+                 ~/.claude/projects/*/memory/ in your home, save each with memory_save.",
+            );
+        } else {
+            text.push_str(" The notes:\n");
+            text.push_str(index.trim_end());
+        }
+        text
+    }
+
+    fn memory(&self) -> taste_core::memory::Memory {
+        taste_core::memory::Memory::for_workspace(self.workspace.root())
     }
 
     /// The `environment` tool: where the caller is and how its environment
@@ -928,6 +958,48 @@ impl McpServer {
                         "content": { "type": "string", "description": "the file's whole new text" }
                     },
                     "required": ["path", "content"]
+                }),
+            ),
+            // The project's memory: the agent's own notes, kept by the IDE
+            // on the user's machine and shared by every environment
+            // (`taste_core::memory`), in place of Claude Code's, which lived
+            // in one environment's home in the VM.
+            tool(
+                "memory_list",
+                "List this project's memory: every note's name and description.",
+                empty.clone(),
+            ),
+            tool(
+                "memory_read",
+                "Read one note of this project's memory by name.",
+                json!({
+                    "type": "object",
+                    "properties": { "name": { "type": "string", "description": "the note's name" } },
+                    "required": ["name"]
+                }),
+            ),
+            tool(
+                "memory_save",
+                "Keep a note in this project's memory for later sessions, replacing a \
+                 note of the same name. One fact to a note.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "lowercase words joined by hyphens, e.g. typst-build-steps" },
+                        "description": { "type": "string", "description": "one line: what the note is about" },
+                        "body": { "type": "string", "description": "the note" }
+                    },
+                    "required": ["name", "description", "body"]
+                }),
+            ),
+            tool(
+                "memory_delete",
+                "Remove a note from this project's memory, when it is wrong or no \
+                 longer true.",
+                json!({
+                    "type": "object",
+                    "properties": { "name": { "type": "string", "description": "the note's name" } },
+                    "required": ["name"]
                 }),
             ),
             tool(
@@ -1706,6 +1778,54 @@ impl McpServer {
                 }))
             }
             "ide_edit_file" | "ide_write_file" => self.write_file_tool(env, name, &args).await,
+            "memory_list" | "memory_read" | "memory_save" | "memory_delete" => {
+                let memory = self.memory();
+                let name_arg = || -> Result<String> {
+                    Ok(arg(&args, &["name"])
+                        .as_str()
+                        .context("needs `name`: the note's name, from memory_list")?
+                        .trim()
+                        .to_string())
+                };
+                let tool = name.to_string();
+                let name = if tool == "memory_list" {
+                    String::new()
+                } else {
+                    name_arg()?
+                };
+                let description = args["description"].as_str().unwrap_or_default().to_string();
+                let body = args["body"].as_str().unwrap_or_default().to_string();
+                // Small files on this machine's disk, off the reactor all
+                // the same.
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    Ok(match tool.as_str() {
+                        "memory_list" => json!({
+                            "notes": memory
+                                .list()
+                                .into_iter()
+                                .map(|n| json!({ "name": n.name, "description": n.description }))
+                                .collect::<Vec<_>>()
+                        }),
+                        "memory_read" => {
+                            let (description, body) =
+                                memory.read(&name).map_err(|e| anyhow::anyhow!(e))?;
+                            json!({ "name": name, "description": description, "body": body })
+                        }
+                        "memory_save" => {
+                            let fresh = memory
+                                .save(&name, &description, &body)
+                                .map_err(|e| anyhow::anyhow!(e))?;
+                            json!({ "saved": name, "new": fresh })
+                        }
+                        _ => {
+                            let removed = memory.delete(&name).map_err(|e| anyhow::anyhow!(e))?;
+                            json!({ "deleted": name, "existed": removed })
+                        }
+                    })
+                })
+                .await
+                .context("the memory call did not finish")?
+            }
             "ide_open_file" => {
                 let path = self.checkout_file(env, &args, "ide_open_file")?;
                 let line = args["line"].as_u64().map(|l| l as u32);
@@ -7112,6 +7232,56 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[1], (3, b"PNG3".to_vec(), "three".to_string()));
         assert!(parse_pdf_pages("no-poppler\n").is_none());
+    }
+
+    /// The project's memory, through its tools: a note saved is listed and
+    /// read, the next connection's instructions carry it, a name that
+    /// could be a path is refused, and a note deleted is gone.
+    #[tokio::test]
+    async fn the_memory_tools_keep_the_projects_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, workspace) = start_test_server(dir.path()).await;
+        let memory = taste_core::memory::Memory::for_workspace(workspace.root());
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        async fn init(stream: &mut UnixStream) -> String {
+            let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+            roundtrip(stream, request).await["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+        assert!(init(&mut stream).await.contains("There are none yet"));
+
+        let saved = call_tool(
+            &mut stream,
+            "memory_save",
+            json!({"name": "typst-build", "description": "How the slides build", "body": "task build"}),
+        )
+        .await;
+        assert_eq!(saved["new"], true, "{saved}");
+        let listed = call_tool(&mut stream, "memory_list", json!({})).await;
+        assert_eq!(listed["notes"][0]["name"], "typst-build");
+        let read = call_tool(&mut stream, "memory_read", json!({"name": "typst-build"})).await;
+        assert_eq!(read["body"], "task build");
+        let mut fresh = UnixStream::connect(&socket).await.unwrap();
+        assert!(init(&mut fresh)
+            .await
+            .contains("- typst-build — How the slides build"));
+
+        let refused = call_tool(
+            &mut stream,
+            "memory_save",
+            json!({"name": "../escape", "description": "d", "body": "b"}),
+        )
+        .await;
+        assert!(refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a note name"));
+        let deleted = call_tool(&mut stream, "memory_delete", json!({"name": "typst-build"})).await;
+        assert_eq!(deleted["existed"], true);
+        assert!(memory.list().is_empty());
+        let _ = std::fs::remove_dir_all(memory.dir().parent().unwrap());
     }
 
     /// With no window, the file tools read and change the disk through

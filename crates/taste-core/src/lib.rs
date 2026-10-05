@@ -18,6 +18,7 @@ pub mod ide_state;
 pub mod instance;
 pub mod logfile;
 pub mod mcp;
+pub mod memory;
 pub mod orchestration;
 pub mod podman;
 pub mod policy;

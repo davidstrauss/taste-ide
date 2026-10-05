@@ -213,6 +213,12 @@ fn exec_in_environment(
         env!("CARGO_PKG_VERSION").to_string(),
     ));
     env.push(("TASTE_IDE_CONFINEMENT".into(), CONFINEMENT.into()));
+    if is_claude_code(spec) {
+        env.push((
+            "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH".into(),
+            CLAUDE_MCP_TEXT_LIMIT.into(),
+        ));
+    }
     // The spec's own environment last, so the auth proxy's placeholder
     // rides in. `ANTHROPIC_BASE_URL` is deliberately NOT filtered out here
     // — the forwarder overwrites it with the port it actually listened on,
@@ -275,8 +281,23 @@ fn exec_in_environment(
 /// `permissions.deny` setting. Search (Glob, Grep) and the shell stay.
 pub const CLAUDE_DENIED_TOOLS: [&str; 4] = ["Read", "Edit", "Write", "MultiEdit"];
 
-/// And the IDE's read, allowed without asking, as Read was.
-pub const CLAUDE_ALLOWED_TOOLS: [&str; 1] = ["mcp__taste-ide__ide_read_file"];
+/// And the IDE's read, allowed without asking, as Read was — and the
+/// project's memory, the agent's own notes, which it kept without asking.
+pub const CLAUDE_ALLOWED_TOOLS: [&str; 5] = [
+    "mcp__taste-ide__ide_read_file",
+    "mcp__taste-ide__memory_list",
+    "mcp__taste-ide__memory_read",
+    "mcp__taste-ide__memory_save",
+    "mcp__taste-ide__memory_delete",
+];
+
+/// How long an MCP server's instructions and tool descriptions may be
+/// before Claude Code cuts them, through its documented
+/// `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`. Its default, 2,048 characters,
+/// took the IDE's instructions off after their first paragraph — the
+/// backlog, the replies, the coordinator's brief, and the project's memory
+/// all past it (2026-10-05).
+const CLAUDE_MCP_TEXT_LIMIT: &str = "32768";
 
 /// Run before the agent: `$1` a directory for the front of `PATH` (empty
 /// for none), `$2` the settings script, the agent's command after. A
@@ -291,8 +312,12 @@ fn is_claude_code(spec: &AgentSpec) -> bool {
 
 /// The node program that merges [`CLAUDE_DENIED_TOOLS`] and
 /// [`CLAUDE_ALLOWED_TOOLS`] into `~/.claude/settings.json` — the agent's
-/// own home, its environment's volume — keeping whatever else is there.
-/// A file that does not parse is left alone rather than replaced.
+/// own home, its environment's volume — keeping whatever else is there,
+/// and turns Claude Code's own auto memory off (`autoMemoryEnabled`): the
+/// project's memory is the IDE's, on the user's machine, shared by every
+/// environment (`taste_core::memory`), where Claude Code's was a
+/// directory in this one environment's home, in the VM. A file that does
+/// not parse is left alone rather than replaced.
 fn claude_settings_script() -> String {
     let list = |tools: &[&str]| serde_json::to_string(tools).unwrap_or_else(|_| "[]".into());
     format!(
@@ -302,7 +327,7 @@ fn claude_settings_script() -> String {
          if(fs.existsSync(f)){{try{{s=JSON.parse(fs.readFileSync(f,'utf8'))}}catch(e){{process.exit(0)}}}}\
          const p=s.permissions=s.permissions||{{}};\
          const add=(k,v)=>{{p[k]=[...new Set([...(p[k]||[]),...v])]}};\
-         add('deny',{deny});add('allow',{allow});\
+         add('deny',{deny});add('allow',{allow});s.autoMemoryEnabled=false;\
          fs.mkdirSync(path.dirname(f),{{recursive:true}});\
          fs.writeFileSync(f+'.taste-part',JSON.stringify(s,null,2)+'\\n');\
          fs.renameSync(f+'.taste-part',f);",
@@ -675,10 +700,12 @@ mod tests {
             merged["permissions"]["deny"],
             serde_json::json!(["Bash(rm:*)", "Read", "Edit", "Write", "MultiEdit"])
         );
+        assert_eq!(merged["permissions"]["allow"][0], "Bash(ls:*)");
         assert_eq!(
-            merged["permissions"]["allow"],
-            serde_json::json!(["Bash(ls:*)", "mcp__taste-ide__ide_read_file"])
+            merged["permissions"]["allow"][1],
+            "mcp__taste-ide__ide_read_file"
         );
+        assert_eq!(merged["autoMemoryEnabled"], false);
         std::fs::write(&file, "{ not json").unwrap();
         run();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ not json");

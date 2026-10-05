@@ -158,6 +158,9 @@ pub fn effect(tool: &str) -> Effect {
         // does: from the buffer the user has open when there is one.
         "ide_read_file" => Effect::Read,
         "ide_edit_file" | "ide_write_file" => Effect::Write,
+        // The project's memory: the agent's own notes, on this machine.
+        "memory_list" | "memory_read" => Effect::Read,
+        "memory_save" | "memory_delete" => Effect::Write,
         // Draws buttons under the agent's own message; touches nothing, and
         // a click is the user choosing, which is the opposite of a
         // permission it would need.

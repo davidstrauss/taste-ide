@@ -2007,6 +2007,17 @@ Tool surface:
   service's poppler (`pages`, as Claude Code's Read took them: a short PDF
   whole, at most twenty at a time). They stand in for Claude Code's own
   file tools (Client-side services, above).
+- `memory_list` / `memory_read` / `memory_save` / `memory_delete` — the
+  project's memory: an agent's notes to itself across sessions, one
+  Markdown file a note in the workspace's state directory on the user's
+  machine (`taste_core::memory`), shared by every environment of the
+  project, the index handed to each agent in the server's instructions
+  as its session starts. They replace Claude Code's own auto memory,
+  which lived in one environment's home in the VM and is turned off
+  (`autoMemoryEnabled: false`) by the same settings merge that turns its
+  file tools off. Those instructions run far past Claude Code's default
+  2,048-character cut for an MCP server's, so the agent is started with
+  `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` raised (`taste_acp::relocate`).
 - `ide_list_files` / `ide_search` — the agent's `ls` and `grep`. The
   workspace is not mounted where the agent runs, so the IDE enumerates and
   searches it: `.gitignore` honored, `.git` and binaries skipped, absolute
