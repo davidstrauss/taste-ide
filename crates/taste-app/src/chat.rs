@@ -609,12 +609,13 @@ pub struct ChatPane {
     /// Offered during the turn, shown when it ends: a question is answered
     /// once it has been asked, not while the agent is still writing it.
     pending_replies: RefCell<Vec<String>>,
-    /// Renders this turn's last response whole, when it was clipped: the
-    /// replies answer what it asked, and a question cut to "… 2 more
-    /// lines" left buttons like "Yes, write all of it" pointing at a list
-    /// nobody could see (2026-10-02). Taken when the replies are drawn;
-    /// dropped by the next response, which is the last one then.
-    unclip_last: RefCell<Option<Box<dyn Fn()>>>,
+    /// Renders the turn's answer whole — each response since its last step
+    /// of work that was clipped: the replies answer what it said, and a
+    /// question cut to "… 2 more lines" left buttons like "Yes, write all
+    /// of it" pointing at a list nobody could see (2026-10-02). Taken when
+    /// the replies are drawn; emptied by a step of work, or a prompt,
+    /// after which what came before is not the answer.
+    unclip_answer: RefCell<Vec<Box<dyn Fn()>>>,
     /// The card's answer buttons, rebuilt per request from the options the
     /// agent offered — every one of them, which is the whole of i-0025.
     permission_answers: adw::WrapBox,
@@ -3262,7 +3263,7 @@ impl ChatPane {
             replies_bar,
             replies_box,
             pending_replies: RefCell::new(Vec::new()),
-            unclip_last: RefCell::new(None),
+            unclip_answer: RefCell::new(Vec::new()),
             revive_bar,
             revive_label,
             revive_queue: RefCell::new(std::collections::VecDeque::new()),
@@ -7007,10 +7008,15 @@ impl ChatPane {
             self.replies_box.remove(&child);
         }
         let replies = self.pending_replies.borrow().clone();
-        // The replies answer the turn's last response: shown whole, so
-        // what they choose between is on screen above them.
+        // The replies answer the turn's answer: every response since its
+        // last step of work, shown whole, so what they choose between is
+        // on screen above them. Not the last response alone: an agent that
+        // wrote its answer, offered the replies, and then asked its
+        // question in a line of its own left the answer clipped, and the
+        // replies naming "all six" of a list nobody could see (David,
+        // 2026-10-05: "Which 'all six'?").
         if !replies.is_empty() {
-            if let Some(unclip) = self.unclip_last.borrow_mut().take() {
+            for unclip in self.unclip_answer.borrow_mut().drain(..) {
                 unclip();
             }
         }
@@ -7402,6 +7408,8 @@ impl ChatPane {
         // update writes a new card below this one instead of rewriting the
         // last turn's checklist further up the transcript.
         self.plan_card.borrow_mut().take();
+        // And its answer: the last turn's is not this one's.
+        self.unclip_answer.borrow_mut().clear();
         self.record_line("you", text);
         // A prompt ends the turn before it: the timeline's line stops at
         // the last step's dot, and the prompt takes the full width below
@@ -7742,7 +7750,7 @@ impl ChatPane {
                 let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
                 body.set_hexpand(true);
                 body.append(&rendered);
-                *self.unclip_last.borrow_mut() = (hidden > 0).then(|| {
+                let unclip = (hidden > 0).then(|| {
                     let body = body.downgrade();
                     let whole = text.clone();
                     let issues = self.issues.clone();
@@ -7759,6 +7767,9 @@ impl ChatPane {
                         ));
                     }) as Box<dyn Fn()>
                 });
+                if let Some(unclip) = unclip {
+                    self.unclip_answer.borrow_mut().push(unclip);
+                }
                 if hidden > 0 {
                     let key = next_doc_key("response");
                     if let Some(row) = slot.parent().and_downcast::<gtk::ListBoxRow>() {
@@ -10520,6 +10531,12 @@ impl ChatPane {
                 }
             }
             SessionUpdate::ToolCall(mut call) => {
+                // A step of work: what was said before it is not the
+                // answer the replies, if any, will be about. Offering the
+                // replies is not work.
+                if mcp_tool_name(&call.title).as_deref() != Some("suggest_replies") {
+                    self.unclip_answer.borrow_mut().clear();
+                }
                 // An edit through the IDE's tools reads as the edit it is.
                 if is_ide_edit_title(&call.title) {
                     self.ide_edit_calls
@@ -11263,6 +11280,36 @@ impl ChatPane {
             // `replies`: the turn over on a question, the agent's suggested
             // answers under it as buttons (`suggest_replies`).
             Ok("replies") => {
+                // The answer, long enough to clip, with the list the
+                // replies choose from in its tail; then the call that
+                // offers them, then the question in a line of its own —
+                // which once left the answer clipped above the buttons
+                // (2026-10-05: "Which 'all six'?").
+                let mut answer = String::from(
+                    "Both commits are in. Neither is pushed.\n\n## What to move into the \
+                     template\n\nRoughly in order of value:\n\n",
+                );
+                for (n, item) in [
+                    "The diagram helpers: node icons, chevron loops, staircase labels",
+                    "The face crops for the people slides",
+                    "The title slide's leading",
+                    "The speaker-notes layout",
+                    "The colour tokens the deck redefines",
+                    "The footer with the event's name",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    answer.push_str(&format!(
+                        "{}. **{item}.** Used on several slides.\n\n",
+                        n + 1
+                    ));
+                }
+                answer.push_str(&"Each of these is deck-agnostic.\n\n".repeat(6));
+                self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(answer)),
+                )));
+                self.finalize_stream();
                 // The call that offered them, opened: its answer is a field
                 // whose value wraps, the row that once stood a page tall
                 // under its last line (2026-10-05).
@@ -11284,6 +11331,12 @@ impl ChatPane {
                 )))];
                 self.render_update(SessionUpdate::ToolCall(offered));
                 self.expand_tool_card_for_probe("probe-replies");
+                self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(
+                        "Should I make those template changes now, or put them on the backlog?",
+                    )),
+                )));
+                self.finalize_stream();
                 self.stop_button.set_visible(false);
                 self.set_busy(false);
                 // A long one among them: a reply wider than the column
@@ -11291,7 +11344,7 @@ impl ChatPane {
                 self.offer_replies(vec![
                     "File it".to_string(),
                     "Change the title first".to_string(),
-                    "Use × for the no-marker too; change the template and record it".to_string(),
+                    "Move all six into the template".to_string(),
                 ]);
             }
             Ok("stopped") => {
