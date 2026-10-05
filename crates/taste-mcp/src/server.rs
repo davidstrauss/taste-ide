@@ -886,13 +886,15 @@ impl McpServer {
                 "ide_read_file",
                 "Read a file: its text with line numbers, from the user's editor when \
                  it is open there (unsaved edits included), else from disk. Images \
-                 come back as images. Use this before ide_edit_file.",
+                 come back as images; a PDF as each page's text and picture. Use this \
+                 before ide_edit_file.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "workspace-relative or absolute path" },
                         "offset": { "type": "integer", "minimum": 1, "description": "first line to return (default 1)" },
-                        "limit": { "type": "integer", "minimum": 1, "description": "lines to return (default 2000)" }
+                        "limit": { "type": "integer", "minimum": 1, "description": "lines to return (default 2000)" },
+                        "pages": { "type": "string", "description": "PDF pages, e.g. \"3\" or \"2-5\"; at most 20, and required past 10 pages" }
                     },
                     "required": ["path"]
                 }),
@@ -4358,6 +4360,13 @@ impl McpServer {
                 "webp" => Some("image/webp"),
                 _ => None,
             });
+        let pdf = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+        if pdf {
+            return read_pdf(&files, &path, args).await;
+        }
         let read = {
             let (files, path) = (files.clone(), path.clone());
             move || files.read(&path)
@@ -4402,11 +4411,8 @@ impl McpServer {
                     .await
                     .context("the read did not finish")?
                     .with_context(|| format!("reading {shown}"))?;
-                String::from_utf8(bytes).map_err(|_| {
-                    anyhow::anyhow!(
-                        "{shown} is not text. For a PDF, run `pdftotext FILE -` with ide_exec"
-                    )
-                })?
+                String::from_utf8(bytes)
+                    .map_err(|_| anyhow::anyhow!("{shown} is not text, an image, or a PDF"))?
             }
         };
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
@@ -5268,6 +5274,154 @@ pub async fn stdio_bridge(socket: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run where the PDF is, with its path, and a first and last page: the
+/// page count, then for each page asked its picture (PNG, 100 dpi) and
+/// its text, each base64 on a line of its own. With no pages asked, the
+/// count alone. `no-poppler` when the files service has no PDF tools.
+const PDF_SCRIPT: &str = r#"f="$1"; first="$2"; last="$3"
+command -v pdftoppm >/dev/null 2>&1 || { echo no-poppler; exit 0; }
+n=$(pdfinfo "$f" 2>/dev/null | awk '/^Pages:/{print $2}')
+echo "pages ${n:-0}"
+[ -n "$first" ] || exit 0
+p=$first
+while [ "$p" -le "$last" ]; do
+  echo "page $p"
+  pdftoppm -png -r 100 -f "$p" -l "$p" -singlefile "$f" | base64 -w0; echo
+  pdftotext -layout -f "$p" -l "$p" "$f" - | base64 -w0; echo
+  p=$((p+1))
+done
+"#;
+
+/// Pages a call may return at once.
+const PDF_PAGES_AT_ONCE: u32 = 20;
+
+/// A PDF short enough to come whole without `pages`.
+const PDF_WHOLE_UP_TO: u32 = 10;
+
+/// The pages to read of a PDF `count` pages long: `spec` as `3` or `2-5`,
+/// or the whole of a short one. The errors say what to pass instead.
+fn pdf_page_range(spec: Option<&str>, count: u32, shown: &str) -> Result<(u32, u32)> {
+    if count == 0 {
+        anyhow::bail!("{shown} has no pages that can be read");
+    }
+    let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+        if count <= PDF_WHOLE_UP_TO {
+            return Ok((1, count));
+        }
+        anyhow::bail!(
+            "{shown} has {count} pages; pass `pages`, e.g. \"1-5\", at most \
+             {PDF_PAGES_AT_ONCE} at a time"
+        );
+    };
+    let (first, last) = match spec.split_once('-') {
+        Some((a, b)) => (a.trim().parse::<u32>(), b.trim().parse::<u32>()),
+        None => (spec.parse::<u32>(), spec.parse::<u32>()),
+    };
+    let (Ok(first), Ok(last)) = (first, last) else {
+        anyhow::bail!("`pages` is a page or a range, e.g. \"3\" or \"2-5\"; got {spec:?}");
+    };
+    if first == 0 || first > last || first > count {
+        anyhow::bail!("{shown} has pages 1-{count}; {spec:?} is not among them");
+    }
+    let last = last.min(count);
+    if last - first + 1 > PDF_PAGES_AT_ONCE {
+        anyhow::bail!(
+            "at most {PDF_PAGES_AT_ONCE} pages at a time; {spec:?} is {}",
+            last - first + 1
+        );
+    }
+    Ok((first, last))
+}
+
+/// [`PDF_SCRIPT`]'s output: the page count, and each page's picture and
+/// text. `None` when the files service has no PDF tools.
+/// One page of a PDF as read: its number, its picture (PNG), its text.
+type PdfPage = (u32, Vec<u8>, String);
+
+fn parse_pdf_pages(out: &str) -> Option<(u32, Vec<PdfPage>)> {
+    use base64::Engine;
+    let decode = |line: Option<&str>| {
+        base64::engine::general_purpose::STANDARD
+            .decode(line.unwrap_or_default().trim())
+            .unwrap_or_default()
+    };
+    let mut lines = out.lines();
+    let first = lines.next()?.trim();
+    if first == "no-poppler" {
+        return None;
+    }
+    let count = first.strip_prefix("pages ")?.trim().parse().unwrap_or(0);
+    let mut pages = Vec::new();
+    while let Some(line) = lines.next() {
+        let Some(number) = line
+            .strip_prefix("page ")
+            .and_then(|n| n.trim().parse().ok())
+        else {
+            continue;
+        };
+        let png = decode(lines.next());
+        let text = String::from_utf8_lossy(&decode(lines.next())).into_owned();
+        pages.push((number, png, text));
+    }
+    Some((count, pages))
+}
+
+/// `ide_read_file` for a PDF: the pages asked — or the whole of a short
+/// one — each as its text and its picture, which is how a slide, a
+/// figure, or a scanned page is read at all. Rendered where the file is,
+/// by the files service.
+async fn read_pdf(files: &taste_core::files::Files, path: &Path, args: &Value) -> Result<Value> {
+    use base64::Engine;
+    let shown = path.display().to_string();
+    let cwd = path.parent().unwrap_or(path).to_path_buf();
+    let run = |first: String, last: String| {
+        let (files, cwd) = (files.clone(), cwd.clone());
+        let argv: Vec<String> = vec![
+            "sh".into(),
+            "-c".into(),
+            PDF_SCRIPT.into(),
+            "taste-pdf".into(),
+            path.display().to_string(),
+            first,
+            last,
+        ];
+        async move {
+            tokio::task::spawn_blocking(move || files.exec(&cwd, &argv))
+                .await
+                .context("the PDF read did not finish")?
+                .context("reading the PDF")
+        }
+    };
+    let unable = || {
+        anyhow::anyhow!(
+            "this environment's files service cannot read PDFs yet; it can once the IDE \
+             restarts"
+        )
+    };
+    let counted = run(String::new(), String::new()).await?;
+    let (count, _) = parse_pdf_pages(&counted.stdout_utf8()).ok_or_else(unable)?;
+    let (first, last) = pdf_page_range(args["pages"].as_str(), count, &shown)?;
+    let read = run(first.to_string(), last.to_string()).await?;
+    let (_, pages) = parse_pdf_pages(&read.stdout_utf8()).ok_or_else(unable)?;
+    let mut content = vec![json!({
+        "type": "text",
+        "text": format!("{shown}: pages {first}-{last} of {count}"),
+    })];
+    for (number, png, text) in pages {
+        content.push(
+            json!({ "type": "text", "text": format!("Page {number}:\n{}", text.trim_end()) }),
+        );
+        if !png.is_empty() {
+            content.push(json!({
+                "type": "image",
+                "data": base64::engine::general_purpose::STANDARD.encode(&png),
+                "mimeType": "image/png",
+            }));
+        }
+    }
+    Ok(json!({ "content": content }))
 }
 
 #[cfg(test)]
@@ -6923,6 +7077,41 @@ mod tests {
         assert_eq!(content[0]["data"], "iQ=="); // base64 of [137]
         let meta: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
         assert_eq!(meta["width"], 640);
+    }
+
+    #[test]
+    fn pdf_pages_are_a_page_a_range_or_a_short_whole() {
+        assert_eq!(pdf_page_range(None, 4, "a.pdf").unwrap(), (1, 4));
+        assert!(pdf_page_range(None, 30, "a.pdf")
+            .unwrap_err()
+            .to_string()
+            .contains("30 pages"));
+        assert_eq!(pdf_page_range(Some("3"), 30, "a.pdf").unwrap(), (3, 3));
+        assert_eq!(
+            pdf_page_range(Some("28-40"), 30, "a.pdf").unwrap(),
+            (28, 30)
+        );
+        assert!(pdf_page_range(Some("1-21"), 30, "a.pdf").is_err());
+        assert!(pdf_page_range(Some("31"), 30, "a.pdf").is_err());
+        assert!(pdf_page_range(Some("x"), 30, "a.pdf").is_err());
+    }
+
+    #[test]
+    fn the_pdf_script_reads_back() {
+        use base64::Engine;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let out = format!(
+            "pages 12\npage 2\n{}\n{}\npage 3\n{}\n{}\n",
+            b64(b"PNG2"),
+            b64(b"two"),
+            b64(b"PNG3"),
+            b64(b"three")
+        );
+        let (count, pages) = parse_pdf_pages(&out).unwrap();
+        assert_eq!(count, 12);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[1], (3, b"PNG3".to_vec(), "three".to_string()));
+        assert!(parse_pdf_pages("no-poppler\n").is_none());
     }
 
     /// With no window, the file tools read and change the disk through

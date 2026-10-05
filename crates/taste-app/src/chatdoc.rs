@@ -44,6 +44,17 @@ pub enum Document {
     Command { command: String, output: String },
     /// A proposed or applied edit to one file.
     Edit(Edit),
+    /// What lies between two commits of one repository: `summary` says
+    /// which two and the commits between them, `edits` are the files that
+    /// differ, and `skipped` names the ones not drawn (binary, or past the
+    /// cap). A submodule at a commit its parent does not record opens as
+    /// one, read from the submodule's own repository (`submodule_diff`).
+    Changes {
+        title: String,
+        summary: String,
+        edits: Vec<Edit>,
+        skipped: Vec<String>,
+    },
 }
 
 /// Whose words a text document holds: the tab wears the role's glyph — the
@@ -81,6 +92,7 @@ impl Document {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| edit.path.display().to_string())
             ),
+            Document::Changes { title, .. } => title.clone(),
         }
     }
 
@@ -100,6 +112,7 @@ impl Document {
             Document::Text { .. } => "text-x-generic-symbolic",
             Document::Command { .. } => "utilities-terminal-symbolic",
             Document::Edit(_) => "document-edit-symbolic",
+            Document::Changes { .. } => "taste-branch-symbolic",
         }
     }
 
@@ -119,6 +132,9 @@ impl Document {
             Document::Text { title, .. } => title.clone(),
             Document::Command { command, .. } => crate::chat::single_line(command, 400),
             Document::Edit(edit) => edit.path.display().to_string(),
+            Document::Changes { summary, .. } => {
+                summary.lines().next().unwrap_or_default().to_string()
+            }
         }
     }
 }
@@ -163,6 +179,37 @@ impl DocPage {
                 column.append(&view.widget);
                 inset(&column)
             }
+            // The summary as it was written — which two commits, and the
+            // ones between — then each file as an edit page draws one.
+            Document::Changes {
+                summary,
+                edits,
+                skipped,
+                ..
+            } => {
+                let column = gtk::Box::new(gtk::Orientation::Vertical, 18);
+                let mut head = summary.clone();
+                if !skipped.is_empty() {
+                    head.push_str(&format!("\n\nNot drawn: {}", skipped.join(", ")));
+                }
+                let summary = gtk::Label::builder()
+                    .label(&head)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .selectable(true)
+                    .css_classes(["monospace"])
+                    .build();
+                column.append(&summary);
+                for edit in edits {
+                    let view = diff_view(edit, None, Layout::SideBySide);
+                    let file = gtk::Box::new(gtk::Orientation::Vertical, 6);
+                    file.append(&diff_header(edit, view.added, view.removed, None));
+                    file.append(&view.widget);
+                    column.append(&file);
+                }
+                inset(&column)
+            }
         };
         let scroller = gtk::ScrolledWindow::builder()
             .child(&content)
@@ -170,11 +217,13 @@ impl DocPage {
             .vexpand(true)
             // Prose folds; a side-by-side diff's lines do not, so the page
             // scrolls sideways for the one and never for the others.
-            .hscrollbar_policy(if matches!(doc, Document::Edit(_)) {
-                gtk::PolicyType::Automatic
-            } else {
-                gtk::PolicyType::Never
-            })
+            .hscrollbar_policy(
+                if matches!(doc, Document::Edit(_) | Document::Changes { .. }) {
+                    gtk::PolicyType::Automatic
+                } else {
+                    gtk::PolicyType::Never
+                },
+            )
             .build();
         Rc::new(Self {
             widget: scroller.upcast(),

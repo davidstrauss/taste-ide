@@ -128,7 +128,7 @@ taken back; `controls` opens the shade scrolled to its Model and security
 section — the permissions row, the model drop-down, fast mode, and the
 effort slider — posed from what the pinned adapter advertises, which a
 probe otherwise never has, since that half of the shade needs a session);
-`TASTE_PROBE_DOC` (`edit`, `command`, `prompt`) opens that step of the
+`TASTE_PROBE_DOC` (`edit`, `command`, `prompt`, `changes` — a submodule's change as the Dirty list opens it, `submodule_diff.rs`) opens that step of the
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_PREVIEW=README.md` (a markdown file, relative
 to where the probe was started; an image, a PDF, or audio or video opens in

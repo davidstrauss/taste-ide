@@ -2002,8 +2002,11 @@ Tool surface:
 - `ide_read_file` / `ide_edit_file` / `ide_write_file` — the workspace's
   files as the editor has them: read from, and changed in, the buffer the
   user has open (unsaved edits included, each change one undo step, then
-  saved), the disk otherwise; an image is read as an image. They stand in
-  for Claude Code's own file tools (Client-side services, above).
+  saved), the disk otherwise; an image is read as an image, and a PDF as
+  each page's text and picture, rendered where the file is by the files
+  service's poppler (`pages`, as Claude Code's Read took them: a short PDF
+  whole, at most twenty at a time). They stand in for Claude Code's own
+  file tools (Client-side services, above).
 - `ide_list_files` / `ide_search` — the agent's `ls` and `grep`. The
   workspace is not mounted where the agent runs, so the IDE enumerates and
   searches it: `.gitignore` honored, `.git` and binaries skipped, absolute

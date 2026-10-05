@@ -808,7 +808,7 @@ pub fn ensure_container(
 /// started with: bumped when they change, so an existing keeper made with
 /// the old ones is made again.
 const KEEPER_LABEL: &str = "taste.keeper";
-const KEEPER_REVISION: &str = "3";
+const KEEPER_REVISION: &str = "4";
 
 fn podman_capture(substrate: &crate::substrate::Substrate, args: &[String]) -> Result<String> {
     let output = substrate

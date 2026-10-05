@@ -2443,6 +2443,44 @@ impl Editor {
         self.sync_toggle_to_selection();
     }
 
+    /// A submodule's change, opened as a document: the commits between the
+    /// one its parent records and the one it is at, and each file that
+    /// differs (`crate::submodule_diff`), read off the main thread. The
+    /// tab is keyed by the two commits, so a second click on the same
+    /// change finds it and a new commit opens its own.
+    pub fn open_submodule_changes(self: &Rc<Self>, path: &Path) {
+        let files = files_among(path, &self.access());
+        let env = self
+            .owning_environment(path)
+            .map(|(env, _, _)| env)
+            .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+        let events = self.workspace.events.clone();
+        let weak = Rc::downgrade(self);
+        let path = path.to_path_buf();
+        glib::spawn_future_local(async move {
+            let read = path.clone();
+            let loaded = crate::runtime::runtime()
+                .spawn_blocking(move || crate::submodule_diff::load(&files, &read))
+                .await;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match loaded {
+                Ok(Ok((doc, want, have))) => {
+                    if let Some(editor) = weak.upgrade() {
+                        let key = format!("submodule-{name}-{want}-{have}");
+                        editor.open_document(&env, &key, doc);
+                    }
+                }
+                Ok(Err(why)) => events.publish(taste_core::Event::Toast(format!(
+                    "Cannot show {name}'s changes: {why}"
+                ))),
+                Err(_) => {}
+            }
+        });
+    }
+
     /// What the window's probe found out about a port with a tab open.
     pub fn set_port_facts(
         &self,
@@ -2638,21 +2676,20 @@ impl Editor {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    // Failures speak: silence here cost a confused click. A
-                    // folder reached here is a submodule the Dirty list
-                    // names because the commit it is at moved, which has
-                    // no text to open.
-                    editor_events.publish(taste_core::Event::Toast(
-                        if e.kind() == std::io::ErrorKind::IsADirectory
-                            || e.to_string().contains("EISDIR")
-                        {
-                            format!(
-                                "{name} is a submodule at a new commit; committing the parent records it"
-                            )
-                        } else {
-                            format!("Cannot open {name}: {e}")
-                        },
-                    ));
+                    // A folder reached here is a submodule the Dirty list
+                    // names because the commit it is at moved: what opens
+                    // is that change, read from its own repository.
+                    if e.kind() == std::io::ErrorKind::IsADirectory
+                        || e.to_string().contains("EISDIR")
+                    {
+                        if let Some(editor) = weak.upgrade() {
+                            editor.open_submodule_changes(&path);
+                        }
+                        return;
+                    }
+                    // Failures speak: silence here cost a confused click.
+                    editor_events
+                        .publish(taste_core::Event::Toast(format!("Cannot open {name}: {e}")));
                     return;
                 }
                 Err(_) => return,

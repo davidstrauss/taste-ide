@@ -63,6 +63,7 @@ mod sparkline;
 mod ssh_agent;
 mod startup;
 mod stripes;
+mod submodule_diff;
 mod syncstatus;
 mod tabfamily;
 mod table;

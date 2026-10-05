@@ -11344,7 +11344,7 @@ impl ChatPane {
         self.show_options(true);
     }
 
-    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_DOC=edit|command|prompt` opens
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_DOC=edit|command|prompt|changes` opens
     /// that step of the seeded transcript whole in the editor's strip — the
     /// page a truncated block opens onto (chatdoc.rs) — through the same
     /// opener the step's button uses. The window calls it after its own
@@ -11359,6 +11359,33 @@ impl ChatPane {
             "edit" => (
                 "probe-edit/edit-0",
                 Document::Edit(edit_from(&probe_edit_diff())),
+            ),
+            // A submodule at a commit its parent does not record, as the
+            // Dirty list opens it (`crate::submodule_diff`).
+            "changes" => (
+                "probe-changes",
+                Document::Changes {
+                    title: "amutable-typst-template 3f9a2c1…8be41d0".into(),
+                    summary: "amutable-typst-template is at 8be41d0; its parent records \
+                              3f9a2c1.\n\n2 commits since:\n8be41d0 Tighten the title \
+                              slide's leading\n5c0e7aa Add the speaker-notes layout"
+                        .into(),
+                    edits: vec![
+                        crate::chatdoc::Edit {
+                            path: "amutable-typst-template/lib.typ".into(),
+                            old: "#let title(body) = {\n  set text(size: 32pt)\n  body\n}\n"
+                                .into(),
+                            new: "#let title(body) = {\n  set text(size: 32pt)\n  set par(leading: 0.4em)\n  body\n}\n"
+                                .into(),
+                        },
+                        crate::chatdoc::Edit {
+                            path: "amutable-typst-template/notes.typ".into(),
+                            old: String::new(),
+                            new: "#let notes(body) = block(inset: 8pt, body)\n".into(),
+                        },
+                    ],
+                    skipped: vec!["logo.png (binary)".into()],
+                },
             ),
             "command" => (
                 "probe-shell/command",
