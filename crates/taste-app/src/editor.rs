@@ -76,7 +76,7 @@ struct EditorPage {
     /// The rendered markdown preview face (rebuilt on refresh).
     preview_holder: gtk::Box,
     /// Revealed when the file changed on disk UNDER unsaved edits.
-    conflict_bar: adw::Banner,
+    conflict_bar: crate::viewer::ChangedBar,
     /// Hash of the bytes the last save wrote: the watcher echoes our own
     /// writes back as FileChanged, and matching content here (not buffer
     /// cleanliness — the user may have typed since) is what tells an echo
@@ -192,6 +192,9 @@ enum SurfaceKind {
     /// A task's output (tasks.rs), by its name: a log of its own, read as
     /// the Logs are.
     Task(Rc<crate::logview::LogPage>, String),
+    /// A file shown rather than edited — an image, a PDF, audio or video
+    /// (viewer.rs) — keyed by its path like a text tab.
+    View(Rc<crate::viewer::ViewerPage>),
 }
 
 /// What the editor's selected tab is, for the flank to mirror (David,
@@ -424,6 +427,12 @@ fn set_dirty_dot(tab: &adw::TabPage, dirty: bool) {
     } else {
         tab.set_indicator_icon(gtk::gio::Icon::NONE);
     }
+}
+
+/// `view:<path>` — the surface key a viewer tab is filed under: its path,
+/// in a namespace no other surface's key is in.
+fn viewer_key(path: &Path) -> PathBuf {
+    PathBuf::from(format!("view:{}", path.display()))
 }
 
 /// The file-type icon GNOME associates with this file name.
@@ -1560,6 +1569,7 @@ impl Editor {
                     crate::logview::LOG_ICON,
                 ),
                 SurfaceKind::Port(_) => (0, crate::portview::PORT_ICON),
+                SurfaceKind::View(page) => (0, page.icon()),
                 SurfaceKind::Task(log, _) => (
                     if query.is_empty() {
                         0
@@ -1805,6 +1815,9 @@ impl Editor {
                             Focused::Task(surface.env.clone(), name.clone())
                         }
                         SurfaceKind::Startup(_) => Focused::Other,
+                        // A file, as far as the tree is concerned: its row
+                        // lights like a text tab's.
+                        SurfaceKind::View(page) => Focused::File(page.path.clone()),
                     }
                 } else {
                     Focused::Other
@@ -1854,10 +1867,13 @@ impl Editor {
                 }
                 SurfaceKind::Port(page) => page.face().icon(),
                 SurfaceKind::Doc(page, _) => page.icon,
+                SurfaceKind::View(page) => page.icon(),
             });
-            // A document has no modes of its own.
-            self.mode_menu
-                .set_sensitive(!matches!(surface.kind, SurfaceKind::Doc(..)));
+            // A document has no modes of its own, and neither has a viewer.
+            self.mode_menu.set_sensitive(!matches!(
+                surface.kind,
+                SurfaceKind::Doc(..) | SurfaceKind::View(_)
+            ));
             self.publish_state();
             return;
         }
@@ -1999,7 +2015,7 @@ impl Editor {
                     Box::new(move || log.set_follow(!following)),
                 ));
             }
-            SurfaceKind::Doc(..) => {}
+            SurfaceKind::Doc(..) | SurfaceKind::View(_) => {}
         }
         for (label, icon, current, act) in rows {
             let row = adw::ActionRow::builder()
@@ -2458,6 +2474,15 @@ impl Editor {
     }
 
     fn open_with(self: &Rc<Self>, path: &Path, line: Option<u32>, changes: bool) {
+        // A file shown rather than edited opens in its viewer: not read as
+        // text, which it is not (a PDF opened as "Cannot open …: stream did
+        // not contain valid UTF-8").
+        if !changes {
+            if let Some(kind) = crate::viewer::kind_for(path) {
+                self.open_viewer(path, kind);
+                return;
+            }
+        }
         // An already-open file is answered from memory. Its owner was
         // settled when the tab was made and never changes — a tab opened
         // while watching `calm-1` is still `calm-1`'s file — so refocusing
@@ -2549,6 +2574,104 @@ impl Editor {
                     editor.sync_toggle_to_selection();
                 }
             }
+        });
+    }
+
+    /// Open `path` in its viewer (viewer.rs), or focus the tab it is open
+    /// in. The read, and an image's decode, run on the blocking pool; the
+    /// file's owner is found the way a text tab's is, so a viewer opens in
+    /// its environment's tab set.
+    fn open_viewer(self: &Rc<Self>, path: &Path, kind: crate::viewer::ViewKind) {
+        let key = viewer_key(path);
+        let existing = self.surfaces.borrow().get(&key).cloned();
+        if let Some(existing) = existing {
+            self.follow_to(Some(existing.env.clone()));
+            self.tabs.set_selected_page(&existing.tab);
+            return;
+        }
+        let checkouts = self.checkouts();
+        let access = self.access();
+        let weak = Rc::downgrade(self);
+        let path = path.to_path_buf();
+        glib::spawn_future_local(async move {
+            let read_path = path.clone();
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let files = files_among(&read_path, &access);
+                let owner = match checkouts {
+                    Checkouts::Probe(owner) => Some(owner),
+                    Checkouts::Real(checkouts) => owner_among(&read_path, &checkouts),
+                };
+                (crate::viewer::load(&files, &read_path, kind), owner, files)
+            });
+            let Ok((loaded, owner, files)) = handle.await else {
+                return;
+            };
+            let Some(editor) = weak.upgrade() else { return };
+            let env = owner
+                .map(|(env, _, _)| env)
+                .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+            editor.follow_to(Some(env.clone()));
+            if let Some(existing) = editor.surfaces.borrow().get(&key).cloned() {
+                editor.tabs.set_selected_page(&existing.tab);
+                return;
+            }
+            let page = match loaded {
+                Ok(loaded) => crate::viewer::ViewerPage::new(&path, kind, loaded),
+                Err(why) => {
+                    editor
+                        .workspace
+                        .events
+                        .publish(taste_core::Event::Toast(format!(
+                            "Cannot open {}: {why}",
+                            path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                        )));
+                    return;
+                }
+            };
+            {
+                // Reload: the same read, shown in place.
+                let weak_page = Rc::downgrade(&page);
+                let path = path.clone();
+                page.set_reload(Rc::new(move || {
+                    let files = files.clone();
+                    let path = path.clone();
+                    let weak_page = weak_page.clone();
+                    glib::spawn_future_local(async move {
+                        let read_path = path.clone();
+                        let handle = crate::runtime::runtime()
+                            .spawn_blocking(move || crate::viewer::load(&files, &read_path, kind));
+                        let Ok(loaded) = handle.await else { return };
+                        let Some(page) = weak_page.upgrade() else {
+                            return;
+                        };
+                        match loaded {
+                            Ok(loaded) => page.show(loaded),
+                            Err(why) => page.show_error(&why),
+                        }
+                    });
+                }));
+            }
+            let tab = editor.tabs.append(&page.widget);
+            tab.set_title(
+                &path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            );
+            tab.set_icon(Some(&file_type_icon(&path)));
+            tab.set_tooltip(&path.display().to_string());
+            editor.surfaces.borrow_mut().insert(
+                key,
+                Rc::new(SurfaceEntry {
+                    tab: tab.clone(),
+                    env,
+                    kind: SurfaceKind::View(page),
+                }),
+            );
+            editor.tabs.set_selected_page(&tab);
+            editor.sync_toggle_to_selection();
         });
     }
 
@@ -2857,18 +2980,31 @@ impl Editor {
 
         // Conflict banner: disk changed under unsaved edits. Reload takes
         // the disk version; doing nothing keeps yours (save overwrites).
-        let conflict_bar = adw::Banner::builder().button_label("Reload File").build();
+        let conflict_bar = crate::viewer::ChangedBar::new(true);
         {
             let weak = Rc::downgrade(self);
             let path = path.to_path_buf();
-            conflict_bar.connect_button_clicked(move |_| {
+            conflict_bar.connect_reload(move || {
                 if let Some(editor) = weak.upgrade() {
                     editor.force_reload(&path);
                 }
             });
         }
+        {
+            // Keep Mine is a save: it writes the buffer over the disk's
+            // version, and a save already settles the conflict for you.
+            let weak = Rc::downgrade(self);
+            let path = path.to_path_buf();
+            conflict_bar.connect_keep(move || {
+                let Some(editor) = weak.upgrade() else { return };
+                let page = editor.pages.borrow().get(&path).cloned();
+                if let Some(page) = page {
+                    let _ = editor.save_page(&path, &page);
+                }
+            });
+        }
         let page_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        page_box.append(&conflict_bar);
+        page_box.append(&conflict_bar.widget);
         page_box.append(&stack);
         let tab = self.tabs.append(&page_box);
         let file_name = path
@@ -3549,6 +3685,35 @@ impl Editor {
     /// through the watcher, and only the content can tell an echo (not a
     /// conflict, even if the user typed since) from a real external change.
     pub fn on_file_changed(self: &Rc<Self>, path: &Path) {
+        // A viewer does not follow its file: when the bytes on disk are no
+        // longer the ones it shows, it says so and offers the reload.
+        let viewer =
+            self.surfaces
+                .borrow()
+                .get(&viewer_key(path))
+                .and_then(|surface| match &surface.kind {
+                    SurfaceKind::View(page) => Some(page.clone()),
+                    _ => None,
+                });
+        if let Some(page) = viewer {
+            let files = files_among(path, &self.access());
+            let read_path = path.to_path_buf();
+            let weak = Rc::downgrade(&page);
+            glib::spawn_future_local(async move {
+                let handle = crate::runtime::runtime().spawn_blocking(move || {
+                    files
+                        .read(&read_path)
+                        .map(|b| crate::viewer::fingerprint(&b))
+                });
+                let Ok(Ok(fingerprint)) = handle.await else {
+                    return;
+                };
+                if let Some(page) = weak.upgrade() {
+                    page.file_changed(fingerprint);
+                }
+            });
+            return;
+        }
         let Some(files) = self.pages.borrow().get(path).map(|page| page.files.clone()) else {
             return;
         };
@@ -3587,10 +3752,8 @@ impl Editor {
                     "{} changed on disk while you have unsaved edits",
                     path.display()
                 ));
-                page.conflict_bar.set_title(
-                    "Changed on disk under your unsaved edits — \
-                     Reload takes the disk version, Save keeps yours",
-                );
+                page.conflict_bar
+                    .set_title("This file changed on disk while you have unsaved edits");
                 page.conflict_bar.set_revealed(true);
                 return;
             }

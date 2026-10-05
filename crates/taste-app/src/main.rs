@@ -68,6 +68,7 @@ mod table;
 mod tasks;
 mod textline;
 mod ui_probe;
+mod viewer;
 mod voice;
 mod window;
 
@@ -360,6 +361,8 @@ fn main() -> glib::ExitCode {
                  /* The markdown preview's map draws its own slider in its \
                     `color`, at the source map's alpha (preview_map.rs). */\n\
                  .preview-map { color: @accent_bg_color; }\n\
+                 .changed-bar { background-color: alpha(@accent_bg_color, 0.18); \
+                   padding: 6px 12px; }\n\
                  /* The environment's startup page (startup.rs): a card for \
                     the checklist over the construction stripes, the log in \
                     a card of its own below; the strip's other tabs dimmed \

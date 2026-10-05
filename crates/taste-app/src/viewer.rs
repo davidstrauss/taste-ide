@@ -1,0 +1,582 @@
+//! **Files the editor shows rather than edits**: images, PDFs, and audio
+//! and video — what GNOME's own viewers open (David, 2026-10-05: "Add the
+//! ability to view PDFs in the file editor"; "Image support would be
+//! welcome, too. Can we embed all the things GNOME can usually open for
+//! viewing?").
+//!
+//! - **Images** are GTK's own: a texture decoded off the main thread by the
+//!   loaders the system has (PNG, JPEG, GIF, WebP, TIFF, BMP, ICO, and
+//!   AVIF/HEIF where those loaders are installed), drawn scaled to fit.
+//! - **Audio and video** are GTK's media widget, on GStreamer.
+//! - **PDFs** are pdf.js (`build-aux/vendor-pdfjs.sh`), pinned and served
+//!   out of the binary on a scheme of the IDE's own into the WebKit view
+//!   the port tabs use: text selection, find, and zoom come with it, and
+//!   nothing reaches the network — the page loads only from that scheme.
+//!
+//! The file's bytes are read through the files service like any other
+//! file's, so a viewer works the same on a checkout in a VM. What is
+//! text-like — SVG, which is XML — stays in the text editor, where it can
+//! be edited.
+//!
+//! A viewer does not follow its file as it changes. When the file changes
+//! on disk, the tab says so in a banner and offers to reload it (David,
+//! 2026-10-05: "If I don't automatically see changes as they happen on an
+//! open viewer tab …, I should get a banner in the tab asking me to reload
+//! to see changes").
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use adw::prelude::*;
+use gtk::glib;
+
+/// What a viewer shows a file as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewKind {
+    Image,
+    Pdf,
+    Media,
+}
+
+/// The viewer a file name calls for, or `None` for one the text editor
+/// keeps: by the name's content type, which needs no read. A type that is
+/// text underneath (SVG is XML) is the text editor's.
+pub fn kind_for(path: &Path) -> Option<ViewKind> {
+    let name = path.file_name()?.to_str()?;
+    let (content_type, _) = gtk::gio::functions::content_type_guess(Some(name), None::<&[u8]>);
+    if gtk::gio::functions::content_type_is_a(&content_type, "text/plain") {
+        return None;
+    }
+    let mime = gtk::gio::functions::content_type_get_mime_type(&content_type)?;
+    let mime = mime.as_str();
+    if mime == "application/pdf" {
+        Some(ViewKind::Pdf)
+    } else if mime.starts_with("image/") {
+        Some(ViewKind::Image)
+    } else if mime.starts_with("video/") || mime.starts_with("audio/") {
+        Some(ViewKind::Media)
+    } else {
+        None
+    }
+}
+
+/// The largest file a viewer reads whole. A viewer of a checkout in a VM
+/// has it over the files service, in one piece.
+pub const MAX_VIEW_BYTES: u64 = 512 * 1024 * 1024;
+
+/// A file read for its viewer, off the main thread: an image decoded
+/// there, anything else as its bytes — and what the bytes were, so a later
+/// change on disk can be told from an event about the same file.
+pub struct Loaded {
+    content: Content,
+    pub fingerprint: u64,
+}
+
+enum Content {
+    Image(gtk::gdk::Texture),
+    Bytes(glib::Bytes),
+}
+
+/// What a file's bytes are, for telling a real change from an event that
+/// changed nothing.
+pub fn fingerprint(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Read and, for an image, decode `path` for a viewer of `kind`. Blocking:
+/// run on the blocking pool.
+pub fn load(
+    files: &taste_core::files::Files,
+    path: &Path,
+    kind: ViewKind,
+) -> Result<Loaded, String> {
+    let size = files.stat(path).map_err(|e| e.to_string())?.size;
+    if size > MAX_VIEW_BYTES {
+        return Err(format!(
+            "{} MB is more than a viewer reads ({} MB)",
+            size / (1024 * 1024),
+            MAX_VIEW_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes = glib::Bytes::from_owned(files.read(path).map_err(|e| e.to_string())?);
+    let fingerprint = fingerprint(&bytes);
+    let content = match kind {
+        ViewKind::Image => gtk::gdk::Texture::from_bytes(&bytes)
+            .map(Content::Image)
+            .map_err(|e| format!("this image could not be decoded: {e}"))?,
+        ViewKind::Pdf | ViewKind::Media => Content::Bytes(bytes),
+    };
+    Ok(Loaded {
+        content,
+        fingerprint,
+    })
+}
+
+/// The bar a tab shows when its file changed on disk under it: what
+/// happened, Reload to take the disk's version, and — for a tab that can
+/// be edited — Keep Mine, which writes the tab's version over the disk's.
+/// A banner's look with two answers, which `AdwBanner` (one button) cannot
+/// hold (David, 2026-10-05: "… a banner in the tab asking me to reload to
+/// see changes (and, for things I can edit, the option overwrite changes
+/// on disk with my version)").
+pub struct ChangedBar {
+    pub widget: gtk::Revealer,
+    title: gtk::Label,
+    reload: gtk::Button,
+    keep: Option<gtk::Button>,
+}
+
+impl ChangedBar {
+    pub fn new(editable: bool) -> Self {
+        let title = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .build();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.add_css_class("changed-bar");
+        row.append(&title);
+        let keep = editable.then(|| {
+            let keep = gtk::Button::builder()
+                .label("Keep Mine")
+                .tooltip_text("Write your version over the file on disk")
+                .valign(gtk::Align::Center)
+                .build();
+            row.append(&keep);
+            keep
+        });
+        let reload = gtk::Button::builder()
+            .label("Reload")
+            .tooltip_text("Take the version on disk")
+            .css_classes(["suggested-action"])
+            .valign(gtk::Align::Center)
+            .build();
+        row.append(&reload);
+        let widget = gtk::Revealer::builder()
+            .child(&row)
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .reveal_child(false)
+            .build();
+        Self {
+            widget,
+            title,
+            reload,
+            keep,
+        }
+    }
+
+    pub fn set_title(&self, title: &str) {
+        self.title.set_label(title);
+    }
+
+    pub fn set_revealed(&self, revealed: bool) {
+        self.widget.set_reveal_child(revealed);
+    }
+
+    pub fn connect_reload(&self, f: impl Fn() + 'static) {
+        self.reload.connect_clicked(move |_| f());
+    }
+
+    pub fn connect_keep(&self, f: impl Fn() + 'static) {
+        if let Some(keep) = &self.keep {
+            keep.connect_clicked(move |_| f());
+        }
+    }
+}
+
+/// One file shown in a viewer tab: the content, and above it the bar that
+/// says when the file has changed on disk since.
+pub struct ViewerPage {
+    pub widget: gtk::Box,
+    pub kind: ViewKind,
+    pub path: PathBuf,
+    banner: ChangedBar,
+    content: gtk::Box,
+    /// What a click on the banner's Reload does: the editor's own read and
+    /// redraw, handed in when the tab is made.
+    reload: RefCell<Option<Rc<dyn Fn()>>>,
+    /// This page's PDF, while it has one, on the viewer scheme.
+    pdf_id: Cell<Option<u64>>,
+    /// What the shown bytes were ([`fingerprint`]).
+    shown: Cell<u64>,
+}
+
+impl ViewerPage {
+    pub fn new(path: &Path, kind: ViewKind, loaded: Loaded) -> Rc<Self> {
+        let banner = ChangedBar::new(false);
+        banner.set_title("This file has changed on disk");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.set_vexpand(true);
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        widget.append(&banner.widget);
+        widget.append(&content);
+        let page = Rc::new(Self {
+            widget,
+            kind,
+            path: path.to_path_buf(),
+            banner,
+            content,
+            reload: RefCell::new(None),
+            pdf_id: Cell::new(None),
+            shown: Cell::new(loaded.fingerprint),
+        });
+        {
+            let weak = Rc::downgrade(&page);
+            page.banner.connect_reload(move || {
+                let Some(page) = weak.upgrade() else { return };
+                let reload = page.reload.borrow().clone();
+                if let Some(reload) = reload {
+                    reload();
+                }
+            });
+        }
+        page.show(loaded);
+        page
+    }
+
+    /// The icon the editor's mode button wears for this tab.
+    pub fn icon(&self) -> &'static str {
+        match self.kind {
+            ViewKind::Image => "image-x-generic-symbolic",
+            ViewKind::Pdf => "x-office-document-symbolic",
+            ViewKind::Media => "multimedia-player-symbolic",
+        }
+    }
+
+    /// What Reload does; the editor's read, which ends in [`Self::show`].
+    pub fn set_reload(&self, reload: Rc<dyn Fn()>) {
+        *self.reload.borrow_mut() = Some(reload);
+    }
+
+    /// The file on disk now has bytes of `fingerprint`: when they are not
+    /// the ones shown, say so and offer the reload. An event about the
+    /// file that changed nothing — a touch, its creation seen late — says
+    /// nothing.
+    pub fn file_changed(&self, fingerprint: u64) {
+        self.banner.set_revealed(fingerprint != self.shown.get());
+    }
+
+    /// Show `loaded`, replacing whatever was shown; the banner goes.
+    pub fn show(&self, loaded: Loaded) {
+        self.banner.set_revealed(false);
+        while let Some(child) = self.content.first_child() {
+            self.content.remove(&child);
+        }
+        if let Some(id) = self.pdf_id.take() {
+            pdf_documents().borrow_mut().remove(&id);
+        }
+        self.shown.set(loaded.fingerprint);
+        let shown: gtk::Widget = match (self.kind, loaded.content) {
+            (ViewKind::Image, Content::Image(texture)) => image_view(&texture),
+            (ViewKind::Media, Content::Bytes(bytes)) => media_view(&bytes),
+            (ViewKind::Pdf, Content::Bytes(bytes)) => {
+                let id = next_pdf_id();
+                pdf_documents().borrow_mut().insert(id, bytes);
+                self.pdf_id.set(Some(id));
+                pdf_view(id)
+            }
+            _ => gtk::Label::new(Some("This file could not be shown.")).upcast(),
+        };
+        shown.set_vexpand(true);
+        self.content.append(&shown);
+    }
+
+    /// Say why the file could not be shown, in place of it.
+    pub fn show_error(&self, why: &str) {
+        while let Some(child) = self.content.first_child() {
+            self.content.remove(&child);
+        }
+        let status = adw::StatusPage::builder()
+            .icon_name("dialog-warning-symbolic")
+            .title("Cannot show this file")
+            .description(glib::markup_escape_text(why).as_str())
+            .vexpand(true)
+            .build();
+        self.content.append(&status);
+    }
+}
+
+impl Drop for ViewerPage {
+    fn drop(&mut self) {
+        if let Some(id) = self.pdf_id.take() {
+            pdf_documents().borrow_mut().remove(&id);
+        }
+    }
+}
+
+/// An image, scaled down to fit and never up, centred on the pane, with
+/// its size under it.
+fn image_view(texture: &gtk::gdk::Texture) -> gtk::Widget {
+    let picture = gtk::Picture::for_paintable(texture);
+    picture.set_content_fit(gtk::ContentFit::ScaleDown);
+    picture.set_can_shrink(true);
+    picture.set_vexpand(true);
+    picture.set_hexpand(true);
+    let size = gtk::Label::builder()
+        .label(format!("{} × {}", texture.width(), texture.height()))
+        .css_classes(["caption", "dim-label"])
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    column.set_margin_top(12);
+    column.set_margin_start(12);
+    column.set_margin_end(12);
+    column.append(&picture);
+    column.append(&size);
+    column.upcast()
+}
+
+/// Audio or video, with GTK's own controls, from the bytes read.
+fn media_view(bytes: &glib::Bytes) -> gtk::Widget {
+    let stream = gtk::gio::MemoryInputStream::from_bytes(bytes);
+    let media = gtk::MediaFile::for_input_stream(&stream);
+    let video = gtk::Video::builder()
+        .media_stream(&media)
+        .autoplay(false)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    video.upcast()
+}
+
+// --- PDFs ----------------------------------------------------------------
+
+/// The scheme the PDF viewer's page, its pdf.js, and the document itself
+/// are served on: `taste-pdf://<id>/…`, one id per open PDF.
+const PDF_SCHEME: &str = "taste-pdf";
+
+const PDF_MIN_MJS: &[u8] = include_bytes!("../vendor/pdfjs/pdf.min.mjs");
+const PDF_WORKER_MJS: &[u8] = include_bytes!("../vendor/pdfjs/pdf.worker.min.mjs");
+const PDF_VIEWER_MJS: &[u8] = include_bytes!("../vendor/pdfjs/pdf_viewer.mjs");
+const PDF_VIEWER_CSS: &[u8] = include_bytes!("../vendor/pdfjs/pdf_viewer.css");
+
+/// The page that draws the PDF: pdf.js's viewer components — the pages
+/// in one scrolling column, their text layer for selection and find — with
+/// the document fitted to the width, Ctrl and the wheel to zoom, and the
+/// pane's own background behind the pages. PDF scripting is never on: the
+/// sandbox that runs a PDF's JavaScript is not served, and `eval` is off.
+const PDF_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<link rel="stylesheet" href="pdf_viewer.css">
+<style>
+html, body { margin: 0; height: 100%; background: transparent; }
+#container { position: absolute; inset: 0; overflow: auto; }
+.pdfViewer .page { border: none; margin: 12px auto;
+  box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+#failed { font: 15px/1.5 system-ui, sans-serif; margin: 15vh auto; max-width: 32em;
+  padding: 0 24px; opacity: .8; }
+</style></head>
+<body><div id="container"><div id="viewer" class="pdfViewer"></div></div>
+<script type="module">
+try {
+  const pdfjsLib = await import("./pdf.min.mjs");
+  globalThis.pdfjsLib = pdfjsLib;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "./pdf.worker.min.mjs";
+  const { EventBus, PDFViewer, PDFLinkService, PDFFindController } =
+    await import("./pdf_viewer.mjs");
+  const container = document.getElementById("container");
+  const eventBus = new EventBus();
+  const linkService = new PDFLinkService({ eventBus });
+  const findController = new PDFFindController({ eventBus, linkService });
+  const viewer = new PDFViewer({ container, eventBus, linkService, findController });
+  linkService.setViewer(viewer);
+  eventBus.on("pagesinit", () => { viewer.currentScaleValue = "page-width"; });
+  const doc = await pdfjsLib.getDocument({
+    url: "document.pdf", isEvalSupported: false, enableXfa: false,
+  }).promise;
+  viewer.setDocument(doc);
+  linkService.setDocument(doc, null);
+  container.addEventListener("wheel", (event) => {
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    viewer.currentScale *= event.deltaY < 0 ? 1.1 : 1 / 1.1;
+  }, { passive: false });
+  new ResizeObserver(() => {
+    if (viewer.currentScaleValue === "page-width") viewer.currentScaleValue = "page-width";
+  }).observe(container);
+} catch (error) {
+  document.body.innerHTML = "";
+  const p = document.createElement("p");
+  p.id = "failed";
+  p.textContent = "This PDF could not be shown: " + error;
+  document.body.append(p);
+}
+</script></body></html>
+"#;
+
+thread_local! {
+    static PDF_DOCUMENTS: Rc<RefCell<HashMap<u64, glib::Bytes>>> = Rc::default();
+    static NEXT_PDF: Cell<u64> = const { Cell::new(1) };
+}
+
+fn pdf_documents() -> Rc<RefCell<HashMap<u64, glib::Bytes>>> {
+    PDF_DOCUMENTS.with(Rc::clone)
+}
+
+fn next_pdf_id() -> u64 {
+    NEXT_PDF.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        id
+    })
+}
+
+/// The answer the viewer scheme gives for `uri`: the page, a pdf.js file,
+/// or the document of the PDF the host names; `None` for anything else.
+fn pdf_resource(uri: &str) -> Option<(glib::Bytes, &'static str)> {
+    let rest = uri.strip_prefix(&format!("{PDF_SCHEME}://"))?;
+    let (id, file) = rest.split_once('/').unwrap_or((rest, ""));
+    let file = file.split(['?', '#']).next().unwrap_or("");
+    let fixed = |bytes: &'static [u8], mime| Some((glib::Bytes::from_static(bytes), mime));
+    match file {
+        "" | "index.html" => fixed(PDF_PAGE.as_bytes(), "text/html"),
+        "pdf.min.mjs" => fixed(PDF_MIN_MJS, "text/javascript"),
+        "pdf.worker.min.mjs" => fixed(PDF_WORKER_MJS, "text/javascript"),
+        "pdf_viewer.mjs" => fixed(PDF_VIEWER_MJS, "text/javascript"),
+        "pdf_viewer.css" => fixed(PDF_VIEWER_CSS, "text/css"),
+        "document.pdf" => {
+            let id: u64 = id.parse().ok()?;
+            let bytes = pdf_documents().borrow().get(&id).cloned()?;
+            Some((bytes, "application/pdf"))
+        }
+        _ => None,
+    }
+}
+
+/// Register the viewer scheme on the default web context, once: secure and
+/// CORS-enabled, which is what lets the page import pdf.js as modules.
+fn register_pdf_scheme() {
+    thread_local! {
+        static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    }
+    if REGISTERED.with(|done| done.replace(true)) {
+        return;
+    }
+    let Some(context) = webkit6::WebContext::default() else {
+        return;
+    };
+    if let Some(security) = context.security_manager() {
+        security.register_uri_scheme_as_secure(PDF_SCHEME);
+        security.register_uri_scheme_as_cors_enabled(PDF_SCHEME);
+    }
+    context.register_uri_scheme(PDF_SCHEME, |request| {
+        let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+        match pdf_resource(&uri) {
+            Some((bytes, mime)) => {
+                let stream = gtk::gio::MemoryInputStream::from_bytes(&bytes);
+                request.finish(&stream, bytes.len() as i64, Some(mime));
+            }
+            None => {
+                let mut error = glib::Error::new(
+                    gtk::gio::IOErrorEnum::NotFound,
+                    &format!("{uri} is not part of the PDF viewer"),
+                );
+                request.finish_error(&mut error);
+            }
+        }
+    });
+}
+
+/// The PDF of `id`, in a WebKit view that loads nothing but the viewer
+/// scheme: navigation anywhere else is refused, and a link the user
+/// clicks opens in their browser instead.
+fn pdf_view(id: u64) -> gtk::Widget {
+    register_pdf_scheme();
+    let session = webkit6::NetworkSession::new_ephemeral();
+    let view = webkit6::WebView::builder()
+        .network_session(&session)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    webkit6::prelude::WebViewExt::set_background_color(
+        &view,
+        &gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0),
+    );
+    webkit6::prelude::WebViewExt::connect_decide_policy(&view, |view, decision, kind| {
+        use webkit6::prelude::PolicyDecisionExt;
+        let navigation = match kind {
+            webkit6::PolicyDecisionType::NavigationAction
+            | webkit6::PolicyDecisionType::NewWindowAction => decision
+                .downcast_ref::<webkit6::NavigationPolicyDecision>()
+                .and_then(|d| d.navigation_action())
+                .and_then(|action| action.request())
+                .and_then(|request| request.uri()),
+            _ => return false,
+        };
+        let Some(uri) = navigation else {
+            return false;
+        };
+        if uri.starts_with(&format!("{PDF_SCHEME}://")) {
+            return false;
+        }
+        // Somewhere else: the user's browser has it, if it is a page at
+        // all; this view goes nowhere.
+        decision.ignore();
+        if uri.starts_with("https://") || uri.starts_with("http://") || uri.starts_with("mailto:") {
+            let window = view.root().and_downcast::<gtk::Window>();
+            gtk::UriLauncher::new(&uri).launch(
+                window.as_ref(),
+                None::<&gtk::gio::Cancellable>,
+                |_| {},
+            );
+        }
+        true
+    });
+    webkit6::prelude::WebViewExt::load_uri(&view, &format!("{PDF_SCHEME}://{id}/index.html"));
+    view.upcast()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_name_says_which_viewer_and_text_stays_text() {
+        for (name, kind) in [
+            ("slides.pdf", Some(ViewKind::Pdf)),
+            ("Hero.PNG", Some(ViewKind::Image)),
+            ("photo.jpeg", Some(ViewKind::Image)),
+            ("clip.webm", Some(ViewKind::Media)),
+            ("talk.mp3", Some(ViewKind::Media)),
+            ("logo.svg", None),
+            ("main.rs", None),
+            ("README.md", None),
+        ] {
+            assert_eq!(kind_for(Path::new(name)), kind, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_scheme_serves_the_viewer_and_only_the_documents_it_holds() {
+        assert_eq!(
+            pdf_resource("taste-pdf://7/index.html").unwrap().1,
+            "text/html"
+        );
+        assert_eq!(
+            pdf_resource("taste-pdf://7/pdf.worker.min.mjs").unwrap().1,
+            "text/javascript"
+        );
+        assert!(pdf_resource("taste-pdf://7/document.pdf").is_none());
+        pdf_documents()
+            .borrow_mut()
+            .insert(7, glib::Bytes::from_static(b"%PDF-1.7"));
+        assert_eq!(
+            pdf_resource("taste-pdf://7/document.pdf")
+                .unwrap()
+                .0
+                .as_ref(),
+            b"%PDF-1.7"
+        );
+        assert!(pdf_resource("taste-pdf://7/../../etc/passwd").is_none());
+        assert!(pdf_resource("https://example.com/").is_none());
+        pdf_documents().borrow_mut().remove(&7);
+    }
+}
