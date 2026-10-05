@@ -130,6 +130,46 @@ pub fn discover(workspace_root: &Path) -> Option<FlatpakManifest> {
 
 #[cfg(test)]
 mod tests {
+    /// Every crate the lock takes from crates.io is in the Flatpak's
+    /// offline vendor list. The Flatpak builds offline from that list, so
+    /// a dependency added without regenerating it fails only there — and
+    /// it did, on GitHub, for three days while CI passed (2026-10-06:
+    /// `taste-gcp`'s `flate2` and `tar`). Regenerate it with the recipe in
+    /// build-aux/flatpak/README.md.
+    #[test]
+    fn the_vendor_list_carries_every_crate_the_lock_does() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+        let sources =
+            std::fs::read_to_string(root.join("build-aux/flatpak/cargo-sources.json")).unwrap();
+        let mut missing = Vec::new();
+        for block in lock.split("[[package]]").skip(1) {
+            let field = |key: &str| {
+                block.lines().find_map(|line| {
+                    line.strip_prefix(&format!("{key} = \""))
+                        .and_then(|rest| rest.strip_suffix('"'))
+                })
+            };
+            let (Some(name), Some(version)) = (field("name"), field("version")) else {
+                continue;
+            };
+            if !field("source").is_some_and(|s| s.starts_with("registry+")) {
+                continue;
+            }
+            let dest = format!("\"dest\": \"cargo/vendor/{name}-{version}\"");
+            if !sources.contains(&dest) {
+                missing.push(format!("{name}-{version}"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "build-aux/flatpak/cargo-sources.json lacks {} crate(s) Cargo.lock takes from \
+             crates.io: {}. Regenerate it with the recipe in build-aux/flatpak/README.md.",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+
     use super::*;
 
     #[test]
