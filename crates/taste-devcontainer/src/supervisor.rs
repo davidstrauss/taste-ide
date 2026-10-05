@@ -4661,9 +4661,11 @@ const QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
 /// when it last printed, and whether it printed at all — from which the
 /// quiet-time note is written.
 #[derive(Debug, Default)]
-struct BuildProgress {
+pub(crate) struct BuildProgress {
     /// `STEP 2/5: RUN dnf install …`, as podman printed it.
     step: Option<String>,
+    /// The step's own last line, for the startup page's detail.
+    last_line: Option<String>,
     step_began: Option<std::time::Instant>,
     last_output: Option<std::time::Instant>,
     /// Lines the step's own command has printed.
@@ -4677,7 +4679,7 @@ impl BuildProgress {
     /// A line arrived. Returns a note to log *before* it when the line
     /// ends a stretch of silence the log had already remarked on — so the
     /// reader learns the commit landed, and how long it took.
-    fn saw(&mut self, line: &str) -> Option<String> {
+    pub(crate) fn saw(&mut self, line: &str) -> Option<String> {
         let now = std::time::Instant::now();
         let mut note = None;
         if line.starts_with("STEP ") {
@@ -4685,6 +4687,7 @@ impl BuildProgress {
             self.step_began = Some(now);
             self.step_lines = 0;
             self.notes = 0;
+            self.last_line = None;
         } else if line.starts_with("--> ") || line.starts_with("COMMIT ") {
             // The layer id: the silence was the commit, and it is over.
             if self.notes > 0 {
@@ -4697,9 +4700,48 @@ impl BuildProgress {
             }
         } else {
             self.step_lines += 1;
+            if !line.trim().is_empty() {
+                self.last_line = Some(line.trim().to_string());
+            }
         }
         self.last_output = Some(now);
         note
+    }
+
+    /// How far the build has got, in one short line for the startup
+    /// page's detail: the step and its command, then the step's latest
+    /// line while it prints, then — once it has been quiet for
+    /// [`QUIET_AFTER`] — that the layer is being written, and for how
+    /// long, which is the silence that reads as a hang. `None` before the
+    /// first step.
+    pub(crate) fn detail(&self) -> Option<String> {
+        let step = self.step.as_deref()?;
+        let (head, command) = step.split_once(": ").unwrap_or((step, ""));
+        let (n, m) = head
+            .strip_prefix("STEP ")
+            .and_then(|nm| nm.split_once('/'))
+            .unwrap_or(("?", "?"));
+        let clip = |text: &str, max: usize| {
+            let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if text.chars().count() > max {
+                format!("{}…", text.chars().take(max).collect::<String>())
+            } else {
+                text
+            }
+        };
+        let quiet = self
+            .last_output
+            .map(|at| at.elapsed())
+            .filter(|quiet| *quiet >= QUIET_AFTER);
+        Some(match (quiet, &self.last_line) {
+            (Some(quiet), Some(_)) if command.starts_with("RUN ") => format!(
+                "Step {n} of {m} · writing the layer, quiet for {}s — podman hashes every file \
+                 the step wrote",
+                quiet.as_secs()
+            ),
+            (_, Some(line)) => format!("Step {n} of {m} · {}", clip(line, 90)),
+            (_, None) => format!("Step {n} of {m}: {}", clip(command, 90)),
+        })
     }
 
     /// Nothing has arrived for [`QUIET_AFTER`]: what to say about it, if
@@ -5260,6 +5302,30 @@ mod tests {
     }
 
     use super::*;
+
+    /// The startup page's line for a build: the step and its command, the
+    /// step's latest line while it prints, and the layer being written
+    /// once it has gone quiet.
+    #[test]
+    fn a_builds_detail_says_its_step_its_line_and_its_quiet() {
+        let mut progress = BuildProgress::default();
+        assert_eq!(progress.detail(), None);
+        progress.saw("STEP 2/4: RUN microdnf install -y poppler-utils");
+        assert_eq!(
+            progress.detail().as_deref(),
+            Some("Step 2 of 4: RUN microdnf install -y poppler-utils")
+        );
+        progress.saw("Installing: poppler-24.02.0-6.fc44.x86_64   100% |   1.2 MiB/s");
+        assert_eq!(
+            progress.detail().as_deref(),
+            Some("Step 2 of 4 · Installing: poppler-24.02.0-6.fc44.x86_64 100% | 1.2 MiB/s")
+        );
+        progress.last_output = Some(std::time::Instant::now() - std::time::Duration::from_secs(45));
+        assert!(progress
+            .detail()
+            .unwrap()
+            .starts_with("Step 2 of 4 · writing the layer, quiet for 45s"));
+    }
 
     fn make(root: &std::path::Path) -> Arc<Supervisor> {
         make_env(root, EnvironmentIdentity::primary(root))

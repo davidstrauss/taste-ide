@@ -2021,10 +2021,61 @@ impl EnvironmentRegistry {
         }
         let domain = vm.domain.clone();
         let started = std::time::Instant::now();
-        let container =
+        // The build's progress on the startup page, not only in the log:
+        // the step it is at and its latest line, and — through the quiet
+        // that follows a RUN while podman writes the layer — a clock, from
+        // a ticker, since nothing prints then (David, 2026-10-05: "This
+        // should show progress").
+        let progress = std::sync::Arc::new(std::sync::Mutex::new((
+            crate::supervisor::BuildProgress::default(),
+            std::time::Instant::now(),
+        )));
+        let built = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if building && primarys {
+            let (progress, built, events, domain) = (
+                progress.clone(),
+                built.clone(),
+                self.events.clone(),
+                domain.clone(),
+            );
+            std::thread::spawn(move || {
+                while !built.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let detail = progress.lock().unwrap().0.detail();
+                    if let Some(line) = detail.filter(|d| d.contains("quiet for")) {
+                        events.publish(Event::VmProgress {
+                            domain: domain.clone(),
+                            line,
+                        });
+                    }
+                }
+            });
+        }
+        let ensured =
             crate::keeper::ensure_container(&substrate, vm, &self.workspace_root, &|line| {
+                if building && primarys {
+                    let detail = {
+                        let mut progress = progress.lock().unwrap();
+                        progress.0.saw(&line);
+                        // A line a fifth of a second, at most: a package
+                        // manager's output is a line a package.
+                        let due = progress.1.elapsed() >= std::time::Duration::from_millis(200);
+                        if due {
+                            progress.1 = std::time::Instant::now();
+                        }
+                        progress
+                            .0
+                            .detail()
+                            .filter(|_| due || line.starts_with("STEP "))
+                    };
+                    if let Some(detail) = detail {
+                        self.progress_vm(&domain, detail);
+                    }
+                }
                 push_vm_log(&self.vm_logs, &self.events, &domain, line)
-            })?;
+            });
+        built.store(true, std::sync::atomic::Ordering::SeqCst);
+        let container = ensured?;
         if building {
             self.note_vm(&vm.domain, "the files service image is built");
         }
@@ -2988,8 +3039,13 @@ impl EnvironmentRegistry {
         // user's folder, uncommitted work included — or, when it is already
         // there, the folder is brought up to date with it.
         if substrate.vm_details().is_some() {
-            self.primary()
-                .announce_preparing("placing the checkout in the VM");
+            // Not announced here: the placement starts the files service
+            // first, building its image when the VM has none, and says
+            // each of those and then itself in that order
+            // (`place_primary_now`, `keeper_for`). Said here as well, the
+            // startup page lit "Sync checkout into VM" first, and the image
+            // build — minutes, with its progress — ran under that row,
+            // since the page never steps back (2026-10-05).
             let registry = self.clone();
             match tokio::task::spawn_blocking(move || registry.place_primary_now()).await {
                 Ok(Ok(Some(sync))) => {

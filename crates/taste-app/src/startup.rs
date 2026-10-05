@@ -804,7 +804,7 @@ impl StartupPage {
     }
 
     /// TASTE_PROBE_CHECK only: pose the page at a stage —
-    /// `TASTE_PROBE_STARTUP=vm|image|novm|place|build|failed|noconfig|ready` — with a few
+    /// `TASTE_PROBE_STARTUP=vm|image|novm|service|place|build|failed|noconfig|ready` — with a few
     /// lines in its log, since a start is a minute of a machine's life and
     /// a shot has none of it.
     #[doc(hidden)]
@@ -838,9 +838,27 @@ impl StartupPage {
                 "Already in the VM, on main, in step with the folder.",
             ),
         ] {
+            // The files service's image building is a pose of the steps
+            // before the checkout's: none of them has ended yet.
+            if kind == "service" && matches!(stage, S::ServiceImage | S::Files | S::Place) {
+                continue;
+            }
             self.on_concluded(stage, words);
         }
         match kind {
+            // The files service's image building in the VM, partway, with
+            // the build's own progress as the step's detail.
+            "service" => {
+                self.activate(Step::Vm, None);
+                self.activate(
+                    Step::ServiceImage,
+                    Some("building the files service image (once per VM)"),
+                );
+                self.on_vm_line("[taste-ide] building the files service image in the guest");
+                self.on_vm_progress(
+                    "Step 2 of 4 · Installing: poppler-24.02.0-6.fc44.x86_64 100% | 1.2 MiB/s",
+                );
+            }
             "build" => {
                 self.activate(Step::Vm, None);
                 self.activate(Step::Files, None);
