@@ -429,7 +429,11 @@ fn set_dirty_dot(tab: &adw::TabPage, dirty: bool) {
     }
     if dirty {
         tab.set_indicator_icon(Some(&gtk::gio::ThemedIcon::new("media-record-symbolic")));
-        tab.set_indicator_tooltip("Unstaged changes");
+        // Activatable, or libadwaita shows no tooltip for it at all, and
+        // the dot was a mark nobody could ask about (David, 2026-10-05:
+        // "What does this black dot mean?"). A click shows the changes.
+        tab.set_indicator_activatable(true);
+        tab.set_indicator_tooltip("Uncommitted changes — click to see them");
     } else {
         tab.set_indicator_icon(gtk::gio::Icon::NONE);
     }
@@ -880,6 +884,22 @@ impl Editor {
 
         // Dirty tabs ask before closing; that is the whole point of tabs.
         let weak = Rc::downgrade(&editor);
+        // A tab's indicator, clicked: the git dot opens the file's changes;
+        // the warning, which says what the bar above the file says, brings
+        // the file to the front where that bar is.
+        {
+            let weak = Rc::downgrade(&editor);
+            editor.tabs.connect_indicator_activated(move |tabs, tab| {
+                let Some(editor) = weak.upgrade() else { return };
+                let Some((path, page)) = editor.page_by_tab(tab) else {
+                    return;
+                };
+                tabs.set_selected_page(tab);
+                if !page.warned.get() {
+                    editor.open_changes(&path);
+                }
+            });
+        }
         editor.tabs.connect_close_page(move |tabs, page| {
             let Some(editor) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
@@ -2811,7 +2831,7 @@ impl Editor {
                     .unwrap_or_default(),
             );
             tab.set_icon(Some(&file_type_icon(&path)));
-            tab.set_tooltip(&path.display().to_string());
+            tab.set_tooltip(&editor.shown_path(&path));
             editor.surfaces.borrow_mut().insert(
                 key,
                 Rc::new(SurfaceEntry {
@@ -3209,12 +3229,12 @@ impl Editor {
                 tab.set_title(&format!("{file_name} · {env}"));
                 tab.set_tooltip(&format!(
                     "{}\nRead-only: {env}'s checkout, which its agent is working in",
-                    path.display()
+                    self.shown_path(path)
                 ));
             }
             (None, None) => {
                 tab.set_title(&file_name);
-                tab.set_tooltip(&path.display().to_string());
+                tab.set_tooltip(&self.shown_path(path));
             }
         }
         tab.set_icon(Some(&file_type_icon(
@@ -3486,7 +3506,7 @@ impl Editor {
             page.warned.set(false);
             page.page.set_indicator_icon(gtk::gio::Icon::NONE);
             set_dirty_dot(&page.page, editor.git_dirty.borrow().contains_key(&path));
-            page.page.set_tooltip(&path.display().to_string());
+            page.page.set_tooltip(&editor.shown_path(&path));
             editor.refresh_markdown_mode(&path, &page);
         });
     }
@@ -3999,7 +4019,7 @@ impl Editor {
                     page.conflict_bar.set_revealed(false);
                     page.page.set_indicator_icon(gtk::gio::Icon::NONE);
                     set_dirty_dot(&page.page, editor.git_dirty.borrow().contains_key(&path));
-                    page.page.set_tooltip(&path.display().to_string());
+                    page.page.set_tooltip(&editor.shown_path(&path));
                 }
                 return;
             }
@@ -4011,8 +4031,13 @@ impl Editor {
                     )));
                 page.page.set_tooltip(&format!(
                     "{} changed on disk while you have unsaved edits",
-                    path.display()
+                    editor.shown_path(&path)
                 ));
+                page.page.set_indicator_activatable(true);
+                page.page.set_indicator_tooltip(
+                    "Changed on disk while you have unsaved edits — the bar above the \
+                     file says what each choice does",
+                );
                 page.conflict_bar
                     .set_title("This file changed on disk while you have unsaved edits");
                 page.conflict_bar.set_revealed(true);
@@ -4050,7 +4075,7 @@ impl Editor {
             if page.warned.replace(false) {
                 page.conflict_bar.set_revealed(false);
                 page.page.set_indicator_icon(gtk::gio::Icon::NONE);
-                page.page.set_tooltip(&path.display().to_string());
+                page.page.set_tooltip(&editor.shown_path(&path));
             }
             restore_scroll(&page.view, &page.scroller, held);
             if was_plain != page.plain.get() || editor.wysiwyg_active(&path, &page) {
@@ -4148,7 +4173,7 @@ impl Editor {
                     // until the next status sync corrects it.
                     page.page.set_indicator_icon(gtk::gio::Icon::NONE);
                     set_dirty_dot(&page.page, true);
-                    page.page.set_tooltip(&path.display().to_string());
+                    page.page.set_tooltip(&self.shown_path(path));
                 }
                 // Own changes are announced, not just watched for: the
                 // Dirty filter and status badges update immediately.
@@ -4169,8 +4194,41 @@ impl Editor {
         page.page.set_tooltip(message);
         page.page
             .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new("dialog-warning-symbolic")));
+        page.page.set_indicator_activatable(true);
+        page.page.set_indicator_tooltip(message);
     }
 
+    /// A file as its tab's tooltip names it: its path in its checkout, and
+    /// the environment when that is not Personal's. Where the checkout
+    /// sits — a directory in a VM, `/var/home/core/taste/<key>/primary/…`
+    /// — means nothing on this machine.
+    pub(crate) fn shown_path(&self, path: impl AsRef<Path>) -> String {
+        shown_path_in(self.workspace.root(), path.as_ref())
+    }
+}
+
+/// [`Editor::shown_path`] for the workspace at `root`.
+fn shown_path_in(root: &Path, path: &Path) -> String {
+    let guest = taste_devcontainer::provision::guest_workspace_dir(root);
+    if let Ok(rest) = path.strip_prefix(&guest) {
+        let mut parts = rest.components();
+        if let Some(env) = parts.next() {
+            let env = env.as_os_str().to_string_lossy();
+            let rel = parts.as_path().display();
+            return if env == "primary" {
+                rel.to_string()
+            } else {
+                format!("{rel} · {env}")
+            };
+        }
+    }
+    match path.strip_prefix(root) {
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+impl Editor {
     /// Apply an already-read `.editorconfig`: indentation on the view now,
     /// whitespace policy recorded for save time.
     ///
@@ -4535,6 +4593,28 @@ mod tests {
             assert!(wait_for(&checkout.join("notes.md")));
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    /// A tab's tooltip names the file in its checkout, and the
+    /// environment when it is not Personal's — never the checkout's place
+    /// in the VM.
+    #[test]
+    fn a_tab_names_its_file_in_its_checkout() {
+        let root = std::path::Path::new("/home/u/Projects/deck");
+        let guest = taste_devcontainer::provision::guest_workspace_dir(root);
+        assert_eq!(
+            super::shown_path_in(root, &guest.join("primary/tpl/README.md")),
+            "tpl/README.md"
+        );
+        assert_eq!(
+            super::shown_path_in(root, &guest.join("i-0003/main.typ")),
+            "main.typ · i-0003"
+        );
+        assert_eq!(super::shown_path_in(root, &root.join("a.md")), "a.md");
+        assert_eq!(
+            super::shown_path_in(root, std::path::Path::new("/etc/x")),
+            "/etc/x"
+        );
     }
 
     /// A change applied to a buffer is the lines that differ, as one step
