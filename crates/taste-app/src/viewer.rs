@@ -338,7 +338,7 @@ impl ViewerPage {
                 glib::timeout_add_local_once(std::time::Duration::from_millis(1500), {
                     let view = view.clone();
                     move || {
-                        js("document.getElementById('container').scrollTop = 150; 'scrolled to ' + document.getElementById('container').scrollTop", &view);
+                        js("'scrolled to ' + window.tasteScroll(1800)", &view);
                         glib::timeout_add_local_once(
                             std::time::Duration::from_millis(400),
                             move || {
@@ -348,7 +348,7 @@ impl ViewerPage {
                                 glib::timeout_add_local_once(
                                     std::time::Duration::from_millis(1500),
                                     move || {
-                                        js("'after reload ' + document.getElementById('container').scrollTop", &view);
+                                        js("'after reload ' + window.tasteScroll()", &view);
                                     },
                                 );
                             },
@@ -530,19 +530,34 @@ const PDF_VIEWER_CSS: &[u8] = include_bytes!("../vendor/pdfjs/pdf_viewer.css");
 /// the document fitted to the width, Ctrl and the wheel to zoom, and the
 /// pane's own background behind the pages. PDF scripting is never on: the
 /// sandbox that runs a PDF's JavaScript is not served, and `eval` is off.
+///
+/// A reload never shows the document coming apart (David, 2026-10-05:
+/// "Make PDF reloads less wonky"). The page keeps two panes: the one on
+/// screen, and one behind it the new document is drawn into — at the zoom
+/// the old one was at, scrolled to the same place on the same page, in
+/// the PDF's own coordinates rather than in pixels, so a page above that
+/// grew or shrank does not move it — and they change places once the
+/// page in view has been drawn, or after a second and a half whatever has
+/// been. A newer reload takes over from one still drawing, and a file that
+/// does not parse — a PDF caught half-written by the build making it —
+/// leaves the one on screen as it is: the write that finishes it is a
+/// change of its own.
 const PDF_PAGE: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="color-scheme" content="light dark">
 <link rel="stylesheet" href="pdf_viewer.css">
 <style>
 html, body { margin: 0; height: 100%; background: transparent; }
-#container { position: absolute; inset: 0; overflow: auto; }
+.pane { position: absolute; inset: 0; overflow: auto; }
+.pane.behind { visibility: hidden; z-index: -1; }
 .pdfViewer .page { border: none; margin: 12px auto;
   box-shadow: 0 1px 3px rgba(0,0,0,.25); }
 #failed { font: 15px/1.5 system-ui, sans-serif; margin: 15vh auto; max-width: 32em;
   padding: 0 24px; opacity: .8; }
 </style></head>
-<body><div id="container"><div id="viewer" class="pdfViewer"></div></div>
+<body>
+<div id="a" class="pane"><div class="pdfViewer"></div></div>
+<div id="b" class="pane behind"><div class="pdfViewer"></div></div>
 <script type="module">
 try {
   const pdfjsLib = await import("./pdf.min.mjs");
@@ -550,43 +565,100 @@ try {
   pdfjsLib.GlobalWorkerOptions.workerSrc = "./pdf.worker.min.mjs";
   const { EventBus, PDFViewer, PDFLinkService, PDFFindController } =
     await import("./pdf_viewer.mjs");
-  const container = document.getElementById("container");
-  const eventBus = new EventBus();
-  const linkService = new PDFLinkService({ eventBus });
-  const findController = new PDFFindController({ eventBus, linkService });
-  const viewer = new PDFViewer({ container, eventBus, linkService, findController });
-  linkService.setViewer(viewer);
-  eventBus.on("pagesinit", () => { viewer.currentScaleValue = "page-width"; });
   const open = (url) => pdfjsLib.getDocument({
     url, isEvalSupported: false, enableXfa: false,
   }).promise;
-  let doc = await open("document.pdf");
-  viewer.setDocument(doc);
-  linkService.setDocument(doc, null);
-  // A reload in place: the new document, at the zoom and the scroll it
-  // replaces, once its pages are laid out (viewer.rs, `ViewerPage::show`).
-  window.tasteReload = async () => {
-    const top = container.scrollTop, left = container.scrollLeft;
-    const scale = viewer.currentScaleValue;
-    const next = await open("document.pdf?v=" + Date.now());
-    eventBus.on("pagesinit", () => {
-      viewer.currentScaleValue = scale;
-      container.scrollTop = top;
-      container.scrollLeft = left;
-    }, { once: true });
-    viewer.setDocument(next);
-    linkService.setDocument(next, null);
-    doc.destroy();
-    doc = next;
+  const pane = (container) => {
+    const eventBus = new EventBus();
+    const linkService = new PDFLinkService({ eventBus });
+    const findController = new PDFFindController({ eventBus, linkService });
+    const viewer = new PDFViewer({ container, eventBus, linkService, findController });
+    linkService.setViewer(viewer);
+    const it = { container, eventBus, linkService, viewer, doc: null, location: null };
+    eventBus.on("updateviewarea", (event) => { it.location = event.location; });
+    return it;
   };
-  container.addEventListener("wheel", (event) => {
-    if (!event.ctrlKey) return;
-    event.preventDefault();
-    viewer.currentScale *= event.deltaY < 0 ? 1.1 : 1 / 1.1;
-  }, { passive: false });
+  const show = (it, doc) => {
+    it.doc = doc;
+    it.viewer.setDocument(doc);
+    it.linkService.setDocument(doc, null);
+  };
+  let shown = pane(document.getElementById("a"));
+  let behind = pane(document.getElementById("b"));
+  shown.eventBus.on("pagesinit", () => {
+    shown.viewer.currentScaleValue = "page-width";
+  }, { once: true });
+  show(shown, await open("document.pdf"));
+
+  let generation = 0;
+  window.tasteReload = async () => {
+    const mine = ++generation;
+    let next;
+    try {
+      next = await open("document.pdf?v=" + Date.now());
+    } catch (error) {
+      return;
+    }
+    if (mine !== generation) { next.destroy(); return; }
+    const into = behind;
+    const scale = shown.viewer.currentScaleValue;
+    // At the very top it stays there: a place in the PDF's coordinates is
+    // a page's edge, which leaves out the margin above the first page.
+    const at = shown.container.scrollTop === 0 ? null : shown.location;
+    await new Promise((resolve) => {
+      let page = 1, done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        into.eventBus.off("pagerendered", drawn);
+        resolve();
+      };
+      const drawn = (event) => { if (event.pageNumber === page) finish(); };
+      into.eventBus.on("pagesinit", () => {
+        into.viewer.currentScaleValue = scale;
+        if (at) {
+          page = Math.min(at.pageNumber, next.numPages);
+          into.viewer.scrollPageIntoView(page === at.pageNumber
+            ? { pageNumber: page, destArray: [null, { name: "XYZ" }, at.left, at.top, null],
+                allowNegativeOffset: true }
+            : { pageNumber: page });
+        }
+      }, { once: true });
+      into.eventBus.on("pagerendered", drawn);
+      setTimeout(finish, 1500);
+      show(into, next);
+    });
+    if (mine !== generation) return;
+    const from = shown;
+    into.container.classList.remove("behind");
+    from.container.classList.add("behind");
+    shown = into;
+    behind = from;
+    const old = from.doc;
+    from.doc = null;
+    from.viewer.setDocument(null);
+    from.linkService.setDocument(null, null);
+    if (old) old.destroy();
+  };
+  // For the probe: the scroll of the pane on screen, and its page.
+  window.tasteScroll = (top) => {
+    if (top !== undefined) shown.container.scrollTop = top;
+    return shown.container.scrollTop + " (page " + shown.viewer.currentPageNumber + ")";
+  };
+  for (const container of document.querySelectorAll(".pane")) {
+    container.addEventListener("wheel", (event) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      shown.viewer.currentScale *= event.deltaY < 0 ? 1.1 : 1 / 1.1;
+    }, { passive: false });
+  }
   new ResizeObserver(() => {
-    if (viewer.currentScaleValue === "page-width") viewer.currentScaleValue = "page-width";
-  }).observe(container);
+    for (const it of [shown, behind]) {
+      if (it.doc && it.viewer.currentScaleValue === "page-width") {
+        it.viewer.currentScaleValue = "page-width";
+      }
+    }
+  }).observe(document.body);
 } catch (error) {
   document.body.innerHTML = "";
   const p = document.createElement("p");
