@@ -1235,6 +1235,129 @@ pub fn share_submodules_remotes(peer: &Path, vm: &Vm, keys: &Keys, files: &Files
     }
 }
 
+/// How many of a copy's files are read from the checkout at once.
+const COPY_READERS: usize = 4;
+
+/// The ignored files at or under each of `rels` in the checkout at `path`,
+/// read through `files`, copied to the same paths under `peer` — the
+/// folder the user opened (David, 2026-10-05: "Let me right-click on an
+/// ignored file to copy it back to my local machine. Also let me do it
+/// with folders"). Part of a sync pass: the mirror never carries an
+/// ignored file, and this is the user asking for some (David: "Queued
+/// ignore copies should be tracked as part of the sync system").
+///
+/// Git in the checkout says which they are (`ls-files --others
+/// --ignored`), the same question for a file and for a folder: a file
+/// that is not ignored is not listed, and a folder gives up only what it
+/// ignores. Read [`COPY_READERS`] at a time; each written in place, its
+/// executable bit kept — being ignored, nothing else reads it on the way.
+/// `on_copied` is told each as it lands. How many were copied, their
+/// bytes, and the asked-for paths that held nothing ignored.
+pub fn copy_ignored_home(
+    files: &Files,
+    path: &Path,
+    peer: &Path,
+    rels: &[PathBuf],
+    on_copied: &(dyn Fn(usize, usize, &Path) + Sync),
+) -> Result<(usize, u64, Vec<PathBuf>)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut wanted: Vec<PathBuf> = Vec::new();
+    let mut empty: Vec<PathBuf> = Vec::new();
+    for rel in rels {
+        let listed = files.exec(
+            path,
+            &[
+                "git".into(),
+                "-c".into(),
+                "core.quotePath=false".into(),
+                "ls-files".into(),
+                "--others".into(),
+                "--ignored".into(),
+                "--exclude-standard".into(),
+                "-z".into(),
+                "--".into(),
+                rel.display().to_string(),
+            ],
+        )?;
+        if !listed.success() {
+            bail!(
+                "listing what is ignored under {}: {}",
+                rel.display(),
+                listed.stderr_utf8().trim()
+            );
+        }
+        let found: Vec<PathBuf> = listed
+            .stdout_utf8()
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| {
+                p.components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+            })
+            .collect();
+        if found.is_empty() {
+            empty.push(rel.clone());
+        }
+        for p in found {
+            if !wanted.contains(&p) {
+                wanted.push(p);
+            }
+        }
+    }
+    let total = wanted.len();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let landed = std::sync::atomic::AtomicUsize::new(0);
+    let bytes = std::sync::atomic::AtomicU64::new(0);
+    let failed: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..COPY_READERS.min(total) {
+            scope.spawn(|| loop {
+                if failed.lock().unwrap().is_some() {
+                    return;
+                }
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(rel) = wanted.get(index) else {
+                    return;
+                };
+                let copied = (|| -> Result<u64> {
+                    let from = path.join(rel);
+                    let content = files
+                        .read(&from)
+                        .with_context(|| format!("reading {}", rel.display()))?;
+                    let to = peer.join(rel);
+                    if let Some(parent) = to.parent() {
+                        std::fs::create_dir_all(parent)
+                            .with_context(|| format!("making {}", parent.display()))?;
+                    }
+                    std::fs::write(&to, &content)
+                        .with_context(|| format!("writing {}", to.display()))?;
+                    if files.stat(&from).is_ok_and(|stat| stat.mode & 0o111 != 0) {
+                        let _ =
+                            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755));
+                    }
+                    Ok(content.len() as u64)
+                })();
+                match copied {
+                    Ok(size) => {
+                        bytes.fetch_add(size, std::sync::atomic::Ordering::SeqCst);
+                        let done = landed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        on_copied(done, total, rel);
+                    }
+                    Err(e) => {
+                        failed.lock().unwrap().get_or_insert(e);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = failed.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok((landed.into_inner(), bytes.into_inner(), empty))
+}
+
 /// Personal's snapshot of the working copy at `path`, taken there.
 fn snapshot_in_checkout(files: &Files, path: &Path) -> Result<()> {
     let script = taste_git::snapshot::script(&taste_git::snapshot_ref("primary"))?;
@@ -2416,6 +2539,56 @@ mod tests {
                 &["rev-parse", "refs/remotes/origin/feature"]
             ),
             head
+        );
+    }
+
+    /// What a copy home brings: the ignored files under a folder, to the
+    /// same paths, an executable one still executable; one ignored file
+    /// alone; and nothing for a file git tracks, which is named back.
+    #[test]
+    fn the_ignored_files_under_a_path_are_copied_to_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let pair = Pair::new("copy-home");
+        let checkout = pair.dir.join("checkout");
+        let folder = pair.dir.join("folder");
+        std::fs::write(checkout.join(".gitignore"), "build/\n*.log\n").unwrap();
+        std::fs::create_dir_all(checkout.join("build/sub")).unwrap();
+        std::fs::write(checkout.join("build/slides.pdf"), "%PDF").unwrap();
+        std::fs::write(checkout.join("build/sub/run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            checkout.join("build/sub/run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(checkout.join("trace.log"), "log").unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let (count, bytes, empty) = copy_ignored_home(
+            &Files::Local,
+            &checkout,
+            &folder,
+            &["build".into(), "trace.log".into(), "a.txt".into()],
+            &|done, total, rel| seen.lock().unwrap().push((done, total, rel.to_path_buf())),
+        )
+        .unwrap();
+        assert_eq!((count, bytes), (3, 17));
+        assert_eq!(
+            empty,
+            [PathBuf::from("a.txt")],
+            "tracked, so nothing to copy"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(folder.join("build/slides.pdf")).unwrap(),
+            "%PDF"
+        );
+        let mode = std::fs::metadata(folder.join("build/sub/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "still executable");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("trace.log")).unwrap(),
+            "log"
         );
     }
 

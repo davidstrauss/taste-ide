@@ -560,6 +560,10 @@ pub struct Supervisor {
     /// Paths the folder and the checkout both changed, differently
     /// (`sync_primary_blocking`); the primary's only.
     folder_conflicts: Mutex<Vec<std::path::PathBuf>>,
+    /// Paths in the primary's checkout whose ignored files the user asked
+    /// for in their folder, waiting for the next sync pass, which carries
+    /// them home ([`Self::request_copy_home`]).
+    copy_home: Mutex<Vec<std::path::PathBuf>>,
     /// The watch on the user's folder (`watch_folder`), held for its life.
     folder_watch: Mutex<Option<notify::RecommendedWatcher>>,
     /// Held for the whole of a primary sync, fetch to resnapshot: one at a
@@ -903,6 +907,7 @@ impl Supervisor {
             hook_failure: Mutex::new(None),
             capability_gaps: Mutex::new(Vec::new()),
             folder_conflicts: Mutex::new(Vec::new()),
+            copy_home: Mutex::new(Vec::new()),
             folder_watch: Mutex::new(None),
             folder_sync: Mutex::new(()),
             agent_node: Mutex::new(None),
@@ -1456,6 +1461,29 @@ impl Supervisor {
     /// which is its own repository. Blocking; the file tree runs it after
     /// every commit, switch, or rebase it makes over there, and the
     /// snapshot cadence after every snapshot that wrote.
+    /// Ask for the ignored files at or under `rel` — a path in the
+    /// primary's checkout — in the user's folder: the sync pass this sets
+    /// off carries them, with its progress, its summary, and its failure
+    /// where the sync's own are (`crate::peer::copy_ignored_home`); one
+    /// asked for while a pass runs goes with the next, and the close's
+    /// last pass takes whatever is still waiting.
+    pub fn request_copy_home(self: &Arc<Self>, rel: std::path::PathBuf) {
+        {
+            let mut asked = self.copy_home.lock().unwrap();
+            if !asked.contains(&rel) {
+                asked.push(rel);
+            }
+        }
+        self.events
+            .publish(Event::FolderSync(taste_core::FolderSync::Pending));
+        let supervisor = self.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = supervisor.sync_peer_blocking() {
+                tracing::warn!("the sync carrying a copy to the folder: {e:#}");
+            }
+        });
+    }
+
     pub fn sync_peer_blocking(&self) -> Result<()> {
         let Checkout::Remote { vm, path } = self.checkout() else {
             return Ok(());
@@ -1536,9 +1564,43 @@ impl Supervisor {
             });
         }
         *self.folder_conflicts.lock().unwrap() = sync.conflicts.clone();
-        events.publish(Event::FolderSync(taste_core::FolderSync::Done {
-            summary: folder_sync_summary(&sync),
-        }));
+        // The ignored files the user asked for, carried by this pass.
+        let asked = std::mem::take(&mut *self.copy_home.lock().unwrap());
+        let mut copied = None;
+        if !asked.is_empty() {
+            events.publish(Event::FolderSync(taste_core::FolderSync::Running {
+                step: "Finding the ignored files you asked for".into(),
+                done: 0,
+                total: 0,
+            }));
+            let on_copied = |done: usize, total: usize, rel: &Path| {
+                events.publish(Event::FolderSync(taste_core::FolderSync::Running {
+                    step: format!("Copying {} to your folder", rel.display()),
+                    done,
+                    total,
+                }));
+            };
+            match crate::peer::copy_ignored_home(
+                &self.files(),
+                path,
+                &self.env.peer,
+                &asked,
+                &on_copied,
+            ) {
+                Ok((count, bytes, empty)) => copied = Some(copy_home_summary(count, bytes, &empty)),
+                Err(e) => {
+                    events.publish(Event::FolderSync(taste_core::FolderSync::Failed {
+                        reason: format!("copying ignored files to your folder: {e:#}"),
+                    }));
+                    return Err(e.context("copying ignored files to the folder"));
+                }
+            }
+        }
+        let summary = match (folder_sync_summary(&sync), copied) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (a, b) => a.or(b),
+        };
+        events.publish(Event::FolderSync(taste_core::FolderSync::Done { summary }));
         if sync.sent > 0 && depth < 2 {
             self.log(format!(
                 "sent {} change(s) from your folder to the checkout in the VM",
@@ -4813,6 +4875,26 @@ fn argv_for_log(exec_args: &[String]) -> String {
 /// The first line of a message, for a toast or a row.
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or(text)
+}
+
+/// What a sync pass's copy home came to, for its summary.
+fn copy_home_summary(count: usize, bytes: u64, empty: &[std::path::PathBuf]) -> String {
+    let mut said = match count {
+        0 => "Nothing ignored to copy to your folder".to_string(),
+        1 => format!(
+            "Copied 1 ignored file to your folder ({})",
+            taste_core::environment::format_bytes(bytes)
+        ),
+        n => format!(
+            "Copied {n} ignored files to your folder ({})",
+            taste_core::environment::format_bytes(bytes)
+        ),
+    };
+    if count > 0 && !empty.is_empty() {
+        let names: Vec<String> = empty.iter().map(|p| p.display().to_string()).collect();
+        said.push_str(&format!("; nothing ignored under {}", names.join(", ")));
+    }
+    said
 }
 
 /// `--userns=keep-id:uid=U,gid=G` for a non-root container user when the

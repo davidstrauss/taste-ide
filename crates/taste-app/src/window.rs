@@ -195,6 +195,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.set_on_open_diff(move |path| editor.open_changes(&path));
     }
     {
+        // Ignored files the user asks for in their folder go with
+        // Personal's next sync pass.
+        let environments = environments.clone();
+        filetree.set_on_copy_home(move |rel| environments.primary().request_copy_home(rel));
+    }
+    {
         // ...and a REVIEW row opens the branch's two sides instead. Not the
         // same call with a different base: there is no file on disk behind
         // a branch's version of a file, and the working tree has no part in
