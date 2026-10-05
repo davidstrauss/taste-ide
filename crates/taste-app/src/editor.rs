@@ -4500,6 +4500,10 @@ mod tests {
             std::fs::create_dir_all(&checkout).unwrap();
             std::fs::write(checkout.join(".env"), "SECRET=1\n").unwrap();
             std::fs::write(checkout.join("notes.md"), "notes\n").unwrap();
+            // As the app does before any editor: the editor loads the
+            // language list, after which no language can be added to it,
+            // and these tests share one GTK thread.
+            crate::languages::register();
             let workspace = taste_core::Workspace::open(folder.clone());
             let editor = super::Editor::new(workspace.clone());
             let wait_for = |path: &std::path::Path| {
