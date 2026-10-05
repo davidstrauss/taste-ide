@@ -4393,6 +4393,30 @@ impl FileTree {
             }
         }
 
+        // Ignored files reach this machine only when asked for: the mirror
+        // never carries them, and the checkout they are in is in the VM.
+        // Offered on a folder, for the ignored files under it, and on a
+        // file whenever ignored files are shown, which is the only time
+        // one can be right-clicked.
+        let remote = self.watching.borrow().is_none() && !self.workspace.files().is_local();
+        if remote && !node.ghost && (node.is_dir || *self.show_ignored.borrow()) {
+            let home_section = gio::Menu::new();
+            home_section.append(
+                Some(if node.is_dir {
+                    "Copy Ignored Files to Your Folder"
+                } else {
+                    "Copy to Your Folder"
+                }),
+                Some("row.copy-home"),
+            );
+            menu.append_section(None, &home_section);
+            let tree = self.clone();
+            let path = node.path.clone();
+            let action = gio::SimpleAction::new("copy-home", None);
+            action.connect_activate(move |_, _| tree.copy_home(&path));
+            actions.add_action(&action);
+        }
+
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
         popover.insert_action_group("row", Some(&actions));
         popover.set_parent(anchor);
@@ -4404,6 +4428,42 @@ impl FileTree {
         // can close it before its anchor row is disposed under it.
         *self.open_menu.borrow_mut() = Some(popover.downgrade());
         popover.popup();
+    }
+
+    /// Copy the ignored files at or under `path` from the checkout in the
+    /// VM to the same place in the user's folder ([`copy_ignored_home`]),
+    /// off the main thread, saying how it went.
+    fn copy_home(self: &Rc<Self>, path: &Path) {
+        let checkout = self.workspace.checkout_path();
+        let Ok(rel) = path.strip_prefix(&checkout).map(Path::to_path_buf) else {
+            return;
+        };
+        let files = self.workspace.files();
+        let folder = self.workspace.root().to_path_buf();
+        let events = self.workspace.events.clone();
+        let shown = if rel.as_os_str().is_empty() {
+            "the checkout".to_string()
+        } else {
+            rel.display().to_string()
+        };
+        glib::spawn_future_local(async move {
+            let done = crate::runtime::runtime()
+                .spawn_blocking(move || copy_ignored_home(&files, &checkout, &folder, &rel))
+                .await;
+            let note = match done {
+                Ok(Ok((1, bytes))) => format!(
+                    "Copied {shown} to your folder ({})",
+                    glib::format_size(bytes)
+                ),
+                Ok(Ok((count, bytes))) => format!(
+                    "Copied {count} ignored files from {shown} to your folder ({})",
+                    glib::format_size(bytes)
+                ),
+                Ok(Err(why)) => format!("Nothing copied from {shown}: {why}"),
+                Err(_) => return,
+            };
+            events.publish(taste_core::Event::Toast(note));
+        });
     }
 
     /// Close the context menu, if open, before its anchor may be disposed.
@@ -7720,6 +7780,79 @@ struct SearchView {
     pinned: Option<PathBuf>,
 }
 
+/// The ignored files at or under `rel` in the checkout at `checkout`,
+/// read through `files`, copied to the same paths under `folder` — the
+/// folder the user opened, on this machine (David, 2026-10-05: "Let me
+/// right-click on an ignored file to copy it back to my local machine.
+/// Also let me do it with folders"). Git in the checkout says which they
+/// are (`ls-files --others --ignored`), which is the same question for a
+/// file and for a folder: a file that is not ignored is not listed, and a
+/// folder gives up only what it ignores — the rest the mirror carries
+/// already. Each is written in place, its executable bit kept: being
+/// ignored, nothing else reads it on the way. How many were copied, and
+/// their bytes.
+fn copy_ignored_home(
+    files: &taste_core::files::Files,
+    checkout: &Path,
+    folder: &Path,
+    rel: &Path,
+) -> Result<(usize, u64), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let listed = files
+        .exec(
+            checkout,
+            &[
+                "git".into(),
+                "-c".into(),
+                "core.quotePath=false".into(),
+                "ls-files".into(),
+                "--others".into(),
+                "--ignored".into(),
+                "--exclude-standard".into(),
+                "-z".into(),
+                "--".into(),
+                rel.display().to_string(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    if !listed.success() {
+        return Err(listed.stderr_utf8().trim().to_string());
+    }
+    let paths: Vec<PathBuf> = listed
+        .stdout_utf8()
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| {
+            p.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        })
+        .collect();
+    if paths.is_empty() {
+        return Err(format!("nothing under {} is ignored", rel.display()));
+    }
+    let mut bytes = 0u64;
+    for path in &paths {
+        let from = checkout.join(path);
+        let content = files
+            .read(&from)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let to = folder.join(path);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("making {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&to, &content).map_err(|e| format!("writing {}: {e}", to.display()))?;
+        if let Ok(stat) = files.stat(&from) {
+            if stat.mode & 0o111 != 0 {
+                let _ = std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        bytes += content.len() as u64;
+    }
+    Ok((paths.len(), bytes))
+}
+
 /// The directory walk itself: `ignore::WalkBuilder` reads `.gitignore` and
 /// touches the filesystem for every entry, so this is the part that must
 /// run off the main thread — plain data in, plain data (`Send`) out, no
@@ -8006,6 +8139,77 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// What "Copy to Your Folder" copies: the ignored files under a folder,
+    /// to the same paths, an executable one still executable; one ignored
+    /// file alone; and nothing, said, for a file git tracks.
+    #[test]
+    fn the_ignored_files_under_a_path_are_copied_to_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile_dir("copy-home");
+        let checkout = dir.join("checkout");
+        let folder = dir.join("folder");
+        std::fs::create_dir_all(checkout.join("build/sub")).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&checkout)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(checkout.join(".gitignore"), "build/\n*.log\n").unwrap();
+        std::fs::write(checkout.join("notes.txt"), "tracked\n").unwrap();
+        git(&["add", "-A"]);
+        std::fs::write(checkout.join("build/slides.pdf"), "%PDF").unwrap();
+        std::fs::write(checkout.join("build/sub/run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            checkout.join("build/sub/run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(checkout.join("trace.log"), "log").unwrap();
+        let files = taste_core::files::Files::Local;
+
+        let (count, bytes) =
+            super::copy_ignored_home(&files, &checkout, &folder, Path::new("build")).unwrap();
+        assert_eq!((count, bytes), (2, 14));
+        assert_eq!(
+            std::fs::read_to_string(folder.join("build/slides.pdf")).unwrap(),
+            "%PDF"
+        );
+        let mode = std::fs::metadata(folder.join("build/sub/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "still executable");
+
+        assert_eq!(
+            super::copy_ignored_home(&files, &checkout, &folder, Path::new("trace.log")).unwrap(),
+            (1, 3)
+        );
+        let tracked = super::copy_ignored_home(&files, &checkout, &folder, Path::new("notes.txt"))
+            .unwrap_err();
+        assert!(
+            tracked.contains("nothing under notes.txt is ignored"),
+            "{tracked}"
+        );
+        assert!(!folder.join("notes.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("taste-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
     use super::files_reached;
 
     /// git's refusal reads as git's, one line, its `fatal:` dropped.
