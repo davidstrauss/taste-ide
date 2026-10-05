@@ -42,9 +42,12 @@ pub struct Convention {
 /// "If .devcontainer/ exists but no json/Containerfile in it, show a ghost
 /// entry for the json + Containerfile. If .devcontainer/ doesn't exist,
 /// there should be a ghost to create the directory"): the directory, a
-/// ghost while it is missing; then, inside it, `devcontainer.json` while
-/// no config exists anywhere, and the `Containerfile` while the config is
-/// missing or names a build file that is.
+/// ghost while it is missing; and inside it, whether it exists yet or not,
+/// `devcontainer.json` while no config exists anywhere, and the
+/// `Containerfile` while the config is missing or names a build file that
+/// is — so the ghost folder opens onto the files it is for, and creating
+/// one makes the folder with it (2026-10-05: "I should be able to open the
+/// ghost folder and directly create the JSON by clicking on it").
 pub fn conventions(root: &Path) -> Vec<Convention> {
     conventions_via(&crate::files::Files::Local, root)
 }
@@ -80,12 +83,14 @@ pub fn conventions_via(files: &crate::files::Files, root: &Path) -> Vec<Conventi
             purpose: "devcontainer definition; the IDE builds and attaches to it \
                       (validated: privilege only as nested podman needs it, mounts stay in the workspace)",
             exists: has_devcontainer,
-            // Offered inside the folder, so only once the folder is there.
-            ghost: dir_exists,
+            // Inside the folder, ghost or real: a ghost folder's rows.
+            ghost: true,
             is_dir: false,
         },
     ];
-    if dir_exists {
+    // A root `.devcontainer.json` is a config with no folder: nothing to
+    // build from is wanted in a folder that is not there.
+    if dir_exists || !has_devcontainer {
         if let Some(build_file) = wanted_build_file(files, &dir) {
             list.push(Convention {
                 exists: false,
@@ -193,12 +198,47 @@ mod tests {
             .unwrap();
         assert!(editorconfig.exists);
         let ghosts: Vec<_> = list.iter().filter(|c| !c.exists && c.ghost).collect();
-        // No folder yet: the folder is the ghost, and the file waits for it.
+        // No folder yet: the folder is a ghost, and so are the files in it.
         assert!(ghosts
             .iter()
             .any(|c| c.path.ends_with(".devcontainer") && c.is_dir));
-        assert!(!ghosts.iter().any(|c| c.path.ends_with("devcontainer.json")));
+        assert!(ghosts
+            .iter()
+            .any(|c| c.path.ends_with(".devcontainer/devcontainer.json")));
+        assert!(ghosts
+            .iter()
+            .any(|c| c.path.ends_with(".devcontainer/Containerfile")));
+        // A root `.devcontainer.json` wants no folder and nothing in one.
+        std::fs::write(dir.path().join(".devcontainer.json"), "{}").unwrap();
+        let list = conventions(dir.path());
+        assert!(!list
+            .iter()
+            .any(|c| !c.exists && c.ghost && c.path.starts_with(dir.path().join(".devcontainer"))));
         assert!(!ghosts.iter().any(|c| c.path.ends_with(".taste.yaml")));
+    }
+
+    /// Everything safe mode lets be written is offered as a ghost while it
+    /// is missing (`.devcontainer.json` aside, the other spelling of the
+    /// config the `.devcontainer/` folder offers). The ghosts may offer
+    /// more — the Taskfile, which safe mode does not write.
+    #[test]
+    fn whatever_safe_mode_writes_is_a_ghost() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ghosts: Vec<PathBuf> = conventions(root)
+            .into_iter()
+            .filter(|c| c.ghost && !c.exists)
+            .map(|c| c.path)
+            .collect();
+        for scope in crate::policy::safe_mode_scope(root) {
+            let offered = ghosts.iter().any(|ghost| ghost.starts_with(&scope));
+            let spelling = scope == root.join(".devcontainer.json");
+            assert!(
+                offered || spelling,
+                "{} is writable in safe mode and offered by no ghost",
+                scope.display()
+            );
+        }
     }
 
     #[test]

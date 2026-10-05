@@ -6666,8 +6666,10 @@ impl FileTree {
         let child_filter = filter.clone();
         let tree_model = gtk::TreeListModel::new(root_store, false, autoexpand, move |item| {
             let node = item.downcast_ref::<BoxedAnyObject>()?.borrow::<FileNode>();
-            // A ghost folder has no children yet: its activation makes it.
-            if node.is_dir && !node.ghost {
+            // A ghost folder opens like any other, onto its ghosts: there
+            // is nothing on disk to list, and `scan_dir_nodes` places the
+            // ghosts that belong in it.
+            if node.is_dir {
                 // Same deal one level down: expanding a folder returns a
                 // store immediately (GTK splices children in fine as they
                 // arrive) instead of walking that directory on the thread
@@ -6821,9 +6823,9 @@ impl FileTree {
                 .borrow::<FileNode>()
                 .clone();
             if node.is_dir || node.ghost {
-                if node.ghost && node.is_dir {
-                    tree.create_ghost_dir(&node.path);
-                } else if node.ghost {
+                // A ghost folder opens rather than appears: what it is for
+                // is the files in it, and creating one of them makes it.
+                if node.ghost && !node.is_dir {
                     tree.create_ghost(&node.path);
                 } else {
                     row.set_expanded(!row.is_expanded());
@@ -7131,28 +7133,6 @@ impl FileTree {
         row.append(&icon);
         row.append(&label);
         row
-    }
-
-    /// Make a ghost folder: `.devcontainer/`, whose existence is what
-    /// reveals the ghosts of the config and the Containerfile inside it.
-    /// Off the main thread like every other filesystem write; the tree's
-    /// watcher redraws when the directory lands.
-    pub fn create_ghost_dir(self: &Rc<Self>, path: &Path) {
-        if self.refuse_read_only() {
-            return;
-        }
-        let path = path.to_path_buf();
-        let events = self.workspace.events.clone();
-        crate::runtime::runtime().spawn(async move {
-            let made = tokio::fs::create_dir_all(&path).await;
-            match made {
-                Ok(()) => events.publish(Event::FileTreeChanged),
-                Err(e) => events.publish(Event::Toast(format!(
-                    "Couldn't create {}: {e}",
-                    path.display()
-                ))),
-            }
-        });
     }
 
     /// Materialize a ghost, then open it. If the user keeps templates for
@@ -7960,6 +7940,47 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::files_reached;
+
+    /// A ghost `.devcontainer/` opens onto ghosts of the files it is for:
+    /// listed as the tree lists a folder it opens, the folder that is not
+    /// there yet holds `devcontainer.json` and the Containerfile, and the
+    /// root holds the folder (2026-10-05).
+    #[test]
+    fn a_ghost_devcontainer_folder_opens_onto_its_files() {
+        let root = std::env::temp_dir().join(format!("taste-ghosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("README.md"), "# r\n").unwrap();
+        let worktree = super::Worktree::Local(root.clone());
+        let ghosts = super::ghost_candidates(&taste_core::files::Files::Local, &root);
+        let names = |dir: &std::path::Path| -> Vec<(String, bool, bool)> {
+            super::scan_dir_nodes(&worktree, dir, false, &ghosts, None)
+                .into_iter()
+                .map(|node| {
+                    (
+                        node.path
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        node.is_dir,
+                        node.ghost,
+                    )
+                })
+                .collect()
+        };
+        assert!(names(&root).contains(&(".devcontainer".into(), true, true)));
+        let inside = names(&root.join(".devcontainer"));
+        assert!(
+            inside.contains(&("devcontainer.json".into(), false, true)),
+            "{inside:?}"
+        );
+        assert!(
+            inside.contains(&("Containerfile".into(), false, true)),
+            "{inside:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn ignoring_anchors_escapes_and_does_not_repeat() {

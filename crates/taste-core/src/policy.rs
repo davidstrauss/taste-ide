@@ -39,7 +39,16 @@ pub fn devcontainer_scope(workspace_root: &Path) -> [PathBuf; 2] {
 /// The full safe-mode writable set: the devcontainer setup plus the
 /// workspace-ergonomics dotfiles. Configuring the container is *work*, and
 /// work deserves its comforts — editorconfig, ignore rules — without
-/// unlocking project source.
+/// unlocking project source. The Taskfile is not here: what the project's
+/// commands are is the project's, not the environment's setup (David,
+/// 2026-10-05: "Taskfile probably shouldn't be writable in safe mode").
+///
+/// Everything here is offered as a ghost in the file tree while it is
+/// missing (David, 2026-10-05: "every safe mode writable file should always
+/// be shown as a ghost. Ghosts can be a superset of safe mode writable
+/// files") — `.devcontainer.json` aside, the other spelling of the config
+/// the `.devcontainer/` folder's ghost offers. `conventions`' tests hold
+/// the two together.
 pub fn safe_mode_scope(workspace_root: &Path) -> Vec<PathBuf> {
     let mut scope: Vec<PathBuf> = devcontainer_scope(workspace_root).into();
     for name in [".editorconfig", ".gitignore", ".gitattributes"] {
@@ -385,6 +394,7 @@ mod tests {
         assert!(write_allowed(root, true, &root.join(".editorconfig")));
         assert!(write_allowed(root, true, &root.join(".gitignore")));
         assert!(write_allowed(root, true, &root.join(".gitattributes")));
+        assert!(!write_allowed(root, true, &root.join("Taskfile.yml")));
         // But not arbitrary dotfiles.
         assert!(!write_allowed(root, true, &root.join(".env")));
         // And not similarly-named files elsewhere... the scope is exact.
