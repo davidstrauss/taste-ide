@@ -805,6 +805,11 @@ impl TreeEvents {
                         if Self::NOISE.iter().any(|noise| name.starts_with(noise)) {
                             continue;
                         }
+                        // The keeper's own write in progress: the rename
+                        // that ends it is heard under the file's name.
+                        if name.ends_with(".taste-part") {
+                            continue;
+                        }
                         // node says `rename` for a file made, removed, or
                         // renamed, and `change` for one written to.
                         if event == "rename" {

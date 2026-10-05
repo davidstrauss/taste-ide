@@ -90,6 +90,32 @@ const writes=new Map(),watches=new Map(),procs=new Map();
 const stdinResume=()=>{if(process.stdin.isPaused())process.stdin.resume()};
 setInterval(()=>{},2147483647);
 const pushFrom=(id,kind,src)=>{src.on('data',d=>{for(let i=0;i<d.length;i+=CHUNK){if(!frame(id,kind,d.subarray(i,Math.min(i+CHUNK,d.length)))){src.pause();out.once('drain',()=>src.resume())}}})};
+// A tree is watched a directory at a time. node's own {recursive:true} on
+// Linux watches each FILE by its inode, so a file replaced by a rename (this
+// keeper's own writes, git's, most editors') is never heard from again; a
+// directory's watch names its children whatever happens to them. A
+// directory that appears is watched and its contents announced, since they
+// may have been made before its watch was; one that goes is let go.
+function treeWatch(root,emit,onError){
+  const dirs=new Map();
+  const under=(rel,name)=>rel?rel+'/'+name:name;
+  const drop=(rel)=>{for(const [k,v] of dirs){if(k===rel||k.startsWith(rel+'/')){v.w.close();dirs.delete(k)}}};
+  const add=(rel,announce)=>{
+    const abs=rel?path.join(root,rel):root;
+    let st;try{st=fs.lstatSync(abs)}catch(e){if(!rel)throw e;return}
+    if(!st.isDirectory())return;
+    const had=dirs.get(rel);if(had&&had.ino===st.ino)return;
+    if(had)drop(rel);
+    let w;try{w=fs.watch(abs,(event,name)=>{if(name==null)return;const child=under(rel,String(name));emit(event,child);if(event==='rename')settle(child)})}catch(e){if(!rel)throw e;return}
+    w.on('error',e=>{drop(rel);if(!rel)onError(e)});
+    dirs.set(rel,{w,ino:st.ino});
+    let ents;try{ents=fs.readdirSync(abs,{withFileTypes:true})}catch{return}
+    for(const d of ents){const child=under(rel,d.name);if(announce)emit('rename',child);if(d.isDirectory())add(child,announce)}
+  };
+  const settle=(rel)=>{let st;try{st=fs.lstatSync(path.join(root,rel))}catch{drop(rel);return}if(st.isDirectory())add(rel,true);else drop(rel)};
+  add('',false);
+  return {close(){for(const v of dirs.values())v.w.close();dirs.clear()}};
+}
 async function handle(id,req){
   switch(req.op){
     case 'ping':return done(id,{pong:true});
@@ -101,7 +127,7 @@ async function handle(id,req){
     case 'remove':await fsp.rm(req.path,{recursive:!!req.recursive,force:false});return done(id,{});
     case 'rename':await fsp.rename(req.from,req.to);return done(id,{});
     case 'exec':{const child=cp.spawn(req.argv[0],req.argv.slice(1),{cwd:req.cwd,stdio:['ignore','pipe','pipe'],env:Object.assign({},process.env,req.env||{})});procs.set(id,child);pushFrom(id,1,child.stdout);pushFrom(id,4,child.stderr);child.on('error',e=>{procs.delete(id);fail(id,e)});child.on('close',(code,signal)=>{procs.delete(id);done(id,{status:code===null?-1:code,signal:signal||null})});return}
-    case 'watch':{const w=fs.watch(req.path,{recursive:true},(event,name)=>json(id,3,{event,name:name==null?null:String(name)}));w.on('error',e=>{watches.delete(id);fail(id,e)});watches.set(id,w);return}
+    case 'watch':{const w=treeWatch(req.path,(event,name)=>json(id,3,{event,name}),e=>{watches.delete(id);w.close();fail(id,e)});watches.set(id,w);return}
     default:return fail(id,{code:'EINVAL',message:'unknown op '+req.op});
   }
 }
@@ -782,7 +808,7 @@ pub fn ensure_container(
 /// started with: bumped when they change, so an existing keeper made with
 /// the old ones is made again.
 const KEEPER_LABEL: &str = "taste.keeper";
-const KEEPER_REVISION: &str = "2";
+const KEEPER_REVISION: &str = "3";
 
 fn podman_capture(substrate: &crate::substrate::Substrate, args: &[String]) -> Result<String> {
     let output = substrate
@@ -1012,6 +1038,58 @@ mod tests {
         drop(handle);
         // The keeper is still there for other requests.
         keeper.ping().unwrap();
+    }
+
+    /// A file replaced by a rename — how the keeper itself writes, and git,
+    /// and most editors — is still heard from the second time and every
+    /// time after, and so is a directory made after the watch began. node's
+    /// own recursive watch heard the first rename of a file and nothing of
+    /// it ever again (2026-10-05, a STYLE.md whose open tab never moved).
+    #[test]
+    fn a_watch_hears_a_file_replaced_by_rename_every_time() {
+        if !node_present() {
+            eprintln!("SKIP: no node on this machine");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("STYLE.md"), "a").unwrap();
+        let keeper = Keeper::local_node_for_tests().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        let _handle = keeper
+            .watch(dir.path(), move |_event, name| {
+                let _ = tx.send(name);
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let heard = |name: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if rx.recv_timeout(Duration::from_millis(100)).as_deref() == Ok(name) {
+                    while rx.recv_timeout(Duration::from_millis(100)).is_ok() {}
+                    return true;
+                }
+            }
+            false
+        };
+        for round in ["b", "c", "d"] {
+            let part = dir.path().join("STYLE.md.taste-part");
+            std::fs::write(&part, round).unwrap();
+            std::fs::rename(&part, dir.path().join("STYLE.md")).unwrap();
+            assert!(heard("STYLE.md"), "the rename writing {round:?} was heard");
+        }
+        std::fs::write(dir.path().join("STYLE.md"), "e").unwrap();
+        assert!(
+            heard("STYLE.md"),
+            "a write in place after the renames was heard"
+        );
+        std::fs::create_dir(dir.path().join("new")).unwrap();
+        std::fs::write(dir.path().join("new/inside.md"), "x").unwrap();
+        assert!(
+            heard("new/inside.md"),
+            "a file in a new directory was heard"
+        );
+        std::fs::write(dir.path().join("new/inside.md"), "y").unwrap();
+        assert!(heard("new/inside.md"), "and so was its next write");
     }
 
     /// A keeper that dies fails every waiter at once, rather than leaving
