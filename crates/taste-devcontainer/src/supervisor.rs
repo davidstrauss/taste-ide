@@ -1166,9 +1166,15 @@ impl Supervisor {
             // git has finished its several writes (David, 2026-09-21:
             // "Snapshot on commit, too"), so the folder has the commit and
             // the ref that restores the working copy as it stands after it.
+            // A submodule's are under `.git/modules/<name>/`, and move its
+            // own pair (`crate::peer::sync_primary_peer_with`).
             let ref_moved = name == ".git/HEAD"
                 || name == ".git/packed-refs"
-                || name.starts_with(".git/refs/heads/");
+                || name.starts_with(".git/refs/heads/")
+                || (name.starts_with(".git/modules/")
+                    && (name.ends_with("/HEAD")
+                        || name.ends_with("/packed-refs")
+                        || name.contains("/refs/heads/")));
             // And for the primary, any change to its working tree: the
             // folder mirrors it (`taste_git::mirror`), so a saved file or
             // an agent's edit reaches the folder two seconds after the
@@ -1581,10 +1587,15 @@ impl Supervisor {
             let relevant = event.paths.iter().any(|path| {
                 path.strip_prefix(&root).is_ok_and(|rel| {
                     let rel = rel.to_string_lossy();
-                    !rel.is_empty()
-                        && rel != ".git"
-                        && !rel.starts_with(".git/")
-                        && !churn_path(&rel)
+                    // A commit or switch in a submodule kept under the
+                    // parent's `.git/modules/` is its pair's to carry.
+                    let submodule_ref = rel.starts_with(".git/modules/")
+                        && (rel.ends_with("/HEAD") || rel.contains("/refs/heads/"));
+                    submodule_ref
+                        || (!rel.is_empty()
+                            && rel != ".git"
+                            && !rel.starts_with(".git/")
+                            && !churn_path(&rel))
                 })
             });
             if !relevant {
@@ -1659,6 +1670,7 @@ impl Supervisor {
                 crate::peer::send_change(&files, &path, change)?;
             }
             git.record_sent(&changes)?;
+            crate::peer::send_submodules_folder_side(&git, &self.env.peer, &files, &path)?;
             let name = taste_git::snapshot_ref(self.env.id.as_str());
             let script = taste_git::snapshot::script(&name)?;
             let out = files.exec(&path, &["sh".into(), "-c".into(), script])?;

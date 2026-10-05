@@ -275,7 +275,17 @@ impl Worktree {
             Worktree::Remote { .. } => {
                 let out =
                     self.git_ok(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
-                Ok(taste_git::status_from_porcelain(&out))
+                let mut status = taste_git::status_from_porcelain(&out);
+                // And the files inside each submodule, which the parent's
+                // status names only as the submodule, modified — so only
+                // asked when something is. One that cannot be read leaves
+                // the parent's answer as it is.
+                if status.values().any(|s| *s == FileState::Modified) {
+                    if let Ok(subs) = self.git_ok(&taste_git::SUBMODULE_STATUS_ARGS) {
+                        status.extend(taste_git::status_from_submodule_porcelain(&subs));
+                    }
+                }
+                Ok(status)
             }
         }
     }

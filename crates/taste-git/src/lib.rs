@@ -163,6 +163,45 @@ pub fn status_from_porcelain(z_output: &str) -> HashMap<PathBuf, FileState> {
     out
 }
 
+/// What [`SUBMODULE_STATUS_ARGS`] prints, as the paths of the files inside
+/// each submodule — `sub/dir/file.typ`, keyed from the parent's root as the
+/// parent's own status is — so a file changed in a submodule is shown
+/// where it is rather than only as its submodule, modified (David,
+/// 2026-10-05: changes in a submodule "don't show up as detailed 'M'
+/// items in the file viewer"). Each submodule's records follow a marker
+/// record, `@@ <path>`, which no porcelain record can be: those begin
+/// with a two-letter code and a space.
+pub fn status_from_submodule_porcelain(z_output: &str) -> HashMap<PathBuf, FileState> {
+    let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
+    for record in z_output.split('\0').filter(|r| !r.is_empty()) {
+        match record.strip_prefix("@@ ") {
+            Some(sub) => sections.push((sub, Vec::new())),
+            None => {
+                if let Some((_, records)) = sections.last_mut() {
+                    records.push(record);
+                }
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for (sub, records) in sections {
+        for (path, state) in status_from_porcelain(&records.join("\0")) {
+            out.insert(Path::new(sub).join(path), state);
+        }
+    }
+    out
+}
+
+/// `git` arguments that print every checked-out submodule's status, nested
+/// ones included, for [`status_from_submodule_porcelain`].
+pub const SUBMODULE_STATUS_ARGS: [&str; 5] = [
+    "submodule",
+    "foreach",
+    "--quiet",
+    "--recursive",
+    r#"printf '@@ %s\0' "$displaypath"; git status --porcelain=v1 -z --untracked-files=all"#,
+];
+
 impl FileState {
     fn from_status(s: Status) -> Self {
         if s.is_conflicted() {
@@ -905,6 +944,19 @@ impl SyncStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each submodule's files are keyed under its path, the nested ones
+    /// under theirs, and a submodule with nothing changed adds nothing.
+    #[test]
+    fn submodule_status_is_keyed_under_each_submodule() {
+        let z = "@@ template\0 M lib.typ\0?? new.typ\0@@ clean\0@@ template/inner\0M  a.txt\0";
+        let status = status_from_submodule_porcelain(z);
+        assert_eq!(status.len(), 3, "{status:?}");
+        assert_eq!(status[Path::new("template/lib.typ")], FileState::Modified);
+        assert_eq!(status[Path::new("template/new.typ")], FileState::Untracked);
+        assert_eq!(status[Path::new("template/inner/a.txt")], FileState::Staged);
+        assert!(status_from_submodule_porcelain("").is_empty());
+    }
 
     /// Every porcelain code lands on the state the library would give.
     #[test]

@@ -41,6 +41,9 @@ pub struct HostKey {
 pub struct Keys {
     dir: PathBuf,
     sandboxed: bool,
+    /// The ssh git is given in place of `ssh`: a test's stand-in, which
+    /// runs the remote command on this machine.
+    ssh: Option<String>,
 }
 
 impl Keys {
@@ -53,11 +56,19 @@ impl Keys {
         Self {
             dir,
             sandboxed: taste_core::podman::sandboxed(),
+            ssh: None,
         }
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// These keys with `program` as git's ssh: a test's stand-in.
+    #[cfg(test)]
+    pub(crate) fn with_ssh_for_tests(mut self, program: &Path) -> Self {
+        self.ssh = Some(program.display().to_string());
+        self
     }
 
     /// The private identity the IDE logs in with.
@@ -259,7 +270,7 @@ impl Keys {
     pub fn git_ssh_command(&self) -> String {
         let quote = |s: String| format!("'{}'", s.replace('\'', "'\\''"));
         [
-            "ssh".to_string(),
+            self.ssh.clone().unwrap_or_else(|| "ssh".to_string()),
             "-i".into(),
             quote(self.identity().display().to_string()),
             "-o".into(),
@@ -302,6 +313,7 @@ mod tests {
         Keys {
             dir: dir.to_path_buf(),
             sandboxed: false,
+            ssh: None,
         }
     }
 

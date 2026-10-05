@@ -287,10 +287,14 @@ pub fn fetch_from_guest(
     path: &Path,
     refspecs: &[&str],
 ) -> Result<()> {
+    // Never into submodules: git would fetch a commit made in one from the
+    // submodule's own remote, which does not have it, and fail the whole
+    // fetch. A submodule is synced as a pair of its own (`sync_submodules`).
     let mut args = vec![
         "fetch".to_string(),
         "--quiet".into(),
         "--update-head-ok".into(),
+        "--no-recurse-submodules".into(),
         guest_url(vm, path),
     ];
     args.extend(refspecs.iter().map(|s| s.to_string()));
@@ -500,24 +504,31 @@ pub fn share_personal(
 /// submodule's name.
 const SUBMODULE_STAGING: &str = ".git/taste/submodules";
 
-/// Run in Personal's checkout for one submodule (name, path, staging), once
-/// the folder's clone of it has been pushed to the staging repository:
-/// `git submodule update` from there, at the commit the parent records —
-/// nothing over the network, no credential. The URL is the checkout's own
-/// (`.git/config`), never `.gitmodules`, which is the project's. Exit 0: at
-/// that commit, whether by now or already; 3: the parent records no commit
-/// for the path. With a fourth argument `check`, it only asks: 0 when the
-/// submodule is there, 1 when it is not — which is how a sync that changes
-/// nothing pushes nothing.
+/// Run in Personal's checkout for one submodule (name, path, staging,
+/// mode, head), once the folder's clone of it has been pushed to the
+/// staging repository: cloned from there into its path and absorbed into
+/// the checkout's `.git` as `git submodule update` would leave it, then
+/// put where the folder's clone is — `branch:<name>` on that branch, else
+/// detached at the folder's HEAD — so the two start out agreeing and the
+/// mirror carries every change after ([`sync_submodules`]). Nothing over
+/// the network, no credential; the URL is the checkout's own
+/// (`.git/config`), never `.gitmodules`, which is the project's. A
+/// submodule already there is never moved: where it stands after this is
+/// the mirror's to follow. With `check` as the mode, it only asks: 0 when
+/// the submodule is there, 1 when it is not — which is how a sync that
+/// changes nothing pushes nothing.
 pub const SUBMODULE_SCRIPT: &str = r#"set -e
-name="$1"; path="$2"; staging="$3"; mode="$4"
-want=$(git ls-files -s -- "$path" | awk '$1=="160000"{print $2; exit}')
-[ -n "$want" ] || exit 3
-have=$(git -C "$path" rev-parse -q --verify HEAD 2>/dev/null || true)
-[ "$have" = "$want" ] && [ -e "$path/.git" ] && exit 0
+name="$1"; path="$2"; staging="$3"; mode="$4"; head="$5"
+[ -e "$path/.git" ] && exit 0
 [ "$mode" = check ] && exit 1
+rmdir "$path" 2>/dev/null || true
+git clone -q --no-checkout "$staging" "$path"
 git config "submodule.$name.url" "$staging"
-git -c protocol.file.allow=always submodule update --init --quiet -- "$path"
+git submodule --quiet absorbgitdirs -- "$path"
+case "$head" in
+  branch:*) b="${head#branch:}"; git -C "$path" checkout -q -B "$b" "origin/$b" ;;
+  *) git -C "$path" checkout -q --detach origin/taste-folder-head ;;
+esac
 "#;
 
 /// Give Personal's checkout the submodules the user has checked out in the
@@ -551,6 +562,10 @@ fn share_submodules(
             bail!("the submodule name {name:?} is not one this can stage");
         }
         let staging = path.join(SUBMODULE_STAGING).join(format!("{name}.git"));
+        let head = match taste_git::GitWorkspace::discover(&clone).and_then(|g| g.branch_name()) {
+            Some(branch) => format!("branch:{branch}"),
+            None => "detached".to_string(),
+        };
         let script = |mode: &str| {
             files.exec(
                 path,
@@ -563,6 +578,7 @@ fn share_submodules(
                     sub.display().to_string(),
                     staging.display().to_string(),
                     mode.into(),
+                    head.clone(),
                 ],
             )
         };
@@ -733,7 +749,7 @@ pub fn sync_primary_peer_with(
     // pinned to a ref first, so the fetch brings its commit: a commit no
     // branch holds is otherwise one the folder never receives.
     let checkout_head = files
-        .read_to_string(&path.join(".git/HEAD"))
+        .read_to_string(&checkout_git_dir(files, path).join("HEAD"))
         .ok()
         .and_then(|head| Head::parse(&head));
     let detached = matches!(checkout_head, Some(Head::Commit(_)));
@@ -1020,6 +1036,9 @@ pub fn sync_primary_peer_with(
         sync.note
             .get_or_insert_with(|| format!("submodules not given to Personal: {e:#}"));
     }
+    // Then each submodule, as a pair of its own, after the parent: the
+    // parent's mirror leaves a submodule's contents alone.
+    let mirrored_parent = matches!((&follow, commits_unsettled), (Some(_), false));
     if let (Some(head), false) = (follow, commits_unsettled) {
         // The folder the user opened, and nothing wider: a folder inside
         // another repository (a dotfiles repository in the home directory)
@@ -1036,7 +1055,120 @@ pub fn sync_primary_peer_with(
             mirror_into_folder(&git, &head, files, path, force, on_send, &mut sync)?;
         }
     }
+    if mirrored_parent {
+        sync_submodules(&git, peer, vm, keys, files, path, force, on_send, &mut sync);
+    }
     Ok(sync)
+}
+
+/// Each submodule checked out on both sides, synced as the parent is —
+/// snapshotted in the checkout, fetched, and mirrored both ways, its own
+/// submodules within it — so a change inside one reaches the folder as
+/// surely as a change in the parent does, and the other way (David,
+/// 2026-10-05: "A submodule should sync its contents to my local machine
+/// just as much as any change in the base git project"). What each one
+/// came to is folded into `sync`, its paths under the submodule's; a
+/// failure is said and the next submodule goes on.
+#[allow(clippy::too_many_arguments)]
+fn sync_submodules(
+    git: &taste_git::GitWorkspace,
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+    force: bool,
+    on_send: OnSend,
+    sync: &mut PeerSync,
+) {
+    for (_, sub) in git.submodules() {
+        let clone = peer.join(&sub);
+        let there = path.join(&sub);
+        if !clone.join(".git").exists() || !files.exists(&there.join(".git")) {
+            continue;
+        }
+        let prefixed = |done: usize, of: usize, p: &Path| on_send(done, of, &sub.join(p));
+        let inner = snapshot_in_checkout(files, &there).and_then(|()| {
+            sync_primary_peer_with(&clone, vm, keys, files, &there, force, &prefixed)
+        });
+        match inner {
+            Ok(inner) => {
+                sync.sent += inner.sent;
+                sync.received += inner.received;
+                sync.conflicts
+                    .extend(inner.conflicts.into_iter().map(|p| sub.join(p)));
+                if let Some(note) = inner.note {
+                    sync.note.get_or_insert_with(|| {
+                        format!("in the submodule {}: {note}", sub.display())
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("syncing the submodule {}: {e:#}", sub.display());
+                sync.note.get_or_insert_with(|| {
+                    format!("the submodule {} did not sync: {e:#}", sub.display())
+                });
+            }
+        }
+    }
+}
+
+/// The git directory of the checkout at `path`: its `.git`, or where a
+/// `.git` file sends it — which is how a submodule's is kept, inside the
+/// parent's `.git/modules/`.
+fn checkout_git_dir(files: &Files, path: &Path) -> PathBuf {
+    let dot_git = path.join(".git");
+    match files.read_to_string(&dot_git) {
+        Ok(text) => match text.trim().strip_prefix("gitdir: ") {
+            Some(dir) => path.join(dir),
+            None => dot_git,
+        },
+        Err(_) => dot_git,
+    }
+}
+
+/// Personal's snapshot of the working copy at `path`, taken there.
+fn snapshot_in_checkout(files: &Files, path: &Path) -> Result<()> {
+    let script = taste_git::snapshot::script(&taste_git::snapshot_ref("primary"))?;
+    let out = files.exec(path, &["sh".into(), "-c".into(), script])?;
+    if !out.success() {
+        bail!(
+            "snapshotting {}: {}",
+            path.display(),
+            out.stderr_utf8().trim()
+        );
+    }
+    Ok(())
+}
+
+/// The folder's side of a conflict, inside each submodule: every change
+/// the folder's clone made since the two last agreed, sent to the
+/// checkout's copy and snapshotted there, nested submodules too — the
+/// parent's half is the caller's.
+pub fn send_submodules_folder_side(
+    git: &taste_git::GitWorkspace,
+    peer: &Path,
+    files: &Files,
+    path: &Path,
+) -> Result<()> {
+    for (_, sub) in git.submodules() {
+        let clone = peer.join(&sub);
+        let there = path.join(&sub);
+        if !clone.join(".git").exists() || !files.exists(&there.join(".git")) {
+            continue;
+        }
+        let Some(inner) = taste_git::GitWorkspace::discover(&clone) else {
+            continue;
+        };
+        let changes = inner.folder_changes()?;
+        for change in &changes {
+            send_change(files, &there, change)?;
+        }
+        inner.record_sent(&changes)?;
+        snapshot_in_checkout(files, &there)?;
+        send_submodules_folder_side(&inner, &clone, files, &there)?;
+    }
+    Ok(())
 }
 
 /// Personal's snapshot, from where the fetch put it to where the mirror
@@ -1968,10 +2100,11 @@ mod tests {
     }
 
     /// A submodule the user cloned into the folder reaches Personal's
-    /// checkout as a repository, at the commit the parent records, with
-    /// nothing fetched over a network: the folder's clone pushed to a
-    /// staging repository and `git submodule update` run against it, which
-    /// writes git's own relative paths.
+    /// checkout as a repository, on the branch the folder's clone is on,
+    /// with nothing fetched over a network: the folder's clone pushed to a
+    /// staging repository and cloned from there into place, absorbed as
+    /// `git submodule update` would leave it, with git's own relative
+    /// paths.
     #[test]
     fn a_submodule_cloned_in_the_folder_is_checked_out_in_personal() {
         let pair = Pair::new("submodule");
@@ -2021,6 +2154,7 @@ mod tests {
                     "tpl",
                     staging.to_str().unwrap(),
                     mode,
+                    "branch:main",
                 ])
                 .output()
                 .unwrap()
@@ -2038,11 +2172,111 @@ mod tests {
         );
         let gitfile = std::fs::read_to_string(pair.dir.join("checkout/tpl/.git")).unwrap();
         assert!(gitfile.trim().starts_with("gitdir: ../"), "{gitfile}");
+        assert_eq!(
+            pair.git("checkout/tpl", &["branch", "--show-current"]),
+            "main"
+        );
         assert_eq!(run("check").status.code(), Some(0), "now nothing to do");
         // The project's .gitmodules is untouched; the URL is the checkout's.
         assert!(!pair
             .git("checkout", &["diff", "--name-only"])
             .contains(".gitmodules"));
+    }
+
+    /// Changes inside a submodule travel as the parent's do: one made in
+    /// Personal's copy reaches the folder's clone, one made in the folder's
+    /// clone reaches Personal's, and so does a commit — the whole sync, run
+    /// against a stand-in ssh that runs git's far end on this machine.
+    #[test]
+    fn a_submodule_syncs_both_ways_as_the_parent_does() {
+        let pair = Pair::new("subsync");
+        pair.git(".", &["init", "-q", "-b", "main", "sub"]);
+        pair.write("sub", "lib.txt", "template\n");
+        pair.git("sub", &["add", "-A"]);
+        pair.commit("sub", "the template");
+        let sub = pair.dir.join("sub").display().to_string();
+        pair.git(
+            "folder",
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub,
+                "tpl",
+            ],
+        );
+        pair.commit("folder", "add the template");
+        pair.git("checkout", &["pull", "-q"]);
+        pair.git(
+            "checkout",
+            &["config", "receive.denyCurrentBranch", "updateInstead"],
+        );
+        let ssh = pair.dir.join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\nfor last; do :; done\nexec sh -c \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let keys = Keys::at(pair.dir.join("keys")).with_ssh_for_tests(&ssh);
+        let vm = Vm {
+            domain: "test".into(),
+            ssh_port: 22,
+            workspace_root: pair.dir.join("folder"),
+            state: crate::provision::DomainState::Running,
+            cloud: None,
+        };
+        let files = Files::Local;
+        let folder = pair.dir.join("folder");
+        let checkout = pair.dir.join("checkout");
+        let sync = |step: &str| {
+            snapshot_in_checkout(&files, &checkout).unwrap();
+            sync_primary_peer_with(&folder, &vm, &keys, &files, &checkout, false, &|_, _, _| {})
+                .unwrap_or_else(|e| panic!("{step}: {e:#}"))
+        };
+        let read = |p: &str| std::fs::read_to_string(pair.dir.join(p)).unwrap_or_default();
+
+        let first = sync("pass 1");
+        assert_eq!(read("checkout/tpl/lib.txt"), "template\n", "{first:?}");
+        assert_eq!(
+            pair.git("checkout/tpl", &["branch", "--show-current"]),
+            "main"
+        );
+
+        // Personal edits inside the submodule; the folder's clone follows.
+        pair.write("checkout/tpl", "lib.txt", "changed in Personal\n");
+        let pass = sync("pass 2");
+        assert_eq!(
+            read("folder/tpl/lib.txt"),
+            "changed in Personal\n",
+            "{pass:?}"
+        );
+
+        // The folder's clone gains a file; Personal's copy does too.
+        pair.write("folder/tpl", "new.txt", "from the folder\n");
+        let pass = sync("pass 3");
+        assert_eq!(
+            read("checkout/tpl/new.txt"),
+            "from the folder\n",
+            "{pass:?}"
+        );
+        let pass = sync("pass 4");
+        assert!(pass.conflicts.is_empty(), "{pass:?}");
+
+        // A commit in Personal's submodule reaches the folder's clone.
+        pair.git("checkout/tpl", &["add", "-A"]);
+        pair.commit("checkout/tpl", "made in Personal");
+        sync("pass 5");
+        let pass = sync("pass 6");
+        assert_eq!(
+            pair.git("folder/tpl", &["rev-parse", "HEAD"]),
+            pair.git("checkout/tpl", &["rev-parse", "HEAD"]),
+            "{pass:?}"
+        );
+        assert_eq!(read("folder/tpl/new.txt"), "from the folder\n");
     }
 
     /// A folder detached at a commit — `git checkout <commit-ish>` — puts

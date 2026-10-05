@@ -746,7 +746,21 @@ impl GitWorkspace {
             .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
         let mut out = std::collections::BTreeMap::new();
         for delta in diff.deltas() {
-            if matches!(delta.status(), Delta::Deleted) {
+            // A submodule's pointer is a commit in another repository, and
+            // the submodule is a pair of its own, synced inside its own
+            // working tree (`taste_devcontainer::peer`): its pointer moving
+            // is nothing for the parent to write, send, or ask about. A
+            // file put where a submodule was is still the file it is.
+            let gone = matches!(delta.status(), Delta::Deleted);
+            let side = if gone {
+                delta.old_file()
+            } else {
+                delta.new_file()
+            };
+            if side.mode() == git2::FileMode::Commit {
+                continue;
+            }
+            if gone {
                 if let Some(path) = delta.old_file().path() {
                     out.insert(path.to_path_buf(), None);
                 }
