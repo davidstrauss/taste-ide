@@ -435,6 +435,56 @@ fn set_dirty_dot(tab: &adw::TabPage, dirty: bool) {
     }
 }
 
+/// Where a text view is scrolled, held across a reload: the line at the top
+/// of the view and how far into it, or — the view at its end, as it is when
+/// following a log someone is writing — the end (David, 2026-10-05: "I'd
+/// like to hold the scroll position (as much as possible) on reload,
+/// especially for auto-reload of changed files").
+#[derive(Clone, Copy)]
+struct ScrollHold {
+    line: i32,
+    into: f64,
+    at_end: bool,
+}
+
+fn hold_scroll(view: &sourceview5::View, scroller: &gtk::ScrolledWindow) -> ScrollHold {
+    let adjustment = scroller.vadjustment();
+    let at_end = adjustment.upper() > adjustment.page_size()
+        && adjustment.value() + adjustment.page_size() >= adjustment.upper() - 2.0;
+    let top = view.visible_rect().y();
+    let (iter, line_top) = view.line_at_y(top);
+    ScrollHold {
+        line: iter.line(),
+        into: f64::from(top - line_top),
+        at_end,
+    }
+}
+
+/// Put the view back where [`hold_scroll`] found it, once the new text is
+/// laid out: the same line at the top, as far as it still exists, or the
+/// end. Replacing the text scrolls the view to wherever the empty buffer
+/// in between left it, which is the top.
+fn restore_scroll(view: &sourceview5::View, scroller: &gtk::ScrolledWindow, held: ScrollHold) {
+    let view = view.clone();
+    let scroller = scroller.clone();
+    glib::idle_add_local_once(move || {
+        let adjustment = scroller.vadjustment();
+        let last = adjustment.upper() - adjustment.page_size();
+        if held.at_end {
+            adjustment.set_value(last.max(adjustment.lower()));
+            return;
+        }
+        let buffer = view.buffer();
+        let iter = buffer
+            .iter_at_line(held.line)
+            .unwrap_or_else(|| buffer.end_iter());
+        let (y, _) = view.line_yrange(&iter);
+        adjustment.set_value(
+            (f64::from(y) + held.into).clamp(adjustment.lower(), last.max(adjustment.lower())),
+        );
+    });
+}
+
 /// `view:<path>` — the surface key a viewer tab is filed under: its path,
 /// in a namespace no other surface's key is in.
 fn viewer_key(path: &Path) -> PathBuf {
@@ -3283,8 +3333,10 @@ impl Editor {
             let (content, crlf, bom) = normalize_load(&content);
             page.crlf.set(crlf);
             page.bom.set(bom);
+            let held = hold_scroll(&page.view, &page.scroller);
             page.buffer.set_text(&content);
             page.buffer.set_modified(false);
+            restore_scroll(&page.view, &page.scroller, held);
             page.conflict_bar.set_revealed(false);
             page.warned.set(false);
             page.page.set_indicator_icon(gtk::gio::Icon::NONE);
@@ -3814,6 +3866,7 @@ impl Editor {
             page.bom.set(bom);
             let mark = page.buffer.get_insert();
             let offset = page.buffer.iter_at_mark(&mark).offset();
+            let held = hold_scroll(&page.view, &page.scroller);
             dismiss_suggestion(&page);
             // Re-evaluate the performance guard: an agent may have rewritten
             // a small file into a huge one (or vice versa).
@@ -3831,6 +3884,7 @@ impl Editor {
             let end = page.buffer.char_count();
             page.buffer
                 .place_cursor(&page.buffer.iter_at_offset(offset.min(end)));
+            restore_scroll(&page.view, &page.scroller, held);
             if was_plain != page.plain.get() || editor.wysiwyg_active(&path, &page) {
                 editor.refresh_markdown_mode(&path, &page);
             }
@@ -3840,12 +3894,6 @@ impl Editor {
         });
     }
 
-    /// Save on the USER's behalf (Ctrl+S, save-and-close).
-    ///
-    /// This is where watching's read-only half is enforced: a file from
-    /// another environment's checkout is refused here, by name, before any
-    /// bytes are rendered. The agent's own writes to that file do not come
-    /// through here — see `persist_page`.
     /// A tab's file changed — reloaded by itself, or waiting on the user —
     /// while the tab was not the one in front: it needs attention, which
     /// the tab bar draws as a line under the tab, or lights the bar's edge
@@ -3869,6 +3917,12 @@ impl Editor {
             .unwrap_or_else(|| !self.workspace.exec.is_container())
     }
 
+    /// Save on the USER's behalf (Ctrl+S, save-and-close).
+    ///
+    /// This is where watching's read-only half is enforced: a file from
+    /// another environment's checkout is refused here, by name, before any
+    /// bytes are rendered. The agent's own writes to that file do not come
+    /// through here — see `persist_page`.
     fn save_page(&self, path: &Path, page: &EditorPage) -> Result<(), String> {
         // A review tab is a pair of blobs, not a file. There is nowhere for
         // a save to go, and the key it is filed under is not a path.
@@ -4272,6 +4326,62 @@ mod tests {
     /// asked has no entries and its tabs read as clean — which is how a
     /// file open from an environment's clone showed no dirty dot however
     /// far its agent had edited it.
+    /// A reload holds the view's place: the line at the top stays at the
+    /// top, and a view at the end — following a file being written —
+    /// stays at the end as the file grows.
+    #[test]
+    fn a_reload_holds_the_line_at_the_top_and_the_end() {
+        crate::gtk_test::on_gtk_thread("scroll hold: no display — skipped", || {
+            use gtk::glib;
+            use gtk::prelude::*;
+            let view = sourceview5::View::new();
+            let scroller = gtk::ScrolledWindow::builder().child(&view).build();
+            let window = gtk::Window::builder()
+                .default_width(400)
+                .default_height(300)
+                .child(&scroller)
+                .build();
+            window.present();
+            let lines = |n: usize| (0..n).map(|i| format!("line {i}\n")).collect::<String>();
+            let settle = || {
+                for _ in 0..200 {
+                    while glib::MainContext::default().iteration(false) {}
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            };
+            let top_line = || {
+                let (iter, _) = view.line_at_y(view.visible_rect().y());
+                iter.line()
+            };
+            view.buffer().set_text(&lines(400));
+            settle();
+            let at = view.buffer().iter_at_line(120).unwrap();
+            let (y, _) = view.line_yrange(&at);
+            scroller.vadjustment().set_value(f64::from(y));
+            settle();
+            assert_eq!(top_line(), 120);
+            let held = super::hold_scroll(&view, &scroller);
+            view.buffer().set_text(&lines(420));
+            super::restore_scroll(&view, &scroller, held);
+            settle();
+            assert_eq!(top_line(), 120, "the same line at the top");
+            // At the end, the file grows: the view follows it.
+            let adjustment = scroller.vadjustment();
+            adjustment.set_value(adjustment.upper() - adjustment.page_size());
+            settle();
+            let held = super::hold_scroll(&view, &scroller);
+            view.buffer().set_text(&lines(500));
+            super::restore_scroll(&view, &scroller, held);
+            settle();
+            let adjustment = scroller.vadjustment();
+            assert!(
+                adjustment.value() + adjustment.page_size() >= adjustment.upper() - 2.0,
+                "still at the end"
+            );
+            window.close();
+        });
+    }
+
     #[test]
     fn the_status_pass_covers_every_open_checkout_once() {
         use super::status_roots;

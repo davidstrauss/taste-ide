@@ -245,6 +245,9 @@ pub struct ViewerPage {
     pending: Cell<bool>,
     /// The bar's Reload automatically is on.
     auto: Cell<bool>,
+    /// The PDF's view, while it has one: a reload replaces the document in
+    /// it rather than the view, so the scroll and the zoom hold.
+    pdf_view: RefCell<Option<webkit6::WebView>>,
 }
 
 impl ViewerPage {
@@ -266,6 +269,7 @@ impl ViewerPage {
             shown: Cell::new(loaded.fingerprint),
             pending: Cell::new(false),
             auto: Cell::new(false),
+            pdf_view: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&page);
@@ -310,6 +314,48 @@ impl ViewerPage {
     #[doc(hidden)]
     pub fn pose_for_probe(&self, variant: &str) {
         match variant {
+            // Scrolled down, then reloaded: the scroll it comes back at is
+            // printed, for checking that a reload holds it.
+            "reload" => {
+                let Some(view) = self.pdf_view.borrow().clone() else {
+                    return;
+                };
+                let js = |script: &'static str, view: &webkit6::WebView| {
+                    webkit6::prelude::WebViewExt::evaluate_javascript(
+                        view,
+                        script,
+                        None,
+                        None,
+                        None::<&gtk::gio::Cancellable>,
+                        |result| {
+                            if let Ok(value) = result {
+                                eprintln!("probe viewer scroll: {}", value.to_str());
+                            }
+                        },
+                    );
+                };
+                let reload = self.reload.borrow().clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), {
+                    let view = view.clone();
+                    move || {
+                        js("document.getElementById('container').scrollTop = 150; 'scrolled to ' + document.getElementById('container').scrollTop", &view);
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(400),
+                            move || {
+                                if let Some(reload) = reload {
+                                    reload();
+                                }
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(1500),
+                                    move || {
+                                        js("'after reload ' + document.getElementById('container').scrollTop", &view);
+                                    },
+                                );
+                            },
+                        );
+                    }
+                });
+            }
             "auto" => {
                 if let Some(auto) = &self.banner.auto {
                     auto.set_active(true);
@@ -359,10 +405,27 @@ impl ViewerPage {
         true
     }
 
-    /// Show `loaded`, replacing whatever was shown; nothing waits now.
+    /// Show `loaded`, replacing whatever was shown; nothing waits now. A
+    /// PDF already on screen takes its new document in place, holding its
+    /// scroll and its zoom (David, 2026-10-05: "I'd like to hold the scroll
+    /// position (as much as possible) on reload").
     pub fn show(&self, loaded: Loaded) {
         self.pending.set(false);
         self.sync_bar();
+        let in_place = self.pdf_view.borrow().clone().zip(self.pdf_id.get());
+        if let (Some((view, id)), Content::Bytes(bytes)) = (in_place, &loaded.content) {
+            pdf_documents().borrow_mut().insert(id, bytes.clone());
+            self.shown.set(loaded.fingerprint);
+            webkit6::prelude::WebViewExt::evaluate_javascript(
+                &view,
+                "window.tasteReload && window.tasteReload()",
+                None,
+                None,
+                None::<&gtk::gio::Cancellable>,
+                |_| {},
+            );
+            return;
+        }
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
@@ -377,7 +440,9 @@ impl ViewerPage {
                 let id = next_pdf_id();
                 pdf_documents().borrow_mut().insert(id, bytes);
                 self.pdf_id.set(Some(id));
-                pdf_view(id)
+                let view = pdf_view(id);
+                *self.pdf_view.borrow_mut() = Some(view.clone());
+                view.upcast()
             }
             _ => gtk::Label::new(Some("This file could not be shown.")).upcast(),
         };
@@ -389,6 +454,11 @@ impl ViewerPage {
     pub fn show_error(&self, why: &str) {
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
+        }
+        // The view is gone with it: the next reload starts a new one.
+        self.pdf_view.borrow_mut().take();
+        if let Some(id) = self.pdf_id.take() {
+            pdf_documents().borrow_mut().remove(&id);
         }
         let status = adw::StatusPage::builder()
             .icon_name("dialog-warning-symbolic")
@@ -487,11 +557,28 @@ try {
   const viewer = new PDFViewer({ container, eventBus, linkService, findController });
   linkService.setViewer(viewer);
   eventBus.on("pagesinit", () => { viewer.currentScaleValue = "page-width"; });
-  const doc = await pdfjsLib.getDocument({
-    url: "document.pdf", isEvalSupported: false, enableXfa: false,
+  const open = (url) => pdfjsLib.getDocument({
+    url, isEvalSupported: false, enableXfa: false,
   }).promise;
+  let doc = await open("document.pdf");
   viewer.setDocument(doc);
   linkService.setDocument(doc, null);
+  // A reload in place: the new document, at the zoom and the scroll it
+  // replaces, once its pages are laid out (viewer.rs, `ViewerPage::show`).
+  window.tasteReload = async () => {
+    const top = container.scrollTop, left = container.scrollLeft;
+    const scale = viewer.currentScaleValue;
+    const next = await open("document.pdf?v=" + Date.now());
+    eventBus.on("pagesinit", () => {
+      viewer.currentScaleValue = scale;
+      container.scrollTop = top;
+      container.scrollLeft = left;
+    }, { once: true });
+    viewer.setDocument(next);
+    linkService.setDocument(next, null);
+    doc.destroy();
+    doc = next;
+  };
   container.addEventListener("wheel", (event) => {
     if (!event.ctrlKey) return;
     event.preventDefault();
@@ -586,7 +673,7 @@ fn register_pdf_scheme() {
 /// The PDF of `id`, in a WebKit view that loads nothing but the viewer
 /// scheme: navigation anywhere else is refused, and a link the user
 /// clicks opens in their browser instead.
-fn pdf_view(id: u64) -> gtk::Widget {
+fn pdf_view(id: u64) -> webkit6::WebView {
     register_pdf_scheme();
     let session = webkit6::NetworkSession::new_ephemeral();
     let view = webkit6::WebView::builder()
@@ -629,7 +716,7 @@ fn pdf_view(id: u64) -> gtk::Widget {
         true
     });
     webkit6::prelude::WebViewExt::load_uri(&view, &format!("{PDF_SCHEME}://{id}/index.html"));
-    view.upcast()
+    view
 }
 
 #[cfg(test)]
