@@ -539,6 +539,39 @@ devcontainer that will not start.
    externally launched virtiofsd (`<source socket=…/>`); keeping podman's
    `:z` from relabelling host files (an `--xattrmap`, or a `context=`
    mount in the guest); and timings on the Drupal tree.
+9. **A read-only git proxy for the environments** — noted, not built
+   (David, 2026-10-05: "DNS + trust trickery to MitM the actual git access
+   to allow it read-only ops but deny any changes"). Today nothing in an
+   environment can do authenticated git: the user's keys never cross into
+   a VM, so a project's `postCreateCommand: git submodule update --init`
+   over `git@github.com:…` fails quietly, and submodule contents never
+   reach Personal's checkout at all. The idea is the auth proxy's move for
+   git — the credential stays on this host, the environment talks to the
+   IDE, and the IDE decides — with the line drawn where git draws it: a
+   fetch or clone asks the server for `git-upload-pack`, a push for
+   `git-receive-pack`, over ssh and https alike, so reads pass and pushes
+   are refused with a reason (work still leaves by publish and review).
+   The shape, as discussed:
+   - **Redirect with git's own `url.<proxy>.insteadOf`**, handed to every
+     git process in the container by `GIT_CONFIG_COUNT`/`_KEY_n`/
+     `_VALUE_n`, rather than by DNS and a trusted CA: it touches git and
+     nothing else (not the GitHub API, `curl`, or package managers), it
+     covers ssh URLs too, which no certificate reaches, and it is a
+     documented interface. The proxy is reached over the same socket
+     forwarding as the auth proxy.
+   - **Only this project's repositories**: its remotes and its
+     `.gitmodules` URLs. The user's keys read every private repository
+     they can, and the environment's code is untrusted; an open read-only
+     proxy is a way to copy any of them out.
+   - **A mirror cache on this host**: a request fetches into the cache
+     with the user's keys, through the IDE's own ssh-agent (the path Pull
+     and Push already take), and is answered from it by `git upload-pack`
+     — one design for ssh and https upstreams alike. Git LFS the same
+     way, downloads only.
+
+   With it, `git clone`, `git submodule update`, and `git fetch` work from
+   hooks, agents, and terminals in the environment, and the hook that
+   failed today succeeds unchanged.
 
 ## 2026 bets (superlean, hyperfunctional)
 
