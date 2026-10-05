@@ -356,6 +356,23 @@ impl ViewerPage {
                     }
                 });
             }
+            // `page:N`: turned to page N once the document is up.
+            page if page.starts_with("page:") => {
+                let Some(view) = self.pdf_view.borrow().clone() else {
+                    return;
+                };
+                let script = format!("window.tastePage({})", &page[5..]);
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                    webkit6::prelude::WebViewExt::evaluate_javascript(
+                        &view,
+                        &script,
+                        None,
+                        None,
+                        None::<&gtk::gio::Cancellable>,
+                        |_| {},
+                    );
+                });
+            }
             "auto" => {
                 if let Some(auto) = &self.banner.auto {
                     auto.set_active(true);
@@ -565,8 +582,13 @@ try {
   pdfjsLib.GlobalWorkerOptions.workerSrc = "./pdf.worker.min.mjs";
   const { EventBus, PDFViewer, PDFLinkService, PDFFindController } =
     await import("./pdf_viewer.mjs");
+  // Images are decoded and drawn by pdf.js itself, never handed to the
+  // browser's decoder or to an offscreen canvas: on a WebKit drawing with
+  // the GPU, images of one pixel size came out as one another — four
+  // photographs of the same size as two, each twice (2026-10-05).
   const open = (url) => pdfjsLib.getDocument({
     url, isEvalSupported: false, enableXfa: false,
+    isOffscreenCanvasSupported: false, isImageDecoderSupported: false,
   }).promise;
   const pane = (container) => {
     const eventBus = new EventBus();
@@ -640,6 +662,8 @@ try {
     from.linkService.setDocument(null, null);
     if (old) old.destroy();
   };
+  // For the probe: a page to turn to.
+  window.tastePage = (n) => { shown.viewer.currentPageNumber = n; return n; };
   // For the probe: the scroll of the pane on screen, and its page.
   window.tasteScroll = (top) => {
     if (top !== undefined) shown.container.scrollTop = top;
@@ -757,6 +781,18 @@ fn pdf_view(id: u64) -> webkit6::WebView {
         &view,
         &gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0),
     );
+    // The page's canvases drawn on the CPU: with WebKit's GPU canvas, a
+    // PDF's images of one pixel size were drawn as one another (David,
+    // 2026-10-05: four photographs on a slide came out as two, each
+    // twice). Set by name, where this WebKit has it (2.46 and later).
+    if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
+        if settings
+            .find_property("enable-2d-canvas-acceleration")
+            .is_some()
+        {
+            settings.set_property("enable-2d-canvas-acceleration", false);
+        }
+    }
     webkit6::prelude::WebViewExt::connect_decide_policy(&view, |view, decision, kind| {
         use webkit6::prelude::PolicyDecisionExt;
         let navigation = match kind {
