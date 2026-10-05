@@ -13019,7 +13019,27 @@ fn edit_title(title: &str, path: &std::path::Path) -> String {
         Some("ide_write_file") => "Write",
         _ => "Edit",
     };
-    format!("{verb} {}", path.display())
+    format!("{verb} {}", checkout_path(&path.to_string_lossy()))
+}
+
+/// A path an agent named, as the transcript says it: within its checkout,
+/// with the environment when it is not Personal's — never the checkout's
+/// place in the VM, `/var/home/core/taste/<workspace>/<environment>/…`.
+fn checkout_path(path: &str) -> String {
+    let guest = format!(
+        "/var/home/{}/taste/",
+        taste_devcontainer::provision::GUEST_USER
+    );
+    let Some(rest) = path.strip_prefix(&guest) else {
+        return path.to_string();
+    };
+    let mut parts = rest.splitn(3, '/');
+    let (_workspace, env, rel) = (parts.next(), parts.next(), parts.next());
+    match (env, rel) {
+        (Some("primary"), Some(rel)) => rel.to_string(),
+        (Some(env), Some(rel)) => format!("{rel} · {env}"),
+        _ => path.to_string(),
+    }
 }
 
 fn standing_tool(request: &RequestPermissionRequest) -> Option<String> {
@@ -13265,6 +13285,19 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "ide_references" => about("Find every use of", "Find every use of a symbol", "symbol"),
         "ide_list_files" => about("List the files in", "List the project's files", "subdir"),
         "ide_open_file" => about("Open", "Open a file", "path"),
+        // As Claude Code's own Read was titled, with the file in its
+        // checkout rather than at its place in the VM.
+        "ide_read_file" => match text("path").or_else(|| text("file_path")) {
+            Some(path) => match text("pages") {
+                Some(pages) => format!("Read {}, pages {pages}", checkout_path(&path)),
+                None => format!("Read {}", checkout_path(&path)),
+            },
+            None => "Read a file".into(),
+        },
+        "memory_list" => "Look through the project's memory".into(),
+        "memory_read" => about("Recall", "Recall a note", "name"),
+        "memory_save" => about("Remember", "Remember something", "name"),
+        "memory_delete" => about("Forget", "Forget a note", "name"),
         "suggest_replies" => "Offer replies".into(),
         "ide_open_files" => "Look at what is open".into(),
         "ide_selection" => "Read what the user has selected".into(),
@@ -15102,6 +15135,20 @@ mod tests {
         assert_eq!(
             edit_title("mcp__taste-ide__ide_edit_file", &path),
             "Edit /w/STYLE.md"
+        );
+        assert_eq!(
+            edit_title(
+                "mcp__taste-ide__ide_write_file",
+                std::path::Path::new("/var/home/core/taste/a8583d2b/primary/deck/main.typ")
+            ),
+            "Write deck/main.typ"
+        );
+        let read = serde_json::json!({
+            "path": "/var/home/core/taste/a8583d2b/i-0003/STYLE.md", "pages": "2-3"
+        });
+        assert_eq!(
+            tool_headline("mcp__taste-ide__ide_read_file", Some(&read)).as_deref(),
+            Some("Read STYLE.md · i-0003, pages 2-3")
         );
         let write = serde_json::json!({ "path": "/w/new.md", "content": "x" });
         let (content, _) = ide_edit_shape("mcp__taste-ide__ide_write_file", Some(&write)).unwrap();
