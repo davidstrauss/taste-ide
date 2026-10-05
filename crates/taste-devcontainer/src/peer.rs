@@ -1116,6 +1116,14 @@ fn sync_submodules(
         if !clone.join(".git").exists() || !files.exists(&there.join(".git")) {
             continue;
         }
+        // What the folder's clone fetched, given to Personal's copy, as the
+        // parent's remote-tracking refs are: nothing in the VM can fetch.
+        if let Err(e) = share_submodule_remotes(&clone, vm, keys, &there) {
+            tracing::warn!(
+                "giving Personal the submodule {}'s fetched refs: {e:#}",
+                sub.display()
+            );
+        }
         let prefixed = |done: usize, of: usize, p: &Path| on_send(done, of, &sub.join(p));
         let inner = snapshot_in_checkout(files, &there).and_then(|()| {
             sync_primary_peer_with(&clone, vm, keys, files, &there, force, &prefixed)
@@ -1153,6 +1161,77 @@ fn checkout_git_dir(files: &Files, path: &Path) -> PathBuf {
             None => dot_git,
         },
         Err(_) => dot_git,
+    }
+}
+
+/// The folder's clone of a submodule's remote-tracking refs — what a
+/// fetch there brought — pushed into Personal's copy at `there`, as
+/// [`REMOTES_REFSPEC`] gives the parent's; nothing in the VM can fetch,
+/// holding none of the user's keys (David, 2026-10-05: "I did a git fetch
+/// for the submodule, but the refs aren't available to the container").
+/// Pushed only when they have changed since the last push, which a mark in
+/// the clone's own git directory remembers, so a sync that moves no ref
+/// opens no connection for it.
+fn share_submodule_remotes(clone: &Path, vm: &Vm, keys: &Keys, there: &Path) -> Result<()> {
+    use std::hash::{Hash, Hasher};
+    let git = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(clone)
+            .args(args)
+            .output()
+            .context("running git")?;
+        if !out.status.success() {
+            bail!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let refs = git(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        "refs/remotes",
+    ])?;
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (refs.as_str(), there).hash(&mut hasher);
+    let print = format!("{:016x}", hasher.finish());
+    let mark =
+        PathBuf::from(git(&["rev-parse", "--absolute-git-dir"])?).join("taste/remotes-shared");
+    if std::fs::read_to_string(&mark).ok().as_deref() == Some(print.as_str()) {
+        return Ok(());
+    }
+    push_to_guest(clone, vm, keys, there, &[REMOTES_REFSPEC])?;
+    if let Some(dir) = mark.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&mark, print);
+    Ok(())
+}
+
+/// [`share_submodule_remotes`] for every submodule checked out on both
+/// sides — what the IDE's own Fetch does after fetching the parent.
+pub fn share_submodules_remotes(peer: &Path, vm: &Vm, keys: &Keys, files: &Files, path: &Path) {
+    let Some(git) = taste_git::GitWorkspace::discover(peer) else {
+        return;
+    };
+    for (_, sub) in git.submodules() {
+        let clone = peer.join(&sub);
+        let there = path.join(&sub);
+        if !clone.join(".git").exists() || !files.exists(&there.join(".git")) {
+            continue;
+        }
+        if let Err(e) = share_submodule_remotes(&clone, vm, keys, &there) {
+            tracing::warn!(
+                "giving Personal the submodule {}'s fetched refs: {e:#}",
+                sub.display()
+            );
+        }
     }
 }
 
@@ -2322,6 +2401,22 @@ mod tests {
             "{pass:?}"
         );
         assert_eq!(read("folder/tpl/new.txt"), "from the folder\n");
+
+        // A fetch in the folder's clone: its remote-tracking refs reach
+        // Personal's copy, which cannot fetch for itself.
+        let head = pair.git("folder/tpl", &["rev-parse", "HEAD"]);
+        pair.git(
+            "folder/tpl",
+            &["update-ref", "refs/remotes/origin/feature", &head],
+        );
+        sync("pass 7");
+        assert_eq!(
+            pair.git(
+                "checkout/tpl",
+                &["rev-parse", "refs/remotes/origin/feature"]
+            ),
+            head
+        );
     }
 
     /// A folder detached at a commit — `git checkout <commit-ish>` — puts

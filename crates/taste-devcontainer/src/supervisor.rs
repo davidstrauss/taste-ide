@@ -1589,8 +1589,13 @@ impl Supervisor {
                     let rel = rel.to_string_lossy();
                     // A commit or switch in a submodule kept under the
                     // parent's `.git/modules/` is its pair's to carry.
+                    // A fetch there moves its remote-tracking refs, which
+                    // the sync gives Personal's copy (`peer`).
                     let submodule_ref = rel.starts_with(".git/modules/")
-                        && (rel.ends_with("/HEAD") || rel.contains("/refs/heads/"));
+                        && (rel.ends_with("/HEAD")
+                            || rel.ends_with("/packed-refs")
+                            || rel.contains("/refs/heads/")
+                            || rel.contains("/refs/remotes/"));
                     submodule_ref
                         || (!rel.is_empty()
                             && rel != ".git"
@@ -1724,7 +1729,16 @@ impl Supervisor {
             &keys,
             &path,
             &[crate::peer::REMOTES_REFSPEC],
-        )
+        )?;
+        // And each submodule's, which the fetch may have moved too.
+        crate::peer::share_submodules_remotes(
+            &self.env.peer,
+            &vm_info,
+            &keys,
+            &self.files(),
+            &path,
+        );
+        Ok(())
     }
 
     /// The workspace this environment belongs to.
