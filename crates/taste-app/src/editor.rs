@@ -2672,6 +2672,14 @@ impl Editor {
             );
             editor.tabs.set_selected_page(&tab);
             editor.sync_toggle_to_selection();
+            if let Ok(variant) = std::env::var("TASTE_PROBE_CHANGED") {
+                if std::env::var_os("TASTE_PROBE_CHECK").is_some() {
+                    let surface = editor.surfaces.borrow().get(&viewer_key(&path)).cloned();
+                    if let Some(SurfaceKind::View(page)) = surface.as_ref().map(|s| &s.kind) {
+                        page.pose_for_probe(&variant);
+                    }
+                }
+            }
         });
     }
 

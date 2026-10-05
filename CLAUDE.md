@@ -133,7 +133,9 @@ seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_PREVIEW=README.md` (a markdown file, relative
 to where the probe was started; an image, a PDF, or audio or video opens in
 its viewer tab instead, `viewer.rs`, and `build-aux/headless/fixtures/sample.pdf`
-is a one-page PDF for it) opens it on its preview face in front,
+is a one-page PDF for it, and `TASTE_PROBE_CHANGED=pending` or `=auto` poses
+the viewer's changed-on-disk bar — a change waiting, or Reload automatically
+on) opens it on its preview face in front,
 which is how the preview's rendering — its pictures, its tables, its
 path links — gets looked at; `build-aux/headless/fixtures/markdown-table.md`
 is a short document with a table and path links for exactly that, and

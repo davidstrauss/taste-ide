@@ -124,11 +124,20 @@ pub fn load(
 /// hold (David, 2026-10-05: "… a banner in the tab asking me to reload to
 /// see changes (and, for things I can edit, the option overwrite changes
 /// on disk with my version)").
+///
+/// A viewer's bar has a third control instead of Keep Mine: Reload
+/// automatically, which makes the tab follow its file, and keeps the bar
+/// up for as long as it is on, saying so (David, 2026-10-05: "Give me a
+/// toggle on the 'file modified' banner that will cause it to
+/// automatically reload on change. Keep the banner present as long as
+/// that's enabled"). An editable tab has no such toggle: what it would
+/// reload over is unsaved work.
 pub struct ChangedBar {
     pub widget: gtk::Revealer,
     title: gtk::Label,
     reload: gtk::Button,
     keep: Option<gtk::Button>,
+    auto: Option<gtk::Switch>,
 }
 
 impl ChangedBar {
@@ -151,6 +160,20 @@ impl ChangedBar {
             row.append(&keep);
             keep
         });
+        let auto = (!editable).then(|| {
+            let switch = gtk::Switch::builder()
+                .valign(gtk::Align::Center)
+                .tooltip_text("Reload this tab whenever the file changes")
+                .build();
+            let label = gtk::Label::builder()
+                .label("Reload automatically")
+                .mnemonic_widget(&switch)
+                .build();
+            switch.update_relation(&[gtk::accessible::Relation::LabelledBy(&[label.upcast_ref()])]);
+            row.append(&label);
+            row.append(&switch);
+            switch
+        });
         let reload = gtk::Button::builder()
             .label("Reload")
             .tooltip_text("Take the version on disk")
@@ -168,6 +191,19 @@ impl ChangedBar {
             title,
             reload,
             keep,
+            auto,
+        }
+    }
+
+    /// Whether the Reload button is offered: not while the tab reloads by
+    /// itself and has nothing waiting.
+    pub fn set_reload_visible(&self, visible: bool) {
+        self.reload.set_visible(visible);
+    }
+
+    pub fn connect_auto(&self, f: impl Fn(bool) + 'static) {
+        if let Some(auto) = &self.auto {
+            auto.connect_active_notify(move |switch| f(switch.is_active()));
         }
     }
 
@@ -205,12 +241,15 @@ pub struct ViewerPage {
     pdf_id: Cell<Option<u64>>,
     /// What the shown bytes were ([`fingerprint`]).
     shown: Cell<u64>,
+    /// The file changed on disk and the tab still shows what it was.
+    pending: Cell<bool>,
+    /// The bar's Reload automatically is on.
+    auto: Cell<bool>,
 }
 
 impl ViewerPage {
     pub fn new(path: &Path, kind: ViewKind, loaded: Loaded) -> Rc<Self> {
         let banner = ChangedBar::new(false);
-        banner.set_title("This file has changed on disk");
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.set_vexpand(true);
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -225,14 +264,26 @@ impl ViewerPage {
             reload: RefCell::new(None),
             pdf_id: Cell::new(None),
             shown: Cell::new(loaded.fingerprint),
+            pending: Cell::new(false),
+            auto: Cell::new(false),
         });
         {
             let weak = Rc::downgrade(&page);
-            page.banner.connect_reload(move || {
+            page.banner.connect_auto(move |on| {
                 let Some(page) = weak.upgrade() else { return };
-                let reload = page.reload.borrow().clone();
-                if let Some(reload) = reload {
-                    reload();
+                page.auto.set(on);
+                // Turned on with a change waiting: take it now.
+                if on && page.pending.get() {
+                    page.reload_now();
+                }
+                page.sync_bar();
+            });
+        }
+        {
+            let weak = Rc::downgrade(&page);
+            page.banner.connect_reload(move || {
+                if let Some(page) = weak.upgrade() {
+                    page.reload_now();
                 }
             });
         }
@@ -254,17 +305,60 @@ impl ViewerPage {
         *self.reload.borrow_mut() = Some(reload);
     }
 
-    /// The file on disk now has bytes of `fingerprint`: when they are not
-    /// the ones shown, say so and offer the reload. An event about the
-    /// file that changed nothing — a touch, its creation seen late — says
-    /// nothing.
-    pub fn file_changed(&self, fingerprint: u64) {
-        self.banner.set_revealed(fingerprint != self.shown.get());
+    /// TASTE_PROBE_CHANGED only: pose the bar — `pending`, a change
+    /// waiting; `auto`, Reload automatically on.
+    #[doc(hidden)]
+    pub fn pose_for_probe(&self, variant: &str) {
+        match variant {
+            "auto" => {
+                if let Some(auto) = &self.banner.auto {
+                    auto.set_active(true);
+                }
+            }
+            _ => self.file_changed(self.shown.get().wrapping_add(1)),
+        }
     }
 
-    /// Show `loaded`, replacing whatever was shown; the banner goes.
+    fn reload_now(&self) {
+        let reload = self.reload.borrow().clone();
+        if let Some(reload) = reload {
+            reload();
+        }
+    }
+
+    /// The bar as the tab stands: up for as long as it reloads by itself,
+    /// saying so; up with Reload while a change waits; away otherwise.
+    fn sync_bar(&self) {
+        let (auto, pending) = (self.auto.get(), self.pending.get());
+        self.banner.set_title(if auto {
+            "Following this file as it changes"
+        } else {
+            "This file has changed on disk"
+        });
+        self.banner.set_reload_visible(!auto);
+        self.banner.set_revealed(auto || pending);
+    }
+
+    /// The file on disk now has bytes of `fingerprint`: when they are not
+    /// the ones shown, reload — by itself, when the bar's toggle is on — or
+    /// say so and offer it. An event about the file that changed nothing —
+    /// a touch, its creation seen late — does nothing.
+    pub fn file_changed(&self, fingerprint: u64) {
+        if fingerprint == self.shown.get() {
+            return;
+        }
+        if self.auto.get() {
+            self.reload_now();
+        } else {
+            self.pending.set(true);
+            self.sync_bar();
+        }
+    }
+
+    /// Show `loaded`, replacing whatever was shown; nothing waits now.
     pub fn show(&self, loaded: Loaded) {
-        self.banner.set_revealed(false);
+        self.pending.set(false);
+        self.sync_bar();
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
@@ -537,6 +631,45 @@ fn pdf_view(id: u64) -> gtk::Widget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bar's three states: away with nothing changed; up with Reload
+    /// when a change waits; and, with Reload automatically on, up for as
+    /// long as it is on, taking each change by itself — and away again
+    /// when it is turned off with nothing waiting.
+    #[test]
+    fn the_bar_reloads_by_itself_while_its_toggle_is_on() {
+        crate::gtk_test::on_gtk_thread("viewer bar: no display — skipped", || {
+            let loaded = |fingerprint| Loaded {
+                content: Content::Bytes(glib::Bytes::from_static(b"")),
+                fingerprint,
+            };
+            let page = ViewerPage::new(Path::new("/x/talk.mp3"), ViewKind::Media, loaded(1));
+            let reloads = Rc::new(Cell::new(0));
+            {
+                let reloads = reloads.clone();
+                page.set_reload(Rc::new(move || reloads.set(reloads.get() + 1)));
+            }
+            let revealed = || page.banner.widget.reveals_child();
+            assert!(!revealed());
+            page.file_changed(1);
+            assert!(!revealed(), "the same bytes are no change");
+            page.file_changed(2);
+            assert!(revealed());
+            assert_eq!(reloads.get(), 0);
+            // On, with a change waiting: it is taken at once, and the bar
+            // stays up after the reload lands.
+            page.banner.auto.as_ref().unwrap().set_active(true);
+            assert_eq!(reloads.get(), 1);
+            page.show(loaded(2));
+            assert!(revealed(), "up for as long as it is on");
+            page.file_changed(3);
+            assert_eq!(reloads.get(), 2, "a change reloads by itself");
+            page.show(loaded(3));
+            // Off with nothing waiting: the bar goes.
+            page.banner.auto.as_ref().unwrap().set_active(false);
+            assert!(!revealed());
+        });
+    }
 
     #[test]
     fn a_file_name_says_which_viewer_and_text_stays_text() {
