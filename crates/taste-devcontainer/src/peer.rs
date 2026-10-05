@@ -513,18 +513,25 @@ const SUBMODULE_STAGING: &str = ".git/taste/submodules";
 /// mirror carries every change after ([`sync_submodules`]). Nothing over
 /// the network, no credential; the URL is the checkout's own
 /// (`.git/config`), never `.gitmodules`, which is the project's. A
-/// submodule already there is never moved: where it stands after this is
-/// the mirror's to follow. With `check` as the mode, it only asks: 0 when
-/// the submodule is there, 1 when it is not — which is how a sync that
+/// submodule already there is moved only by `meet`, at the two's first
+/// meeting ([`share_submodules`]), and only when it holds no work of its
+/// own (exit 4 when it does); after that, where it stands is the mirror's
+/// to follow. With `check` as the mode, it only asks: 0 when the
+/// submodule is there, 1 when it is not — which is how a sync that
 /// changes nothing pushes nothing.
 pub const SUBMODULE_SCRIPT: &str = r#"set -e
 name="$1"; path="$2"; staging="$3"; mode="$4"; head="$5"
-[ -e "$path/.git" ] && exit 0
-[ "$mode" = check ] && exit 1
-rmdir "$path" 2>/dev/null || true
-git clone -q --no-checkout "$staging" "$path"
-git config "submodule.$name.url" "$staging"
-git submodule --quiet absorbgitdirs -- "$path"
+if [ -e "$path/.git" ]; then
+  [ "$mode" = meet ] || exit 0
+  [ -z "$(git -C "$path" status --porcelain)" ] || exit 4
+  git -C "$path" fetch -q "$staging" "+refs/heads/*:refs/remotes/origin/*"
+else
+  [ "$mode" = check ] && exit 1
+  rmdir "$path" 2>/dev/null || true
+  git clone -q --no-checkout "$staging" "$path"
+  git config "submodule.$name.url" "$staging"
+  git submodule --quiet absorbgitdirs -- "$path"
+fi
 case "$head" in
   branch:*) b="${head#branch:}"; git -C "$path" checkout -q -B "$b" "origin/$b" ;;
   *) git -C "$path" checkout -q --detach origin/taste-folder-head ;;
@@ -562,7 +569,8 @@ fn share_submodules(
             bail!("the submodule name {name:?} is not one this can stage");
         }
         let staging = path.join(SUBMODULE_STAGING).join(format!("{name}.git"));
-        let head = match taste_git::GitWorkspace::discover(&clone).and_then(|g| g.branch_name()) {
+        let folder_git = taste_git::GitWorkspace::discover(&clone);
+        let head = match folder_git.as_ref().and_then(|g| g.branch_name()) {
             Some(branch) => format!("branch:{branch}"),
             None => "detached".to_string(),
         };
@@ -582,8 +590,25 @@ fn share_submodules(
                 ],
             )
         };
-        if matches!(script("check")?.status, 0 | 3) {
-            continue;
+        // There already: left as it is, except at the two's first meeting
+        // — before the submodule's mirror has recorded anything — when
+        // Personal's copy is not where the folder's clone is. One placed
+        // before the pair existed was put at the parent's recorded
+        // commit, detached, and the mirror would otherwise follow THAT
+        // and take the folder's clone off its branch.
+        let present = script("check")?.status == 0;
+        if present {
+            let first_meeting = folder_git
+                .as_ref()
+                .is_some_and(|g| matches!(g.read_ref(taste_git::mirror::MIRROR_REF), Ok(None)));
+            let here = folder_git.as_ref().and_then(|g| g.checked_out());
+            let there = files
+                .read_to_string(&checkout_git_dir(files, &path.join(&sub)).join("HEAD"))
+                .ok()
+                .and_then(|h| taste_git::mirror::Head::parse(&h));
+            if !first_meeting || here.is_none() || here == there {
+                continue;
+            }
         }
         let made = files.exec(
             path,
@@ -617,9 +642,13 @@ fn share_submodules(
         .collect();
         git_streaming(&clone, keys, &args, &mut |_| {})
             .with_context(|| format!("pushing the folder's {} to Personal", sub.display()))?;
-        let out = script("update")?;
+        let out = script(if present { "meet" } else { "update" })?;
         match out.status {
-            0 | 3 => {}
+            0 => {}
+            4 => tracing::info!(
+                "Personal's {} has uncommitted work; it stays where it is",
+                sub.display()
+            ),
             _ => bail!(
                 "checking out {} in Personal: {}",
                 sub.display(),
@@ -2177,6 +2206,22 @@ mod tests {
             "main"
         );
         assert_eq!(run("check").status.code(), Some(0), "now nothing to do");
+        // One placed detached, as the old placement left it, meets the
+        // folder's clone on its branch — unless it holds work of its own.
+        pair.git("checkout/tpl", &["checkout", "-q", "--detach"]);
+        pair.write("checkout/tpl", "lib.txt", "Personal's own\n");
+        assert_eq!(run("meet").status.code(), Some(4));
+        pair.git("checkout/tpl", &["checkout", "-q", "--", "lib.txt"]);
+        let out = run("meet");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            pair.git("checkout/tpl", &["branch", "--show-current"]),
+            "main"
+        );
         // The project's .gitmodules is untouched; the URL is the checkout's.
         assert!(!pair
             .git("checkout", &["diff", "--name-only"])
