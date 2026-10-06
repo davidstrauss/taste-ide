@@ -2761,14 +2761,9 @@ impl Editor {
                         Checkouts::Probe(owner) => Some(owner),
                         Checkouts::Real(checkouts) => owner_among(&read_path, &checkouts),
                     };
-                    // `.editorconfig` is an ancestor walk of THIS host's
-                    // directories; a file in a VM has its format read off
-                    // its own bytes instead.
-                    let config = if files.is_local() {
-                        taste_core::textfile::EditorConfig::read(&read_path)
-                    } else {
-                        taste_core::textfile::EditorConfig::default()
-                    };
+                    // `.editorconfig` is an ancestor walk of the file's own
+                    // directories, through whichever service has them.
+                    let config = taste_core::textfile::EditorConfig::read_via(&files, &read_path);
                     Ok((content, Prepared { owner, config }))
                 },
             );

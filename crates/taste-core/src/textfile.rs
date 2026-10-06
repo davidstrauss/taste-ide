@@ -7,7 +7,7 @@
 //! makes the rules below unit-testable, which they are not once they live
 //! inside a `GtkTextBuffer`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// How a file is stored: detected at load, overridden by `.editorconfig`.
 ///
@@ -79,14 +79,63 @@ impl EditorConfig {
     /// Read `.editorconfig` for `path`. **This does filesystem IO** — call
     /// it off the GTK main thread.
     pub fn read(path: &Path) -> Self {
-        use ec4rs::property::*;
-        let mut out = Self {
+        match ec4rs::properties_of(path) {
+            Ok(props) => Self::from_properties(props),
+            Err(_) => Self::unconfigured(),
+        }
+    }
+
+    /// [`Self::read`], wherever the file is. Through a remote files service
+    /// — which is where nearly every file the IDE opens is, since the
+    /// checkouts live in VMs — each ancestor's `.editorconfig` is read
+    /// through the service and handed to the same parser, nearest last, up
+    /// to the first that says `root = true`: the walk `ec4rs` makes on this
+    /// host's directories, made on the file's own. Until 2026-10-06 a remote
+    /// file got no `.editorconfig` at all (David: "This IDE practically
+    /// *only* opens files from VMs"). **IO, through the service** — off the
+    /// GTK main thread.
+    pub fn read_via(files: &crate::files::Files, path: &Path) -> Self {
+        if files.is_local() {
+            return Self::read(path);
+        }
+        // Nearest first, as found; applied outermost first.
+        let mut found: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        let mut dir = path.parent();
+        while let Some(at) = dir {
+            let candidate = at.join(".editorconfig");
+            if let Ok(bytes) = files.read(&candidate) {
+                let root = ec4rs::ConfigParser::new_buffered(bytes.as_slice())
+                    .is_ok_and(|parser| parser.is_root);
+                found.push((at.to_path_buf(), bytes));
+                if root {
+                    break;
+                }
+            }
+            dir = at.parent();
+        }
+        let mut props = ec4rs::Properties::new();
+        for (at, bytes) in found.iter().rev() {
+            let Ok(mut parser) = ec4rs::ConfigParser::new_buffered(bytes.as_slice()) else {
+                continue;
+            };
+            let relative = path.strip_prefix(at).unwrap_or(path);
+            use ec4rs::PropertiesSource;
+            let _ = (&mut parser).apply_to(&mut props, relative);
+        }
+        Self::from_properties(props)
+    }
+
+    /// No `.editorconfig` in force: the defaults a file is saved with.
+    fn unconfigured() -> Self {
+        Self {
             final_newline: true,
             ..Self::default()
-        };
-        let Ok(mut props) = ec4rs::properties_of(path) else {
-            return out;
-        };
+        }
+    }
+
+    fn from_properties(mut props: ec4rs::Properties) -> Self {
+        use ec4rs::property::*;
+        let mut out = Self::unconfigured();
         props.use_fallbacks();
         out.indent_spaces = props
             .get::<IndentStyle>()
@@ -168,10 +217,8 @@ pub fn load(path: &Path) -> std::io::Result<(String, FileFormat)> {
     Ok((text, format))
 }
 
-/// [`load`], wherever the file is. On this host it is `load`, with
-/// `.editorconfig` honoured; through a remote service the bytes come from
-/// there and the format is what the bytes say, because `.editorconfig`
-/// discovery walks this host's directories and the file's are not here.
+/// [`load`], wherever the file is: the bytes and the `.editorconfig`s
+/// alike come through the service ([`EditorConfig::read_via`]).
 pub fn load_via(files: &crate::files::Files, path: &Path) -> std::io::Result<(String, FileFormat)> {
     if files.is_local() {
         return load(path);
@@ -182,14 +229,13 @@ pub fn load_via(files: &crate::files::Files, path: &Path) -> std::io::Result<(St
         Err(e) => return Err(e),
     };
     let (text, crlf, bom) = normalize_load(&raw);
-    Ok((
-        text,
-        FileFormat {
-            crlf,
-            bom,
-            ..FileFormat::default()
-        },
-    ))
+    let mut format = FileFormat {
+        crlf,
+        bom,
+        ..FileFormat::default()
+    };
+    EditorConfig::read_via(files, path).apply_to(&mut format);
+    Ok((text, format))
 }
 
 /// [`save`], wherever the file is. The same policy check, the same bytes;
@@ -282,6 +328,76 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A files service that is not this host's, over a temporary directory:
+    /// what a checkout in a VM looks like to the editor.
+    #[derive(Debug)]
+    struct Elsewhere;
+
+    impl crate::files::RemoteFiles for Elsewhere {
+        fn describe(&self) -> String {
+            "elsewhere".into()
+        }
+        fn stat(&self, path: &Path) -> std::io::Result<crate::files::Stat> {
+            crate::files::Files::Local.stat(path)
+        }
+        fn list(&self, path: &Path) -> std::io::Result<Vec<crate::files::Entry>> {
+            crate::files::Files::Local.list(path)
+        }
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            std::fs::read(path)
+        }
+        fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            std::fs::write(path, bytes)
+        }
+        fn mkdir_all(&self, path: &Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(path)
+        }
+        fn remove(&self, path: &Path, _recursive: bool) -> std::io::Result<()> {
+            std::fs::remove_file(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            std::fs::rename(from, to)
+        }
+        fn exec(&self, _cwd: &Path, _argv: &[String]) -> std::io::Result<crate::files::ExecOutput> {
+            Err(std::io::Error::other("no exec here"))
+        }
+    }
+
+    #[test]
+    fn a_remote_file_takes_its_editorconfigs_nearest_last_up_to_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        // Above the root: never read.
+        std::fs::write(dir.path().join(".editorconfig"), "[*]\nindent_size = 8\n").unwrap();
+        std::fs::write(
+            checkout.join(".editorconfig"),
+            "root = true\n[*]\nindent_style = space\nindent_size = 4\n[*.md]\ntrim_trailing_whitespace = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join("src/.editorconfig"),
+            "[*.rs]\nindent_size = 2\n",
+        )
+        .unwrap();
+        let files = crate::files::Files::Remote(std::sync::Arc::new(Elsewhere));
+
+        let rust = EditorConfig::read_via(&files, &checkout.join("src/main.rs"));
+        assert_eq!(rust.indent_spaces, Some(true));
+        assert_eq!(rust.indent_width, Some(2), "the nearer file wins");
+
+        let readme = EditorConfig::read_via(&files, &checkout.join("README.md"));
+        assert_eq!(readme.indent_width, Some(4), "the root stops the walk");
+        assert!(
+            readme.trim_trailing_ws,
+            "a glob is matched against the path below its file"
+        );
+        assert_eq!(
+            EditorConfig::read_via(&files, &checkout.join("README.md")),
+            EditorConfig::read(&checkout.join("README.md"))
+        );
+    }
 
     /// One read has to say everything the two reads said, or the editor
     /// quietly loses a project's indentation rules.
