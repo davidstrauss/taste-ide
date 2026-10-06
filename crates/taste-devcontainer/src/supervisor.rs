@@ -1587,8 +1587,19 @@ impl Supervisor {
                 &asked,
                 &on_copied,
             ) {
-                Ok((count, bytes, empty)) => copied = Some(copy_home_summary(count, bytes, &empty)),
+                // Said in a toast as well as in the pass's summary: the
+                // user asked for these, and waits to hear they are there
+                // (David, 2026-10-06: "When I ask to copy ignored items,
+                // show a toast when it finishes").
+                Ok((count, bytes, empty)) => {
+                    let said = copy_home_summary(count, bytes, &empty);
+                    events.publish(Event::Toast(said.clone()));
+                    copied = Some(said);
+                }
                 Err(e) => {
+                    events.publish(Event::Toast(format!(
+                        "Copying ignored files to your folder failed: {e:#}"
+                    )));
                     events.publish(Event::FolderSync(taste_core::FolderSync::Failed {
                         reason: format!("copying ignored files to your folder: {e:#}"),
                     }));
