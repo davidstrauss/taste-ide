@@ -1265,14 +1265,26 @@ fn grow_to_fit(entry: &sourceview5::View, scroller: &gtk::ScrolledWindow) {
         let scroller = scroller_for_value;
         adjustment.connect_value_changed(move |adjustment| {
             let visible = f64::from(scroller.height());
-            if visible <= 0.0 || adjustment.upper() > visible + 0.5 {
+            if visible <= 0.0 {
                 return;
             }
+            // A page the field has outgrown is the field's height now,
+            // whether or not the content fits. The text view kept the page
+            // it had before a paste grew the field to its ceiling, scrolled
+            // to the cursor for that small page, and left the last lines at
+            // the top of the grown field with empty field under them (David,
+            // 2026-10-06: "When I pasted in text to the dispatch, it
+            // resized/positioned in a wonky way").
             if adjustment.page_size() < visible {
                 adjustment.set_page_size(visible);
             }
-            if adjustment.value() != 0.0 {
-                adjustment.set_value(0.0);
+            let last = if adjustment.upper() > visible + 0.5 {
+                adjustment.upper() - adjustment.page_size()
+            } else {
+                0.0
+            };
+            if adjustment.value() > last {
+                adjustment.set_value(last.max(adjustment.lower()));
             }
         });
     }
@@ -1293,7 +1305,20 @@ fn grow_to_fit(entry: &sourceview5::View, scroller: &gtk::ScrolledWindow) {
     });
     {
         let schedule = schedule.clone();
-        adjustment.connect_changed(move |_| schedule());
+        adjustment.connect_changed(move |adjustment| {
+            // Never scrolled past the content's end. A paste longer than
+            // the field scrolls the view to the cursor while the field is
+            // still its old height; the field then grows to its ceiling
+            // and the scroll stays where the short field put it — the last
+            // lines at the top, a sliver of the line above, and empty
+            // field below them (David, 2026-10-06: "When I pasted in text
+            // to the dispatch, it resized/positioned in a wonky way").
+            let last = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+            if adjustment.value() > last {
+                adjustment.set_value(last);
+            }
+            schedule();
+        });
     }
     entry.buffer().connect_changed(move |_| schedule());
 }
