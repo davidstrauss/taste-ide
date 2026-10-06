@@ -11,8 +11,21 @@ on:
 
 jobs:
   check:
-    name: fmt, clippy, test
-    runs-on: ubuntu-latest
+    name: fmt, clippy, test (${{ matrix.arch }})
+    # Each architecture builds and tests natively on GitHub's hosted runner
+    # of that architecture (free for public repositories), never under
+    # emulation: the devcontainer's base image is a multi-arch index, so the
+    # same Containerfile builds on both. One failing should not hide the
+    # other's result.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       # Pinned to commits, with the tag beside them (see flatpak.yml).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -27,8 +40,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', '.devcontainer/Containerfile') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', '.devcontainer/Containerfile') }}
+          restore-keys: cargo-${{ runner.os }}-${{ matrix.arch }}-
 
       - name: fmt, clippy, test
         run: |
