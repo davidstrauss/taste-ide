@@ -2575,8 +2575,14 @@ impl EnvironmentRegistry {
         // refs. On this host only for the test suites' host substrate,
         // where the clone is the checkout.
         let identity = if self.substrate().vm_details().is_some() {
+            // Sized for what will run: the clone's config, or Personal's
+            // that it will be given (`crate::seed`), as the folder has it.
+            let grant = match DevcontainerConfig::discover(&repo) {
+                Ok(Some(config)) => config.grant(),
+                _ => Self::grant_of(&self.workspace_root),
+            };
             let placed = self
-                .place_by_capacity(Self::grant_of(&repo), host)
+                .place_by_capacity(grant, host)
                 .and_then(|vm| self.place_in_vm(&id, &repo, &vm));
             match placed {
                 Ok(identity) => identity,
@@ -2597,6 +2603,7 @@ impl EnvironmentRegistry {
             );
         };
         let supervisor = self.adopt_identity(identity);
+        self.seed_from_personal(&supervisor);
         // Supervised for real from its first second, the way a restored
         // environment is (see `reconcile`): the clone carries the project's
         // .devcontainer, and a supervisor left in NoConfig would report a
@@ -2612,6 +2619,32 @@ impl EnvironmentRegistry {
             tracing::info!("environment {id}: Personal's branches not shared yet: {e:#}");
         }
         Ok(supervisor)
+    }
+
+    /// Give a new environment the configuration its clone lacks from
+    /// Personal's working copy (`crate::seed`), before anything has looked
+    /// for its config: read through Personal's files service, or from the
+    /// folder, which mirrors it, while that service is not connected yet.
+    /// Said in the environment's log; a failure is said and the environment
+    /// goes on without, as it would have.
+    fn seed_from_personal(&self, supervisor: &Supervisor) {
+        let personal = self
+            .get(&EnvironmentId::primary())
+            .filter(|primary| primary.files().is_connected())
+            .map(|primary| (primary.files(), primary.checkout().path().to_path_buf()))
+            .unwrap_or_else(|| (Files::Local, self.workspace_root.clone()));
+        let (from, from_root) = personal;
+        let to_root = supervisor.checkout().path().to_path_buf();
+        match crate::seed::from_personal(&from, &from_root, &supervisor.files(), &to_root) {
+            Ok(copied) if copied.is_empty() => {}
+            Ok(copied) => supervisor.log(format!(
+                "this clone had no {} of its own; copied from Personal's working copy",
+                copied.join(", ")
+            )),
+            Err(e) => supervisor.log(format!(
+                "copying configuration from Personal's working copy failed: {e:#}"
+            )),
+        }
     }
 
     /// Give other environments Personal's branches, as the `personal`
@@ -4992,6 +5025,31 @@ mod tests {
 
         // Creating it twice is an error, not a silent re-clone.
         assert!(registry.create(env("review")).is_err());
+    }
+
+    /// Configuration that exists only uncommitted in Personal reaches a new
+    /// environment, whose clone of the commit has none of it.
+    #[test]
+    fn a_new_environment_takes_personals_uncommitted_config() {
+        let fixture = Fixture::new();
+        let root = fixture.workspace.path();
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        std::fs::write(
+            root.join(".devcontainer/devcontainer.json"),
+            r#"{"image": "fedora"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("Taskfile.yml"), "version: '3'\n").unwrap();
+        std::fs::write(root.join(".editorconfig"), "root = true\n").unwrap();
+        let registry = fixture.registry();
+
+        let review = registry.create(env("review")).unwrap();
+
+        let checkout = review.checkout().path().to_path_buf();
+        assert!(checkout.join(".devcontainer/devcontainer.json").is_file());
+        assert!(checkout.join("Taskfile.yml").is_file());
+        assert!(checkout.join(".editorconfig").is_file());
+        assert_eq!(review.state(), SupervisorState::ConfigDetected);
     }
 
     /// A new environment has no container yet, so it is in safe mode — even

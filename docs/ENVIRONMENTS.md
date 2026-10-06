@@ -362,6 +362,15 @@ in safe mode; what changed is that safe mode now has somewhere to run:
   container up so it can actually *run* things while doing so. This is the
   bootstrap path for every new agent environment: clone, baseline up,
   config authored/validated, start, relocate.
+- A clone is of a commit, so configuration that exists only uncommitted in
+  Personal is not in it. Before anything looks for its config, a new
+  environment is given each kind its clone has none of — the devcontainer
+  config (`.devcontainer/` or `.devcontainer.json`), a Taskfile, and
+  `.editorconfig` — whole, from Personal's working copy, as untracked files
+  its snapshot keeps and review sees (`crate::seed`; David, 2026-10-06:
+  "so I can launch other envs even if I only have uncommitted devcontainer
+  config"). A kind the clone has is left as committed, and the VM is sized
+  for the config that will run.
 - There is no configuration-authority split any more: the agent authors
   and applies, because every lifecycle command runs in the environment's
   VM and the user is told how the rebuild ended (a toast for the

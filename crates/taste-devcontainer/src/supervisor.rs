@@ -2847,7 +2847,7 @@ impl Supervisor {
     /// The log ring is per-supervisor, so it is per-environment for free —
     /// no de-interleaving, no shared buffer. The event carries the id so a
     /// subscriber showing one environment's build can drop the rest.
-    fn log(&self, line: impl Into<String>) {
+    pub(crate) fn log(&self, line: impl Into<String>) {
         let line = line.into();
         if let Some(file) = self.log_file.lock().unwrap().as_ref() {
             file.line(&line);
