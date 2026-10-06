@@ -4335,7 +4335,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             }
                         }
                     }
-                    Event::FolderSync(moment) => sync_status_for_events.apply(&moment),
+                    Event::FolderSync(moment) => {
+                        filetree.set_folder_syncing(matches!(
+                            moment,
+                            taste_core::FolderSync::Pending
+                                | taste_core::FolderSync::Running { .. }
+                        ));
+                        sync_status_for_events.apply(&moment);
+                    }
 
                     // An agent's suggested replies, to its own chat.
                     Event::SuggestedReplies { env, replies } => {

@@ -485,6 +485,10 @@ pub struct FileTree {
     /// where it is: its row reads "name @ main" under a folder with git's
     /// mark (David, 2026-10-06).
     submodule_heads: RefCell<HashMap<PathBuf, taste_devcontainer::worktree::SubmoduleHead>>,
+    /// A sync of the folder with Personal is pending or under way: a
+    /// submodule caught halfway through one — its parent's commit there,
+    /// its own not yet — is not warned about until the pass has ended.
+    folder_syncing: Cell<bool>,
     on_open: RefCell<Option<OpenCallback>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
     on_open_diff: RefCell<Option<OpenDiffCallback>>,
@@ -1501,6 +1505,7 @@ impl FileTree {
             rendered_non_repo: std::cell::Cell::new(false),
             show_ignored: Rc::new(RefCell::new(false)),
             submodule_heads: RefCell::new(HashMap::new()),
+            folder_syncing: Cell::new(false),
             on_open: RefCell::new(None),
             on_open_diff: RefCell::new(None),
             on_copy_home: RefCell::new(None),
@@ -6775,6 +6780,26 @@ impl FileTree {
         path.strip_prefix(workdir).ok().map(Path::to_path_buf)
     }
 
+    /// Whether a sync of the folder with Personal is pending or under way.
+    /// A submodule's warning waits for the pass to end; when it does, the
+    /// tree asks again, and a problem still there is shown.
+    pub fn set_folder_syncing(self: &Rc<Self>, syncing: bool) {
+        if self.folder_syncing.replace(syncing) == syncing {
+            return;
+        }
+        let warned = self
+            .submodule_heads
+            .borrow()
+            .values()
+            .any(|head| head.pin.is_problem());
+        if !syncing {
+            self.refresh_status();
+        }
+        if warned {
+            self.rebuild();
+        }
+    }
+
     /// Where the submodule at `path` is, when it is one.
     fn submodule_head(&self, path: &Path) -> Option<taste_devcontainer::worktree::SubmoduleHead> {
         let rel = self.repo_relative(path)?;
@@ -7197,7 +7222,7 @@ impl FileTree {
         if let Some(head) = &submodule {
             let standing = format!("{name} is {}", head.pin.describe());
             row.set_tooltip_text(Some(&standing));
-            if head.pin.is_problem() {
+            if head.pin.is_problem() && !self.folder_syncing.get() {
                 let warning = gtk::Image::from_icon_name("dialog-warning-symbolic");
                 warning.add_css_class("warning");
                 warning.set_tooltip_text(Some(&standing));

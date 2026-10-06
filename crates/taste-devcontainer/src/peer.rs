@@ -1072,9 +1072,6 @@ pub fn sync_primary_peer_with(
         sync.note
             .get_or_insert_with(|| format!("submodules not given to Personal: {e:#}"));
     }
-    // Then each submodule, as a pair of its own, after the parent: the
-    // parent's mirror leaves a submodule's contents alone.
-    let mirrored_parent = matches!((&follow, commits_unsettled), (Some(_), false));
     if let (Some(head), false) = (follow, commits_unsettled) {
         // The folder the user opened, and nothing wider: a folder inside
         // another repository (a dotfiles repository in the home directory)
@@ -1091,9 +1088,14 @@ pub fn sync_primary_peer_with(
             mirror_into_folder(&git, &head, files, path, force, on_send, &mut sync)?;
         }
     }
-    if mirrored_parent {
-        sync_submodules(&git, peer, vm, keys, files, path, force, on_send, &mut sync);
-    }
+    // Then each submodule, as a pair of its own, after the parent — in
+    // every pass, whatever the parent's commits did in it. Waiting for a
+    // pass where the parent had settled left a parent commit that records
+    // a new submodule commit in Personal with the submodule not yet given
+    // it, warned about as missing until something else set off another
+    // pass (2026-10-06: "I shouldn't see this error while the env
+    // builds").
+    sync_submodules(&git, peer, vm, keys, files, path, force, on_send, &mut sync);
     Ok(sync)
 }
 
@@ -2546,6 +2548,26 @@ mod tests {
                 &["rev-parse", "refs/remotes/origin/feature"]
             ),
             head
+        );
+
+        // A commit in the folder's clone, and the parent committed to
+        // record it: one pass gives Personal both, the submodule's commit
+        // with the parent's that records it, never the one without the
+        // other for a pass.
+        pair.write("folder/tpl", "lib.txt", "moved on\n");
+        pair.git("folder/tpl", &["commit", "-q", "-am", "moved on"]);
+        pair.git("folder", &["add", "tpl"]);
+        pair.commit("folder", "record the template's new commit");
+        sync("pass 8");
+        assert_eq!(
+            pair.git("checkout", &["rev-parse", "HEAD"]),
+            pair.git("folder", &["rev-parse", "HEAD"]),
+            "the parent's commit arrived"
+        );
+        assert_eq!(
+            pair.git("checkout/tpl", &["rev-parse", "HEAD"]),
+            pair.git("folder/tpl", &["rev-parse", "HEAD"]),
+            "and the submodule's with it, in the same pass"
         );
     }
 
