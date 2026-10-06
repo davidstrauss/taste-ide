@@ -256,6 +256,11 @@ pub struct ViewerPage {
     /// Which reading of the text is current: a reload starts another, and
     /// an older one finishing late is not taken.
     text_generation: Cell<u64>,
+    /// A reading is under way.
+    reading: Cell<bool>,
+    /// The page that draws the PDF has loaded: before, it has nothing to
+    /// read the text with.
+    loaded: Cell<bool>,
     /// OCR is under way, or done, for the text as it stands.
     ocr_started: Cell<bool>,
     /// Pages OCR has yet to read; zero when none are waiting.
@@ -289,6 +294,8 @@ impl ViewerPage {
             pdf_view: RefCell::new(None),
             text: RefCell::new(None),
             text_generation: Cell::new(0),
+            reading: Cell::new(false),
+            loaded: Cell::new(false),
             ocr_started: Cell::new(false),
             ocr_pending: Cell::new(0),
             source: RefCell::new(None),
@@ -509,11 +516,13 @@ impl ViewerPage {
                 self.pdf_id.set(Some(id));
                 let view = pdf_view(id);
                 *self.pdf_view.borrow_mut() = Some(view.clone());
+                self.loaded.set(false);
                 // Its text, once the page that draws it has loaded.
                 let weak = self.this.borrow().clone();
                 webkit6::prelude::WebViewExt::connect_load_changed(&view, move |_, event| {
                     if event == webkit6::LoadEvent::Finished {
                         if let Some(page) = weak.upgrade() {
+                            page.loaded.set(true);
                             page.read_text();
                         }
                     }
@@ -550,6 +559,20 @@ impl ViewerPage {
         self.text.borrow().clone()
     }
 
+    /// Read the text again when there is none and no reading is under way:
+    /// a reading that failed — a reload that threw under it — leaves the
+    /// PDF unsearchable until something reads it again, and a query is
+    /// that something.
+    pub fn ensure_text(&self) {
+        if self.loaded.get()
+            && self.pdf_view.borrow().is_some()
+            && self.text.borrow().is_none()
+            && !self.reading.get()
+        {
+            self.read_text();
+        }
+    }
+
     /// Whether its text is still coming: being read, or pages being read
     /// by OCR.
     pub fn text_pending(&self) -> bool {
@@ -572,6 +595,7 @@ impl ViewerPage {
         };
         let generation = self.text_generation.get() + 1;
         self.text_generation.set(generation);
+        self.reading.set(true);
         *self.text.borrow_mut() = None;
         self.ocr_started.set(false);
         self.ocr_pending.set(0);
@@ -589,10 +613,29 @@ impl ViewerPage {
             if page.text_generation.get() != generation {
                 return;
             }
-            let pages = read
-                .ok()
-                .map(|value| value.to_str().to_string())
-                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok());
+            page.reading.set(false);
+            // A reading that failed says why: silence here is a PDF the
+            // find never answers for, with nothing to say what went wrong.
+            let pages = match read {
+                Ok(value) => {
+                    let json = value.to_str().to_string();
+                    match serde_json::from_str::<Vec<String>>(&json) {
+                        Ok(pages) => Some(pages),
+                        Err(e) => {
+                            tracing::warn!(
+                                "reading {}'s text: not a list of pages ({e}): {}",
+                                path_name(&page.path),
+                                json.chars().take(200).collect::<String>()
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("reading {}'s text: {e}", path_name(&page.path));
+                    None
+                }
+            };
             if let Some(pages) = pages {
                 *page.text.borrow_mut() = Some(pages);
                 page.notify_text();
@@ -870,8 +913,10 @@ try {
   // The reload under way, if one is: the text is read from the document
   // that comes out of it, not the one going.
   let settled = Promise.resolve();
+  // Settled whatever happens in it: the text read after a reload waits
+  // on this, and one that threw left every later reading failing with it.
   window.tasteReload = () => {
-    settled = reload();
+    settled = reload().catch(() => {});
     return settled;
   };
   // Each page's text, as pdf.js reads it from the document — the
