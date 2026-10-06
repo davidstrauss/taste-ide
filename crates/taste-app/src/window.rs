@@ -4373,6 +4373,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             if let Some(pane) = chats.pane_for(&env) {
                                 if pane.is_busy() {
                                     tracing::info!("{env}'s agent is mid-turn; its migration notice waits for the next");
+                                } else if pane.would_hold() {
+                                    // Not queued for an agent that is not
+                                    // there — stopped with its container for
+                                    // the very rebuild this would ask for
+                                    // (2026-10-06): the nudge comes again in
+                                    // ten minutes, and the agent is told how
+                                    // a rebuild ended when it ends.
+                                    tracing::info!("{env}'s agent is not there; its migration notice waits for the next");
                                 } else if let Err(e) = pane.submit_prompt(text) {
                                     tracing::info!(
                                         "{env}'s migration notice was not delivered: {e}"

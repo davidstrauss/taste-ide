@@ -3816,6 +3816,11 @@ impl EnvironmentRegistry {
             .map(|(id, m)| (id.clone(), m.clone()))
             .collect();
         for (id, mut migration) in pending {
+            // One under way says nothing more until it ends: its agent
+            // asked, or was made to, and is told how it went.
+            if self.relocations_in_flight.lock().unwrap().contains(&id) {
+                continue;
+            }
             let due = migration.due(now);
             if due.is_empty() {
                 continue;
@@ -3861,6 +3866,14 @@ impl EnvironmentRegistry {
                  its image's packages are less than a day old"
             )
         })?;
+        // Asked, whoever approves it: the nudges stop.
+        let now = now_secs();
+        migration.requested_at.get_or_insert(now);
+        migration.write(&self.env_dir(env))?;
+        self.migrations
+            .lock()
+            .unwrap()
+            .insert(env.clone(), migration.clone());
         if env.is_primary() {
             self.spawn_relocate(env.clone(), "the coordinator asked for it".to_string());
             return Ok(
@@ -3869,13 +3882,6 @@ impl EnvironmentRegistry {
                     .to_string(),
             );
         }
-        let now = now_secs();
-        migration.requested_at.get_or_insert(now);
-        migration.write(&self.env_dir(env))?;
-        self.migrations
-            .lock()
-            .unwrap()
-            .insert(env.clone(), migration.clone());
         let left = migration.forced_at().saturating_sub(now) / 60;
         self.events.publish(Event::MigrationNotice {
             env: env.clone(),
@@ -4692,6 +4698,81 @@ mod tests {
 
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Personal's own request for a rebuild records that it asked, as an
+    /// agent environment's does; and while a rebuild is under way, the
+    /// clock that nudges the agent says nothing — which once queued "your
+    /// image is out of date" for an agent stopped by the rebuild it had
+    /// asked for (2026-10-06).
+    #[test]
+    fn a_rebuild_under_way_is_not_nudged_about() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let events = EventBus::new();
+        let seen = events.subscribe();
+        let registry = EnvironmentRegistry::new_for_tests(
+            workspace.path(),
+            events.clone(),
+            ExecContext::host_unsandboxed_for_tests(),
+            state.path(),
+        );
+        let primary = EnvironmentId::primary();
+        let pending =
+            crate::migration::Migration::packages("vm", "44", "package updates are available", 0);
+        registry
+            .migrations
+            .lock()
+            .unwrap()
+            .insert(primary.clone(), pending);
+        // Under way already, so the request starts nothing here.
+        registry
+            .relocations_in_flight
+            .lock()
+            .unwrap()
+            .insert(primary.clone());
+        registry.request_migration(&primary).unwrap();
+        assert!(
+            registry
+                .migration_of(&primary)
+                .unwrap()
+                .requested_at
+                .is_some(),
+            "Personal's request is recorded"
+        );
+        // One nobody asked for, twenty minutes old: due a nudge, and
+        // nothing is said while it runs; once it is not under way, the
+        // nudge is said.
+        let now = now_secs();
+        let mut unasked = crate::migration::Migration::packages(
+            "vm",
+            "44",
+            "package updates are available",
+            now - 20 * 60,
+        );
+        unasked.requested_at = None;
+        registry
+            .migrations
+            .lock()
+            .unwrap()
+            .insert(primary.clone(), unasked);
+        let nudged = |seen: &async_channel::Receiver<Event>| {
+            let mut said = false;
+            while let Ok(event) = seen.try_recv() {
+                said |= matches!(event, Event::MigrationNotice { .. });
+            }
+            said
+        };
+        let _ = nudged(&seen);
+        registry.tick_migrations();
+        assert!(!nudged(&seen), "nothing said about a rebuild under way");
+        registry
+            .relocations_in_flight
+            .lock()
+            .unwrap()
+            .remove(&primary);
+        registry.tick_migrations();
+        assert!(nudged(&seen), "and the nudge is said once it is not");
+    }
 
     /// The placement file is what tells a restored environment its
     /// checkout is in a VM; without it, the clone is the checkout.

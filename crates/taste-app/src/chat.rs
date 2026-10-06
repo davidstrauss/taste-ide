@@ -4610,6 +4610,13 @@ impl ChatPane {
         self.busy.get()
     }
 
+    /// Whether a prompt submitted now would wait for the agent rather than
+    /// reach it: no agent in the chat yet, one coming up. A notice that
+    /// is only true now — a rebuild's nudge — is not worth holding.
+    pub fn would_hold(&self) -> bool {
+        matches!(delivery(self.send_facts()), Delivery::Hold)
+    }
+
     /// Whether this chat is stopped on a question only the user can
     /// answer: an unanswered permission request, or a sign-in it cannot
     /// perform for itself.
