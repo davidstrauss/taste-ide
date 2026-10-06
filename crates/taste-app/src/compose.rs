@@ -798,6 +798,31 @@ impl Compose {
         let entry = self.composer.entry.clone();
         let text = text.to_string();
         self.focus();
+        // `TASTE_PROBE_PASTE`: the text pasted through the clipboard in one
+        // go, as Ctrl+V does — one insertion of the whole, which typing a
+        // character at a time is not.
+        if std::env::var_os("TASTE_PROBE_PASTE").is_some() {
+            // Into an empty field, as a message is most often pasted.
+            // Steps separated by U+0001 paste one after another, each over
+            // the whole of what is there, as select-all and paste does — a
+            // long paste replaced by a short one is a state one paste does
+            // not reach.
+            entry.buffer().set_text("");
+            let steps: Vec<String> = text.split('\u{1}').map(str::to_string).collect();
+            glib::spawn_future_local(async move {
+                for step in steps {
+                    let buffer = entry.buffer();
+                    let (start, end) = buffer.bounds();
+                    buffer.select_range(&start, &end);
+                    entry.clipboard().set_text(&step);
+                    glib::timeout_future(std::time::Duration::from_millis(300)).await;
+                    entry.emit_paste_clipboard();
+                    glib::timeout_future(std::time::Duration::from_millis(400)).await;
+                }
+                done();
+            });
+            return;
+        }
         glib::spawn_future_local(async move {
             for ch in text.chars() {
                 let buffer = entry.buffer();

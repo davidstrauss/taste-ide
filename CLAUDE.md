@@ -245,7 +245,10 @@ per-keystroke tooltips, the restyle debounce and the completion popup's
 own frame clock all do their work in the GAPS between keystrokes, and a
 field that grows by less than a line and scrolls its first line up does
 so only on the way there (pair it with `TASTE_PROBE_HEIGHT` for a
-squeezed column);
+squeezed column); `TASTE_PROBE_PASTE=<text>` pastes it instead, through the
+clipboard in one go as Ctrl+V does, into an emptied field — steps separated
+by U+0001 paste one after another, each over the whole of what is there, which
+is how a long paste replaced by a short one is posed — and is shot the same way;
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 `TASTE_PROBE_WIDTH` (and `TASTE_PROBE_HEIGHT`) override the window size a

@@ -3350,7 +3350,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // The chat's slash commands go on the box first, because the
                 // completion is what the popup belongs to and a box with no
                 // commands behind it never opens one.
-                if let Ok(text) = std::env::var("TASTE_PROBE_TYPE") {
+                // `TASTE_PROBE_PASTE=<text>` pastes it instead, through the
+                // clipboard, and is shot the same way.
+                if let Ok(text) = std::env::var("TASTE_PROBE_TYPE")
+                    .or_else(|_| std::env::var("TASTE_PROBE_PASTE"))
+                {
                     if let Some(pane) = chats_for_probe.selected() {
                         let provider = pane.command_provider();
                         provider.set_commands(
