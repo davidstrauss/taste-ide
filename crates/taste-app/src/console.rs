@@ -411,6 +411,10 @@ pub struct Console {
     /// Shell tabs running on the machine/IDE-container — retired when the
     /// devcontainer attaches (work belongs inside it).
     host_shells: RefCell<Vec<adw::TabPage>>,
+    /// Shells asked for in the Flatpak before the primary had a container:
+    /// none is opened on this machine there, and this many open in the
+    /// container when it comes up (`add_terminal_tab_at`).
+    waiting_shells: Cell<usize>,
     /// Shell tabs whose container went away under them — stopped, or
     /// replaced by a rebuild — waiting for their environment to run again,
     /// when each is reopened as a fresh shell in the new container (David,
@@ -632,6 +636,7 @@ impl Console {
             tab_glyphs: RefCell::new(HashMap::new()),
             search_terminals: RefCell::new(Vec::new()),
             host_shells: RefCell::new(Vec::new()),
+            waiting_shells: Cell::new(0),
             dead_shells: RefCell::new(Vec::new()),
             vm_graphs: RefCell::new(HashMap::new()),
             held_buttons: RefCell::new(Vec::new()),
@@ -2295,7 +2300,8 @@ impl Console {
             for page in stale {
                 self.host().close_page(&page);
             }
-            if had_hosts {
+            let waiting = self.waiting_shells.replace(0);
+            for _ in 0..waiting.max(usize::from(had_hosts)) {
                 self.add_terminal_tab();
             }
         }
@@ -3296,6 +3302,20 @@ impl Console {
         target: (EnvironmentId, taste_core::ExecContext, PathBuf),
     ) {
         let (env, exec, cwd) = target;
+        // In the Flatpak, a shell with no container to be in is not opened
+        // on this machine: it would reach the host through flatpak-spawn,
+        // whose bash gets the sandbox's pty and no controlling terminal
+        // ("cannot set terminal process group", "no job control"), and it
+        // would only stand in until the container came up anyway (David,
+        // 2026-10-06: "In the Flatpak, don't open the host shell; just wait
+        // for the container's shell"). It opens there instead, when it can.
+        if exec.container_id().is_none()
+            && !exec.is_inside_container()
+            && taste_core::podman::sandboxed()
+        {
+            self.waiting_shells.set(self.waiting_shells.get() + 1);
+            return;
+        }
         // The prompt names what the tab names — `user@host`, which in a
         // container is the user and the container's short id — and then
         // the directory; an image with no rc files left bash at its bare

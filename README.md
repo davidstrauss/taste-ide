@@ -193,9 +193,7 @@ gigabyte, once.
 `taste-ide <folder>` opens that folder; a bare `taste-ide` at a shell
 opens the one you are in; a launch from the desktop or the installed
 Flatpak asks which. Each folder is a window and a process of its own, and
-the title bar's Open Folder (Ctrl+O) opens another. The Flatpak and a
-build run from this repository share their state, so a folder's VM, its
-credential, and its environments are the same whichever one opens it.
+the title bar's Open Folder (Ctrl+O) opens another.
 
 Any cargo command runs the same way, on host podman:
 

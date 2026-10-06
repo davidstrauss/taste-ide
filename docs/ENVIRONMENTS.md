@@ -3162,6 +3162,19 @@ is shouted, but nothing runs either. The rows say what is missing, and
   lack an active owning IDE"). Each would have stopped on its own within
   minutes; a launch wants its room now, and a VM nobody is using is the
   host's memory committed for nothing.
+- **A VM is the install's that made it.** The Flatpak and a build run
+  from a checkout keep their own state — the Flatpak under
+  `~/.var/app/net.davidstrauss.Taste/`, as Flatpak apps do — and talk to
+  the one user-session libvirt, where a domain's name says which folder
+  it serves but not which install made it. Its ssh key, Ignition, and
+  supervision lock are in the maker's state, out of the other's reach, so
+  each install takes for its pool, sweeps, and reports only the domains
+  whose disk is in its own `guests/machines` (`provision::made_here`),
+  and the other's VMs for the same folder are left alone; the room check
+  still counts every install's, since the memory is the host's (2026-10-06:
+  the Flatpak's first launch on a folder started a build's VM for it and
+  waited on a key it did not have). A domain whose key is missing anyway
+  is refused when its connection is registered, with the reason.
 - **VMs are cattle, and they are never updated.** The guest does not
   self-update (Zincati is off) and the IDE never reshapes one. The answer
   to a VM that is wrong, old, or gone is a fresh one from the stream's

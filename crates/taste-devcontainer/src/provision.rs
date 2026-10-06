@@ -678,6 +678,36 @@ pub fn ssh_port_from_xml(xml: &str) -> Result<u16> {
         .with_context(|| format!("the ssh forward's port is not a number: {start:?}"))
 }
 
+/// The disk a domain boots, from its `<disk>`'s `<source file=…>`.
+pub fn disk_from_xml(xml: &str) -> Option<PathBuf> {
+    let disk = xml.find("<disk")?;
+    let source = disk + xml[disk..].find("<source")?;
+    attr(&xml[source..], "file").map(|file| PathBuf::from(unescape(file)))
+}
+
+/// Whether a domain is THIS install's: its disk is in this install's
+/// [`disks_dir`]. Every install of the IDE on a machine — the Flatpak, a
+/// build run from a checkout — talks to the one user-session libvirt, and
+/// the domains are named for the workspace's folder, so the name alone
+/// cannot say whose a VM is; its ssh key, its Ignition, and its
+/// supervision lock are in the state of whichever install made it, and
+/// another's cannot reach it. The disk is in that install's data
+/// directory, and the domain records where (2026-10-06: the Flatpak, on
+/// its first launch on a folder, started a build's VM for it and waited on
+/// a key it did not have).
+pub fn made_here(xml: &str) -> bool {
+    disk_from_xml(xml).is_some_and(|disk| disk.starts_with(disks_dir()))
+}
+
+/// Which domains a listing covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Made {
+    /// This install's, the only ones it may start, stop, or adopt.
+    Here,
+    /// Every install's, for what the host's memory is committed to.
+    Anywhere,
+}
+
 /// The workspace a domain serves, from its metadata. `None` for a domain
 /// without one — which is a domain the IDE did not make.
 pub fn workspace_from_xml(xml: &str) -> Option<PathBuf> {
@@ -1045,8 +1075,9 @@ impl LibvirtSession {
         Ok(())
     }
 
-    /// Every VM whose name starts with `prefix`, sorted by name.
-    async fn list_prefixed(&self, prefix: &str) -> Result<Vec<Vm>> {
+    /// Every VM whose name starts with `prefix`, sorted by name: this
+    /// install's, or every install's (see [`made_here`]).
+    async fn list_prefixed(&self, prefix: &str, made: Made) -> Result<Vec<Vm>> {
         let names = self.virsh(&["list", "--all", "--name"]).await?;
         let mut vms = Vec::new();
         for name in names
@@ -1055,6 +1086,9 @@ impl LibvirtSession {
             .filter(|n| n.starts_with(prefix))
         {
             let xml = self.virsh(&["dumpxml", name]).await?;
+            if made == Made::Here && !made_here(&xml) {
+                continue;
+            }
             let state = self.virsh(&["domstate", name]).await?;
             vms.push(Vm {
                 domain: name.to_string(),
@@ -1069,14 +1103,22 @@ impl LibvirtSession {
         Ok(vms)
     }
 
-    /// This workspace's pool, as libvirt has it.
+    /// This workspace's pool, as libvirt has it: this install's VMs for it.
     pub async fn list(&self, workspace_root: &Path) -> Result<Vec<Vm>> {
-        self.list_prefixed(&domain_prefix(workspace_root)).await
+        self.list_prefixed(&domain_prefix(workspace_root), Made::Here)
+            .await
     }
 
-    /// Every VM the IDE made, for any workspace — the startup sweep's view.
+    /// Every VM this install made, for any workspace — the startup sweep's
+    /// view, which stops and reports only what is its own.
     pub async fn list_all(&self) -> Result<Vec<Vm>> {
-        self.list_prefixed("taste-").await
+        self.list_prefixed("taste-", Made::Here).await
+    }
+
+    /// Every Taste VM on this host, whichever install made it: the memory
+    /// they commit is the host's either way.
+    pub async fn list_all_installs(&self) -> Result<Vec<Vm>> {
+        self.list_prefixed("taste-", Made::Anywhere).await
     }
 
     /// Make a VM for a workspace: the disk, the Ignition, the definition.
@@ -1969,6 +2011,31 @@ mod tests {
         let xml = domain_xml(&awkward).unwrap();
         assert!(xml.contains("a &amp; b/&lt;disk&gt;.qcow2"), "{xml}");
         assert!(!xml.contains("<disk>.qcow2"));
+    }
+
+    #[test]
+    fn a_domain_is_this_installs_when_its_disk_is_in_this_installs_data() {
+        let here = DomainSpec {
+            disk: disks_dir()
+                .join("taste-799fd7acd369bf5c-k7m2qx.qcow2")
+                .display()
+                .to_string(),
+            ..spec()
+        };
+        let xml = domain_xml(&here).unwrap();
+        assert_eq!(
+            disk_from_xml(&xml),
+            Some(disks_dir().join("taste-799fd7acd369bf5c-k7m2qx.qcow2"))
+        );
+        assert!(made_here(&xml));
+        let elsewhere = DomainSpec {
+            disk:
+                "/home/dev/.var/app/net.davidstrauss.Taste/data/taste-ide/guests/machines/ws.qcow2"
+                    .into(),
+            ..spec()
+        };
+        assert!(!made_here(&domain_xml(&elsewhere).unwrap()));
+        assert!(!made_here("<domain><name>x</name></domain>"));
     }
 
     #[test]

@@ -479,7 +479,7 @@ impl Pool {
         let host_mib = sizing::host_memory_mib().unwrap_or(u64::MAX);
         let all = self
             .libvirt
-            .list_all()
+            .list_all_installs()
             .await
             .map_err(PoolError::Unavailable)?;
         let mut running = 0usize;
@@ -514,7 +514,7 @@ impl Pool {
         let mut committed_mib = 0u64;
         for vm in self
             .libvirt
-            .list_all()
+            .list_all_installs()
             .await?
             .iter()
             .filter(|vm| vm.state == DomainState::Running)
