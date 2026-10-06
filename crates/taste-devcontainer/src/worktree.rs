@@ -299,7 +299,43 @@ impl Worktree {
         }
     }
 
-    /// The branch HEAD is on, or `None` when detached or unborn.
+    /// Each submodule of this checkout, by its path, and where it is: the
+    /// branch its own HEAD is on, else a tag at that exact commit, else the
+    /// commit, short — or, not checked out, the commit the parent records —
+    /// and how that stands to the commit the parent records. What the file
+    /// tree writes after a submodule's name, and what it warns about
+    /// (David, 2026-10-06: "I'd also like them to show in the file tree as
+    /// [folder] @ [commit-ish]"; "Rather than the 'M' label on the
+    /// submodule if it's out of sync with the pin, we should probably show
+    /// an indicator of an actual problem"). Empty for a checkout with none,
+    /// and when git cannot say.
+    pub fn submodule_heads(&self) -> HashMap<PathBuf, SubmoduleHead> {
+        let Ok(status) = self.run_git(&["submodule", "status"], &[]) else {
+            return HashMap::new();
+        };
+        if !status.success() {
+            return HashMap::new();
+        }
+        let mut heads = submodule_status_heads(&status.stdout_utf8());
+        if heads
+            .values()
+            .any(|head| head.pin != SubmodulePin::NotCheckedOut)
+        {
+            if let Ok(named) = self.run_git(&SUBMODULE_NAMES, &[]) {
+                if named.success() {
+                    for (path, head) in submodule_names(&named.stdout_utf8()) {
+                        // A conflict is the parent's to say, and stays.
+                        if heads.get(&path).map(|h| &h.pin) != Some(&SubmodulePin::Conflicted) {
+                            heads.insert(path, head);
+                        }
+                    }
+                }
+            }
+        }
+        heads
+    }
+
+    /// The branch HEAD is on, or `None` when detached or unborn.    /// The branch HEAD is on, or `None` when detached or unborn.
     pub fn branch_name(&self) -> Option<String> {
         match self {
             Worktree::Local(_) => self.local().ok()?.branch_name(),
@@ -706,9 +742,258 @@ impl Worktree {
     }
 }
 
+/// Where a submodule is ([`Worktree::submodule_heads`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmoduleHead {
+    /// The branch its HEAD is on, else a tag at that exact commit, else
+    /// the commit, short.
+    pub at: String,
+    /// How that stands to the commit the parent records.
+    pub pin: SubmodulePin,
+}
+
+/// A submodule's commit against the one its parent records — the pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmodulePin {
+    /// At it.
+    Same,
+    /// Past it, by this many commits: work in the submodule the parent has
+    /// not recorded yet, which is the ordinary state of working in one.
+    Ahead(u32),
+    /// Short of it, by this many: the parent expects commits it has not got.
+    Behind(u32),
+    /// Neither contains the other.
+    Diverged,
+    /// The recorded commit is not in the submodule's clone: not fetched.
+    Missing,
+    /// Not checked out at all.
+    NotCheckedOut,
+    /// The parent's own merge or rebase disagrees about it.
+    Conflicted,
+}
+
+impl SubmodulePin {
+    /// Whether this is something to fix rather than the way things are
+    /// while working: at the pin, or past it, is not.
+    pub fn is_problem(&self) -> bool {
+        !matches!(self, SubmodulePin::Same | SubmodulePin::Ahead(_))
+    }
+
+    /// The sentence for it, after the submodule's name.
+    pub fn describe(&self) -> String {
+        let commits = |n: u32| {
+            if n == 1 {
+                "1 commit".to_string()
+            } else {
+                format!("{n} commits")
+            }
+        };
+        match self {
+            SubmodulePin::Same => "at the commit the parent records".into(),
+            SubmodulePin::Ahead(n) => format!(
+                "{} past the commit the parent records — committing the parent records it",
+                commits(*n)
+            ),
+            SubmodulePin::Behind(n) => format!(
+                "{} short of the commit the parent records — the parent expects work this \
+                 checkout does not have",
+                commits(*n)
+            ),
+            SubmodulePin::Diverged => "diverged from the commit the parent records — \
+                 neither contains the other"
+                .into(),
+            SubmodulePin::Missing => "the commit the parent records is not in this clone — \
+                 fetch the submodule"
+                .into(),
+            SubmodulePin::NotCheckedOut => "not checked out".into(),
+            SubmodulePin::Conflicted => "conflicted in the parent's merge or rebase".into(),
+        }
+    }
+}
+
+/// `git submodule foreach` over the checked-out submodules: each one's
+/// path, what its HEAD is — the branch, else a tag at that exact commit,
+/// else the commit, short — and how it stands to the commit the parent
+/// records (`$sha1`), tab-separated.
+const SUBMODULE_NAMES: [&str; 4] = [
+    "submodule",
+    "foreach",
+    "--quiet",
+    r#"head=$(git rev-parse HEAD)
+if [ "$head" = "$sha1" ]; then pin=same
+elif ! git cat-file -e "$sha1^{commit}" 2>/dev/null; then pin=missing
+elif git merge-base --is-ancestor "$sha1" HEAD; then pin="ahead $(git rev-list --count "$sha1..HEAD")"
+elif git merge-base --is-ancestor HEAD "$sha1"; then pin="behind $(git rev-list --count "HEAD..$sha1")"
+else pin=diverged
+fi
+printf '%s\t%s\t%s\n' "$sm_path" "$(git symbolic-ref -q --short HEAD || git describe --tags --exact-match HEAD 2>/dev/null || git rev-parse --short HEAD)" "$pin""#,
+];
+
+/// `git submodule status`, read as each submodule's path and its commit,
+/// short. A line is a state flag (` `, `-` not checked out, `+` at another
+/// commit than the parent records, `U` conflicted), the commit, the path,
+/// and, for one checked out, ` (describe)`.
+fn submodule_status_heads(out: &str) -> HashMap<PathBuf, SubmoduleHead> {
+    out.lines()
+        .filter_map(|line| {
+            let flag = line.chars().next()?;
+            let rest = line.get(1..)?;
+            let (sha, path) = rest.split_once(' ')?;
+            let path = match path.rfind(" (") {
+                Some(at) if path.ends_with(')') => &path[..at],
+                _ => path,
+            };
+            let pin = match flag {
+                '-' => SubmodulePin::NotCheckedOut,
+                'U' => SubmodulePin::Conflicted,
+                _ => SubmodulePin::Same,
+            };
+            Some((
+                PathBuf::from(path),
+                SubmoduleHead {
+                    at: sha.chars().take(7).collect(),
+                    pin,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// [`SUBMODULE_NAMES`]'s output: each checked-out submodule's path, name,
+/// and standing against its pin.
+fn submodule_names(out: &str) -> HashMap<PathBuf, SubmoduleHead> {
+    out.lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let (path, at, pin) = (fields.next()?, fields.next()?, fields.next()?);
+            let count = |word: &str| {
+                pin.strip_prefix(word)
+                    .and_then(|n| n.trim().parse::<u32>().ok())
+            };
+            let pin = match pin.trim() {
+                "same" => SubmodulePin::Same,
+                "missing" => SubmodulePin::Missing,
+                "diverged" => SubmodulePin::Diverged,
+                _ => match (count("ahead "), count("behind ")) {
+                    (Some(n), _) => SubmodulePin::Ahead(n),
+                    (_, Some(n)) => SubmodulePin::Behind(n),
+                    _ => SubmodulePin::Same,
+                },
+            };
+            Some((
+                PathBuf::from(path),
+                SubmoduleHead {
+                    at: at.trim().to_string(),
+                    pin,
+                },
+            ))
+        })
+        .filter(|(_, head)| !head.at.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The standing against the pin, from git itself: past the recorded
+    /// commit after a commit in the submodule, short of it once the parent
+    /// records a commit the submodule has gone back from.
+    #[test]
+    fn a_submodule_is_measured_against_the_commit_its_parent_records() {
+        let dir = std::env::temp_dir().join(format!("taste-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q", "-b", "main"]);
+        std::fs::write(sub.join("a"), "1").unwrap();
+        git(&sub, &["add", "-A"]);
+        git(&sub, &["commit", "-q", "-m", "one"]);
+        let parent = dir.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        git(&parent, &["init", "-q", "-b", "main"]);
+        git(
+            &parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub.to_str().unwrap(),
+                "tpl",
+            ],
+        );
+        git(&parent, &["commit", "-q", "-m", "add"]);
+        let tpl = parent.join("tpl");
+        let worktree = Worktree::Local(parent.clone());
+        let head = |w: &Worktree| w.submodule_heads()[Path::new("tpl")].clone();
+        assert_eq!(head(&worktree).pin, SubmodulePin::Same);
+
+        std::fs::write(tpl.join("a"), "2").unwrap();
+        git(&tpl, &["commit", "-q", "-am", "two"]);
+        let ahead = head(&worktree);
+        assert_eq!(
+            (ahead.at.as_str(), &ahead.pin),
+            ("main", &SubmodulePin::Ahead(1))
+        );
+
+        git(&parent, &["add", "tpl"]);
+        git(&parent, &["commit", "-q", "-m", "record two"]);
+        git(&tpl, &["checkout", "-q", "HEAD~1"]);
+        assert_eq!(head(&worktree).pin, SubmodulePin::Behind(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A submodule's place, as the file tree writes it: its branch, a tag,
+    /// or its commit; and one not checked out at the commit its parent
+    /// records.
+    #[test]
+    fn submodule_heads_read_back_from_git() {
+        let status =
+            " a1d4e5a0c3b2f1e0d9c8b7a6f5e4d3c2b1a09f8e amutable-typst-template (heads/main)\n\
+                      -97368d91cd4e37e94d0db0817fde54f9b713ac17 vendor/empty\n\
+                      +ca2618d00000000000000000000000000000000 deps/my lib (v1.2)\n";
+        let heads = submodule_status_heads(status);
+        assert_eq!(heads[Path::new("amutable-typst-template")].at, "a1d4e5a");
+        assert_eq!(heads[Path::new("vendor/empty")].at, "97368d9");
+        assert_eq!(
+            heads[Path::new("vendor/empty")].pin,
+            SubmodulePin::NotCheckedOut
+        );
+        assert_eq!(heads[Path::new("deps/my lib")].at, "ca2618d");
+        let names = submodule_names(
+            "amutable-typst-template\tmain\tahead 1\ndeps/my lib\tv1.2\tbehind 3\nx\tabc1234\tmissing\n",
+        );
+        let tpl = &names[Path::new("amutable-typst-template")];
+        assert_eq!(
+            (tpl.at.as_str(), &tpl.pin),
+            ("main", &SubmodulePin::Ahead(1))
+        );
+        assert!(
+            !tpl.pin.is_problem(),
+            "past the pin is working, not a problem"
+        );
+        assert_eq!(names[Path::new("deps/my lib")].pin, SubmodulePin::Behind(3));
+        assert!(names[Path::new("x")].pin.is_problem());
+    }
 
     fn git_present() -> bool {
         std::process::Command::new("git")

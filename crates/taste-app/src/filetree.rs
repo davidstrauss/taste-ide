@@ -481,6 +481,10 @@ pub struct FileTree {
     /// lets the unchanged-guard engage for them too.
     rendered_non_repo: std::cell::Cell<bool>,
     show_ignored: Rc<RefCell<bool>>,
+    /// Each submodule of the checkout on screen, by its path in it, and
+    /// where it is: its row reads "name @ main" under a folder with git's
+    /// mark (David, 2026-10-06).
+    submodule_heads: RefCell<HashMap<PathBuf, taste_devcontainer::worktree::SubmoduleHead>>,
     on_open: RefCell<Option<OpenCallback>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
     on_open_diff: RefCell<Option<OpenDiffCallback>>,
@@ -738,11 +742,32 @@ struct StatusSnapshot {
     branch: Option<String>,
     sync: Option<taste_git::SyncStatus>,
     rebasing: bool,
+    /// Each submodule's path and where it is (`Worktree::submodule_heads`).
+    submodules: HashMap<PathBuf, taste_devcontainer::worktree::SubmoduleHead>,
 }
 
 /// How long a fetch, rebase or push may run before it is called failed. A
 /// hung network step must not leave the sync row spinning for ever.
 const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The fetch of each submodule cloned in the folder at `root`, by its
+/// path: every remote, as the parent's own fetch is.
+fn submodule_fetch_commands(root: &Path) -> Vec<(String, (String, Vec<String>))> {
+    let Some(git) = taste_git::GitWorkspace::discover(root) else {
+        return Vec::new();
+    };
+    git.submodules()
+        .into_iter()
+        .filter_map(|(_, sub)| {
+            let clone = root.join(&sub);
+            if !clone.join(".git").exists() {
+                return None;
+            }
+            let inner = taste_git::GitWorkspace::discover(&clone)?;
+            Some((sub.display().to_string(), inner.fetch_all_command()))
+        })
+        .collect()
+}
 
 /// Run one git step, bounded. `Err` carries something worth putting in a
 /// toast.
@@ -1475,6 +1500,7 @@ impl FileTree {
             pane: std::cell::Cell::new(PaneKind::None),
             rendered_non_repo: std::cell::Cell::new(false),
             show_ignored: Rc::new(RefCell::new(false)),
+            submodule_heads: RefCell::new(HashMap::new()),
             on_open: RefCell::new(None),
             on_open_diff: RefCell::new(None),
             on_copy_home: RefCell::new(None),
@@ -4566,6 +4592,7 @@ impl FileTree {
                     None => git.sync_status().ok(),
                 });
                 Ok(StatusSnapshot {
+                    submodules: worktree.submodule_heads(),
                     status,
                     stashed: worktree.stashed_paths().unwrap_or_default(),
                     ignore_rules: worktree
@@ -4681,16 +4708,22 @@ impl FileTree {
         match snapshot {
             Some(snapshot) => {
                 self.rendered_non_repo.set(false);
+                // A submodule that moved rewrites its row's name, which no
+                // file state says: a full rebind, as rarely as that is.
+                let heads_changed = *self.submodule_heads.borrow() != snapshot.submodules;
                 // Unchanged status must not churn row widgets: factory
                 // resets during agent/build activity are what made hovering
                 // feel laggy. ignore_rules participates: a new rule changes
                 // no file state, but the Staged pane restore rides on this
                 // refresh actually rendering.
                 unchanged = !mode_changed
+                    && !heads_changed
                     && *self.status.borrow() == snapshot.status
                     && *self.stashed.borrow() == snapshot.stashed
                     && self.ignore_rules.get() == snapshot.ignore_rules;
-                states_only = !mode_changed && self.ignore_rules.get() == snapshot.ignore_rules;
+                states_only = !mode_changed
+                    && !heads_changed
+                    && self.ignore_rules.get() == snapshot.ignore_rules;
                 let conflict_count = |status: &HashMap<PathBuf, FileState>| {
                     status
                         .values()
@@ -4704,6 +4737,7 @@ impl FileTree {
                 rebase_ended = self.abort_button.is_visible() && !snapshot.rebasing;
                 *self.status.borrow_mut() = snapshot.status;
                 *self.stashed.borrow_mut() = snapshot.stashed;
+                *self.submodule_heads.borrow_mut() = snapshot.submodules;
                 self.ignore_rules.set(snapshot.ignore_rules);
                 self.sync_filter_counts();
                 *self.status_branch.borrow_mut() = snapshot.branch.clone();
@@ -6499,15 +6533,62 @@ impl FileTree {
                     }
                 }
             }
+            // Each submodule cloned in the folder, fetched with the same
+            // keys: its refs are as much the user's as the parent's (David,
+            // 2026-10-06: "We should ensure the refs get fetched as part of
+            // the 'fetch' button and other fetch operations"). One that
+            // fails says so and the rest go on.
+            if !failed {
+                let commands = crate::runtime::runtime()
+                    .spawn_blocking({
+                        let root = root.clone();
+                        move || submodule_fetch_commands(&root)
+                    })
+                    .await
+                    .unwrap_or_default();
+                for (name, (program, args)) in commands {
+                    let handle =
+                        crate::runtime::runtime().spawn(run_git_step(program, args, envs.clone()));
+                    let failure = match handle.await {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(reason)) => Some(reason),
+                        Err(_) => Some("interrupted".to_string()),
+                    };
+                    if let Some(reason) = failure {
+                        events.publish(Event::Toast(format!(
+                            "fetching the submodule {name} failed: {reason}"
+                        )));
+                    }
+                }
+            }
+            // What was fetched, given to the checkout in the VM, which
+            // cannot fetch for itself: the parent's remote-tracking refs and
+            // each submodule's — after every fetch, not only before a
+            // rebase, so a branch the user fetched is there to be checked
+            // out or compared against.
+            let shared = if !failed && !worktree.is_local() {
+                match share_remotes.clone() {
+                    Some(share) => crate::runtime::runtime()
+                        .spawn_blocking(move || share())
+                        .await
+                        .unwrap_or_else(|_| Err("interrupted".to_string())),
+                    None => Ok(()),
+                }
+            } else {
+                Ok(())
+            };
+            if let Err(reason) = &shared {
+                events.publish(Event::Toast(format!(
+                    "the fetched refs did not reach Personal: {reason}"
+                )));
+            }
             if rebase && !failed && !worktree.is_local() {
                 let worktree = worktree.clone();
                 let handle = crate::runtime::runtime().spawn_blocking(move || {
                     let Some(upstream) = upstream else {
                         return Err("this branch has no upstream to rebase onto".to_string());
                     };
-                    if let Some(share) = share_remotes {
-                        share()?;
-                    }
+                    shared?;
                     worktree.rebase_onto(&upstream).map_err(|e| e.to_string())
                 });
                 match handle.await {
@@ -6694,6 +6775,12 @@ impl FileTree {
         path.strip_prefix(workdir).ok().map(Path::to_path_buf)
     }
 
+    /// Where the submodule at `path` is, when it is one.
+    fn submodule_head(&self, path: &Path) -> Option<taste_devcontainer::worktree::SubmoduleHead> {
+        let rel = self.repo_relative(path)?;
+        self.submodule_heads.borrow().get(&rel).cloned()
+    }
+
     fn state_of(&self, node: &FileNode) -> FileState {
         let Some(rel) = self.repo_relative(&node.path) else {
             return FileState::Clean;
@@ -6861,8 +6948,21 @@ impl FileTree {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    // A submodule is a folder with git's mark, whatever
+                    // its name would have given it.
+                    let submodule = tree.submodule_head(&node.path).is_some();
                     row.bind_property("expanded", &image, "icon-name")
                         .transform_to(move |_, expanded: bool| {
+                            if submodule {
+                                return Some(
+                                    if expanded {
+                                        "taste-mi-folder-git-open"
+                                    } else {
+                                        "taste-mi-folder-git"
+                                    }
+                                    .to_string(),
+                                );
+                            }
                             crate::file_icons::icon_name(
                                 &name,
                                 crate::file_icons::Kind::Folder { expanded },
@@ -7060,8 +7160,31 @@ impl FileTree {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build()
             .full_text_on_hover();
+        let submodule = node
+            .is_dir
+            .then(|| self.submodule_head(&node.path))
+            .flatten();
+        // A submodule says where it is after its name, dimmed: the branch,
+        // a tag, or the commit.
+        if let Some(head) = &submodule {
+            label.set_use_markup(true);
+            label.set_label(&format!(
+                "{} <span alpha=\"55%\">@ {}</span>",
+                glib::markup_escape_text(&name),
+                glib::markup_escape_text(&head.at)
+            ));
+        }
 
-        let (badge, css) = state_style(state);
+        // A submodule's row does not wear the parent's "M" for its commit
+        // differing from the one the parent records: past it is the way a
+        // submodule is while it is worked in. It wears a warning only for
+        // something to fix — short of it, diverged, the commit not fetched,
+        // not checked out, conflicted — and says which, as its tooltip says
+        // where it stands either way (David, 2026-10-06).
+        let (badge, css) = match &submodule {
+            Some(_) => ("", None),
+            None => state_style(state),
+        };
         let badge_label = gtk::Label::builder().label(badge).build();
         if let Some(css) = css {
             badge_label.add_css_class(css);
@@ -7071,6 +7194,16 @@ impl FileTree {
         row.append(&icon);
         row.append(&label);
         row.append(&badge_label);
+        if let Some(head) = &submodule {
+            let standing = format!("{name} is {}", head.pin.describe());
+            row.set_tooltip_text(Some(&standing));
+            if head.pin.is_problem() {
+                let warning = gtk::Image::from_icon_name("dialog-warning-symbolic");
+                warning.add_css_class("warning");
+                warning.set_tooltip_text(Some(&standing));
+                row.append(&warning);
+            }
+        }
 
         // Search annotations: per-file match count; in ghost mode the
         // non-matching rows stay but fade.
