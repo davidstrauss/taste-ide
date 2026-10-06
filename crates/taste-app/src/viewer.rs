@@ -248,6 +248,23 @@ pub struct ViewerPage {
     /// The PDF's view, while it has one: a reload replaces the document in
     /// it rather than the view, so the scroll and the zoom hold.
     pdf_view: RefCell<Option<webkit6::WebView>>,
+    /// The PDF's text, a string a page, once read ([`Self::read_text`]),
+    /// for the universal find (David, 2026-10-06: "Universal find should
+    /// work on open PDFs. You should even OCR if necessary"). A page drawn
+    /// as a picture reads as empty until OCR has read it.
+    text: RefCell<Option<Vec<String>>>,
+    /// Which reading of the text is current: a reload starts another, and
+    /// an older one finishing late is not taken.
+    text_generation: Cell<u64>,
+    /// OCR is under way, or done, for the text as it stands.
+    ocr_started: Cell<bool>,
+    /// Pages OCR has yet to read; zero when none are waiting.
+    ocr_pending: Cell<usize>,
+    /// Where the file is read from, for OCR, which runs beside it.
+    source: RefCell<Option<(taste_core::files::Files, PathBuf)>>,
+    /// Told when the text changes — read, or a page read by OCR.
+    on_text: RefCell<Option<Rc<dyn Fn()>>>,
+    this: RefCell<std::rc::Weak<Self>>,
 }
 
 impl ViewerPage {
@@ -270,7 +287,15 @@ impl ViewerPage {
             pending: Cell::new(false),
             auto: Cell::new(false),
             pdf_view: RefCell::new(None),
+            text: RefCell::new(None),
+            text_generation: Cell::new(0),
+            ocr_started: Cell::new(false),
+            ocr_pending: Cell::new(0),
+            source: RefCell::new(None),
+            on_text: RefCell::new(None),
+            this: RefCell::new(std::rc::Weak::new()),
         });
+        *page.this.borrow_mut() = Rc::downgrade(&page);
         {
             let weak = Rc::downgrade(&page);
             page.banner.connect_auto(move |on| {
@@ -354,6 +379,29 @@ impl ViewerPage {
                             },
                         );
                     }
+                });
+            }
+            // `keys`: Page Down pressed in the page, the scroll printed
+            // before and after.
+            "keys" => {
+                let Some(view) = self.pdf_view.borrow().clone() else {
+                    return;
+                };
+                glib::timeout_add_local_once(std::time::Duration::from_millis(2000), move || {
+                    webkit6::prelude::WebViewExt::evaluate_javascript(
+                        &view,
+                        "const before = window.tasteScroll(); \
+                         document.dispatchEvent(new KeyboardEvent('keydown', {key: 'PageDown', bubbles: true})); \
+                         'page down: ' + before + ' -> ' + window.tasteScroll()",
+                        None,
+                        None,
+                        None::<&gtk::gio::Cancellable>,
+                        |result| {
+                            if let Ok(value) = result {
+                                eprintln!("probe viewer keys: {}", value.to_str());
+                            }
+                        },
+                    );
                 });
             }
             // `page:N`: turned to page N once the document is up.
@@ -441,6 +489,8 @@ impl ViewerPage {
                 None::<&gtk::gio::Cancellable>,
                 |_| {},
             );
+            // The new document's text, read once its reload has settled.
+            self.read_text();
             return;
         }
         while let Some(child) = self.content.first_child() {
@@ -459,12 +509,175 @@ impl ViewerPage {
                 self.pdf_id.set(Some(id));
                 let view = pdf_view(id);
                 *self.pdf_view.borrow_mut() = Some(view.clone());
+                // Its text, once the page that draws it has loaded.
+                let weak = self.this.borrow().clone();
+                webkit6::prelude::WebViewExt::connect_load_changed(&view, move |_, event| {
+                    if event == webkit6::LoadEvent::Finished {
+                        if let Some(page) = weak.upgrade() {
+                            page.read_text();
+                        }
+                    }
+                });
                 view.upcast()
             }
             _ => gtk::Label::new(Some("This file could not be shown.")).upcast(),
         };
         shown.set_vexpand(true);
         self.content.append(&shown);
+    }
+
+    /// Take the keyboard, as the tab comes to the front: a PDF pages with
+    /// Page Up and Down, which go to whatever has the focus.
+    pub fn focus(&self) {
+        if let Some(view) = self.pdf_view.borrow().as_ref() {
+            view.grab_focus();
+        }
+    }
+
+    /// Where the file is read from: OCR runs beside it.
+    pub fn set_source(&self, files: taste_core::files::Files, path: PathBuf) {
+        *self.source.borrow_mut() = Some((files, path));
+    }
+
+    /// Who is told when the text changes.
+    pub fn set_on_text(&self, hook: Rc<dyn Fn()>) {
+        *self.on_text.borrow_mut() = Some(hook);
+    }
+
+    /// The PDF's text, a string a page, once read; `None` before, and for
+    /// anything but a PDF.
+    pub fn text_pages(&self) -> Option<Vec<String>> {
+        self.text.borrow().clone()
+    }
+
+    /// Whether its text is still coming: being read, or pages being read
+    /// by OCR.
+    pub fn text_pending(&self) -> bool {
+        self.pdf_view.borrow().is_some()
+            && (self.text.borrow().is_none() || self.ocr_pending.get() > 0)
+    }
+
+    fn notify_text(&self) {
+        let hook = self.on_text.borrow().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Read the PDF's text from the page that draws it — pdf.js's own
+    /// reading, a string a page — and say so when it lands.
+    fn read_text(&self) {
+        let Some(view) = self.pdf_view.borrow().clone() else {
+            return;
+        };
+        let generation = self.text_generation.get() + 1;
+        self.text_generation.set(generation);
+        *self.text.borrow_mut() = None;
+        self.ocr_started.set(false);
+        self.ocr_pending.set(0);
+        let weak = self.this.borrow().clone();
+        glib::spawn_future_local(async move {
+            let read = webkit6::prelude::WebViewExt::call_async_javascript_function_future(
+                &view,
+                "await window.tasteReady; return await window.tasteText();",
+                None,
+                None,
+                None,
+            )
+            .await;
+            let Some(page) = weak.upgrade() else { return };
+            if page.text_generation.get() != generation {
+                return;
+            }
+            let pages = read
+                .ok()
+                .map(|value| value.to_str().to_string())
+                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok());
+            if let Some(pages) = pages {
+                *page.text.borrow_mut() = Some(pages);
+                page.notify_text();
+            }
+        });
+    }
+
+    /// Read the pages with no text — scans, slides that are pictures — by
+    /// OCR, beside the file ([`OCR_SCRIPT`]), one at a time, each told as
+    /// it lands. Once for the text as it stands; a page OCR cannot read
+    /// stays empty.
+    pub fn read_textless_pages(&self) {
+        if self.ocr_started.get() {
+            return;
+        }
+        let Some(pages) = self.text.borrow().clone() else {
+            return;
+        };
+        let Some((files, path)) = self.source.borrow().clone() else {
+            return;
+        };
+        let textless: Vec<usize> = pages
+            .iter()
+            .enumerate()
+            .filter(|(_, text)| text.trim().is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        self.ocr_started.set(true);
+        if textless.is_empty() {
+            return;
+        }
+        self.ocr_pending.set(textless.len());
+        let generation = self.text_generation.get();
+        let weak = self.this.borrow().clone();
+        glib::spawn_future_local(async move {
+            for index in textless {
+                let (files, path) = (files.clone(), path.clone());
+                let read = crate::runtime::runtime()
+                    .spawn_blocking(move || ocr_page(&files, &path, index + 1))
+                    .await;
+                let Some(page) = weak.upgrade() else { return };
+                if page.text_generation.get() != generation {
+                    return;
+                }
+                page.ocr_pending
+                    .set(page.ocr_pending.get().saturating_sub(1));
+                match read {
+                    Ok(Ok(text)) => {
+                        if let Some(pages) = page.text.borrow_mut().as_mut() {
+                            if let Some(slot) = pages.get_mut(index) {
+                                *slot = text;
+                            }
+                        }
+                        page.notify_text();
+                    }
+                    Ok(Err(why)) => {
+                        tracing::info!("no OCR for {}: {why}", path_name(&page.path));
+                        page.ocr_pending.set(0);
+                        page.notify_text();
+                        return;
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+
+    /// A hit the find's listing chose: its page, with the query lit on it.
+    pub fn find(&self, query: &taste_core::search::Query, page: usize) {
+        let Some(view) = self.pdf_view.borrow().clone() else {
+            return;
+        };
+        let script = format!(
+            "window.tasteFind && window.tasteFind({}, {}, {page})",
+            serde_json::to_string(query.text.trim()).unwrap_or_else(|_| "\"\"".into()),
+            query.case_sensitive()
+        );
+        webkit6::prelude::WebViewExt::evaluate_javascript(
+            &view,
+            &script,
+            None,
+            None,
+            None::<&gtk::gio::Cancellable>,
+            |_| {},
+        );
     }
 
     /// Say why the file could not be shown, in place of it.
@@ -533,6 +746,42 @@ fn media_view(bytes: &glib::Bytes) -> gtk::Widget {
 
 // --- PDFs ----------------------------------------------------------------
 
+/// Run beside the PDF, with its path and a page number: the page drawn at
+/// 200 dpi and read by Tesseract, its text on stdout. Exit 3 when the
+/// files service has no OCR to run.
+const OCR_SCRIPT: &str = r#"command -v tesseract >/dev/null 2>&1 || exit 3
+pdftoppm -r 200 -f "$2" -l "$2" -singlefile -png "$1" | tesseract stdin stdout 2>/dev/null
+"#;
+
+/// One page of the PDF at `path`, read by OCR where the file is.
+fn ocr_page(files: &taste_core::files::Files, path: &Path, page: usize) -> Result<String, String> {
+    let cwd = path.parent().unwrap_or(path);
+    let out = files
+        .exec(
+            cwd,
+            &[
+                "sh".into(),
+                "-c".into(),
+                OCR_SCRIPT.into(),
+                "taste-ocr".into(),
+                path.display().to_string(),
+                page.to_string(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    match out.status {
+        0 => Ok(out.stdout_utf8()),
+        3 => Err("the files service has no OCR yet; it does once the IDE restarts".into()),
+        _ => Err(out.stderr_utf8().trim().to_string()),
+    }
+}
+
+fn path_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// The scheme the PDF viewer's page, its pdf.js, and the document itself
 /// are served on: `taste-pdf://<id>/…`, one id per open PDF.
 const PDF_SCHEME: &str = "taste-pdf";
@@ -573,6 +822,11 @@ html, body { margin: 0; height: 100%; background: transparent; }
   padding: 0 24px; opacity: .8; }
 </style></head>
 <body>
+<script>
+// Ready once the first document is up: what the IDE asks of the page —
+// its text, a find — waits on this, since the module below loads first.
+window.tasteReady = new Promise((resolve) => { window.tasteReadyResolve = resolve; });
+</script>
 <div id="a" class="pane"><div class="pdfViewer"></div></div>
 <div id="b" class="pane behind"><div class="pdfViewer"></div></div>
 <script type="module">
@@ -596,7 +850,7 @@ try {
     const findController = new PDFFindController({ eventBus, linkService });
     const viewer = new PDFViewer({ container, eventBus, linkService, findController });
     linkService.setViewer(viewer);
-    const it = { container, eventBus, linkService, viewer, doc: null, location: null };
+    const it = { container, eventBus, linkService, viewer, findController, doc: null, location: null };
     eventBus.on("updateviewarea", (event) => { it.location = event.location; });
     return it;
   };
@@ -613,7 +867,35 @@ try {
   show(shown, await open("document.pdf"));
 
   let generation = 0;
-  window.tasteReload = async () => {
+  // The reload under way, if one is: the text is read from the document
+  // that comes out of it, not the one going.
+  let settled = Promise.resolve();
+  window.tasteReload = () => {
+    settled = reload();
+    return settled;
+  };
+  // Each page's text, as pdf.js reads it from the document — the
+  // universal find's for a PDF (viewer.rs, `ViewerPage::read_text`). A
+  // page drawn as a picture has none; the IDE reads those by OCR.
+  window.tasteText = async () => {
+    await settled;
+    const doc = shown.doc, pages = [];
+    for (let n = 1; n <= doc.numPages; n++) {
+      const content = await (await doc.getPage(n)).getTextContent();
+      pages.push(content.items.map((item) => (item.str || "") + (item.hasEOL ? "\n" : "")).join(""));
+    }
+    return JSON.stringify(pages);
+  };
+  // A hit chosen in the find's listing: its page, and the query lit on it
+  // by pdf.js's own find.
+  window.tasteFind = (query, caseSensitive, page) => {
+    if (page) shown.viewer.currentPageNumber = page;
+    shown.eventBus.dispatch("find", {
+      source: null, type: "", query, caseSensitive, entireWord: false,
+      highlightAll: true, findPrevious: false, matchDiacritics: false,
+    });
+  };
+  const reload = async () => {
     const mine = ++generation;
     let next;
     try {
@@ -669,6 +951,31 @@ try {
     if (top !== undefined) shown.container.scrollTop = top;
     return shown.container.scrollTop + " (page " + shown.viewer.currentPageNumber + ")";
   };
+  window.tasteReadyResolve();
+  // The keys a reader pages with. The document scrolls inside a pane, not
+  // the page, so the browser's own Page Up and Down — which scroll the
+  // page — moved nothing (David, 2026-10-06: "pgup/pgdown should also work
+  // in pdfs"). A screenful less a line, so a line stays in view across
+  // the turn; Space as Page Down, Shift+Space as Page Up; Home and End.
+  document.addEventListener("keydown", (event) => {
+    if (event.ctrlKey || event.altKey || event.metaKey) return;
+    const pane = shown.container, line = 40;
+    const screen = Math.max(pane.clientHeight - line, line);
+    const by = {
+      PageDown: screen, PageUp: -screen, ArrowDown: line, ArrowUp: -line,
+      " ": event.shiftKey ? -screen : screen,
+    }[event.key];
+    if (by !== undefined) {
+      pane.scrollBy({ top: by });
+    } else if (event.key === "Home") {
+      pane.scrollTop = 0;
+    } else if (event.key === "End") {
+      pane.scrollTop = pane.scrollHeight;
+    } else {
+      return;
+    }
+    event.preventDefault();
+  });
   for (const container of document.querySelectorAll(".pane")) {
     container.addEventListener("wheel", (event) => {
       if (!event.ctrlKey) return;

@@ -24,6 +24,9 @@
 #   poppler-utils — an agent reads a PDF through the keeper too
 #            (`ide_read_file`): each page's text, and the page as a
 #            picture, which is how a slide or a figure is read at all.
+#   tesseract — a PDF page with no text in it, a scan or a slide that
+#            is a picture, is read by OCR for the universal find
+#            (viewer.rs, `ViewerPage::read_textless_pages`).
 #
 # The base is pinned by digest, not by tag: the baseline is the rung that
 # is supposed to always work, so it must not change under the user
@@ -39,7 +42,7 @@ RUN microdnf upgrade -y --setopt=install_weak_deps=0 --nodocs \
         nodejs npm \
         git \
         coreutils findutils grep sed gawk diffutils ripgrep \
-        poppler-utils \
+        poppler-utils tesseract tesseract-langpack-eng \
         tar gzip xz \
         procps-ng which less \
         ca-certificates \

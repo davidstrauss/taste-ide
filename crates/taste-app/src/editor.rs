@@ -865,6 +865,13 @@ impl Editor {
             if let Some((path, _)) = editor.selected() {
                 editor.record_visit(path);
             }
+            // A PDF in front takes the keyboard, so Page Up and Down page
+            // it.
+            if let Some(surface) = editor.selected_surface() {
+                if let SurfaceKind::View(page) = &surface.kind {
+                    page.focus();
+                }
+            }
         });
 
         // The terminals stay behind the files, whatever the user drags
@@ -1647,6 +1654,18 @@ impl Editor {
         }
     }
 
+    /// Answer the query on screen again: something it searches changed
+    /// under it — a PDF's text read, a page read by OCR.
+    fn search_again(self: &Rc<Self>) {
+        let search = self.search.borrow().as_ref().and_then(|s| s.upgrade());
+        if let Some(search) = search {
+            let query = search.query();
+            if !query.is_empty() {
+                self.answer_search(&query);
+            }
+        }
+    }
+
     /// The document on screen's hits, listed at the pane's foot.
     fn answer_search(self: &Rc<Self>, query: &crate::search::Query) {
         use crate::results::{safe_markup, Group, Item, Target};
@@ -1690,7 +1709,20 @@ impl Editor {
                     crate::logview::LOG_ICON,
                 ),
                 SurfaceKind::Port(_) => (0, crate::portview::PORT_ICON),
-                SurfaceKind::View(page) => (0, page.icon()),
+                // A PDF's pages, as read — the text layer, or OCR's.
+                SurfaceKind::View(page) => (
+                    if query.is_empty() {
+                        0
+                    } else {
+                        page.text_pages().map_or(0, |pages| {
+                            pages
+                                .iter()
+                                .map(|text| taste_core::search::search_text(text, query, 0).0)
+                                .sum()
+                        })
+                    },
+                    page.icon(),
+                ),
                 SurfaceKind::Task(log, _) => (
                     if query.is_empty() {
                         0
@@ -1823,6 +1855,42 @@ impl Editor {
                 }
                 _ => None,
             };
+            // A PDF in front: its hits by page, and its textless pages read
+            // by OCR as the query asks — listed as they land.
+            if let SurfaceKind::View(page) = &surface.kind {
+                if let Some(pages) = page.text_pages() {
+                    page.read_textless_pages();
+                    let mut count = 0;
+                    let mut items = Vec::new();
+                    for (index, text) in pages.iter().enumerate() {
+                        let (found, hits) = taste_core::search::search_text(text, query, 200);
+                        count += found;
+                        items.extend(hits.into_iter().map(|(_, snippet)| Item {
+                            primary: safe_markup(&query.highlight_markup(&snippet), &snippet),
+                            secondary: format!("page {}", index + 1),
+                            target: Target::PdfPage { page: index + 1 },
+                        }));
+                    }
+                    let name = page
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    self.results.show(
+                        query,
+                        &name,
+                        vec![Group {
+                            title: String::new(),
+                            items,
+                        }],
+                        page.text_pending(),
+                        1,
+                        1,
+                    );
+                    report(count);
+                    return;
+                }
+            }
             if let Some((log, what)) = log_like {
                 let (count, hits) = taste_core::search::search_text(&log.text(), query, 500);
                 let items: Vec<Item> = hits
@@ -1891,6 +1959,13 @@ impl Editor {
                 // is the theme's faintest grey, and the caret would move.
                 crate::palette::highlight_range(buffer.upcast_ref(), &start, &end);
                 page.view.scroll_to_iter(&mut start, 0.2, false, 0.0, 0.0);
+            }
+            crate::results::Target::PdfPage { page } => {
+                if let Some(surface) = self.selected_surface() {
+                    if let SurfaceKind::View(view) = &surface.kind {
+                        view.find(&query, *page);
+                    }
+                }
             }
             crate::results::Target::Log { line } => {
                 if let Some(surface) = self.selected_surface() {
@@ -2800,6 +2875,17 @@ impl Editor {
                     return;
                 }
             };
+            // Its text answers the universal find, and OCR for the pages
+            // without any runs where the file is.
+            page.set_source(files.clone(), path.clone());
+            {
+                let weak = Rc::downgrade(&editor);
+                page.set_on_text(Rc::new(move || {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.search_again();
+                    }
+                }));
+            }
             {
                 // Reload: the same read, shown in place.
                 let weak_page = Rc::downgrade(&page);

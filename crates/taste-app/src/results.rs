@@ -34,6 +34,10 @@ pub enum Target {
     Transcript {
         row: i32,
     },
+    /// A page of the PDF in front, 1-based.
+    PdfPage {
+        page: usize,
+    },
 }
 
 #[derive(Debug, Clone)]

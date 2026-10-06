@@ -156,6 +156,7 @@ the same recipes made the box a slab on dark and nothing at all on light.
 | Environment Build log | filter (the Logs row hides, or dims under the ghost) + badge; the log tab's listing in the editor | the environment's log buffer | trivial |
 | Environment Runtime output, Taste IDE log | filter + badge on the Logs row; the log tab's listing in the editor | the supervisor's runtime ring (`podman logs`, podman's events, agents' commands), the app log ring | trivial |
 | Ports | filter (the row hides, or dims under the ghost) + badge | the port's title and address | trivial |
+| Open PDFs | the PDF tab on screen's listing, by page + count on every PDF tab; a hit chosen turns to its page and lights the match with pdf.js's own find | each page's text as pdf.js reads it from the document (`ViewerPage::read_text`), and a page with none — a scan, a slide that is a picture — read by OCR beside the file, Tesseract in the files service, one page at a time as the query asks (`read_textless_pages`) | the text layer once per load; OCR a page at a time, seconds each, listed as it lands |
 | Chat transcripts | listing (chat pane) + count on the environment's row | the rows on screen, walked for their text (labels and text views), for every environment's chat (`Chats::attach_search`) | trivial per chat |
 
 Not searched, on purpose: settings, the agent's own working memory, the
