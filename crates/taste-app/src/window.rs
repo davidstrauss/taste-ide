@@ -1728,6 +1728,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         breakpoint.add_setter(&editor.forward_button, "visible", Some(&false.to_value()));
         // Nor room for Open Folder, which the menu and Ctrl+O still reach.
         breakpoint.add_setter(&open_folder_button, "visible", Some(&false.to_value()));
+        // Nor for the app icon, which is decoration: with the title bar's
+        // cloud beside the search, the bar wanted 413px of this rung's 400
+        // and cut off the close button and the panel's right edge.
+        breakpoint.add_setter(&app_icon, "visible", Some(&false.to_value()));
         // Seven lozenges are wider than the 400px window this rung is for.
         breakpoint.add_setter(search.bar(), "visible", Some(&false.to_value()));
         breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
