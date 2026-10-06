@@ -11,8 +11,10 @@ configuration over code: projects behave uniformly because things live in
 fixed places, not because each repo scripts its own behavior.
 
 Every environment, your own included, runs in a VM the IDE provisions for
-the workspace. Nothing a project needs is layered onto the OS, and there is
-no mode that runs a project's code on the host with less isolation. The
+the workspace, or, when you start one in the cloud, on a host of the same
+kind in your own Google Cloud project. Nothing a project needs is layered
+onto the OS, and there is no mode that runs a project's code on the host
+with less isolation. The
 design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 and [docs/ENVIRONMENTS.md](docs/ENVIRONMENTS.md).
 
@@ -26,7 +28,14 @@ The backlog is a git ref, and every issue an agent works on is an
 environment with its own checkout, container, and chat.
 
 ![The backlog: issues with status dots and activity sparklines, one waiting
-for review, one queued, one declined.](docs/screenshots/backlog.png)
+for review, one building, one queued.](docs/screenshots/backlog.png)
+
+The coordinator — the chat in your own environment — files, orders,
+starts, and closes that work, and says what it did as it goes, so the
+fleet is supervised from one conversation rather than visited tab by tab.
+
+![The coordinator's transcript: issues filed, moved, started, completed,
+and declined, each as a card, with the queue as it now stands.](docs/screenshots/orchestrator.png)
 
 Watching an environment aims every pane at its checkout, read-only, with
 its agent's conversation on screen.
@@ -48,6 +57,19 @@ where the subscription stands.
 
 ![The Utilization tab: context window, session tokens, cache, thinking,
 cost, and the subscription's window.](docs/screenshots/utilization.png)
+
+One search box, and every pane answers it: file names and contents, code
+by meaning, ports, tasks, logs, the conversation, and the environments'
+own chats and terminals, each section a Tab stop.
+
+![A search for "gauge": the tree filtered to matches, the editor on a hit,
+a match by meaning, and every other pane saying what it found.](docs/screenshots/search.png)
+
+An environment coming up says where it is, step by step, from the VM to
+the container.
+
+![The startup page: the VM's bring-up as a checklist, over stripes while
+it runs.](docs/screenshots/startup.png)
 
 Narrow windows fold the panes into one strip rather than dropping any of
 them, and a gadget face keeps the fleet in view at a glance.
@@ -81,7 +103,10 @@ How Taste meets it:
 - **Git that touches a working tree runs in the VM**, hooks and filters
   included. The folder you opened is a git peer: it fetches refs from
   the VM over ssh with a generated identity, and only your own Push and
-  Pull run host git with your keys. Agent git cannot push anywhere, by
+  Pull run host git with your keys. Its working tree mirrors your own
+  environment's checkout both ways, submodules included: a file you
+  change in the folder goes to the checkout, the agent's changes come
+  back, and a path both sides changed is asked about, never overwritten. Agent git cannot push anywhere, by
   configuration and by the absence of any credential to push with.
 - **Agents author and apply, in the VM.** An agent may write
   `.devcontainer/` and rebuild into it without asking, because the build
@@ -162,7 +187,15 @@ The bootstrap's devcontainer is the one container that runs on the host's
 own podman: this repository's toolchain building this repository. Every
 environment the running IDE opens, your own included, goes into a VM of
 the workspace's pool, which is why the host wants libvirt even for the
-`--host` run.
+`--host` run. The first launch downloads the VM's guest image, about a
+gigabyte, once.
+
+`taste-ide <folder>` opens that folder; a bare `taste-ide` at a shell
+opens the one you are in; a launch from the desktop or the installed
+Flatpak asks which. Each folder is a window and a process of its own, and
+the title bar's Open Folder (Ctrl+O) opens another. The Flatpak and a
+build run from this repository share their state, so a folder's VM, its
+credential, and its environments are the same whichever one opens it.
 
 Any cargo command runs the same way, on host podman:
 
@@ -170,17 +203,6 @@ Any cargo command runs the same way, on host podman:
 podman run --rm --userns=keep-id:uid=1000,gid=1000 \
   -v "$PWD:/workspaces/taste-ide:z" -v taste-ide-cargo:/home/dev/.cargo \
   taste-ide-devcontainer cargo test --workspace
-```
-
-One host setting is worth changing: rootless podman spends your uid's
-inotify budget for every container, and the default of 128 runs out under
-a fleet.
-
-```sh
-sudo tee /etc/sysctl.d/90-inotify.conf <<'EOF'
-fs.inotify.max_user_instances = 1024
-EOF
-sudo sysctl --system
 ```
 
 Credentials are the project's: open a Claude Code chat's **Settings** and

@@ -29,9 +29,10 @@
       to your remote without you.
     </p>
     <p>
-      Rootless Podman devcontainers, git in the file tree, one search box
-      that every pane answers, voice input transcribed locally, and an
-      Agent Client Protocol client as the way agents plug in.
+      Devcontainers in a VM per workspace, or on a host in your own Google
+      Cloud project, git in the file tree, one search box that every pane
+      answers, voice input transcribed locally, and an Agent Client
+      Protocol client as the way agents plug in.
     </p>
   </description>
   <launchable type="desktop-id">net.davidstrauss.Taste.desktop</launchable>
@@ -52,11 +53,23 @@
   <screenshots>
     <screenshot type="default">
       <image>https://raw.githubusercontent.com/davidstrauss/taste-ide/main/docs/screenshots/hero.png</image>
-      <caption>The file tree with git in it, the editor, the console and the agent's chat</caption>
+      <caption>The file tree with git in it, the editor, the console, and the agent's chat</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/davidstrauss/taste-ide/main/docs/screenshots/search.png</image>
+      <caption>One search, and every pane answering it</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/davidstrauss/taste-ide/main/docs/screenshots/review-diff.png</image>
+      <caption>An agent's branch reviewed as a diff, with Merge and Reject</caption>
     </screenshot>
     <screenshot>
       <image>https://raw.githubusercontent.com/davidstrauss/taste-ide/main/docs/screenshots/watching.png</image>
-      <caption>An environment being watched: its container, its work, its agent's terminal</caption>
+      <caption>Another environment's checkout, its editor, and its agent, read-only</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/davidstrauss/taste-ide/main/docs/screenshots/startup.png</image>
+      <caption>An environment's VM coming up, step by step</caption>
     </screenshot>
   </screenshots>
   <content_rating type="oars-1.1" />

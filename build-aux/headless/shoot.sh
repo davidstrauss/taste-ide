@@ -79,7 +79,9 @@ DISPLAY="$DISPLAY_NUM" GDK_BACKEND=x11 \
     exit 1
 }
 
-SHOT="/tmp/probe-$PANE.png"
+# A pane inside a pane is named with a dot (`filetree.backlog`) and
+# written with a dash (`/tmp/probe-filetree-backlog.png`).
+SHOT="/tmp/probe-$(printf %s "$PANE" | tr . -).png"
 [ -f "$SHOT" ] || { echo "no $SHOT was written; see /tmp/probe-run.log" >&2; exit 1; }
 
 # Blank-frame guard. The probe shoots on a timer, and on a cold start —
