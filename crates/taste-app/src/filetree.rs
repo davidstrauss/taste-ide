@@ -6795,8 +6795,13 @@ impl FileTree {
         if !syncing {
             self.refresh_status();
         }
+        // The visible rows redrawn, as a status change redraws them — not
+        // the tree rebuilt, which lists it again and selects the file in
+        // front again, opening every folder above it: folders the user had
+        // closed opened by themselves at every sync (David, 2026-10-06:
+        // "Did the folders start auto-expanding?").
         if warned {
-            self.rebuild();
+            self.rebuild_rows_in_place();
         }
     }
 
