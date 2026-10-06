@@ -1369,6 +1369,86 @@ fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
     window.present();
 }
 
+/// Another folder, in a window of its own: the title bar's Open Folder
+/// (David, 2026-10-06: "If I have one IDE open, I should also be able to
+/// open another window/folder with a button from the top of the window").
+///
+/// A window on another folder is another PROCESS, as every folder is
+/// (`NON_UNIQUE`, in `main`): its log, its auth proxy, and its pool are
+/// the process's, so the chosen folder goes to `taste-ide <folder>` rather
+/// than to a second `build_window` here. The chooser opens beside the
+/// folder this window has, since a project's siblings are where the next
+/// one usually is, and choosing this window's own folder just brings it
+/// forward.
+pub(crate) fn open_folder_in_new_window(
+    parent: &adw::ApplicationWindow,
+    current: &std::path::Path,
+    toasts: &adw::ToastOverlay,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Open a Project Folder")
+        .accept_label("Open in New Window")
+        .build();
+    if let Some(beside) = current.parent() {
+        dialog.set_initial_folder(Some(&gtk::gio::File::for_path(beside)));
+    }
+    let current = current.to_path_buf();
+    let window = parent.clone();
+    let toasts = toasts.clone();
+    dialog.select_folder(Some(parent), gtk::gio::Cancellable::NONE, move |result| {
+        let Some(folder) = result.ok().and_then(|folder| folder.path()) else {
+            return;
+        };
+        let folder = folder.canonicalize().unwrap_or(folder);
+        if folder == current {
+            window.present();
+            return;
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("new-window".into())
+            .spawn(move || match launch_window_on(&folder) {
+                Ok(mut child) => {
+                    let _ = sender.send(Ok(()));
+                    // Waited on so it is reaped when it closes; this
+                    // thread is all this window keeps of it.
+                    let _ = child.wait();
+                }
+                Err(e) => {
+                    let _ = sender.send(Err(e));
+                }
+            })
+            .ok();
+        glib::spawn_future_local(async move {
+            if let Ok(Err(e)) = receiver.await {
+                toasts.add_toast(adw::Toast::new(&format!(
+                    "Could not open a new window: {e}"
+                )));
+            }
+        });
+    });
+}
+
+/// `taste-ide <folder>`, this same binary, as a process the user's
+/// terminal does not own: its own process group, so a Ctrl+C meant for the
+/// window that was started from a shell does not take this one with it.
+/// The bootstrap's host-side opener goes along, since `main` took it out
+/// of the environment the child would otherwise inherit it from.
+fn launch_window_on(folder: &std::path::Path) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .arg(folder)
+        .stdin(std::process::Stdio::null())
+        .process_group(0);
+    if let Some((dir, token)) = host_open_channel() {
+        command
+            .env("TASTE_HOST_OPEN_DIR", dir)
+            .env("TASTE_HOST_OPEN_TOKEN", token);
+    }
+    command.spawn()
+}
+
 /// How many runs' app logs are kept: the newest, by the start time in
 /// their names.
 const APP_LOGS_KEPT: usize = 10;

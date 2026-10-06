@@ -332,7 +332,11 @@ once. A bare `taste-ide` at a shell prompt is `taste-ide .`: the working
 directory is the project, as every editor with a CLI reads it, except a
 home directory or `/`, which are where a shell starts rather than
 anything anyone is working on; a desktop launch, with no terminal, opens
-the folder chooser (`project_from_cwd`, main.rs). That makes every shared name on the machine a collision waiting to
+the folder chooser (`project_from_cwd`, main.rs). From inside a window,
+the title bar's Open Folder (Ctrl+O, and the main menu) is the same
+gesture: the folder chosen goes to another `taste-ide <folder>`, a
+process of its own, rather than to a second window in this one
+(`open_folder_in_new_window`). That makes every shared name on the machine a collision waiting to
 happen, so there is exactly one rule and one exception.
 
 **The rule: everything derives from the canonicalized workspace path.**
