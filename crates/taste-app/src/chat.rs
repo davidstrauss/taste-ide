@@ -162,12 +162,20 @@ struct EnvGate {
     in_transition: bool,
     /// Whether its state is one the IDE may start from.
     can_start: bool,
+    /// Stopped or failed: settled, with nothing on its way. Short of
+    /// these, Personal's container is coming — at a launch, before the
+    /// IDE has said it is preparing, it reads as not started yet.
+    settled_down: bool,
 }
 
 /// Everything the decision below is allowed to look at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GateFacts {
     primary: bool,
+    /// This machine can run the agent outside a container at all
+    /// (`taste_acp::sandbox::runs_outside_a_container`): a bare host has no
+    /// `npx`, and a launch there is refused.
+    outside_possible: bool,
     inside_container: bool,
     gave_up: bool,
     live_agent: bool,
@@ -202,10 +210,21 @@ fn container_gate(facts: GateFacts) -> Gate {
     // container that was up — or, on a machine with no node, refused it
     // with a note saying the container was not up (2026-10-02). The wait
     // is a probe long, and the chat asks for the probe (`ask_hosting`).
+    //
+    // And where this machine cannot run the agent outside a container at
+    // all, it waits for its container whenever one is coming — at a
+    // launch that is before the IDE has said so, when the environment
+    // reads as not started yet. Spawned there, it was refused, and the
+    // refusal sat in the chat while the container came up (David,
+    // 2026-10-06: "I shouldn't see this during env startup"). Stopped or
+    // failed, nothing is coming, and the refusal's note is what says so.
     if facts.primary {
         return match facts.env {
             Some(env) if env.in_transition && !env.has_exec_target => Gate::Hold,
             Some(env) if env.has_exec_target && env.hosting_unknown => Gate::Hold,
+            Some(env) if !facts.outside_possible && !env.has_exec_target && !env.settled_down => {
+                Gate::Hold
+            }
             _ => Gate::Spawn,
         };
     }
@@ -5621,6 +5640,10 @@ impl ChatPane {
         let supervisor = self.environments.get(&self.environment);
         let facts = GateFacts {
             primary: self.environment.is_primary(),
+            outside_possible: taste_acp::sandbox::runs_outside_a_container(
+                &self.agent_spec().command,
+            )
+            .is_ok(),
             inside_container: taste_acp::sandbox::inside_container(),
             gave_up: self.container_wait.get() == ContainerWait::GaveUp,
             live_agent: self.client.borrow().is_some(),
@@ -5629,6 +5652,11 @@ impl ChatPane {
                 hosting_unknown: s.agent_hosting() == taste_devcontainer::AgentHosting::Unknown,
                 in_transition: self.environment_in_transition(),
                 can_start: revive_wanted(&s.state(), true),
+                settled_down: matches!(
+                    s.state(),
+                    taste_devcontainer::SupervisorState::Stopped
+                        | taste_devcontainer::SupervisorState::Failed { .. }
+                ),
             }),
         };
         match container_gate(facts) {
@@ -14799,9 +14827,11 @@ mod tests {
                 hosting_unknown: false,
                 in_transition,
                 can_start,
+                settled_down: false,
             })
         };
         let facts = GateFacts {
+            outside_possible: true,
             primary: false,
             inside_container: false,
             gave_up: false,
@@ -14849,6 +14879,7 @@ mod tests {
         // cannot say why...
         assert_eq!(
             container_gate(GateFacts {
+                outside_possible: true,
                 primary: true,
                 ..facts
             }),
@@ -14858,12 +14889,14 @@ mod tests {
         // waits like everyone else, rather than spending a session outside.
         assert_eq!(
             container_gate(GateFacts {
+                outside_possible: true,
                 primary: true,
                 env: Some(EnvGate {
                     has_exec_target: false,
                     hosting_unknown: true,
                     in_transition: true,
                     can_start: false,
+                    settled_down: false,
                 }),
                 ..facts
             }),
@@ -14874,6 +14907,7 @@ mod tests {
         // state until its probe answers.
         assert_eq!(
             container_gate(GateFacts {
+                outside_possible: true,
                 primary: true,
                 env: Some(EnvGate {
                     hosting_unknown: true,
@@ -14887,8 +14921,53 @@ mod tests {
         // reason said.
         assert_eq!(
             container_gate(GateFacts {
+                outside_possible: true,
                 primary: true,
                 env: env(true, false, false),
+                ..facts
+            }),
+            Gate::Spawn
+        );
+        // On a machine that cannot run it outside a container, it waits
+        // for the container whenever one is coming — at a launch, before
+        // the IDE has said it is preparing — rather than being refused in
+        // front of the user while the container comes up.
+        let not_started = EnvGate {
+            has_exec_target: false,
+            hosting_unknown: true,
+            in_transition: false,
+            can_start: true,
+            settled_down: false,
+        };
+        assert_eq!(
+            container_gate(GateFacts {
+                outside_possible: false,
+                primary: true,
+                env: Some(not_started),
+                ..facts
+            }),
+            Gate::Hold
+        );
+        // Stopped or failed, nothing is coming: it spawns, and its refusal
+        // says so.
+        assert_eq!(
+            container_gate(GateFacts {
+                outside_possible: false,
+                primary: true,
+                env: Some(EnvGate {
+                    settled_down: true,
+                    ..not_started
+                }),
+                ..facts
+            }),
+            Gate::Spawn
+        );
+        // And a machine that can run it outside starts it at once, as ever.
+        assert_eq!(
+            container_gate(GateFacts {
+                outside_possible: true,
+                primary: true,
+                env: Some(not_started),
                 ..facts
             }),
             Gate::Spawn
@@ -15061,6 +15140,7 @@ mod tests {
         // container is coming up. The agent is held back for it, which is
         // the ordering `b85b8ac` established.
         let gate = container_gate(GateFacts {
+            outside_possible: true,
             primary: false,
             inside_container: false,
             gave_up: false,
@@ -15070,6 +15150,7 @@ mod tests {
                 hosting_unknown: false,
                 in_transition: false,
                 can_start: true,
+                settled_down: false,
             }),
         });
         assert_eq!(gate, Gate::StartThenHold);
