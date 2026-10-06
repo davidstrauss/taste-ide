@@ -126,6 +126,11 @@ pub enum FileState {
     Ignored,
 }
 
+/// How the user's push treats submodules: push any commit the branch
+/// records that a submodule's remote lacks, first, or push nothing
+/// ([`GitWorkspace::push_command`]).
+pub const PUSH_SUBMODULES: &str = "--recurse-submodules=on-demand";
+
 /// `git status --porcelain=v1 -z --untracked-files=all`, as the same map
 /// [`GitWorkspace::status`] gives — for a working copy this process cannot
 /// open, where `git` runs beside the files and only its output comes here.
@@ -715,8 +720,16 @@ impl GitWorkspace {
     /// credential helpers, SSH agent, and remote helpers all just work.
     /// Push is a *user* action only: it is never exposed to agents (their
     /// sandbox blocks push at the git layer) nor over MCP.
+    ///
+    /// Submodules first, on demand: a submodule commit this push records
+    /// that the submodule's remote does not have is pushed there before
+    /// the branch, and when it cannot be, nothing is pushed — never a
+    /// parent pointing at a commit only this machine has (David,
+    /// 2026-10-06: "add submodule push to the IDE's push"). Git does this
+    /// for the submodules it knows as active; with none, the flag changes
+    /// nothing.
     pub fn push_command(&self) -> (String, Vec<String>) {
-        self.git_command(&["push"])
+        self.git_command(&["push", PUSH_SUBMODULES])
     }
 
     /// The user's push, carrying extra refspecs alongside the branch — e.g.
@@ -737,7 +750,11 @@ impl GitWorkspace {
         if extra_refspecs.is_empty() {
             return self.push_command();
         }
-        let mut args = vec!["push".to_string(), self.push_remote()];
+        let mut args = vec![
+            "push".to_string(),
+            PUSH_SUBMODULES.to_string(),
+            self.push_remote(),
+        ];
         if let Some(branch) = self.push_branch_refspec() {
             args.push(branch);
         }
@@ -1436,7 +1453,15 @@ mod tests {
         assert_eq!(ws.push_command_with(&[]), ws.push_command());
         assert_eq!(
             ws.push_command(),
-            ("git".into(), vec!["-C".into(), wd.clone(), "push".into()])
+            (
+                "git".into(),
+                vec![
+                    "-C".into(),
+                    wd.clone(),
+                    "push".into(),
+                    PUSH_SUBMODULES.into()
+                ]
+            )
         );
 
         // With extras and no upstream: origin, this branch, extras last.
@@ -1448,6 +1473,7 @@ mod tests {
                 "-C".to_string(),
                 wd.clone(),
                 "push".into(),
+                PUSH_SUBMODULES.into(),
                 "origin".into(),
                 format!("HEAD:refs/heads/{branch}"),
                 "refs/taste/issues:refs/taste/issues".into(),
@@ -1476,10 +1502,84 @@ mod tests {
                 "-C".to_string(),
                 wd,
                 "push".into(),
+                PUSH_SUBMODULES.into(),
                 "hub".into(),
                 "HEAD:refs/heads/trunk".into(),
                 "refs/taste/issues:refs/taste/issues".into(),
             ]
+        );
+    }
+
+    /// The user's push takes a submodule commit the branch records to the
+    /// submodule's remote first: against real git, with local bare
+    /// repositories for both remotes.
+    #[test]
+    fn a_push_takes_the_submodule_commit_it_records_along() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+                .env("GIT_CONFIG_VALUE_0", "always")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // The template and its remote.
+        git(root, &["init", "-q", "--bare", "-b", "main", "tpl.git"]);
+        git(root, &["clone", "-q", "tpl.git", "tpl-work"]);
+        fs::write(root.join("tpl-work/a"), "1").unwrap();
+        git(&root.join("tpl-work"), &["add", "-A"]);
+        git(&root.join("tpl-work"), &["commit", "-q", "-m", "one"]);
+        git(
+            &root.join("tpl-work"),
+            &["push", "-q", "origin", "HEAD:main"],
+        );
+        // The deck, its remote, and the template as its submodule.
+        git(root, &["init", "-q", "--bare", "-b", "main", "deck.git"]);
+        git(root, &["clone", "-q", "deck.git", "deck"]);
+        let deck = root.join("deck");
+        let tpl_url = root.join("tpl.git").display().to_string();
+        git(&deck, &["submodule", "add", "-q", &tpl_url, "tpl"]);
+        git(&deck, &["commit", "-q", "-m", "add the template"]);
+        git(&deck, &["push", "-q", "-u", "origin", "HEAD:main"]);
+        // A commit in the submodule, recorded in the deck, pushed by the
+        // IDE's push of the deck alone.
+        fs::write(deck.join("tpl/a"), "2").unwrap();
+        git(&deck.join("tpl"), &["commit", "-q", "-am", "two"]);
+        let recorded = git(&deck.join("tpl"), &["rev-parse", "HEAD"]);
+        git(&deck, &["add", "tpl"]);
+        git(&deck, &["commit", "-q", "-m", "record two"]);
+        let ws = GitWorkspace::discover(&deck).unwrap();
+        let (program, args) = ws.push_command();
+        let out = std::process::Command::new(program)
+            .args(&args)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+            .env("GIT_CONFIG_VALUE_0", "always")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            git(&root.join("tpl.git"), &["rev-parse", "main"]),
+            recorded,
+            "the submodule's commit reached its remote"
         );
     }
 
