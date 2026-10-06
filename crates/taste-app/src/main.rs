@@ -196,6 +196,17 @@ fn main() -> glib::ExitCode {
                     std::backtrace::Backtrace::force_capture()
                 );
             }
+            // GTK's "without a current allocation" names a widget by type
+            // and address — "GtkGizmo 0x55c1dac91e40", which is a part of
+            // every scrollbar, level bar, and progress bar in the window —
+            // and a backtrace through the frame clock names nobody either.
+            // Where it SITS does: its ancestry, to the window, logged right
+            // under the warning.
+            if let Some(place) = field("MESSAGE").and_then(unallocated_widget_place) {
+                let line = format!("  that widget is {place}");
+                eprintln!("{line}");
+                taste_core::app_log::push("WARNING", "Gtk", &line);
+            }
         }
         glib::log_writer_default(level, fields)
     });
@@ -1003,6 +1014,47 @@ fn dev_icon_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// Where the widget in GTK's "Trying to snapshot <Type> <address> without
+/// a current allocation" sits: its type, CSS name, and classes, then each
+/// ancestor's, nearest first. `None` for any other message.
+///
+/// The address is followed only for this one message, and only on the main
+/// thread, because GTK logs it from inside `gtk_widget_snapshot` on that
+/// widget: it is alive and in the middle of being drawn while this runs.
+fn unallocated_widget_place(message: &str) -> Option<String> {
+    use gtk::prelude::*;
+    let rest = message.strip_prefix("Trying to snapshot ")?;
+    let rest = rest.strip_suffix(" without a current allocation")?;
+    let (_, address) = rest.rsplit_once(' ')?;
+    let address = usize::from_str_radix(address.strip_prefix("0x")?, 16).ok()?;
+    if address == 0 || !glib::MainContext::default().is_owner() {
+        return None;
+    }
+    // SAFETY: see above — GTK holds this widget, mid-snapshot, on this
+    // thread, for as long as its log call (and so this function) runs.
+    let widget: gtk::Widget =
+        unsafe { glib::translate::from_glib_none(address as *mut gtk::ffi::GtkWidget) };
+    let describe = |widget: &gtk::Widget| {
+        let mut out = format!("{}[{}]", widget.type_().name(), widget.css_name());
+        for class in widget.css_classes() {
+            out.push('.');
+            out.push_str(&class);
+        }
+        let name = widget.widget_name();
+        if name != widget.type_().name() {
+            out.push_str(&format!(" #{name}"));
+        }
+        out
+    };
+    let mut path = vec![describe(&widget)];
+    let mut parent = widget.parent();
+    while let Some(ancestor) = parent {
+        path.push(describe(&ancestor));
+        parent = ancestor.parent();
+    }
+    Some(path.join(" < "))
+}
+
 /// The project a bare `taste-ide` at a shell prompt means: the working
 /// directory, when there IS a shell. A terminal on stdin or stderr is what
 /// says so; a desktop launcher has neither, and its working directory is
@@ -1572,5 +1624,33 @@ mod tree_font_tests {
         assert_eq!(super::transcript_font_px(11.0 * 96.0 / 72.0), (11, 12));
         // 13.83px and 15.18px at 125% text scaling.
         assert_eq!(super::transcript_font_px(11.0 * 120.0 / 72.0), (14, 15));
+    }
+}
+
+#[cfg(test)]
+mod unallocated_widget_tests {
+    use gtk::prelude::*;
+
+    #[test]
+    fn the_warning_is_placed_in_the_widget_tree() {
+        crate::gtk_test::on_gtk_thread("unallocated widget: no display — skipped", || {
+            let bar = gtk::LevelBar::new();
+            bar.add_css_class("gauge");
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            row.set_widget_name("quota");
+            row.append(&bar);
+            let message = format!(
+                "Trying to snapshot GtkLevelBar {:p} without a current allocation",
+                bar.upcast_ref::<gtk::Widget>().as_ptr()
+            );
+            assert_eq!(
+                super::unallocated_widget_place(&message).as_deref(),
+                Some("GtkLevelBar[levelbar].horizontal.continuous.gauge < GtkBox[box].horizontal #quota")
+            );
+            assert_eq!(
+                super::unallocated_widget_place("Trying to snapshot a thing"),
+                None
+            );
+        });
     }
 }
