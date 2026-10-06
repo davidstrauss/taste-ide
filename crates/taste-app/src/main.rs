@@ -96,7 +96,45 @@ pub(crate) fn host_open_channel() -> Option<(std::path::PathBuf, String)> {
     HOST_OPEN.get().cloned().flatten()
 }
 
+/// Inside the Flatpak, the IDE's state, data, and configuration are the
+/// host's: the same `~/.local/state/taste-ide`, `~/.local/share/taste-ide`,
+/// and `~/.config/taste-ide` a build run outside it uses.
+///
+/// What they hold is the workspace's, not the install's. A workspace's VM
+/// is a libvirt domain named for the folder, on the one user session both
+/// installs talk to, and its ssh key, its guest image, the project's
+/// credential, and its environments' clones live in these directories. With
+/// the Flatpak's own (`~/.var/app/<id>/…`), the first Flatpak launch on a
+/// folder a build had opened found that folder's VM, started it, and
+/// registered a podman connection with a key that existed only on the other
+/// side, then waited on it for minutes (2026-10-06) — and asked for a
+/// credential the project already had.
+///
+/// The cache stays the sandbox's: it holds fontconfig's and Mesa's caches
+/// for the runtime's libraries, which are not the host's. Set first thing,
+/// before any thread exists or anything has read the variables, so every
+/// crate and every child (the embedding helper, askpass) agrees.
+fn share_state_with_the_host() {
+    if !std::path::Path::new("/.flatpak-info").exists() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return;
+    };
+    for (variable, default) in [
+        ("XDG_STATE_HOME", ".local/state"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_CONFIG_HOME", ".config"),
+    ] {
+        let host = std::env::var_os(format!("HOST_{variable}"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(default));
+        std::env::set_var(variable, host);
+    }
+}
+
 fn main() -> glib::ExitCode {
+    share_state_with_the_host();
     let channel = match (
         std::env::var("TASTE_HOST_OPEN_DIR"),
         std::env::var("TASTE_HOST_OPEN_TOKEN"),

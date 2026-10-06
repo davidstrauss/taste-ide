@@ -1708,6 +1708,19 @@ pub fn release_from_base_name(path: &str) -> Option<String> {
 /// a VM of either kind becomes a podman connection.
 pub(crate) async fn register_connection(vm: &Vm, sandboxed: bool) -> Result<()> {
     let keys = Keys::for_workspace(&vm.workspace_root);
+    // A domain made with a key this IDE does not hold answers every podman
+    // call with a refused publickey, and the wait for podman then lasts its
+    // whole timeout saying nothing (2026-10-06: the Flatpak, on its own
+    // state, starting a VM a build had made). Said at once instead.
+    if !keys.identity().exists() {
+        bail!(
+            "{} was made with an ssh key this IDE does not have ({} is missing): \
+             another copy of Taste with its own state made it, or this workspace's \
+             state was removed since",
+            vm.domain,
+            keys.identity().display()
+        );
+    }
     let podman = PodmanTarget::local(sandboxed);
 
     let (program, args) = podman.argv(["system", "connection", "remove", &vm.domain]);
