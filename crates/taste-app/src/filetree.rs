@@ -7189,14 +7189,28 @@ impl FileTree {
             .is_dir
             .then(|| self.submodule_head(&node.path))
             .flatten();
-        // A submodule says where it is after its name, dimmed: the branch,
-        // a tag, or the commit.
+        // A submodule says what its parent pins it to, after its name and
+        // dimmed: the commit, whatever branch is there — "@ 37cf0ad (main)"
+        // when it is at the pin on a branch, "@ 37cf0ad → main" when it
+        // has moved off it (David, 2026-10-06: "I want to see what it's
+        // pinned to, even if it's equivalent to a branch").
         if let Some(head) = &submodule {
+            let place = if head.pin == taste_devcontainer::worktree::SubmodulePin::Same {
+                if head.at == head.pinned {
+                    head.pinned.clone()
+                } else {
+                    format!("{} ({})", head.pinned, head.at)
+                }
+            } else if head.at == head.pinned {
+                head.pinned.clone()
+            } else {
+                format!("{} → {}", head.pinned, head.at)
+            };
             label.set_use_markup(true);
             label.set_label(&format!(
                 "{} <span alpha=\"55%\">@ {}</span>",
                 glib::markup_escape_text(&name),
-                glib::markup_escape_text(&head.at)
+                glib::markup_escape_text(&place)
             ));
         }
 

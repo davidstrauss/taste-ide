@@ -748,6 +748,11 @@ pub struct SubmoduleHead {
     /// The branch its HEAD is on, else a tag at that exact commit, else
     /// the commit, short.
     pub at: String,
+    /// The commit the parent records for it — the pin — short. What the
+    /// file tree leads with, whatever branch happens to be there (David,
+    /// 2026-10-06: "I want to see what it's pinned to, even if it's
+    /// equivalent to a branch").
+    pub pinned: String,
     /// How that stands to the commit the parent records.
     pub pin: SubmodulePin,
 }
@@ -826,7 +831,7 @@ elif git merge-base --is-ancestor "$sha1" HEAD; then pin="ahead $(git rev-list -
 elif git merge-base --is-ancestor HEAD "$sha1"; then pin="behind $(git rev-list --count "HEAD..$sha1")"
 else pin=diverged
 fi
-printf '%s\t%s\t%s\n' "$sm_path" "$(git symbolic-ref -q --short HEAD || git describe --tags --exact-match HEAD 2>/dev/null || git rev-parse --short HEAD)" "$pin""#,
+printf '%s\t%s\t%s\t%s\n' "$sm_path" "$(git symbolic-ref -q --short HEAD || git describe --tags --exact-match HEAD 2>/dev/null || git rev-parse --short HEAD)" "$pin" "$(printf %.7s "$sha1")""#,
 ];
 
 /// `git submodule status`, read as each submodule's path and its commit,
@@ -848,10 +853,15 @@ fn submodule_status_heads(out: &str) -> HashMap<PathBuf, SubmoduleHead> {
                 'U' => SubmodulePin::Conflicted,
                 _ => SubmodulePin::Same,
             };
+            // The commit shown is the submodule's own, which is the pin
+            // only until it is checked out and moves; the walk over the
+            // checked-out ones says the pin (`$sha1`).
+            let short: String = sha.chars().take(7).collect();
             Some((
                 PathBuf::from(path),
                 SubmoduleHead {
-                    at: sha.chars().take(7).collect(),
+                    at: short.clone(),
+                    pinned: short,
                     pin,
                 },
             ))
@@ -864,8 +874,9 @@ fn submodule_status_heads(out: &str) -> HashMap<PathBuf, SubmoduleHead> {
 fn submodule_names(out: &str) -> HashMap<PathBuf, SubmoduleHead> {
     out.lines()
         .filter_map(|line| {
-            let mut fields = line.splitn(3, '\t');
+            let mut fields = line.splitn(4, '\t');
             let (path, at, pin) = (fields.next()?, fields.next()?, fields.next()?);
+            let pinned = fields.next().unwrap_or_default().trim().to_string();
             let count = |word: &str| {
                 pin.strip_prefix(word)
                     .and_then(|n| n.trim().parse::<u32>().ok())
@@ -884,6 +895,7 @@ fn submodule_names(out: &str) -> HashMap<PathBuf, SubmoduleHead> {
                 PathBuf::from(path),
                 SubmoduleHead {
                     at: at.trim().to_string(),
+                    pinned,
                     pin,
                 },
             ))
@@ -919,6 +931,7 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&out.stderr)
             );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
@@ -945,7 +958,13 @@ mod tests {
         let tpl = parent.join("tpl");
         let worktree = Worktree::Local(parent.clone());
         let head = |w: &Worktree| w.submodule_heads()[Path::new("tpl")].clone();
-        assert_eq!(head(&worktree).pin, SubmodulePin::Same);
+        let at_pin = head(&worktree);
+        assert_eq!(at_pin.pin, SubmodulePin::Same);
+        let pinned = git(&parent, &["rev-parse", "--short=7", "HEAD:tpl"]);
+        assert_eq!(
+            (at_pin.at.as_str(), at_pin.pinned.as_str()),
+            ("main", pinned.as_str())
+        );
 
         std::fs::write(tpl.join("a"), "2").unwrap();
         git(&tpl, &["commit", "-q", "-am", "two"]);
@@ -980,9 +999,10 @@ mod tests {
         );
         assert_eq!(heads[Path::new("deps/my lib")].at, "ca2618d");
         let names = submodule_names(
-            "amutable-typst-template\tmain\tahead 1\ndeps/my lib\tv1.2\tbehind 3\nx\tabc1234\tmissing\n",
+            "amutable-typst-template\tmain\tahead 1\t37cf0ad\ndeps/my lib\tv1.2\tbehind 3\tca2618d\nx\tabc1234\tmissing\t1111111\n",
         );
         let tpl = &names[Path::new("amutable-typst-template")];
+        assert_eq!(tpl.pinned, "37cf0ad");
         assert_eq!(
             (tpl.at.as_str(), &tpl.pin),
             ("main", &SubmodulePin::Ahead(1))

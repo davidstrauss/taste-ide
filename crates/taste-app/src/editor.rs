@@ -1714,6 +1714,7 @@ impl Editor {
                     if query.is_empty() {
                         0
                     } else {
+                        page.ensure_text();
                         page.text_pages().map_or(0, |pages| {
                             pages
                                 .iter()
