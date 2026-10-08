@@ -4860,6 +4860,7 @@ impl ChatPane {
             // made the container path too — no translation, by design.
             cwd: supervisor.checkout().path().to_path_buf(),
             roster: self.workspace.shells.clone(),
+            files: supervisor.files(),
         })
     }
 

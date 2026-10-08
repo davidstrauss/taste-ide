@@ -739,7 +739,13 @@ impl AgentClient {
                         // the user's control is the Kill button on the tab.
                         let terminals = terminals_for_create.clone();
                         cx.spawn(async move {
-                            match serve_terminal(terminals.as_ref(), |t| t.create(&request)) {
+                            let created = match terminals.as_ref() {
+                                Some(terminals) => {
+                                    terminals.create(&request).await.map_err(|e| e.to_string())
+                                }
+                                None => Err(UNSERVED.to_string()),
+                            };
+                            match created {
                                 Ok(id) => responder.respond(CreateTerminalResponse::new(id))?,
                                 Err(message) => responder.respond_with_internal_error(message)?,
                             }

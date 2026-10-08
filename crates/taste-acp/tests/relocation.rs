@@ -419,6 +419,7 @@ impl Relocated {
             exec,
             cwd: repo.clone(),
             roster: shells.clone(),
+            files: taste_core::files::Files::Local,
         };
 
         let client = AgentClient::spawn(

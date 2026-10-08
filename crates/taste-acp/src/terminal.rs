@@ -101,11 +101,18 @@ pub struct TerminalHost {
     pub cwd: PathBuf,
     /// Where the tabs come from.
     pub roster: ShellRoster,
+    /// The checkout's files, wherever they are: what a command's config
+    /// check reads (`taste_core::configprint`). The checkout is `cwd`.
+    pub files: taste_core::files::Files,
 }
 
 struct TerminalState {
     output: CappedOutput,
     exit: Option<TerminalExitStatus>,
+    /// Said after the output once the command has ended: that it changed
+    /// the devcontainer config. Kept beside the capture rather than in it,
+    /// so an output budget can never cut it.
+    note: Option<String>,
 }
 
 struct Terminal {
@@ -143,7 +150,7 @@ impl Terminals {
     /// is the precedent) and the same one `ide_exec` takes, which is what
     /// makes "one environment of record" true rather than aspirational. The
     /// agent git policy rides along because that resolver applies it.
-    pub fn create(&self, request: &CreateTerminalRequest) -> Result<TerminalId> {
+    pub async fn create(&self, request: &CreateTerminalRequest) -> Result<TerminalId> {
         // Belt and braces, exactly as `taste_mcp::exec` does it: the caller
         // gates advertisement, and this refuses anyway. A container that
         // stopped between `initialize` and now must not become a reason to
@@ -179,6 +186,17 @@ impl Terminals {
             .chain(request.args.iter().cloned())
             .collect::<Vec<_>>()
             .join(" ");
+
+        // The config as the command finds it, before it runs, to compare
+        // with when it ends.
+        let config = {
+            let (files, root) = (self.host.files.clone(), self.host.cwd.clone());
+            move || taste_core::configprint::Fingerprint::take(&files, &root)
+        };
+        let before = tokio::task::spawn_blocking(config.clone())
+            .await
+            .ok()
+            .flatten();
 
         let mut child = tokio::process::Command::new(&spec.program)
             .args(&spec.args)
@@ -222,6 +240,7 @@ impl Terminals {
                 None => CappedOutput::default(),
             },
             exit: None,
+            note: None,
         }));
 
         let stdout = child.stdout.take().context("child stdout")?;
@@ -242,6 +261,18 @@ impl Terminals {
                     }
                 };
                 let (exit, shell_state) = exit_status(status);
+                // Before the exit is set, so whoever learns the command
+                // ended learns this with it.
+                if let Some(before) = before {
+                    let after = tokio::task::spawn_blocking(config).await.ok().flatten();
+                    if let Some(after) = after {
+                        let changed = before.changed(&after);
+                        if !changed.is_empty() {
+                            state.lock().unwrap().note =
+                                Some(taste_core::configprint::report(&changed));
+                        }
+                    }
+                }
                 state.lock().unwrap().exit = Some(exit);
                 shell.finish(shell_state);
                 done.notify_waiters();
@@ -272,8 +303,16 @@ impl Terminals {
     pub fn output(&self, id: &TerminalId) -> Result<TerminalOutputResponse> {
         let state = self.state_of(id)?;
         let state = state.lock().unwrap();
-        let mut response =
-            TerminalOutputResponse::new(state.output.render(), state.output.truncated());
+        let mut output = state.output.render();
+        if let (Some(note), Some(_)) = (&state.note, &state.exit) {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str("[taste-ide] ");
+            output.push_str(note);
+            output.push('\n');
+        }
+        let mut response = TerminalOutputResponse::new(output, state.output.truncated());
         response.exit_status = state.exit.clone();
         Ok(response)
     }
@@ -645,6 +684,7 @@ mod tests {
             exec: ExecContext::for_tests(true),
             cwd: std::env::temp_dir(),
             roster: roster.clone(),
+            files: taste_core::files::Files::Local,
         }
     }
 
@@ -660,6 +700,7 @@ mod tests {
         let terminals = Terminals::new(host(&roster));
         let id = terminals
             .create(&request("sh", &["-c", "echo hello; echo oops >&2"]))
+            .await
             .unwrap();
 
         // The command shows up as a killable agent shell in ITS environment.
@@ -708,6 +749,7 @@ mod tests {
         let terminals = Terminals::new(host(&roster));
         let id = terminals
             .create(&request("sh", &["-c", "echo started; sleep 600"]))
+            .await
             .unwrap();
 
         // Kill through the ROSTER — the user's Kill button, not the agent's
@@ -771,6 +813,7 @@ mod tests {
         let terminals = Terminals::new(host);
         let error = terminals
             .create(&request("echo", &["hi"]))
+            .await
             .unwrap_err()
             .to_string();
         assert!(
@@ -801,6 +844,7 @@ mod tests {
         // `tests/relocation.rs` is where that is asked for real.
         let refused_by_the_gate = terminals
             .create(&request("echo", &["hi"]))
+            .await
             .err()
             .is_some_and(|e| e.to_string().contains("nowhere to run"));
         assert!(
@@ -816,8 +860,8 @@ mod tests {
     async fn every_terminal_dies_with_its_session() {
         let roster = ShellRoster::new();
         let terminals = Terminals::new(host(&roster));
-        let first = terminals.create(&request("sleep", &["600"])).unwrap();
-        terminals.create(&request("sleep", &["600"])).unwrap();
+        let first = terminals.create(&request("sleep", &["600"])).await.unwrap();
+        terminals.create(&request("sleep", &["600"])).await.unwrap();
         assert_eq!(roster.list(None).len(), 2);
 
         terminals.release_all();
@@ -840,7 +884,7 @@ mod tests {
             ],
         );
         request.output_byte_limit = Some(2048);
-        let id = terminals.create(&request).unwrap();
+        let id = terminals.create(&request).await.unwrap();
         terminals.wait_for_exit(&id).await.unwrap();
 
         let output = terminals.output(&id).unwrap();
@@ -868,6 +912,7 @@ mod tests {
         // exec: a signal, no exit code.
         let id = terminals
             .create(&request("sh", &["-c", "kill -TERM $$"]))
+            .await
             .unwrap();
         let exit = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -898,7 +943,7 @@ mod tests {
             "TASTE_PROBE",
             "seen",
         )];
-        let id = terminals.create(&request).unwrap();
+        let id = terminals.create(&request).await.unwrap();
         terminals.wait_for_exit(&id).await.unwrap();
         let output = terminals.output(&id).unwrap().output;
         assert!(output.contains("marker"), "{output}");
@@ -1034,6 +1079,7 @@ mod tests {
         let terminals = Terminals::new(host(&roster));
         let id = terminals
             .create(&request("sh", &["-c", "echo one; sleep 0.2; echo two"]))
+            .await
             .unwrap();
         let (_, updates) = roster.watch(roster.list(None)[0].id).unwrap();
 
@@ -1055,5 +1101,42 @@ mod tests {
         assert!(ended, "the watcher must be told when it ended");
         assert!(seen.contains("two"), "{seen}");
         terminals.release(&id).unwrap();
+    }
+
+    /// A command that rewrites the devcontainer config says so after its
+    /// output, once it has ended; one that does not, does not.
+    #[tokio::test]
+    async fn a_command_that_changes_the_config_says_so_when_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devcontainer")).unwrap();
+        std::fs::write(dir.path().join(".devcontainer/Containerfile"), "FROM a\n").unwrap();
+        let roster = ShellRoster::new();
+        let mut host = host(&roster);
+        host.cwd = dir.path().to_path_buf();
+        let terminals = Terminals::new(host);
+
+        let quiet = terminals
+            .create(&request("sh", &["-c", "echo built"]))
+            .await
+            .unwrap();
+        terminals.wait_for_exit(&quiet).await.unwrap();
+        let output = terminals.output(&quiet).unwrap().output;
+        assert!(!output.contains("[taste-ide]"), "{output}");
+
+        let edit = terminals
+            .create(&request(
+                "sh",
+                &[
+                    "-c",
+                    "echo 'FROM b' > .devcontainer/Containerfile; echo edited",
+                ],
+            ))
+            .await
+            .unwrap();
+        terminals.wait_for_exit(&edit).await.unwrap();
+        let output = terminals.output(&edit).unwrap().output;
+        assert!(output.starts_with("edited\n[taste-ide] "), "{output}");
+        assert!(output.contains(".devcontainer/Containerfile"), "{output}");
+        assert!(output.contains("devcontainer_reload"), "{output}");
     }
 }

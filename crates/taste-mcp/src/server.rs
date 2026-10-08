@@ -24,7 +24,7 @@
 //! `ide_environment` sits across the line on purpose: it names the IDE *and*
 //! says which environment the caller is in.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -113,6 +113,11 @@ struct EnvServices {
     /// respawned when that container changes (it keys on the container id,
     /// so an environment's reload restarts its own server and no other).
     references: crate::lsp::RaServer,
+    /// The devcontainer config as each running job found it, by handle:
+    /// compared with the config when the job is collected finished, so a
+    /// command that rewrote it says so in its result
+    /// (`taste_core::configprint`).
+    config_before: Mutex<HashMap<u64, taste_core::configprint::Fingerprint>>,
 }
 
 pub struct McpServer {
@@ -503,6 +508,7 @@ impl McpServer {
                 supervisor.checkout().path().to_path_buf(),
                 supervisor.exec().clone(),
             ),
+            config_before: Mutex::new(HashMap::new()),
         });
         // `or_insert` and not `insert`: two concurrent first calls must not
         // end up with two job registries, one of which owns handles nobody
@@ -2113,6 +2119,8 @@ impl McpServer {
                 let spec = exec.resolve_for_agent(command, &refs);
                 let services = self.services(env)?;
                 let jobs = &services.jobs;
+                // The config as the command finds it, before it runs.
+                let before = self.config_print(env).await;
                 // The console tab shows what the agent asked for; the
                 // wrapper `spec` carries is for the agent's own eyes. A
                 // shell line is shown as the line, not as `sh -c` around it.
@@ -2130,6 +2138,16 @@ impl McpServer {
                     exec.container_id(),
                     exec.is_inside_container(),
                 )?;
+                if let Some(before) = before {
+                    let mut held = services.config_before.lock().unwrap();
+                    // A job never collected leaves its entry behind; the
+                    // oldest go first.
+                    while held.len() >= 64 {
+                        let oldest = *held.keys().min().unwrap();
+                        held.remove(&oldest);
+                    }
+                    held.insert(handle, before);
+                }
                 let snapshot = jobs
                     .wait(handle, std::time::Duration::from_secs(timeout))
                     .await?;
@@ -2146,7 +2164,13 @@ impl McpServer {
                             .unwrap_or_default()
                     ));
                 }
-                Ok(exec_result(handle, snapshot))
+                let finished = snapshot.exit_code.is_some();
+                let mut result = exec_result(handle, snapshot);
+                if finished {
+                    self.note_config_change(env, &services, handle, &mut result)
+                        .await;
+                }
+                Ok(result)
             }
             "ide_exec_output" => {
                 let handle = arg(&args, &["handle", "id"]).as_u64().context(
@@ -2156,12 +2180,18 @@ impl McpServer {
                 // Handles are per environment, so one is meaningless in
                 // another's namespace — which is the point: two agents
                 // polling handle 1 collect their own builds.
-                let snapshot = self
-                    .services(env)?
+                let services = self.services(env)?;
+                let snapshot = services
                     .jobs
                     .wait(handle, std::time::Duration::from_secs(wait))
                     .await?;
-                Ok(exec_result(handle, snapshot))
+                let finished = snapshot.exit_code.is_some();
+                let mut result = exec_result(handle, snapshot);
+                if finished {
+                    self.note_config_change(env, &services, handle, &mut result)
+                        .await;
+                }
+                Ok(result)
             }
             "ide_exec_kill" => {
                 let handle = arg(&args, &["handle", "id"]).as_u64().context(
@@ -4627,6 +4657,45 @@ impl McpServer {
     /// `ide_edit_file` and `ide_write_file`: the change made through the
     /// editor, so a file open in it changes in its buffer and is saved;
     /// with no window, on the disk through the editor's own save code.
+    /// This environment's devcontainer config as it stands
+    /// (`taste_core::configprint`), read off the async threads.
+    async fn config_print(
+        &self,
+        env: &EnvironmentId,
+    ) -> Option<taste_core::configprint::Fingerprint> {
+        let supervisor = self.supervisor(env).ok()?;
+        let files = supervisor.files();
+        let root = supervisor.checkout().path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            taste_core::configprint::Fingerprint::take(&files, &root)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// A finished job's result, told whether the config changed while it
+    /// ran. Once per job: the fingerprint it started with is spent here.
+    async fn note_config_change(
+        &self,
+        env: &EnvironmentId,
+        services: &EnvServices,
+        handle: u64,
+        result: &mut Value,
+    ) {
+        let Some(before) = services.config_before.lock().unwrap().remove(&handle) else {
+            return;
+        };
+        let Some(after) = self.config_print(env).await else {
+            return;
+        };
+        let changed = before.changed(&after);
+        if !changed.is_empty() {
+            result["config_changed"] = json!(changed);
+            result["next"] = json!(taste_core::configprint::report(&changed));
+        }
+    }
+
     async fn write_file_tool(
         &self,
         env: &EnvironmentId,
@@ -7603,6 +7672,63 @@ mod tests {
         });
         let allowed = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
         assert_eq!(allowed["started"], true, "{allowed}");
+    }
+
+    /// A command that rewrites the devcontainer config says so in its
+    /// result, with the files it changed; one that does not, does not.
+    #[tokio::test]
+    async fn a_command_that_changes_the_config_says_so_in_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devcontainer")).unwrap();
+        std::fs::write(dir.path().join(".devcontainer/Containerfile"), "FROM a\n").unwrap();
+        let mut workspace = taste_core::Workspace::open(dir.path().to_path_buf());
+        // The self-hosting shape: an exec target, and no podman to wrap.
+        workspace.exec = ExecContext::for_tests(true);
+        let environments = EnvironmentRegistry::new_for_tests(
+            dir.path().to_path_buf(),
+            workspace.events.clone(),
+            workspace.exec.clone(),
+            dir.path().join("state"),
+        );
+        let packager = Packager::new(dir.path().to_path_buf(), workspace.events.clone());
+        let server = McpServer::new(environments, packager, workspace);
+        let socket = serve_on(
+            &server,
+            EnvironmentId::primary(),
+            dir.path().join("mcp.sock"),
+        )
+        .await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let root = dir.path().display();
+        let quiet = call_tool(
+            &mut stream,
+            "ide_exec",
+            json!({"command": format!("cd {root} && echo built")}),
+        )
+        .await;
+        assert_eq!(quiet["exit_code"], 0, "{quiet}");
+        assert!(quiet.get("config_changed").is_none(), "{quiet}");
+
+        let edited = call_tool(
+            &mut stream,
+            "ide_exec",
+            json!({"command": format!("cd {root} && echo 'FROM b' > .devcontainer/Containerfile")}),
+        )
+        .await;
+        assert_eq!(edited["exit_code"], 0, "{edited}");
+        assert_eq!(
+            edited["config_changed"],
+            json!([".devcontainer/Containerfile"]),
+            "{edited}"
+        );
+        assert!(
+            edited["next"]
+                .as_str()
+                .unwrap()
+                .contains("devcontainer_reload"),
+            "{edited}"
+        );
     }
 
     /// Safe mode has no devcontainer, so an agent command has nowhere to

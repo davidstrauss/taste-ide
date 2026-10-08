@@ -9,6 +9,7 @@ pub mod agentedit;
 pub mod app_log;
 pub mod capped;
 pub mod chatarchive;
+pub mod configprint;
 pub mod conventions;
 pub mod environment;
 pub mod event;
