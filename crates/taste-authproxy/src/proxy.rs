@@ -709,6 +709,13 @@ impl Handle {
         self.state.credentials.label()
     }
 
+    /// Whether this project has a usable credential, as the last read
+    /// found (`CredentialSource::present`). A pure read, for the GTK
+    /// thread; `None` until something has read.
+    pub fn credential_present(&self) -> Option<bool> {
+        self.state.credentials.present()
+    }
+
     /// What the custom endpoint is, for a picker row or a header mark.
     ///
     /// A pure read, for the GTK thread: nothing here touches the disk, and

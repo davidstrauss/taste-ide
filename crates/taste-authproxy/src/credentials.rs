@@ -186,6 +186,15 @@ pub trait CredentialSource: Send + Sync + 'static {
     fn label(&self) -> Option<String> {
         None
     }
+
+    /// Whether the last read found a usable credential: `None` until
+    /// something has read (`Handle::warm_credentials` does at start-up).
+    /// A pure read, for the GTK thread, like [`Self::label`]: what the
+    /// chat's gear badge asks, because a session comes up on the
+    /// placeholder whether or not there is a credential behind it.
+    fn present(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// A credential that never changes: one read from the IDE's environment.
@@ -398,6 +407,10 @@ impl CredentialSource for FileCredentials {
 pub struct IdeCredentials {
     workspace_root: PathBuf,
     resolved: tokio::sync::OnceCell<Arc<dyn CredentialSource>>,
+    /// What the last read came to ([`CredentialSource::present`]):
+    /// 0 not read yet, 1 a usable credential, 2 none — missing, unreadable,
+    /// or expired.
+    last_read: std::sync::atomic::AtomicU8,
 }
 
 impl IdeCredentials {
@@ -405,6 +418,7 @@ impl IdeCredentials {
         Self {
             workspace_root: workspace_root.into(),
             resolved: tokio::sync::OnceCell::new(),
+            last_read: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -417,11 +431,19 @@ impl IdeCredentials {
 impl CredentialSource for IdeCredentials {
     fn credential(&self) -> CredentialFuture<'_> {
         Box::pin(async move {
-            let inner = self
-                .resolved
-                .get_or_try_init(|| async { discover(&self.workspace_root).await })
-                .await?;
-            inner.credential().await
+            let read = async {
+                let inner = self
+                    .resolved
+                    .get_or_try_init(|| async { discover(&self.workspace_root).await })
+                    .await?;
+                inner.credential().await
+            }
+            .await;
+            self.last_read.store(
+                if read.is_ok() { 1 } else { 2 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            read
         })
     }
 
@@ -433,6 +455,14 @@ impl CredentialSource for IdeCredentials {
 
     fn label(&self) -> Option<String> {
         self.resolved.get()?.label()
+    }
+
+    fn present(&self) -> Option<bool> {
+        match self.last_read.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -622,6 +652,18 @@ mod tests {
         let round = String::from_utf8(serde_json::to_vec(&parsed).unwrap()).unwrap();
         assert!(!round.contains("expires_at_ms"), "{round}");
         assert!(!round.contains("label"), "{round}");
+    }
+
+    /// Whether there is a credential is known only once something has
+    /// read, and is then what that read found — the gear badge's answer
+    /// to "is this agent configured", asked on the GTK thread.
+    #[tokio::test]
+    async fn presence_is_unknown_until_read_and_then_what_the_read_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = IdeCredentials::new(dir.path().join("never-provisioned"));
+        assert_eq!(credentials.present(), None);
+        let read = credentials.credential().await;
+        assert_eq!(credentials.present(), Some(read.is_ok()));
     }
 
     /// The label is a pure read of what was already parsed, so the header

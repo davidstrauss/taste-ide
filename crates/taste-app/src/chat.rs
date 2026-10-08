@@ -4325,6 +4325,8 @@ impl ChatPane {
                     &format!("Couldn't save the credential: {error:#}"),
                 ),
             }
+            // The save read the file: the gear says what it found.
+            pane.sync_link_badge();
         });
     }
 
@@ -6343,6 +6345,20 @@ impl ChatPane {
         self.client.borrow().is_some()
             && self.session_info.borrow().is_some()
             && !self.needs_auth.get()
+            && !self.unconfigured()
+    }
+
+    /// An agent whose requests go through the proxy to Anthropic when this
+    /// project has no credential for it to use: its session comes up on
+    /// the placeholder all the same, so the session alone said "connected"
+    /// and the gear went green over an agent that could not answer a
+    /// prompt (David, 2026-10-08: "An unconfigured agent should not have a
+    /// green badge on the gear").
+    fn unconfigured(&self) -> bool {
+        let spec = self.agent_spec();
+        taste_acp::authproxy::proxies(&spec)
+            && !spec.is_custom()
+            && taste_acp::authproxy::credential_missing()
     }
 
     /// The gear's badge and tooltip, from the link's state and the last
@@ -6358,7 +6374,9 @@ impl ChatPane {
         };
         let status = self.status_label.label();
         let status = status.trim();
-        let word = if !status.is_empty() {
+        let word = if self.unconfigured() {
+            "no Anthropic credential for this project".to_string()
+        } else if !status.is_empty() {
             status.to_string()
         } else if good {
             "connected".to_string()

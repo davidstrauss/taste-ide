@@ -292,6 +292,14 @@ pub fn credential_label() -> Option<String> {
     handle()?.credential_label()
 }
 
+/// Whether the proxy has looked for this project's credential and found
+/// none usable: an agent behind it is unconfigured, whatever its session
+/// says. False with no proxy, and before the first read. A pure read, for
+/// the GTK thread.
+pub fn credential_missing() -> bool {
+    handle().and_then(Handle::credential_present) == Some(false)
+}
+
 /// The id of the picker row a spawn would add right now — the account's
 /// top tier as the proxy last read it (`top_tier_picker_row`), or `None`
 /// for no row. A pane records this at its spawn and compares it when the
