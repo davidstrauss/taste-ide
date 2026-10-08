@@ -628,6 +628,10 @@ pub struct ChatPane {
     /// Offered during the turn, shown when it ends: a question is answered
     /// once it has been asked, not while the agent is still writing it.
     pending_replies: RefCell<Vec<String>>,
+    /// The `suggest_replies` call a replay is going through, by id: its
+    /// input is where a restored conversation's replies come back from
+    /// (`recover_replies`), and its updates may carry that input late.
+    replayed_replies_call: RefCell<Option<String>>,
     /// Renders the turn's answer whole — each response since its last step
     /// of work that was clipped: the replies answer what it said, and a
     /// question cut to "… 2 more lines" left buttons like "Yes, write all
@@ -3287,6 +3291,7 @@ impl ChatPane {
             replies_bar,
             replies_box,
             pending_replies: RefCell::new(Vec::new()),
+            replayed_replies_call: RefCell::new(None),
             unclip_answer: RefCell::new(Vec::new()),
             revive_bar,
             revive_label,
@@ -7140,6 +7145,45 @@ impl ChatPane {
         self.replies_bar.set_reveal_child(false);
     }
 
+    /// The replay is over: the question the restored conversation ended on
+    /// keeps its replies — unless a message waiting to go answers it, or
+    /// the agent kept no conversation to answer.
+    fn settle_replayed_replies(self: &Rc<Self>, restored: bool) {
+        self.replayed_replies_call.borrow_mut().take();
+        let answered = !self.pending_prompts.borrow().is_empty();
+        if !restored || answered {
+            self.clear_replies();
+        } else if !self.busy.get() && !self.pending_replies.borrow().is_empty() {
+            self.show_replies();
+        }
+    }
+
+    /// A `suggest_replies` call in a replayed conversation: the replies it
+    /// offered, read back from its input, are pending again — drawn when
+    /// the replay is over, unless a message later in it answered them.
+    /// They reach a live chat as the IDE's own event, which nothing
+    /// replays, so a question left unanswered when the IDE closed came
+    /// back with no buttons under it (David, 2026-10-08: "If I haven't
+    /// chosen a reply yet, I should still see the options on restoring
+    /// the IDE after closing it").
+    fn recover_replies(
+        &self,
+        id: &str,
+        input: Option<&serde_json::Value>,
+        status: Option<ToolCallStatus>,
+    ) {
+        *self.replayed_replies_call.borrow_mut() = Some(id.to_string());
+        // Refused by the server, so never shown in the first place.
+        if status == Some(ToolCallStatus::Failed) {
+            self.pending_replies.borrow_mut().clear();
+            return;
+        }
+        let replies = input.map(offered_replies).unwrap_or_default();
+        if !replies.is_empty() {
+            *self.pending_replies.borrow_mut() = replies;
+        }
+    }
+
     fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
         if busy {
@@ -7767,6 +7811,12 @@ impl ChatPane {
         };
         if pending.text.trim().is_empty() && pending.attachments.is_empty() {
             return;
+        }
+        // A message later in a replay answered whatever replies came
+        // before it.
+        if self.replaying.get() {
+            self.pending_replies.borrow_mut().clear();
+            self.replayed_replies_call.borrow_mut().take();
         }
         // The agent's block, if one is open, belongs above this message.
         self.close_stream();
@@ -9046,6 +9096,7 @@ impl ChatPane {
                 // seems to disappear from the chat after the container
                 // finishes coming up, even though the agent replies").
                 self.reattach_pending_cards();
+                self.settle_replayed_replies(restored);
                 self.persist_session_id();
                 // Close the shade only if the IDE opened it (for sign-in)
                 // and sign-in is done; a shade the user opened stays open
@@ -10625,6 +10676,8 @@ impl ChatPane {
         // the rendering it replaces goes now, and not a moment sooner.
         if self.clear_on_replay.replace(false) {
             self.clear_transcript();
+            // ...and the replies under it: the replay says which, if any.
+            self.clear_replies();
         }
         self.note_word();
         // Anything that is not another piece of the user's message ends it.
@@ -10701,6 +10754,12 @@ impl ChatPane {
                 // replies is not work.
                 if mcp_tool_name(&call.title).as_deref() != Some("suggest_replies") {
                     self.unclip_answer.borrow_mut().clear();
+                } else if self.replaying.get() {
+                    self.recover_replies(
+                        &call.tool_call_id.to_string(),
+                        call.raw_input.as_ref(),
+                        Some(call.status),
+                    );
                 }
                 // An edit through the IDE's tools reads as the edit it is.
                 if is_ide_edit_title(&call.title) {
@@ -10734,6 +10793,15 @@ impl ChatPane {
             }
             SessionUpdate::ToolCallUpdate(mut update) => {
                 let id = update.tool_call_id.to_string();
+                if self.replaying.get()
+                    && self.replayed_replies_call.borrow().as_deref() == Some(id.as_str())
+                {
+                    self.recover_replies(
+                        &id,
+                        update.fields.raw_input.as_ref(),
+                        update.fields.status,
+                    );
+                }
                 if let Some(title) = update
                     .fields
                     .title
@@ -11503,8 +11571,18 @@ impl ChatPane {
                 self.revive_bar.set_reveal_child(true);
             }
             // `replies`: the turn over on a question, the agent's suggested
-            // answers under it as buttons (`suggest_replies`).
-            Ok("replies") => {
+            // answers under it as buttons (`suggest_replies`). `restored`:
+            // the same conversation as a restore replays it, where the
+            // buttons come back from the call's input rather than the
+            // IDE's event.
+            Ok(variant @ ("replies" | "restored")) => {
+                let restored = variant == "restored";
+                let offers = vec![
+                    "File it".to_string(),
+                    "Change the title first".to_string(),
+                    "Move all six into the template".to_string(),
+                ];
+                self.replaying.set(restored);
                 // The answer, long enough to clip, with the list the
                 // replies choose from in its tail; then the call that
                 // offers them, then the question in a line of its own —
@@ -11541,6 +11619,7 @@ impl ChatPane {
                 let mut offered = ToolCall::new("probe-replies", "mcp__taste-ide__suggest_replies");
                 offered.kind = ToolKind::Other;
                 offered.status = ToolCallStatus::Completed;
+                offered.raw_input = Some(serde_json::json!({ "replies": offers }));
                 offered.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
                     TextContent::new(
                         serde_json::json!({
@@ -11566,11 +11645,12 @@ impl ChatPane {
                 self.set_busy(false);
                 // A long one among them: a reply wider than the column
                 // wraps rather than running off its edge.
-                self.offer_replies(vec![
-                    "File it".to_string(),
-                    "Change the title first".to_string(),
-                    "Move all six into the template".to_string(),
-                ]);
+                if restored {
+                    self.replaying.set(false);
+                    self.settle_replayed_replies(true);
+                } else {
+                    self.offer_replies(offers);
+                }
             }
             Ok("stopped") => {
                 self.settle_running_steps();
@@ -14577,6 +14657,22 @@ fn edit_from(diff: &Diff) -> crate::chatdoc::Edit {
     }
 }
 
+/// The replies a `suggest_replies` call offered, read from its input as
+/// the IDE's MCP server reads them: trimmed, the empty ones dropped.
+fn offered_replies(input: &serde_json::Value) -> Vec<String> {
+    input["replies"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|reply| reply.trim().to_string())
+                .filter(|reply| !reply.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One `<task-notification>` block: the message Claude Code puts into the
 /// conversation when a background task (a subagent, a background shell)
 /// ends, which reaches a client as a user message like any other.
@@ -14943,6 +15039,16 @@ fn centre_dot_after_layout(row_box: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restored `suggest_replies` call gives back what the server would
+    /// have shown: trimmed, nothing empty, and nothing from a malformed
+    /// input.
+    #[test]
+    fn a_replayed_offer_reads_back_the_replies_it_showed() {
+        let input = serde_json::json!({ "replies": [" File it ", "", 3, "Not yet"] });
+        assert_eq!(offered_replies(&input), vec!["File it", "Not yet"]);
+        assert!(offered_replies(&serde_json::json!({ "replies": "File it" })).is_empty());
+    }
 
     /// The message Claude Code delivers when a subagent ends, as the
     /// transcript received it on 2026-10-08: the step it becomes says what
