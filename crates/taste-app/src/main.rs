@@ -248,6 +248,29 @@ fn main() -> glib::ExitCode {
         crate::file_icons::init();
         // Before any editor asks for a language (languages.rs).
         crate::languages::register();
+        // Whether the connection is metered, kept current for everything
+        // below the app that decides whether to download by choice
+        // (`taste_core::network`). The desktop's answer, through the
+        // portal inside the Flatpak; read before the first reconcile asks.
+        {
+            let monitor = gtk::gio::NetworkMonitor::default();
+            let say = |metered: bool| {
+                if taste_core::network::set_metered(metered) || metered {
+                    tracing::info!(
+                        "the connection is {}",
+                        if metered {
+                            "metered: downloads by choice wait"
+                        } else {
+                            "not metered"
+                        }
+                    );
+                }
+            };
+            say(monitor.is_network_metered());
+            monitor.connect_network_metered_notify(move |monitor| {
+                say(monitor.is_network_metered());
+            });
+        }
         // App-level styling: the chat prompt entry (transparent TextView in
         // an entry-shaped container, matching GNOME chat apps).
         // The composer wears the same treatment a selected tab gets, and

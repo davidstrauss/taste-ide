@@ -4067,6 +4067,23 @@ minutes later; the fleet row reads "moving to a VM on <release>" or
 "rebuilding with updated packages" while one is pending. Moving is one operation with four reasons, never a reboot the
 IDE schedules.
 
+**A metered connection holds what the IDE would download by choice**
+(`taste_core::network`, kept current from the desktop's network monitor;
+David, 2026-10-06: "I want the IDE to respect metered connections").
+While the connection is metered, the clock above nudges nobody, tells
+the coordinator nothing, and forces nothing, since each ends in a rebuild
+that downloads; the person sees, once per metered stretch, a note in that
+environment's chat that the agent would have been asked, which the agent
+never sees. Once the connection is not metered, whatever is due happens.
+An agent that asks for its rebuild is choosing it, and is not held. The
+stream is not read for a newer guest release, the next release is not
+fetched ahead of the moves, and an image's package check waits; a VM made
+meanwhile boots the newest verified base already on this machine rather
+than download the release the stream last named, and the startup page's
+guest image step says the freshness check was skipped and why. Only a
+machine with no base image at all downloads one on a metered connection,
+because nothing else can boot, and its notice says so.
+
 **Staleness is per kind, and must be said before it is needed.** A cloud
 credential expires or is revoked and its quota moves; a remote libvirt
 host is simply off; any of them can stop offering the guest image a

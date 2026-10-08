@@ -19,6 +19,7 @@ pub mod instance;
 pub mod logfile;
 pub mod mcp;
 pub mod memory;
+pub mod network;
 pub mod orchestration;
 pub mod podman;
 pub mod policy;

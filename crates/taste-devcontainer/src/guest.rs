@@ -383,6 +383,77 @@ pub fn pinned_for(arch: &str) -> Result<GuestImage> {
 /// last read ([`refresh_from_stream`]), else the compiled-in one. The
 /// compiled-in release's own sizes are kept when the stream names it too.
 pub fn image_for(arch: &str) -> Result<GuestImage> {
+    let named = named_for(arch)?;
+    if taste_core::network::metered() && !named.base_is_present() {
+        if let Some(here) = newest_present(arch) {
+            return Ok(here);
+        }
+    }
+    Ok(named)
+}
+
+/// Whether [`image`] is a release already here in place of the one the
+/// stream named, because the connection is metered.
+pub fn held_back_by_metering() -> Option<String> {
+    let arch = std::env::consts::ARCH;
+    let named = named_for(arch).ok()?;
+    let image = image_for(arch).ok()?;
+    (image.release != named.release).then_some(named.release)
+}
+
+/// The newest base image on this machine that was verified when it
+/// arrived — its digest marker beside it — as a [`GuestImage`] that needs
+/// no download. On a metered connection a new VM boots this rather than
+/// fetch the stream's newer release: a gigabyte by the IDE's own choice is
+/// what a metered connection is for not spending (`taste_core::network`).
+fn newest_present(arch: &str) -> Option<GuestImage> {
+    newest_present_in(&images_dir(), arch)
+}
+
+/// [`newest_present`] in `dir`: a base image there counts when its digest
+/// marker is beside it, which is written only once the digest matched.
+fn newest_present_in(dir: &Path, arch: &str) -> Option<GuestImage> {
+    let suffix = format!("-qemu.{arch}.qcow2");
+    let mut found: Vec<GuestImage> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let release = name
+                .strip_prefix("fedora-coreos-")?
+                .strip_suffix(&suffix)?
+                .to_string();
+            let marker = entry.path().with_extension("qcow2.sha256");
+            let digest = std::fs::read_to_string(marker).ok()?.trim().to_string();
+            Some(GuestImage {
+                release,
+                arch: if arch == "aarch64" {
+                    "aarch64"
+                } else {
+                    "x86_64"
+                },
+                url: String::new(),
+                sha256: String::new(),
+                bytes: None,
+                uncompressed_sha256: digest,
+                uncompressed_bytes: None,
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| {
+        if release_is_behind(&a.release, &b.release) {
+            std::cmp::Ordering::Less
+        } else if release_is_behind(&b.release, &a.release) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    found.pop()
+}
+
+/// The release the stream last named, else the compiled-in one.
+fn named_for(arch: &str) -> Result<GuestImage> {
     let pinned = pinned_for(arch)?;
     match read_stream_record(arch) {
         Some(record) if record.release == pinned.release => Ok(pinned),
@@ -807,6 +878,35 @@ mod tests {
     fn a_stream_without_the_architecture_says_which_one() {
         let missing = parse_stream(STREAM_FIXTURE, "aarch64").unwrap_err();
         assert!(format!("{missing:#}").contains("aarch64"));
+    }
+
+    /// On a metered connection a new VM boots the newest verified base
+    /// already here; a base with no digest marker beside it was never
+    /// verified and does not count.
+    #[test]
+    fn the_newest_verified_base_here_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = |release: &str, marked: bool| {
+            let path = dir
+                .path()
+                .join(format!("fedora-coreos-{release}-qemu.x86_64.qcow2"));
+            std::fs::write(&path, b"qcow").unwrap();
+            if marked {
+                std::fs::write(
+                    path.with_extension("qcow2.sha256"),
+                    format!("{release}-digest\n"),
+                )
+                .unwrap();
+            }
+        };
+        assert!(newest_present_in(dir.path(), "x86_64").is_none());
+        base("44.20260829.3.1", true);
+        base("44.20260913.3.2", true);
+        base("44.20260927.3.0", false);
+        let here = newest_present_in(dir.path(), "x86_64").unwrap();
+        assert_eq!(here.release, "44.20260913.3.2");
+        assert_eq!(here.uncompressed_sha256, "44.20260913.3.2-digest");
+        assert!(newest_present_in(dir.path(), "aarch64").is_none());
     }
 
     /// Guests are not models, and do not live in the models directory.

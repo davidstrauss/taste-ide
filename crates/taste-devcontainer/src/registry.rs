@@ -410,6 +410,9 @@ pub struct EnvironmentRegistry {
     /// Whether the new release's base image is being fetched ahead of the
     /// moves that need it.
     prefetching_guest: AtomicBool,
+    /// Environments whose held nudge has been noted in their chat during
+    /// this metered stretch (`tick_migrations`).
+    metered_noted: Mutex<BTreeSet<EnvironmentId>>,
     /// Package checks under way, by image, so one image is asked once.
     image_checks: Mutex<std::collections::BTreeSet<String>>,
     /// One writer at a time for the image records file.
@@ -494,6 +497,7 @@ impl EnvironmentRegistry {
             relocations_in_flight: Mutex::new(std::collections::BTreeSet::new()),
             relocating: tokio::sync::Mutex::new(()),
             prefetching_guest: AtomicBool::new(false),
+            metered_noted: Mutex::new(BTreeSet::new()),
             image_checks: Mutex::new(std::collections::BTreeSet::new()),
             image_records_lock: Mutex::new(()),
             free_disk_for_tests: Mutex::new(None),
@@ -2866,24 +2870,43 @@ impl EnvironmentRegistry {
         // The stream first: what it names is what a VM made in this
         // reconcile is built from, and what every VM's release is judged
         // against (`crate::guest` → the stream, followed).
-        let stream = crate::guest::refresh_from_stream()
-            .await
-            .map_err(|e| format!("{e:#}"));
-        match &stream {
-            Ok(record) => tracing::info!(
-                "the {} stream is at {}",
-                crate::guest::STREAM,
-                record.release
-            ),
-            Err(e) => tracing::warn!("the {} stream could not be read: {e}", crate::guest::STREAM),
-        }
+        // Not on a metered connection: a new release found is a gigabyte
+        // to fetch by choice, so the check that would find one waits too.
+        let stream = if taste_core::network::metered() {
+            tracing::info!(
+                "the {} stream was not read: the connection is metered",
+                crate::guest::STREAM
+            );
+            StreamRead::Skipped
+        } else {
+            match crate::guest::refresh_from_stream().await {
+                Ok(record) => {
+                    tracing::info!(
+                        "the {} stream is at {}",
+                        crate::guest::STREAM,
+                        record.release
+                    );
+                    StreamRead::Read
+                }
+                Err(e) => {
+                    let e = format!("{e:#}");
+                    tracing::warn!("the {} stream could not be read: {e}", crate::guest::STREAM);
+                    StreamRead::Failed(e)
+                }
+            }
+        };
         let pool = self.pool();
         // A download happens only for a VM that has to be made: a stream
         // that moved while this workspace's VM exists downloads nothing
         // now, since that VM keeps its release.
         let fetching = pool.will_download() && pool.vms().await.map_or(true, |vms| vms.is_empty());
         if fetching {
-            let notice = "Fetching the guest image for this machine's VMs (about 1 GiB, once)";
+            let notice = if taste_core::network::metered() {
+                "Fetching the guest image for this machine's VMs (about 1 GiB, once) on a \
+                 metered connection: there is none here to boot instead"
+            } else {
+                "Fetching the guest image for this machine's VMs (about 1 GiB, once)"
+            };
             taste_core::app_log::push("info", "substrate", notice);
             self.events.publish(Event::Toast(notice.to_string()));
         }
@@ -3463,7 +3486,7 @@ impl EnvironmentRegistry {
                 let Some(registry) = weak.upgrade() else {
                     break;
                 };
-                if stream_read.elapsed() >= STREAM_EVERY {
+                if stream_read.elapsed() >= STREAM_EVERY && !taste_core::network::metered() {
                     if let Err(e) = crate::guest::refresh_from_stream().await {
                         tracing::warn!("reading the {} stream: {e:#}", crate::guest::STREAM);
                     }
@@ -3690,6 +3713,12 @@ impl EnvironmentRegistry {
         supervisor: Arc<Supervisor>,
         image: RunningImage,
     ) {
+        // A package manager's check downloads its repositories' metadata,
+        // tens of megabytes for dnf: asked again once the connection is
+        // not metered, since the record still says it is due.
+        if taste_core::network::metered() {
+            return;
+        }
         if !self.image_checks.lock().unwrap().insert(key.clone()) {
             return;
         }
@@ -3803,6 +3832,11 @@ impl EnvironmentRegistry {
     /// The new release's base image, fetched in the background once a move
     /// needs it, so the move itself does not wait a gigabyte.
     fn prefetch_guest_image(self: &Arc<Self>) {
+        // Fetched ahead by choice, so not on a metered connection; the
+        // moves it is for are held there too (`tick_migrations`).
+        if taste_core::network::metered() {
+            return;
+        }
         let moving = self
             .migrations
             .lock()
@@ -3839,6 +3873,11 @@ impl EnvironmentRegistry {
     /// What the clock says is due for each pending move: its agent told,
     /// the coordinator told, or the move forced.
     fn tick_migrations(self: &Arc<Self>) {
+        self.tick_migrations_with(taste_core::network::metered());
+    }
+
+    /// [`Self::tick_migrations`], told whether the connection is metered.
+    fn tick_migrations_with(self: &Arc<Self>, metered: bool) {
         use crate::migration::Due;
         let now = now_secs();
         let pending: Vec<(EnvironmentId, crate::migration::Migration)> = self
@@ -3858,6 +3897,29 @@ impl EnvironmentRegistry {
             if due.is_empty() {
                 continue;
             }
+            // On a metered connection nothing is nudged, told, or forced:
+            // each ends in a rebuild that downloads a base image or a new
+            // VM's worth, by the IDE's choice. The agent can still ask
+            // (`request_migration`), which is its choice. The person sees
+            // that a nudge was held, once per metered stretch, in that
+            // environment's chat and not the agent's context; once the
+            // connection is not metered the clock says what is due and it
+            // happens.
+            if metered {
+                if self.metered_noted.lock().unwrap().insert(id.clone()) {
+                    self.events.publish(Event::ChatNotice {
+                        env: id.clone(),
+                        key: Some("metered-migration".to_string()),
+                        text: format!(
+                            "The agent would have been asked to {}; not while the connection \
+                             is metered. It is asked once it is not.",
+                            migration.what()
+                        ),
+                    });
+                }
+                continue;
+            }
+            self.metered_noted.lock().unwrap().remove(&id);
             for due in due {
                 match due {
                     Due::Nudge => {
@@ -4672,10 +4734,17 @@ fn clean_console_line(raw: &str) -> String {
 /// is for has booted (David, 2026-09-23: "The summary should appear as the
 /// step completes or is verified as completed"): at once when the image
 /// was already here, and when a download reaches Ready otherwise.
-fn guest_image_words(
-    stream: &std::result::Result<crate::guest::StreamRecord, String>,
-    fetched: bool,
-) -> Option<String> {
+/// What the reconcile learned of the stream.
+#[derive(Debug, Clone)]
+enum StreamRead {
+    /// Read just now; its release is recorded (`crate::guest`).
+    Read,
+    /// Not asked: the connection is metered.
+    Skipped,
+    Failed(String),
+}
+
+fn guest_image_words(stream: &StreamRead, fetched: bool) -> Option<String> {
     let image = crate::guest::image().ok()?;
     // "44.20260912.3.0 (released 2026-09-12), the latest stable as of
     // just now; 983 MiB, verified 2026-09-22": which release, whether
@@ -4685,15 +4754,29 @@ fn guest_image_words(
     if let Some(date) = image.release_date() {
         words.push_str(&format!(" (released {date})"));
     }
+    let last = || {
+        crate::guest::last_stream_check()
+            .map(|record| format!("; last read {}", crate::guest::date_of(record.checked_at)))
+            .unwrap_or_default()
+    };
     match stream {
-        Ok(_) => words.push_str(", the latest stable as of just now"),
-        Err(e) => {
-            let last = crate::guest::last_stream_check()
-                .map(|record| format!("; last read {}", crate::guest::date_of(record.checked_at)))
-                .unwrap_or_default();
+        StreamRead::Read => words.push_str(", the latest stable as of just now"),
+        StreamRead::Skipped => {
             words.push_str(&format!(
-                "; the stable stream could not be read ({}){last}",
-                e.lines().next().unwrap_or(e)
+                "; the freshness check was skipped because the connection is metered{}",
+                last()
+            ));
+            if let Some(named) = crate::guest::held_back_by_metering() {
+                words.push_str(&format!(
+                    "; {named} is newer and not downloaded, so the release here is used"
+                ));
+            }
+        }
+        StreamRead::Failed(e) => {
+            words.push_str(&format!(
+                "; the stable stream could not be read ({}){}",
+                e.lines().next().unwrap_or(e),
+                last()
             ));
         }
     }
@@ -4719,6 +4802,18 @@ fn guest_image_words(
 
 #[cfg(test)]
 mod tests {
+    /// The startup page says why the stream was not read.
+    #[test]
+    fn a_skipped_freshness_check_says_why() {
+        let words = super::guest_image_words(&super::StreamRead::Skipped, false).unwrap();
+        assert!(
+            words.contains("the freshness check was skipped because the connection is metered"),
+            "{words}"
+        );
+        let read = super::guest_image_words(&super::StreamRead::Read, false).unwrap();
+        assert!(read.contains("the latest stable as of just now"), "{read}");
+    }
+
     #[test]
     fn a_console_line_keeps_its_colours_and_loses_the_rest() {
         let raw = "\u{1b}[2K\u{1b}[0;32m  OK  \u{1b}[0m] Reached target \u{1b}]0;x\u{7}\u{1b}[0;1;39mMulti-User System\u{1b}[0m.\r";
@@ -4805,6 +4900,58 @@ mod tests {
             .remove(&primary);
         registry.tick_migrations();
         assert!(nudged(&seen), "and the nudge is said once it is not");
+    }
+
+    /// On a metered connection a due nudge is held, and the person is told
+    /// so in that environment's chat, once; off it, the nudge goes.
+    #[test]
+    fn a_metered_connection_holds_the_nudge_and_says_so_once() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let seen = registry.events.subscribe();
+        let primary = EnvironmentId::primary();
+        let now = now_secs();
+        let mut due = crate::migration::Migration::packages(
+            "vm",
+            "44",
+            "package updates are available",
+            now - 20 * 60,
+        );
+        due.requested_at = None;
+        registry
+            .migrations
+            .lock()
+            .unwrap()
+            .insert(primary.clone(), due);
+        let heard = |seen: &async_channel::Receiver<Event>| {
+            let (mut nudges, mut notes) = (0, Vec::new());
+            while let Ok(event) = seen.try_recv() {
+                match event {
+                    Event::MigrationNotice { .. } => nudges += 1,
+                    Event::ChatNotice { env, key, text } => {
+                        assert_eq!(env, EnvironmentId::primary());
+                        assert_eq!(key.as_deref(), Some("metered-migration"));
+                        notes.push(text);
+                    }
+                    _ => {}
+                }
+            }
+            (nudges, notes)
+        };
+        let _ = heard(&seen);
+
+        registry.tick_migrations_with(true);
+        registry.tick_migrations_with(true);
+        let (nudges, notes) = heard(&seen);
+        assert_eq!(nudges, 0, "nothing asked of the agent while metered");
+        assert_eq!(notes.len(), 1, "said once: {notes:?}");
+        assert!(notes[0].contains("metered"), "{}", notes[0]);
+        assert!(notes[0].contains("package updates"), "{}", notes[0]);
+
+        registry.tick_migrations_with(false);
+        let (nudges, notes) = heard(&seen);
+        assert_eq!(nudges, 1, "asked once the connection is not metered");
+        assert!(notes.is_empty());
     }
 
     /// The placement file is what tells a restored environment its

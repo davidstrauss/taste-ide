@@ -224,6 +224,18 @@ impl Migration {
         let _ = std::fs::remove_file(env_dir.join(Self::FILE));
     }
 
+    /// What reinstantiating would do, as a person reads it after "the
+    /// agent would have been asked to".
+    pub fn what(&self) -> String {
+        match self.kind {
+            Kind::Guest => format!(
+                "move this environment to a VM on {} (it is on {})",
+                self.to_release, self.from_release
+            ),
+            Kind::Packages => "rebuild this environment's image for its package updates".into(),
+        }
+    }
+
     /// What the environment's agent is told: what is pending, what it
     /// costs, what to call, and when it happens regardless — the evidence
     /// in the words, so nothing has to be looked up first.
