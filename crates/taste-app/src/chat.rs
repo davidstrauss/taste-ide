@@ -7008,16 +7008,23 @@ impl ChatPane {
 
     /// "… N more lines · open in the editor", as the line that does so.
     fn more_button(&self, key: &str, hidden: usize, tooltip: &str, doc: Document) -> gtk::Button {
+        let label = if hidden == 0 {
+            // Nothing clipped: the whole of it, in another form.
+            "open in the editor".to_string()
+        } else {
+            format!(
+                "… {hidden} more line{} · open in the editor",
+                if hidden == 1 { "" } else { "s" }
+            )
+        };
+        self.open_line(key, &label, tooltip, doc)
+    }
+
+    /// [`Self::more_button`] saying something else: the same dim line,
+    /// opening `doc`.
+    fn open_line(&self, key: &str, label: &str, tooltip: &str, doc: Document) -> gtk::Button {
         let button = gtk::Button::builder()
-            .label(if hidden == 0 {
-                // Nothing clipped: the whole of it, in another form.
-                "open in the editor".to_string()
-            } else {
-                format!(
-                    "… {hidden} more line{} · open in the editor",
-                    if hidden == 1 { "" } else { "s" }
-                )
-            })
+            .label(label)
             .tooltip_text(tooltip)
             .css_classes(["flat", "open-more"])
             .halign(gtk::Align::Start)
@@ -7763,7 +7770,69 @@ impl ChatPane {
         }
         // The agent's block, if one is open, belongs above this message.
         self.close_stream();
-        self.user_card(pending.text.trim_end(), &pending.attachments);
+        let mut text = pending.text.trim_end().to_string();
+        // A background task's report, delivered to the agent as a user
+        // message, is not something the user said: it is a step of the
+        // agent's work, and drawn as one.
+        if let Some((notes, rest)) = task_notifications(&text) {
+            for note in &notes {
+                self.task_notification_step(note);
+            }
+            if rest.is_empty() && pending.attachments.is_empty() {
+                return;
+            }
+            text = rest;
+        }
+        self.user_card(&text, &pending.attachments);
+    }
+
+    /// A background task finishing, as a step of the turn that started
+    /// it: what it was and how it ended on the line, its dot the colour of
+    /// how it ended, and its report — which the agent goes on to read, and
+    /// usually summarize — one click away in the editor, where it opens as
+    /// a response does. The raw notification, tags and all, filled a
+    /// prompt's box and read as though the user had pasted it (David,
+    /// 2026-10-08: "fix this output for task notifs").
+    fn task_notification_step(&self, note: &TaskNotification) {
+        let title = note.title();
+        self.record_line("note", &title);
+        let label = gtk::Label::builder()
+            .label(&title)
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .attributes(&no_hyphens())
+            .css_classes(["tool-title"])
+            .build();
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        body.append(&label);
+        let key = note.report.as_ref().map(|report| {
+            let key = next_doc_key("task");
+            let lines = report.lines().count();
+            body.append(&self.open_line(
+                &key,
+                &format!(
+                    "report · {lines} line{} · open in the editor",
+                    if lines == 1 { "" } else { "s" }
+                ),
+                "Open the task's report in the editor",
+                Document::Text {
+                    title: stamp_now(),
+                    body: report.clone(),
+                    markdown: true,
+                    role: crate::chatdoc::TextRole::Response,
+                },
+            ));
+            key
+        });
+        let (row, rail) = self.append_step(&body);
+        if let Some(tone) = note.tone() {
+            rail.dot.add_css_class(tone);
+        }
+        if let Some(key) = key {
+            self.note_doc_row(&key, &row);
+        }
     }
 
     /// Close out the current streamed message: style it as markdown.
@@ -11143,6 +11212,60 @@ impl ChatPane {
         self.replay_stash();
     }
 
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=task`.
+    #[doc(hidden)]
+    fn seed_task_notifications_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::ContentChunk;
+        let user = |text: &str| {
+            SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(text),
+            )))
+        };
+        let agent = |text: &str| {
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(text),
+            )))
+        };
+        self.render_update(user(
+            "Security review: enrollment. Have two agents read the WIT and OIDC \
+             brokers and the enrollment service in parallel.",
+        ));
+        self.render_update(agent(
+            "Started two background reviewers; I will read their reports as they land.",
+        ));
+        self.render_update(user(
+            "<task-notification>\n\
+             <task-id>a54396ae446d6860c</task-id>\n\
+             <tool-use-id>toolu_01GHppHQNWZE4UtGrr1HdWKZ</tool-use-id>\n\
+             <output-file>/tmp/claude-1000/tasks/a54396ae446d6860c.output</output-file>\n\
+             <status>completed</status>\n\
+             <summary>Agent \"Review WIT and OIDC brokers\" finished</summary>\n\
+             <result>## Findings\n\n\
+             1. **The OIDC broker accepts an unsigned `id_token`** when the issuer's \
+             JWKS fetch times out (`brokers/oidc/verify.rs:88`).\n\
+             2. The WIT broker logs the bearer token at debug level.\n\n\
+             ## Not a finding\n\n\
+             - Audience checks are present on both paths.</result>\n\
+             <usage><total_tokens>51200</total_tokens></usage>\n\
+             </task-notification>\n\
+             Full transcript available at: /tmp/claude-1000/tasks/a54396ae446d6860c.output",
+        ));
+        self.render_update(agent(
+            "The broker review is in: one real finding (an unsigned `id_token` \
+             accepted on a JWKS timeout) and one logging leak.",
+        ));
+        self.render_update(user(
+            "<task-notification>\n\
+             <task-id>b81c02f9e7d4a5310</task-id>\n\
+             <status>failed</status>\n\
+             <summary>Agent \"Review the enrollment service\" failed</summary>\n\
+             </task-notification>",
+        ));
+        // What would end it is the agent's next word, which a probe has
+        // not got.
+        self.flush_user_message();
+    }
+
     pub fn seed_transcript_for_probe(self: &Rc<Self>) {
         // `TASTE_PROBE_CHAT=empty` leaves the transcript alone, so the other
         // face of the pane — the empty page, and the composer wearing the
@@ -11173,6 +11296,12 @@ impl ChatPane {
         // lands in when it is restored from its archive.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("stash") {
             self.seed_stash_for_probe();
+            return;
+        }
+        // `TASTE_PROBE_CHAT=task` is a turn that two background subagents
+        // report back into: one finished with a report, one failed.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("task") {
+            self.seed_task_notifications_for_probe();
             return;
         }
         if std::env::var("TASTE_PROBE_SCROLL").is_ok() {
@@ -11514,7 +11643,7 @@ impl ChatPane {
         self.show_options(true);
     }
 
-    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_DOC=edit|command|prompt|changes` opens
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_DOC=edit|command|prompt|changes|response|source` opens
     /// that step of the seeded transcript whole in the editor's strip — the
     /// page a truncated block opens onto (chatdoc.rs) — through the same
     /// opener the step's button uses. The window calls it after its own
@@ -11555,6 +11684,23 @@ impl ChatPane {
                         },
                     ],
                     skipped: vec!["logo.png (binary)".into()],
+                },
+            ),
+            // A response, on its rendered face — or, with `source`, on
+            // the Markdown it was written in.
+            "response" | "source" => (
+                "probe-response",
+                Document::Text {
+                    title: stamp_now(),
+                    body: "## Findings\n\n\
+                           1. **The OIDC broker accepts an unsigned `id_token`** when the \
+                           issuer's JWKS fetch times out (`brokers/oidc/verify.rs:88`).\n\
+                           2. The WIT broker logs the bearer token at debug level.\n\n\
+                           | Path | Audience checked |\n|---|---|\n| OIDC | yes |\n| WIT | yes |\n\n\
+                           ```rust\nlet claims = verify(&token, &jwks)?;\n```\n"
+                        .to_string(),
+                    markdown: true,
+                    role: crate::chatdoc::TextRole::Response,
                 },
             ),
             "command" => (
@@ -14431,6 +14577,102 @@ fn edit_from(diff: &Diff) -> crate::chatdoc::Edit {
     }
 }
 
+/// One `<task-notification>` block: the message Claude Code puts into the
+/// conversation when a background task (a subagent, a background shell)
+/// ends, which reaches a client as a user message like any other.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TaskNotification {
+    /// `completed`, `failed`, `killed`, … — as the block says it.
+    status: Option<String>,
+    /// The block's one-line account: `Agent "…" finished`.
+    summary: Option<String>,
+    /// What the task handed back, the subagent's own Markdown.
+    report: Option<String>,
+}
+
+impl TaskNotification {
+    fn title(&self) -> String {
+        match (&self.summary, &self.status) {
+            (Some(summary), _) => summary.clone(),
+            (None, Some(status)) => format!("Background task {status}"),
+            (None, None) => "Background task ended".to_string(),
+        }
+    }
+
+    /// The dot's class (`.rail-dot.<tone>`): finished green, failed red,
+    /// and stopped hollow — it ended, but did not get to say how.
+    fn tone(&self) -> Option<&'static str> {
+        match self.status.as_deref()? {
+            "completed" => Some("ok"),
+            "failed" => Some("fail"),
+            "killed" | "stopped" | "cancelled" => Some("cut"),
+            _ => None,
+        }
+    }
+}
+
+/// The task notifications a user message is made of, and whatever else it
+/// says besides them — or `None` when it does not open with one, which is
+/// every message the user actually wrote. The trailing "Full transcript
+/// available at …" names a file in the agent's own environment, which
+/// nothing here can open, so it is not kept.
+fn task_notifications(text: &str) -> Option<(Vec<TaskNotification>, String)> {
+    const OPEN: &str = "<task-notification>";
+    const CLOSE: &str = "</task-notification>";
+    let mut rest = text.trim_start();
+    if !rest.starts_with(OPEN) {
+        return None;
+    }
+    let mut notes = Vec::new();
+    let mut outside = String::new();
+    while let Some(start) = rest.find(OPEN) {
+        outside.push_str(&rest[..start]);
+        let inner = &rest[start + OPEN.len()..];
+        let (block, after) = match inner.find(CLOSE) {
+            Some(end) => (&inner[..end], &inner[end + CLOSE.len()..]),
+            None => (inner, ""),
+        };
+        notes.push(task_notification(block));
+        rest = after;
+    }
+    outside.push_str(rest);
+    let outside = outside
+        .lines()
+        .filter(|line| {
+            !line
+                .trim_start()
+                .starts_with("Full transcript available at")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    Some((notes, outside))
+}
+
+/// One block's fields. The report is read first and taken out, from its
+/// first opening tag to its LAST closing one: it is the subagent's free
+/// text, and anything that looks like a tag inside it is its own.
+fn task_notification(block: &str) -> TaskNotification {
+    let mut head = block.to_string();
+    let report = block.find("<result>").and_then(|start| {
+        let end = block.rfind("</result>").filter(|&end| end >= start)?;
+        head = format!("{}{}", &block[..start], &block[end + "</result>".len()..]);
+        Some(block[start + "<result>".len()..end].trim().to_string())
+    });
+    let field = |name: &str| {
+        let open = format!("<{name}>");
+        let start = head.find(&open)? + open.len();
+        let end = head[start..].find(&format!("</{name}>"))? + start;
+        Some(head[start..end].trim().to_string()).filter(|value| !value.is_empty())
+    };
+    TaskNotification {
+        status: field("status"),
+        summary: field("summary"),
+        report: report.filter(|report| !report.is_empty()),
+    }
+}
+
 /// A fresh key for a document that has no id of its own — a prompt, a
 /// response — so its opener finds the same tab twice.
 fn next_doc_key(prefix: &str) -> String {
@@ -14701,6 +14943,59 @@ fn centre_dot_after_layout(row_box: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The message Claude Code delivers when a subagent ends, as the
+    /// transcript received it on 2026-10-08: the step it becomes says what
+    /// ended and how, keeps the report, and leaves nothing for a prompt's
+    /// box.
+    #[test]
+    fn a_task_notification_is_read_as_the_step_it_reports() {
+        let text = "<task-notification>\n\
+            <task-id>a54396ae446d6860c</task-id>\n\
+            <tool-use-id>toolu_01GHppHQNWZE4UtGrr1HdWKZ</tool-use-id>\n\
+            <output-file>/tmp/claude-1000/tasks/a54396ae446d6860c.output</output-file>\n\
+            <status>completed</status>\n\
+            <summary>Agent \"Review WIT and OIDC brokers\" finished</summary>\n\
+            <result>## Findings\n\n- the broker trusts `<status>` blindly</result>\n\
+            <usage><total_tokens>5120</total_tokens></usage>\n\
+            </task-notification>\n\
+            Full transcript available at: /tmp/claude-1000/tasks/a54396ae446d6860c.output";
+        let (notes, rest) = task_notifications(text).expect("a notification");
+        assert_eq!(rest, "");
+        assert_eq!(
+            notes,
+            vec![TaskNotification {
+                status: Some("completed".into()),
+                summary: Some("Agent \"Review WIT and OIDC brokers\" finished".into()),
+                report: Some("## Findings\n\n- the broker trusts `<status>` blindly".into()),
+            }]
+        );
+        assert_eq!(
+            notes[0].title(),
+            "Agent \"Review WIT and OIDC brokers\" finished"
+        );
+        assert_eq!(notes[0].tone(), Some("ok"));
+    }
+
+    /// Two at once are two steps; a failure is red; and a message that
+    /// does not open with one is the user's, however it mentions the tag.
+    #[test]
+    fn only_a_message_that_opens_with_a_notification_is_one() {
+        let text = "<task-notification><status>failed</status></task-notification>\n\
+                    <task-notification><status>killed</status></task-notification>\n\
+                    and then this";
+        let (notes, rest) = task_notifications(text).expect("notifications");
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].title(), "Background task failed");
+        assert_eq!(notes[0].tone(), Some("fail"));
+        assert_eq!(notes[1].tone(), Some("cut"));
+        assert_eq!(notes[1].report, None);
+        assert_eq!(rest, "and then this");
+        assert_eq!(
+            task_notifications("why does <task-notification> show raw?"),
+            None
+        );
+    }
 
     #[test]
     fn the_token_a_sign_in_printed_is_found_and_a_mention_of_one_is_not() {

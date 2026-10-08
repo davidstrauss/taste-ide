@@ -3354,6 +3354,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 }
                 // The page a chat step opens whole onto (`TASTE_PROBE_DOC`),
                 // in front for the same reason.
+                if std::env::var("TASTE_PROBE_DOC").as_deref() == Ok("source") {
+                    editor_for_probe.open_documents_on_source();
+                }
                 if let Some(pane) = chats_for_probe.selected() {
                     pane.open_probe_document();
                 }

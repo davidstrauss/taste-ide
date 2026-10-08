@@ -145,16 +145,53 @@ pub struct DocPage {
     /// The tab's glyph (`Document::icon`), kept for the editor's badge
     /// pass, which draws every surface's icon from the surface itself.
     pub icon: &'static str,
+    /// A rendered document's two faces — the page as it reads, and the
+    /// Markdown it was written in — when it has them (David, 2026-10-08:
+    /// "Let me switch to viewing the Markdown itself when I open up a
+    /// message from the chat agent"). The editor's mode menu switches
+    /// them, the way it switches a Markdown file's Preview and Edit.
+    faces: Option<gtk::Stack>,
 }
+
+/// A face of a rendered document page (`DocPage::faces`).
+const PREVIEW_FACE: &str = "preview";
+const SOURCE_FACE: &str = "source";
 
 impl DocPage {
     pub fn new(doc: &Document, on_link: Rc<dyn Fn(&str)>) -> Rc<Self> {
+        if let Document::Text {
+            body,
+            markdown: true,
+            ..
+        } = doc
+        {
+            // Each face in a scroller of its own, so each keeps its own
+            // place: the line read in the source is not at the pixel the
+            // preview was scrolled to. Not homogeneous, so neither face
+            // scrolls on into the other's height.
+            let faces = gtk::Stack::builder()
+                .hhomogeneous(false)
+                .vhomogeneous(false)
+                .hexpand(true)
+                .vexpand(true)
+                .build();
+            faces.add_named(
+                &page_scroller(&crate::markdown_view::render(body, on_link), false),
+                Some(PREVIEW_FACE),
+            );
+            faces.add_named(
+                &page_scroller(&markdown_source(body), false),
+                Some(SOURCE_FACE),
+            );
+            faces.set_visible_child_name(PREVIEW_FACE);
+            return Rc::new(Self {
+                widget: faces.clone().upcast(),
+                icon: doc.icon(),
+                faces: Some(faces),
+            });
+        }
         let content: gtk::Widget = match doc {
-            Document::Text {
-                body,
-                markdown: true,
-                ..
-            } => crate::markdown_view::render(body, on_link),
+            // Shown as typed: a prompt, or a tool's result.
             Document::Text { body, .. } => {
                 let view = gtk::TextView::builder()
                     .editable(false)
@@ -211,25 +248,75 @@ impl DocPage {
                 inset(&column)
             }
         };
-        let scroller = gtk::ScrolledWindow::builder()
-            .child(&content)
-            .hexpand(true)
-            .vexpand(true)
-            // Prose folds; a side-by-side diff's lines do not, so the page
-            // scrolls sideways for the one and never for the others.
-            .hscrollbar_policy(
-                if matches!(doc, Document::Edit(_) | Document::Changes { .. }) {
-                    gtk::PolicyType::Automatic
-                } else {
-                    gtk::PolicyType::Never
-                },
-            )
-            .build();
+        // Prose folds; a side-by-side diff's lines do not, so the page
+        // scrolls sideways for the one and never for the others.
+        let sideways = matches!(doc, Document::Edit(_) | Document::Changes { .. });
         Rc::new(Self {
-            widget: scroller.upcast(),
+            widget: page_scroller(&content, sideways).upcast(),
             icon: doc.icon(),
+            faces: None,
         })
     }
+
+    /// Whether this page has a source face to switch to.
+    pub fn has_faces(&self) -> bool {
+        self.faces.is_some()
+    }
+
+    /// Whether the Markdown itself is the face on screen.
+    pub fn showing_source(&self) -> bool {
+        self.faces
+            .as_ref()
+            .is_some_and(|faces| faces.visible_child_name().as_deref() == Some(SOURCE_FACE))
+    }
+
+    /// Put the Markdown (`true`) or the rendered page in front. A page
+    /// with one face ignores it.
+    pub fn show_source(&self, source: bool) {
+        if let Some(faces) = &self.faces {
+            faces.set_visible_child_name(if source { SOURCE_FACE } else { PREVIEW_FACE });
+        }
+    }
+}
+
+/// The scroller a document page stands in: at full size, never sideways
+/// unless `sideways`.
+fn page_scroller(content: &impl IsA<gtk::Widget>, sideways: bool) -> gtk::ScrolledWindow {
+    gtk::ScrolledWindow::builder()
+        .child(content)
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(if sideways {
+            gtk::PolicyType::Automatic
+        } else {
+            gtk::PolicyType::Never
+        })
+        .build()
+}
+
+/// Markdown as it was written: read-only, highlighted as the editor
+/// highlights a `.md` file, and folded at the page's width — a response's
+/// paragraphs are single lines, and a page that scrolled sideways to read
+/// one would be worse than the preview it is an alternative to.
+fn markdown_source(text: &str) -> gtk::Widget {
+    let buffer = sourceview5::Buffer::new(None);
+    buffer.set_text(text);
+    let language = sourceview5::LanguageManager::default().language("markdown");
+    sourceview5::prelude::BufferExt::set_language(&buffer, language.as_ref());
+    sourceview5::prelude::BufferExt::set_highlight_syntax(&buffer, true);
+    apply_scheme(&buffer);
+    let view = sourceview5::View::builder()
+        .buffer(&buffer)
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(PAGE_INSET)
+        .bottom_margin(PAGE_INSET)
+        .left_margin(PAGE_INSET)
+        .right_margin(PAGE_INSET)
+        .build();
+    view.upcast()
 }
 
 /// A document page's inset — the markdown preview's own figure, so a

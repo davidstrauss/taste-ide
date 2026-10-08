@@ -109,7 +109,9 @@ and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `quiet` — `busy` silent for over a minute, the
 working line saying for how long and naming Stop —, `starting` — the line above the composer while the environment comes up,
 a message waiting on it —, `replies` — the turn over on a question, the agent's suggested replies
-under it as buttons —, `reseat` — a prompt sent mid-turn and taken after it, the marker left where it was typed with the rail running through it, the prompt seated below the turn —, `stopped` — the same turn stopped, the steps it left running settled on their hollow "never reported finishing" dot —, `table` — a finished answer with a three-column table of sentence-long cells in a reply long enough to clip, the row that once stood a page tall under its last line (`table.rs`) —, `ask` — the agent's questions on the card above the composer, two as the adapter sends an AskUserQuestion of them (an ACP form elicitation: described options, a multi-select, the "Other" boxes; `elicit.rs`) —, `rebuild` — the agent's own rebuild call coming back as the connection closing, drawn finished rather than failed, the IDE's note under it —, `acts` — the coordinator's transcript, its
+under it as buttons —, `reseat` — a prompt sent mid-turn and taken after it, the marker left where it was typed with the rail running through it, the prompt seated below the turn —, `stopped` — the same turn stopped, the steps it left running settled on their hollow "never reported finishing" dot —, `table` — a finished answer with a three-column table of sentence-long cells in a reply long enough to clip, the row that once stood a page tall under its last line (`table.rs`) —, `ask` — the agent's questions on the card above the composer, two as the adapter sends an AskUserQuestion of them (an ACP form elicitation: described options, a multi-select, the "Other" boxes; `elicit.rs`) —, `rebuild` — the agent's own rebuild call coming back as the connection closing, drawn finished rather than failed, the IDE's note under it —, `task` — two background subagents reporting back into a turn, one
+finished with its report one click away and one failed, which is what
+Claude Code's `<task-notification>` messages are drawn as —, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,
 `permission-edit`, `permission-standing`, `standing`,
 `none` — no chat seeded at all —,
@@ -128,7 +130,9 @@ taken back; `controls` opens the shade scrolled to its Model and security
 section — the permissions row, the model drop-down, fast mode, and the
 effort slider — posed from what the pinned adapter advertises, which a
 probe otherwise never has, since that half of the shade needs a session);
-`TASTE_PROBE_DOC` (`edit`, `command`, `prompt`, `changes` — a submodule's change as the Dirty list opens it, `submodule_diff.rs`) opens that step of the
+`TASTE_PROBE_DOC` (`edit`, `command`, `prompt`, `changes` — a submodule's change as the Dirty list opens it, `submodule_diff.rs` —, `response` — an
+answer's rendered face —, and `source` — the same answer on its Markdown,
+the face the editor's mode menu switches it to) opens that step of the
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_PREVIEW=README.md` (a markdown file, relative
 to where the probe was started; an image, a PDF, or audio or video opens in

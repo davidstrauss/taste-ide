@@ -227,6 +227,11 @@ pub enum Focused {
 
 /// The startup page's tab glyph and its key among the surfaces.
 const STARTUP_ICON: &str = "emblem-synchronizing-symbolic";
+/// A rendered document's two faces in the mode menu: the preview wears
+/// what a Markdown file's Preview wears, and the Markdown itself the plain
+/// text glyph rather than Edit's pencil, since a document is read-only.
+const DOC_PREVIEW_ICON: &str = "x-office-document-symbolic";
+const DOC_SOURCE_ICON: &str = "text-x-generic-symbolic";
 const STARTUP_KEY: &str = "startup:primary";
 
 /// `log:<env>/<kind>` — one tab per environment per log; the IDE's own log
@@ -597,6 +602,9 @@ pub struct Editor {
     tabs: adw::TabView,
     mode_menu: gtk::MenuButton,
     mode_popover: gtk::Popover,
+    /// The face the last rendered document was switched to: a response
+    /// opened after the reader chose its Markdown opens on its Markdown.
+    doc_source: Cell<bool>,
     pages: RefCell<HashMap<PathBuf, Rc<EditorPage>>>,
     /// Tabs the last session had open that the folder does not hold —
     /// files the mirror never carries, the ignored ones, which exist only
@@ -792,6 +800,7 @@ impl Editor {
             tabs,
             mode_menu: mode_menu.clone(),
             mode_popover: mode_popover.clone(),
+            doc_source: Cell::new(false),
             pages: RefCell::new(HashMap::new()),
             awaiting: RefCell::new((Vec::new(), None)),
             surfaces: RefCell::new(HashMap::new()),
@@ -2063,14 +2072,25 @@ impl Editor {
                     }
                 }
                 SurfaceKind::Port(page) => page.face().icon(),
+                // A rendered document names its face, as a Markdown
+                // file's toggle does.
+                SurfaceKind::Doc(page, _) if page.has_faces() => {
+                    if page.showing_source() {
+                        DOC_SOURCE_ICON
+                    } else {
+                        DOC_PREVIEW_ICON
+                    }
+                }
                 SurfaceKind::Doc(page, _) => page.icon,
                 SurfaceKind::View(page) => page.icon(),
             });
-            // A document has no modes of its own, and neither has a viewer.
-            self.mode_menu.set_sensitive(!matches!(
-                surface.kind,
-                SurfaceKind::Doc(..) | SurfaceKind::View(_)
-            ));
+            // A document has no modes of its own unless it is rendered,
+            // and a viewer has none.
+            self.mode_menu.set_sensitive(match &surface.kind {
+                SurfaceKind::Doc(page, _) => page.has_faces(),
+                SurfaceKind::View(_) => false,
+                _ => true,
+            });
             self.publish_state();
             return;
         }
@@ -2211,6 +2231,27 @@ impl Editor {
                     following,
                     Box::new(move || log.set_follow(!following)),
                 ));
+            }
+            SurfaceKind::Doc(page, _) if page.has_faces() => {
+                let source = page.showing_source();
+                for (label, icon, face) in [
+                    ("Preview", DOC_PREVIEW_ICON, false),
+                    ("Markdown", DOC_SOURCE_ICON, true),
+                ] {
+                    let editor = Rc::downgrade(self);
+                    let page = page.clone();
+                    rows.push((
+                        label.to_string(),
+                        icon,
+                        source == face,
+                        Box::new(move || {
+                            page.show_source(face);
+                            if let Some(editor) = editor.upgrade() {
+                                editor.doc_source.set(face);
+                            }
+                        }),
+                    ));
+                }
             }
             SurfaceKind::Doc(..) | SurfaceKind::View(_) => {}
         }
@@ -2509,6 +2550,13 @@ impl Editor {
     /// of a prompt, a response, a command with its output, an edit — as a
     /// read-only tab in `env`'s set (chatdoc.rs). `key` is the step's own,
     /// so a second click finds the tab the first one opened.
+    /// TASTE_PROBE_CHECK only: rendered documents open on their Markdown
+    /// from here on (`TASTE_PROBE_DOC=source`), as they do once the reader
+    /// has chosen it.
+    pub fn open_documents_on_source(&self) {
+        self.doc_source.set(true);
+    }
+
     pub fn open_document(
         self: &Rc<Self>,
         env: &taste_core::environment::EnvironmentId,
@@ -2526,6 +2574,7 @@ impl Editor {
             events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
         });
         let page = crate::chatdoc::DocPage::new(&doc, on_link);
+        page.show_source(self.doc_source.get());
         let tab = self.tabs.append(&page.widget);
         tab.set_title(&if env.is_primary() {
             doc.title()
