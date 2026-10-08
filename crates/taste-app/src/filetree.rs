@@ -5662,6 +5662,13 @@ impl FileTree {
                 tree.run_branch_op(name, true);
             });
         }
+        // Enter in the field is Create: a name typed is a name meant
+        // (David, 2026-10-08: "When I type a new branch name and press
+        // enter, it should apply the change without a button click").
+        {
+            let create = create.clone();
+            entry.connect_activate(move |_| create.emit_clicked());
+        }
         let create_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         create_row.set_margin_top(6);
         create_row.append(&entry);
