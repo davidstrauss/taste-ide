@@ -4801,6 +4801,7 @@ impl ChatPane {
             // The IDE's own node when the container runs it, the image's
             // otherwise (`taste_devcontainer::agentnode`).
             node_bin: supervisor.agent_node_bin().map(std::path::PathBuf::from),
+            task_dir: supervisor.agent_task_dir().map(std::path::PathBuf::from),
         })
     }
 

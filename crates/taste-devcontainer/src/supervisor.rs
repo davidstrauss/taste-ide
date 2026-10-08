@@ -576,6 +576,9 @@ pub struct Supervisor {
     /// What the last hosting probe found of the IDE's own node
     /// (`Supervisor::agent_node_bin`).
     agent_node: Mutex<Option<String>>,
+    /// The IDE's Task's directory in the container, when the last probe
+    /// found it running there (`crate::agentnode::task_probe`).
+    agent_task: Mutex<Option<String>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     /// The same lines on disk, once the window that supervises this
@@ -911,6 +914,7 @@ impl Supervisor {
             folder_watch: Mutex::new(None),
             folder_sync: Mutex::new(()),
             agent_node: Mutex::new(None),
+            agent_task: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             log_file: Mutex::new(None),
@@ -2317,6 +2321,13 @@ impl Supervisor {
         self.agent_node.lock().unwrap().clone()
     }
 
+    /// The directory of the IDE's own Task in this environment's container,
+    /// when the last probe found it running there: what an agent's `PATH`
+    /// ends with, so `task` is there whatever the image carries.
+    pub fn agent_task_dir(&self) -> Option<String> {
+        self.agent_task.lock().unwrap().clone()
+    }
+
     /// Ask the container whether it can host an agent, and remember the
     /// answer for as long as that container lives.
     ///
@@ -2405,6 +2416,15 @@ impl Supervisor {
             .map(|bin| bin.trim().to_string())
             .filter(|bin| !bin.is_empty());
         *self.agent_node.lock().unwrap() = ours.clone();
+        // The IDE's Task, which is static and so runs where its node may
+        // not (an Alpine image).
+        let task = self
+            .run_captured(sh(crate::agentnode::task_probe()))
+            .await
+            .ok()
+            .map(|dir| dir.trim().to_string())
+            .filter(|dir| !dir.is_empty());
+        *self.agent_task.lock().unwrap() = task;
         let hosting = if ours.is_none()
             && self
                 .run_captured(sh("command -v node".into()))

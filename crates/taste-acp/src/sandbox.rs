@@ -609,6 +609,7 @@ mod tests {
                 ),
                 auth: None,
                 node_bin: None,
+                task_dir: None,
             },
         );
         assert!(inside.contains(&format!("HOME={home}")), "{inside:?}");

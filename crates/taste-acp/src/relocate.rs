@@ -103,6 +103,13 @@ pub struct Relocation {
     /// so the adapter, the bridge, and the forwarder all run on it and the
     /// image need carry no node. `None` uses the image's own.
     pub node_bin: Option<PathBuf>,
+    /// The directory of the IDE's own Task in the container, when it runs
+    /// there (`taste_devcontainer::agentnode::task_probe`): put LAST on the
+    /// agent's `PATH`, so `task` works in its shell whatever the image
+    /// carries and an image's own Task still wins (David, 2026-10-08:
+    /// "Agents should probably understand that the IDE can inject its own
+    /// Taskfile runner now"). `None` adds nothing.
+    pub task_dir: Option<PathBuf>,
 }
 
 /// The in-container auth forwarder, as a node program.
@@ -240,33 +247,28 @@ fn exec_in_environment(
             "-c".into(),
             CLAUDE_PRELUDE.into(),
             "taste-agent".into(),
-            relocation
-                .node_bin
-                .as_ref()
-                .map(|bin| bin.display().to_string())
-                .unwrap_or_default(),
+            path_arg(&relocation.node_bin),
+            path_arg(&relocation.task_dir),
             claude_settings_script(),
         ]);
         args.extend(inner);
         return relocation.podman.argv(args);
     }
-    match &relocation.node_bin {
-        // Prepended in the container's own shell rather than set with
-        // `--env`, which would replace the image's `PATH` wholesale, and
-        // it is the image's tools the agent's shell is there to reach.
-        // The directory rides as an argument, never in the script.
-        Some(bin) => {
-            args.extend([
-                "sh".into(),
-                "-c".into(),
-                r#"PATH="$1:$PATH"; export PATH; shift; exec "$@""#.into(),
-                "taste-agent".into(),
-                bin.display().to_string(),
-            ]);
-            args.extend(inner);
-        }
-        None => args.extend(inner),
+    // Set in the container's own shell rather than with `--env`, which
+    // would replace the image's `PATH` wholesale, and it is the image's
+    // tools the agent's shell is there to reach. The directories ride as
+    // arguments, never in the script.
+    if relocation.node_bin.is_some() || relocation.task_dir.is_some() {
+        args.extend([
+            "sh".into(),
+            "-c".into(),
+            PATH_PRELUDE.into(),
+            "taste-agent".into(),
+            path_arg(&relocation.node_bin),
+            path_arg(&relocation.task_dir),
+        ]);
     }
+    args.extend(inner);
     relocation.podman.argv(args)
 }
 
@@ -299,12 +301,23 @@ pub const CLAUDE_ALLOWED_TOOLS: [&str; 5] = [
 /// all past it (2026-10-05).
 const CLAUDE_MCP_TEXT_LIMIT: &str = "32768";
 
-/// Run before the agent: `$1` a directory for the front of `PATH` (empty
-/// for none), `$2` the settings script, the agent's command after. A
+/// A directory for the agent's `PATH`, as a prelude's argument: empty for
+/// none.
+fn path_arg(dir: &Option<PathBuf>) -> String {
+    dir.as_ref()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default()
+}
+
+/// Run before an agent: `$1` a directory for the front of `PATH` (the
+/// IDE's node), `$2` one for the end (the IDE's Task), either empty for
+/// none, and the agent's command after.
+const PATH_PRELUDE: &str = r#"[ -n "$1" ] && PATH="$1:$PATH"; [ -n "$2" ] && PATH="$PATH:$2"; export PATH; shift 2; exec "$@""#;
+
+/// [`PATH_PRELUDE`] for Claude Code, with `$3` the settings script. A
 /// settings file that cannot be merged leaves the agent with its own
 /// tools, which still work, so a failure there does not stop the start.
-const CLAUDE_PRELUDE: &str =
-    r#"[ -n "$1" ] && PATH="$1:$PATH"; export PATH; node -e "$2" || true; shift 2; exec "$@""#;
+const CLAUDE_PRELUDE: &str = r#"[ -n "$1" ] && PATH="$1:$PATH"; [ -n "$2" ] && PATH="$PATH:$2"; export PATH; node -e "$3" || true; shift 3; exec "$@""#;
 
 fn is_claude_code(spec: &AgentSpec) -> bool {
     spec.id == crate::registry::CLAUDE_CODE || spec.id == crate::registry::CLAUDE_CODE_CUSTOM
@@ -359,11 +372,35 @@ mod tests {
                 socket: taste_core::environment::container_auth_socket(&env),
             }),
             node_bin: None,
+            task_dir: None,
         }
     }
 
     fn relocation() -> Relocation {
         relocation_on(taste_core::PodmanTarget::local(false))
+    }
+
+    /// With the IDE's own Task found in the container, the agent's shell
+    /// has `task` after the image's own tools, and with nothing else the
+    /// IDE adds, the prelude still runs to put it there.
+    #[test]
+    fn the_injected_task_goes_last_on_the_images_path() {
+        let mut relocation = relocation();
+        relocation.task_dir = Some("/opt/taste-agent/task-v3.54.0-linux-amd64".into());
+        let mut spec = spec();
+        spec.id = "another-agent".into();
+        let (_, args) = relocated_agent_command(&spec, Path::new("/w"), &relocation);
+        let container = args
+            .iter()
+            .position(|a| a == "taste-abc123-review")
+            .unwrap();
+        assert_eq!(args[container + 3], PATH_PRELUDE);
+        assert!(PATH_PRELUDE.contains(r#"PATH="$PATH:$2""#));
+        assert_eq!(args[container + 5], "", "no node of the IDE's");
+        assert_eq!(
+            args[container + 6],
+            "/opt/taste-agent/task-v3.54.0-linux-amd64"
+        );
     }
 
     /// With the IDE's own node found in the container, the agent runs with
@@ -398,7 +435,7 @@ mod tests {
             .unwrap()
             + 1..];
         assert_eq!(
-            &args[container + 6..],
+            &args[container + 7..],
             tail,
             "the same command, after the prefix"
         );
@@ -466,7 +503,7 @@ mod tests {
         // Claude Code's settings prelude first, then the forwarder
         // wrapping the agent.
         assert_eq!(args[container + 3], CLAUDE_PRELUDE);
-        assert_eq!(args[container + 7], "node", "the forwarder wraps the agent");
+        assert_eq!(args[container + 8], "node", "the forwarder wraps the agent");
         assert!(args[container..].contains(&"npx".to_string()));
     }
 
@@ -626,6 +663,7 @@ mod tests {
                 mcp_socket: PathBuf::from("/tmp/taste-ide-p/mcp.sock"),
                 auth: None,
                 node_bin: None,
+                task_dir: None,
             },
         );
         let container = args.iter().position(|a| a == "c").unwrap();
@@ -646,7 +684,7 @@ mod tests {
             .unwrap();
         assert_eq!(args[container + 3], CLAUDE_PRELUDE);
         assert_eq!(args[container + 5], "/opt/taste-agent/bin");
-        assert!(args[container + 6].contains("\"Edit\""), "{args:?}");
+        assert!(args[container + 7].contains("\"Edit\""), "{args:?}");
         let (_, plain) = relocated_agent_command(&spec(), Path::new("/w"), &self::relocation());
         assert_eq!(
             plain[container + 5],

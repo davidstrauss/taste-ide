@@ -182,9 +182,31 @@ pub const PROBE: &str = r#"for d in /opt/taste-agent/node-v24.21.0-linux-*; do
 done
 exit 1"#;
 
+/// Run in an environment's container: the directory of the IDE's pinned
+/// Task, when it is mounted and runs there, printed; exit 1 otherwise.
+/// What goes last on an agent's `PATH` (`taste_acp::Relocation::task_dir`)
+/// and an agent's `ide_exec` shell lines'.
+pub fn task_probe() -> String {
+    format!(
+        r#"for d in {IN_CONTAINER}/task-v{}-linux-*; do
+  if [ -x "$d/task" ] && "$d/task" --version >/dev/null 2>&1; then echo "$d"; exit 0; fi
+done
+exit 1"#,
+        taste_core::tasks::IDE_TASK_VERSION
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_task_probe_looks_for_the_pinned_task() {
+        assert!(task_probe().contains(&format!(
+            "{IN_CONTAINER}/task-v{}-linux-",
+            taste_core::tasks::IDE_TASK_VERSION
+        )));
+    }
 
     /// The probe looks for the version that is pinned, not a stale copy of
     /// its number.

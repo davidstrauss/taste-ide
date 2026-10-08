@@ -443,6 +443,7 @@ impl Relocated {
                     socket: channel.paths().auth.clone(),
                 }),
                 node_bin: None,
+                task_dir: None,
             }),
             Some(terminals),
             false,

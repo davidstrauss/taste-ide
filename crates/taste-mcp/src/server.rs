@@ -239,6 +239,11 @@ impl McpServer {
              later. When they ask for a set of backlog items in one go, file the set and \
              show them the list. Follow-up work you find while working an issue is a new \
              issue, not a detour.\n\n\
+             TASKS. `task` (Task, taskfile.dev) is always there in your environment's \
+             container: the image's own when it has one, otherwise the IDE's, which it \
+             puts on your PATH and on ide_exec's. Do not install Task, link go-task to \
+             task, or change the devcontainer to provide it. task_list and task_run run \
+             the project's Taskfile where the user sees it.\n\n\
              REPLIES. When a turn ends on a question or a choice for the user — confirm \
              this, pick one of these — call suggest_replies last, with the replies they \
              are likeliest to give, so they can answer with a click. Each reply names \
@@ -2062,8 +2067,22 @@ impl McpServer {
                 // and `command: "cargo"` alone means the same either way.
                 let shell_line = argv.is_empty();
                 let line = command.to_string();
+                let supervisor = self.supervisor(env)?;
                 let (command, argv) = if shell_line {
-                    ("sh", vec!["-c".to_string(), command.to_string()])
+                    // The IDE's Task last on the line's PATH, as on the
+                    // agent's own (`taste_acp::Relocation::task_dir`): a
+                    // `task` in an ide_exec line finds the same Task its
+                    // shell would. The directory is the probe's answer, a
+                    // path the IDE mounted, and is used only when it is
+                    // nothing but path characters.
+                    let script = match supervisor.agent_task_dir().filter(|dir| {
+                        dir.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
+                    }) {
+                        Some(dir) => format!("PATH=\"$PATH:{dir}\"; export PATH; {command}"),
+                        None => command.to_string(),
+                    };
+                    ("sh", vec!["-c".to_string(), script])
                 } else {
                     (command, argv)
                 };
@@ -2075,7 +2094,6 @@ impl McpServer {
                 // point of the refusal, is the HOST: no container of any
                 // authority means nowhere to run, and an agent command never
                 // falls back to the user's machine.
-                let supervisor = self.supervisor(env)?;
                 if !supervisor.exec().has_exec_target() {
                     anyhow::bail!(
                         "environment {env} has no container running, so there is nowhere \
