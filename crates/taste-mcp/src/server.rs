@@ -1017,6 +1017,8 @@ impl McpServer {
                 "devcontainer_reload",
                 "Rebuild and restart this environment's container from .devcontainer/, \
                  in its VM; nobody is asked, and the user is told how it ended. \
+                 Call it for config changes YOU made, once they are complete; a change \
+                 you did not make may be the user's, unfinished, so leave it to them. \
                  Editor buffers and chats survive it. Returns at once unless \
                  `wait_seconds` is set; a full build can take minutes, so call \
                  environment to follow it.",
@@ -4636,6 +4638,7 @@ impl McpServer {
         let root = self.checkout_path(env)?;
         let safe_mode = self.safe_mode(env)?;
         let shown = path.display().to_string();
+        let config = is_config_path(&root, &path);
         if !taste_core::policy::write_allowed(&root, safe_mode, &path) {
             anyhow::bail!(if safe_mode {
                 format!(
@@ -4720,7 +4723,7 @@ impl McpServer {
             .context("the write did not finish")?
         }
         .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(match done {
+        let mut reply = match done {
             Some(done) => {
                 let changed = args["new_string"]
                     .as_str()
@@ -4733,7 +4736,21 @@ impl McpServer {
                 json!({ "edited": shown, "replaced": done.count, "around": snippet })
             }
             None => json!({ "written": shown }),
-        })
+        };
+        // The agent's own change to the environment's config, known to be
+        // its own because it came through this call — the user's editor
+        // saves never do. So this, and not the drift every config change
+        // causes, is where the rebuild is pointed at: a change the user
+        // made may be half-finished, and is theirs to apply (David,
+        // 2026-10-08: "I don't want to nudge it if I made the change in
+        // the shell/editor").
+        if config {
+            reply["next"] = json!(
+                "This is the environment's config. When your change to it is complete, \
+                 call devcontainer_reload to rebuild with it."
+            );
+        }
+        Ok(reply)
     }
 
     async fn probe(
@@ -5398,6 +5415,16 @@ fn force_confirmation(attempt: &PublishAttempt, dest: &str) -> (String, String) 
         &new[..new.len().min(12)],
     );
     (format!("Overwrite published branch {branch}?"), body)
+}
+
+/// Whether `path` is part of the checkout's devcontainer config: under
+/// `.devcontainer/`, or the `.devcontainer.json` VS Code also reads at the
+/// root.
+fn is_config_path(root: &std::path::Path, path: &std::path::Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative.starts_with(".devcontainer") || relative == std::path::Path::new(".devcontainer.json")
 }
 
 /// How many replies `suggest_replies` shows, and how long each may be:
@@ -7356,6 +7383,25 @@ mod tests {
     /// the editor's own save code, under the same write policy: here, a
     /// safe-mode checkout, where `.devcontainer/` is writable and the rest
     /// is not.
+    #[test]
+    fn the_config_is_the_devcontainer_folder_and_its_root_file() {
+        let root = std::path::Path::new("/w");
+        for (path, config) in [
+            ("/w/.devcontainer/devcontainer.json", true),
+            ("/w/.devcontainer/Containerfile", true),
+            ("/w/.devcontainer.json", true),
+            ("/w/.devcontainerrc", false),
+            ("/w/src/.devcontainer/x", false),
+            ("/elsewhere/.devcontainer/devcontainer.json", false),
+        ] {
+            assert_eq!(
+                is_config_path(root, std::path::Path::new(path)),
+                config,
+                "{path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_file_tools_read_and_edit_without_a_window() {
         let dir = tempfile::tempdir().unwrap();
@@ -7391,6 +7437,14 @@ mod tests {
         )
         .await;
         assert_eq!(edited["replaced"], 1, "{edited}");
+        // Its own change to the config, so it is pointed at the rebuild.
+        assert!(
+            edited["next"]
+                .as_str()
+                .unwrap()
+                .contains("devcontainer_reload"),
+            "{edited}"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join(".devcontainer/devcontainer.json")).unwrap(),
             "{\n  \"image\": \"new\"\n}\n"
