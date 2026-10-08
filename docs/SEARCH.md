@@ -336,8 +336,12 @@ semantic search over a workspace index
   (UPower's `OnBattery`, `taste_core::power`; David, 2026-10-08: "Pause
   semantic index building when on battery"): a build under way stops
   between files, keeping what it finished, and what is owed is built once
-  the machine is on mains; a clone an agent asks for is built regardless,
-  since that is a need rather than upkeep. Chunks are cut on content — a blank line or a definition
+  the machine is on mains. An agent's ask does not build one on battery
+  either — it is too heavy for that, whoever wants it: `ide_semantic_search`
+  answers from an index already built (a query is one embedding), declines
+  with `"status": "deferred"` and `ide_search` to use instead where there is
+  none, and a build an ask started on mains stops between files when the
+  machine goes on battery, its work kept for the next ask. Chunks are cut on content — a blank line or a definition
   starts one, once the current one has eight lines, and none runs past
   forty — so an edit disturbs the chunk it lands in and that chunk alone
   is embedded again ("Can the index be incrementally freshened?"). Text

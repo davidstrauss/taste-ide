@@ -2400,11 +2400,31 @@ impl McpServer {
                         })),
                     })),
                     Err(e) => match e.downcast_ref::<taste_semantic::Unavailable>() {
+                        // Not on battery: building an index is minutes of
+                        // embedding at full tilt, too heavy to spend the
+                        // battery on even when an agent asks (David,
+                        // 2026-10-08). An index already built answers, since
+                        // a query is one embedding; one not built is
+                        // declined, with what to use instead.
+                        Some(taste_semantic::Unavailable::NotIndexed)
+                            if taste_core::power::on_battery() =>
+                        {
+                            Ok(json!({
+                                "status": "deferred",
+                                "message": "this checkout has no index for meaning yet, and none \
+                                            is built while the machine is on battery; use \
+                                            ide_search or ide_find now. It is built when asked \
+                                            again on mains power"
+                            }))
+                        }
                         Some(taste_semantic::Unavailable::NotIndexed) => {
                             // An environment's clone is indexed on first
                             // ask (the primary's, the app keeps current
                             // itself). Off the workers; the next ask finds
-                            // it. One at a time per checkout.
+                            // it. One at a time per checkout. A build the
+                            // battery interrupts stops between files and
+                            // keeps what it embedded, so the next ask on
+                            // mains carries on from there.
                             if taste_semantic::Semantic::model_present()
                                 && !semantic.refreshing(&root)
                             {
@@ -2413,9 +2433,33 @@ impl McpServer {
                                 let files = files.clone();
                                 let events = self.workspace.events.clone();
                                 let env = env.clone();
+                                let cancel =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let done =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                {
+                                    let cancel = cancel.clone();
+                                    let done = done.clone();
+                                    tokio::spawn(async move {
+                                        use std::sync::atomic::Ordering;
+                                        while !done.load(Ordering::Relaxed) {
+                                            if taste_core::power::on_battery() {
+                                                cancel.store(true, Ordering::Relaxed);
+                                                return;
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_secs(2))
+                                                .await;
+                                        }
+                                    });
+                                }
                                 tokio::task::spawn_blocking(move || {
-                                    let cancel = std::sync::atomic::AtomicBool::new(false);
-                                    match semantic.refresh_via(&files, &root, &cancel, |_| {}) {
+                                    let outcome =
+                                        semantic.refresh_via(&files, &root, &cancel, |_| {});
+                                    done.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    match outcome {
+                                        Ok(report) if report.cancelled => tracing::info!(
+                                            "semantic index for {env}: stopped on battery"
+                                        ),
                                         Ok(report) => events.publish(Event::Toast(format!(
                                             "{env} is indexed for semantic search: {} files, {} chunks",
                                             report.files, report.chunks
