@@ -1334,9 +1334,14 @@ enum EnvReading {
 /// anything else there.
 const REBUILD_REPORT_HEAD: &str = "REBUILD RESULT (you called devcontainer_reload)\n";
 
-fn rebuild_report(ok: bool, message: &str, failure: Option<&str>) -> String {
+fn rebuild_report(ok: bool, on_project: bool, message: &str, failure: Option<&str>) -> String {
     let mut text = String::from(REBUILD_REPORT_HEAD);
     match (ok, failure) {
+        (true, _) if !on_project => text.push_str(&format!(
+            "Outcome: the environment started on the IDE's baseline container, not the \
+             project's configuration{}.\n",
+            failure.map(|f| format!(": {f}")).unwrap_or_default()
+        )),
         (true, None) => text.push_str(
             "Outcome: the environment rebuilt and started, and the project's \
              configuration is in force.\n",
@@ -4856,6 +4861,14 @@ impl ChatPane {
     /// Is this chat's environment on its way somewhere? Building and
     /// starting are the two states that will produce a settled one shortly,
     /// and the only two worth waiting for rather than reacting to.
+    /// Whether the agent's connection closing now is its environment's
+    /// doing: a rebuild under way, or a relocated agent whose container
+    /// stopped (the supervisor gives up the exec target before its
+    /// teardown for exactly this reading). Not a failure of the agent's.
+    fn closed_by_environment(&self) -> bool {
+        self.environment_in_transition() || (self.relocated.get() && !self.has_exec_target())
+    }
+
     fn environment_in_transition(&self) -> bool {
         let environment = self.environment.clone();
         self.environments.get(&environment).is_some_and(|s| {
@@ -5381,11 +5394,18 @@ impl ChatPane {
     /// successful and how"). A chat with no agent coming gets the report
     /// as a note, so the record is there when one does.
     pub fn on_reload_report(self: &Rc<Self>, ok: bool, message: &str) {
-        let failure = self
+        // The outcome is the situation's, the same words the orientation
+        // ahead of it is made of: a reload can end OK with the IDE's
+        // baseline running rather than the project's config, and a report
+        // that said "in force" over an orientation saying "safe" left the
+        // agent to work out which was true (David, 2026-10-08).
+        let situation = self
             .environments
             .get(&self.environment)
-            .and_then(|supervisor| supervisor.situation().failure);
-        let text = rebuild_report(ok, message, failure.as_deref());
+            .map(|supervisor| supervisor.situation());
+        let failure = situation.as_ref().and_then(|s| s.failure.clone());
+        let on_project = situation.as_ref().is_none_or(|s| s.mode == "container");
+        let text = rebuild_report(ok, on_project, message, failure.as_deref());
         // One outcome waits for the agent, the latest: two rebuilds while it
         // was down — a fault, then the fix rebuilt — queued two reports,
         // and the first would have told it of a fault already gone (David,
@@ -9006,6 +9026,18 @@ impl ChatPane {
                 if let Some((_, on_done)) = self.capture.borrow_mut().take() {
                     on_done(String::new());
                 }
+                // The transport closed because the agent's container went
+                // down — the rebuild it asked for, usually, mid-turn. The
+                // prompt was delivered and worked on, so it stays in the
+                // transcript and is not handed back or sent again; the
+                // close that follows says what happened (David, 2026-10-08:
+                // a "prompt failed: Incoming transport closed" row under
+                // the agent's own "Rebuild the container").
+                if self.closed_by_environment() {
+                    self.pending_prompts.borrow_mut().pop_front();
+                    self.settle_running_steps();
+                    return;
+                }
                 // A rejected prompt is not part of the conversation: take
                 // its card out of the transcript and hand the text back.
                 let rejected = self.pending_prompts.borrow_mut().pop_front();
@@ -9236,7 +9268,7 @@ impl ChatPane {
                 // closes are not.
                 if self.environment_in_transition() {
                     self.note("the agent stopped with its container — it comes back when the rebuild finishes");
-                } else if self.relocated.get() && !self.has_exec_target() {
+                } else if self.closed_by_environment() {
                     // Stopped rather than rebuilt: the supervisor gives up
                     // the exec target before its teardown for exactly this
                     // reading.
@@ -9253,6 +9285,16 @@ impl ChatPane {
                 // accepted on an orchestrator's behalf to the hold queue,
                 // because it has no box to go back to and dropping it took
                 // a whole started issue's brief with it (i-0011).
+                // The one in flight when the environment took the agent down
+                // was delivered — the agent was working on it, often the
+                // very turn that asked for the rebuild — so it is not sent
+                // again: put back on the hold queue, a rebuild report the
+                // agent had already read came back to it after the next
+                // rebuild as a repeat (David, 2026-10-08). Those queued
+                // behind it never reached the agent and go back as before.
+                if self.closed_by_environment() {
+                    self.pending_prompts.borrow_mut().pop_front();
+                }
                 let pending: Vec<PendingPrompt> =
                     self.pending_prompts.borrow_mut().drain(..).collect();
                 let mut restored: Vec<String> = Vec::new();
@@ -15615,7 +15657,7 @@ mod tests {
     /// has to read; a clean rebuild says so and no more.
     #[test]
     fn the_rebuild_report_says_how_it_went() {
-        let clean = rebuild_report(true, "", None);
+        let clean = rebuild_report(true, true, "", None);
         assert!(clean.starts_with("REBUILD RESULT"), "{clean}");
         assert!(clean.contains("rebuilt and started"), "{clean}");
         assert!(!clean.contains("fault"), "{clean}");
@@ -15624,17 +15666,33 @@ mod tests {
         // 2026-09-16: "it has no idea it can pick work back up").
         assert!(clean.contains("still yours to finish"), "{clean}");
         assert!(clean.contains("Pick it back up"), "{clean}");
-        let wounded = rebuild_report(true, "", Some("a lifecycle command failed: composer"));
+        let wounded = rebuild_report(true, true, "", Some("a lifecycle command failed: composer"));
         assert!(
             wounded.contains("with a fault: a lifecycle command failed"),
             "{wounded}"
         );
-        let failed = rebuild_report(false, "manifest unknown", None);
+        let failed = rebuild_report(false, true, "manifest unknown", None);
         assert!(
             failed.contains("the rebuild failed: manifest unknown"),
             "{failed}"
         );
-        let explained = rebuild_report(false, "podman", Some("the build failed: no such image"));
+        let explained = rebuild_report(
+            false,
+            true,
+            "podman",
+            Some("the build failed: no such image"),
+        );
+        let baseline = rebuild_report(
+            true,
+            false,
+            "",
+            Some("the project's devcontainer config was passed over: refused"),
+        );
+        assert!(
+            baseline.contains("the IDE's baseline container, not the project's configuration"),
+            "{baseline}"
+        );
+        assert!(!baseline.contains("is in force"), "{baseline}");
         assert!(
             explained.contains("the rebuild failed: the build failed: no such image"),
             "{explained}"

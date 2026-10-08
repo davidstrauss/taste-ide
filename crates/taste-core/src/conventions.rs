@@ -81,7 +81,8 @@ pub fn conventions_via(files: &crate::files::Files, root: &Path) -> Vec<Conventi
         Convention {
             path: dir.join("devcontainer.json"),
             purpose: "devcontainer definition; the IDE builds and attaches to it \
-                      (validated: privilege only as nested podman needs it, mounts stay in the workspace)",
+                      (validated: privilege only as nested podman needs it, mounts stay in the workspace). \
+                      Run as a non-root user named dev, uid 1000: \"remoteUser\": \"dev\"",
             exists: has_devcontainer,
             // Inside the folder, ghost or real: a ghost folder's rows.
             ghost: true,

@@ -2005,7 +2005,9 @@ impl Supervisor {
             }
             _ if !has_config => "This checkout has no devcontainer config. Write \
                  .devcontainer/devcontainer.json (and its Containerfile, if it builds one), \
-                 then call devcontainer_reload. ide_conventions names the exact paths."
+                 then call devcontainer_reload. Run as a non-root user named dev with uid \
+                 1000: create it in the Containerfile (useradd --uid 1000 --create-home dev) \
+                 and set \"remoteUser\": \"dev\". ide_conventions names the exact paths."
                 .to_string(),
             _ => "Read the failure above, fix it under .devcontainer/ (that directory is \
                  writable), then call devcontainer_reload. Call environment with include \
