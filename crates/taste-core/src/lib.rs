@@ -23,6 +23,7 @@ pub mod network;
 pub mod orchestration;
 pub mod podman;
 pub mod policy;
+pub mod power;
 pub mod quota;
 pub mod review;
 pub mod search;

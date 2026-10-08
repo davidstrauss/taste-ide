@@ -17,6 +17,7 @@
         "--socket=pulseaudio",
         "--share=network",
         "--talk-name=org.freedesktop.Flatpak",
+        "--system-talk-name=org.freedesktop.UPower",
         "--filesystem=home"
     ],
     "build-options": {

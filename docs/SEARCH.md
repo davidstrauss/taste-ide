@@ -332,7 +332,12 @@ semantic search over a workspace index
   envs just query the base index?"). The primary is indexed when the
   window opens and re-indexed, debounced, when git says the tree changed
   (`taste-app/src/semantic.rs`); an environment's clone the first time an
-  agent asks. Chunks are cut on content — a blank line or a definition
+  agent asks. The primary's upkeep waits while the machine is on battery
+  (UPower's `OnBattery`, `taste_core::power`; David, 2026-10-08: "Pause
+  semantic index building when on battery"): a build under way stops
+  between files, keeping what it finished, and what is owed is built once
+  the machine is on mains; a clone an agent asks for is built regardless,
+  since that is a need rather than upkeep. Chunks are cut on content — a blank line or a definition
   starts one, once the current one has eight lines, and none runs past
   forty — so an edit disturbs the chunk it lands in and that chunk alone
   is embedded again ("Can the index be incrementally freshened?"). Text

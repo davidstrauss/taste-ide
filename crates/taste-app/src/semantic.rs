@@ -7,11 +7,18 @@
 //! time the index is ready and a line in the IDE log for every refresh
 //! after that (docs/spikes/agent-workspace-context.md).
 //!
+//! On battery the keeper does not build (`taste_core::power`; David,
+//! 2026-10-08: "Pause semantic index building when on battery"): a refresh
+//! asked for then is held, one under way stops between files — what it
+//! finished is kept — and both happen once the machine is on mains again.
+//! An index an agent asks for (`ide_semantic_search`) is not this keeper's
+//! and is not held: that is a need, not upkeep.
+//!
 //! Only the primary checkout is kept here. An environment's clone is
 //! indexed when an agent first asks (`ide_semantic_search` starts it), and
 //! goes with the clone.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,6 +46,10 @@ pub struct Keeper {
     /// re-asks the index for the query on screen, which may have been typed
     /// while there was nothing to ask.
     on_indexed: RefCell<Option<Box<dyn Fn()>>>,
+    /// A refresh is under way.
+    running: Rc<Cell<bool>>,
+    /// A refresh is owed: asked for, or stopped, while on battery.
+    held: Cell<bool>,
 }
 
 impl Keeper {
@@ -60,9 +71,19 @@ impl Keeper {
             cancel: RefCell::new(None),
             timer: RefCell::new(None),
             on_indexed: RefCell::new(None),
+            running: Rc::new(Cell::new(false)),
+            held: Cell::new(false),
         });
         if std::env::var_os("TASTE_PROBE_CHECK").is_some() {
             return keeper;
+        }
+        {
+            let weak = Rc::downgrade(&keeper);
+            crate::power::on_change(move |on_battery| {
+                if let Some(keeper) = weak.upgrade() {
+                    keeper.on_power(on_battery);
+                }
+            });
         }
         if taste_semantic::Semantic::model_present() {
             keeper.refresh_now();
@@ -123,12 +144,36 @@ impl Keeper {
         *self.timer.borrow_mut() = Some(id);
     }
 
+    /// Battery or mains: a build under way stops between files when the
+    /// machine goes on battery, and one owed starts when it is back on
+    /// mains.
+    fn on_power(self: &Rc<Self>, on_battery: bool) {
+        if on_battery {
+            if self.running.get() {
+                if let Some(cancel) = self.cancel.borrow().as_ref() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                self.held.set(true);
+                tracing::info!("semantic index: paused on battery; it resumes on mains");
+            }
+        } else if self.held.replace(false) {
+            self.refresh_now();
+        }
+    }
+
     /// Refresh now, stopping a refresh already in flight between files —
     /// what it finished is kept and the new one carries on from there.
     fn refresh_now(self: &Rc<Self>) {
         if !taste_semantic::Semantic::model_present() {
             return;
         }
+        if taste_core::power::on_battery() {
+            if !self.held.replace(true) {
+                tracing::info!("semantic index: held on battery; it is built on mains");
+            }
+            return;
+        }
+        self.running.set(true);
         if let Some(previous) = self.cancel.borrow_mut().take() {
             previous.store(true, Ordering::Relaxed);
         }
@@ -203,8 +248,10 @@ impl Keeper {
             let _ = tx.send_blocking(result);
         });
         let weak = Rc::downgrade(self);
+        let running = self.running.clone();
         glib::spawn_future_local(async move {
             let Ok(result) = rx.recv().await else { return };
+            running.set(false);
             let Some(keeper) = weak.upgrade() else { return };
             match result {
                 Ok(report) if report.cancelled => {}

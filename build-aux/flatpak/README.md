@@ -45,5 +45,8 @@ flatpak run net.davidstrauss.Taste
 
 - `--talk-name=org.freedesktop.Flatpak` is required: podman, agent
   subprocesses, and `git push` all run on the host via `flatpak-spawn --host`.
+- `--system-talk-name=org.freedesktop.UPower` lets the IDE ask whether the
+  machine is on battery, which background indexing waits out
+  (`crates/taste-app/src/power.rs`). Without it the IDE assumes mains.
 - `--filesystem=home` is a stopgap until workspace selection goes through
   the file portal.

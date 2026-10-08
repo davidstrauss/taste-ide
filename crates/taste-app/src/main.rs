@@ -52,6 +52,7 @@ mod orchestration;
 mod pages_menu;
 mod palette;
 mod portview;
+mod power;
 mod preview_map;
 mod rest;
 mod results;
@@ -271,6 +272,8 @@ fn main() -> glib::ExitCode {
                 say(monitor.is_network_metered());
             });
         }
+        // Battery or mains, likewise (`power.rs`).
+        crate::power::watch();
         // App-level styling: the chat prompt entry (transparent TextView in
         // an entry-shaped container, matching GNOME chat apps).
         // The composer wears the same treatment a selected tab gets, and
