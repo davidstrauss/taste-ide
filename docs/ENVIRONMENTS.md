@@ -4074,7 +4074,11 @@ While the connection is metered, the clock above nudges nobody, tells
 the coordinator nothing, and forces nothing, since each ends in a rebuild
 that downloads; the person sees, once per metered stretch, a note in that
 environment's chat that the agent would have been asked, which the agent
-never sees. Once the connection is not metered, whatever is due happens.
+never sees. Once the connection is not metered the agent is nudged first,
+at once, and a move the stretch held past its two hours is forced no
+sooner than half an hour after that nudge (`migration::AFTER_METERED`;
+David, 2026-10-08: "I want to nudge it first"); the hold is recorded
+beside the environment, so a restart in between changes nothing.
 An agent that asks for its rebuild is choosing it, and is not held. The
 stream is not read for a newer guest release, the next release is not
 fetched ahead of the moves, and an image's package check waits; a VM made

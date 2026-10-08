@@ -410,9 +410,6 @@ pub struct EnvironmentRegistry {
     /// Whether the new release's base image is being fetched ahead of the
     /// moves that need it.
     prefetching_guest: AtomicBool,
-    /// Environments whose held nudge has been noted in their chat during
-    /// this metered stretch (`tick_migrations`).
-    metered_noted: Mutex<BTreeSet<EnvironmentId>>,
     /// Package checks under way, by image, so one image is asked once.
     image_checks: Mutex<std::collections::BTreeSet<String>>,
     /// One writer at a time for the image records file.
@@ -497,7 +494,6 @@ impl EnvironmentRegistry {
             relocations_in_flight: Mutex::new(std::collections::BTreeSet::new()),
             relocating: tokio::sync::Mutex::new(()),
             prefetching_guest: AtomicBool::new(false),
-            metered_noted: Mutex::new(BTreeSet::new()),
             image_checks: Mutex::new(std::collections::BTreeSet::new()),
             image_records_lock: Mutex::new(()),
             free_disk_for_tests: Mutex::new(None),
@@ -3893,20 +3889,23 @@ impl EnvironmentRegistry {
             if self.relocations_in_flight.lock().unwrap().contains(&id) {
                 continue;
             }
-            let due = migration.due(now);
-            if due.is_empty() {
-                continue;
-            }
             // On a metered connection nothing is nudged, told, or forced:
             // each ends in a rebuild that downloads a base image or a new
             // VM's worth, by the IDE's choice. The agent can still ask
             // (`request_migration`), which is its choice. The person sees
             // that a nudge was held, once per metered stretch, in that
-            // environment's chat and not the agent's context; once the
-            // connection is not metered the clock says what is due and it
-            // happens.
+            // environment's chat and not the agent's context. When the
+            // stretch ends the agent is nudged first, and a move held past
+            // its two hours waits `AFTER_METERED` beyond that nudge.
             if metered {
-                if self.metered_noted.lock().unwrap().insert(id.clone()) {
+                if migration.due(now).is_empty() {
+                    continue;
+                }
+                if migration.hold_for_metering() {
+                    let _ = migration.write(&self.env_dir(&id));
+                    if let Some(slot) = self.migrations.lock().unwrap().get_mut(&id) {
+                        *slot = migration.clone();
+                    }
                     self.events.publish(Event::ChatNotice {
                         env: id.clone(),
                         key: Some("metered-migration".to_string()),
@@ -3919,7 +3918,17 @@ impl EnvironmentRegistry {
                 }
                 continue;
             }
-            self.metered_noted.lock().unwrap().remove(&id);
+            let resumed = migration.resume_after_metering(now);
+            let due = migration.due(now);
+            if due.is_empty() {
+                if resumed {
+                    let _ = migration.write(&self.env_dir(&id));
+                    if let Some(slot) = self.migrations.lock().unwrap().get_mut(&id) {
+                        *slot = migration;
+                    }
+                }
+                continue;
+            }
             for due in due {
                 match due {
                     Due::Nudge => {
@@ -4952,6 +4961,56 @@ mod tests {
         let (nudges, notes) = heard(&seen);
         assert_eq!(nudges, 1, "asked once the connection is not metered");
         assert!(notes.is_empty());
+    }
+
+    /// A move held by a metered connection past its two hours is not forced
+    /// the moment the connection frees: the agent is nudged first, and the
+    /// force waits half an hour beyond that nudge.
+    #[test]
+    fn a_move_held_past_its_force_is_nudged_first() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let seen = registry.events.subscribe();
+        let primary = EnvironmentId::primary();
+        let now = now_secs();
+        let mut overdue = crate::migration::Migration::packages(
+            "vm",
+            "44",
+            "package updates are available",
+            now - 3 * 60 * 60,
+        );
+        overdue.requested_at = None;
+        overdue.last_nudge = Some(now - 5 * 60);
+        registry
+            .migrations
+            .lock()
+            .unwrap()
+            .insert(primary.clone(), overdue);
+        let _ = seen.try_recv();
+
+        registry.tick_migrations_with(true);
+        registry.tick_migrations_with(false);
+        let mut nudged = false;
+        while let Ok(event) = seen.try_recv() {
+            nudged |= matches!(
+                event,
+                Event::MigrationNotice {
+                    audience: taste_core::MigrationAudience::Agent,
+                    ..
+                }
+            );
+        }
+        assert!(nudged, "the agent is told first");
+        let after = registry.migration_of(&primary).unwrap();
+        assert!(!after.held_metered);
+        assert!(
+            after.forced_at() >= now + crate::migration::AFTER_METERED.as_secs(),
+            "and the force waits half an hour past it"
+        );
+        assert!(
+            registry.relocations_in_flight.lock().unwrap().is_empty(),
+            "nothing was forced"
+        );
     }
 
     /// The placement file is what tells a restored environment its

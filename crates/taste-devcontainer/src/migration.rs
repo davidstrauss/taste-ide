@@ -48,6 +48,10 @@ pub const NUDGE_EVERY: Duration = Duration::from_secs(10 * 60);
 pub const TELL_COORDINATOR_AFTER: Duration = Duration::from_secs(60 * 60);
 /// How long after it became pending a move is forced.
 pub const FORCE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
+/// The least a forced move waits after a metered stretch ends: the agent
+/// is told first, at once, and given this long to ask before it happens
+/// regardless (David, 2026-10-08: "I want to nudge it first").
+pub const AFTER_METERED: Duration = Duration::from_secs(30 * 60);
 /// How long a move that failed waits before it is tried again.
 pub const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 /// How often an image's package manager is asked whether it has updates,
@@ -98,6 +102,16 @@ pub struct Migration {
     /// again every minute.
     #[serde(default)]
     pub failed_at: Option<u64>,
+    /// Whether something came due while the connection was metered and
+    /// was held (`taste_core::network`). Recorded beside the environment,
+    /// so a restart in between still nudges first when the stretch ends.
+    #[serde(default)]
+    pub held_metered: bool,
+    /// The earliest a forced move may happen, when a metered stretch held
+    /// it past its two hours: [`AFTER_METERED`] after the nudge that
+    /// followed.
+    #[serde(default)]
+    pub force_not_before: Option<u64>,
 }
 
 /// What the clock says is due for a pending move.
@@ -125,6 +139,8 @@ impl Migration {
             last_nudge: None,
             coordinator_told: false,
             failed_at: None,
+            held_metered: false,
+            force_not_before: None,
         }
     }
 
@@ -173,7 +189,25 @@ impl Migration {
 
     /// When it will be forced, in Unix seconds.
     pub fn forced_at(&self) -> u64 {
-        self.pending_since + FORCE_AFTER.as_secs()
+        (self.pending_since + FORCE_AFTER.as_secs()).max(self.force_not_before.unwrap_or(0))
+    }
+
+    /// Something came due on a metered connection and was held. True the
+    /// first time in a stretch, which is when the person is told.
+    pub fn hold_for_metering(&mut self) -> bool {
+        !std::mem::replace(&mut self.held_metered, true)
+    }
+
+    /// The connection is not metered: if something was held, the agent is
+    /// told again at once and a forced move waits [`AFTER_METERED`] past
+    /// that, so nothing happens to it unannounced. True when it was held.
+    pub fn resume_after_metering(&mut self, now: u64) -> bool {
+        if !std::mem::replace(&mut self.held_metered, false) {
+            return false;
+        }
+        self.last_nudge = None;
+        self.force_not_before = Some(self.forced_at().max(now + AFTER_METERED.as_secs()));
+        true
     }
 
     /// What is due at `now`. A forced move is all there is once it is
