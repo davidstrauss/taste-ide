@@ -179,14 +179,57 @@ fn render_full(
     // the end decides what the image becomes.
     let mut image: Option<(String, String)> = None;
 
+    // Prose is set as RUNS: consecutive headings, paragraphs, and list
+    // items share one label, so a selection can cross from one to the
+    // next. GTK cannot carry a selection from one label into another, and
+    // a label per paragraph made "select these three bullets" impossible
+    // (David, 2026-10-09: "I often can't select text that spans multiple
+    // paragraphs (or even bullets) in the chat or Markdown preview"). A
+    // block that is a widget of its own — code, a table, a picture, a
+    // rule — or a quote's indent ends the run.
+    //
+    // A block joins the run when it ends (`end_block`); the run becomes a
+    // label when something that is not prose interrupts it, or the
+    // document ends (`flush`, which ends the open block first).
+    let run: RefCell<(String, Option<Block>)> = RefCell::new((String::new(), None));
+    let end_block = |markup: &mut String, heading: &mut Option<HeadingLevel>, block: Block| {
+        let level = heading.take();
+        if markup.trim().is_empty() {
+            markup.clear();
+            return;
+        }
+        let block = if level.is_some() {
+            Block::Heading
+        } else {
+            block
+        };
+        let mut run = run.borrow_mut();
+        let (text, last) = &mut *run;
+        if let Some(last) = *last {
+            text.push('\n');
+            text.push_str(gap(last, block));
+        }
+        match level {
+            Some(level) => {
+                let (size, weight) = heading_type(level);
+                text.push_str(&format!(
+                    "<span font_size=\"{size}\" weight=\"{weight}\">{markup}</span>"
+                ));
+            }
+            None => text.push_str(markup),
+        }
+        markup.clear();
+        *last = Some(block);
+    };
     let flush = |markup: &mut String,
                  spans: &mut Vec<String>,
                  heading: &mut Option<HeadingLevel>,
                  quote_depth: usize,
                  root: &gtk::Box,
                  on_link: &Rc<dyn Fn(&str)>| {
+        end_block(markup, heading, Block::Paragraph);
+        let (markup, _) = std::mem::take(&mut *run.borrow_mut());
         if markup.trim().is_empty() {
-            markup.clear();
             spans.clear();
             return;
         }
@@ -199,13 +242,6 @@ fn render_full(
             .xalign(0.0)
             .selectable(true)
             .build();
-        match heading.take() {
-            Some(HeadingLevel::H1) => label.add_css_class("title-1"),
-            Some(HeadingLevel::H2) => label.add_css_class("title-2"),
-            Some(HeadingLevel::H3) => label.add_css_class("title-3"),
-            Some(_) => label.add_css_class("title-4"),
-            None => {}
-        }
         if quote_depth > 0 {
             label.set_margin_start(14 * quote_depth as i32);
             label.add_css_class("dim-label");
@@ -247,7 +283,6 @@ fn render_full(
         // (`issue_pill::PillText`); the label itself is still the thing
         // selected, clicked, and asked for tooltips above.
         root.append(&crate::issue_pill::PillText::wrap(&label));
-        markup.clear();
     };
 
     for event in parser {
@@ -270,14 +305,10 @@ fn render_full(
                     code_block = Some(String::new());
                 }
                 Tag::List(start) => {
-                    flush(
-                        &mut markup,
-                        &mut spans,
-                        &mut heading,
-                        quote_depth,
-                        &root,
-                        &on_link,
-                    );
+                    // The text before a list — a paragraph, or the item a
+                    // nested list belongs to — ends here; the list goes on
+                    // in the same run.
+                    end_block(&mut markup, &mut heading, Block::Item);
                     list_stack.push(start);
                 }
                 Tag::Item => {
@@ -337,16 +368,15 @@ fn render_full(
                 _ => {}
             },
             Event::End(tag) => match tag {
-                TagEnd::Heading(_) | TagEnd::Paragraph | TagEnd::Item => {
-                    flush(
-                        &mut markup,
-                        &mut spans,
-                        &mut heading,
-                        quote_depth,
-                        &root,
-                        &on_link,
-                    );
+                TagEnd::Heading(_) | TagEnd::Paragraph => {
+                    let block = if list_stack.is_empty() {
+                        Block::Paragraph
+                    } else {
+                        Block::Item
+                    };
+                    end_block(&mut markup, &mut heading, block);
                 }
+                TagEnd::Item => end_block(&mut markup, &mut heading, Block::Item),
                 TagEnd::CodeBlock => {
                     if let Some(code) = code_block.take() {
                         let code = code.trim_end_matches('\n');
@@ -511,6 +541,38 @@ fn render_full(
         &on_link,
     );
     root.upcast()
+}
+
+/// What a block of prose was, for the space above the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Block {
+    Paragraph,
+    Heading,
+    Item,
+}
+
+/// The space between two blocks of a run, as an empty line of the given
+/// size: what the box's spacing was when each block was a label of its
+/// own, about ten pixels, and less between the items of one list, which
+/// read as one block. A heading takes more above it than below.
+fn gap(previous: Block, next: Block) -> &'static str {
+    match (previous, next) {
+        (Block::Item, Block::Item) => "<span font_size=\"3pt\">\n</span>",
+        (_, Block::Heading) => "<span font_size=\"9pt\">\n</span>",
+        _ => "<span font_size=\"6pt\">\n</span>",
+    }
+}
+
+/// A heading's type: libadwaita's `title-1` to `title-4`, which a heading
+/// wore as a class when it was a label of its own, as Pango sizes them
+/// relative to the body (20, 15, 15, and 13 points over 11).
+fn heading_type(level: HeadingLevel) -> (&'static str, u16) {
+    match level {
+        HeadingLevel::H1 => ("181%", 800),
+        HeadingLevel::H2 => ("136%", 800),
+        HeadingLevel::H3 => ("136%", 700),
+        _ => ("118%", 700),
+    }
 }
 
 /// A code block: monospace card with a copy button that confirms itself.
@@ -741,6 +803,52 @@ mod tests {
             root: PathBuf::from("/checkout"),
             open_file: Rc::new(|_, _| {}),
         }
+    }
+
+    /// The labels a rendering set its prose in, in order, by their text.
+    fn prose(widget: &gtk::Widget) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            match current.downcast_ref::<gtk::Label>() {
+                // A code card's own label is monospace; prose is not.
+                Some(label) if label.is_selectable() && !label.has_css_class("monospace") => {
+                    found.push(label.text().to_string())
+                }
+                _ => found.extend(prose(&current)),
+            }
+            child = current.next_sibling();
+        }
+        found
+    }
+
+    /// A heading, its paragraphs, and a list are ONE label, so a selection
+    /// can run from the heading to the last bullet; a code block is a
+    /// widget of its own and starts the next run.
+    #[test]
+    fn prose_runs_are_one_label_so_a_selection_can_cross_them() {
+        crate::gtk_test::on_gtk_thread("markdown runs: no display — skipped", || {
+            let rendered = render(
+                "# Title\n\nFirst paragraph.\n\n- one\n- two\n  - nested\n\nAfter the list.\n\n\
+                 ```\ncode\n```\n\nAfter the code.",
+                Rc::new(|_: &str| {}),
+            );
+            let runs = prose(&rendered);
+            assert_eq!(runs.len(), 2, "{runs:?}");
+            let first = &runs[0];
+            for part in [
+                "Title",
+                "First paragraph.",
+                "• one",
+                "• two",
+                "• nested",
+                "After the list.",
+            ] {
+                assert!(first.contains(part), "{part} missing from {first:?}");
+            }
+            assert!(!first.contains("code"), "{first:?}");
+            assert_eq!(runs[1], "After the code.");
+        });
     }
 
     #[test]
