@@ -1,0 +1,10 @@
+[package]
+name = "taste-confine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kernel confinement (Landlock and seccomp) for the IDE's helper processes"
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true

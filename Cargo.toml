@@ -14,6 +14,7 @@ members = [
     "crates/taste-gcp",
     "crates/taste-semantic",
     "crates/taste-embed",
+    "crates/taste-confine",
     "crates/taste-app",
 ]
 
@@ -36,6 +37,7 @@ taste-voice = { path = "crates/taste-voice" }
 taste-models = { path = "crates/taste-models" }
 taste-gcp = { path = "crates/taste-gcp" }
 taste-semantic = { path = "crates/taste-semantic" }
+taste-confine = { path = "crates/taste-confine" }
 
 anyhow = "1"
 thiserror = "2"
