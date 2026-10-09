@@ -170,10 +170,9 @@ fn is_git_dir_name(name: &str) -> bool {
     folded == ".git" || folded == "git~1"
 }
 
-/// Where the mirror keeps the paths it will never touch or send: those the
-/// folder ignored at the moment a pass changed a `.gitignore`, one per
-/// line, inside the folder's own git directory.
-const HELD_FILE: &str = "taste-mirror-held";
+/// Where the mirror once kept paths it held back after a `.gitignore`
+/// change; removed when found (`mirror_at`), since nothing is held now.
+const RETIRED_HELD_FILE: &str = "taste-mirror-held";
 
 /// The commit a snapshot names in its message ("taste snapshot against
 /// <oid>"), if it names one.
@@ -252,6 +251,8 @@ impl GitWorkspace {
         if let Some(reason) = self.mirror_paused()? {
             return Ok(Mirror::Paused { reason });
         }
+        // A list of held paths an earlier version kept; nothing reads it.
+        let _ = std::fs::remove_file(self.repo.path().join(RETIRED_HELD_FILE));
         let target = snap.tree()?;
         let based_on_tip = snapshot_base(snap.message().unwrap_or("")) == Some(tip);
         if !based_on_tip && target.id() != tip_commit.tree_id() {
@@ -289,12 +290,8 @@ impl GitWorkspace {
         if current != baseline {
             // Each side's changes since the base, path by path, as the
             // entry each now has (`None`: deleted).
-            let held = self.held_paths();
             let mut here = self.entries_between(baseline, current)?;
-            // What the folder ignored before the checkout un-ignored it is
-            // still the folder's own and stays here: a `.env` a `.gitignore`
-            // change surfaced is not the user's edit to send.
-            here.retain(|path, entry| !under_any(path, &held) && self.folder_owns(path, entry));
+            here.retain(|path, entry| self.folder_owns(path, entry));
             let there = self.entries_between(baseline, target.id())?;
             // What the checkout holds because the folder sent it is the
             // folder's own, not a change of the checkout's.
@@ -362,8 +359,7 @@ impl GitWorkspace {
         if let Some(reason) = room(self.bytes_written_over(current, target.id())?) {
             return Ok(Mirror::Paused { reason });
         }
-        self.hold_ignored_if_rules_change(current, target.id())?;
-        let changed = self.write_tree_over(current, target.id())?;
+        let (changed, skipped) = self.write_tree_over(current, target.id())?;
         match (local, branch.as_deref()) {
             (Some(local), Some(branch)) => {
                 self.set_ref(local, tip)?;
@@ -384,7 +380,21 @@ impl GitWorkspace {
         let mut index = self.repo.index()?;
         index.read_tree(&tip_commit.tree()?)?;
         index.write()?;
-        self.record_at(target.id(), local, tip)?;
+        // What the pass did not write — the folder ignored it — is not
+        // what the folder holds, so the baseline does not say it is: it is
+        // recorded absent, as the folder's own working copy (which leaves
+        // ignored files out) reads it. If the rule that kept it out goes,
+        // the folder's file and the checkout's are then two sides of one
+        // path — the same, agreement; different, a question; only the
+        // folder's, sent — never the checkout's version assumed to be
+        // here and the folder's sent over it as an edit.
+        let written = if skipped.is_empty() {
+            target.id()
+        } else {
+            let absent = skipped.into_iter().map(|path| (path, None)).collect();
+            self.tree_with(target.id(), &absent)?
+        };
+        self.record_at(written, local, tip)?;
         Ok(Mirror::Applied {
             changed,
             switched: !on_branch,
@@ -687,10 +697,9 @@ impl GitWorkspace {
         };
         let current = self.worktree_tree()?;
         let current_tree = self.repo.find_tree(current)?;
-        let held = self.held_paths();
         self.entries_between(baseline, current)?
             .iter()
-            .filter(|(path, entry)| !under_any(path, &held) && self.folder_owns(path, entry))
+            .filter(|(path, entry)| self.folder_owns(path, entry))
             .map(|(path, _)| self.change_at(&current_tree, path))
             .collect()
     }
@@ -773,59 +782,6 @@ impl GitWorkspace {
             }
         }
         Ok(out)
-    }
-
-    /// The paths held back from the mirror (`HELD_FILE`).
-    fn held_paths(&self) -> Vec<PathBuf> {
-        std::fs::read_to_string(self.repo.path().join(HELD_FILE))
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(PathBuf::from)
-            .collect()
-    }
-
-    /// When this pass is about to change a `.gitignore`, hold back what the
-    /// folder ignores right now: once the new rules are on disk, a file
-    /// they no longer ignore would read as the folder's own change and go
-    /// to the checkout — a secret the VM never had, carried across by the
-    /// VM's own edit to the rules.
-    fn hold_ignored_if_rules_change(&self, from: Oid, to: Oid) -> Result<()> {
-        let from_tree = self.repo.find_tree(from)?;
-        let to_tree = self.repo.find_tree(to)?;
-        let diff = self
-            .repo
-            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
-        let rules_change = diff.deltas().any(|d| {
-            [d.old_file().path(), d.new_file().path()]
-                .into_iter()
-                .flatten()
-                .any(|p| p.file_name().is_some_and(|n| n == ".gitignore"))
-        });
-        if !rules_change {
-            return Ok(());
-        }
-        let mut held = self.held_paths();
-        let statuses = self.repo.statuses(Some(
-            git2::StatusOptions::new()
-                .include_ignored(true)
-                .recurse_ignored_dirs(false)
-                .include_untracked(false),
-        ))?;
-        for entry in statuses.iter() {
-            if entry.status().contains(git2::Status::IGNORED) {
-                if let Some(path) = entry.path() {
-                    let path = PathBuf::from(path.trim_end_matches('/'));
-                    if !held.contains(&path) {
-                        held.push(path);
-                    }
-                }
-            }
-        }
-        let text: String = held.iter().map(|p| format!("{}\n", p.display())).collect();
-        std::fs::write(self.repo.path().join(HELD_FILE), text)
-            .context("recording the paths the mirror holds back")?;
-        Ok(())
     }
 
     /// Whether this folder's `branch` is where the mirror last left it: no
@@ -926,7 +882,10 @@ impl GitWorkspace {
     /// Write `to`'s files over a working tree that holds `from`'s: each
     /// path that differs written or removed, nothing else touched — so what
     /// neither tree has (ignored files, `.git`) is left exactly as it is.
-    fn write_tree_over(&self, from: Oid, to: Oid) -> Result<usize> {
+    ///
+    /// Returns how many paths it wrote or removed, and the paths it left
+    /// alone because the folder ignores them.
+    fn write_tree_over(&self, from: Oid, to: Oid) -> Result<(usize, Vec<PathBuf>)> {
         let from_tree = self.repo.find_tree(from)?;
         let to_tree = self.repo.find_tree(to)?;
         let diff = self
@@ -934,18 +893,17 @@ impl GitWorkspace {
             .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
         // Decided before anything is written, so a `.gitignore` this pass
         // writes cannot change the answer halfway: what the folder ignores
-        // now, and what it held back when its rules last changed, is never
-        // written over or removed — a checkout that adds `.env` does not
-        // get to replace the user's (the docs' promise that ignored files
-        // are never written or removed).
-        let held = self.held_paths();
-        let protected: std::collections::HashSet<PathBuf> = diff
+        // now is never written over or removed — a checkout that adds
+        // `.env` does not get to replace the user's (the docs' promise that
+        // ignored files are never written or removed). The rules are
+        // decluttering, not a lock (David, 2026-10-09: "It isn't a
+        // security mechanism"): once a pass carries a rule's removal here,
+        // what it ignored is an ordinary path on both sides.
+        let protected: std::collections::BTreeSet<PathBuf> = diff
             .deltas()
             .flat_map(|d| [d.old_file().path(), d.new_file().path()])
             .flatten()
-            .filter(|path| {
-                under_any(path, &held) || self.repo.is_path_ignored(path).unwrap_or(true)
-            })
+            .filter(|path| self.repo.is_path_ignored(path).unwrap_or(true))
             .map(Path::to_path_buf)
             .collect();
         let skip = |delta: &git2::DiffDelta| {
@@ -1029,7 +987,7 @@ impl GitWorkspace {
                 }
             }
         }
-        Ok(changed)
+        Ok((changed, protected.into_iter().collect()))
     }
 
     /// A path inside the working tree, refused when it would reach outside
@@ -1086,11 +1044,6 @@ impl GitWorkspace {
         }
         Ok(())
     }
-}
-
-/// Whether `path` is one of `prefixes` or inside one.
-fn under_any(path: &Path, prefixes: &[PathBuf]) -> bool {
-    prefixes.iter().any(|prefix| path.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -1620,8 +1573,12 @@ mod tests {
         assert!(ws.checked_path(Path::new("ok/.gitignore")).is_ok());
     }
 
+    /// An ignored file is never written over; once the rule that ignored
+    /// it is gone, it is an ordinary path, and the folder's version and
+    /// the checkout's are two sides of it — different, so asked about,
+    /// with neither sent over the other.
     #[test]
-    fn an_ignored_file_is_never_written_over_nor_sent_when_the_rules_change() {
+    fn an_unignored_file_on_both_sides_is_asked_about_never_overwritten() {
         let (dir, ws) = repo();
         fs::write(dir.path().join(".gitignore"), ".env\n").unwrap();
         fs::write(dir.path().join("a.txt"), "one\n").unwrap();
@@ -1632,37 +1589,68 @@ mod tests {
         let main = ws.branch_name().unwrap();
 
         // The checkout un-ignores .env and writes one of its own.
-        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+        let checkout = |vm: &Path, _: &GitWorkspace| {
             fs::write(vm.join(".gitignore"), "").unwrap();
             fs::write(vm.join(".env"), "SECRET=theirs\n").unwrap();
-        });
+        };
+        let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
         ws.mirror_from(&main, tip, snap, false).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join(".env")).unwrap(),
             "SECRET=mine\n",
             "an ignored file is not written over"
         );
-        // The rules changed, so the next pass must not send the secret.
-        let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, _| {
-            fs::write(vm.join(".gitignore"), "").unwrap();
-            fs::write(vm.join(".env"), "SECRET=theirs\n").unwrap();
-            fs::write(vm.join("b.txt"), "more\n").unwrap();
-        });
-        if let Mirror::Outgoing { changes } = ws.mirror_from(&main, tip2, snap2, false).unwrap() {
-            assert!(
-                changes.iter().all(|c| c.path != Path::new(".env")),
-                "the held-back file is never sent: {changes:?}"
-            );
+        // The rule is gone here too now: the two versions are a conflict.
+        let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
+        match ws.mirror_from(&main, tip, snap, false).unwrap() {
+            Mirror::Drift { paths } => assert_eq!(paths, vec![PathBuf::from(".env")]),
+            other => panic!("expected the two .env files asked about, got {other:?}"),
         }
-        assert!(ws
-            .folder_changes()
-            .unwrap()
-            .iter()
-            .all(|c| c.path != Path::new(".env")));
         assert_eq!(
             fs::read_to_string(dir.path().join(".env")).unwrap(),
             "SECRET=mine\n"
         );
+    }
+
+    /// A rule taken out in the checkout takes effect here outright: what it
+    /// kept in this folder alone goes to the checkout on the next pass,
+    /// whether or not the rule was ever committed (David, 2026-10-09:
+    /// "Honor every removal outright").
+    #[test]
+    fn a_removed_rule_sends_what_it_kept_here() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join(".gitignore"), "").unwrap();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new(".gitignore")).unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+
+        // Personal ignores ext/ in its working copy, uncommitted...
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join(".gitignore"), "/ext/\n").unwrap();
+        });
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+        fs::create_dir_all(dir.path().join("ext")).unwrap();
+        fs::write(dir.path().join("ext/notes.txt"), "mine\n").unwrap();
+        assert!(ws.folder_changes().unwrap().is_empty(), "ignored for now");
+
+        // ...and takes the rule back out.
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join(".gitignore"), "").unwrap();
+        });
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join(".gitignore"), "").unwrap();
+        });
+        match ws.mirror_from(&main, tip, snap, false).unwrap() {
+            Mirror::Outgoing { changes } => assert!(
+                changes.iter().any(|c| c.path == Path::new("ext/notes.txt")),
+                "{changes:?}"
+            ),
+            other => panic!("expected the folder's ext/ to go out, got {other:?}"),
+        }
+        assert!(!dir.path().join(".git").join(RETIRED_HELD_FILE).exists());
     }
 
     #[test]

@@ -49,7 +49,12 @@ checkout through the files service (`taste_core::files`, the keeper), and
 the folder MIRRORS the checkout both ways (`taste_git::mirror`, since
 2026-09-23): its branch, and its working tree less what is ignored, follow
 Personal's; a file changed in the folder goes to the checkout first; a path
-both sides changed is asked about, never overwritten. A workspace
+both sides changed is asked about, never overwritten. What is ignored is
+decluttering (and keeping two architectures' build output apart), not a
+security boundary: a rule's removal, whoever makes it and committed or
+not, takes effect outright, and what it kept here goes to the checkout
+(David, 2026-10-09: "It's not to protect sensitive data in my local
+working copy from moving to the envs"). A workspace
 whose provisioner cannot supply a VM has environments that **refuse to
 start** with the reason on their rows — there is no host rung and no
 `podman machine` (ENVIRONMENTS.md → "There is no rung below VM
