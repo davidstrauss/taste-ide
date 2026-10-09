@@ -698,12 +698,21 @@ impl GitWorkspace {
 
     /// The submodules `.gitmodules` declares: each one's name and path,
     /// in the order the file gives them.
+    ///
+    /// Only paths plainly inside the working tree: `.gitmodules` is the
+    /// repository's own text, and every caller joins the path onto a
+    /// directory — the folder, where the IDE pushes a submodule's clone
+    /// from with the user's keys, or the checkout. A declared
+    /// `../other-repo` would have handed Personal a repository from
+    /// outside the project, so a path that is absolute or steps up is not
+    /// a submodule here, as git's own index would not take it.
     pub fn submodules(&self) -> Vec<(String, PathBuf)> {
         self.repo
             .submodules()
             .map(|subs| {
                 subs.iter()
                     .filter_map(|sub| Some((sub.name()?.to_string(), sub.path().to_path_buf())))
+                    .filter(|(_, path)| inside(path))
                     .collect()
             })
             .unwrap_or_default()
@@ -958,9 +967,34 @@ impl SyncStatus {
     }
 }
 
+/// Whether a repository-relative path names something inside the
+/// working tree: every component an ordinary name, none of them `..`, the
+/// root, or a prefix, and not empty.
+fn inside(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_submodule_path_must_stay_inside_the_working_tree() {
+        for (path, ok) in [
+            ("ext/amutablectl", true),
+            ("lib", true),
+            ("../other-repo", false),
+            ("ext/../../x", false),
+            ("/etc", false),
+            ("./lib", false),
+            ("", false),
+        ] {
+            assert_eq!(inside(Path::new(path)), ok, "{path}");
+        }
+    }
 
     /// Each submodule's files are keyed under its path, the nested ones
     /// under theirs, and a submodule with nothing changed adds nothing.

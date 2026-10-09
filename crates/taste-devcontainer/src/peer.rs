@@ -538,6 +538,24 @@ case "$head" in
 esac
 "#;
 
+/// A submodule's name as one file name: the staging repository it gets in
+/// Personal's `.git` is named for it, and a name is `.gitmodules` text —
+/// `ext/amutablectl` by git's own default, which is the submodule's path.
+/// Every byte but a letter, a digit, `-`, `_`, or `.` is written `%XX`,
+/// so no name holds a separator and two names never share a directory;
+/// the plain names this used to insist on come out as they were, so a
+/// staging repository already made keeps its name.
+fn staging_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Give Personal's checkout the submodules the user has checked out in the
 /// folder (David, 2026-10-05: "When I cloned into my folder (to basically
 /// manually handle the submodule checkout), it doesn't seem to sync to the
@@ -557,104 +575,122 @@ fn share_submodules(
     files: &Files,
     path: &Path,
 ) -> Result<()> {
+    let mut failed = Vec::new();
     for (name, sub) in git.submodules() {
-        let clone = peer.join(&sub);
-        if !clone.join(".git").exists() {
-            continue;
+        // One submodule's failure is its own: the rest still go.
+        if let Err(e) = share_submodule(&name, &sub, peer, vm, keys, files, path) {
+            failed.push(format!("{}: {e:#}", sub.display()));
         }
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        {
-            bail!("the submodule name {name:?} is not one this can stage");
-        }
-        let staging = path.join(SUBMODULE_STAGING).join(format!("{name}.git"));
-        let folder_git = taste_git::GitWorkspace::discover(&clone);
-        let head = match folder_git.as_ref().and_then(|g| g.branch_name()) {
-            Some(branch) => format!("branch:{branch}"),
-            None => "detached".to_string(),
-        };
-        let script = |mode: &str| {
-            files.exec(
-                path,
-                &[
-                    "sh".into(),
-                    "-c".into(),
-                    SUBMODULE_SCRIPT.into(),
-                    "taste-submodule".into(),
-                    name.clone(),
-                    sub.display().to_string(),
-                    staging.display().to_string(),
-                    mode.into(),
-                    head.clone(),
-                ],
-            )
-        };
-        // There already: left as it is, except at the two's first meeting
-        // — before the submodule's mirror has recorded anything — when
-        // Personal's copy is not where the folder's clone is. One placed
-        // before the pair existed was put at the parent's recorded
-        // commit, detached, and the mirror would otherwise follow THAT
-        // and take the folder's clone off its branch.
-        let present = script("check")?.status == 0;
-        if present {
-            let first_meeting = folder_git
-                .as_ref()
-                .is_some_and(|g| matches!(g.read_ref(taste_git::mirror::MIRROR_REF), Ok(None)));
-            let here = folder_git.as_ref().and_then(|g| g.checked_out());
-            let there = files
-                .read_to_string(&checkout_git_dir(files, &path.join(&sub)).join("HEAD"))
-                .ok()
-                .and_then(|h| taste_git::mirror::Head::parse(&h));
-            if !first_meeting || here.is_none() || here == there {
-                continue;
-            }
-        }
-        let made = files.exec(
+    }
+    if !failed.is_empty() {
+        bail!("{}", failed.join("; "));
+    }
+    Ok(())
+}
+
+/// [`share_submodules`] for one: `name` and `sub` as `.gitmodules` gives
+/// them, the path already checked to lie inside the folder.
+fn share_submodule(
+    name: &str,
+    sub: &Path,
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+) -> Result<()> {
+    let clone = peer.join(sub);
+    if !clone.join(".git").exists() {
+        return Ok(());
+    }
+    let staging = path
+        .join(SUBMODULE_STAGING)
+        .join(format!("{}.git", staging_name(name)));
+    let folder_git = taste_git::GitWorkspace::discover(&clone);
+    let head = match folder_git.as_ref().and_then(|g| g.branch_name()) {
+        Some(branch) => format!("branch:{branch}"),
+        None => "detached".to_string(),
+    };
+    let script = |mode: &str| {
+        files.exec(
             path,
             &[
-                "git".into(),
-                "init".into(),
-                "-q".into(),
-                "--bare".into(),
+                "sh".into(),
+                "-c".into(),
+                SUBMODULE_SCRIPT.into(),
+                "taste-submodule".into(),
+                name.to_string(),
+                sub.display().to_string(),
                 staging.display().to_string(),
+                mode.into(),
+                head.clone(),
             ],
-        )?;
-        if !made.success() {
-            bail!(
-                "making {}: {}",
-                staging.display(),
-                made.stderr_utf8().trim()
-            );
+        )
+    };
+    // There already: left as it is, except at the two's first meeting
+    // — before the submodule's mirror has recorded anything — when
+    // Personal's copy is not where the folder's clone is. One placed
+    // before the pair existed was put at the parent's recorded
+    // commit, detached, and the mirror would otherwise follow THAT
+    // and take the folder's clone off its branch.
+    let present = script("check")?.status == 0;
+    if present {
+        let first_meeting = folder_git
+            .as_ref()
+            .is_some_and(|g| matches!(g.read_ref(taste_git::mirror::MIRROR_REF), Ok(None)));
+        let here = folder_git.as_ref().and_then(|g| g.checked_out());
+        let there = files
+            .read_to_string(&checkout_git_dir(files, &path.join(sub)).join("HEAD"))
+            .ok()
+            .and_then(|h| taste_git::mirror::Head::parse(&h));
+        if !first_meeting || here.is_none() || here == there {
+            return Ok(());
         }
-        let args: Vec<String> = [
-            "push",
-            "--force",
-            "--quiet",
-            &guest_url(vm, &staging),
-            "+refs/heads/*:refs/heads/*",
-            "+refs/remotes/origin/*:refs/heads/origin/*",
-            "+refs/tags/*:refs/tags/*",
-            "+HEAD:refs/heads/taste-folder-head",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        git_streaming(&clone, keys, &args, &mut |_| {})
-            .with_context(|| format!("pushing the folder's {} to Personal", sub.display()))?;
-        let out = script(if present { "meet" } else { "update" })?;
-        match out.status {
-            0 => {}
-            4 => tracing::info!(
-                "Personal's {} has uncommitted work; it stays where it is",
-                sub.display()
-            ),
-            _ => bail!(
-                "checking out {} in Personal: {}",
-                sub.display(),
-                out.stderr_utf8().trim()
-            ),
-        }
+    }
+    let made = files.exec(
+        path,
+        &[
+            "git".into(),
+            "init".into(),
+            "-q".into(),
+            "--bare".into(),
+            staging.display().to_string(),
+        ],
+    )?;
+    if !made.success() {
+        bail!(
+            "making {}: {}",
+            staging.display(),
+            made.stderr_utf8().trim()
+        );
+    }
+    let args: Vec<String> = [
+        "push",
+        "--force",
+        "--quiet",
+        &guest_url(vm, &staging),
+        "+refs/heads/*:refs/heads/*",
+        "+refs/remotes/origin/*:refs/heads/origin/*",
+        "+refs/tags/*:refs/tags/*",
+        "+HEAD:refs/heads/taste-folder-head",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    git_streaming(&clone, keys, &args, &mut |_| {})
+        .with_context(|| format!("pushing the folder's {} to Personal", sub.display()))?;
+    let out = script(if present { "meet" } else { "update" })?;
+    match out.status {
+        0 => {}
+        4 => tracing::info!(
+            "Personal's {} has uncommitted work; it stays where it is",
+            sub.display()
+        ),
+        _ => bail!(
+            "checking out {} in Personal: {}",
+            sub.display(),
+            out.stderr_utf8().trim()
+        ),
     }
     Ok(())
 }
@@ -1993,6 +2029,27 @@ fn push_ahead_into_checkout(
 mod tests {
     use super::*;
 
+    /// A submodule's name becomes one file name: plain names as they were
+    /// (so a staging repository already made keeps its place), git's
+    /// default path-shaped names with their slashes written out, and no
+    /// name able to step out of the staging directory.
+    #[test]
+    fn a_submodule_name_stages_under_one_file_name() {
+        assert_eq!(staging_name("amutablectl"), "amutablectl");
+        assert_eq!(staging_name("Amutable-OS_v2.x"), "Amutable-OS_v2.x");
+        assert_eq!(staging_name("ext/amutablectl"), "ext%2Famutablectl");
+        assert_eq!(staging_name("../../etc"), "..%2F..%2Fetc");
+        assert_eq!(
+            staging_name("a%2Fb"),
+            "a%252Fb",
+            "an escape cannot be forged"
+        );
+        assert_eq!(staging_name("naïve"), "na%C3%AFve");
+        for name in ["ext/a", "../x", "a/../../b"] {
+            assert!(!staging_name(name).contains('/'), "{name}");
+        }
+    }
+
     /// A folder and its checkout, as `git` sees them, for the sync script.
     struct Pair {
         dir: PathBuf,
@@ -2345,6 +2402,80 @@ mod tests {
     /// staging repository and cloned from there into place, absorbed as
     /// `git submodule update` would leave it, with git's own relative
     /// paths.
+    /// git names a submodule by its path unless told otherwise, so a
+    /// name with a slash in it is the ordinary case, and it goes across
+    /// like any other: staged under its encoded name, its URL set under
+    /// its real one, its repository absorbed where git expects.
+    #[test]
+    fn a_submodule_named_by_its_path_goes_across_too() {
+        let pair = Pair::new("submodule-path-name");
+        pair.git(".", &["init", "-q", "-b", "main", "sub"]);
+        pair.write("sub", "lib.txt", "template\n");
+        pair.git("sub", &["add", "-A"]);
+        pair.commit("sub", "the template");
+        let sub = pair.dir.join("sub").display().to_string();
+        pair.git(
+            "folder",
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub,
+                "ext/tpl",
+            ],
+        );
+        pair.commit("folder", "add the template");
+        assert!(pair
+            .git(
+                "folder",
+                &["config", "-f", ".gitmodules", "--get-regexp", "path"]
+            )
+            .contains("submodule.ext/tpl.path"));
+        pair.git("checkout", &["pull", "-q"]);
+        let staging = pair
+            .dir
+            .join("checkout/.git/taste/submodules")
+            .join(format!("{}.git", staging_name("ext/tpl")));
+        pair.git(".", &["init", "-q", "--bare", staging.to_str().unwrap()]);
+        pair.git(
+            "folder/ext/tpl",
+            &[
+                "push",
+                "-q",
+                "--force",
+                staging.to_str().unwrap(),
+                "+refs/heads/*:refs/heads/*",
+            ],
+        );
+        let out = std::process::Command::new("sh")
+            .current_dir(pair.dir.join("checkout"))
+            .args([
+                "-c",
+                SUBMODULE_SCRIPT,
+                "taste-submodule",
+                "ext/tpl",
+                "ext/tpl",
+                staging.to_str().unwrap(),
+                "update",
+                "branch:main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(pair.dir.join("checkout/ext/tpl/lib.txt")).unwrap(),
+            "template\n"
+        );
+        let gitfile = std::fs::read_to_string(pair.dir.join("checkout/ext/tpl/.git")).unwrap();
+        assert!(gitfile.trim().starts_with("gitdir: ../"), "{gitfile}");
+    }
+
     #[test]
     fn a_submodule_cloned_in_the_folder_is_checked_out_in_personal() {
         let pair = Pair::new("submodule");
