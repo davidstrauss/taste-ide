@@ -3443,6 +3443,11 @@ impl Console {
             let sink = sink.clone();
             let weak = Rc::downgrade(self);
             let env = env.clone();
+            // The container this shell is in, to ask after it when the
+            // shell ends: the environment on another one, or on none, is
+            // the container gone, whatever podman managed to print.
+            let started_in = exec.container_id();
+            let exec = exec.clone();
             terminal.connect_child_exited(move |terminal, status| {
                 // A shell whose container was stopped or rebuilt under it
                 // ends with podman's own last words — "no such exec
@@ -3457,7 +3462,15 @@ impl Console {
                     }
                     None => String::new(),
                 };
-                let container_gone = tail.contains("no such exec session")
+                // Asked of the environment first: a shell over the VM's
+                // podman connection can die with the container and print
+                // nothing at all, which left a dead prompt with no word of
+                // why and no shell to replace it (2026-10-09, a rebuild for
+                // updated packages). podman's words are the fallback.
+                let now_in = exec.container_id();
+                let moved = started_in.is_some() && now_in != started_in;
+                let container_gone = moved
+                    || tail.contains("no such exec session")
                     || tail.contains("no container with ID")
                     || tail.contains("no such container");
                 if container_gone {
@@ -3466,10 +3479,25 @@ impl Console {
                           or rebuilt. A shell opens in the new one when it is up.\x1b[0m\r\n",
                     );
                     if let Some(console) = weak.upgrade() {
-                        console
-                            .dead_shells
-                            .borrow_mut()
-                            .push((env.clone(), page.clone()));
+                        if moved && now_in.is_some() {
+                            // The new one is up already, so the event that
+                            // revives dead shells has been and gone: the
+                            // replacement opens now — after this handler,
+                            // since the tab it replaces is the one whose
+                            // terminal is calling it.
+                            let (page, env) = (page.clone(), env.clone());
+                            glib::idle_add_local_once(move || {
+                                if console.tab_is_open(&page) {
+                                    console.host().close_page(&page);
+                                    console.add_terminal_tab_in(&env);
+                                }
+                            });
+                        } else {
+                            console
+                                .dead_shells
+                                .borrow_mut()
+                                .push((env.clone(), page.clone()));
+                        }
                     }
                 }
                 sink.finish(taste_core::ShellState::Exited {
