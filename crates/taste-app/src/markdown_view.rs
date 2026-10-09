@@ -165,6 +165,8 @@ fn render_full(
     let mut spans: Vec<String> = Vec::new();
     let mut heading: Option<HeadingLevel> = None;
     let mut code_block: Option<String> = None;
+    // The fence's info string: `mermaid` makes the block a diagram.
+    let mut code_info = String::new();
     let mut list_stack: Vec<Option<u64>> = Vec::new();
     let mut quote_depth: usize = 0;
     // Tables: the column alignments and the rows, the first row the head,
@@ -261,8 +263,8 @@ fn render_full(
                         &root,
                         &on_link,
                     );
-                    let _lang = match kind {
-                        CodeBlockKind::Fenced(lang) => lang.to_string(),
+                    code_info = match kind {
+                        CodeBlockKind::Fenced(info) => info.to_string(),
                         CodeBlockKind::Indented => String::new(),
                     };
                     code_block = Some(String::new());
@@ -347,7 +349,16 @@ fn render_full(
                 }
                 TagEnd::CodeBlock => {
                     if let Some(code) = code_block.take() {
-                        root.append(&code_card(code.trim_end_matches('\n'), true));
+                        let code = code.trim_end_matches('\n');
+                        let card = code_card(code, true);
+                        if crate::mermaid::is_mermaid(&code_info) {
+                            // The block as code stays the fallback: a
+                            // diagram that does not parse is shown as
+                            // written, with the reason under it.
+                            root.append(&crate::mermaid::diagram(code, card));
+                        } else {
+                            root.append(&card);
+                        }
                     }
                 }
                 TagEnd::List(_) => {

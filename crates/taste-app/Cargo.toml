@@ -20,6 +20,8 @@ taste-voice.workspace = true
 taste-models.workspace = true
 taste-gcp.workspace = true
 taste-semantic.workspace = true
+# The diagram helper is started confined (mermaid.rs).
+taste-confine.workspace = true
 
 agent-client-protocol = { version = "2", features = ["unstable_elicitation"] }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }

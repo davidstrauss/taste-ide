@@ -415,6 +415,15 @@ to.
   no llama.cpp: the model runs in `crates/taste-embed`, a helper process,
   because whisper.cpp (voice) and llama.cpp each bundle a ggml and two
   cannot share one binary.
+- `crates/taste-confine` — kernel confinement for helper processes:
+  Landlock (read-only system and font paths, no write anywhere, no TCP,
+  no signals out) and seccomp (no sockets — the session bus and its
+  host-exec portal with them — no io_uring, ptrace, or namespaces),
+  applied between fork and exec. Refuses on a kernel below Landlock ABI 3;
+  confinement is not best-effort.
+- `crates/taste-diagram` — Mermaid drawn in a confined process (merman
+  for layout and SVG, resvg for pixels); `taste-app`'s `mermaid.rs` is
+  its client, and checks every reply before believing it.
 - `crates/taste-voice` — voice input: the pinned speech model, microphone
   capture (GStreamer), local transcription (whisper.cpp). No GTK; the
   composer drives it.
@@ -519,6 +528,15 @@ to.
   `.devcontainer/` bound writable over it, because the pinned adapter
   writes files natively and that directory is the write safe mode exists
   to grant.
+- **Third-party code that parses untrusted content runs in a confined
+  helper, not in the IDE.** The IDE's process is the host side of the
+  boundary — the Flatpak grants it the home, the network, and the portal
+  that runs host commands — so a dependency linked into it acts with all
+  of that, and a parser bug an input can drive does too. A renderer or
+  parser fed what a repository or an agent wrote goes in a helper binary
+  started through `taste_confine::confine` (David, 2026-10-09, of the
+  Mermaid renderer's eighty crates: "Build the sandboxed helper first").
+  `taste-embed` predates this and is not yet confined.
 - Adapter packages fetched from registries stay version-pinned.
 - **The interface must be beautiful — and the chat pane and prompt box
   are held to the highest bar in the app.** Beauty here means libadwaita

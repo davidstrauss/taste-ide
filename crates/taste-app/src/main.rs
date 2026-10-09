@@ -47,6 +47,7 @@ mod logview;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
 mod markdown_view;
+mod mermaid;
 mod notify;
 mod orchestration;
 mod pages_menu;

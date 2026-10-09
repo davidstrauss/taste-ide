@@ -1,0 +1,28 @@
+[package]
+name = "taste-diagram"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The IDE's diagram helper: Mermaid drawn in a confined process"
+
+[[bin]]
+name = "taste-diagram"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+# Mermaid, natively: merman lays a diagram out and writes SVG — the
+# implementation Zed embeds — and resvg draws it. ELK layout is left out
+# (its EPL-2.0 notices travel with any build that compiles it); rustybuzz
+# shapes the text the layout measures, at the version usvg shapes it with.
+# All of it runs here and never in the IDE: it parses text a repository
+# or an agent wrote, and this process is confined (taste-confine).
+merman = { version = "=0.8.0", default-features = false, features = ["all-diagrams", "svg"] }
+resvg = { version = "0.47", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+rustybuzz = "0.20"
+
+[dev-dependencies]
+taste-confine.workspace = true
+base64.workspace = true
