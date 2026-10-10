@@ -1177,13 +1177,13 @@ impl Supervisor {
             // the ref that restores the working copy as it stands after it.
             // A submodule's are under `.git/modules/<name>/`, and move its
             // own pair (`crate::peer::sync_primary_peer_with`).
-            let ref_moved = name == ".git/HEAD"
-                || name == ".git/packed-refs"
-                || name.starts_with(".git/refs/heads/")
-                || (name.starts_with(".git/modules/")
-                    && (name.ends_with("/HEAD")
-                        || name.ends_with("/packed-refs")
-                        || name.contains("/refs/heads/")));
+            let ref_moved = match git_part(&name) {
+                Some((false, inside)) => {
+                    inside == "HEAD" || inside == "packed-refs" || inside.starts_with("refs/heads/")
+                }
+                Some((true, inside)) => moves_a_ref(inside, false),
+                None => false,
+            };
             // And for the primary, any change to its working tree: the
             // folder mirrors it (`taste_git::mirror`), so a saved file or
             // an agent's edit reaches the folder two seconds after the
@@ -1192,7 +1192,7 @@ impl Supervisor {
             // files are not the working tree, and a build's output churns
             // without being anything git would show.
             let worktree_changed =
-                primary && !name.starts_with(".git/") && name != ".git" && !churn_path(&name);
+                primary && git_part(&name).is_none() && !name.is_empty() && !churn_path(&name);
             if worktree_changed && !snapshot_pending.load(Ordering::SeqCst) {
                 folder_events.publish(Event::FolderSync(taste_core::FolderSync::Pending));
             }
@@ -1682,20 +1682,19 @@ impl Supervisor {
             let relevant = event.paths.iter().any(|path| {
                 path.strip_prefix(&root).is_ok_and(|rel| {
                     let rel = rel.to_string_lossy();
-                    // A commit or switch in a submodule kept under the
-                    // parent's `.git/modules/` is its pair's to carry.
-                    // A fetch there moves its remote-tracking refs, which
-                    // the sync gives Personal's copy (`peer`).
-                    let submodule_ref = rel.starts_with(".git/modules/")
-                        && (rel.ends_with("/HEAD")
-                            || rel.ends_with("/packed-refs")
-                            || rel.contains("/refs/heads/")
-                            || rel.contains("/refs/remotes/"));
-                    submodule_ref
-                        || (!rel.is_empty()
-                            && rel != ".git"
-                            && !rel.starts_with(".git/")
-                            && !churn_path(&rel))
+                    match git_part(&rel) {
+                        // The working tree: an edit to send.
+                        None => !rel.is_empty() && !churn_path(&rel),
+                        // A commit or switch in a submodule is its pair's
+                        // to carry, and a fetch there moves its
+                        // remote-tracking refs, which the sync gives
+                        // Personal's copy (`peer`). Nothing else a
+                        // submodule's git directory holds is a change: the
+                        // sync's own fetches and records land there.
+                        Some((true, inside)) => moves_a_ref(inside, true),
+                        // The folder's own `.git`: the sync's.
+                        Some((false, _)) => false,
+                    }
                 })
             });
             if !relevant {
@@ -4998,6 +4997,50 @@ fn folder_sync_summary(sync: &crate::peer::PeerSync) -> Option<String> {
 /// that TRACKS a file under one of these still has it mirrored, on the
 /// next change anywhere else, since the snapshot is the whole working
 /// copy.
+/// Where a watched path falls in git's terms: `None` in a working tree,
+/// or inside a git directory — `(false, rest)` the project's own `.git`,
+/// `(true, rest)` a submodule's, whether kept under `.git/modules/` (as
+/// git keeps one it cloned) or inline as `<path>/.git` (as it keeps a
+/// repository adopted with `git submodule add`). A watch that took an
+/// inline one for the working tree saw the sync's own fetch into it as
+/// the user's edit, synced again, fetched again, and never stopped
+/// (2026-10-09: six submodules "repeated over and over").
+fn git_part(rel: &str) -> Option<(bool, &str)> {
+    let mut offset = 0;
+    for (index, part) in rel.split('/').enumerate() {
+        if part == ".git" {
+            let inside = rel.get(offset + part.len() + 1..).unwrap_or("");
+            if index > 0 {
+                return Some((true, inside));
+            }
+            return Some(match inside.strip_prefix("modules/") {
+                Some(rest) => (true, rest),
+                None => (false, inside),
+            });
+        }
+        offset += part.len() + 1;
+    }
+    None
+}
+
+/// Whether a path inside a submodule's git directory (`git_part`'s rest)
+/// is one of its refs moving: HEAD, the packed refs, a branch — and, with
+/// `remotes`, a remote-tracking ref. Under `.git/modules/` the rest starts
+/// with the submodule's name, which may hold slashes, so these are matched
+/// at the end. Its logs, objects, index, and the IDE's own refs are not.
+fn moves_a_ref(inside: &str, remotes: bool) -> bool {
+    if inside.starts_with("logs/") || inside.contains("/logs/") {
+        return false;
+    }
+    let under = |dir: &str| inside.starts_with(dir) || inside.contains(&format!("/{dir}"));
+    inside == "HEAD"
+        || inside.ends_with("/HEAD")
+        || inside == "packed-refs"
+        || inside.ends_with("/packed-refs")
+        || under("refs/heads/")
+        || (remotes && under("refs/remotes/"))
+}
+
 fn churn_path(rel: &str) -> bool {
     const CHURN: [&str; 6] = ["target", "node_modules", ".cache", "dist", "build", ".venv"];
     rel.split('/').any(|part| CHURN.contains(&part))
@@ -5449,6 +5492,51 @@ mod tests {
     }
 
     use super::*;
+
+    /// A submodule's git directory is git's, wherever it is kept: the
+    /// sync's own fetches into one are not an edit, and a branch moving in
+    /// one is a ref move, not a working-tree change.
+    #[test]
+    fn a_submodules_git_directory_is_gits_wherever_it_is_kept() {
+        for (path, expected) in [
+            ("src/main.rs", None),
+            ("ext/amutablectl/README.md", None),
+            (".git", Some((false, ""))),
+            (".git/refs/heads/main", Some((false, "refs/heads/main"))),
+            (".git/modules/tpl/HEAD", Some((true, "tpl/HEAD"))),
+            ("ext/amutablectl/.git/HEAD", Some((true, "HEAD"))),
+            (
+                "ext/amutablectl/.git/refs/taste/vm/main",
+                Some((true, "refs/taste/vm/main")),
+            ),
+        ] {
+            assert_eq!(git_part(path), expected, "{path}");
+        }
+        // What the sync writes into a submodule's git directory is not a
+        // change; a commit or a fetch the user made there is.
+        for inside in [
+            "refs/taste/vm/main",
+            "refs/taste/mirror/primary",
+            "objects/ab/cdef",
+            "index",
+            "FETCH_HEAD",
+            "logs/HEAD",
+            "ext/tpl/logs/refs/heads/main",
+        ] {
+            assert!(!moves_a_ref(inside, true), "{inside}");
+        }
+        for inside in [
+            "HEAD",
+            "packed-refs",
+            "refs/heads/main",
+            "ext/tpl/HEAD",
+            "tpl/refs/heads/x",
+        ] {
+            assert!(moves_a_ref(inside, false), "{inside}");
+        }
+        assert!(moves_a_ref("refs/remotes/origin/main", true));
+        assert!(!moves_a_ref("refs/remotes/origin/main", false));
+    }
 
     /// The startup page's line for a build: the step and its command, the
     /// step's latest line while it prints, and the layer being written
