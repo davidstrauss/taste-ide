@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
@@ -184,6 +184,93 @@ impl Spend {
     }
 }
 
+/// What an environment's traffic with the model is doing right now
+/// ([`Handle::traffic`]): the witness the chat's working line asks when
+/// the agent itself has gone quiet, because only the proxy sees whether a
+/// reply is streaming, waited on, or not asked for at all (David,
+/// 2026-10-09: "Could I get better feedback when the agent is simply
+/// working and not hung?").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Traffic {
+    /// Requests forwarded and not yet answered to the end.
+    pub in_flight: u32,
+    /// How long since the latest request went upstream.
+    pub since_request: Option<Duration>,
+    /// How long since the last byte of any reply arrived.
+    pub since_byte: Option<Duration>,
+    /// What the reply streaming now is producing, as its own events say.
+    pub producing: Option<Producing>,
+}
+
+/// The kind of content block a streaming reply is in the middle of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Producing {
+    Thinking,
+    Text,
+    ToolCall,
+}
+
+impl Producing {
+    /// The block type a `content_block_start` event names, if this chunk
+    /// opens one: the last such in the chunk.
+    fn opened_in(chunk: &[u8]) -> Option<Self> {
+        const MARK: &[u8] = br#""content_block":{"type":""#;
+        let at = chunk.windows(MARK.len()).rposition(|w| w == MARK)? + MARK.len();
+        let rest = &chunk[at..];
+        let end = rest.iter().position(|b| *b == b'"')?;
+        match &rest[..end] {
+            b"thinking" | b"redacted_thinking" => Some(Self::Thinking),
+            b"text" => Some(Self::Text),
+            b"tool_use" | b"server_tool_use" => Some(Self::ToolCall),
+            _ => None,
+        }
+    }
+}
+
+/// [`Traffic`] as kept: moments, not ages.
+#[derive(Debug, Default)]
+struct Live {
+    in_flight: u32,
+    requested: Option<Instant>,
+    byte: Option<Instant>,
+    producing: Option<Producing>,
+}
+
+/// One request in flight, counted until dropped — with the response body
+/// when there is one, so it ends however the request does: answered,
+/// failed upstream, or abandoned by the agent.
+struct InFlight {
+    state: Arc<ProxyState>,
+    env: String,
+}
+
+impl InFlight {
+    fn begin(state: Arc<ProxyState>, env: &str) -> Self {
+        if let Ok(mut traffic) = state.traffic.lock() {
+            let live = traffic.entry(env.to_string()).or_default();
+            live.in_flight += 1;
+            live.requested = Some(Instant::now());
+        }
+        Self {
+            state,
+            env: env.to_string(),
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut traffic) = self.state.traffic.lock() {
+            if let Some(live) = traffic.get_mut(&self.env) {
+                live.in_flight = live.in_flight.saturating_sub(1);
+                if live.in_flight == 0 {
+                    live.producing = None;
+                }
+            }
+        }
+    }
+}
+
 struct ProxyState {
     upstream: Uri,
     credentials: Arc<dyn CredentialSource>,
@@ -201,6 +288,8 @@ struct ProxyState {
     /// hardware must not quietly spend their subscription instead.
     custom: Mutex<Option<Arc<FileCustomUpstream>>>,
     spend: Mutex<HashMap<String, Spend>>,
+    /// Each environment's traffic as it stands ([`Traffic`]).
+    traffic: Mutex<HashMap<String, Live>>,
     /// The account's limit state, as the last response described it.
     ///
     /// One snapshot, not one per environment: the subscription is a
@@ -466,6 +555,19 @@ impl ProxyState {
 
     fn custom_source(&self) -> Option<Arc<FileCustomUpstream>> {
         self.custom.lock().ok()?.clone()
+    }
+
+    /// A reply's bytes arrived for `env`; `opened` is the content block a
+    /// chunk began, when it began one.
+    fn note_bytes(&self, env: &str, opened: Option<Producing>) {
+        if let Ok(mut traffic) = self.traffic.lock() {
+            if let Some(live) = traffic.get_mut(env) {
+                live.byte = Some(Instant::now());
+                if opened.is_some() {
+                    live.producing = opened;
+                }
+            }
+        }
     }
 
     fn record_request(&self, env: &str) {
@@ -802,6 +904,23 @@ impl Handle {
     }
 
     /// What this environment has spent so far.
+    /// What `env_id`'s traffic with the model is doing now.
+    pub fn traffic(&self, env_id: &str) -> Traffic {
+        self.state
+            .traffic
+            .lock()
+            .ok()
+            .and_then(|traffic| {
+                traffic.get(env_id).map(|live| Traffic {
+                    in_flight: live.in_flight,
+                    since_request: live.requested.map(|at| at.elapsed()),
+                    since_byte: live.byte.map(|at| at.elapsed()),
+                    producing: live.producing,
+                })
+            })
+            .unwrap_or_default()
+    }
+
     pub fn spend(&self, env_id: &str) -> Spend {
         self.state
             .spend
@@ -888,6 +1007,7 @@ impl AuthProxy {
             tokens: Mutex::new(HashMap::new()),
             custom: Mutex::new(None),
             spend: Mutex::new(HashMap::new()),
+            traffic: Mutex::new(HashMap::new()),
             quota: Mutex::new(QuotaSnapshot::default()),
             models: Mutex::new(None),
             models_cache: Mutex::new(None),
@@ -1382,6 +1502,7 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
     let outbound = Request::from_parts(parts, body);
 
     state.record_request(&env_id);
+    let in_flight = InFlight::begin(state.clone(), &env_id);
     let sent = tokio::time::timeout(HEADERS_TIMEOUT, state.client.request(outbound)).await;
     let upstream = match sent {
         Ok(Ok(response)) => response,
@@ -1485,6 +1606,7 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         .map(|idle| *idle)
         .unwrap_or(STREAM_IDLE_TIMEOUT);
     let metered = MeteredBody {
+        _in_flight: in_flight,
         inner: body,
         state: state.clone(),
         env: env_id,
@@ -1579,6 +1701,8 @@ fn error_response(status: StatusCode, kind: &str, message: &str) -> Response<Pro
 /// Messages API's `usage` counters, and handed on — through the block
 /// normalizer when there is one (`crate::sse`), as they came otherwise.
 struct MeteredBody {
+    /// Counted in flight for as long as the body is being read.
+    _in_flight: InFlight,
     inner: Incoming,
     state: Arc<ProxyState>,
     env: String,
@@ -1718,6 +1842,8 @@ impl Body for MeteredBody {
                     }
                     this.bytes += data.len() as u64;
                     let data = data.clone();
+                    this.state
+                        .note_bytes(&this.env, Producing::opened_in(&data));
                     this.usage.feed(&data);
                     if let Some(refusal) = this.refusal.as_mut() {
                         let room = MAX_REFUSAL_BODY.saturating_sub(refusal.len());
@@ -1894,6 +2020,35 @@ fn parse_u64(bytes: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The block a streaming reply is making, read from its own
+    /// `content_block_start` events: the last one a chunk opens.
+    #[test]
+    fn a_reply_says_what_it_is_making() {
+        let event = |kind: &str| {
+            format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"{kind}\",\"text\":\"\"}}}}\n\n"
+            )
+        };
+        assert_eq!(
+            Producing::opened_in(event("thinking").as_bytes()),
+            Some(Producing::Thinking)
+        );
+        assert_eq!(
+            Producing::opened_in(event("text").as_bytes()),
+            Some(Producing::Text)
+        );
+        assert_eq!(
+            Producing::opened_in(event("tool_use").as_bytes()),
+            Some(Producing::ToolCall)
+        );
+        let both = format!("{}{}", event("thinking"), event("text"));
+        assert_eq!(Producing::opened_in(both.as_bytes()), Some(Producing::Text));
+        assert_eq!(
+            Producing::opened_in(b"event: content_block_delta\ndata: {\"delta\":{}}\n\n"),
+            None
+        );
+    }
 
     #[test]
     fn usage_counters_survive_a_chunk_boundary() {

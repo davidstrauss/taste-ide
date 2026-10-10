@@ -98,6 +98,7 @@ pub use custom::{
     StoredCustomModel,
 };
 pub use proxy::{
-    AccountProbe, AuthProxy, CustomProbe, Handle, ModelsListener, Route, Spend, ANTHROPIC_UPSTREAM,
+    AccountProbe, AuthProxy, CustomProbe, Handle, ModelsListener, Producing, Route, Spend, Traffic,
+    ANTHROPIC_UPSTREAM,
 };
 pub use taste_core::quota::QuotaSnapshot;

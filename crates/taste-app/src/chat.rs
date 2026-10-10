@@ -7282,20 +7282,14 @@ impl ChatPane {
             .get()
             .map(|since| since.elapsed())
             .unwrap_or_default();
-        // Past a minute the silence is the news, so it leads and the
-        // activity is what the ellipsis takes: the line is cut from its
-        // end at the column's width, and "Stop if it has gone away" is
-        // the part that must survive the cut.
-        let label = if quiet < std::time::Duration::from_secs(20) {
-            activity.clone()
-        } else if quiet < std::time::Duration::from_secs(60) {
-            format!("{activity} · quiet for {}", duration_text(quiet))
-        } else {
-            format!(
-                "Quiet for {} — Stop if it has gone away · {activity}",
-                duration_text(quiet)
-            )
-        };
+        let tool_running = self
+            .tool_cards
+            .borrow()
+            .values()
+            .any(|card| card.running.get());
+        let traffic =
+            taste_acp::authproxy::handle().map(|proxy| proxy.traffic(self.environment.as_str()));
+        let label = working_line(&activity, quiet, tool_running, traffic);
         self.busy_label.set_label(&label);
     }
 
@@ -14872,6 +14866,79 @@ fn content_text(block: &ContentBlock) -> Option<String> {
     }
 }
 
+/// What the working line says, from how long the agent has said nothing
+/// (`quiet`), whether one of its steps is still running, and what the
+/// auth proxy sees of its traffic with the model — `None` when the agent
+/// does not go through it.
+///
+/// Silence alone could not tell a model deep in a long piece of thinking
+/// from a connection that died, so after a minute every quiet turn said
+/// "Stop if it has gone away" (David, 2026-10-09: "Could I get better
+/// feedback when the agent is simply working and not hung?"). The proxy
+/// sees the difference: a reply streaming now is work, and says what the
+/// model is making; a request asked and unanswered is waiting, and only
+/// past two minutes without a byte — the proxy itself ends a stream at
+/// ninety seconds of nothing — does it ask whether to stop; a step still
+/// running is the step's time; and nothing in flight at all is the one
+/// silence that is suspicious on its face.
+///
+/// Past the point where the silence is the news it leads, and the
+/// activity is what the ellipsis takes: the line is cut from its end at
+/// the column's width, and the advice is the part that must survive.
+fn working_line(
+    activity: &str,
+    quiet: std::time::Duration,
+    tool_running: bool,
+    traffic: Option<taste_acp::authproxy::Traffic>,
+) -> String {
+    use std::time::Duration;
+    if quiet < Duration::from_secs(20) {
+        return activity.to_string();
+    }
+    if let Some(traffic) = traffic {
+        if traffic.in_flight > 0 {
+            let asked = traffic.since_request.unwrap_or(quiet);
+            // A byte since the latest request, and a recent one.
+            let since_byte = traffic.since_byte.filter(|byte| *byte <= asked);
+            if since_byte.is_some_and(|byte| byte < Duration::from_secs(15)) {
+                use taste_acp::authproxy::Producing;
+                let doing = match traffic.producing {
+                    Some(Producing::Thinking) => "The model is thinking",
+                    Some(Producing::Text) => "The model is writing",
+                    Some(Producing::ToolCall) => "The model is writing a tool call",
+                    None => "The model is answering",
+                };
+                return format!(
+                    "{doing} · {} into this reply · {activity}",
+                    duration_text(asked)
+                );
+            }
+            let silent = since_byte.unwrap_or(asked);
+            if silent < Duration::from_secs(120) {
+                return format!(
+                    "Waiting on the model · asked {} ago · {activity}",
+                    duration_text(asked)
+                );
+            }
+            return format!(
+                "The model has sent nothing for {} — Stop if it has gone away · {activity}",
+                duration_text(silent)
+            );
+        }
+        if tool_running {
+            return format!("{activity} · running for {}", duration_text(quiet));
+        }
+    }
+    if quiet < Duration::from_secs(60) {
+        format!("{activity} · quiet for {}", duration_text(quiet))
+    } else {
+        format!(
+            "Quiet for {} — Stop if it has gone away · {activity}",
+            duration_text(quiet)
+        )
+    }
+}
+
 /// Session-cumulative token usage, humanized. Account-level quotas (5-hour
 /// and weekly limits) are not modeled by ACP; agents announce those in-band
 /// when relevant.
@@ -15121,6 +15188,66 @@ fn centre_dot_after_layout(row_box: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The working line tells working from gone by what the proxy sees,
+    /// not by silence alone.
+    #[test]
+    fn a_quiet_turn_says_whether_the_model_is_working() {
+        use std::time::Duration;
+        use taste_acp::authproxy::{Producing, Traffic};
+        let secs = Duration::from_secs;
+        let streaming = Traffic {
+            in_flight: 1,
+            since_request: Some(secs(200)),
+            since_byte: Some(secs(2)),
+            producing: Some(Producing::Thinking),
+        };
+        // Three minutes quiet, but the model is streaming its thinking:
+        // work, not a reason to stop.
+        let line = working_line("Working…", secs(213), false, Some(streaming));
+        assert!(
+            line.starts_with("The model is thinking · 3m 20s into this reply"),
+            "{line}"
+        );
+        assert!(!line.contains("Stop"), "{line}");
+        // Asked, nothing back yet, not long: waiting.
+        let asked = Traffic {
+            in_flight: 1,
+            since_request: Some(secs(45)),
+            since_byte: None,
+            producing: None,
+        };
+        let line = working_line("Working…", secs(45), false, Some(asked));
+        assert!(
+            line.starts_with("Waiting on the model · asked 45s ago"),
+            "{line}"
+        );
+        // Asked, and nothing for over two minutes: now it is a question.
+        let stalled = Traffic {
+            since_request: Some(secs(150)),
+            ..asked
+        };
+        let line = working_line("Working…", secs(150), false, Some(stalled));
+        assert!(
+            line.contains("sent nothing for 2m 30s — Stop if it has gone away"),
+            "{line}"
+        );
+        // Nothing in flight, but a step is running: the step's time.
+        let idle = Traffic::default();
+        let line = working_line("cargo test", secs(200), true, Some(idle));
+        assert_eq!(line, "cargo test · running for 3m 20s");
+        // Nothing in flight and nothing running: the suspicious silence.
+        let line = working_line("Working…", secs(213), false, Some(idle));
+        assert!(
+            line.starts_with("Quiet for 3m 33s — Stop if it has gone away"),
+            "{line}"
+        );
+        // Under twenty seconds, just the activity.
+        assert_eq!(
+            working_line("Working…", secs(5), false, Some(streaming)),
+            "Working…"
+        );
+    }
 
     /// A restored `suggest_replies` call gives back what the server would
     /// have shown: trimmed, nothing empty, and nothing from a malformed

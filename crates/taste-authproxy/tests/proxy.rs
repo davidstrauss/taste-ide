@@ -774,12 +774,29 @@ async fn responses_stream_chunk_by_chunk() {
 
     let mut body = response.into_body();
     let mut arrivals = Vec::new();
+    let mut mid_stream = None;
     while let Some(frame) = body.frame().await {
         let frame = frame.unwrap();
         if frame.data_ref().is_some() {
             arrivals.push(started.elapsed());
+            // What the chat's working line would read, mid-reply.
+            mid_stream.get_or_insert_with(|| handle.traffic("primary"));
         }
     }
+    drop(body);
+    let mid_stream = mid_stream.expect("a frame arrived");
+    assert_eq!(mid_stream.in_flight, 1, "{mid_stream:?}");
+    assert!(
+        mid_stream
+            .since_byte
+            .is_some_and(|byte| byte < Duration::from_millis(100)),
+        "{mid_stream:?}"
+    );
+    // Answered to the end: nothing in flight, and when the last byte came.
+    let after = handle.traffic("primary");
+    assert_eq!(after.in_flight, 0, "{after:?}");
+    assert!(after.since_byte.is_some(), "{after:?}");
+    assert_eq!(handle.traffic("never-issued"), Default::default());
 
     assert_eq!(arrivals.len(), 3, "one frame per upstream event");
     // Buffering would have made all three arrive together, after 400ms+.

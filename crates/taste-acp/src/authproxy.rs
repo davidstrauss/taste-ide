@@ -46,8 +46,8 @@ use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 /// reaches the proxy through this module and depends on no other part of
 /// `taste-authproxy`.
 pub use taste_authproxy::{
-    stored_custom_key, AccountProbe, CredentialKind, CustomFacts, CustomProbe, Route,
-    StoredCredential, StoredCustomModel,
+    stored_custom_key, AccountProbe, CredentialKind, CustomFacts, CustomProbe, Producing, Route,
+    StoredCredential, StoredCustomModel, Traffic,
 };
 
 use crate::registry::{AgentSpec, CLAUDE_CODE, CLAUDE_CODE_CUSTOM};
