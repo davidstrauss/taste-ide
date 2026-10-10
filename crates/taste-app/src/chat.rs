@@ -11762,6 +11762,31 @@ impl ChatPane {
             Ok("standing") => self.seed_standing_for_probe(),
             Ok("table") => self.seed_table_for_probe(),
             Ok("ask") => self.seed_questions_for_probe(),
+            // `ask-other`: the same, with an answer of the user's own typed
+            // into the first question's box — which selects its radio.
+            Ok("ask-other") => {
+                self.seed_questions_for_probe();
+                let bar = self.permission_bar.clone();
+                // Once the card is up, which is after this turn of the loop.
+                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                    fn first_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
+                        if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                            return Some(entry.clone());
+                        }
+                        let mut child = widget.first_child();
+                        while let Some(current) = child {
+                            if let Some(entry) = first_entry(&current) {
+                                return Some(entry);
+                            }
+                            child = current.next_sibling();
+                        }
+                        None
+                    }
+                    if let Some(entry) = bar.child().and_then(|card| first_entry(&card)) {
+                        entry.set_text("Neither — pin it in the TPM only after enrollment");
+                    }
+                });
+            }
             Ok("controls") => self.seed_controls_for_probe(),
             Ok(variant) => self.seed_permission_for_probe(variant),
             Err(_) => self.seed_permission_for_probe(""),
@@ -12936,14 +12961,53 @@ impl ChatPane {
                         group.append(&row);
                         buttons.push((button, choice.value.clone()));
                     }
-                    let other_entry = other.as_ref().map(|_| {
-                        let entry = gtk::Entry::builder()
-                            .placeholder_text(if many {
-                                "Add your own (optional)"
-                            } else {
-                                "Your own answer, or a note on your pick (optional)"
-                            })
+                    // The answer of the user's own is an option like the
+                    // others: a radio in their group (a check beside them,
+                    // for many), selected by focusing or typing in its box
+                    // and sent only while it is (David, 2026-10-09: "A
+                    // custom answer should be its own radio button,
+                    // selected automatically if I focus the custom text
+                    // box"). As a box under the options it read as a note
+                    // on the pick, and went with one.
+                    let other_row = other.as_ref().map(|_| {
+                        let button = gtk::CheckButton::builder()
+                            .valign(gtk::Align::Center)
                             .build();
+                        if !many {
+                            match &leader {
+                                Some(leader) => button.set_group(Some(leader)),
+                                None => leader = Some(button.clone()),
+                            }
+                        }
+                        let entry = gtk::Entry::builder()
+                            .placeholder_text("Your own answer")
+                            .hexpand(true)
+                            .build();
+                        button.update_relation(&[gtk::accessible::Relation::LabelledBy(&[
+                            entry.upcast_ref()
+                        ])]);
+                        let focus = gtk::EventControllerFocus::new();
+                        {
+                            let button = button.clone();
+                            focus.connect_enter(move |_| button.set_active(true));
+                        }
+                        entry.add_controller(focus);
+                        {
+                            let button = button.clone();
+                            entry.connect_changed(move |entry| {
+                                if !entry.text().is_empty() {
+                                    button.set_active(true);
+                                }
+                            });
+                        }
+                        {
+                            let entry = entry.clone();
+                            button.connect_toggled(move |button| {
+                                if button.is_active() && !entry.has_focus() {
+                                    entry.grab_focus();
+                                }
+                            });
+                        }
                         let answer_now = answer_now.clone();
                         entry.connect_activate(move |_| {
                             let go = answer_now.borrow().clone();
@@ -12951,13 +13015,18 @@ impl ChatPane {
                                 go();
                             }
                         });
-                        group.append(&entry);
-                        entry
+                        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                        row.add_css_class("question-option");
+                        row.append(&button);
+                        row.append(&entry);
+                        group.append(&row);
+                        (button, entry)
                     });
                     Box::new(move || {
-                        let typed = other_entry
+                        let typed = other_row
                             .as_ref()
-                            .map(|entry| entry.text().to_string())
+                            .filter(|(button, _)| button.is_active())
+                            .map(|(_, entry)| entry.text().trim().to_string())
                             .unwrap_or_default();
                         let picked: Vec<String> = buttons
                             .iter()
