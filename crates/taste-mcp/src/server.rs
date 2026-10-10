@@ -249,6 +249,12 @@ impl McpServer {
              puts on your PATH and on ide_exec's. Do not install Task, link go-task to \
              task, or change the devcontainer to provide it. task_list and task_run run \
              the project's Taskfile where the user sees it.\n\n\
+             MARKDOWN. Your replies here and the editor's preview of a .md file are \
+             rendered Markdown: tables, images, and Mermaid diagrams in ```mermaid \
+             fences, which are drawn as diagrams. To show a diagram, write it as \
+             Mermaid, in a reply or in a .md file; the user sees it drawn. There is no \
+             rendering step to offer or ask about: do not offer to render, export, or \
+             screenshot a diagram.\n\n\
              REPLIES. When a turn ends on a question or a choice for the user — confirm \
              this, pick one of these — call suggest_replies last, with the replies they \
              are likeliest to give, so they can answer with a click. Each reply names \
@@ -8183,6 +8189,9 @@ mod tests {
             assert!(text.contains("cat, sed, head, grep, or find"), "{text}");
             assert!(text.contains("supervises"), "{text}");
             assert!(text.contains("only what is on disk"), "{text}");
+            // Diagrams are drawn where they are written: nothing to offer.
+            assert!(text.contains("```mermaid"), "{text}");
+            assert!(text.contains("do not offer to render"), "{text}");
         }
         let coordinator = instructions(&primary_socket).await;
         assert!(
