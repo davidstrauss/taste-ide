@@ -69,15 +69,18 @@ pub fn render(source: &str, dark: bool, family: &str, scale: f32) -> Result<Rast
     .map_err(|e| e.to_string())?;
     let policy =
         TextMeasurementPolicy::host_display(identity, measure.clone(), TextMeasurementPhase::ALL);
+    let palette = if dark { &DARK } else { &LIGHT };
     let resolved = Presentation::new()
-        .with_theme(theme(if dark { &DARK } else { &LIGHT }, dark, family))
+        .with_theme(theme(palette, dark, family))
         .resolve();
-    let renderer = Renderer::new().with_engine(resolved.materialize_engine(merman::Engine::new()));
+    let engine = merman::Engine::new().with_site_config(layout_config());
+    let renderer = Renderer::new().with_engine(resolved.materialize_engine(engine));
     let output = SvgOutputPolicy {
         preset: SvgPipelinePreset::ResvgSafe,
         css_override_policy: CssOverridePolicy::StripExistingImportant,
         // Mermaid paints its root white; the page is the canvas here.
         root_background_color: Some("transparent".to_string()),
+        scoped_css: Some(label_halo(palette.canvas)),
         ..SvgOutputPolicy::default()
     };
     let request = SvgRequest {
@@ -318,6 +321,11 @@ impl HostTextMeasurer for Measure {
         };
         Ok(Some(match request.operation {
             Op::Measure | Op::Wrapped => HostTextMeasurement::Metrics(metrics(request.max_width)),
+            // Mermaid's `calculateTextDimensions`: how a sequence diagram
+            // sizes every message, note, and participant. Declined, it fell
+            // to merman's estimate — a narrower face than the one drawn —
+            // and labels ran out of what was laid out for them.
+            Op::MermaidCalculateTextDimensions => HostTextMeasurement::Metrics(metrics(None)),
             Op::WrappedWithRawWidth => HostTextMeasurement::WrappedWithRawWidth {
                 metrics: metrics(request.max_width),
                 raw_width: Some(metrics(None).width),
@@ -435,6 +443,41 @@ fn theme(palette: &Palette, dark: bool, family: &str) -> HostTheme {
     theme
 }
 
+/// Mermaid's own settings, chosen for text that stays where it belongs
+/// (David, 2026-10-09: "Also hoping this layout can improve to have less
+/// text crossing boundaries"). Every one is a setting a diagram's author
+/// could write in the diagram itself, which still takes precedence:
+/// - Sequence diagrams wrap. Without it a note over two participants is
+///   as wide as the gap between them whatever it says — upstream Mermaid
+///   does the same — and a long message runs across other participants'
+///   lifelines; with it, both fold to fit. Participants are 200 wide
+///   rather than 150, which is also the measure a message to oneself is
+///   folded to, so those come out three lines rather than five.
+/// - State diagrams and flowcharts get more room between nodes and
+///   between ranks, where their edge labels sit.
+fn layout_config() -> merman::MermaidConfig {
+    merman::MermaidConfig::from_value(serde_json::json!({
+        "sequence": { "wrap": true, "width": 200 },
+        "state": { "nodeSpacing": 80, "rankSpacing": 70 },
+        "flowchart": { "nodeSpacing": 60, "rankSpacing": 60 }
+    }))
+}
+
+/// A halo under a sequence diagram's label text, in the page's own color:
+/// a lifeline or a frame passing behind a label breaks around its letters
+/// rather than striking through them, as a map's labels sit over its
+/// roads. A message to oneself is labelled centred on one's own lifeline,
+/// so without it that line ran through every such label. Only these
+/// labels: a flowchart's or a state diagram's edge labels have a box of
+/// their own already.
+fn label_halo(canvas: &str) -> String {
+    format!(
+        ".messageText, .loopText, .labelText {{ paint-order: stroke fill !important; \
+         stroke: {canvas} !important; stroke-width: 6px !important; \
+         stroke-linejoin: round !important; }}"
+    )
+}
+
 /// Read the system's fonts now, so the first diagram does not wait on the
 /// scan.
 pub fn warm(family: &str) {
@@ -512,6 +555,40 @@ mod tests {
         let guarded = usvg::Tree::from_str(&svg, &options).unwrap();
         assert_eq!(images(guarded.root()), 0);
         let _ = std::fs::remove_file(&picture);
+    }
+
+    /// Every measurement a sequence diagram sizes its messages, notes, and
+    /// participants by is answered in the drawing face, not left to
+    /// merman's estimate of a narrower one.
+    #[test]
+    fn a_sequence_diagrams_text_is_measured_in_the_drawing_face() {
+        use merman::svg::{TextStyle, WrapMode};
+        let measure = measure_for("Adwaita Sans").expect("a face");
+        let style = TextStyle {
+            font_family: None,
+            font_size: 16.0,
+            font_weight: None,
+            font_style: None,
+        };
+        let text = "From here the TPM won't sign identity requests";
+        let answer = measure.measure(HostTextMeasurementRequest {
+            operation: Op::MermaidCalculateTextDimensions,
+            phase: TextMeasurementPhase::Layout,
+            text,
+            style: &style,
+            max_width: None,
+            wrap_mode: WrapMode::SvgLike,
+        });
+        let Ok(Some(HostTextMeasurement::Metrics(metrics))) = answer else {
+            panic!("calculateTextDimensions was not answered: {answer:?}");
+        };
+        let drawn = measure.regular.advance(text, 16.0);
+        assert!(
+            (metrics.width - drawn).abs() < 0.5,
+            "{} vs {drawn}",
+            metrics.width
+        );
+        assert_eq!(metrics.line_count, 1);
     }
 
     /// The point of measuring with the drawing face: a wider label makes a
