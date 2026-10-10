@@ -106,7 +106,9 @@ computed geometry, and quit — the headless way to *see* a UI change.
 composer on Backlog, half-written, the list scrolled to the ghost row
 that points at it —, `orchestrator`,
 `port` (a forwarded port's tab on its REST face),
-`utilization`, `search` — the one query posed, every pane answering it —,
+`utilization`, `search` — the one query posed, every pane answering it,
+the index mid-build on the meaning button (`TASTE_PROBE_INDEX=held`: waiting
+for mains instead, a struck plug in the minutes' place) —,
 `dirty` — the Dirty filter view, for measuring the column's rows —,
 `stashed` — the Stashed filter view with two rows checked, its pane's
 Unstash and held trash in the frame, against the checkout's own stash)

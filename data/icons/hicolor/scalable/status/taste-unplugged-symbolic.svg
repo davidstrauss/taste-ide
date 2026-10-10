@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A plug struck through: search by meaning's index waiting for mains,
+     on the meaning button where the minutes left would be (David,
+     2026-10-09: "If I'm on battery and the index is suspended, we should
+     show a plug with a slash through it instead of the remaining time").
+     The slash cuts a halo through the plug (a mask), as the struck ghost's
+     does, so the two shapes stay separate in one colour. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <defs>
+    <mask id="halo">
+      <rect width="16" height="16" fill="#fff"/>
+      <path d="M13.0 0.2 L 15.8 3.0 L 3.0 15.8 L 0.2 13.0 Z" fill="#000"/>
+    </mask>
+  </defs>
+  <g fill="#241f31">
+    <g mask="url(#halo)">
+      <rect x="5" y="1" width="1.5" height="4" rx=".75"/>
+      <rect x="9.5" y="1" width="1.5" height="4" rx=".75"/>
+      <path d="M3.5 4.5 h9 v2.5 a4.5 4.5 0 0 1 -3.75 4.44 V 15 h-1.5 v-3.56 A4.5 4.5 0 0 1 3.5 7 Z"/>
+    </g>
+    <path d="M13.6 1.0 A0.9 0.9 0 0 1 15.0 2.4 L 2.4 15.0 A0.9 0.9 0 0 1 1.0 13.6 Z"/>
+  </g>
+</svg>

@@ -154,10 +154,18 @@ impl Keeper {
                     cancel.store(true, Ordering::Relaxed);
                 }
                 self.held.set(true);
+                self.say_held(true);
                 tracing::info!("semantic index: paused on battery; it resumes on mains");
             }
         } else if self.held.replace(false) {
             self.refresh_now();
+        }
+    }
+
+    /// Tell the search box the index is (or is no longer) waiting for mains.
+    fn say_held(&self, held: bool) {
+        if let Some(search) = self.search.upgrade() {
+            search.set_index_held(held);
         }
     }
 
@@ -171,8 +179,10 @@ impl Keeper {
             if !self.held.replace(true) {
                 tracing::info!("semantic index: held on battery; it is built on mains");
             }
+            self.say_held(true);
             return;
         }
+        self.say_held(false);
         self.running.set(true);
         if let Some(previous) = self.cancel.borrow_mut().take() {
             previous.store(true, Ordering::Relaxed);

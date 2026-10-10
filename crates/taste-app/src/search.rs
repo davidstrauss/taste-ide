@@ -575,9 +575,14 @@ pub struct Search {
     /// gauge's drawing (`gauge.rs`) in the search's ink, and the time left.
     /// The minutes left on the meaning button while the index builds.
     index_pill: gtk::Label,
+    /// In the pill's place while the index waits for mains: a plug struck
+    /// through, so a build stopped on battery does not read as one done.
+    index_held: gtk::Image,
     /// The index is building: the meaning button stays disabled whatever
     /// the query says.
     indexing: Cell<bool>,
+    /// The index has work owed that waits for the machine to be plugged in.
+    held: Cell<bool>,
     /// The two above in one box, so the narrow rungs can hide the pair
     rule: gtk::LevelBar,
     query: RefCell<Query>,
@@ -741,9 +746,16 @@ impl Search {
             .css_classes(["index-pill", "numeric"])
             .visible(false)
             .build();
+        let index_held = gtk::Image::builder()
+            .icon_name("taste-unplugged-symbolic")
+            .pixel_size(12)
+            .css_classes(["index-pill"])
+            .visible(false)
+            .build();
         let meaning_face = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         meaning_face.append(&gtk::Image::from_icon_name(MEANING_ICON));
         meaning_face.append(&index_pill);
+        meaning_face.append(&index_held);
         let meaning = gtk::ToggleButton::builder()
             .child(&meaning_face)
             .tooltip_text(MEANING_TOOLTIP)
@@ -769,7 +781,9 @@ impl Search {
             stops,
             placeholders: RefCell::new(HashMap::new()),
             index_pill,
+            index_held,
             indexing: Cell::new(false),
+            held: Cell::new(false),
             rule,
             query: RefCell::new(Query::default()),
             generation: Cell::new(0),
@@ -998,11 +1012,12 @@ impl Search {
         let Some(indexing) = indexing else {
             self.indexing.set(false);
             self.index_pill.set_visible(false);
-            self.meaning.set_tooltip_text(Some(MEANING_TOOLTIP));
+            self.draw_held();
             self.sync_meaning_sensitivity();
             return;
         };
         self.indexing.set(true);
+        self.index_held.set_visible(false);
         self.index_pill.set_label(&minutes_left(indexing.eta));
         self.index_pill.set_visible(true);
         self.meaning.set_tooltip_text(Some(&format!(
@@ -1022,6 +1037,32 @@ impl Search {
         self.sync_meaning_sensitivity();
     }
 
+    /// The index has work owed that waits for mains (`held`), or no longer.
+    /// While it waits, a struck plug stands where the minutes left would:
+    /// a build stopped on battery is not a build finished, and the empty
+    /// button said it was (David, 2026-10-09). The index as it last stood
+    /// still answers, so the button stays usable.
+    pub fn set_index_held(&self, held: bool) {
+        self.held.set(held);
+        if !self.indexing.get() {
+            self.draw_held();
+        }
+    }
+
+    /// The button's face when no build is running: the struck plug and
+    /// its reason while one waits for mains, the plain button otherwise.
+    fn draw_held(&self) {
+        let held = self.held.get();
+        self.index_held.set_visible(held);
+        self.meaning.set_tooltip_text(Some(if held {
+            "Indexing this checkout for search by meaning is paused while the machine runs \
+             on battery, and continues when it is plugged in. Results by meaning come from \
+             the index as it last stood; literal search works now."
+        } else {
+            MEANING_TOOLTIP
+        }));
+    }
+
     /// The meaning button takes a click whenever there is an index to ask —
     /// before any text is typed too, since the toggle is how the next query
     /// is asked (David, 2026-09-07: "I should be able to toggle AI search
@@ -1033,6 +1074,11 @@ impl Search {
     /// TASTE_PROBE_CHECK only: the index mid-build, so the frame shows the
     /// pill.
     pub fn seed_indexing_for_probe(&self) {
+        // `TASTE_PROBE_INDEX=held`: waiting for mains instead.
+        if std::env::var("TASTE_PROBE_INDEX").as_deref() == Ok("held") {
+            self.set_index_held(true);
+            return;
+        }
         self.set_indexing(Some(Indexing {
             done: 1_290,
             total: 3_257,
