@@ -1374,7 +1374,6 @@ pub fn copy_ignored_home(
     rels: &[PathBuf],
     on_copied: &(dyn Fn(usize, usize, &Path) + Sync),
 ) -> Result<(usize, u64, Vec<PathBuf>)> {
-    use std::os::unix::fs::PermissionsExt;
     let mut wanted: Vec<PathBuf> = Vec::new();
     let mut empty: Vec<PathBuf> = Vec::new();
     for rel in rels {
@@ -1439,17 +1438,12 @@ pub fn copy_ignored_home(
                     let content = files
                         .read(&from)
                         .with_context(|| format!("reading {}", rel.display()))?;
-                    let to = peer.join(rel);
-                    if let Some(parent) = to.parent() {
-                        std::fs::create_dir_all(parent)
-                            .with_context(|| format!("making {}", parent.display()))?;
-                    }
-                    std::fs::write(&to, &content)
-                        .with_context(|| format!("writing {}", to.display()))?;
-                    if files.stat(&from).is_ok_and(|stat| stat.mode & 0o111 != 0) {
-                        let _ =
-                            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755));
-                    }
+                    // The path is the VM's git's answer, so it goes
+                    // through `beneath` like every other write the VM
+                    // names: not into `.git`, and not through a link the
+                    // mirror wrote into the folder.
+                    let executable = files.stat(&from).is_ok_and(|stat| stat.mode & 0o111 != 0);
+                    taste_git::beneath::write_file(peer, rel, &content, executable)?;
                     Ok(content.len() as u64)
                 })();
                 match copied {

@@ -157,23 +157,25 @@ impl GitWorkspace {
             }
             git2::TreeWalkResult::Ok
         })?;
+        // Through `beneath`: the commit came from the VM, and its paths do
+        // not get to choose where on this host they are written — not out
+        // of the folder, and not through a link an earlier entry made.
         for (rel, id, mode) in missing {
-            let path = self.workdir.join(&rel);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
             let blob = self.repo.find_blob(id)?;
             if mode == i32::from(git2::FileMode::Link) {
-                let target = std::str::from_utf8(blob.content())
-                    .context("a symlink target that is not UTF-8")?;
-                std::os::unix::fs::symlink(target, &path)?;
+                use std::os::unix::ffi::OsStrExt;
+                crate::beneath::write_link(
+                    &self.workdir,
+                    &rel,
+                    std::ffi::OsStr::from_bytes(blob.content()),
+                )?;
             } else {
-                std::fs::write(&path, blob.content())
-                    .with_context(|| format!("writing {}", path.display()))?;
-                if mode == i32::from(git2::FileMode::BlobExecutable) {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-                }
+                crate::beneath::write_file(
+                    &self.workdir,
+                    &rel,
+                    blob.content(),
+                    mode == i32::from(git2::FileMode::BlobExecutable),
+                )?;
             }
         }
         self.repo.reference(

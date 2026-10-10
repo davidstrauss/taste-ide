@@ -34,7 +34,6 @@
 //! which writes no new snapshot) is current whatever it names.
 
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -161,13 +160,6 @@ pub struct Change {
     pub content: Option<Vec<u8>>,
     pub executable: bool,
     pub link: bool,
-}
-
-/// Whether a path component names a repository's metadata directory, the
-/// way git's `verify_path` sees it.
-fn is_git_dir_name(name: &str) -> bool {
-    let folded = name.trim_end_matches(['.', ' ']).to_ascii_lowercase();
-    folded == ".git" || folded == "git~1"
 }
 
 /// Where the mirror once kept paths it held back after a `.gitignore`
@@ -941,90 +933,32 @@ impl GitWorkspace {
                 // A submodule's pointer: nothing to write here.
                 continue;
             }
-            let absolute = self.checked_path(rel)?;
-            if let Some(parent) = absolute.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("making {}", parent.display()))?;
-            }
             let blob = self.repo.find_blob(file.id())?;
-            // A path that was a file becoming one, a link, or a directory
-            // the old tree never had: cleared first, so the write below
-            // cannot land through a link.
-            if std::fs::symlink_metadata(&absolute).is_ok_and(|m| m.file_type().is_symlink()) {
-                std::fs::remove_file(&absolute)?;
-            }
+            // Through `beneath`, which refuses a path out of the folder, a
+            // directory on the way that is a link, and a staging name
+            // planted as one — the checkout chose this path, and it does
+            // not get to choose where on this host it lands.
             match file.mode() {
-                git2::FileMode::Link => {
-                    let _ = std::fs::remove_file(&absolute);
-                    let target = std::ffi::OsStr::from_bytes(blob.content());
-                    std::os::unix::fs::symlink(target, &absolute)
-                        .with_context(|| format!("linking {}", absolute.display()))?;
-                }
-                mode => {
-                    // Written beside and renamed over, so a file is never
-                    // seen half-written — by the user's editor, a build, or
-                    // a close that stops the pass partway.
-                    let name = absolute.file_name().unwrap_or_default().to_string_lossy();
-                    let staging = absolute.with_file_name(format!(".{name}.taste-mirror"));
-                    std::fs::write(&staging, blob.content())
-                        .with_context(|| format!("writing {}", absolute.display()))?;
-                    let executable = mode == git2::FileMode::BlobExecutable;
-                    let mut permissions = std::fs::metadata(&staging)?.permissions();
-                    let bits = match std::fs::metadata(&absolute) {
-                        Ok(existing) => existing.permissions().mode(),
-                        Err(_) => permissions.mode(),
-                    };
-                    permissions.set_mode(if executable {
-                        bits | 0o111
-                    } else {
-                        bits & !0o111
-                    });
-                    std::fs::set_permissions(&staging, permissions)?;
-                    if let Err(e) = std::fs::rename(&staging, &absolute) {
-                        let _ = std::fs::remove_file(&staging);
-                        return Err(e).with_context(|| format!("writing {}", absolute.display()));
-                    }
-                }
+                git2::FileMode::Link => crate::beneath::write_link(
+                    &self.workdir,
+                    rel,
+                    std::ffi::OsStr::from_bytes(blob.content()),
+                )?,
+                mode => crate::beneath::write_file(
+                    &self.workdir,
+                    rel,
+                    blob.content(),
+                    mode == git2::FileMode::BlobExecutable,
+                )?,
             }
         }
         Ok((changed, protected.into_iter().collect()))
     }
 
     /// A path inside the working tree, refused when it would reach outside
-    /// it or into `.git` — a tree is data, and data does not get to choose
-    /// where on this host it is written.
+    /// it, into `.git`, or through a link ([`crate::beneath::checked`]).
     fn checked_path(&self, rel: &Path) -> Result<PathBuf> {
-        use std::path::Component;
-        // `.git` in ANY component, as git's own verify_path refuses it:
-        // a tree carrying `sub/.git/config` would plant a repository's
-        // config in the folder, and git on this host reads it — and runs
-        // what `core.fsmonitor` or an alias names — in that directory. Case
-        // and the trailing dots, spaces, and 8.3 name some filesystems fold
-        // into `.git` too.
-        let ok = rel.components().all(|c| match c {
-            Component::Normal(name) => !is_git_dir_name(&name.to_string_lossy()),
-            _ => false,
-        });
-        if !ok {
-            bail!(
-                "refusing to write {} outside the working tree",
-                rel.display()
-            );
-        }
-        // A directory on the way that is a link would carry the write out
-        // of the folder.
-        let mut at = self.workdir.clone();
-        for part in rel.parent().into_iter().flat_map(Path::components) {
-            at.push(part);
-            if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
-                bail!(
-                    "refusing to write {} through the link {}",
-                    rel.display(),
-                    at.display()
-                );
-            }
-        }
-        Ok(self.workdir.join(rel))
+        crate::beneath::checked(&self.workdir, rel)
     }
 
     fn remove_in_worktree(&self, rel: &Path) -> Result<()> {

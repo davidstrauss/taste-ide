@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use git2::{Repository, Status, StatusOptions};
 
+pub mod beneath;
 pub mod clone;
 pub mod issues;
 pub mod mediate;
@@ -706,6 +707,13 @@ impl GitWorkspace {
     /// `../other-repo` would have handed Personal a repository from
     /// outside the project, so a path that is absolute or steps up is not
     /// a submodule here, as git's own index would not take it.
+    ///
+    /// Nor one that reaches its place through a link in the folder, its
+    /// own name included. The checkout's links are mirrored here with
+    /// whatever target they carry, so `sub -> ../sibling` beside a
+    /// `.gitmodules` naming `sub` is lexically inside and lands on another
+    /// project on this machine — whose refs the sync would then hand the
+    /// VM, and whose working tree it would mirror the checkout into.
     pub fn submodules(&self) -> Vec<(String, PathBuf)> {
         self.repo
             .submodules()
@@ -713,6 +721,7 @@ impl GitWorkspace {
                 subs.iter()
                     .filter_map(|sub| Some((sub.name()?.to_string(), sub.path().to_path_buf())))
                     .filter(|(_, path)| inside(path))
+                    .filter(|(_, path)| !beneath::passes_a_link(&self.workdir, path))
                     .collect()
             })
             .unwrap_or_default()
@@ -994,6 +1003,29 @@ mod tests {
         ] {
             assert_eq!(inside(Path::new(path)), ok, "{path}");
         }
+    }
+
+    /// A submodule `.gitmodules` names at a path that is a link in the
+    /// folder is not one: the link could be the checkout's, pointing at
+    /// another project on this machine.
+    #[test]
+    fn a_submodule_reached_through_a_link_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        git2::Repository::init(outside.path()).unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"real\"]\n\tpath = real\n\turl = https://example.com/real.git\n\
+             [submodule \"linked\"]\n\tpath = linked\n\turl = https://example.com/linked.git\n",
+        )
+        .unwrap();
+        git2::Repository::init(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).unwrap();
+        let ws = GitWorkspace::discover(dir.path()).unwrap();
+        let paths: Vec<PathBuf> = ws.submodules().into_iter().map(|(_, p)| p).collect();
+        assert!(paths.contains(&PathBuf::from("real")), "{paths:?}");
+        assert!(!paths.contains(&PathBuf::from("linked")), "{paths:?}");
     }
 
     /// Each submodule's files are keyed under its path, the nested ones
