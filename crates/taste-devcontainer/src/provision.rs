@@ -391,6 +391,28 @@ pub const GUEST_INOTIFY_SYSCTL: (&str, &str) = (
     "fs.inotify.max_user_watches = 1048576\nfs.inotify.max_user_instances = 8192\nfs.inotify.max_queued_events = 65536\n",
 );
 
+/// The guest's sshd, sized for its one client. Every git transfer, port
+/// tunnel, and podman connection the IDE makes arrives from one address —
+/// the host, through the VM's user-mode network — and sshd's defaults are
+/// for a server facing strangers: past ten handshakes in flight
+/// (`MaxStartups 10:30:100`) it began dropping them, which a sync with
+/// six submodules did ("kex_exchange_identification: read: Connection
+/// reset by peer", 2026-10-09); and its per-source penalties would answer
+/// a few failed connections by refusing that one address — the IDE,
+/// whole — for up to ten minutes. And git's transfers share one
+/// connection (`Keys::git_ssh_command`), where sshd's ten sessions a
+/// connection would refuse the eleventh outright rather than queue it. The door is loopback on the host and a
+/// key only the workspace holds, so neither limit guards anything here.
+/// Read before Fedora's own drop-ins (sshd takes the first value it sees).
+/// Written by Ignition for a new VM, and into one that predates it at
+/// bring-up ([`LibvirtSession::tune_guest_shutdown`]), sshd reloaded.
+pub const GUEST_SSHD_CONF: (&str, &str) = (
+    "/etc/ssh/sshd_config.d/10-taste-ide.conf",
+    "# Written by taste-ide: the IDE on this VM's host is its only client.\n\
+     MaxStartups 200:30:400\nPerSourceMaxStartups none\nPerSourcePenalties no\n\
+     MaxSessions 100\n",
+);
+
 /// The guest's dead man's switch: a timer that powers the VM off once no
 /// ssh session has been established for a while. The IDE holds one for
 /// as long as it lives — the keeper's `podman exec` rides it — so the
@@ -522,7 +544,10 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
     // on the other side (David, 2026-09-22: "A ton of time gets wasted
     // waiting on this"). Ten seconds for a unit, fifteen for the user
     // manager that holds the containers.
-    for (path, contents) in GUEST_STOP_DROPINS.into_iter().chain([GUEST_INOTIFY_SYSCTL]) {
+    for (path, contents) in GUEST_STOP_DROPINS
+        .into_iter()
+        .chain([GUEST_INOTIFY_SYSCTL, GUEST_SSHD_CONF])
+    {
         files.push(serde_json::json!({
             "path": path,
             "mode": 420,
@@ -1531,8 +1556,9 @@ impl LibvirtSession {
         if String::from_utf8_lossy(&output.stdout).contains("changed") {
             self.say(
                 &vm.domain,
-                "guest tuned: stop timeouts of 10s per unit and 15s for the user manager, and a \
-                 power-off five minutes after the last ssh session",
+                "guest tuned: stop timeouts of 10s per unit and 15s for the user manager, a \
+                 power-off five minutes after the last ssh session, and sshd's connection \
+                 limits sized for the IDE",
             );
         }
         Ok(())
@@ -1672,6 +1698,7 @@ fn guest_tuning_script() -> String {
         .map(|(path, contents)| (*path, *contents, "644"))
         .collect();
     files.push((GUEST_INOTIFY_SYSCTL.0, GUEST_INOTIFY_SYSCTL.1, "644"));
+    files.push((GUEST_SSHD_CONF.0, GUEST_SSHD_CONF.1, "644"));
     files.push((GUEST_IDLE_OFF_SCRIPT_PATH, GUEST_IDLE_OFF_SCRIPT, "755"));
     files.push((
         "/etc/systemd/system/taste-idle-off.service",
@@ -1694,9 +1721,12 @@ fn guest_tuning_script() -> String {
         "sysctl -q -p {} >/dev/null 2>&1 || true\n",
         GUEST_INOTIFY_SYSCTL.0
     ));
+    // A reload keeps the sessions it has, this one included; a config
+    // sshd would refuse is not reloaded into, so the old one stays.
     script.push_str(
         "if [ \"$changed\" = 1 ]; then systemctl daemon-reload; \
-         systemctl enable --now taste-idle-off.timer >/dev/null 2>&1 || true; echo changed; fi\n",
+         systemctl enable --now taste-idle-off.timer >/dev/null 2>&1 || true; \
+         sshd -t && systemctl reload sshd.service >/dev/null 2>&1 || true; echo changed; fi\n",
     );
     script
 }
@@ -2082,6 +2112,10 @@ mod tests {
         assert!(
             files.iter().any(|f| f["path"] == GUEST_INOTIFY_SYSCTL.0),
             "the raised inotify limits are in every new guest"
+        );
+        assert!(
+            files.iter().any(|f| f["path"] == GUEST_SSHD_CONF.0),
+            "sshd sized for the IDE in every new guest"
         );
         let links = parsed["storage"]["links"].as_array().unwrap();
         let socket = links

@@ -267,8 +267,35 @@ impl Keys {
     /// the same options as [`Self::ssh_argv`], without the host and port,
     /// which git supplies from the URL. Shell-quoted, because git runs it
     /// through a shell.
+    ///
+    /// Git transfers share one connection per VM (OpenSSH multiplexing),
+    /// kept a minute past the last: a sync runs a fetch or a push per
+    /// branch and per submodule, and a fresh handshake for each was a
+    /// burst that sshd's handshake limit dropped (2026-10-09), besides
+    /// costing each its own key exchange. The socket lives in the runtime
+    /// directory, which only the user can enter — never `/tmp`, where
+    /// another account could plant one and take the IDE's git traffic.
+    /// No runtime directory, no sharing.
     pub fn git_ssh_command(&self) -> String {
         let quote = |s: String| format!("'{}'", s.replace('\'', "'\\''"));
+        let mux = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute() && dir.is_dir())
+            .map(|dir| {
+                [
+                    "-o".to_string(),
+                    "ControlMaster=auto".into(),
+                    "-o".into(),
+                    quote(format!(
+                        "ControlPath={}",
+                        dir.join("taste-ssh-%C").display()
+                    )),
+                    "-o".into(),
+                    "ControlPersist=60".into(),
+                ]
+            })
+            .into_iter()
+            .flatten();
         [
             self.ssh.clone().unwrap_or_else(|| "ssh".to_string()),
             "-i".into(),
@@ -287,6 +314,9 @@ impl Keys {
             "-o".into(),
             "BatchMode=yes".into(),
         ]
+        .into_iter()
+        .chain(mux)
+        .collect::<Vec<_>>()
         .join(" ")
     }
 }
@@ -400,5 +430,17 @@ mod tests {
         assert!(command.contains("'UserKnownHostsFile="), "{command}");
         assert!(command.contains("BatchMode=yes"), "{command}");
         assert!(!command.contains("127.0.0.1"), "{command}");
+        // Shared, when there is a runtime directory to keep the socket
+        // in, and only there.
+        match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+            Some(dir) if dir.is_absolute() && dir.is_dir() => {
+                assert!(command.contains("ControlMaster=auto"), "{command}");
+                assert!(
+                    command.contains(&format!("'ControlPath={}/taste-ssh-%C'", dir.display())),
+                    "{command}"
+                );
+            }
+            _ => assert!(!command.contains("ControlMaster"), "{command}"),
+        }
     }
 }
