@@ -75,6 +75,9 @@ struct EditorPage {
     changes_holder: gtk::Box,
     /// The rendered markdown preview face (rebuilt on refresh).
     preview_holder: gtk::Box,
+    /// Which rebuild of the preview is the latest: one overtaken by a newer
+    /// edit before it was whole is dropped rather than shown late.
+    preview_generation: Rc<Cell<u64>>,
     /// Revealed when the file changed on disk UNDER unsaved edits.
     conflict_bar: crate::viewer::ChangedBar,
     /// Hash of the bytes the last save wrote: the watcher echoes our own
@@ -694,6 +697,10 @@ pub struct Editor {
 }
 
 const MAX_NAV_HISTORY: usize = 100;
+
+/// The longest a Markdown preview's rebuild waits for its pictures and
+/// diagrams before it takes the screen anyway, the rest filling in after.
+const PREVIEW_SWAP_WAIT: std::time::Duration = std::time::Duration::from_millis(600);
 
 impl Editor {
     /// The tab strip, for the key reveal to point at.
@@ -3396,6 +3403,7 @@ impl Editor {
             stack,
             changes_holder,
             preview_holder,
+            preview_generation: Rc::new(Cell::new(0)),
             conflict_bar,
             saved_hash: Cell::new(None),
             warned: Cell::new(false),
@@ -4420,9 +4428,6 @@ impl Editor {
         if self.wysiwyg_active(path, page) {
             // Full-quality preview: pulldown-cmark rendered into native
             // widgets, with copy affordances on code spans and blocks.
-            while let Some(child) = page.preview_holder.first_child() {
-                page.preview_holder.remove(&child);
-            }
             let text = page
                 .buffer
                 .text(&page.buffer.start_iter(), &page.buffer.end_iter(), true)
@@ -4446,10 +4451,53 @@ impl Editor {
                     open_events.publish(taste_core::Event::OpenFileRequested { path, line });
                 }),
             };
-            page.preview_holder
-                .append(&crate::markdown_view::render_document(
-                    &text, on_link, images,
-                ));
+            // Double-buffered: the next rendering is built beside the one
+            // on screen and takes its place in one step once its pictures
+            // and diagrams are in — or after a moment, whichever is first —
+            // so an edit or a reload never shows the page torn down, half
+            // empty, or jumping as images fill in and the scroll is
+            // clamped (David, 2026-10-09: "Ensure Markdown preview updates
+            // get double-buffered to avoid jank"). The first rendering has
+            // nothing to stand behind, and shows as it fills.
+            let (fresh, ready) =
+                crate::markdown_view::render_document_buffered(&text, on_link, images);
+            let generation = page.preview_generation.get() + 1;
+            page.preview_generation.set(generation);
+            let holder = page.preview_holder.clone();
+            let swap: Rc<dyn Fn()> = {
+                let holder = holder.clone();
+                let latest = page.preview_generation.clone();
+                Rc::new(move || {
+                    if latest.get() != generation || fresh.parent().is_some() {
+                        return;
+                    }
+                    let adjustment = holder
+                        .ancestor(gtk::ScrolledWindow::static_type())
+                        .and_downcast::<gtk::ScrolledWindow>()
+                        .map(|scroller| scroller.vadjustment());
+                    let held = adjustment.as_ref().map(|a| a.value());
+                    while let Some(child) = holder.first_child() {
+                        holder.remove(&child);
+                    }
+                    holder.append(&fresh);
+                    if let (Some(adjustment), Some(value)) = (adjustment, held) {
+                        adjustment.set_value(value);
+                        // And after the new rendering's first layout, which
+                        // is when its height is known.
+                        glib::idle_add_local_once(move || {
+                            let top = (adjustment.upper() - adjustment.page_size()).max(0.0);
+                            adjustment.set_value(value.min(top));
+                        });
+                    }
+                })
+            };
+            if holder.first_child().is_none() {
+                swap();
+            } else {
+                let on_ready = swap.clone();
+                ready.when_ready(move || on_ready());
+                glib::timeout_add_local_once(PREVIEW_SWAP_WAIT, move || swap());
+            }
         }
         if !page.changes_view.get() {
             page.stack

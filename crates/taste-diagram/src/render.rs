@@ -32,12 +32,20 @@ use resvg::usvg::{self, fontdb};
 
 /// How long one diagram may take before it is given up on. A preview is
 /// interactive, and a pathological graph must not hold a thread for ever.
-const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The longest side a raster may have, in pixels. Past it the scale comes
 /// down rather than the allocation going up. The IDE refuses a reply
 /// larger than this, so the two say the same number.
 pub const MAX_RASTER_SIDE: f32 = 8192.0;
+
+/// The most pixels a picture is drawn with: four megapixels, sixteen
+/// megabytes. Past it the scale comes down. A preview shows a diagram at
+/// most a column wide — under a thousand pixels — so this is still more
+/// than twice that across for the widest, and it keeps a document of many
+/// diagrams from being gigabytes of textures: sixteen drawn at twice their
+/// size were 586 MB, up to 104 for one (2026-10-09).
+pub const MAX_RASTER_PIXELS: f32 = 4_000_000.0;
 
 /// A drawn diagram: premultiplied RGBA at `width`×`height` pixels, which
 /// stand for `logical_width` at the scale it was drawn for (the height
@@ -92,6 +100,12 @@ pub fn render(source: &str, dark: bool, family: &str, scale: f32) -> Result<Rast
     let longest = size.width().max(size.height()) * scale;
     let scale = if longest > MAX_RASTER_SIDE {
         scale * MAX_RASTER_SIDE / longest
+    } else {
+        scale
+    };
+    let area = size.width() * size.height() * scale * scale;
+    let scale = if area > MAX_RASTER_PIXELS {
+        scale * (MAX_RASTER_PIXELS / area).sqrt()
     } else {
         scale
     };

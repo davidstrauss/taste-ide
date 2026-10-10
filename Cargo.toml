@@ -90,3 +90,34 @@ getrandom = "0.4"
 # everybody's transitive dependency; naming it buys the declaration, not the
 # build.
 libc = "0.2"
+
+# The diagram helper's layout and drawing (taste-diagram), optimized in a
+# debug build too: unoptimized, merman took 1.4 to 5.4 seconds a diagram,
+# against a deadline, while a preview waited on it (2026-10-09). Only
+# these crates; the IDE's own code keeps its debug build.
+[profile.dev.package.merman]
+opt-level = 3
+[profile.dev.package.merman-core]
+opt-level = 3
+[profile.dev.package.merman-render]
+opt-level = 3
+[profile.dev.package.dugong]
+opt-level = 3
+[profile.dev.package.dugong-graphlib]
+opt-level = 3
+[profile.dev.package.resvg]
+opt-level = 3
+[profile.dev.package.usvg]
+opt-level = 3
+[profile.dev.package.tiny-skia]
+opt-level = 3
+[profile.dev.package.tiny-skia-path]
+opt-level = 3
+[profile.dev.package.rustybuzz]
+opt-level = 3
+[profile.dev.package.ttf-parser]
+opt-level = 3
+[profile.dev.package.fontdb]
+opt-level = 3
+[profile.dev.package.roxmltree]
+opt-level = 3

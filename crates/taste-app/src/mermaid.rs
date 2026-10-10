@@ -48,17 +48,15 @@ pub fn is_mermaid(info: &str) -> bool {
         .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
 }
 
-/// How many finished pictures are kept.
-const CACHE_ENTRIES: usize = 64;
-
 /// The longest side of a picture the helper may send: its own cap
 /// (`taste_diagram`'s `MAX_RASTER_SIDE`). Anything larger is a lie about
 /// the size, and the reply is refused before a byte of it is allocated.
 const MAX_SIDE: u64 = 8192;
 
-/// How long the helper has to answer: its own deadline is five seconds a
-/// diagram, and a reply that has not come in twice that is a helper stuck.
-const REPLY_DEADLINE: Duration = Duration::from_secs(10);
+/// How long the helper has to answer: its own deadline is thirty seconds a
+/// diagram, and a reply that has not come in fifteen past that is a
+/// helper stuck.
+const REPLY_DEADLINE: Duration = Duration::from_secs(45);
 
 /// A drawn diagram: premultiplied RGBA at `width`×`height` pixels, which
 /// stand for `logical_width` at the scale it was drawn for.
@@ -265,15 +263,39 @@ struct Key {
     scale: i32,
 }
 
-/// A finished picture: the texture and the size it stands for.
+/// A finished picture: the texture, the size it stands for, and what it
+/// holds in memory.
 #[derive(Clone)]
 struct Drawn {
     texture: gtk::gdk::Texture,
     width: f32,
+    bytes: usize,
 }
 
+/// How much of finished pictures is kept, in bytes. Each is a texture the
+/// GPU holds while it is shown, and counting pictures did not bound that:
+/// one document's sixteen diagrams were 586 MB at twice their size
+/// (2026-10-09, beside "a device memory allocation has failed").
+const CACHE_BYTES: usize = 256 << 20;
+
 thread_local! {
-    static CACHE: RefCell<HashMap<Key, Drawn>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<(HashMap<Key, Drawn>, usize)> = RefCell::new((HashMap::new(), 0));
+}
+
+fn cached(key: &Key) -> Option<Drawn> {
+    CACHE.with(|cache| cache.borrow().0.get(key).cloned())
+}
+
+fn keep(key: Key, drawn: Drawn) {
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.1 + drawn.bytes > CACHE_BYTES {
+            cache.0.clear();
+            cache.1 = 0;
+        }
+        cache.1 += drawn.bytes;
+        cache.0.insert(key, drawn);
+    });
 }
 
 /// The window's interface font, by family: what the diagram is set in.
@@ -285,28 +307,63 @@ fn interface_family() -> String {
         .unwrap_or_else(|| "Adwaita Sans".to_string())
 }
 
-/// A ```mermaid block as the diagram it describes, drawn when it is first
-/// realized (at the scale of the monitor it is on) and again whenever the
-/// window goes light or dark. Until then it is an empty box; if it cannot
-/// be drawn, `fallback` — the block as code — stands in its place, with
-/// the reason under it.
-pub fn diagram(source: &str, fallback: gtk::Widget) -> gtk::Widget {
+/// The scale to draw at before the box is on a monitor: the largest any
+/// monitor has, so a diagram drawn off-screen — the preview builds its
+/// next rendering beside the one on screen — is sharp wherever it lands.
+fn display_scale() -> i32 {
+    gtk::gdk::Display::default()
+        .map(|display| {
+            let monitors = display.monitors();
+            (0..monitors.n_items())
+                .filter_map(|i| monitors.item(i).and_downcast::<gtk::gdk::Monitor>())
+                .map(|monitor| monitor.scale_factor())
+                .max()
+                .unwrap_or(1)
+        })
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// A ```mermaid block as the diagram it describes. Drawn as soon as it is
+/// made, not when it is first shown, so a rendering built off-screen gets
+/// whole (`hold`, released once the picture or the reason it failed is in
+/// place); again if the monitor it lands on has another scale, and
+/// whenever the window goes light or dark. While it draws, the box says
+/// so where the diagram will be (David, 2026-10-09: "show that the
+/// diagram is generating in the places where they will appear"); if it
+/// cannot be drawn, `fallback` — the block as code — stands in its place,
+/// with the reason under it.
+pub fn diagram(
+    source: &str,
+    fallback: gtk::Widget,
+    hold: Option<crate::markdown_view::Hold>,
+) -> gtk::Widget {
     let holder = gtk::Box::new(gtk::Orientation::Vertical, 4);
     holder.set_hexpand(true);
     let source = source.to_string();
-    let draw: Rc<dyn Fn(&gtk::Box)> = Rc::new(move |holder: &gtk::Box| {
+    let hold = Rc::new(RefCell::new(hold));
+    let drawn_at = Rc::new(std::cell::Cell::new(display_scale()));
+    let draw: Rc<dyn Fn(&gtk::Box, i32)> = Rc::new(move |holder: &gtk::Box, scale: i32| {
         let key = Key {
             source: source.clone(),
             dark: adw::StyleManager::default().is_dark(),
             family: interface_family(),
-            scale: holder.scale_factor().max(1),
+            scale,
         };
-        if let Some(drawn) = CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        if let Some(drawn) = cached(&key) {
             show(holder, &drawn, &key.source);
+            hold.borrow_mut().take();
             return;
+        }
+        // The first drawing says it is coming; a redraw — the other
+        // theme, a sharper scale — keeps the picture it has until the new
+        // one replaces it.
+        if holder.first_child().is_none() {
+            holder.append(&drawing());
         }
         let weak = holder.downgrade();
         let fallback = fallback.clone();
+        let hold = hold.clone();
         glib::spawn_future_local(async move {
             let job = key.clone();
             let rendered = crate::runtime::runtime()
@@ -318,25 +375,20 @@ pub fn diagram(source: &str, fallback: gtk::Widget) -> gtk::Widget {
             let Some(holder) = weak.upgrade() else { return };
             match rendered {
                 Ok(raster) => {
-                    let bytes = glib::Bytes::from_owned(raster.rgba);
+                    let bytes = raster.rgba.len();
                     let texture = gtk::gdk::MemoryTexture::new(
                         raster.width as i32,
                         raster.height as i32,
                         gtk::gdk::MemoryFormat::R8g8b8a8Premultiplied,
-                        &bytes,
+                        &glib::Bytes::from_owned(raster.rgba),
                         raster.width as usize * 4,
                     );
                     let drawn = Drawn {
                         texture: texture.upcast(),
                         width: raster.logical_width,
+                        bytes,
                     };
-                    CACHE.with(|cache| {
-                        let mut cache = cache.borrow_mut();
-                        if cache.len() >= CACHE_ENTRIES {
-                            cache.clear();
-                        }
-                        cache.insert(key.clone(), drawn.clone());
-                    });
+                    keep(key.clone(), drawn.clone());
                     show(&holder, &drawn, &key.source);
                 }
                 Err(why) => {
@@ -354,19 +406,27 @@ pub fn diagram(source: &str, fallback: gtk::Widget) -> gtk::Widget {
                     );
                 }
             }
+            hold.borrow_mut().take();
         });
     });
+    draw(&holder, drawn_at.get());
     {
         let draw = draw.clone();
-        holder.connect_realize(move |holder| draw(holder));
+        let drawn_at = drawn_at.clone();
+        holder.connect_realize(move |holder| {
+            let scale = holder.scale_factor().max(1);
+            if drawn_at.replace(scale) != scale {
+                draw(holder, scale);
+            }
+        });
     }
     // Light and dark are two drawings, not one recoloured: the style
     // manager says when to make the other, for as long as the box exists.
     let style = adw::StyleManager::default();
     let weak = holder.downgrade();
     let handler = style.connect_dark_notify(move |_| {
-        if let Some(holder) = weak.upgrade().filter(|holder| holder.is_realized()) {
-            draw(&holder);
+        if let Some(holder) = weak.upgrade() {
+            draw(&holder, drawn_at.get());
         }
     });
     let handler = RefCell::new(Some(handler));
@@ -376,6 +436,26 @@ pub fn diagram(source: &str, fallback: gtk::Widget) -> gtk::Widget {
         }
     });
     holder.upcast()
+}
+
+/// What stands where a diagram will be while it is drawn.
+fn drawing() -> gtk::Widget {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .margin_top(12)
+        .margin_bottom(12)
+        .build();
+    let spinner = adw::Spinner::new();
+    row.append(&spinner);
+    row.append(
+        &gtk::Label::builder()
+            .label("Drawing diagram…")
+            .css_classes(["dim-label"])
+            .build(),
+    );
+    row.upcast()
 }
 
 fn clear(holder: &gtk::Box) {

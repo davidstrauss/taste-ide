@@ -119,13 +119,72 @@ fn percent_decode(text: &str) -> String {
 /// Render `text` to a widget tree. `on_link` receives activated http(s)
 /// links (the caller decides how to open them).
 pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
-    render_full(text, on_link, None, None)
+    render_full(text, on_link, None, None, None)
+}
+
+/// What a rendering still has on its way: its pictures read and decoded,
+/// its diagrams drawn. A caller that keeps the previous rendering on
+/// screen until the next is whole — the editor's preview — asks to be
+/// told when this is nothing ([`Readiness::when_ready`]); each piece of
+/// work holds a [`Hold`] and lets go when it lands, or fails.
+#[derive(Clone, Default)]
+pub struct Readiness(Rc<ReadinessState>);
+
+#[derive(Default)]
+struct ReadinessState {
+    pending: std::cell::Cell<usize>,
+    on_ready: RefCell<Option<Box<dyn FnOnce()>>>,
+}
+
+impl Readiness {
+    /// One more piece of work on its way.
+    pub fn hold(&self) -> Hold {
+        self.0.pending.set(self.0.pending.get() + 1);
+        Hold(self.clone())
+    }
+
+    /// Run `ready` once nothing is on its way: now, if nothing is.
+    pub fn when_ready(&self, ready: impl FnOnce() + 'static) {
+        if self.0.pending.get() == 0 {
+            ready();
+        } else {
+            *self.0.on_ready.borrow_mut() = Some(Box::new(ready));
+        }
+    }
+}
+
+/// A piece of a rendering's work, outstanding until dropped.
+pub struct Hold(Readiness);
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let state = &(self.0).0;
+        let left = state.pending.get().saturating_sub(1);
+        state.pending.set(left);
+        if left == 0 {
+            if let Some(ready) = state.on_ready.borrow_mut().take() {
+                // Not inside whatever is dropping the hold: a widget's
+                // callback, mid-update.
+                glib::idle_add_local_once(ready);
+            }
+        }
+    }
 }
 
 /// [`render`] for a document with a place: its relative images are read
 /// from beside it and shown (the editor's preview).
-pub fn render_document(text: &str, on_link: Rc<dyn Fn(&str)>, images: DocumentBase) -> gtk::Widget {
-    render_full(text, on_link, None, Some(images))
+///
+/// Returned with what its pictures and diagrams have still to do: the
+/// editor's preview builds the next rendering beside the one on screen
+/// and swaps them once this says the next is whole.
+pub fn render_document_buffered(
+    text: &str,
+    on_link: Rc<dyn Fn(&str)>,
+    images: DocumentBase,
+) -> (gtk::Widget, Readiness) {
+    let readiness = Readiness::default();
+    let widget = render_full(text, on_link, None, Some(images), Some(&readiness));
+    (widget, readiness)
 }
 
 /// [`render`] with issue references drawn as pills when an index is
@@ -139,7 +198,7 @@ pub fn render_in(
     issues: Option<crate::issue_pill::SharedIssueIndex>,
     base: Option<DocumentBase>,
 ) -> gtk::Widget {
-    render_full(text, on_link, issues, base)
+    render_full(text, on_link, issues, base, None)
 }
 
 fn render_full(
@@ -147,6 +206,7 @@ fn render_full(
     on_link: Rc<dyn Fn(&str)>,
     issues: Option<crate::issue_pill::SharedIssueIndex>,
     images: Option<DocumentBase>,
+    readiness: Option<&Readiness>,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root.set_margin_top(16);
@@ -385,7 +445,11 @@ fn render_full(
                             // The block as code stays the fallback: a
                             // diagram that does not parse is shown as
                             // written, with the reason under it.
-                            root.append(&crate::mermaid::diagram(code, card));
+                            root.append(&crate::mermaid::diagram(
+                                code,
+                                card,
+                                readiness.map(Readiness::hold),
+                            ));
                         } else {
                             root.append(&card);
                         }
@@ -425,7 +489,12 @@ fn render_full(
                                     &root,
                                     &on_link,
                                 );
-                                root.append(&picture(base, path, &alt));
+                                root.append(&picture(
+                                    base,
+                                    path,
+                                    &alt,
+                                    readiness.map(Readiness::hold),
+                                ));
                             }
                             _ if source.starts_with("http://")
                                 || source.starts_with("https://") =>
@@ -590,7 +659,7 @@ fn heading_type(level: HeadingLevel) -> (&'static str, u16) {
 /// widget takes the texture when it lands. Scaled down to the column,
 /// never up; the alt text is the tooltip, and the whole caption when the
 /// file cannot be read or is not an image.
-fn picture(base: &DocumentBase, path: PathBuf, alt: &str) -> gtk::Widget {
+fn picture(base: &DocumentBase, path: PathBuf, alt: &str, hold: Option<Hold>) -> gtk::Widget {
     // The picture fills the column and scales down to it, never up: a
     // 1440px screenshot in a 600px column is the column wide and keeps
     // its aspect. Its minimum height is zero (it can shrink), so the
@@ -614,6 +683,8 @@ fn picture(base: &DocumentBase, path: PathBuf, alt: &str) -> gtk::Widget {
     let weak = holder.downgrade();
     let picture_weak = picture.downgrade();
     glib::spawn_future_local(async move {
+        // Outstanding until this task ends, whichever way it ends.
+        let _hold = hold;
         let read_path = path.clone();
         let loaded = crate::runtime::runtime()
             .spawn_blocking(move || -> Result<gtk::gdk::Texture, String> {
