@@ -521,6 +521,12 @@ const SUBMODULE_STAGING: &str = ".git/taste/submodules";
 /// changes nothing pushes nothing.
 pub const SUBMODULE_SCRIPT: &str = r#"set -e
 name="$1"; path="$2"; staging="$3"; mode="$4"; head="$5"
+# Not yet: Personal's own commit does not record the submodule — the
+# parent's commit that adds it has not arrived — so nothing is made
+# here, and a later pass, once it has, does the work. Cloning first left a
+# repository git did not know as a submodule, which no absorb could take
+# and every snapshot after failed on (2026-10-09).
+git ls-files --stage -- "$path" | grep -q '^160000 ' || exit 6
 if [ -e "$path/.git" ]; then
   [ "$mode" = meet ] || exit 0
   [ -z "$(git -C "$path" status --porcelain)" ] || exit 4
@@ -640,7 +646,17 @@ fn share_submodule(
     // before the pair existed was put at the parent's recorded
     // commit, detached, and the mirror would otherwise follow THAT
     // and take the folder's clone off its branch.
-    let present = script("check")?.status == 0;
+    let checked = script("check")?.status;
+    if checked == 6 {
+        // Not recorded in Personal's commit yet: the next pass, once the
+        // parent's commit has arrived.
+        say(&format!(
+            "the submodule {} waits for Personal to have the commit that adds it",
+            sub.display()
+        ));
+        return Ok(());
+    }
+    let present = checked == 0;
     if present {
         let first_meeting = folder_git
             .as_ref()
@@ -2462,6 +2478,66 @@ mod tests {
     /// staging repository and cloned from there into place, absorbed as
     /// `git submodule update` would leave it, with git's own relative
     /// paths.
+    /// A checkout whose own commit does not record the submodule yet — the
+    /// parent's commit that adds it has not arrived — gets nothing made in
+    /// it: the script says "not yet", and the path stays as it was.
+    #[test]
+    fn a_submodule_waits_for_the_commit_that_adds_it() {
+        let pair = Pair::new("submodule-not-yet");
+        pair.git(".", &["init", "-q", "-b", "main", "sub"]);
+        pair.write("sub", "lib.txt", "template\n");
+        pair.git("sub", &["add", "-A"]);
+        pair.commit("sub", "the template");
+        let sub = pair.dir.join("sub").display().to_string();
+        pair.git(
+            "folder",
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub,
+                "tpl",
+            ],
+        );
+        pair.commit("folder", "add the template");
+        // Personal has NOT pulled the commit that adds it.
+        let staging = pair.dir.join("checkout/.git/taste/submodules/tpl.git");
+        pair.git(".", &["init", "-q", "--bare", staging.to_str().unwrap()]);
+        pair.git(
+            "folder/tpl",
+            &[
+                "push",
+                "-q",
+                "--force",
+                staging.to_str().unwrap(),
+                "+refs/heads/*:refs/heads/*",
+            ],
+        );
+        for mode in ["check", "update"] {
+            let out = std::process::Command::new("sh")
+                .current_dir(pair.dir.join("checkout"))
+                .args([
+                    "-c",
+                    SUBMODULE_SCRIPT,
+                    "taste-submodule",
+                    "tpl",
+                    "tpl",
+                    staging.to_str().unwrap(),
+                    mode,
+                    "branch:main",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(6), "{mode}");
+        }
+        assert!(
+            !pair.dir.join("checkout/tpl/.git").exists(),
+            "nothing was cloned"
+        );
+    }
+
     /// git names a submodule by its path unless told otherwise, so a
     /// name with a slash in it is the ordinary case, and it goes across
     /// like any other: staged under its encoded name, its URL set under
