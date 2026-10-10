@@ -3528,7 +3528,16 @@ asked about and ruled out of scope (David, same day):
   and `/dev/net/tun`, `--security-opt` other
   than nesting's own values, `--pid=host`, `--network=host`, and arbitrary
   `-v` binds are refused; `--privileged` is never passed as asked, and
-  becomes nesting (below).
+  becomes nesting (below). What is checked is the argv podman is given,
+  entry for entry (`security::run_args_to_pass`), and a `mounts` string is
+  read the way podman reads it or refused: no quotes (podman parses the
+  string as CSV, so `"type=bind"` was a bind to podman and an untyped
+  volume to the check), a stated `type`, no repeated or aliased key, and
+  only the options this file lists for that type (`volume-opt` makes a
+  volume a bind of any path in the VM). Both were found passing on
+  2026-10-10 and measured against podman 5.8.7
+  (docs/spikes/sandbox-tightening.md). The pool's grant is the last
+  `--memory` and `--cpus` podman sees, so a config cannot raise its own.
 - **Nested podman is granted, and only as much of it as it needs**
   (2026-09-23). Projects that run podman themselves — a build in a
   container, a test that starts one — are ordinary, and a devcontainer
@@ -3591,6 +3600,13 @@ asked about and ruled out of scope (David, same day):
   A path changed only in the folder goes to the checkout first, before
   anything is written back; a path changed on both sides to different
   content is a conflict, asked about with nothing written either way.
+  Every write a VM names — the mirror's, a first commit's adoption, an
+  ignored-file copy — goes through `taste_git::beneath`: inside the
+  folder, never into `.git`, never through a directory that is a link,
+  and staged under a name created fresh, since a link the checkout
+  planted at the staging name once carried a file's bytes to wherever it
+  pointed (2026-10-10). A submodule whose path passes through a link in
+  the folder is not a submodule to the sync.
   Triggers are a working-tree change in the VM or the folder (two seconds
   after a burst, build churn aside), every snapshot, and the window's
   close, which waits up to twenty seconds for the last one (David: "I
@@ -3750,6 +3766,9 @@ they do not run.
   clean folder to what the VM has (`taste_git::merge`). No hooks, no
   external filter drivers, git's own path checks on `.git`; a checkout
   bug in libgit2 would be exposed here, on commits the VM already holds.
+  The IDE's own writes from VM data (the mirror, `adopt_first_commit`,
+  ignored-file copies) do not go through libgit2's checkout and carry
+  their own checks (`taste_git::beneath`).
 - **Your own Push and Pull run the host `git` with your config and your
   keys**, against your remotes. That is the point — the credential never
   enters the VM — and it means your `.gitconfig` (aliases, a hooks path,
