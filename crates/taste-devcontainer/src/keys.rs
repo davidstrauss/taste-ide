@@ -46,6 +46,21 @@ pub struct Keys {
     ssh: Option<String>,
 }
 
+/// How long an ssh to a VM waits, on every connection the IDE makes. The
+/// VM's port forward accepts the TCP connection even when the guest's
+/// sshd cannot answer, so without a limit an ssh waited for its greeting
+/// for ever — holding the folder sync's lock, with every later sync
+/// queued silently behind it, and a window's close waiting on a sync that
+/// would not end ("did not finish in 20s", 2026-10-09). `ConnectTimeout`
+/// bounds the connection and its banner; the keepalives end a session
+/// whose far side has gone quiet for 45 seconds, which a transfer that is
+/// moving never is.
+const LIVENESS: [&str; 3] = [
+    "ConnectTimeout=15",
+    "ServerAliveInterval=15",
+    "ServerAliveCountMax=3",
+];
+
 impl Keys {
     /// Under the workspace's state directory: `<state>/guest/`.
     pub fn for_workspace(workspace_root: &Path) -> Self {
@@ -219,6 +234,12 @@ impl Keys {
             "StrictHostKeyChecking=yes".into(),
             "-o".into(),
             "BatchMode=yes".into(),
+            "-o".into(),
+            LIVENESS[0].into(),
+            "-o".into(),
+            LIVENESS[1].into(),
+            "-o".into(),
+            LIVENESS[2].into(),
             "-p".into(),
             port.to_string(),
             format!("{}@127.0.0.1", crate::provision::GUEST_USER),
@@ -252,6 +273,12 @@ impl Keys {
             "StrictHostKeyChecking=yes".into(),
             "-o".into(),
             "BatchMode=yes".into(),
+            "-o".into(),
+            LIVENESS[0].into(),
+            "-o".into(),
+            LIVENESS[1].into(),
+            "-o".into(),
+            LIVENESS[2].into(),
         ];
         for forward in forwards {
             args.push("-L".into());
@@ -313,6 +340,12 @@ impl Keys {
             "StrictHostKeyChecking=yes".into(),
             "-o".into(),
             "BatchMode=yes".into(),
+            "-o".into(),
+            LIVENESS[0].into(),
+            "-o".into(),
+            LIVENESS[1].into(),
+            "-o".into(),
+            LIVENESS[2].into(),
         ]
         .into_iter()
         .chain(mux)
@@ -429,6 +462,10 @@ mod tests {
         assert!(command.contains("IdentitiesOnly=yes"), "{command}");
         assert!(command.contains("'UserKnownHostsFile="), "{command}");
         assert!(command.contains("BatchMode=yes"), "{command}");
+        for option in LIVENESS {
+            assert!(command.contains(option), "{command}");
+            assert!(joined.contains(option), "{joined}");
+        }
         assert!(!command.contains("127.0.0.1"), "{command}");
         // Shared, when there is a runtime directory to keep the socket
         // in, and only there.
