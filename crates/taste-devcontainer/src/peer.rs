@@ -1741,8 +1741,11 @@ if [ -n "$sent" ]; then
   done
 fi
 # The checkout's files are the folder's: move the branch, keep the files.
+# The scratch index lives in the checkout's own git directory: the keeper
+# this runs in cannot write /tmp, and a bare mktemp there failed every
+# folder-ahead sync with "Permission denied" (2026-10-09).
 if [ -n "$folder_tree" ]; then
-  index=$(mktemp)
+  index=$(mktemp "$(git rev-parse --git-dir)/taste-sync-index.XXXXXX")
   GIT_INDEX_FILE="$index" git read-tree HEAD
   GIT_INDEX_FILE="$index" git add -A
   mine=$(GIT_INDEX_FILE="$index" git write-tree)
@@ -2132,6 +2135,10 @@ mod tests {
                 ])
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
+                // As in the keeper the script runs in, where the system's
+                // temporary directory cannot be written: nothing it does
+                // may lean on one.
+                .env("TMPDIR", "/nonexistent/taste-keeper-has-no-tmp")
                 .output()
                 .unwrap();
             out.status.code().unwrap_or(-1)
