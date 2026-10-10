@@ -37,8 +37,19 @@ const ALLOWED_FLAG_PREFIXES: &[&str] = &[
     "--label=",
 ];
 
-/// runArgs flags that consume the *next* entry as their value.
-const ALLOWED_FLAGS_WITH_VALUE: &[&str] = &["-e", "--env", "--shm-size", "--hostname", "--label"];
+/// runArgs flags that consume the *next* entry as their value. Each of
+/// those values is refused when it starts with `-`: podman would take it
+/// as the value too, but a reader of the list — this one — must never be
+/// left guessing which entries are flags.
+const ALLOWED_FLAGS_WITH_VALUE: &[&str] = &[
+    "-e",
+    "--env",
+    "--shm-size",
+    "--hostname",
+    "--label",
+    "--memory",
+    "--cpus",
+];
 
 /// What a container needs to run podman inside itself — `podman build`
 /// and `podman run` both, rootless, as the image's user — and nothing more.
@@ -114,6 +125,23 @@ const ALLOWED_CAPS: &[&str] = &["SYS_ADMIN", "CAP_SYS_ADMIN"];
 /// and the flag becomes the nesting set, which is the one thing a config
 /// asking for it could still want (`privileged_run_args`).
 pub const STRIPPED_FLAGS: &[&str] = &["--privileged"];
+
+/// The config's `runArgs` exactly as podman is given them: the stripped
+/// flags gone, every other entry in its place. What is validated and what
+/// is passed are this one list, never two readings of the config that
+/// have to agree. They once were two: the check skipped `--privileged`
+/// where it stood while a value-taking flag before it swallowed it, and
+/// the run then deleted it, so `--label --privileged --label --network=host`
+/// passed as two labels and reached podman as one label and a
+/// `--network=host` — any flag at all, smuggled the same way.
+pub fn run_args_to_pass(config: &DevcontainerConfig) -> Vec<String> {
+    config
+        .run_args
+        .iter()
+        .filter(|arg| !STRIPPED_FLAGS.contains(&arg.as_str()))
+        .cloned()
+        .collect()
+}
 
 /// Whether the config asks for a container engine inside the container:
 /// privileged, or stating nesting's SELinux domain itself. What decides
@@ -206,7 +234,7 @@ pub fn validate_security_via(
     config: &DevcontainerConfig,
     workspace_root: &Path,
 ) -> Result<()> {
-    validate_run_args(&config.run_args)?;
+    validate_run_args(&run_args_to_pass(config))?;
     validate_build(config)?;
     for port in &config.forward_ports {
         if *port < 1024 {
@@ -276,12 +304,14 @@ fn validate_build(config: &DevcontainerConfig) -> Result<()> {
 fn validate_run_args(run_args: &[String]) -> Result<()> {
     let mut iter = run_args.iter().peekable();
     while let Some(arg) = iter.next() {
-        if STRIPPED_FLAGS.contains(&arg.as_str()) {
-            continue;
-        }
         if ALLOWED_FLAGS_WITH_VALUE.contains(&arg.as_str()) {
-            if iter.next().is_none() {
-                bail!("devcontainer.json runArgs: {arg} is missing its value");
+            match iter.next() {
+                None => bail!("devcontainer.json runArgs: {arg} is missing its value"),
+                Some(value) if value.starts_with('-') => bail!(
+                    "devcontainer.json runArgs: \"{arg} {value}\" is not allowed; write \
+                     {arg}={value} if the value really starts with a dash"
+                ),
+                Some(_) => {}
             }
             continue;
         }
@@ -298,6 +328,9 @@ fn validate_run_args(run_args: &[String]) -> Result<()> {
             let value = match arg.strip_prefix(&format!("{flag}=")) {
                 Some(value) => value.to_string(),
                 None => match iter.next() {
+                    Some(value) if value.starts_with('-') => {
+                        bail!("devcontainer.json runArgs: {flag} is missing its value")
+                    }
                     Some(value) => value.clone(),
                     None => bail!("devcontainer.json runArgs: {arg} is missing its value"),
                 },
@@ -331,24 +364,146 @@ fn validate_run_args(run_args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// A mount string (`source=…,target=…,type=…`) may bind only paths inside
-/// the workspace, or use named volumes.
+/// The `--mount` options a config may give each type, beyond `type`,
+/// the source, and the target. Anything else is refused by name, so an
+/// option podman reads and this file never heard of cannot change what a
+/// mount IS. `volume-opt` is why: `type=volume,…,volume-opt=type=none,
+/// volume-opt=o=bind,volume-opt=device=/anywhere` is podman's own way of
+/// making a "volume" that is a bind of any path in the VM (measured,
+/// podman 5.8.7), and a validator that took volumes "with any options"
+/// passed it.
+const MOUNT_COMMON_KEYS: &[&str] = &[
+    "type",
+    "source",
+    "src",
+    "target",
+    "dst",
+    "destination",
+    "ro",
+    "readonly",
+    "rw",
+    // Docker Desktop's file-sharing hint; VS Code's documentation writes
+    // it on bind mounts, and podman accepts and ignores it.
+    "consistency",
+];
+const MOUNT_BIND_KEYS: &[&str] = &[
+    "bind-propagation",
+    "bind-nonrecursive",
+    "relabel",
+    "z",
+    "Z",
+    "U",
+];
+const MOUNT_VOLUME_KEYS: &[&str] = &["U", "nocopy", "subpath"];
+const MOUNT_TMPFS_KEYS: &[&str] = &[
+    "tmpfs-size",
+    "tmpfs-mode",
+    "size",
+    "mode",
+    "tmpcopyup",
+    "notmpcopyup",
+    "noswap",
+    "U",
+];
+
+/// A mount string's options in order: each key, and its value if it has
+/// one (`ro` has none).
+type MountOptions = Vec<(String, Option<String>)>;
+
+/// A mount string (`type=…,source=…,target=…`) read the way podman reads
+/// it — or refused where the two readings could differ.
+///
+/// Podman parses `--mount` as one CSV record, so `"type=bind",source=/x`
+/// is a bind to podman; read as plain text it has no `type` key at all,
+/// and was passed as the volume an untyped mount defaults to (measured,
+/// podman 5.8.7). So a quote anywhere is refused, every key must be one
+/// this file knows for the mount's type, none may repeat, and `type` must
+/// be stated: an untyped mount is a volume to podman, and the IDE's
+/// renaming of a repo's volumes per environment reads only an explicit
+/// `type=volume` — a mount the two read differently is not one to pass.
+fn mount_options(mount: &str) -> Result<(String, MountOptions)> {
+    if mount.contains('"') {
+        bail!(
+            "devcontainer.json mount \"{mount}\": quotes are not supported in a mount \
+             string; write it as plain type=…,source=…,target=…"
+        );
+    }
+    let mut options: MountOptions = Vec::new();
+    for part in mount.split(',') {
+        let (key, value) = match part.split_once('=') {
+            Some((key, value)) => (key.to_string(), Some(value.to_string())),
+            None => (part.to_string(), None),
+        };
+        if options.iter().any(|(seen, _)| *seen == key) {
+            bail!("devcontainer.json mount \"{mount}\": \"{key}\" is given twice");
+        }
+        options.push((key, value));
+    }
+    // Aliases are one key: given both, podman takes one and this file
+    // could check the other — `source=` inside the workspace beside an
+    // `src=` anywhere at all.
+    for aliases in [
+        &["source", "src"][..],
+        &["target", "dst", "destination"][..],
+    ] {
+        if options
+            .iter()
+            .filter(|(key, _)| aliases.contains(&key.as_str()))
+            .count()
+            > 1
+        {
+            bail!(
+                "devcontainer.json mount \"{mount}\": give one of {}, not several",
+                aliases.join(", ")
+            );
+        }
+    }
+    let Some(mount_type) = options
+        .iter()
+        .find(|(key, _)| key == "type")
+        .and_then(|(_, value)| value.clone())
+    else {
+        bail!(
+            "devcontainer.json mount \"{mount}\": state its type (type=volume, type=bind, \
+             or type=tmpfs)"
+        );
+    };
+    let own: &[&str] = match mount_type.as_str() {
+        "volume" => MOUNT_VOLUME_KEYS,
+        "bind" => MOUNT_BIND_KEYS,
+        "tmpfs" => MOUNT_TMPFS_KEYS,
+        other => bail!("devcontainer.json mount \"{mount}\": unsupported type \"{other}\""),
+    };
+    if let Some((key, _)) = options
+        .iter()
+        .find(|(key, _)| !MOUNT_COMMON_KEYS.contains(&key.as_str()) && !own.contains(&key.as_str()))
+    {
+        bail!(
+            "devcontainer.json mount \"{mount}\": the option \"{key}\" is not supported on a \
+             {mount_type} mount (the repo is untrusted; a {mount_type} mount takes {})",
+            MOUNT_COMMON_KEYS
+                .iter()
+                .chain(own)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok((mount_type, options))
+}
+
+/// A mount string may bind only paths inside the workspace, or use named
+/// volumes and tmpfs, each with only the options [`mount_options`] knows.
 fn validate_mount(
     files: &taste_core::files::Files,
     mount: &str,
     workspace_root: &Path,
 ) -> Result<()> {
-    let mut source: Option<String> = None;
-    let mut mount_type: Option<String> = None;
-    for part in mount.split(',') {
-        let mut kv = part.splitn(2, '=');
-        match (kv.next().map(str::trim), kv.next().map(str::trim)) {
-            (Some("source") | Some("src"), Some(v)) => source = Some(v.to_string()),
-            (Some("type"), Some(v)) => mount_type = Some(v.to_string()),
-            _ => {}
-        }
-    }
-    let mount_type = mount_type.unwrap_or_else(|| "volume".into());
+    let (mount_type, options) = mount_options(mount)?;
+    let source = options
+        .iter()
+        .find(|(key, _)| key == "source" || key == "src")
+        .and_then(|(_, value)| value.clone());
     match mount_type.as_str() {
         "volume" => Ok(()),
         "bind" => {
@@ -433,8 +588,7 @@ fn validate_mount(
                 }
             }
         }
-        "tmpfs" => Ok(()),
-        other => bail!("devcontainer.json mount \"{mount}\": unsupported type \"{other}\""),
+        _ => Ok(()),
     }
 }
 
@@ -614,6 +768,69 @@ mod tests {
         }
         let (_dir, ok) = config_with(r#"{"build": {"dockerfile": "Containerfile"}}"#);
         assert!(validate_security(&ok, Path::new("/work/p")).is_ok());
+    }
+
+    /// A flag smuggled past the check as a value-taking flag's "value"
+    /// that the run then deleted: the check reads the list the run passes.
+    #[test]
+    fn a_stripped_flag_cannot_hide_the_flag_after_it() {
+        for run_args in [
+            r#"["--label", "--privileged", "--label", "--network=host"]"#,
+            r#"["-e", "--privileged", "-e", "--pid=host"]"#,
+            r#"["--hostname", "--privileged", "--hostname", "-v"]"#,
+            r#"["--memory", "--network=host"]"#,
+            r#"["--security-opt", "--network=host"]"#,
+        ] {
+            let (dir, config) =
+                config_with(&format!(r#"{{"image": "img", "runArgs": {run_args}}}"#));
+            assert!(
+                validate_security(&config, dir.path()).is_err(),
+                "{run_args} should be rejected"
+            );
+        }
+        let (dir, config) = config_with(
+            r#"{"image": "img", "runArgs": ["--privileged", "--label", "a=b", "--memory", "4g"]}"#,
+        );
+        validate_security(&config, dir.path()).unwrap();
+        assert_eq!(
+            run_args_to_pass(&config),
+            vec!["--label", "a=b", "--memory", "4g"]
+        );
+    }
+
+    /// Mount strings podman reads differently from a plain split: a
+    /// quoted key, repeated or aliased keys, an untyped mount, and the
+    /// volume options that make a volume a bind of any path.
+    #[test]
+    fn a_mount_podman_would_read_differently_is_refused() {
+        for bad in [
+            r#"\"type=bind\",source=/var/home/core,target=/h"#,
+            "type=bind,source=${localWorkspaceFolder}/x,src=/var/home/core,target=/h",
+            "type=volume,type=bind,source=/var/home/core,target=/h",
+            "source=/var/home/core,target=/h",
+            "type=volume,source=v,target=/h,volume-opt=type=none,volume-opt=o=bind,volume-opt=device=/",
+            "type=volume,source=v,target=/h,volume-driver=local",
+            "type=bind,source=${localWorkspaceFolder}/x,target=/h,idmap",
+            "type=image,source=alpine,target=/h",
+            " type=bind,source=/var/home/core,target=/h",
+        ] {
+            let (dir, config) =
+                config_with(&format!(r#"{{"image": "img", "mounts": ["{bad}"]}}"#));
+            assert!(
+                validate_security(&config, dir.path()).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+        for good in [
+            "source=cache,target=/cache,type=volume",
+            "type=volume,source=cache,target=/cache,ro",
+            "type=bind,source=${localWorkspaceFolder}/data,target=/data,consistency=cached",
+            "type=tmpfs,target=/scratch,tmpfs-size=1g",
+        ] {
+            let (dir, config) =
+                config_with(&format!(r#"{{"image": "img", "mounts": ["{good}"]}}"#));
+            validate_security(&config, dir.path()).unwrap_or_else(|e| panic!("{good}: {e:#}"));
+        }
     }
 
     #[test]

@@ -3948,19 +3948,6 @@ impl Supervisor {
                 );
             }
         }
-        // The grant, enforced: what the pool placed this environment by is
-        // what its container may use. Swap equal to memory, so the ceiling
-        // is a ceiling; the guest delegates the cpu and memory controllers
-        // to rootless podman (verified on the guest, 2026-09-21).
-        let grant = self.grant_for(&config, authority);
-        args.push("--cpus".into());
-        args.push(grant.cpus.to_string());
-        args.push("--memory".into());
-        args.push(format!("{}m", grant.memory_mib));
-        args.push("--memory-swap".into());
-        args.push(format!("{}m", grant.memory_mib));
-        args.extend(priority_args(self.env.id.is_primary(), grant));
-        *self.applied_grant.lock().unwrap() = Some(grant);
         args.extend(self.ide_mounts(&config, authority));
         for (k, v) in &config.container_env {
             args.push("-e".into());
@@ -3997,12 +3984,8 @@ impl Supervisor {
             ));
             args.push(flag);
         }
-        for arg in &config.run_args {
-            if crate::security::STRIPPED_FLAGS.contains(&arg.as_str()) {
-                continue;
-            }
-            args.push(arg.clone());
-        }
+        // The list `security` validated, entry for entry.
+        args.extend(crate::security::run_args_to_pass(&config));
         let nesting = crate::security::privileged_run_args(&config);
         if !nesting.is_empty() {
             self.log(format!(
@@ -4012,6 +3995,23 @@ impl Supervisor {
             ));
             args.extend(nesting);
         }
+        // The grant, enforced: what the pool placed this environment by is
+        // what its container may use. Swap equal to memory, so the ceiling
+        // is a ceiling; the guest delegates the cpu and memory controllers
+        // to rootless podman (verified on the guest, 2026-09-21). After the
+        // config's own runArgs, because podman takes the last `--memory`
+        // and `--cpus` it is given: before them, a config's
+        // `--memory=64g` raised its own ceiling past what it was placed by,
+        // on a VM its neighbours share.
+        let grant = self.grant_for(&config, authority);
+        args.push("--cpus".into());
+        args.push(grant.cpus.to_string());
+        args.push("--memory".into());
+        args.push(format!("{}m", grant.memory_mib));
+        args.push("--memory-swap".into());
+        args.push(format!("{}m", grant.memory_mib));
+        args.extend(priority_args(self.env.id.is_primary(), grant));
+        *self.applied_grant.lock().unwrap() = Some(grant);
         args.push(image);
         if config.override_command != Some(false) {
             args.push("sleep".into());
