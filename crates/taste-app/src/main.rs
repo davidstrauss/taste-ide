@@ -98,6 +98,57 @@ pub(crate) fn host_open_channel() -> Option<(std::path::PathBuf, String)> {
     HOST_OPEN.get().cloned().flatten()
 }
 
+/// Once a minute, how many file descriptors this process holds; past
+/// half a thousand, what kinds, in the app log. Twice on 2026-10-09 the
+/// IDE ran out ("Too many open files", the GPU unable to allocate) and
+/// froze, and by the time anyone looked the process was gone; this is
+/// what the next time leaves behind to read. Off the main thread, and a
+/// directory listing a minute.
+fn watch_descriptors() {
+    std::thread::Builder::new()
+        .name("fd-watch".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+                return;
+            };
+            let targets: Vec<String> = entries
+                .flatten()
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .map(|target| target.to_string_lossy().into_owned())
+                .collect();
+            if targets.len() < 512 {
+                continue;
+            }
+            let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+            for target in &targets {
+                // `pipe:[123]` and `socket:[456]` by kind; a file by its
+                // directory, which says whose it is.
+                let kind = match target.split_once(":[") {
+                    Some((kind, _)) => kind.to_string(),
+                    None => std::path::Path::new(target)
+                        .parent()
+                        .map(|dir| dir.display().to_string())
+                        .unwrap_or_else(|| target.clone()),
+                };
+                *kinds.entry(kind).or_default() += 1;
+            }
+            let mut kinds: Vec<_> = kinds.into_iter().collect();
+            kinds.sort_by_key(|kind| std::cmp::Reverse(kind.1));
+            let top: Vec<String> = kinds
+                .iter()
+                .take(8)
+                .map(|(kind, count)| format!("{count} {kind}"))
+                .collect();
+            tracing::warn!(
+                "this process holds {} file descriptors: {}",
+                targets.len(),
+                top.join(", ")
+            );
+        })
+        .ok();
+}
+
 fn main() -> glib::ExitCode {
     let channel = match (
         std::env::var("TASTE_HOST_OPEN_DIR"),
@@ -227,6 +278,8 @@ fn main() -> glib::ExitCode {
         .filter(|p| p.is_dir())
         .and_then(|p| p.canonicalize().ok())
         .or_else(project_from_cwd);
+
+    watch_descriptors();
 
     // NON_UNIQUE: each `taste-ide <folder>` is its own process/window —
     // otherwise a second workspace would just re-activate the first.
