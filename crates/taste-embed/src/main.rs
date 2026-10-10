@@ -199,17 +199,49 @@ fn normalize(v: &[f32]) -> Vec<f32> {
     }
 }
 
+/// Run only on time nothing else on the machine wants. A niceness of ten
+/// was a smaller share, not a lower place: under a build, a browser, or a
+/// VM, indexing still took its weight of every contended core (David,
+/// 2026-10-09: "Is it possible to deprioritize the semantic indexing versus
+/// other activity on my machine?"). So, for this process and the threads it
+/// starts after:
+/// - `SCHED_IDLE`, the scheduler's lowest class: below every ordinary
+///   process whatever its niceness, run when a core would otherwise idle;
+/// - niceness 19, the floor of the ordinary scale, for a kernel that
+///   refuses the class;
+/// - the idle I/O class: its reads of the model wait for every other
+///   process's disk work.
+///
+/// Every one of these is a process lowering itself, which needs no
+/// privilege and works inside the Flatpak. A query still runs here, and on
+/// an idle machine at full speed; on a saturated one it waits its turn,
+/// which the search shows as its own progress.
+fn yield_to_everything() {
+    // SAFETY: each call changes this thread's own scheduling and reads
+    // nothing but the struct handed to it.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        let param = libc::sched_param { sched_priority: 0 };
+        libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+        // ioprio_set(IOPRIO_WHO_PROCESS, self, IOPRIO_CLASS_IDLE << 13).
+        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+        const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+        const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            0,
+            IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT,
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
         .context("usage: taste-embed <model.gguf>")?;
-    // Background work yields to the IDE and the VM when they want the
-    // machine: a niceness of ten, for this process and the threads it
-    // starts after.
-    // SAFETY: setpriority on our own process changes nothing it reads.
-    unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
-    }
+    // Before anything else starts a thread, so every thread inherits it.
+    yield_to_everything();
     let embedder = Embedder::load(Path::new(&path))?;
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -282,6 +314,27 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The helper lowers itself to the bottom of every scale it can, and a
+    /// thread it starts after inherits all of it.
+    #[test]
+    fn the_helper_runs_only_on_time_nothing_else_wants() {
+        std::thread::spawn(|| {
+            yield_to_everything();
+            let check = || unsafe {
+                (
+                    libc::sched_getscheduler(0),
+                    libc::getpriority(libc::PRIO_PROCESS, 0),
+                    libc::syscall(libc::SYS_ioprio_get, 1, 0) >> 13,
+                )
+            };
+            assert_eq!(check(), (libc::SCHED_IDLE, 19, 3));
+            let inherited = std::thread::spawn(check).join().unwrap();
+            assert_eq!(inherited, (libc::SCHED_IDLE, 19, 3));
+        })
+        .join()
+        .unwrap();
+    }
     use std::time::Duration;
 
     #[test]
