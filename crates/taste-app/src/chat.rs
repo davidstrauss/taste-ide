@@ -7282,11 +7282,15 @@ impl ChatPane {
             .get()
             .map(|since| since.elapsed())
             .unwrap_or_default();
-        let tool_running = self
-            .tool_cards
-            .borrow()
-            .values()
-            .any(|card| card.running.get());
+        // Asked only when the line will use it, and never while a step is
+        // being written: a step starting sets the activity, which draws
+        // this line from inside `upsert_tool_card`'s borrow of the cards,
+        // and a plain borrow there panicked the IDE out of existence.
+        let tool_running = quiet >= std::time::Duration::from_secs(20)
+            && self
+                .tool_cards
+                .try_borrow()
+                .is_ok_and(|cards| cards.values().any(|card| card.running.get()));
         let traffic =
             taste_acp::authproxy::handle().map(|proxy| proxy.traffic(self.environment.as_str()));
         let label = working_line(&activity, quiet, tool_running, traffic);
