@@ -949,6 +949,11 @@ pub struct ChatPane {
     /// [`DEFAULT_PERMISSION_MODE`]. Re-applied to every session this chat
     /// connects, so the setting survives restarts and respawns.
     permission_mode: RefCell<Option<String>>,
+    /// The user's choices among the agent's session options (effort, fast
+    /// mode, …), by option id: persisted with the chat
+    /// (`ChatEntry::config_values`) and re-applied to each session it
+    /// connects (`build_controls`).
+    config_values: RefCell<std::collections::BTreeMap<String, String>>,
     /// The agent's "mode" CONFIG option, when it exposes one: some agents
     /// carry the permission mode there instead of (or as well as) in the
     /// modes state, and that is then the only channel to set it through.
@@ -3380,6 +3385,7 @@ impl ChatPane {
             pending_restore: RefCell::new(None),
             model_value: RefCell::new(None),
             permission_mode: RefCell::new(None),
+            config_values: RefCell::new(Default::default()),
             mode_config: RefCell::new(None),
             selected: Cell::new(false),
             notify_key: next_notify_key(),
@@ -5592,6 +5598,7 @@ impl ChatPane {
             session_id: persisted.map(|(_, session)| session),
             model_value: self.model_value.borrow().clone(),
             permission_mode: self.permission_mode.borrow().clone(),
+            config_values: self.config_values.borrow().clone(),
             auto_approve: self.approval_picker.is_active(),
             restart_when_silent: self.restart_picker.is_active(),
             environment: self.environment.clone(),
@@ -5624,6 +5631,7 @@ impl ChatPane {
         }
         *self.model_value.borrow_mut() = entry.model_value.clone();
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
+        *self.config_values.borrow_mut() = entry.config_values.clone();
         self.syncing.set(true);
         self.approval_picker.set_active(entry.auto_approve);
         self.restart_picker.set_active(entry.restart_when_silent);
@@ -5757,6 +5765,7 @@ impl ChatPane {
         // one too, and its own spawn mints its own placeholder for it.
         *self.model_value.borrow_mut() = from.model_value.borrow().clone();
         *self.permission_mode.borrow_mut() = from.permission_mode.borrow().clone();
+        *self.config_values.borrow_mut() = from.config_values.borrow().clone();
         self.syncing.set(true);
         self.approval_picker
             .set_active(from.approval_picker.is_active());
@@ -9804,7 +9813,13 @@ impl ChatPane {
             }
             match &option.kind {
                 SessionConfigKind::Boolean(boolean) => {
-                    let row = self.append_switch_row(&option.name, boolean.current_value);
+                    let shown = self
+                        .reapply_choice(&option.id, &boolean.current_value.to_string(), true, |v| {
+                            v == "true" || v == "false"
+                        })
+                        .map(|v| v == "true")
+                        .unwrap_or(boolean.current_value);
+                    let row = self.append_switch_row(&option.name, shown);
                     let weak = Rc::downgrade(self);
                     let config_id = option.id.clone();
                     row.connect_active_notify(move |row| {
@@ -9818,8 +9833,11 @@ impl ChatPane {
                             }
                             None => Ok(()),
                         };
-                        if let Err(e) = result {
-                            pane.meta_row(&format!("error: {e}"));
+                        match result {
+                            Ok(()) => {
+                                pane.remember_choice(&config_id, &row.is_active().to_string())
+                            }
+                            Err(e) => pane.meta_row(&format!("error: {e}")),
                         }
                     });
                 }
@@ -9839,7 +9857,20 @@ impl ChatPane {
                     if choices.is_empty() {
                         continue;
                     }
-                    let current_value = select.current_value.to_string();
+                    let mut current_value = select.current_value.to_string();
+                    // The user's earlier choice, back in force — except the
+                    // model and the permission mode, which have their own.
+                    let own_handling =
+                        option.id.to_string().eq_ignore_ascii_case("model") || is_mode;
+                    if !own_handling {
+                        if let Some(chosen) =
+                            self.reapply_choice(&option.id, &current_value, false, |v| {
+                                choices.iter().any(|(value, _)| value == v)
+                            })
+                        {
+                            current_value = chosen;
+                        }
+                    }
                     // On/off selects ARE switches, whatever the wire says.
                     if let Some((on_value, off_value)) = switch_values(&choices) {
                         let row = self.append_switch_row(&option.name, current_value == on_value);
@@ -9856,13 +9887,13 @@ impl ChatPane {
                                 off_value.clone()
                             };
                             let result = match pane.client.borrow().as_ref() {
-                                Some(client) => {
-                                    client.set_config_option(config_id.clone(), value.into())
-                                }
+                                Some(client) => client
+                                    .set_config_option(config_id.clone(), value.clone().into()),
                                 None => Ok(()),
                             };
-                            if let Err(e) = result {
-                                pane.meta_row(&format!("error: {e}"));
+                            match result {
+                                Ok(()) => pane.remember_choice(&config_id, &value),
+                                Err(e) => pane.meta_row(&format!("error: {e}")),
                             }
                         });
                         continue;
@@ -9901,8 +9932,9 @@ impl ChatPane {
                                     .set_config_option(config_id.clone(), value.clone().into()),
                                 None => Ok(()),
                             };
-                            if let Err(e) = result {
-                                pane.meta_row(&format!("error: {e}"));
+                            match result {
+                                Ok(()) => pane.remember_choice(&config_id, value),
+                                Err(e) => pane.meta_row(&format!("error: {e}")),
                             }
                         });
                         continue;
@@ -9927,7 +9959,7 @@ impl ChatPane {
                                 // than in a modes state, this is where the
                                 // user makes their choice — remember it.
                                 Ok(()) if is_mode => pane.remember_mode(&value),
-                                Ok(()) => {}
+                                Ok(()) => pane.remember_choice(&config_id, &value),
                                 Err(e) => pane.meta_row(&format!("error: {e}")),
                             }
                         });
@@ -10086,6 +10118,55 @@ impl ChatPane {
         *current = Some(id.to_string());
         drop(current);
         self.notify_persist();
+    }
+
+    /// Record the user's choice for one of the agent's session options, so
+    /// the next session this chat connects starts with it (David,
+    /// 2026-10-09: "I don't think the effort configuration for the chat
+    /// agent is persisting correctly" — it went to the running session
+    /// and nowhere else, and every respawn came back at the default).
+    fn remember_choice(&self, id: &SessionConfigId, value: &str) {
+        let key = id.to_string();
+        let mut values = self.config_values.borrow_mut();
+        if values.get(&key).map(String::as_str) == Some(value) {
+            return;
+        }
+        values.insert(key, value.to_string());
+        drop(values);
+        self.notify_persist();
+    }
+
+    /// The user's remembered choice for `id`, put back in force on this
+    /// session when it differs from `current` and the agent still offers
+    /// it (`valid`): what the control should show, or `None` to show the
+    /// session's own value. A choice the agent refuses is forgotten
+    /// rather than fought over every session after.
+    fn reapply_choice(
+        &self,
+        id: &SessionConfigId,
+        current: &str,
+        boolean: bool,
+        valid: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let key = id.to_string();
+        let wanted = self.config_values.borrow().get(&key).cloned()?;
+        if wanted == current || !valid(&wanted) {
+            return None;
+        }
+        let result = match self.client.borrow().as_ref() {
+            Some(client) if boolean => client.set_config_bool(id.clone(), wanted == "true"),
+            Some(client) => client.set_config_option(id.clone(), wanted.clone().into()),
+            None => return None,
+        };
+        match result {
+            Ok(()) => Some(wanted),
+            Err(e) => {
+                tracing::info!("{key} {wanted:?} was not taken back up: {e}");
+                self.config_values.borrow_mut().remove(&key);
+                self.notify_persist();
+                None
+            }
+        }
     }
 
     /// Reflect `last_modes` into the mode list's checkmarks in place.

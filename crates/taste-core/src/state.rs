@@ -335,6 +335,14 @@ pub struct ChatEntry {
     /// session it connects.
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// The user's choices among the agent's own session options — effort,
+    /// fast mode, whatever else an adapter offers — by option id: a
+    /// select's value id, or `true`/`false` for a switch. Re-applied to
+    /// every session the chat connects; one the agent stops offering is
+    /// left alone. The model and the permission mode are kept above, each
+    /// with handling of its own. Empty = the agent's defaults.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub config_values: std::collections::BTreeMap<String, String>,
     /// The client-side auto-approve switch: answer the agent's permission
     /// requests without asking. Off unless the user turned it on.
     #[serde(default)]
@@ -372,6 +380,7 @@ impl Default for ChatEntry {
             session_id: None,
             model_value: None,
             permission_mode: None,
+            config_values: Default::default(),
             auto_approve: false,
             restart_when_silent: false,
             environment: EnvironmentId::primary(),
@@ -761,6 +770,32 @@ mod tests {
         });
         save_to(base.path(), root, &state).unwrap();
         assert!(load_from(base.path(), root).chats()[0].restart_when_silent);
+    }
+
+    /// The agent's session options the user chose — effort, fast mode —
+    /// come back with the chat, and a file from before they were kept
+    /// reads back with none rather than failing.
+    #[test]
+    fn a_chats_option_choices_survive_a_restart() {
+        let base = tempfile::tempdir().unwrap();
+        let root = std::path::Path::new("/w/project");
+        let mut state = WorkspaceState {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
+        let mut chat = chat("claude-code", "s");
+        chat.config_values.insert("effort".into(), "high".into());
+        chat.config_values.insert("fast".into(), "true".into());
+        state.set_chat(chat);
+        save_to(base.path(), root, &state).unwrap();
+        let back = load_from(base.path(), root).chats()[0]
+            .config_values
+            .clone();
+        assert_eq!(back.get("effort").map(String::as_str), Some("high"));
+        assert_eq!(back.get("fast").map(String::as_str), Some("true"));
+
+        let older: ChatEntry = serde_json::from_str(r#"{"agent_id":"claude-code"}"#).unwrap();
+        assert!(older.config_values.is_empty());
     }
 
     /// A state file written before standing answers existed reads back with
