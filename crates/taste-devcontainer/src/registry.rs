@@ -1736,7 +1736,10 @@ impl EnvironmentRegistry {
                     path.display()
                 ),
             );
-            let sync = crate::peer::sync_primary_peer(&peer, vm, &keys, &files, &path)?;
+            // Each phase, and git's progress through the slow ones, is the
+            // step's detail while it runs.
+            let say = |line: &str| self.progress_vm(&vm.domain, format!("syncing: {line}"));
+            let sync = crate::peer::sync_primary_peer(&peer, vm, &keys, &files, &path, &say)?;
             self.note_vm(
                 &vm.domain,
                 match &sync.note {

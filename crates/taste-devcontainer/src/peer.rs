@@ -574,11 +574,15 @@ fn share_submodules(
     keys: &Keys,
     files: &Files,
     path: &Path,
+    say: Say,
 ) -> Result<()> {
     let mut failed = Vec::new();
-    for (name, sub) in git.submodules() {
+    let submodules = git.submodules();
+    let count = submodules.len();
+    for (index, (name, sub)) in submodules.into_iter().enumerate() {
+        let of = (index + 1, count);
         // One submodule's failure is its own: the rest still go.
-        if let Err(e) = share_submodule(&name, &sub, peer, vm, keys, files, path) {
+        if let Err(e) = share_submodule(&name, &sub, of, peer, vm, keys, files, path, say) {
             failed.push(format!("{}: {e:#}", sub.display()));
         }
     }
@@ -590,14 +594,17 @@ fn share_submodules(
 
 /// [`share_submodules`] for one: `name` and `sub` as `.gitmodules` gives
 /// them, the path already checked to lie inside the folder.
+#[allow(clippy::too_many_arguments)]
 fn share_submodule(
     name: &str,
     sub: &Path,
+    (index, count): (usize, usize),
     peer: &Path,
     vm: &Vm,
     keys: &Keys,
     files: &Files,
     path: &Path,
+    say: Say,
 ) -> Result<()> {
     let clone = peer.join(sub);
     if !clone.join(".git").exists() {
@@ -664,10 +671,14 @@ fn share_submodule(
             made.stderr_utf8().trim()
         );
     }
+    say(&format!(
+        "giving Personal the submodule {} ({index} of {count})",
+        sub.display()
+    ));
     let args: Vec<String> = [
         "push",
         "--force",
-        "--quiet",
+        "--progress",
         &guest_url(vm, &staging),
         "+refs/heads/*:refs/heads/*",
         "+refs/remotes/origin/*:refs/heads/origin/*",
@@ -677,8 +688,19 @@ fn share_submodule(
     .iter()
     .map(|s| s.to_string())
     .collect();
-    git_streaming(&clone, keys, &args, &mut |_| {})
-        .with_context(|| format!("pushing the folder's {} to Personal", sub.display()))?;
+    // A whole repository can cross here — the first time, every object it
+    // has — so git's own progress is what the step says while it goes.
+    let mut pace = ProgressPace::default();
+    git_streaming(&clone, keys, &args, &mut |p| {
+        if pace.due(p) {
+            say(&format!(
+                "giving Personal the submodule {} ({index} of {count}): {}",
+                sub.display(),
+                p.words()
+            ));
+        }
+    })
+    .with_context(|| format!("pushing the folder's {} to Personal", sub.display()))?;
     let out = script(if present { "meet" } else { "update" })?;
     match out.status {
         0 => {}
@@ -782,13 +804,27 @@ pub fn sync_primary_peer(
     keys: &Keys,
     files: &Files,
     path: &Path,
+    say: Say,
 ) -> Result<PeerSync> {
-    sync_primary_peer_with(peer, vm, keys, files, path, false, &|_, _, _| {})
+    let on_send = |done: usize, total: usize, next: &Path| {
+        say(&format!(
+            "sending {} to Personal ({done} of {total} done)",
+            next.display()
+        ))
+    };
+    sync_primary_peer_with(peer, vm, keys, files, path, false, &on_send, say)
 }
 
 /// Told of each of the folder's changes as it is sent to the checkout:
 /// how many are done, of how many, and which is next.
 pub type OnSend<'a> = &'a dyn Fn(usize, usize, &Path);
+
+/// Told what the sync is doing now, in a few lowercase words — a phase,
+/// or git's own progress through a transfer. The startup page shows it as
+/// its step's detail and the title bar's sync as its running step, so a
+/// pass that takes minutes is never one sentence for all of them (David,
+/// 2026-10-09: "Could this show more progress detail?").
+pub type Say<'a> = &'a dyn Fn(&str);
 
 /// [`sync_primary_peer`], with `force` to write the checkout's side over
 /// paths both sides changed — the user's answer to a conflict.
@@ -800,6 +836,7 @@ pub type OnSend<'a> = &'a dyn Fn(usize, usize, &Path);
 /// (David, 2026-09-23: "I want Taste to keep my local checkout/working
 /// copy updated from the VM data"; "If there isn't a conflict, I want the
 /// sync to be two-way").
+#[allow(clippy::too_many_arguments)]
 pub fn sync_primary_peer_with(
     peer: &Path,
     vm: &Vm,
@@ -808,6 +845,7 @@ pub fn sync_primary_peer_with(
     path: &Path,
     force: bool,
     on_send: OnSend,
+    say: Say,
 ) -> Result<PeerSync> {
     use taste_git::mirror::Head;
     // What Personal's HEAD names, from its own file. A detached one is
@@ -835,6 +873,7 @@ pub fn sync_primary_peer_with(
             );
         }
     }
+    say("fetching Personal's branches and working copy");
     fetch_from_guest(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS)?;
     if detached {
         fetch_from_guest(
@@ -901,6 +940,7 @@ pub fn sync_primary_peer_with(
                     let rewrite = personal && ahead > 0 && behind > 0 && agreed == Some(oid);
                     if personal && ahead > 0 && (behind == 0 || rewrite) {
                         commits_unsettled = true;
+                        say(&format!("sending this folder's {branch} to Personal"));
                         let expected = rewrite.then(|| oid.to_string());
                         match push_ahead_into_checkout(
                             peer,
@@ -963,6 +1003,9 @@ pub fn sync_primary_peer_with(
             }
             (ahead, 0) if ahead > 0 => {
                 commits_unsettled = true;
+                say(&format!(
+                    "sending this folder's {ahead} new commit(s) on {branch} to Personal"
+                ));
                 let folder_tree = working_tree_id(peer);
                 match push_ahead_into_checkout(
                     peer,
@@ -1011,6 +1054,9 @@ pub fn sync_primary_peer_with(
                     && git.mirror_recorded_tip(branch)? == Some(oid) =>
             {
                 commits_unsettled = true;
+                say(&format!(
+                    "sending this folder's rewritten {branch} to Personal"
+                ));
                 let folder_tree = working_tree_id(peer);
                 match push_ahead_into_checkout(
                     peer,
@@ -1066,6 +1112,7 @@ pub fn sync_primary_peer_with(
     ) {
         (Some(here), Some(there), Some(agreed)) if here != there && here != agreed => {
             if there == agreed {
+                say(&format!("moving Personal to {}", here.describe()));
                 match switch_checkout(peer, vm, keys, files, path, &here, &there) {
                     Ok(()) => {
                         match &here {
@@ -1103,7 +1150,7 @@ pub fn sync_primary_peer_with(
     adopt_snapshot(&git)?;
     // Submodules the user checked out in the folder reach Personal's
     // checkout as repositories; a failure is said, and the sync goes on.
-    if let Err(e) = share_submodules(&git, peer, vm, keys, files, path) {
+    if let Err(e) = share_submodules(&git, peer, vm, keys, files, path, say) {
         tracing::warn!("submodules not given to Personal: {e:#}");
         sync.note
             .get_or_insert_with(|| format!("submodules not given to Personal: {e:#}"));
@@ -1121,6 +1168,7 @@ pub fn sync_primary_peer_with(
                 git.workdir().display()
             ));
         } else {
+            say("bringing Personal's working copy into this folder");
             mirror_into_folder(&git, &head, files, path, force, on_send, &mut sync)?;
         }
     }
@@ -1131,7 +1179,9 @@ pub fn sync_primary_peer_with(
     // it, warned about as missing until something else set off another
     // pass (2026-10-06: "I shouldn't see this error while the env
     // builds").
-    sync_submodules(&git, peer, vm, keys, files, path, force, on_send, &mut sync);
+    sync_submodules(
+        &git, peer, vm, keys, files, path, force, on_send, say, &mut sync,
+    );
     Ok(sync)
 }
 
@@ -1153,6 +1203,7 @@ fn sync_submodules(
     path: &Path,
     force: bool,
     on_send: OnSend,
+    say: Say,
     sync: &mut PeerSync,
 ) {
     for (_, sub) in git.submodules() {
@@ -1170,8 +1221,10 @@ fn sync_submodules(
             );
         }
         let prefixed = |done: usize, of: usize, p: &Path| on_send(done, of, &sub.join(p));
+        let within = |line: &str| say(&format!("{}: {line}", sub.display()));
+        say(&format!("syncing the submodule {}", sub.display()));
         let inner = snapshot_in_checkout(files, &there).and_then(|()| {
-            sync_primary_peer_with(&clone, vm, keys, files, &there, force, &prefixed)
+            sync_primary_peer_with(&clone, vm, keys, files, &there, force, &prefixed, &within)
         });
         match inner {
             Ok(inner) => {
@@ -2626,14 +2679,38 @@ mod tests {
         let files = Files::Local;
         let folder = pair.dir.join("folder");
         let checkout = pair.dir.join("checkout");
+        let said = std::cell::RefCell::new(Vec::<String>::new());
         let sync = |step: &str| {
             snapshot_in_checkout(&files, &checkout).unwrap();
-            sync_primary_peer_with(&folder, &vm, &keys, &files, &checkout, false, &|_, _, _| {})
-                .unwrap_or_else(|e| panic!("{step}: {e:#}"))
+            sync_primary_peer_with(
+                &folder,
+                &vm,
+                &keys,
+                &files,
+                &checkout,
+                false,
+                &|_, _, _| {},
+                &|line| said.borrow_mut().push(line.to_string()),
+            )
+            .unwrap_or_else(|e| panic!("{step}: {e:#}"))
         };
         let read = |p: &str| std::fs::read_to_string(pair.dir.join(p)).unwrap_or_default();
 
         let first = sync("pass 1");
+        // The pass said what it was doing as it went, the submodule's own
+        // phases under its path.
+        let said_now = said.borrow().clone();
+        for phase in [
+            "fetching Personal's branches and working copy",
+            "giving Personal the submodule tpl (1 of 1)",
+            "syncing the submodule tpl",
+            "tpl: fetching Personal's branches and working copy",
+        ] {
+            assert!(
+                said_now.iter().any(|l| l == phase),
+                "{phase} not in {said_now:#?}"
+            );
+        }
         assert_eq!(read("checkout/tpl/lib.txt"), "template\n", "{first:?}");
         assert_eq!(
             pair.git("checkout/tpl", &["branch", "--show-current"]),
@@ -2790,8 +2867,17 @@ mod tests {
         let checkout = pair.dir.join("checkout");
         let sync = || {
             snapshot_in_checkout(&files, &checkout).unwrap();
-            sync_primary_peer_with(&folder, &vm, &keys, &files, &checkout, false, &|_, _, _| {})
-                .unwrap()
+            sync_primary_peer_with(
+                &folder,
+                &vm,
+                &keys,
+                &files,
+                &checkout,
+                false,
+                &|_, _, _| {},
+                &|_| {},
+            )
+            .unwrap()
         };
         // Personal makes a branch; the folder is given its copy.
         pair.git("checkout", &["branch", "side"]);

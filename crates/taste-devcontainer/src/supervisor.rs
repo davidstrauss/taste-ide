@@ -1546,6 +1546,23 @@ impl Supervisor {
                 }));
             }
         };
+        // The pass's phases as the running step, the first word raised as
+        // the badge's other steps are written.
+        let say = {
+            let events = events.clone();
+            move |line: &str| {
+                let mut chars = line.chars();
+                let step = match chars.next() {
+                    Some(first) => first.to_uppercase().chain(chars).collect(),
+                    None => String::new(),
+                };
+                events.publish(Event::FolderSync(taste_core::FolderSync::Running {
+                    step,
+                    done: 0,
+                    total: 0,
+                }));
+            }
+        };
         let sync = crate::peer::sync_primary_peer_with(
             &self.env.peer,
             vm,
@@ -1554,6 +1571,7 @@ impl Supervisor {
             path,
             force,
             &on_send,
+            &say,
         );
         if let Err(e) = &sync {
             events.publish(Event::FolderSync(taste_core::FolderSync::Failed {
