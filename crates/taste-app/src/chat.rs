@@ -8100,14 +8100,8 @@ impl ChatPane {
         // headline, which is the sentence a reader of the tail wants.
         if let Some(title) = &title {
             if !self.tool_cards.borrow().contains_key(&id) {
-                let line = match act_kind(title) {
-                    Some(kind) => act_headline(
-                        kind,
-                        raw_input,
-                        raw_output.and_then(act_output_json).as_ref(),
-                    ),
-                    None => tool_headline(title, raw_input).unwrap_or_else(|| title.clone()),
-                };
+                let line =
+                    step_title(title, raw_input, raw_output).unwrap_or_else(|| title.clone());
                 self.record_line("tool", &line);
             }
         }
@@ -8309,28 +8303,20 @@ impl ChatPane {
             // tool, the entire script. A collapsed card summarises in one
             // line; the whole thing stays a hover away, and the card's own
             // content carries the detail when it is opened.
-            // The IDE's own tools say what they are doing in English
-            // (`tool_headline`); anything else keeps whatever its adapter
-            // called it. The raw name stays on the tooltip and in
-            // `title_full`, which is what the IN/OUT matcher compares a
-            // shell card's output against.
-            // An act is worded as one from its first appearance too: the
-            // working line takes this title the moment the call starts,
-            // and read `mcp__taste-ide__issue_update` for as long as the
-            // call ran (David, 2026-10-04: "This should be human friendly
-            // text").
-            let shown = match act_kind(&title) {
-                Some(kind) => act_headline(
-                    kind,
-                    raw_input,
-                    raw_output.and_then(act_output_json).as_ref(),
-                ),
-                None => {
-                    tool_headline(&title, raw_input).unwrap_or_else(|| single_line(&title, 200))
-                }
-            };
+            // A tool's name is worded in English wherever it shows, the
+            // first moment included (`step_title`); a title that is the
+            // adapter's own words — a shell command, "Read filetree.rs" —
+            // stays as it came. The raw name stays only in `title_full`,
+            // which is what the IN/OUT matcher compares a shell card's
+            // output against: not on the tooltip, and so never in front
+            // of the user (David, 2026-10-09: "I don't want to see the
+            // internal function/method names in even transitory
+            // circumstances").
+            let worded = step_title(&title, raw_input, raw_output);
+            let shown = worded.clone().unwrap_or_else(|| single_line(&title, 200));
             card.title_label.set_markup(&self.pillify_headline(&shown));
-            card.title_label.set_tooltip_text(Some(&title));
+            card.title_label
+                .set_tooltip_text(Some(worded.as_deref().unwrap_or(&title)));
             *card.title_full.borrow_mut() = title.clone();
             // An act — the coordinator filing, starting, completing,
             // declining, moving or prompting — is dressed as one from its
@@ -8552,7 +8538,7 @@ impl ChatPane {
                                 {
                                     let text = content_text(&block.content).unwrap_or_default();
                                     card.content.append(&fields_grid(&fields));
-                                    let title = single_line(&card.title_full.borrow(), 60);
+                                    let title = single_line(&card.title_label.text(), 60);
                                     let key = format!("{marked}/result-{index}");
                                     self.note_doc_row(&key, &card.row);
                                     card.content.append(&self.more_button(
@@ -8590,7 +8576,7 @@ impl ChatPane {
                                             .build(),
                                     );
                                     if hidden > 0 {
-                                        let title = single_line(&card.title_full.borrow(), 60);
+                                        let title = single_line(&card.title_label.text(), 60);
                                         let key = format!("{marked}/result-{index}");
                                         self.note_doc_row(&key, &card.row);
                                         card.content.append(&self.more_button(
@@ -13769,6 +13755,37 @@ fn act_kind(title: &str) -> Option<ActKind> {
     }
 }
 
+/// A step's title in English when the agent's title for it is a tool's
+/// name: an act's headline (`act_headline`), the IDE's own tools' wording
+/// (`tool_headline`), and anybody else's MCP tool as its name in words
+/// with its server beside it (`humanize_tool_title`). `None` when the
+/// title is already the adapter's own words — a shell command, "Read
+/// filetree.rs" — which are shown as they came.
+fn step_title(
+    title: &str,
+    input: Option<&serde_json::Value>,
+    output: Option<&serde_json::Value>,
+) -> Option<String> {
+    if let Some(kind) = act_kind(title) {
+        return Some(act_headline(
+            kind,
+            input,
+            output.and_then(act_output_json).as_ref(),
+        ));
+    }
+    if let Some(worded) = tool_headline(title, input) {
+        return Some(worded);
+    }
+    // A bare word is not taken for the IDE's tool here: "Bash" and "Read"
+    // are the adapter's own titles, and they are already words.
+    if let Some(name) = mcp_tool_name(title).filter(|_| title.contains("taste-ide")) {
+        return Some(humanize_tool_title(&format!("mcp__taste-ide__{name}")));
+    }
+    title
+        .starts_with("mcp__")
+        .then(|| humanize_tool_title(title))
+}
+
 /// What the IDE's own MCP tools are called in the transcript, in English,
 /// with what they were asked where that is the point of the row.
 ///
@@ -13776,8 +13793,8 @@ fn act_kind(title: &str) -> Option<ActKind> {
 /// steps read `mcp__taste-ide__ide_search` over and over (David,
 /// 2026-09-08: "can we show these events in chat with human-friendly
 /// language?"). These are the IDE's own tools and the IDE knows what they
-/// mean; anybody else's keeps whatever title its adapter gave it, which is
-/// the only honest thing to do with a tool we did not define.
+/// mean; anybody else's is its name in words (`step_title`), which is as
+/// much as can honestly be said of a tool we did not define.
 ///
 /// The ones the coordinator ACTS with are not here — they are cards of
 /// their own (`act_kind`, `act_headline`), and they say more than a name.
@@ -13811,6 +13828,17 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "ide_open_file" => about("Open", "Open a file", "path"),
         // As Claude Code's own Read was titled, with the file in its
         // checkout rather than at its place in the VM.
+        "ide_edit_file" | "ide_write_file" => {
+            let verb = if name == "ide_write_file" {
+                "Write"
+            } else {
+                "Edit"
+            };
+            match text("path").or_else(|| text("file_path")) {
+                Some(path) => format!("{verb} {}", checkout_path(&path)),
+                None => format!("{verb} a file"),
+            }
+        }
         "ide_read_file" => match text("path").or_else(|| text("file_path")) {
             Some(path) => match text("pages") {
                 Some(pages) => format!("Read {}, pages {pages}", checkout_path(&path)),
@@ -13871,6 +13899,13 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "task_stop" => about("Stop task", "Stop a task", "name"),
         "flatpak_status" => "Read the Flatpak build's state".into(),
         "flatpak_logs" => "Read the Flatpak build's log".into(),
+        "environment_destroy" => about(
+            "Destroy environment",
+            "Destroy an environment",
+            "environment",
+        ),
+        "environment_move" => about("Move environment", "Move an environment", "environment"),
+        "issue_delete" => about("Delete issue", "Delete an issue", "issue"),
         _ => return None,
     })
 }
@@ -16042,6 +16077,82 @@ mod tests {
         assert!(!is_ide_edit_title("mcp__taste-ide__ide_read_file"));
     }
 
+    /// No tool's internal name reaches the user, at any moment of the call
+    /// (David, 2026-10-09: "I don't want to see the internal
+    /// function/method names in even transitory circumstances"): every
+    /// tool the IDE's MCP server defines has English, an edit has it
+    /// before its arguments name the file, and another server's tool is
+    /// its name in words.
+    #[test]
+    fn no_step_wears_a_tools_internal_name() {
+        let sources = [
+            include_str!("../../taste-mcp/src/server.rs"),
+            include_str!("../../taste-mcp/src/orchestration.rs"),
+        ];
+        let mut defined = Vec::new();
+        for source in sources {
+            let mut rest = source;
+            while let Some(at) = rest.find("tool(") {
+                rest = &rest[at + "tool(".len()..];
+                let trimmed = rest.trim_start();
+                let Some(quoted) = trimmed.strip_prefix('"') else {
+                    continue;
+                };
+                let name: String = quoted
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || *c == '_')
+                    .collect();
+                if quoted[name.len()..].starts_with('"') && !name.is_empty() {
+                    defined.push(name);
+                }
+            }
+        }
+        assert!(defined.len() > 40, "found only {defined:?}");
+        for name in &defined {
+            let title = format!("mcp__taste-ide__{name}");
+            let worded =
+                step_title(&title, None, None).unwrap_or_else(|| panic!("{title} has no wording"));
+            assert!(
+                act_kind(&title).is_some() || tool_headline(&title, None).is_some(),
+                "{name} falls back to its name in words: {worded}"
+            );
+            assert!(!worded.contains('_'), "{name} is shown as {worded:?}");
+        }
+
+        assert_eq!(
+            step_title("mcp__taste-ide__ide_write_file", None, None).as_deref(),
+            Some("Write a file")
+        );
+        assert_eq!(
+            step_title("mcp__taste-ide__ide_edit_file", None, None).as_deref(),
+            Some("Edit a file")
+        );
+        let edit = serde_json::json!({
+            "path": "/var/home/core/taste/a8583d2b/primary/src/lib.rs"
+        });
+        assert_eq!(
+            step_title("mcp__taste-ide__ide_edit_file", Some(&edit), None).as_deref(),
+            Some("Edit src/lib.rs")
+        );
+        assert_eq!(
+            step_title("mcp__claude_ai_Slack__slack_send_message", None, None).as_deref(),
+            Some("Slack Send Message (claude_ai_Slack)")
+        );
+        assert_eq!(
+            step_title("mcp__taste-ide__a_tool_from_tomorrow", None, None).as_deref(),
+            Some("A Tool From Tomorrow (IDE)")
+        );
+        // The adapter's own titles are words already.
+        for own in [
+            "Bash",
+            "Read",
+            "Read filetree.rs",
+            "cargo test -p taste-app",
+        ] {
+            assert_eq!(step_title(own, None, None), None, "{own}");
+        }
+    }
+
     #[test]
     fn the_ides_own_tools_say_what_they_are_doing() {
         let asked = serde_json::json!({"query": "gauge"});
@@ -16068,9 +16179,9 @@ mod tests {
             Some("Read the backlog")
         );
 
-        // A tool the IDE did not define keeps whatever its adapter called
-        // it: we do not know what it means, and guessing would be worse
-        // than the raw name.
+        // A tool the IDE did not define is not given the IDE's wording:
+        // `step_title` says its name in words, and the adapter's own
+        // titles are left as they are.
         assert_eq!(tool_headline("Bash", None), None);
         assert_eq!(tool_headline("Read", None), None);
         // ...and the same "is the tool, does not merely mention it" rule
