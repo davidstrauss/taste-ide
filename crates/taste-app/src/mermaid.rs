@@ -28,9 +28,12 @@
 //! preview that redraws on every edit redraws an unchanged diagram from
 //! memory, without the flash of an empty box.
 //!
-//! The same helper draws a notebook's SVG figures ([`svg_figure`]):
-//! matplotlib and Seaborn write SVG when a notebook asks them to, and an
-//! SVG is a document the project chose, parsed by the same usvg.
+//! The same helper draws a notebook's figures ([`figure`]): its SVG,
+//! which matplotlib and Seaborn write when a notebook asks them to, and an
+//! SVG is a document the project chose, parsed by the same usvg; and its
+//! PNG and JPEG pictures, each wrapped as the one image of an SVG, so they
+//! are decoded by resvg's decoders in the confined helper rather than by
+//! libpng, libjpeg, or a sniffed loader in this process.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -269,7 +272,10 @@ fn render(
 /// What a finished render is cached under.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
-    source: String,
+    /// The source's digest and length, not the source: an SVG figure can
+    /// be sixteen megabytes, and the cache counts textures, not keys.
+    digest: u64,
+    len: usize,
     dark: bool,
     family: String,
     scale: i32,
@@ -376,14 +382,15 @@ pub fn diagram(
     let drawn_at = Rc::new(std::cell::Cell::new(display_scale()));
     let draw: Rc<dyn Fn(&gtk::Box, i32)> = Rc::new(move |holder: &gtk::Box, scale: i32| {
         let key = Key {
-            source: source.clone(),
+            digest: digest(source.as_bytes()),
+            len: source.len(),
             dark: adw::StyleManager::default().is_dark(),
             family: interface_family(),
             scale,
             kind: Kind::Mermaid,
         };
         if let Some(drawn) = cached(&key) {
-            show(holder, &drawn, &key.source);
+            show(holder, &drawn, &source);
             hold.borrow_mut().take();
             return;
         }
@@ -396,17 +403,13 @@ pub fn diagram(
         let weak = holder.downgrade();
         let fallback = fallback.clone();
         let hold = hold.clone();
+        let source = source.clone();
         glib::spawn_future_local(async move {
             let job = key.clone();
+            let text = source.clone();
             let rendered = crate::runtime::runtime()
                 .spawn_blocking(move || {
-                    render(
-                        &job.source,
-                        job.dark,
-                        &job.family,
-                        job.scale as f32,
-                        job.kind,
-                    )
+                    render(&text, job.dark, &job.family, job.scale as f32, job.kind)
                 })
                 .await
                 .unwrap_or_else(|e| Err(format!("the renderer stopped: {e}")));
@@ -427,7 +430,7 @@ pub fn diagram(
                         bytes,
                     };
                     keep(key.clone(), drawn.clone());
-                    show(&holder, &drawn, &key.source);
+                    show(&holder, &drawn, &source);
                 }
                 Err(why) => {
                     tracing::info!("a Mermaid diagram was not drawn: {why}");
@@ -476,42 +479,199 @@ pub fn diagram(
     holder.upcast()
 }
 
-/// An SVG figure — a notebook output's `image/svg+xml` — drawn by the
-/// helper, at the window's scale and never larger than the size the SVG
-/// states. Held until drawn (`hold`), like a diagram; one that cannot be
-/// drawn says why where it would have been.
-pub fn svg_figure(svg: &str, hold: Option<crate::markdown_view::Hold>) -> gtk::Widget {
+/// A figure to draw: an SVG document, or a picture's bytes in a format
+/// this side has checked by its header.
+pub enum Figure {
+    Svg(String),
+    Png(Vec<u8>),
+    Jpeg(Vec<u8>),
+    /// A notebook's base64, decoded off the main thread with the rest.
+    EncodedPng(String),
+    EncodedJpeg(String),
+}
+
+/// The largest picture decoded, in pixels: a decompression bomb's header
+/// says how large it is before a byte of it is unpacked, and is refused.
+const MAX_PICTURE_PIXELS: u64 = 50_000_000;
+const MAX_PICTURE_SIDE: u32 = 30_000;
+
+/// A picture's width and height from its own header — PNG's IHDR, JPEG's
+/// start-of-frame — or why it is not the format it was said to be.
+pub fn picture_size(figure: &Figure) -> Result<(u32, u32), String> {
+    let (width, height) = match figure {
+        Figure::Svg(_) | Figure::EncodedPng(_) | Figure::EncodedJpeg(_) => {
+            return Err("an SVG has no pixel size, and base64 is read first".into())
+        }
+        Figure::Png(bytes) => {
+            if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR"
+            {
+                return Err("it says PNG and is not one".into());
+            }
+            let be = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+            (be(16), be(20))
+        }
+        Figure::Jpeg(bytes) => jpeg_size(bytes).ok_or("it says JPEG and is not one")?,
+    };
+    if width == 0 || height == 0 || width > MAX_PICTURE_SIDE || height > MAX_PICTURE_SIDE {
+        return Err(format!("it is {width}×{height}, past what is drawn here"));
+    }
+    if width as u64 * height as u64 > MAX_PICTURE_PIXELS {
+        return Err(format!("it is {width}×{height}, past what is drawn here"));
+    }
+    Ok((width, height))
+}
+
+/// A JPEG's size from its first start-of-frame marker.
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+    let mut at = 2;
+    while at + 4 <= bytes.len() {
+        if bytes[at] != 0xFF {
+            return None;
+        }
+        let marker = bytes[at + 1];
+        if marker == 0xFF {
+            at += 1;
+            continue;
+        }
+        if marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
+            at += 2;
+            continue;
+        }
+        let length = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+        let frame = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+        if frame {
+            if at + 9 > bytes.len() {
+                return None;
+            }
+            let height = u16::from_be_bytes([bytes[at + 5], bytes[at + 6]]) as u32;
+            let width = u16::from_be_bytes([bytes[at + 7], bytes[at + 8]]) as u32;
+            return Some((width, height));
+        }
+        at += 2 + length;
+    }
+    None
+}
+
+/// The SVG the helper draws for a figure: the document itself, or a
+/// picture wrapped as the one image in one, which is how a PNG or a JPEG
+/// gets decoded in the confined helper (resvg's own decoders) rather than
+/// in this process — and the logical width it stands for.
+fn figure_svg(figure: Figure) -> Result<(String, f32), String> {
+    use base64::Engine as _;
+    let decode = |text: String| {
+        let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(text.as_bytes())
+            .map_err(|e| format!("its base64 does not decode: {e}"))
+    };
+    let figure = match figure {
+        Figure::EncodedPng(text) => Figure::Png(decode(text)?),
+        Figure::EncodedJpeg(text) => Figure::Jpeg(decode(text)?),
+        other => other,
+    };
+    let (width, height) = match &figure {
+        Figure::Svg(svg) => return Ok((svg.clone(), 0.0)),
+        picture => picture_size(picture)?,
+    };
+    let (mime, bytes) = match figure {
+        Figure::Png(bytes) => ("image/png", bytes),
+        Figure::Jpeg(bytes) => ("image/jpeg", bytes),
+        _ => unreachable!("decoded and checked above"),
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok((
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" \
+             viewBox=\"0 0 {width} {height}\"><image width=\"{width}\" height=\"{height}\" \
+             href=\"data:{mime};base64,{encoded}\"/></svg>"
+        ),
+        width as f32,
+    ))
+}
+
+/// A figure — a notebook output's picture or SVG, an Image widget's value —
+/// drawn by the confined helper and shown at the start of its column,
+/// scaled down to it and never wider than `width` when the output says
+/// one (a retina figure's) or the size it states. Everything heavy is off
+/// this thread: the header's check, the encoding, the digest, the drawing.
+/// Held until drawn (`hold`); one that cannot be drawn says why.
+pub fn figure(
+    figure: Figure,
+    width: Option<f64>,
+    hold: Option<crate::markdown_view::Hold>,
+) -> gtk::Widget {
     let holder = gtk::Box::new(gtk::Orientation::Vertical, 4);
     holder.set_hexpand(true);
-    let key = Key {
-        source: svg.to_string(),
-        dark: false,
-        family: interface_family(),
-        scale: display_scale(),
-        kind: Kind::Svg,
-    };
-    if let Some(drawn) = cached(&key) {
-        show(&holder, &drawn, "figure");
-        if let Some(clamp) = holder.first_child() {
-            clamp.set_halign(gtk::Align::Start);
-        }
-        return holder.upcast();
-    }
     holder.append(&drawing());
+    let raster = !matches!(figure, Figure::Svg(_));
+    // A picture is drawn at its own pixels; an SVG at the window's scale.
+    let scale = if raster { 1 } else { display_scale() };
+    let family = interface_family();
     let weak = holder.downgrade();
     glib::spawn_future_local(async move {
         let _hold = hold;
+        let prepared = crate::runtime::runtime()
+            .spawn_blocking(move || {
+                figure_svg(figure).map(|(svg, logical)| {
+                    let key = Key {
+                        digest: digest(svg.as_bytes()),
+                        len: svg.len(),
+                        dark: false,
+                        family,
+                        scale,
+                        kind: Kind::Svg,
+                    };
+                    (svg, logical, key)
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("the renderer stopped: {e}")));
+        let shown = |holder: &gtk::Box, drawn: &Drawn| {
+            let mut drawn = drawn.clone();
+            if let Some(width) = width.filter(|w| w.is_finite() && *w >= 1.0) {
+                drawn.width = drawn.width.min(width as f32);
+            }
+            show(holder, &drawn, "figure");
+            // An output sits at the start of its column, as Jupyter draws
+            // it, not centred as a diagram is.
+            if let Some(clamp) = holder.first_child() {
+                clamp.set_halign(gtk::Align::Start);
+            }
+        };
+        let failed = |holder: &gtk::Box, why: &str| {
+            tracing::info!("a figure was not drawn: {why}");
+            clear(holder);
+            holder.append(
+                &gtk::Label::builder()
+                    .label(format!("This figure could not be drawn: {why}"))
+                    .xalign(0.0)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .css_classes(["caption", "dim-label"])
+                    .build(),
+            );
+        };
+        let (svg, logical, key) = match prepared {
+            Ok(prepared) => prepared,
+            Err(why) => {
+                if let Some(holder) = weak.upgrade() {
+                    failed(&holder, &why);
+                }
+                return;
+            }
+        };
+        if let Some(drawn) = cached(&key) {
+            if let Some(holder) = weak.upgrade() {
+                shown(&holder, &drawn);
+            }
+            return;
+        }
         let job = key.clone();
         let rendered = crate::runtime::runtime()
-            .spawn_blocking(move || {
-                render(
-                    &job.source,
-                    job.dark,
-                    &job.family,
-                    job.scale as f32,
-                    job.kind,
-                )
-            })
+            .spawn_blocking(move || render(&svg, job.dark, &job.family, job.scale as f32, job.kind))
             .await
             .unwrap_or_else(|e| Err(format!("the renderer stopped: {e}")));
         let Some(holder) = weak.upgrade() else { return };
@@ -527,33 +687,28 @@ pub fn svg_figure(svg: &str, hold: Option<crate::markdown_view::Hold>) -> gtk::W
                 );
                 let drawn = Drawn {
                     texture: texture.upcast(),
-                    width: raster.logical_width,
+                    width: if logical > 0.0 {
+                        logical
+                    } else {
+                        raster.logical_width
+                    },
                     bytes,
                 };
                 keep(key, drawn.clone());
-                show(&holder, &drawn, "figure");
-                // An output sits at the start of its column, as Jupyter
-                // draws it, not centred as a diagram is.
-                if let Some(clamp) = holder.first_child() {
-                    clamp.set_halign(gtk::Align::Start);
-                }
+                shown(&holder, &drawn);
             }
-            Err(why) => {
-                tracing::info!("an SVG figure was not drawn: {why}");
-                clear(&holder);
-                holder.append(
-                    &gtk::Label::builder()
-                        .label(format!("This SVG figure could not be drawn: {why}"))
-                        .xalign(0.0)
-                        .wrap(true)
-                        .wrap_mode(gtk::pango::WrapMode::WordChar)
-                        .css_classes(["caption", "dim-label"])
-                        .build(),
-                );
-            }
+            Err(why) => failed(&holder, &why),
         }
     });
     holder.upcast()
+}
+
+/// A source's digest, for the cache's key.
+fn digest(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// What stands where a diagram will be while it is drawn.
@@ -607,6 +762,29 @@ fn show(holder: &gtk::Box, drawn: &Drawn, source: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A picture is checked against the format it is said to be, and its
+    /// size read from its own header, before anything decodes it.
+    #[test]
+    fn a_picture_is_its_format_and_a_bomb_is_refused_by_its_header() {
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.extend_from_slice(&640u32.to_be_bytes());
+        png.extend_from_slice(&480u32.to_be_bytes());
+        assert_eq!(picture_size(&Figure::Png(png.clone())), Ok((640, 480)));
+        let mut bomb = png[..16].to_vec();
+        bomb.extend_from_slice(&30_000u32.to_be_bytes());
+        bomb.extend_from_slice(&30_000u32.to_be_bytes());
+        assert!(picture_size(&Figure::Png(bomb)).is_err());
+        // A TIFF (or anything else) labelled PNG is not decoded as anything.
+        assert!(picture_size(&Figure::Png(b"II*\x00........................".to_vec())).is_err());
+        // A JPEG: SOI, an APP0 segment, then SOF0 with height 300, width 400.
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01,
+            0x2C, 0x01, 0x90,
+        ];
+        assert_eq!(picture_size(&Figure::Jpeg(jpeg.to_vec())), Ok((400, 300)));
+        assert!(picture_size(&Figure::Jpeg(vec![0xFF, 0xD8, 0x00])).is_err());
+    }
 
     #[test]
     fn a_mermaid_fence_is_recognised_by_its_first_word() {

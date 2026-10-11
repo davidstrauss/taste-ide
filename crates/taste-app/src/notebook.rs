@@ -45,8 +45,14 @@ use crate::markdown_view::{DocumentBase, Readiness};
 
 /// The most lines of one text output drawn; the rest stay in the file.
 const MAX_OUTPUT_LINES: usize = 400;
+/// The most of one text output drawn, in bytes, whatever its lines.
+const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// How long a code cell's typing settles before it is written back.
 const SOURCE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+/// The most often a running cell's outputs are redrawn. A cell printing in
+/// a loop sends thousands of messages a second, and redrawing on each one
+/// is the main thread's whole time (20,000 flushed prints took 26.9s).
+const REDRAW_EVERY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Where the kernel stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,15 +74,27 @@ enum State {
     },
 }
 
-/// One run of one cell, until its reply.
+/// One run of one cell, until its reply AND its idle: outputs can arrive
+/// after the reply (a large final figure often does), and the protocol's
+/// word for "nothing more" is the request's idle.
 struct Run {
     index: usize,
+    /// The cell's nbformat id, when it has one: what its outputs are
+    /// written back to, whatever has moved it since.
+    cell_id: Option<String>,
     code: String,
     outputs: Vec<Value>,
     count: Option<i64>,
     /// `clear_output` with `wait`: clear at the next output, not now.
     clear_on_next: bool,
+    reply: Option<Value>,
+    idle: bool,
 }
+
+/// A change to the notebook's JSON, queued and applied off the main thread
+/// with the others queued beside it; it says whether it changed anything.
+/// A `Fn`, so a batch the buffer changed under can be applied again.
+type Edit = std::sync::Arc<dyn Fn(&mut Value) -> bool + Send + Sync>;
 
 /// One drawn code cell's live parts.
 struct CellParts {
@@ -84,6 +102,15 @@ struct CellParts {
     outputs: gtk::Box,
     source: sourceview5::Buffer,
     view: sourceview5::View,
+    /// Its nbformat id, when it has one.
+    id: Option<String>,
+    /// The source the file holds for it, as last drawn or written: a write
+    /// of an edit lands only on a cell that still holds this.
+    filed: Rc<RefCell<String>>,
+    /// A source edit waiting for the typing to settle.
+    pending: Rc<RefCell<Option<glib::SourceId>>>,
+    /// The outputs drawn now, for an `update_display_data` after its run.
+    shown: Rc<RefCell<Vec<Value>>>,
 }
 
 /// The parts of the current drawing that a kernel event changes.
@@ -119,6 +146,25 @@ pub struct Session {
     on_prompt_agent: Rc<dyn Fn(String, (String, String))>,
     /// The kernel's widget models, and their views (`crate::widgets`).
     widgets: Rc<crate::widgets::Manager>,
+    /// Cells whose outputs changed since they were last drawn, and whether
+    /// a redraw of them is due.
+    stale: RefCell<std::collections::BTreeSet<usize>>,
+    redraw_due: Cell<bool>,
+    /// The latest rendering asked for: an older one that finishes after it
+    /// does not take the drawing over.
+    generation: Cell<u64>,
+    /// Edits to the file waiting to be applied, and whether a batch is
+    /// being applied now.
+    edits: RefCell<Vec<Edit>>,
+    editing: Cell<bool>,
+    /// How many times the buffer has changed: a batch computed off the main
+    /// thread is applied only over the text it was computed from.
+    changes: Rc<Cell<u64>>,
+    /// Where each display id's output is: its cell and its place among the
+    /// cell's outputs (`update_display_data`).
+    displays: RefCell<HashMap<String, (usize, usize)>>,
+    /// The session itself, weakly, for the work it schedules.
+    this: RefCell<Weak<Session>>,
 }
 
 impl Session {
@@ -156,7 +202,22 @@ impl Session {
             drawing: RefCell::new(None),
             on_prompt_agent,
             widgets: crate::widgets::Manager::new(),
+            stale: RefCell::new(std::collections::BTreeSet::new()),
+            redraw_due: Cell::new(false),
+            generation: Cell::new(0),
+            edits: RefCell::new(Vec::new()),
+            editing: Cell::new(false),
+            changes: Rc::new(Cell::new(0)),
+            displays: RefCell::new(HashMap::new()),
+            this: RefCell::new(Weak::new()),
         });
+        *session.this.borrow_mut() = Rc::downgrade(&session);
+        {
+            let changes = session.changes.clone();
+            session
+                .buffer
+                .connect_changed(move |_| changes.set(changes.get() + 1));
+        }
         // A widget's change reaches its model through the kernel's bridge.
         let weak = Rc::downgrade(&session);
         session
@@ -187,6 +248,8 @@ impl Session {
         let readiness = Readiness::default();
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let hold = readiness.hold();
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
         let weak = Rc::downgrade(self);
         let root_weak = root.downgrade();
         let ready = readiness.clone();
@@ -199,7 +262,9 @@ impl Session {
                 return;
             };
             match parsed {
-                Ok(Ok(notebook)) => session.build(&root, &notebook, base, on_link, &ready),
+                Ok(Ok(notebook)) => {
+                    session.build(&root, &notebook, base, on_link, &ready, generation)
+                }
                 Ok(Err(e)) => root.append(&notice(&format!(
                     "This notebook's JSON could not be read: {e}. The Edit face shows it as it \
                      is."
@@ -217,6 +282,7 @@ impl Session {
         base: DocumentBase,
         on_link: Rc<dyn Fn(&str)>,
         ready: &Readiness,
+        generation: u64,
     ) {
         let major = notebook["nbformat"].as_u64().unwrap_or(0);
         if major != 4 {
@@ -338,6 +404,7 @@ impl Session {
                     parts
                         .outputs
                         .set_visible(parts.outputs.first_child().is_some());
+                    *parts.shown.borrow_mut() = outputs.clone();
                     parts.prompt.set_label(&if live.is_some() {
                         "[*]".to_string()
                     } else {
@@ -400,6 +467,13 @@ impl Session {
                 }
             });
         }
+        // Overtaken by a newer rendering while this one was parsed: it is
+        // drawn, and dropped by the editor, and it is not the one runs draw
+        // into.
+        if generation != self.generation.get() {
+            return;
+        }
+        self.displays.borrow_mut().clear();
         *self.drawing.borrow_mut() = Some(Drawing {
             status,
             run_all,
@@ -420,7 +494,7 @@ impl Session {
         index: usize,
         source: &str,
         language: &str,
-        _cell: &Value,
+        cell: &Value,
     ) -> (gtk::Widget, CellParts) {
         let buffer = sourceview5::Buffer::new(None);
         buffer.set_text(source.strip_suffix('\n').unwrap_or(source));
@@ -506,21 +580,22 @@ impl Session {
             });
             view.add_controller(keys);
         }
-        // Edited here, written back once the typing settles.
+        // Edited here, written back once the typing settles — or at once,
+        // when the cell is run before it has (`run_cell`).
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         if self.editable() {
-            let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+            let pending = pending.clone();
             let weak: Weak<Session> = Rc::downgrade(self);
-            buffer.connect_changed(move |buffer| {
+            buffer.connect_changed(move |_| {
                 if let Some(id) = pending.borrow_mut().take() {
                     id.remove();
                 }
                 let weak = weak.clone();
-                let buffer = buffer.clone();
                 let slot = pending.clone();
                 let id = glib::timeout_add_local_once(SOURCE_SETTLE, move || {
                     slot.borrow_mut().take();
                     if let Some(session) = weak.upgrade() {
-                        session.write_source(index, &buffer_text(&buffer));
+                        session.write_source(index);
                     }
                 });
                 *pending.borrow_mut() = Some(id);
@@ -533,6 +608,10 @@ impl Session {
                 outputs,
                 source: buffer,
                 view,
+                id: cell["id"].as_str().map(str::to_string),
+                filed: Rc::new(RefCell::new(joined(&cell["source"]))),
+                pending,
+                shown: Rc::new(RefCell::new(Vec::new())),
             },
         )
     }
@@ -587,12 +666,15 @@ impl Session {
 
     /// Run code cell `index` as its source stands on screen.
     pub fn run_cell(self: &Rc<Self>, index: usize) {
-        let code = {
+        // An edit still settling is filed first, so the outputs written at
+        // the end of this run land beside the code that made them.
+        self.write_source(index);
+        let (code, cell_id) = {
             let drawing = self.drawing.borrow();
             let Some(parts) = drawing.as_ref().and_then(|d| d.cells.get(&index)) else {
                 return;
             };
-            buffer_text(&parts.source)
+            (buffer_text(&parts.source), parts.id.clone())
         };
         if !self.ensure_kernel() {
             return;
@@ -604,10 +686,13 @@ impl Session {
             token.clone(),
             Run {
                 index,
+                cell_id,
                 code: code.clone(),
                 outputs: Vec::new(),
                 count: None,
                 clear_on_next: false,
+                reply: None,
+                idle: false,
             },
         );
         if let Some(parts) = self
@@ -811,21 +896,43 @@ impl Session {
                 self.abandon_runs();
                 self.set_state(State::Failed { message, report });
             }
-            Event::State(state) => match state.as_str() {
+            Event::State { state, cell, .. } => match state.as_str() {
                 "busy" => self.set_state(State::Busy),
-                "idle" => self.set_state(State::Idle),
+                "idle" => {
+                    self.set_state(State::Idle);
+                    if let Some(token) = cell {
+                        self.on_idle(&token);
+                    }
+                }
                 "restarting" => self.set_state(State::Restarting),
-                "dead" => self.set_state(State::Stopped {
-                    report: "The kernel died.".into(),
-                }),
+                "dead" => {
+                    // Gone: the next Run starts another, rather than sending
+                    // to one that will never answer.
+                    self.kernel.borrow_mut().take();
+                    self.abandon_runs();
+                    self.set_state(State::Stopped {
+                        report: "The kernel died.".into(),
+                    });
+                }
                 _ => {}
             },
+            Event::Error { message } => {
+                tracing::warn!("notebook kernel: {message}");
+                if let Some(drawing) = self.drawing.borrow().as_ref() {
+                    drawing.status.set_tooltip_text(Some(&message));
+                }
+            }
             Event::Output {
                 cell,
                 parent,
                 kind,
                 content,
             } => {
+                // A display updated by its id, wherever it was drawn.
+                if kind == "update_display_data" {
+                    self.update_display(&content);
+                    return;
+                }
                 // An Output widget capturing this request takes its output
                 // first — a callback's, or a cell's own under `with out:`.
                 if self.widgets.capture(&parent, &kind, &content) {
@@ -857,62 +964,152 @@ impl Session {
         }
     }
 
-    fn on_output(&self, token: &str, kind: &str, content: Value) {
-        let mut runs = self.runs.borrow_mut();
-        let Some(run) = runs.get_mut(token) else {
-            return;
-        };
-        let drawing = self.drawing.borrow();
-        let parts = drawing.as_ref().and_then(|d| d.cells.get(&run.index));
-        if kind == "execute_input" {
-            run.count = content["execution_count"].as_i64();
-            return;
-        }
-        if kind == "clear_output" {
-            if content["wait"].as_bool().unwrap_or(false) {
-                run.clear_on_next = true;
-            } else {
-                run.outputs.clear();
-                if let Some(parts) = parts {
-                    clear(&parts.outputs);
+    fn on_output(self: &Rc<Self>, token: &str, kind: &str, content: Value) {
+        let index = {
+            let mut runs = self.runs.borrow_mut();
+            let Some(run) = runs.get_mut(token) else {
+                return;
+            };
+            match kind {
+                "execute_input" => {
+                    run.count = content["execution_count"].as_i64();
+                    return;
+                }
+                "clear_output" => {
+                    if content["wait"].as_bool().unwrap_or(false) {
+                        run.clear_on_next = true;
+                        return;
+                    }
+                    run.outputs.clear();
+                }
+                _ => {
+                    let display = content["transient"]["display_id"]
+                        .as_str()
+                        .map(str::to_string);
+                    let Some(output) = nbformat_output(kind, content) else {
+                        return;
+                    };
+                    if run.clear_on_next {
+                        run.clear_on_next = false;
+                        run.outputs.clear();
+                    }
+                    push_output(&mut run.outputs, output);
+                    if let Some(display) = display {
+                        self.displays
+                            .borrow_mut()
+                            .insert(display, (run.index, run.outputs.len() - 1));
+                    }
                 }
             }
-            return;
-        }
-        let Some(output) = nbformat_output(kind, content) else {
-            return;
+            run.index
         };
-        if run.clear_on_next {
-            run.clear_on_next = false;
-            run.outputs.clear();
-            if let Some(parts) = parts {
-                clear(&parts.outputs);
-            }
+        self.stale.borrow_mut().insert(index);
+        if self.redraw_due.replace(true) {
+            return;
         }
-        push_output(&mut run.outputs, output.clone());
-        if let (Some(parts), Some(drawing)) = (parts, drawing.as_ref()) {
-            // A stream continues the last one of its name, so redraw that
-            // one rather than add a line of its own.
-            clear(&parts.outputs);
-            for output in &run.outputs {
-                if let Some(widget) = output_widget(
-                    output,
-                    &drawing.base,
-                    &drawing.on_link,
-                    None,
-                    Some(&self.widgets),
-                ) {
-                    parts.outputs.append(&widget);
-                }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(REDRAW_EVERY, move || {
+            if let Some(session) = weak.upgrade() {
+                session.redraw_stale();
             }
-            parts.outputs.set_visible(true);
+        });
+    }
+
+    /// Redraw the cells whose running outputs changed since they were last
+    /// drawn, from what their runs hold now.
+    fn redraw_stale(&self) {
+        self.redraw_due.set(false);
+        let stale = std::mem::take(&mut *self.stale.borrow_mut());
+        for index in stale {
+            let outputs = self
+                .runs
+                .borrow()
+                .values()
+                .find(|run| run.index == index)
+                .map(|run| run.outputs.clone());
+            if let Some(outputs) = outputs {
+                self.draw_outputs(index, &outputs);
+            }
         }
     }
 
-    fn on_reply(&self, token: &str, content: &Value) {
+    /// Cell `index`'s outputs drawn afresh as `outputs`.
+    fn draw_outputs(&self, index: usize, outputs: &[Value]) {
+        let drawing = self.drawing.borrow();
+        let Some(drawing) = drawing.as_ref() else {
+            return;
+        };
+        let Some(parts) = drawing.cells.get(&index) else {
+            return;
+        };
+        clear(&parts.outputs);
+        for output in outputs {
+            if let Some(widget) = output_widget(
+                output,
+                &drawing.base,
+                &drawing.on_link,
+                None,
+                Some(&self.widgets),
+            ) {
+                parts.outputs.append(&widget);
+            }
+        }
+        parts
+            .outputs
+            .set_visible(parts.outputs.first_child().is_some());
+        *parts.shown.borrow_mut() = outputs.to_vec();
+    }
+
+    /// A run's reply. The run is over once its idle has come too — or at
+    /// once, for one the kernel aborted (a cell queued behind an error),
+    /// which may have no idle of its own; and a reply whose idle has not
+    /// come a second later is taken as the end all the same.
+    fn on_reply(self: &Rc<Self>, token: &str, content: &Value) {
+        let done = {
+            let mut runs = self.runs.borrow_mut();
+            let Some(run) = runs.get_mut(token) else {
+                return;
+            };
+            run.reply = Some(content.clone());
+            run.idle || content["status"].as_str() == Some("aborted")
+        };
+        if done {
+            self.finish_run(token);
+            return;
+        }
+        let (weak, token) = (Rc::downgrade(self), token.to_string());
+        glib::timeout_add_local_once(std::time::Duration::from_secs(1), move || {
+            if let Some(session) = weak.upgrade() {
+                session.finish_run(&token);
+            }
+        });
+    }
+
+    fn on_idle(&self, token: &str) {
+        let done = {
+            let mut runs = self.runs.borrow_mut();
+            let Some(run) = runs.get_mut(token) else {
+                return;
+            };
+            run.idle = true;
+            run.reply.is_some()
+        };
+        if done {
+            self.finish_run(token);
+        }
+    }
+
+    /// A run over: its last outputs drawn, its count shown, and both
+    /// written into the file.
+    fn finish_run(&self, token: &str) {
         let Some(run) = self.runs.borrow_mut().remove(token) else {
             return;
         };
+        let content = run.reply.clone().unwrap_or(Value::Null);
+        // Its last outputs drawn now, whatever the redraw timer has yet to
+        // do: the run is over and out of the list the timer reads.
+        self.stale.borrow_mut().remove(&run.index);
+        self.draw_outputs(run.index, &run.outputs);
         let aborted = content["status"].as_str() == Some("aborted");
         let count = content["execution_count"].as_i64().or(run.count);
         if let Some(parts) = self
@@ -926,8 +1123,64 @@ impl Session {
                 .set_label(&prompt_text(if aborted { None } else { count }));
         }
         if !aborted {
-            self.write_outputs(run.index, &run.code, &run.outputs, count);
+            self.write_outputs(&run, count);
         }
+    }
+
+    /// `update_display_data`: the output a display id names replaced where
+    /// it is — in a run still going, or among a finished cell's outputs and
+    /// in the file.
+    fn update_display(&self, content: &Value) {
+        let Some(display) = content["transient"]["display_id"].as_str() else {
+            return;
+        };
+        let Some((index, place)) = self.displays.borrow().get(display).copied() else {
+            return;
+        };
+        let Some(output) = nbformat_output("display_data", content.clone()) else {
+            return;
+        };
+        let running = {
+            let mut runs = self.runs.borrow_mut();
+            match runs.values_mut().find(|run| run.index == index) {
+                Some(run) => {
+                    if let Some(slot) = run.outputs.get_mut(place) {
+                        *slot = output.clone();
+                    }
+                    Some(run.outputs.clone())
+                }
+                None => None,
+            }
+        };
+        if let Some(outputs) = running {
+            self.draw_outputs(index, &outputs);
+            return;
+        }
+        let (id, outputs) = {
+            let drawing = self.drawing.borrow();
+            let Some(parts) = drawing.as_ref().and_then(|d| d.cells.get(&index)) else {
+                return;
+            };
+            let mut shown = parts.shown.borrow_mut();
+            let Some(slot) = shown.get_mut(place) else {
+                return;
+            };
+            *slot = output.clone();
+            (parts.id.clone(), shown.clone())
+        };
+        self.draw_outputs(index, &outputs);
+        self.queue_edit(std::sync::Arc::new(move |notebook: &mut Value| {
+            let Some(cell) = cell_mut(notebook, id.as_deref(), index) else {
+                return false;
+            };
+            match cell.get_mut("outputs").and_then(Value::as_array_mut) {
+                Some(outputs) if place < outputs.len() => {
+                    outputs[place] = output.clone();
+                    true
+                }
+                _ => false,
+            }
+        }));
     }
 
     fn set_state(&self, state: State) {
@@ -1001,50 +1254,201 @@ impl Session {
 
     /// Write `code`'s outputs into cell `index` of the buffer, when that
     /// cell's source is still `code`.
-    fn write_outputs(&self, index: usize, code: &str, outputs: &[Value], count: Option<i64>) {
-        self.edit_cell(index, |cell| {
-            if joined(&cell["source"]).trim_end_matches('\n') != code.trim_end_matches('\n') {
+    /// A finished run's outputs and count, into its cell in the file — the
+    /// cell its id names, or the one at its index — when that cell's source
+    /// is still the code that ran.
+    fn write_outputs(&self, run: &Run, count: Option<i64>) {
+        let (id, index, code) = (run.cell_id.clone(), run.index, run.code.clone());
+        let outputs = Value::Array(run.outputs.clone());
+        self.queue_edit(std::sync::Arc::new(move |notebook: &mut Value| {
+            let Some(cell) = cell_mut(notebook, id.as_deref(), index) else {
+                return false;
+            };
+            let source = joined(cell.get("source").unwrap_or(&Value::Null));
+            if source.trim_end_matches('\n') != code.trim_end_matches('\n') {
                 return false;
             }
-            cell["outputs"] = Value::Array(outputs.to_vec());
-            cell["execution_count"] = count.map_or(Value::Null, Value::from);
+            cell.insert("outputs".into(), outputs.clone());
+            cell.insert(
+                "execution_count".into(),
+                count.map_or(Value::Null, Value::from),
+            );
             true
-        });
+        }));
     }
 
-    fn write_source(&self, index: usize, source: &str) {
-        self.edit_cell(index, |cell| {
-            if joined(&cell["source"]) == source {
-                return false;
+    /// Cell `index`'s source as it stands on screen, into the file — onto
+    /// the cell that still holds the source last filed for it, so an edit
+    /// never lands on a cell something else moved into its place.
+    fn write_source(&self, index: usize) {
+        let (id, source, filed) = {
+            let drawing = self.drawing.borrow();
+            let Some(parts) = drawing.as_ref().and_then(|d| d.cells.get(&index)) else {
+                return;
+            };
+            if let Some(timer) = parts.pending.borrow_mut().take() {
+                timer.remove();
             }
-            cell["source"] = source_lines(source);
-            true
-        });
-    }
-
-    /// Change one cell in the buffer's JSON, through `change`, which says
-    /// whether it changed anything. The buffer is rewritten in one user
-    /// action, so one undo takes it back.
-    fn edit_cell(&self, index: usize, change: impl FnOnce(&mut Value) -> bool) {
-        let text = buffer_text(&self.buffer);
-        let Ok(mut notebook) = serde_json::from_str::<Value>(&text) else {
-            return;
+            let source = buffer_text(&parts.source);
+            let before = parts.filed.replace(source.clone());
+            (parts.id.clone(), source, before)
         };
-        let Some(cell) = notebook["cells"].get_mut(index) else {
-            return;
-        };
-        if !change(cell) {
+        if source == filed {
             return;
         }
-        let Some(written) = nbformat_json(&notebook) else {
-            return;
-        };
-        self.writing.set(true);
-        self.buffer.begin_user_action();
-        self.buffer.set_text(&written);
-        self.buffer.end_user_action();
-        self.writing.set(false);
+        self.queue_edit(std::sync::Arc::new(move |notebook: &mut Value| {
+            let Some(cell) = cell_mut(notebook, id.as_deref(), index) else {
+                return false;
+            };
+            let now = joined(cell.get("source").unwrap_or(&Value::Null));
+            if now.trim_end_matches('\n') != filed.trim_end_matches('\n') {
+                return false;
+            }
+            cell.insert("source".into(), source_lines(&source));
+            true
+        }));
     }
+
+    /// Queue a change to the file. Changes are applied in batches off the
+    /// main thread — parsing and writing a notebook of figures is tens of
+    /// milliseconds — and the buffer is changed by the difference only, in
+    /// one user action, so the Edit face keeps its place and one undo takes
+    /// the batch back.
+    fn queue_edit(&self, edit: Edit) {
+        self.edits.borrow_mut().push(edit);
+        if !self.editing.replace(true) {
+            glib::idle_add_local_once({
+                let weak = self.self_weak();
+                move || {
+                    if let Some(session) = weak.upgrade() {
+                        session.apply_edits(0);
+                    }
+                }
+            });
+        }
+    }
+
+    fn self_weak(&self) -> Weak<Session> {
+        self.this.borrow().clone()
+    }
+
+    fn apply_edits(self: &Rc<Self>, attempt: u32) {
+        let edits: Vec<Edit> = std::mem::take(&mut *self.edits.borrow_mut());
+        if edits.is_empty() {
+            self.editing.set(false);
+            return;
+        }
+        let text = buffer_text(&self.buffer);
+        let changes = self.changes.get();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let batch = edits.clone();
+            let splice = crate::runtime::runtime()
+                .spawn_blocking(move || -> Option<Splice> {
+                    let mut notebook: Value = serde_json::from_str(&text).ok()?;
+                    let mut changed = false;
+                    for edit in &batch {
+                        changed |= edit(&mut notebook);
+                    }
+                    if !changed {
+                        return None;
+                    }
+                    Some(splice_between(&text, &nbformat_json(&notebook)?))
+                })
+                .await
+                .ok()
+                .flatten();
+            let Some(session) = weak.upgrade() else {
+                return;
+            };
+            if session.changes.get() != changes {
+                // The buffer changed while the batch was computed: computed
+                // again over what it holds now, a few times at most.
+                if attempt < 5 {
+                    let mut queued = session.edits.borrow_mut();
+                    let later = std::mem::take(&mut *queued);
+                    *queued = edits;
+                    queued.extend(later);
+                } else {
+                    tracing::warn!("notebook: outputs not written: the file kept changing");
+                }
+                session.apply_edits(attempt + 1);
+                return;
+            }
+            if let Some(splice) = splice {
+                session.writing.set(true);
+                let buffer = &session.buffer;
+                buffer.begin_user_action();
+                let mut start = buffer.iter_at_offset(splice.start as i32);
+                let mut end = buffer.iter_at_offset(splice.end as i32);
+                buffer.delete(&mut start, &mut end);
+                let mut at = buffer.iter_at_offset(splice.start as i32);
+                buffer.insert(&mut at, &splice.text);
+                buffer.end_user_action();
+                session.writing.set(false);
+            }
+            session.apply_edits(0);
+        });
+    }
+}
+
+/// The part of a text that changed: characters `start..end` of the old
+/// text replaced by `text`.
+struct Splice {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+/// The smallest replacement that turns `before` into `after`: what they
+/// share at the start and at the end is kept.
+fn splice_between(before: &str, after: &str) -> Splice {
+    let prefix = before
+        .char_indices()
+        .zip(after.chars())
+        .find(|((_, a), b)| a != b)
+        .map_or(before.len().min(after.len()), |((i, _), _)| i);
+    let prefix = {
+        let mut p = prefix.min(after.len());
+        while !after.is_char_boundary(p) || !before.is_char_boundary(p) {
+            p -= 1;
+        }
+        p
+    };
+    let (rest_before, rest_after) = (&before[prefix..], &after[prefix..]);
+    let mut suffix = 0;
+    for (a, b) in rest_before.chars().rev().zip(rest_after.chars().rev()) {
+        if a != b {
+            break;
+        }
+        suffix += a.len_utf8();
+    }
+    let suffix = suffix.min(rest_before.len()).min(rest_after.len());
+    let start = before[..prefix].chars().count();
+    let removed = rest_before[..rest_before.len() - suffix].chars().count();
+    Splice {
+        start,
+        end: start + removed,
+        text: rest_after[..rest_after.len() - suffix].to_string(),
+    }
+}
+
+/// The cell an edit is for: the one with nbformat id `id` when it has one,
+/// otherwise the one at `index` — `None` when the notebook is not the shape
+/// a notebook has, rather than a panic on a file something rewrote.
+fn cell_mut<'a>(
+    notebook: &'a mut Value,
+    id: Option<&str>,
+    index: usize,
+) -> Option<&'a mut serde_json::Map<String, Value>> {
+    let cells = notebook.as_object_mut()?.get_mut("cells")?.as_array_mut()?;
+    let cell = match id {
+        Some(id) => cells
+            .iter_mut()
+            .find(|cell| cell.get("id").and_then(Value::as_str) == Some(id))?,
+        None => cells.get_mut(index)?,
+    };
+    cell.as_object_mut()
 }
 
 /// The first slider under `widget`, depth first.
@@ -1180,13 +1584,46 @@ pub(crate) fn push_output(outputs: &mut Vec<Value>, output: Value) {
     if output["output_type"] == "stream" {
         if let Some(last) = outputs.last_mut() {
             if last["output_type"] == "stream" && last["name"] == output["name"] {
-                let text = joined(&last["text"]) + &joined(&output["text"]);
-                last["text"] = Value::from(text);
+                // In place: a stream of twenty thousand prints copied its
+                // whole text on every one of them.
+                if !last["text"].is_string() {
+                    last["text"] = Value::from(joined(&last["text"]));
+                }
+                if let Value::String(text) = &mut last["text"] {
+                    let from = text.rfind('\n').map_or(0, |i| i + 1);
+                    text.push_str(&joined(&output["text"]));
+                    collapse_overwrites(text, from);
+                }
                 return;
             }
         }
     }
+    let mut output = output;
+    if output["output_type"] == "stream" {
+        let mut text = joined(&output["text"]);
+        collapse_overwrites(&mut text, 0);
+        output["text"] = Value::from(text);
+    }
     outputs.push(output);
+}
+
+/// A carriage return's overwrite applied to `text` from byte `from` on, as
+/// a terminal — and JupyterLab — keeps it: each line keeps what follows its
+/// last lone `\r`. A progress bar redrawing itself thousands of times is
+/// then one line in the file, not thousands run together.
+fn collapse_overwrites(text: &mut String, from: usize) {
+    let tail = &text[from..];
+    if !tail.contains('\r') {
+        return;
+    }
+    let collapsed = tail
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(|line| line.rsplit('\r').next().unwrap_or(line).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.truncate(from);
+    text.push_str(&collapsed);
 }
 
 /// Text with a terminal's escapes as Pango markup: SGR colour and weight
@@ -1231,18 +1668,33 @@ fn ansi_markup(text: &str) -> String {
 /// Text as an output shows it: monospace, coloured, selectable, folded to
 /// the column, and cut at [`MAX_OUTPUT_LINES`] with what was cut said.
 fn text_output(text: &str, error: bool) -> gtk::Widget {
+    let text = text.trim_end_matches('\n');
     let total = text.lines().count();
-    let shown: String = if total > MAX_OUTPUT_LINES {
-        text.lines()
-            .take(MAX_OUTPUT_LINES)
-            .collect::<Vec<_>>()
-            .join("\n")
+    // The last lines: a long output is a log, and its latest lines are the
+    // ones being watched.
+    let shown: &str = if total > MAX_OUTPUT_LINES {
+        let mut cut = text.len();
+        for _ in 0..MAX_OUTPUT_LINES {
+            cut = text[..cut].rfind('\n').unwrap_or(0);
+        }
+        text[cut..].trim_start_matches('\n')
     } else {
-        text.trim_end_matches('\n').to_string()
+        text
+    };
+    // And by size: one line can be megabytes, and laying it out is the
+    // main thread's.
+    let shown = if shown.len() > MAX_OUTPUT_BYTES {
+        let mut cut = shown.len() - MAX_OUTPUT_BYTES;
+        while !shown.is_char_boundary(cut) {
+            cut += 1;
+        }
+        &shown[cut..]
+    } else {
+        shown
     };
     let label = gtk::Label::builder()
         .use_markup(true)
-        .label(ansi_markup(&shown))
+        .label(ansi_markup(shown))
         .xalign(0.0)
         .selectable(true)
         .wrap(true)
@@ -1252,21 +1704,22 @@ fn text_output(text: &str, error: bool) -> gtk::Widget {
     if error {
         label.add_css_class("notebook-error");
     }
-    if total <= MAX_OUTPUT_LINES {
+    if total <= MAX_OUTPUT_LINES && shown.len() == text.len() {
         return label.upcast();
     }
     let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    column.append(&label);
     column.append(
         &gtk::Label::builder()
-            .label(format!(
-                "{} more lines, in the file",
-                total - MAX_OUTPUT_LINES
-            ))
+            .label(if total > MAX_OUTPUT_LINES {
+                format!("{} earlier lines, in the file", total - MAX_OUTPUT_LINES)
+            } else {
+                "The start of this output is in the file".to_string()
+            })
             .xalign(0.0)
             .css_classes(["caption", "dim-label"])
             .build(),
     );
+    column.append(&label);
     column.upcast()
 }
 
@@ -1320,19 +1773,27 @@ fn output_widget(
             // the size to show it at beside it when it was drawn at twice
             // that (`figure_format = 'retina'`); an SVG when the notebook
             // asked for one, drawn by the confined helper Mermaid uses.
+            // Each drawn by the confined helper, never decoded here.
             for mime in ["image/png", "image/jpeg"] {
                 if data.get(mime).is_some() {
                     let width = output["metadata"][mime]["width"].as_f64();
-                    return Some(picture(
-                        &joined(&data[mime]),
+                    let encoded = joined(&data[mime]);
+                    let figure = if mime == "image/png" {
+                        crate::mermaid::Figure::EncodedPng(encoded)
+                    } else {
+                        crate::mermaid::Figure::EncodedJpeg(encoded)
+                    };
+                    return Some(crate::mermaid::figure(
+                        figure,
                         width,
                         ready.map(Readiness::hold),
                     ));
                 }
             }
             if data.get("image/svg+xml").is_some() {
-                return Some(crate::mermaid::svg_figure(
-                    &joined(&data["image/svg+xml"]),
+                return Some(crate::mermaid::figure(
+                    crate::mermaid::Figure::Svg(joined(&data["image/svg+xml"])),
+                    None,
                     ready.map(Readiness::hold),
                 ));
             }
@@ -1362,59 +1823,6 @@ fn output_widget(
         }
         _ => None,
     }
-}
-
-/// A base64 picture, decoded off this thread and shown scaled down to the
-/// column, never up — and never wider than `width`, the size its output
-/// says to show it at, when it says one: a retina figure is drawn at twice
-/// the size it stands for.
-fn picture(
-    base64: &str,
-    width: Option<f64>,
-    hold: Option<crate::markdown_view::Hold>,
-) -> gtk::Widget {
-    let picture = gtk::Picture::builder()
-        .content_fit(gtk::ContentFit::ScaleDown)
-        .can_shrink(true)
-        .halign(gtk::Align::Start)
-        .build();
-    let shown: gtk::Widget = match width.filter(|w| w.is_finite() && *w >= 1.0) {
-        Some(width) => adw::Clamp::builder()
-            .maximum_size(width.ceil() as i32)
-            .tightening_threshold(width.ceil() as i32)
-            .halign(gtk::Align::Start)
-            .child(&picture)
-            .build()
-            .upcast(),
-        None => picture.clone().upcast(),
-    };
-    let encoded: String = base64.chars().filter(|c| !c.is_whitespace()).collect();
-    let weak = picture.downgrade();
-    glib::spawn_future_local(async move {
-        let _hold = hold;
-        let decoded = crate::runtime::runtime()
-            .spawn_blocking(move || -> Result<gtk::gdk::Texture, String> {
-                use base64::Engine as _;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(encoded.as_bytes())
-                    .map_err(|e| format!("its base64 does not decode: {e}"))?;
-                gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
-                    .map_err(|e| format!("it is not a picture this build decodes: {e}"))
-            })
-            .await;
-        let Some(picture) = weak.upgrade() else {
-            return;
-        };
-        match decoded {
-            Ok(Ok(texture)) => picture.set_paintable(Some(&texture)),
-            Ok(Err(why)) => {
-                tracing::info!("a notebook picture was not shown: {why}");
-                picture.set_tooltip_text(Some(&format!("Not shown: {why}")));
-            }
-            Err(e) => tracing::info!("a notebook picture was not shown: {e}"),
-        }
-    });
-    shown
 }
 
 /// The prompt Prompt Agent sends when the kernel would not start, and what
@@ -1496,6 +1904,62 @@ mod tests {
         assert_eq!(result["output_type"], "execute_result");
         assert_eq!(result["execution_count"], 1);
         assert!(nbformat_output("status", Value::Null).is_none());
+    }
+
+    /// A progress bar redrawn by carriage returns, arriving in pieces, is
+    /// kept as its last state — one line, as a terminal shows it — and the
+    /// lines before it are untouched.
+    #[test]
+    fn a_progress_bar_is_kept_as_its_last_state() {
+        let stream = |text: &str| {
+            nbformat_output(
+                "stream",
+                serde_json::json!({"name": "stderr", "text": text}),
+            )
+            .unwrap()
+        };
+        let mut outputs = Vec::new();
+        push_output(&mut outputs, stream("loading\n  0%"));
+        for pct in 1..=100 {
+            push_output(&mut outputs, stream(&format!("\r{pct:3}%")));
+        }
+        push_output(&mut outputs, stream("\ndone\r\n"));
+        assert_eq!(joined(&outputs[0]["text"]), "loading\n100%\ndone\n");
+    }
+
+    /// The buffer is changed by the difference only, in characters, so a
+    /// write-back is one small edit and multibyte text survives it.
+    #[test]
+    fn a_write_back_changes_only_what_differs() {
+        let splice = splice_between(
+            "{ \"a\": \"é1\", \"z\": 0 }",
+            "{ \"a\": \"é22\", \"z\": 0 }",
+        );
+        assert_eq!(
+            (splice.start, splice.end, splice.text.as_str()),
+            (9, 10, "22")
+        );
+        let same = splice_between("abc", "abc");
+        assert_eq!((same.start, same.end, same.text.as_str()), (3, 3, ""));
+        let grown = splice_between("ab", "abab");
+        assert_eq!((grown.start, grown.end, grown.text.as_str()), (2, 2, "ab"));
+    }
+
+    /// A cell is found by its id wherever it has moved, by its index when
+    /// it has none, and a file that is not a notebook's shape is refused
+    /// rather than a panic.
+    #[test]
+    fn a_cell_is_found_by_id_and_a_strange_file_is_refused() {
+        let mut notebook = serde_json::json!({"cells": [
+            {"id": "new", "source": "inserted above"},
+            {"id": "mine", "source": "x = 1"},
+        ]});
+        let cell = cell_mut(&mut notebook, Some("mine"), 0).unwrap();
+        assert_eq!(cell["source"], "x = 1");
+        assert!(cell_mut(&mut notebook, None, 1).is_some());
+        assert!(cell_mut(&mut notebook, Some("gone"), 0).is_none());
+        assert!(cell_mut(&mut serde_json::json!([1, 2]), None, 0).is_none());
+        assert!(cell_mut(&mut serde_json::json!({"cells": ["a string"]}), None, 0).is_none());
     }
 
     /// Written back the way Jupyter writes: one-space indentation, a

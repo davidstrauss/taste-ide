@@ -548,6 +548,22 @@ mod tests {
         assert!(render_svg("not a picture", "Adwaita Sans", 1.0).is_err());
     }
 
+    /// A picture inline in an SVG — how the IDE hands a notebook's PNG to
+    /// this process to decode — is drawn; without resvg's raster decoders
+    /// it was nothing at all.
+    #[test]
+    fn a_picture_inline_in_an_svg_is_drawn() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4" viewBox="0 0 4 4"><image width="4" height="4" href="data:image/png;base64,{png}"/></svg>"#
+        );
+        let raster = render_svg(&svg, "Adwaita Sans", 1.0).expect("draws");
+        assert!(
+            raster.rgba.chunks(4).any(|px| px[3] != 0),
+            "the picture's pixels are there"
+        );
+    }
+
     /// An SVG that names a file on this machine draws nothing for it:
     /// the file is never opened, though it exists and is a picture.
     #[test]

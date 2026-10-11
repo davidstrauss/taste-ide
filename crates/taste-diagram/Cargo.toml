@@ -20,7 +20,12 @@ libc.workspace = true
 # All of it runs here and never in the IDE: it parses text a repository
 # or an agent wrote, and this process is confined (taste-confine).
 merman = { version = "=0.8.0", default-features = false, features = ["all-diagrams", "svg"] }
-resvg = { version = "0.47", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+# `raster-images`: resvg's own decoders (PNG through tiny-skia, JPEG
+# through zune-jpeg, GIF, WebP), all memory-safe Rust, for a notebook's
+# pictures — each wrapped as the one image of an SVG, so they are decoded
+# here, confined, and never by libpng, libjpeg, or a sniffed loader in the
+# IDE (taste-app's mermaid.rs, `figure`).
+resvg = { version = "0.47", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 rustybuzz = "0.20"
 
 [dev-dependencies]

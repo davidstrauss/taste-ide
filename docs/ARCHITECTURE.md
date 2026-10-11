@@ -1120,12 +1120,23 @@ no-op at every other width.
   editable, highlighted in the notebook's language, and run with their
   gutter button, Shift+Enter (and on), or Ctrl+Enter (in place); outputs
   are text with its ANSI colour, Markdown, and figures — PNG and JPEG, a
-  retina PNG at the width its metadata gives, and SVG drawn by the
-  confined `taste-diagram` helper, which is how matplotlib's and Seaborn's
+  retina PNG at the width its metadata gives, and SVG, all drawn by the
+  confined `taste-diagram` helper (a picture is checked against its
+  format's magic bytes, sized from its own header and refused past 50
+  megapixels, then wrapped as the one image of an SVG so resvg's
+  memory-safe decoders unpack it there — never libpng, libjpeg, or a
+  sniffed loader in this process), which is how matplotlib's and Seaborn's
   every output format is covered. HTML is named, not drawn; a DataFrame's
   text beside its HTML is what shows. A run's outputs and count are
   written back into the buffer when it finishes — one undoable edit, kept
-  by a save — and only into a cell whose source is still what ran.
+  by a save — and only into a cell whose source is still what ran, found
+  by its nbformat id when it has one. A run ends on its reply AND its
+  request's idle (a figure can follow the reply); write-backs are batched,
+  computed off the main thread, and spliced in as the difference only; a
+  running cell is redrawn at most every 50ms, and a stream appends in
+  place, a carriage return's overwrite collapsed as a terminal shows it.
+  A kernel's flood is bounded at every step — lines past 64 MiB dropped,
+  a bounded queue, events taken in batches with the main loop let in.
   **The kernel runs in the notebook's environment's container**, through
   `podman exec` as rust-analyzer does, and is refused when there is no
   container (David: "I expect that to happen in the sandboxed

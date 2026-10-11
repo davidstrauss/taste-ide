@@ -38,12 +38,32 @@ use serde_json::{Map, Value};
 /// How often a dragged slider tells the kernel where it is: often enough
 /// for a plot under `interact` to follow, never per pixel.
 const THROTTLE: std::time::Duration = std::time::Duration::from_millis(60);
+/// The most often an Output widget's view is redrawn while its outputs
+/// change.
+const REDRAW_EVERY: std::time::Duration = std::time::Duration::from_millis(50);
 /// How long a widget that does not update continuously waits for the
 /// change to settle before it is sent.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// The prefix a model reference carries in another model's state.
 const MODEL_REF: &str = "IPY_MODEL_";
+/// How deep views may nest, and how many one top-level view may hold.
+const MAX_DEPTH: usize = 32;
+const MAX_VIEWS: usize = 2000;
+/// How long a chain of links one change may follow.
+const MAX_LINK_DEPTH: usize = 16;
+
+/// The views being built, for [`Manager::view`]'s budget.
+#[derive(Default)]
+struct Views {
+    stack: Vec<String>,
+    built: usize,
+}
+
+thread_local! {
+    static VIEWS: RefCell<Views> = RefCell::new(Views::default());
+    static LINK_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 
 type Listener = Box<dyn Fn(&Rc<Model>, &[String]) -> bool>;
 
@@ -246,7 +266,9 @@ impl Manager {
                 }
             }
             "comm_close" => {
-                if let Some(model) = self.model(&id) {
+                // Out of the map: its views keep it for what they show, and
+                // nothing else holds it.
+                if let Some(model) = self.models.borrow_mut().remove(&id) {
                     model.live.set(false);
                     notify(&model, &["_live".to_string()]);
                 }
@@ -301,6 +323,18 @@ impl Manager {
     /// followed.
     fn changed(self: &Rc<Self>, model: &Rc<Model>, keys: &[String]) {
         notify(model, keys);
+        // A chain of links follows one change through each; a chain longer
+        // than this — or a ring the values never settle in — stops.
+        let depth = LINK_DEPTH.with(Cell::get);
+        if depth >= MAX_LINK_DEPTH {
+            return;
+        }
+        LINK_DEPTH.with(|d| d.set(depth + 1));
+        self.follow_links(model, keys);
+        LINK_DEPTH.with(|d| d.set(depth));
+    }
+
+    fn follow_links(self: &Rc<Self>, model: &Rc<Model>, keys: &[String]) {
         let links: Vec<Rc<Model>> = self
             .models
             .borrow()
@@ -362,16 +396,20 @@ impl Manager {
             // `execute_input` and the like: the request's, not shown.
             return true;
         };
-        let mut outputs: Vec<Value> = if model.clear_on_next.replace(false) {
-            Vec::new()
-        } else {
-            model.get("outputs").as_array().cloned().unwrap_or_default()
-        };
-        crate::notebook::push_output(&mut outputs, output);
-        model
-            .state
-            .borrow_mut()
-            .insert("outputs".into(), Value::Array(outputs));
+        {
+            // In place: a callback printing in a loop made this a copy of
+            // every output so far, per output.
+            let mut state = model.state.borrow_mut();
+            let outputs = state
+                .entry("outputs")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if !outputs.is_array() || model.clear_on_next.replace(false) {
+                *outputs = Value::Array(Vec::new());
+            }
+            if let Value::Array(outputs) = outputs {
+                crate::notebook::push_output(outputs, output);
+            }
+        }
         notify(&model, &["outputs".to_string()]);
         true
     }
@@ -379,8 +417,36 @@ impl Manager {
     /// A view of model `id`; `None` when there is no such model or it is
     /// not one drawn here.
     pub fn view(self: &Rc<Self>, id: &str) -> Option<gtk::Widget> {
+        // Views nest — a box's children, a tab's pages, an Output's widgets
+        // — and the state saying so is the notebook's, so a box listing
+        // itself, or a few listing each other twice over forty deep, would
+        // be a stack overflow or a hang on opening the file. Each top-level
+        // view has a budget: no model inside itself, no deeper than
+        // MAX_DEPTH, no more than MAX_VIEWS views.
         let model = self.model(id)?;
-        let view = build_view(self, &model)?;
+        let refused = VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            if views.stack.is_empty() {
+                views.built = 0;
+            }
+            views.built += 1;
+            views.stack.contains(&model.id)
+                || views.stack.len() >= MAX_DEPTH
+                || views.built > MAX_VIEWS
+        });
+        if refused {
+            return Some(
+                gtk::Label::builder()
+                    .label("A widget nested past what is drawn here")
+                    .css_classes(["dim-label"])
+                    .build()
+                    .upcast(),
+            );
+        }
+        VIEWS.with(|views| views.borrow_mut().stack.push(model.id.clone()));
+        let view = build_view(self, &model);
+        VIEWS.with(|views| views.borrow_mut().stack.pop());
+        let view = view?;
         // Usable while the kernel holds the model; drawn, and said to be
         // waiting for one, when it does not.
         let set_live = |view: &gtk::Widget, model: &Model| {
@@ -1428,56 +1494,84 @@ fn output(manager: &Rc<Manager>, model: &Rc<Model>) -> gtk::Widget {
     let holder = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let guard = Rc::new(Cell::new(false));
     let manager = Rc::downgrade(manager);
-    bind(
-        model,
-        &holder,
-        &guard,
-        &["outputs"],
-        move |holder, model| {
-            while let Some(child) = holder.first_child() {
-                holder.remove(&child);
+    let weak_model = Rc::downgrade(model);
+    // Redrawn at most every REDRAW_EVERY: a callback printing in a loop
+    // changes the outputs on every message.
+    let redraw = Rc::new(move |holder: &gtk::Box| {
+        while let Some(child) = holder.first_child() {
+            holder.remove(&child);
+        }
+        let (Some(manager), Some(model)) = (manager.upgrade(), weak_model.upgrade()) else {
+            return;
+        };
+        let Some(draw) = manager.draw_output.borrow().clone() else {
+            return;
+        };
+        for output in model.get("outputs").as_array().into_iter().flatten() {
+            if let Some(widget) = draw(output) {
+                holder.append(&widget);
             }
-            let Some(manager) = manager.upgrade() else {
-                return;
-            };
-            let Some(draw) = manager.draw_output.borrow().clone() else {
-                return;
-            };
-            for output in model.get("outputs").as_array().into_iter().flatten() {
-                if let Some(widget) = draw(output) {
-                    holder.append(&widget);
-                }
+        }
+    });
+    redraw(&holder);
+    let pending = Rc::new(Cell::new(false));
+    bind(model, &holder, &guard, &["outputs"], move |holder, _| {
+        if pending.replace(true) {
+            return;
+        }
+        let (holder, redraw, pending) = (holder.downgrade(), redraw.clone(), pending.clone());
+        glib::timeout_add_local_once(REDRAW_EVERY, move || {
+            pending.set(false);
+            if let Some(holder) = holder.upgrade() {
+                redraw(&holder);
             }
-        },
-    );
+        });
+    });
     holder.upcast()
 }
 
 fn image(model: &Rc<Model>) -> gtk::Widget {
-    let picture = gtk::Picture::builder()
-        .content_fit(gtk::ContentFit::ScaleDown)
-        .can_shrink(true)
-        .halign(gtk::Align::Start)
-        .build();
+    let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    holder.set_halign(gtk::Align::Start);
     let guard = Rc::new(Cell::new(false));
     bind(
         model,
-        &picture,
+        &holder,
         &guard,
-        &["value", "width"],
-        |picture, model| {
-            if let Some(bytes) = model.buffers.borrow().get("value") {
-                match gtk::gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice())) {
-                    Ok(texture) => picture.set_paintable(Some(&texture)),
-                    Err(e) => tracing::info!("an Image widget's picture was not decoded: {e}"),
+        &["value", "format", "width"],
+        |holder, model| {
+            while let Some(child) = holder.first_child() {
+                holder.remove(&child);
+            }
+            let Some(bytes) = model.buffers.borrow().get("value").cloned() else {
+                return;
+            };
+            // Drawn by the confined helper, never decoded in this process; a
+            // format it does not take is said rather than sniffed.
+            let figure = match model.str("format").as_str() {
+                "png" => crate::mermaid::Figure::Png(bytes),
+                "jpg" | "jpeg" => crate::mermaid::Figure::Jpeg(bytes),
+                other => {
+                    holder.append(
+                        &gtk::Label::builder()
+                            .label(format!(
+                                "An image in {other} format, which is not drawn here"
+                            ))
+                            .css_classes(["dim-label"])
+                            .build(),
+                    );
+                    return;
                 }
-            }
-            if let Ok(width) = model.str("width").trim_end_matches("px").parse::<i32>() {
-                picture.set_width_request(width.min(1200));
-            }
+            };
+            let width = model
+                .str("width")
+                .trim_end_matches("px")
+                .parse::<f64>()
+                .ok();
+            holder.append(&crate::mermaid::figure(figure, width, None));
         },
     );
-    picture.upcast()
+    holder.upcast()
 }
 
 fn play(manager: &Rc<Manager>, model: &Rc<Model>) -> gtk::Widget {
@@ -1654,11 +1748,14 @@ pub fn plain_text(html: &str) -> String {
 /// widget, `.2f` for a float one).
 pub fn number_text(value: f64, spec: &str, int: bool) -> String {
     let spec = spec.trim();
+    // At most twenty digits, whatever the spec asks: a precision past what
+    // a formatter takes is a panic, and the spec is the notebook's.
     let digits = |s: &str| {
         s.trim_start_matches('.')
             .trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%')
             .parse::<usize>()
             .ok()
+            .map(|d| d.min(20))
     };
     if spec.ends_with('%') {
         return format!("{:.*}%", digits(spec).unwrap_or(0), value * 100.0);
@@ -1831,6 +1928,26 @@ mod tests {
         assert_eq!(number_text(7.0, "", true), "7");
         assert_eq!(plain_text("<b>Size</b>&nbsp;&amp; shape"), "Size & shape");
         assert_eq!(plain_text("one<br>two"), "one\ntwo");
+    }
+
+    /// A widget saved as inside itself, or nested past the budget, is a
+    /// placeholder, not a stack overflow on opening the notebook.
+    #[test]
+    fn a_widget_inside_itself_is_drawn_once() {
+        crate::gtk_test::on_gtk_thread("widgets: no display — skipped", || {
+            let manager = Manager::new();
+            manager.load_saved(&serde_json::json!({
+                "a": {"model_name": "VBoxModel", "state": {"children": ["IPY_MODEL_a", "IPY_MODEL_b"]}},
+                "b": {"model_name": "HBoxModel", "state": {"children": ["IPY_MODEL_a"]}},
+            }));
+            assert!(manager.view("a").is_some());
+            VIEWS.with(|views| assert!(views.borrow().stack.is_empty()));
+        });
+    }
+
+    #[test]
+    fn a_precision_past_reason_is_clamped() {
+        assert_eq!(number_text(1.5, ".100000f", false).len(), "1.".len() + 20);
     }
 
     #[test]

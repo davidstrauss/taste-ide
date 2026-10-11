@@ -21,12 +21,15 @@
 #   {"ev": "comm", "type": "comm_open" | "comm_msg" | "comm_close",
 #    "content": {...}, "buffers": [base64, ...], "parent": msg_id}
 #   {"ev": "reply", "cell": id, "content": {...}}
-#   {"ev": "state", "state": "busy" | "idle" | "restarting" | "dead"}
+#   {"ev": "state", "state": "busy" | "idle" | "restarting" | "dead",
+#    "cell": id | null, "parent": msg_id | null}
+#   {"ev": "error", "message": ...} — an operation that failed, said
 #
 # End of input shuts the kernel down: the IDE closing the page, or the
 # IDE itself going, must not leave a kernel running in the container.
 import base64
 import json
+import math
 import os
 import sys
 import threading
@@ -34,8 +37,23 @@ import threading
 out_lock = threading.Lock()
 
 
+def finite(value):
+    """A message with NaN and the infinities as null: the IDE's JSON reader
+    refuses them, and one would drop the whole message."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [finite(v) for v in value]
+    return value
+
+
 def say(**message):
-    line = json.dumps(message, default=str)
+    try:
+        line = json.dumps(message, default=str, allow_nan=False)
+    except ValueError:
+        line = json.dumps(finite(message), default=str, allow_nan=False)
     with out_lock:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
@@ -50,13 +68,16 @@ except Exception as e:  # noqa: BLE001 - any import failure is the same answer
 
 km = None
 kc = None
-cells = {}  # parent msg_id -> the IDE's cell id
-ours = set()  # every msg_id this bridge sent, cells' and widgets' alike
+cells = {}  # parent msg_id -> the IDE's cell id, until its reply
+ours = set()  # every msg_id this bridge sent, until its idle
 cells_lock = threading.Lock()
 # A ZeroMQ socket is not safe across threads: the shell socket is read by
 # pump_shell and written by main, so each holds this while it does.
 shell_lock = threading.Lock()
 stopping = threading.Event()
+# Set while a restart runs: the pumps leave the sockets to it, since
+# wait_for_ready reads both shell and iopub itself.
+paused = threading.Event()
 
 
 def kernel_names():
@@ -71,6 +92,11 @@ def start(name, cwd):
     names = kernel_names()
     if not name:
         name = "python3" if "python3" in names or not names else names[0]
+    # The notebook's directory as the IDE sees it, which the container has
+    # at the same path; where it does not, the container's own directory
+    # rather than a kernel that cannot start.
+    if cwd and not os.path.isdir(cwd):
+        cwd = None
     try:
         km = KernelManager(kernel_name=name)
         spec = km.kernel_spec
@@ -112,19 +138,33 @@ def encoded(buffers):
 
 
 def pump_iopub():
+    dead = False
     while not stopping.is_set():
+        if paused.is_set():
+            stopping.wait(0.05)
+            continue
         try:
             message = kc.get_iopub_msg(timeout=0.5)
         except Exception:  # noqa: BLE001 - queue.Empty, or channels closing
-            if km is not None and not km.is_alive() and not stopping.is_set():
-                say(ev="state", state="dead")
-                return
+            alive = km is not None and km.is_alive()
+            if not alive and not dead and not paused.is_set() and not stopping.is_set():
+                dead = True
+                say(ev="state", state="dead", cell=None, parent=None)
+            elif alive:
+                dead = False
             continue
         kind = message.get("msg_type") or message["header"].get("msg_type")
         content = message.get("content") or {}
+        parent = parent_of(message)
         if kind == "status":
-            if is_ours(message) or content.get("execution_state") == "restarting":
-                say(ev="state", state=content.get("execution_state"))
+            state = content.get("execution_state")
+            if is_ours(message) or state == "restarting":
+                say(ev="state", state=state, cell=cell_of(message), parent=parent)
+            # Idle is the last message a request's iopub sends: its outputs
+            # are all over, and its id need not be kept.
+            if state == "idle":
+                with cells_lock:
+                    ours.discard(parent)
             continue
         # Widgets: their models open, change, and close on comms, whoever
         # set the change off — a cell, a slider's update, or the kernel
@@ -135,24 +175,21 @@ def pump_iopub():
                 type=kind,
                 content=content,
                 buffers=encoded(message.get("buffers")),
-                parent=parent_of(message),
+                parent=parent,
             )
             continue
         # An output goes over when this bridge set it off: a cell's, or a
         # widget callback's, which an Output widget may be capturing.
         if not is_ours(message):
             continue
-        say(
-            ev="output",
-            cell=cell_of(message),
-            parent=parent_of(message),
-            type=kind,
-            content=content,
-        )
+        say(ev="output", cell=cell_of(message), parent=parent, type=kind, content=content)
 
 
 def pump_shell():
     while not stopping.is_set():
+        if paused.is_set():
+            stopping.wait(0.05)
+            continue
         try:
             with shell_lock:
                 message = kc.get_shell_msg(timeout=0.05)
@@ -161,9 +198,59 @@ def pump_shell():
             continue
         if (message.get("msg_type") or message["header"].get("msg_type")) != "execute_reply":
             continue
-        cell = cell_of(message)
+        with cells_lock:
+            cell = cells.get(parent_of(message))
         if cell is not None:
             say(ev="reply", cell=cell, content=message.get("content") or {})
+
+
+def handle(request):
+    op = request.get("op")
+    if op == "execute":
+        with shell_lock:
+            msg_id = kc.execute(request.get("code", ""), store_history=True, allow_stdin=False)
+        with cells_lock:
+            cells[msg_id] = request.get("cell")
+            ours.add(msg_id)
+    elif op == "comm_msg":
+        # A widget's change, from the IDE's view of it, to its model in the
+        # kernel; binary buffers ride along as bytes.
+        message = kc.session.msg(
+            "comm_msg",
+            {"comm_id": request.get("comm_id"), "data": request.get("data") or {}},
+        )
+        buffers = [base64.b64decode(b) for b in request.get("buffers") or []]
+        with cells_lock:
+            ours.add(message["header"]["msg_id"])
+        with shell_lock:
+            kc.session.send(kc.shell_channel.socket, message, buffers=buffers)
+    elif op == "interrupt":
+        km.interrupt_kernel()
+    elif op == "restart":
+        say(ev="state", state="restarting", cell=None, parent=None)
+        paused.set()
+        try:
+            km.restart_kernel(now=False)
+            kc.wait_for_ready(timeout=120)
+        finally:
+            paused.clear()
+        with cells_lock:
+            cells.clear()
+            ours.clear()
+        say(ev="state", state="idle", cell=None, parent=None)
+
+
+def prune():
+    """A cell's id is kept until its reply and its idle are both over. The
+    reply can come after the idle, so an id is dropped only when it was
+    already idle at the last pass, five seconds ago: long after any reply."""
+    idle_before = set()
+    while not stopping.wait(5):
+        with cells_lock:
+            idle_now = {m for m in cells if m not in ours}
+            for msg_id in idle_now & idle_before:
+                cells.pop(msg_id, None)
+            idle_before = idle_now
 
 
 def main():
@@ -174,43 +261,28 @@ def main():
         except ValueError:
             continue
         op = request.get("op")
-        if op == "start" and not started:
+        if op == "shutdown":
+            break
+        if op == "start":
+            if started:
+                continue
             if not start(request.get("kernel"), request.get("cwd")):
                 break
             started = True
             threading.Thread(target=pump_iopub, daemon=True).start()
             threading.Thread(target=pump_shell, daemon=True).start()
-        elif not started:
+            threading.Thread(target=prune, daemon=True).start()
             continue
-        elif op == "execute":
-            with shell_lock:
-                msg_id = kc.execute(
-                    request.get("code", ""), store_history=True, allow_stdin=False
-                )
-            with cells_lock:
-                cells[msg_id] = request.get("cell")
-                ours.add(msg_id)
-        elif op == "comm_msg":
-            # A widget's change, from the IDE's view of it, to its model in
-            # the kernel; binary buffers ride along as bytes.
-            message = kc.session.msg(
-                "comm_msg",
-                {"comm_id": request.get("comm_id"), "data": request.get("data") or {}},
-            )
-            buffers = [base64.b64decode(b) for b in request.get("buffers") or []]
-            with cells_lock:
-                ours.add(message["header"]["msg_id"])
-            with shell_lock:
-                kc.session.send(kc.shell_channel.socket, message, buffers=buffers)
-        elif op == "interrupt":
-            km.interrupt_kernel()
-        elif op == "restart":
-            say(ev="state", state="restarting")
-            km.restart_kernel(now=False)
-            kc.wait_for_ready(timeout=120)
-            say(ev="state", state="idle")
-        elif op == "shutdown":
-            break
+        if not started:
+            continue
+        # One request failing — a restart that times out, an interrupt of
+        # a kernel already gone — is said, and the bridge goes on.
+        try:
+            handle(request)
+        except Exception as e:  # noqa: BLE001
+            say(ev="error", message="%s failed: %s" % (op, e))
+            if op == "restart":
+                say(ev="state", state="dead", cell=None, parent=None)
     stopping.set()
     if km is not None:
         try:
