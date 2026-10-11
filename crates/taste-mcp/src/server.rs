@@ -252,6 +252,11 @@ impl McpServer {
              shell or ide_exec, or in the user's terminal: each is shown in the user's Tasks \
              section with its output. A task that takes arguments after `--` or asks for \
              input runs from a shell; the play button runs a task by name only.\n\n\
+             SERVICES. ",
+        );
+        text.push_str(taste_core::conventions::SERVICES);
+        text.push_str(
+            "\n\n\
              MARKDOWN. Your replies here and the editor's preview of a .md file are \
              rendered Markdown: tables, images, and Mermaid diagrams in ```mermaid \
              fences, which are drawn as diagrams. To show a diagram, write it as \

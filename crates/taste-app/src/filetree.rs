@@ -535,6 +535,11 @@ pub struct FileTree {
     tasks_empty: gtk::Box,
     tasks_ghost_label: gtk::Label,
     tasks: RefCell<(Vec<TaskRow>, Option<String>, bool)>,
+    /// The aimed environment's services (`taste_devcontainer::config::
+    /// ServiceSpec`): which tasks run something long-lived, and the port
+    /// each serves — a service's row says so, and its port's row runs and
+    /// stops it.
+    services: RefCell<std::collections::BTreeMap<String, taste_devcontainer::config::ServiceSpec>>,
     task_in_front: RefCell<Option<String>>,
     /// The file whose tab is in front, when the tab in front is a file's:
     /// the one row the tree may light (`select_for_editor`).
@@ -1474,6 +1479,7 @@ impl FileTree {
             tasks_empty,
             tasks_ghost_label,
             tasks: RefCell::new((Vec::new(), None, false)),
+            services: RefCell::new(std::collections::BTreeMap::new()),
             task_in_front: RefCell::new(None),
             file_in_front: RefCell::new(None),
             task_hits: RefCell::new(HashMap::new()),
@@ -2793,6 +2799,10 @@ impl FileTree {
         }
         *self.tasks.borrow_mut() = next;
         self.render_tasks();
+        // A service's state is its port's button too.
+        if !self.services.borrow().is_empty() {
+            self.render_ports();
+        }
     }
 
     fn render_tasks(self: &Rc<Self>) {
@@ -3040,6 +3050,21 @@ impl FileTree {
             .then(|| crate::kernels::kernels().row_note(&self.aimed_environment()))
             .flatten();
         let desc = kernel_note.as_deref().unwrap_or(row.info.desc.as_str());
+        // A service says it is one, and the port it serves.
+        let service =
+            self.services
+                .borrow()
+                .get(&row.info.name)
+                .map(|service| match service.port {
+                    Some(port) => format!("service on {port}"),
+                    None => "service".to_string(),
+                });
+        let desc = match (service, desc) {
+            (Some(service), "") => service,
+            (Some(service), desc) => format!("{service} · {desc}"),
+            (None, desc) => desc.to_string(),
+        };
+        let desc = desc.as_str();
         let subtitle = match (row.state.words(), desc) {
             ("", desc) => desc.to_string(),
             (words, "") => words.to_string(),
@@ -3363,7 +3388,21 @@ impl FileTree {
     /// ports and what the window's probe knows about each. Rebuilt only
     /// when something changed, which on the once-a-second tick is almost
     /// never.
-    pub fn set_ports(&self, rows: Vec<PortRow>) {
+    /// The aimed environment's services, as its config says them now;
+    /// redrawn when they moved.
+    pub fn set_services(
+        self: &Rc<Self>,
+        services: std::collections::BTreeMap<String, taste_devcontainer::config::ServiceSpec>,
+    ) {
+        if *self.services.borrow() == services {
+            return;
+        }
+        *self.services.borrow_mut() = services;
+        self.render_tasks();
+        self.render_ports();
+    }
+
+    pub fn set_ports(self: &Rc<Self>, rows: Vec<PortRow>) {
         if *self.ports.borrow() == rows {
             return;
         }
@@ -3413,7 +3452,7 @@ impl FileTree {
         )));
     }
 
-    fn render_ports(&self) {
+    fn render_ports(self: &Rc<Self>) {
         self.port_sparklines.borrow_mut().clear();
         while let Some(child) = self.ports_list.first_child() {
             self.ports_list.remove(&child);
@@ -3421,6 +3460,12 @@ impl FileTree {
         let query = self.query.borrow().clone();
         let rows = self.ports.borrow();
         let mut total = 0usize;
+        let any_service = rows.iter().any(|row| {
+            self.services
+                .borrow()
+                .values()
+                .any(|service| service.port == Some(row.spec.port))
+        });
         for row in rows.iter() {
             // The word is the short one: this row has an address after
             // it and a narrow pane around it, and the tab's header says
@@ -3456,6 +3501,28 @@ impl FileTree {
             if let Some(traffic) = self.port_traffic_seed.borrow().get(&row.spec.host) {
                 Self::show_port_traffic(&ingress, &egress, traffic);
             }
+            // The service that serves this port, when the config pairs one
+            // and the Taskfile has it: its play and stop, here as on its
+            // own row (David, 2026-10-11: "offer play/stop next to ports
+            // and trigger the corresponding task").
+            match self.port_service_button(row.spec.port) {
+                Some(button) => trailing.append(&button),
+                // A row without one keeps its place, so every row's
+                // sparklines stand in one column.
+                None if any_service => {
+                    let slot = gtk::Button::builder()
+                        .icon_name("media-playback-start-symbolic")
+                        .css_classes(["flat", "circular"])
+                        .valign(gtk::Align::Center)
+                        .opacity(0.0)
+                        .can_target(false)
+                        .can_focus(false)
+                        .build();
+                    slot.update_state(&[gtk::accessible::State::Hidden(true)]);
+                    trailing.append(&slot);
+                }
+                None => {}
+            }
             self.port_sparklines
                 .borrow_mut()
                 .insert(row.spec.host, (ingress, egress));
@@ -3487,6 +3554,51 @@ impl FileTree {
         } else {
             self.ports_results.show_count(&query, "ports", total, false);
         }
+    }
+
+    /// Run or stop the task that serves `port` — `None` when no service
+    /// is paired with it, or the Taskfile has no such task.
+    fn port_service_button(self: &Rc<Self>, port: u16) -> Option<gtk::Button> {
+        let name = self
+            .services
+            .borrow()
+            .iter()
+            .find(|(_, service)| service.port == Some(port))
+            .map(|(name, _)| name.clone())?;
+        let state = self
+            .tasks
+            .borrow()
+            .0
+            .iter()
+            .find(|row| row.info.name == name)
+            .map(|row| row.state)?;
+        let running = state == crate::tasks::RunState::Running;
+        let runnable = self.tasks.borrow().1.is_none();
+        let button = gtk::Button::builder()
+            .icon_name(if running {
+                "media-playback-stop-symbolic"
+            } else {
+                "media-playback-start-symbolic"
+            })
+            .tooltip_text(if running {
+                format!("Stop {name}, which serves this port")
+            } else {
+                format!("Start {name}, which serves this port")
+            })
+            .css_classes(["flat", "circular"])
+            .valign(gtk::Align::Center)
+            .sensitive(runnable || running)
+            .build();
+        let weak = Rc::downgrade(self);
+        button.connect_clicked(move |_| {
+            let Some(tree) = weak.upgrade() else { return };
+            let env = tree.aimed_environment();
+            let hook = tree.on_run_task.borrow();
+            if let Some(hook) = hook.as_ref() {
+                hook(env, name.clone());
+            }
+        });
+        Some(button)
     }
 
     /// What each Logs row is worth to the current query: the matches
@@ -3661,7 +3773,7 @@ impl FileTree {
     /// same way, so the row and the tab in one frame agree about the port
     /// they are both naming.
     #[doc(hidden)]
-    pub fn seed_ports_for_probe(&self, state: Option<crate::portview::PortState>) {
+    pub fn seed_ports_for_probe(self: &Rc<Self>, state: Option<crate::portview::PortState>) {
         // Traffic through the app's port: requests in, pages out, a burst
         // two minutes ago; nothing through the database's.
         {
@@ -3684,6 +3796,12 @@ impl FileTree {
             }
             self.port_traffic_seed.borrow_mut().insert(3000, traffic);
         }
+        // The seeded `dev:serve` task serves the first port: its play
+        // button there, and "service on 3000" on its own row.
+        self.set_services(std::collections::BTreeMap::from([(
+            "dev:serve".to_string(),
+            taste_devcontainer::config::ServiceSpec { port: Some(3000) },
+        )]));
         self.set_ports(vec![
             PortRow {
                 spec: PortSpec {

@@ -817,9 +817,11 @@ pub(crate) fn author_prompt() -> String {
      IDE lists and runs the project's tasks through it.\n\
      If the checkout has Jupyter notebooks (.ipynb files): install ipykernel, which brings \
      jupyter_client, into the Python the project uses, and the packages the notebooks import, \
-     install Task, and add the notebook kernel's task to the Taskfile. "
+     and add the notebook kernel's task to the Taskfile. "
         .to_string();
     text.push_str(&taste_core::kernel_task::convention());
+    text.push_str("\nIf the project runs servers, workers, or watchers as tasks: ");
+    text.push_str(taste_core::conventions::SERVICES);
     text.push_str(
         "\n\
      If the project runs podman or docker itself (its build, tests, or tasks call it): \

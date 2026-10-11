@@ -37,7 +37,9 @@ pub fn convention() -> String {
          \x20 cmds:\n\
          \x20   - .venv/bin/python -m ipykernel_launcher -f {CONNECTION_FILE}\n\
          ```\n\n\
-         The kernel runs from the Taskfile's directory. The IDE starts the task when a \
+         Name it a service too, in devcontainer.json's customizations.taste-ide.services, as \
+         `\"{TASK}\": {{}}`. The kernel runs from the Taskfile's directory. The IDE starts the \
+         task when a \
          notebook asks for its kernel, connects to the kernel through that file, and shows the \
          kernel's state on the task's row in Tasks; restarting the kernel restarts the task. \
          The IDE's client also needs jupyter_client (ipykernel brings it) in the first of \

@@ -31,6 +31,70 @@ pub struct PortAttributes {
     pub require_local_port: Option<bool>,
 }
 
+/// One of the project's services: a task that runs something long-lived —
+/// a server, a worker, a watcher, the notebooks' kernel — rather than doing
+/// a job and exiting, and the port it serves, when it serves one.
+///
+/// Taskfile has no word for this (David, 2026-10-11: "Is there any way to
+/// identify persistent/daemon tasks vs. batch/exiting ones?"), and a key of
+/// our own there would not come back from `task --list-all --json`; so the
+/// project says it where the spec keeps each tool's settings, in
+/// `devcontainer.json`, which VS Code and Codespaces read past:
+///
+/// ```json
+/// "customizations": { "taste-ide": { "services": {
+///     "dev": { "port": 3000 }, "worker": {} } } }
+/// ```
+///
+/// A port a service serves gets the task's play and stop on its row. The
+/// block is left out of the config's hash ([`crate::hash`]), so editing it
+/// rebuilds nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceSpec {
+    pub port: Option<u16>,
+}
+
+/// The services a config's `customizations` names (`taste-ide.services`):
+/// each task's name and its port, a number or a numeral. An entry that is
+/// not an object, or a port that is not one, counts as a service without a
+/// port rather than refusing the config.
+pub fn services_from(
+    customizations: &serde_json::Value,
+) -> std::collections::BTreeMap<String, ServiceSpec> {
+    let Some(services) = customizations
+        .get("taste-ide")
+        .and_then(|ours| ours.get("services"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Default::default();
+    };
+    services
+        .iter()
+        .filter(|(name, _)| !name.trim().is_empty())
+        .map(|(name, spec)| {
+            let port = spec
+                .get("port")
+                .and_then(|port| {
+                    port.as_u64()
+                        .or_else(|| port.as_str().and_then(|p| p.trim().parse().ok()))
+                })
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port > 0);
+            (name.clone(), ServiceSpec { port })
+        })
+        .collect()
+}
+
+/// A config file's text as JSON: JSONC's comments and trailing commas
+/// dropped.
+pub fn jsonc_value(raw: &str) -> Result<serde_json::Value> {
+    let mut stripped = String::new();
+    json_comments::StripComments::new(raw.as_bytes())
+        .read_to_string(&mut stripped)
+        .context("stripping JSONC comments")?;
+    Ok(serde_json::from_str(&remove_trailing_commas(&stripped))?)
+}
+
 /// A forwarded port with what the config says about it — the row the
 /// file tree's Ports section shows, and the subject of a port tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +279,10 @@ pub struct DevcontainerConfig {
     /// port as a string.
     #[serde(default)]
     pub ports_attributes: std::collections::BTreeMap<String, PortAttributes>,
+    /// The spec's `customizations`, each tool's own; this IDE reads its
+    /// `taste-ide` key ([`DevcontainerConfig::services`]).
+    #[serde(default)]
+    pub customizations: serde_json::Value,
     pub on_create_command: Option<serde_json::Value>,
     pub post_create_command: Option<serde_json::Value>,
     pub post_start_command: Option<serde_json::Value>,
@@ -373,6 +441,13 @@ impl DevcontainerConfig {
                 }
             })
             .collect()
+    }
+
+    /// The project's services: the tasks that run something long-lived,
+    /// and the port each serves, from `customizations.taste-ide.services`
+    /// ([`services_from`]).
+    pub fn services(&self) -> std::collections::BTreeMap<String, ServiceSpec> {
+        services_from(&self.customizations)
     }
 
     pub fn workspace_folder(&self) -> &str {
@@ -605,6 +680,31 @@ mod tests {
         assert_eq!(ports[1].port, 5432);
         assert_eq!(ports[1].label, None);
         assert_eq!(ports[1].title(), "5432");
+    }
+
+    /// The services a config names, with their ports, however written; a
+    /// strange entry is a service without a port, and no block is none.
+    #[test]
+    fn the_services_come_from_the_ides_own_customizations() {
+        let customizations = serde_json::json!({
+            "vscode": { "extensions": [] },
+            "taste-ide": { "services": {
+                "dev": { "port": 3000 },
+                "api": { "port": "8080" },
+                "worker": {},
+                "odd": true,
+                "bad": { "port": 70000 },
+                "": { "port": 1 }
+            } }
+        });
+        let services = services_from(&customizations);
+        assert_eq!(services.len(), 5, "{services:?}");
+        assert_eq!(services["dev"].port, Some(3000));
+        assert_eq!(services["api"].port, Some(8080));
+        assert_eq!(services["worker"].port, None);
+        assert_eq!(services["odd"].port, None);
+        assert_eq!(services["bad"].port, None);
+        assert!(services_from(&serde_json::Value::Null).is_empty());
     }
 
     #[test]

@@ -2107,6 +2107,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     .get(&env)
                     .map(|supervisor| supervisor.ports())
                     .unwrap_or_default();
+                // The project's services, read again each tick: editing
+                // them rebuilds nothing, so nothing else announces it.
+                filetree.set_services(
+                    environments
+                        .get(&env)
+                        .map(|supervisor| supervisor.services())
+                        .unwrap_or_default(),
+                );
                 filetree.set_ports(port_rows(&specs, &env, &port_facts.borrow()));
                 filetree.set_port_traffic(&environments.port_traffic(&env));
                 let tick = ticks.get().wrapping_add(1);

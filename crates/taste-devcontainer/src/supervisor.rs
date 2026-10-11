@@ -513,6 +513,10 @@ pub struct Supervisor {
     /// what the file tree's Ports section lists. Recorded by
     /// `resolve_config`, so it is never a filesystem read at render time.
     declared_ports: Mutex<Vec<crate::config::PortSpec>>,
+    /// The project's services (`crate::config::ServiceSpec`), as its config
+    /// says them now: read again at every recheck, since editing them
+    /// rebuilds nothing.
+    declared_services: Mutex<std::collections::BTreeMap<String, crate::config::ServiceSpec>>,
     /// Which localhost port each forwarded port is actually published on
     /// (container port → host port), filled at start and on adoption
     /// (`LABEL_PORTS`). Empty means each on its own number.
@@ -899,6 +903,7 @@ impl Supervisor {
             channel_services: Mutex::new(None),
             running_hash: Mutex::new(None),
             declared_ports: Mutex::new(Vec::new()),
+            declared_services: Mutex::new(std::collections::BTreeMap::new()),
             published_ports: Mutex::new(std::collections::HashMap::new()),
             passed_over: Mutex::new(None),
             build_failed: Mutex::new(None),
@@ -2007,6 +2012,12 @@ impl Supervisor {
     /// The forwarded ports of the config this environment last resolved,
     /// with their attributes. Empty until the first resolution, and empty
     /// for a baseline (the IDE's own config forwards nothing).
+    /// The project's services, by task: which tasks run something
+    /// long-lived, and the port each serves (`crate::config::ServiceSpec`).
+    pub fn services(&self) -> std::collections::BTreeMap<String, crate::config::ServiceSpec> {
+        self.declared_services.lock().unwrap().clone()
+    }
+
     pub fn ports(&self) -> Vec<crate::config::PortSpec> {
         let published = self.published_ports.lock().unwrap();
         self.declared_ports
@@ -2887,6 +2898,12 @@ impl Supervisor {
         let project = DevcontainerConfig::discover(&self.config_root())
             .ok()
             .flatten();
+        // The services are the project's, whatever runs: an edit to them is
+        // in force at once.
+        *self.declared_services.lock().unwrap() = project
+            .as_ref()
+            .map(DevcontainerConfig::services)
+            .unwrap_or_default();
         let current = self.state();
         match &current {
             SupervisorState::Running { .. } => {

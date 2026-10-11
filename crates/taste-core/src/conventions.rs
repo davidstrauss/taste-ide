@@ -20,6 +20,25 @@ pub const TASKFILE_NAMES: [&str; 8] = [
     "taskfile.dist.yaml",
 ];
 
+/// Which tasks are services, for an agent: the `customizations.taste-ide`
+/// block in devcontainer.json that taste-devcontainer's `ServiceSpec`
+/// reads. A task runs something long-lived or does a job and exits, and
+/// Taskfile cannot say which.
+pub const SERVICES: &str = "A task that runs something long-lived — a server, a worker, a \
+     watcher, the notebooks' kernel — rather than doing a job and exiting is a service. Name \
+     each in .devcontainer/devcontainer.json under customizations.taste-ide.services, with the \
+     forwarded port it serves when it serves one:\n\n\
+     ```json\n\
+     \"customizations\": { \"taste-ide\": { \"services\": {\n\
+     \x20 \"dev\": { \"port\": 3000 },\n\
+     \x20 \"jupyter:kernel\": {}\n\
+     } } }\n\
+     ```\n\n\
+     The user's Tasks section marks a service as one, and a forwarded port's row gets its \
+     service's play and stop. The key is each task's name as task_list gives it. Editing this \
+     block rebuilds nothing and is in force at once; any other edit to devcontainer.json still \
+     needs devcontainer_reload.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Convention {
     /// Absolute path where the file belongs in this workspace.
@@ -187,6 +206,15 @@ fn build_dockerfile(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_services_text_shows_the_block() {
+        assert!(SERVICES.contains("customizations.taste-ide.services"));
+        assert!(
+            SERVICES.contains("\n  \"dev\": { \"port\": 3000 },\n"),
+            "{SERVICES}"
+        );
+    }
 
     #[test]
     fn existing_files_are_marked_and_ghosts_selectable() {

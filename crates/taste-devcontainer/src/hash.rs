@@ -32,7 +32,11 @@ pub fn config_hash(config: &DevcontainerConfig, ide_mounts: &[String]) -> Result
     // to its own root — and a checkout in a VM, whose config the IDE reads
     // from a host-side mirror, would otherwise never share with anything.
     for (relative, path) in config.hash_inputs_relative() {
-        hash_file(&mut hasher, &relative, &path);
+        if path == config.config_path {
+            hash_config(&mut hasher, &relative, &path);
+        } else {
+            hash_file(&mut hasher, &relative, &path);
+        }
     }
     // Domain-separated from the file bytes above, so a Containerfile whose
     // contents happen to look like a mount spec cannot collide with one.
@@ -59,6 +63,35 @@ pub fn build_hash(config: &DevcontainerConfig) -> Result<String> {
     config_hash(config, &[])
 }
 
+/// The config file, less what is this IDE's alone: its
+/// `customizations.taste-ide` block says which tasks are services
+/// (`crate::config::ServiceSpec`) and changes nothing the container is
+/// built or run from, so editing it must not make the container stale. A
+/// config without the block hashes as its bytes, as it always has, so no
+/// existing image's tag moves; one with it hashes as its JSON without it.
+fn hash_config(hasher: &mut Sha256, name: &Path, path: &Path) {
+    let stripped = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| crate::config::jsonc_value(&raw).ok())
+        .and_then(|mut value| {
+            let customizations = value.get_mut("customizations")?.as_object_mut()?;
+            customizations.remove("taste-ide")?;
+            if customizations.is_empty() {
+                value.as_object_mut()?.remove("customizations");
+            }
+            serde_json::to_vec(&value).ok()
+        });
+    match stripped {
+        Some(bytes) => {
+            hasher.update(name.to_string_lossy().as_bytes());
+            hasher.update([3u8]);
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+        }
+        None => hash_file(hasher, name, path),
+    }
+}
+
 fn hash_file(hasher: &mut Sha256, name: &Path, path: &Path) {
     hasher.update(name.to_string_lossy().as_bytes());
     match std::fs::read(path) {
@@ -78,6 +111,42 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IDE's own block — which tasks are services — rebuilds nothing:
+    /// adding it, or changing it, leaves the hash where the rest of the
+    /// config puts it; changing anything else still moves it.
+    #[test]
+    fn the_ides_own_block_is_not_part_of_the_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_config(dir.path(), "FROM fedora\n");
+        let path = config.config_path.clone();
+        let base = std::fs::read_to_string(&path).unwrap();
+        let with = |services: &str| {
+            let text = base.trim_end().strip_suffix('}').unwrap().to_string()
+                + &format!(",\n  \"customizations\": {{ \"taste-ide\": {{ \"services\": {services} }} }}\n}}\n");
+            std::fs::write(&path, text).unwrap();
+            config_hash(&config, &[]).unwrap()
+        };
+        std::fs::write(&path, &base).unwrap();
+        let plain = config_hash(&config, &[]).unwrap();
+        let one = with(r#"{ "dev": { "port": 3000 } }"#);
+        let two = with(r#"{ "dev": { "port": 3001 }, "worker": {} }"#);
+        assert_eq!(
+            one, two,
+            "the block changes nothing the container is made from"
+        );
+        // And the config's own text, the block aside, is hashed as JSON.
+        let mut value: serde_json::Value = crate::config::jsonc_value(&base).unwrap();
+        value["image"] = serde_json::json!("other");
+        let other = serde_json::to_string(&value).unwrap();
+        let other = other.strip_suffix('}').unwrap().to_string()
+            + r#","customizations":{"taste-ide":{"services":{"dev":{}}}}}"#;
+        std::fs::write(&path, other).unwrap();
+        assert_ne!(config_hash(&config, &[]).unwrap(), one);
+        // Without the block, the bytes, as before.
+        std::fs::write(&path, &base).unwrap();
+        assert_eq!(config_hash(&config, &[]).unwrap(), plain);
+    }
 
     fn write_config(dir: &Path, containerfile: &str) -> DevcontainerConfig {
         let dc = dir.join(".devcontainer");
