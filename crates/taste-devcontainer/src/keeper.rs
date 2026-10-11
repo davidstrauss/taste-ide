@@ -81,13 +81,46 @@ use taste_core::files::{Entry, ExecOutput, Kind, RemoteFiles, Stat};
 pub const KEEPER: &str = r#"'use strict';
 const fs=require('fs'),fsp=fs.promises,path=require('path'),cp=require('child_process');
 // Every git the IDE runs here runs none of the repository's commands: its
-// attributes are read from the empty tree, so no filter, textconv, or
-// diff driver runs, and its fsmonitor and hooks are off. This process
-// reaches every environment's checkout, and a checkout's .git/config is
-// its agent's to write; and a filter installed in the dev container
-// (nbstripout, at a path only that container has) failed every snapshot
-// here, which stopped the folder's sync (2026-10-11).
+// .gitattributes are read from the empty tree, every filter driver its
+// config defines is a passthrough and every diff driver's textconv the
+// identity (gitSafe, below), and its fsmonitor and hooks are off. This
+// process reaches every environment's checkout, and a checkout's
+// .git/config is its agent's to write; and a filter installed in the dev
+// container (nbstripout, at a path only that container has) failed every
+// snapshot here, which stopped the folder's sync (2026-10-11).
 const GIT_SAFE={GIT_ATTR_SOURCE:'4b825dc642cb6eb9a060e54bf8d69288fbee4904',GIT_CONFIG_COUNT:'2',GIT_CONFIG_KEY_0:'core.fsmonitor',GIT_CONFIG_VALUE_0:'false',GIT_CONFIG_KEY_1:'core.hooksPath',GIT_CONFIG_VALUE_1:'/dev/null'};
+// GIT_SAFE for a git run in cwd, with the drivers its repository's config
+// defines made harmless: GIT_ATTR_SOURCE reaches only .gitattributes, and
+// .git/info/attributes, where `nbstripout --install` writes, still names
+// them, so the empty tree alone left that snapshot failing (2026-10-11).
+function gitSafe(cwd){
+  const env=Object.assign({},GIT_SAFE);let n=Number(GIT_SAFE.GIT_CONFIG_COUNT);
+  const set=(k,v)=>{env['GIT_CONFIG_KEY_'+n]=k;env['GIT_CONFIG_VALUE_'+n]=v;n++};
+  try{
+    let dir=cwd,gitdir=null;
+    for(let i=0;i<64;i++){
+      const dot=path.join(dir,'.git');let st=null;try{st=fs.statSync(dot)}catch{}
+      if(st){if(st.isDirectory())gitdir=dot;else{const m=/^gitdir:\s*(.+)$/m.exec(fs.readFileSync(dot,'utf8'));if(m)gitdir=path.resolve(dir,m[1].trim())}break}
+      const up=path.dirname(dir);if(up===dir)break;dir=up;
+    }
+    if(gitdir){
+      const configs=[path.join(gitdir,'config')];
+      try{configs.push(path.join(path.resolve(gitdir,fs.readFileSync(path.join(gitdir,'commondir'),'utf8').trim()),'config'))}catch{}
+      const seen=new Set();
+      for(const file of configs){
+        let text;try{text=fs.readFileSync(file,'utf8')}catch{continue}
+        const re=/^\s*\[\s*(filter|diff)\s*(?:"((?:[^"\\\n]|\\.)*)"|\.([^\]\s]+))\s*\]/gim;let m;
+        while((m=re.exec(text))){
+          const kind=m[1].toLowerCase(),name=m[2]!==undefined?m[2].replace(/\\(.)/g,'$1'):m[3].toLowerCase(),key=kind+'.'+name;
+          if(seen.has(key))continue;seen.add(key);
+          if(kind==='filter'){set(key+'.clean','cat');set(key+'.smudge','cat');set(key+'.process','');set(key+'.required','false')}
+          else set(key+'.textconv','cat');
+        }
+      }
+    }
+  }catch{}
+  env.GIT_CONFIG_COUNT=String(n);return env;
+}
 const out=process.stdout,CHUNK=65536;
 const frame=(id,kind,payload)=>{const h=Buffer.alloc(9);h.writeUInt32BE(id,0);h.writeUInt8(kind,4);h.writeUInt32BE(payload.length,5);return out.write(Buffer.concat([h,payload]))};
 const json=(id,kind,obj)=>frame(id,kind,Buffer.from(JSON.stringify(obj)));
@@ -134,7 +167,7 @@ async function handle(id,req){
     case 'mkdir':await fsp.mkdir(req.path,{recursive:true});return done(id,{});
     case 'remove':await fsp.rm(req.path,{recursive:!!req.recursive,force:false});return done(id,{});
     case 'rename':await fsp.rename(req.from,req.to);return done(id,{});
-    case 'exec':{const child=cp.spawn(req.argv[0],req.argv.slice(1),{cwd:req.cwd,stdio:['ignore','pipe','pipe'],env:Object.assign({},process.env,GIT_SAFE,req.env||{})});procs.set(id,child);pushFrom(id,1,child.stdout);pushFrom(id,4,child.stderr);child.on('error',e=>{procs.delete(id);fail(id,e)});child.on('close',(code,signal)=>{procs.delete(id);done(id,{status:code===null?-1:code,signal:signal||null})});return}
+    case 'exec':{const child=cp.spawn(req.argv[0],req.argv.slice(1),{cwd:req.cwd,stdio:['ignore','pipe','pipe'],env:Object.assign({},process.env,gitSafe(req.cwd),req.env||{})});procs.set(id,child);pushFrom(id,1,child.stdout);pushFrom(id,4,child.stderr);child.on('error',e=>{procs.delete(id);fail(id,e)});child.on('close',(code,signal)=>{procs.delete(id);done(id,{status:code===null?-1:code,signal:signal||null})});return}
     case 'watch':{const w=treeWatch(req.path,(event,name)=>json(id,3,{event,name}),e=>{watches.delete(id);w.close();fail(id,e)});watches.set(id,w);return}
     default:return fail(id,{code:'EINVAL',message:'unknown op '+req.op});
   }
@@ -1118,6 +1151,87 @@ mod tests {
         assert!(!keeper.alive());
         let err = keeper.ping().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
+    }
+
+    /// A filter the checkout's config defines, named from
+    /// `.git/info/attributes` where the empty-tree attribute source does not
+    /// reach and pointing at a program this container lacks, runs on
+    /// nothing git does here: the snapshot's `add` succeeds with the file's
+    /// own bytes, and `status` answers (2026-10-11: nbstripout's install
+    /// stopped the folder's sync this way twice).
+    #[test]
+    fn a_filter_the_checkout_defines_does_not_run() {
+        if !node_present() {
+            eprintln!("SKIP: no node on this machine");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "config",
+            "filter.nbstripout.clean",
+            "/nowhere/python -m nbstripout",
+        ]);
+        git(&["config", "filter.nbstripout.required", "true"]);
+        git(&[
+            "config",
+            "filter.lfs.process",
+            "/nowhere/git-lfs filter-process",
+        ]);
+        git(&["config", "filter.lfs.required", "true"]);
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::write(
+            root.join(".git/info/attributes"),
+            "*.ipynb filter=nbstripout\n*.bin filter=lfs\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.ipynb"), "{\"cells\": [1]}\n").unwrap();
+        std::fs::write(root.join("b.bin"), "bytes\n").unwrap();
+        let keeper = Keeper::local_node_for_tests().unwrap();
+        let run = |script: &str| {
+            keeper
+                .exec(root, &["sh".into(), "-c".into(), script.into()])
+                .unwrap()
+        };
+        let added = run(
+            "GIT_INDEX_FILE=.git/scratch git add -A && GIT_INDEX_FILE=.git/scratch git ls-files -s",
+        );
+        assert!(added.success(), "{}", added.stderr_utf8());
+        let blob = |text: &str| {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(["hash-object", "--no-filters", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    child.stdin.take().unwrap().write_all(text.as_bytes())?;
+                    child.wait_with_output()
+                })
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert!(
+            added.stdout_utf8().contains(&blob("{\"cells\": [1]}\n")),
+            "the file's own bytes: {}",
+            added.stdout_utf8()
+        );
+        let status = run("git status --porcelain");
+        assert!(status.success(), "{}", status.stderr_utf8());
     }
 
     #[test]

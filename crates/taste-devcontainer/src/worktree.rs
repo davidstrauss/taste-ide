@@ -623,7 +623,9 @@ impl Worktree {
         match self {
             Worktree::Local(_) => self.local()?.staged_diff(max_bytes),
             Worktree::Remote { .. } => {
-                let mut text = self.git_ok(&["diff", "--cached", "--no-color"])?;
+                // No external diff driver: one a repository names is a command
+                // of its own, and it is not run here.
+                let mut text = self.git_ok(&["diff", "--cached", "--no-color", "--no-ext-diff"])?;
                 if text.len() > max_bytes {
                     let mut cut = max_bytes;
                     while !text.is_char_boundary(cut) {
