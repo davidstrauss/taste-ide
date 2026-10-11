@@ -573,6 +573,26 @@ devcontainer that will not start.
    hooks, agents, and terminals in the environment, and the hook that
    failed today succeeds unchanged.
 
+10. **Start a parameterized task from the GUI** — wanted, not built
+    (David, 2026-10-11: "Put something into the roadmap about also
+    starting parameterized tasks from the GUI. Just don't build it yet").
+    The Tasks section's play button runs a task by name with no input and
+    no arguments, so `task gmail:add -- personal you@gmail.com` — arguments
+    after `--`, read as `{{.CLI_ARGS}}`, and a hidden password prompt — can
+    only be started from a terminal or an agent's shell. Those runs are
+    now shown in the section (the IDE's `task` wrapper reports them over
+    the environment channel's `Tasks` service), so what is missing is the
+    starting. The shape to work out:
+    - **Arguments**: a field under the row (or a popover on the button)
+      for what follows `--`, remembered per task; Task's own `requires:
+      vars` and a task's `{{.CLI_ARGS}}` use say when one is wanted.
+    - **Input**: a run that reads stdin or a password needs a terminal, so
+      the GUI starts it in a terminal tab (VTE, the console's) rather than
+      in the output tab, and the wrapper reports it as it does any other —
+      one record of the run whichever face started it.
+    - **Agents**: `task_run` gains the same arguments, so an agent does not
+      fall back to `ide_exec` for a task that takes them.
+
 ## 2026 bets (superlean, hyperfunctional)
 
 - **The working set is the review unit.** Deepen the Dirty/Staged/Stashed

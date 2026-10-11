@@ -4818,6 +4818,9 @@ impl ChatPane {
             // otherwise (`taste_devcontainer::agentnode`).
             node_bin: supervisor.agent_node_bin().map(std::path::PathBuf::from),
             task_dir: supervisor.agent_task_dir().map(std::path::PathBuf::from),
+            // The channel's `task` wrapper, first: the agent's runs of a task
+            // are shown in the Tasks section.
+            task_wrapper: Some(paths.task_wrapper),
         })
     }
 

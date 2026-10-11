@@ -248,7 +248,10 @@ impl McpServer {
              container: the image's own when it has one, otherwise the IDE's, which it \
              puts on your PATH and on ide_exec's. Do not install Task, link go-task to \
              task, or change the devcontainer to provide it. task_list and task_run run \
-             the project's Taskfile where the user sees it.\n\n\
+             the project's Taskfile where the user sees it, and so does any `task` run in your \
+             shell or ide_exec, or in the user's terminal: each is shown in the user's Tasks \
+             section with its output. A task that takes arguments after `--` or asks for \
+             input runs from a shell; the play button runs a task by name only.\n\n\
              MARKDOWN. Your replies here and the editor's preview of a .md file are \
              rendered Markdown: tables, images, and Mermaid diagrams in ```mermaid \
              fences, which are drawn as diagrams. To show a diagram, write it as \
@@ -2116,7 +2119,29 @@ impl McpServer {
                         Some(dir) => format!("PATH=\"$PATH:{dir}\"; export PATH; {command}"),
                         None => command.to_string(),
                     };
+                    // And the channel's `task` wrapper first, so a run of a
+                    // task here is shown in the Tasks section as the user's
+                    // are; it finds the real Task as the line would have.
+                    let wrapper = taste_core::environment::container_task_wrapper_dir(env);
+                    let script = format!(
+                        "[ -x \"{w}/task\" ] && PATH=\"{w}:$PATH\" && export PATH; {script}",
+                        w = wrapper.display()
+                    );
                     ("sh", vec!["-c".to_string(), script])
+                } else if command == "task" {
+                    // `task` as a program with its arguments: through the
+                    // wrapper too, when the channel has written it.
+                    let wrapper = taste_core::environment::container_task_wrapper_dir(env);
+                    let mut through = vec![
+                        "-c".to_string(),
+                        format!(
+                            "[ -x \"{w}/task\" ] && exec \"{w}/task\" \"$@\"; exec task \"$@\"",
+                            w = wrapper.display()
+                        ),
+                        "task".to_string(),
+                    ];
+                    through.extend(argv.iter().map(|a| a.to_string()));
+                    ("sh", through)
                 } else {
                     (command, argv)
                 };

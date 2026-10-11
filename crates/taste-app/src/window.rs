@@ -148,7 +148,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Kept before the server is handed to the channel services: the chat
     // strip tells it which environment's socket serves the orchestration
     // tools, and the server is the only thing that can act on that.
-    environments.set_channel_services(crate::env_channel::IdeChannelServices::new(server));
+    environments.set_channel_services(crate::env_channel::IdeChannelServices::new(
+        server,
+        workspace.tasks.clone(),
+    ));
 
     // Agents reach the MCP server through our own binary's bridge mode.
     // The socket half is per environment, so the command is composed at
@@ -4100,6 +4103,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             .is_some_and(|name| {
                                 taste_core::conventions::TASKFILE_NAMES.contains(&name)
                             })
+                            || is_included_taskfile(&path)
                         {
                             refresh_tasks_for_events();
                         }
@@ -4416,6 +4420,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         if filetree.aimed_environment() == env {
                             let board = workspace.tasks.clone();
                             filetree.update_task_states(|task| board.state(&env, task));
+                            // A run of a task the list does not have — one
+                            // an agent just added to an included Taskfile,
+                            // say — is when its row is wanted: listed again.
+                            if !filetree.task_rows().iter().any(|row| row.info.name == name) {
+                                refresh_tasks_for_events();
+                            }
                         }
                     }
                     Event::MigrationNotice {
@@ -5806,6 +5816,31 @@ fn mark_summary(
         },
         false,
     )
+}
+
+/// Whether a changed file is likely one a Taskfile includes — a YAML file
+/// named for Task, or in a directory of task files — so a task added there
+/// is listed without waiting for a run of it.
+fn is_included_taskfile(path: &std::path::Path) -> bool {
+    let yaml = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("yml") | Some("yaml")
+    );
+    if !yaml {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let dir = path
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|d| d.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.contains("taskfile") || matches!(dir.as_str(), "taskfiles" | "tasks" | ".taskfiles")
 }
 
 fn plain_toast(text: &str) -> adw::Toast {

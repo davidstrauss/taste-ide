@@ -120,9 +120,17 @@ pub fn locate_task() -> String {
 /// 2026-10-11). It runs the task as itself, with the terminal's input, so a
 /// task that asks for a password or takes arguments works as it would
 /// anywhere.
-pub fn terminal_prelude() -> String {
+///
+/// `wrapper` is the environment's `task` wrapper directory
+/// (`taste_core::environment::container_task_wrapper_dir`): when the IDE's
+/// channel has written its wrapper there, it goes first on `PATH`, and it
+/// resolves the real Task this same way while telling the IDE the run is
+/// happening, so it shows in the Tasks section.
+pub fn terminal_prelude(wrapper: &Path) -> String {
+    let wrapper = wrapper.display();
     format!(
-        "if ! command -v task >/dev/null 2>&1; then \
+        "if [ -x \"{wrapper}/task\" ]; then PATH=\"{wrapper}:$PATH\"; export PATH; fi; \
+         if ! command -v task >/dev/null 2>&1; then \
            if command -v go-task >/dev/null 2>&1; then \
              task() {{ go-task \"$@\"; }}; export -f task; \
            else \
@@ -543,6 +551,67 @@ impl TaskBoard {
         Ok(())
     }
 
+    /// A run started somewhere other than this board — the user's terminal,
+    /// an agent's shell — as the IDE's `task` wrapper in that environment
+    /// reports it (`taste_devcontainer::channel`, `Service::Tasks`): shown
+    /// as this board shows its own, its row's light and its output tab, so
+    /// a run is seen whoever started it (David, 2026-10-11: "I'd still like
+    /// to see when it's kicked off by the agent or CLI"). `header` is its
+    /// first line. What comes back is how the board's stop reaches it: the
+    /// reporter is told, and stops the task where it runs.
+    pub fn begin_external(
+        &self,
+        env: &EnvironmentId,
+        name: &str,
+        header: String,
+    ) -> Arc<tokio::sync::Notify> {
+        let key = (env.clone(), name.to_string());
+        let stop = Arc::new(tokio::sync::Notify::new());
+        self.runs.lock().unwrap().insert(
+            key.clone(),
+            Run {
+                lines: Vec::new(),
+                state: RunState::Running,
+                stop: Some(stop.clone()),
+            },
+        );
+        self.publish_lines(&key, vec![header]);
+        self.events.publish(Event::TaskState {
+            env: env.clone(),
+            name: name.to_string(),
+        });
+        stop
+    }
+
+    /// Lines an external run printed.
+    pub fn external_lines(&self, env: &EnvironmentId, name: &str, lines: &[String]) {
+        let key = (env.clone(), name.to_string());
+        self.publish_lines(&key, lines.iter().map(|l| terminal_line(l)).collect());
+    }
+
+    /// An external run over: `code` its exit status, `None` when the
+    /// reporter went without saying.
+    pub fn end_external(&self, env: &EnvironmentId, name: &str, code: Option<i32>) {
+        let key = (env.clone(), name.to_string());
+        let (state, last) = match code {
+            Some(0) => (RunState::Succeeded, "— done —".to_string()),
+            Some(code) => (RunState::Failed, format!("— failed: exit status {code} —")),
+            None => (
+                RunState::Failed,
+                "— ended without saying how (the terminal or shell went away) —".to_string(),
+            ),
+        };
+        if let Some(run) = self.runs.lock().unwrap().get_mut(&key) {
+            run.state = state;
+            run.stop = None;
+        }
+        self.publish_lines(&key, vec![last]);
+        self.events.publish(Event::TaskState {
+            env: env.clone(),
+            name: name.to_string(),
+        });
+    }
+
     fn publish_lines(&self, key: &(EnvironmentId, String), lines: Vec<String>) {
         if let Some(run) = self.runs.lock().unwrap().get_mut(key) {
             run.lines.extend(lines.iter().cloned());
@@ -568,8 +637,10 @@ mod tests {
     /// terminal is still the interactive bash it was.
     #[test]
     fn a_terminal_resolves_task_as_the_gui_does() {
-        let prelude = terminal_prelude();
+        let prelude = terminal_prelude(Path::new("/tmp/taste-ide-primary/bin"));
+        let wrapper = prelude.find("/tmp/taste-ide-primary/bin/task").unwrap();
         let own = prelude.find("command -v task").unwrap();
+        assert!(wrapper < own, "the IDE's wrapper first: {prelude}");
         let go = prelude.find("command -v go-task").unwrap();
         let ide = prelude
             .find(&format!("{IDE_TASK_DIR}/task-v{IDE_TASK_VERSION}-linux-"))

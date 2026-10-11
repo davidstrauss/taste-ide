@@ -579,6 +579,14 @@ pub fn container_channel_dir(env: &EnvironmentId) -> PathBuf {
     PathBuf::from(format!("/tmp/taste-ide-{env}"))
 }
 
+/// Where the environment channel's helper writes the IDE's `task` wrapper,
+/// inside the container: first on the `PATH` of the user's terminals, the
+/// agent's shell, and `ide_exec`, so every run of `task` there is reported
+/// to the IDE's Tasks section (`taste_devcontainer::channel`).
+pub fn container_task_wrapper_dir(env: &EnvironmentId) -> PathBuf {
+    container_channel_dir(env).join("bin")
+}
+
 /// The environment channel's MCP endpoint, inside the container. The
 /// relocated agent's stdio bridge connects here instead of to a mounted
 /// host socket.

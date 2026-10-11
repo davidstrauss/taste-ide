@@ -58,8 +58,8 @@
 //! into, so it knows which environment the far end of that pipe is; the
 //! environment id is attached here, at the demux, exactly where it used to
 //! be attached at `accept`. Nothing a client sends names an environment,
-//! and [`Service`] is a closed set of two codes — a container cannot ask
-//! for an environment, only for one of the two things the IDE serves it.
+//! and [`Service`] is a closed set of codes — a container cannot ask for an
+//! environment, only for one of the things the IDE serves it.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -74,7 +74,7 @@ use tokio::sync::mpsc;
 
 /// What the IDE serves down an environment channel.
 ///
-/// Deliberately a closed set of two, and deliberately a code on the wire
+/// Deliberately a closed set, and deliberately a code on the wire
 /// rather than a name: the container asks for one of the things the IDE
 /// offers, and there is no string for it to get creative with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +87,11 @@ pub enum Service {
     /// environment reaches; the channel does not have to be the identity
     /// here, and is not.
     Auth,
+    /// Runs of `task` the IDE's wrapper reports — from the user's terminal,
+    /// the agent's shell, `ide_exec` — for the Tasks section to show. The
+    /// channel is the identity, as for MCP: a run is the environment's whose
+    /// container it was reported from.
+    Tasks,
 }
 
 impl Service {
@@ -94,6 +99,7 @@ impl Service {
         match self {
             Service::Mcp => 1,
             Service::Auth => 2,
+            Service::Tasks => 3,
         }
     }
 
@@ -101,6 +107,7 @@ impl Service {
         match code {
             1 => Some(Service::Mcp),
             2 => Some(Service::Auth),
+            3 => Some(Service::Tasks),
             _ => None,
         }
     }
@@ -109,6 +116,7 @@ impl Service {
         match self {
             Service::Mcp => "mcp",
             Service::Auth => "auth",
+            Service::Tasks => "tasks",
         }
     }
 }
@@ -231,7 +239,7 @@ impl Frame {
 
 /// Service codes as bytes, so an `Open` frame's one-byte payload can be
 /// borrowed rather than allocated. Indexed by the code itself.
-const SERVICE_CODES: [u8; 3] = [0, 1, 2];
+const SERVICE_CODES: [u8; 4] = [0, 1, 2, 3];
 
 // --- the in-container helper ----------------------------------------------
 
@@ -252,8 +260,14 @@ const SERVICE_CODES: [u8; 3] = [0, 1, 2];
 /// through here and a dropped byte is a corrupted turn.
 pub const HELPER: &str = "\
 const net=require('net'),fs=require('fs'),path=require('path');\
-const dir=process.argv[1],specs=process.argv.slice(2);\
+const dir=process.argv[1],all=process.argv.slice(2);\
+const specs=all.filter(a=>/^[0-9]+:/.test(a));\
 fs.mkdirSync(dir,{recursive:true,mode:0o700});\
+for(const w of all.filter(a=>a.startsWith('w:'))){\
+const [,name,mode,b64]=w.split(':');const p=path.join(dir,name);\
+fs.mkdirSync(path.dirname(p),{recursive:true,mode:0o700});\
+const body=Buffer.from(b64,'base64').toString().split('@NODE@').join(process.execPath).split('@DIR@').join(dir);\
+fs.writeFileSync(p+'.part',body,{mode:parseInt(mode,8)});fs.renameSync(p+'.part',p)}\
 const chans=new Map();let next=1;\
 const out=process.stdout;\
 const frame=(id,kind,payload)=>{\
@@ -342,8 +356,125 @@ pub fn helper_command(env: &EnvironmentId, node: &str) -> Vec<String> {
             .to_string(),
         format!("{}:mcp.sock", Service::Mcp.code()),
         format!("{}:auth.sock", Service::Auth.code()),
+        format!("{}:tasks.sock", Service::Tasks.code()),
+        written("task-report.js", "644", &task_reporter()),
+        written("bin/task", "755", TASK_WRAPPER),
     ]
 }
+
+/// A file for the helper to write into its directory at start: `w:` and
+/// its name, mode, and contents, base64'd so no character of it means
+/// anything on a command line. `@NODE@` and `@DIR@` in the contents become
+/// the helper's own node and directory.
+fn written(name: &str, mode: &str, contents: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "w:{name}:{mode}:{}",
+        base64::engine::general_purpose::STANDARD.encode(contents)
+    )
+}
+
+/// The `task` the user's terminals, the agent's shell, and `ide_exec` find
+/// first on their `PATH` (`taste_core::environment::container_task_wrapper_dir`):
+/// the reporter, on the node the channel's helper runs on.
+const TASK_WRAPPER: &str = "#!/bin/sh\n\
+# Written by taste-ide: runs of `task` in this environment, shown in the\n\
+# IDE's Tasks section. The real Task runs as it would without this.\n\
+exec \"@NODE@\" \"@DIR@/task-report.js\" \"@DIR@/tasks.sock\" \"$@\"\n";
+
+/// The reporter the wrapper runs: it finds the real Task as the GUI's runs
+/// do (`taste_core::tasks::locate_task`) — the image's `task`, then its
+/// `go-task`, then the IDE's pinned one, never this wrapper — runs it with
+/// the caller's input, its output passed through as it comes and copied to
+/// the IDE, and tells the IDE the run began and how it ended. A run is a
+/// task named or the default; `--list`, `--version`, and the like pass
+/// straight through unreported. Nothing it says to the IDE decides how the
+/// task runs: with the IDE gone, the task runs the same. The IDE's stop is
+/// a `stop` line back, and the task is sent SIGTERM.
+fn task_reporter() -> String {
+    TASK_REPORTER
+        .replace("@TASKDIR@", taste_core::tasks::IDE_TASK_DIR)
+        .replace("@TASKVERSION@", taste_core::tasks::IDE_TASK_VERSION)
+}
+
+const TASK_REPORTER: &str = r#"'use strict';
+const net = require('net'), fs = require('fs'), path = require('path');
+const { spawn } = require('child_process');
+const { StringDecoder } = require('string_decoder');
+const [sock, ...args] = process.argv.slice(2);
+const own = path.resolve(path.dirname(sock), 'bin');
+const runs = (p) => { try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch (e) { return false; } };
+const find = (name) => {
+  for (const d of (process.env.PATH || '').split(':')) {
+    if (!d || path.resolve(d) === own) continue;
+    const p = path.join(d, name);
+    if (runs(p)) return p;
+  }
+  return null;
+};
+const ide = () => {
+  try {
+    for (const e of fs.readdirSync('@TASKDIR@')) {
+      if (e.startsWith('task-v@TASKVERSION@-linux-') && runs(path.join('@TASKDIR@', e, 'task'))) {
+        return path.join('@TASKDIR@', e, 'task');
+      }
+    }
+  } catch (e) {}
+  return null;
+};
+const real = find('task') || find('go-task') || ide();
+if (!real) {
+  process.stderr.write('task: Task is not installed in this environment\n');
+  process.exit(127);
+}
+const meta = new Set(['--list', '-l', '--list-all', '-a', '--version', '--help', '-h', '--init', '-i',
+  '--summary', '--completion', '--status', '--dry', '-n', '--json', '--experiments']);
+let name = 'default';
+for (const a of args) {
+  if (a === '--') break;
+  if (meta.has(a)) { name = null; break; }
+  if (!a.startsWith('-')) { name = a; break; }
+}
+if (name === null) {
+  const plain = spawn(real, args, { stdio: 'inherit' });
+  plain.on('error', (e) => { process.stderr.write('task: ' + e.message + '\n'); process.exit(127); });
+  plain.on('close', (code, signal) => process.exit(code == null ? 1 : code));
+  return;
+}
+let conn = null, child = null;
+try {
+  conn = net.connect(sock);
+  conn.on('error', () => { conn = null; });
+  conn.on('data', (d) => { if (child && d.toString().includes('stop')) child.kill('SIGTERM'); });
+} catch (e) { conn = null; }
+const send = (o) => { if (conn) { try { conn.write(JSON.stringify(o) + '\n'); } catch (e) {} } };
+const interactive = !!process.stdin.isTTY;
+send({ ev: 'start', name, args, origin: interactive ? 'terminal' : 'shell' });
+const env = Object.assign({}, process.env);
+if (process.stdout.isTTY) {
+  env.FORCE_COLOR = env.FORCE_COLOR || '1';
+  env.CLICOLOR_FORCE = env.CLICOLOR_FORCE || '1';
+}
+child = spawn(real, args, { stdio: ['inherit', 'pipe', 'pipe'], env });
+for (const [from, to] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
+  const text = new StringDecoder('utf8');
+  from.on('data', (d) => { to.write(d); send({ ev: 'out', text: text.write(d) }); });
+}
+// A terminal's Ctrl+C reaches the task itself; a signal sent to this
+// process alone is passed on.
+process.on('SIGINT', () => { if (!interactive) child.kill('SIGINT'); });
+for (const sig of ['SIGTERM', 'SIGHUP']) process.on(sig, () => child.kill(sig));
+child.on('error', (e) => {
+  process.stderr.write('task: ' + e.message + '\n');
+  send({ ev: 'exit', code: 127 });
+  process.exit(127);
+});
+child.on('close', (code, signal) => {
+  send({ ev: 'exit', code: code == null ? null : code });
+  const done = () => process.exit(code == null ? 128 + (require('os').constants.signals[signal] || 1) : code);
+  if (conn) conn.end(done); else done();
+});
+"#;
 
 // --- the host side --------------------------------------------------------
 
@@ -355,6 +486,9 @@ pub fn helper_command(env: &EnvironmentId, node: &str) -> Vec<String> {
 pub struct ChannelPaths {
     pub mcp: PathBuf,
     pub auth: PathBuf,
+    /// The directory the helper wrote the IDE's `task` wrapper into, for
+    /// the front of a relocated agent's `PATH`.
+    pub task_wrapper: PathBuf,
 }
 
 /// A live environment channel. Dropping it kills the helper, which drops
@@ -487,6 +621,7 @@ impl EnvChannel {
             paths: ChannelPaths {
                 mcp: environment::container_mcp_socket(&env),
                 auth: environment::container_auth_socket(&env),
+                task_wrapper: environment::container_task_wrapper_dir(&env),
             },
             env,
             alive,
@@ -601,6 +736,112 @@ async fn client_bound(
 mod tests {
     use super::*;
 
+    /// The whole in-container path of a reported run, with node where the
+    /// tests run (skipped where it is not): the helper, as the IDE starts it,
+    /// writes the `task` wrapper; the wrapper runs a stand-in Task with the
+    /// caller's arguments and passes its output through; and the run comes
+    /// out of the helper's stdout as frames on the `Tasks` service — start,
+    /// output, exit — for the IDE's demux to hand the task board.
+    #[test]
+    fn a_task_run_is_reported_through_the_helper() {
+        use std::io::{BufRead, Read};
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            println!("no node here — skipped");
+            return;
+        }
+        let env = EnvironmentId::parse(format!("wrap{}", std::process::id())).unwrap();
+        let dir = environment::container_channel_dir(&env);
+        let _ = std::fs::remove_dir_all(&dir);
+        let argv = helper_command(&env, "node");
+        let mut helper = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut said = std::io::BufReader::new(helper.stderr.take().unwrap());
+        let mut line = String::new();
+        while said.read_line(&mut line).unwrap() > 0 && !line.contains("channel ready") {
+            line.clear();
+        }
+        // A stand-in Task, on the PATH after the wrapper.
+        let fake = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fake.path().join("task"),
+            "#!/bin/sh\necho \"ran $*\"\necho oops >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            fake.path().join("task"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let wrapper = environment::container_task_wrapper_dir(&env);
+        let run = std::process::Command::new(wrapper.join("task"))
+            .args(["gmail:add", "--", "personal", "a b"])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    wrapper.display(),
+                    fake.path().display()
+                ),
+            )
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(
+            run.status.code(),
+            Some(3),
+            "the task's own exit status; the wrapper said {:?}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            "ran gmail:add -- personal a b\n"
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stderr), "oops\n");
+
+        // What the helper sent the IDE: an open on Tasks, then the report.
+        drop(helper.stdin.take());
+        let mut frames = Vec::new();
+        helper
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut frames)
+            .unwrap();
+        let _ = helper.wait();
+        let mut at = 0;
+        let mut service = None;
+        let mut report = String::new();
+        while let Some((frame, used)) = Frame::decode(&frames[at..]).unwrap() {
+            at += used;
+            match frame {
+                Frame::Open { service: s, .. } => service = Some(s),
+                Frame::Data { bytes, .. } => report.push_str(&String::from_utf8_lossy(&bytes)),
+                Frame::Close { .. } => {}
+            }
+        }
+        assert_eq!(service, Some(Service::Tasks));
+        let events: Vec<serde_json::Value> = report
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events[0]["ev"], "start");
+        assert_eq!(events[0]["name"], "gmail:add");
+        assert_eq!(events[0]["args"][3], "a b");
+        assert!(events.iter().any(|e| e["ev"] == "out"));
+        assert_eq!(events.last().unwrap()["ev"], "exit");
+        assert_eq!(events.last().unwrap()["code"], 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_frame_survives_its_own_encoding() {
         let frames = [
@@ -684,8 +925,10 @@ mod tests {
         assert_eq!(Service::Auth.code(), 2);
         assert_eq!(Service::from_code(1), Some(Service::Mcp));
         assert_eq!(Service::from_code(2), Some(Service::Auth));
+        assert_eq!(Service::Tasks.code(), 3);
+        assert_eq!(Service::from_code(3), Some(Service::Tasks));
         assert_eq!(Service::from_code(0), None);
-        assert_eq!(Service::from_code(3), None);
+        assert_eq!(Service::from_code(4), None);
     }
 
     /// The helper's argv is the whole of what the container is told: where
@@ -705,6 +948,13 @@ mod tests {
         assert_eq!(argv[3], dir.display().to_string());
         assert_eq!(argv[4], format!("{}:mcp.sock", Service::Mcp.code()));
         assert_eq!(argv[5], format!("{}:auth.sock", Service::Auth.code()));
+        assert_eq!(argv[6], format!("{}:tasks.sock", Service::Tasks.code()));
+        // And the wrapper, written into the directory the PATHs put first.
+        assert!(argv.iter().any(|a| a.starts_with("w:bin/task:755:")));
+        assert_eq!(
+            environment::container_task_wrapper_dir(&env),
+            dir.join("bin")
+        );
         assert_eq!(
             environment::container_mcp_socket(&env),
             dir.join("mcp.sock"),

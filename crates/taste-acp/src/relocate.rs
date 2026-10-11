@@ -110,6 +110,12 @@ pub struct Relocation {
     /// "Agents should probably understand that the IDE can inject its own
     /// Taskfile runner now"). `None` adds nothing.
     pub task_dir: Option<PathBuf>,
+    /// The directory the environment channel wrote the IDE's `task`
+    /// wrapper into (`taste_devcontainer::channel`): put FIRST on the
+    /// agent's `PATH`, so a run of `task` in its shell is shown in the
+    /// IDE's Tasks section as the user's are. The wrapper finds the real
+    /// Task as before, so the image's own still wins. `None` adds nothing.
+    pub task_wrapper: Option<PathBuf>,
 }
 
 /// The in-container auth forwarder, as a node program.
@@ -247,7 +253,7 @@ fn exec_in_environment(
             "-c".into(),
             CLAUDE_PRELUDE.into(),
             "taste-agent".into(),
-            path_arg(&relocation.node_bin),
+            front_arg(relocation),
             path_arg(&relocation.task_dir),
             claude_settings_script(),
         ]);
@@ -258,13 +264,16 @@ fn exec_in_environment(
     // would replace the image's `PATH` wholesale, and it is the image's
     // tools the agent's shell is there to reach. The directories ride as
     // arguments, never in the script.
-    if relocation.node_bin.is_some() || relocation.task_dir.is_some() {
+    if relocation.node_bin.is_some()
+        || relocation.task_dir.is_some()
+        || relocation.task_wrapper.is_some()
+    {
         args.extend([
             "sh".into(),
             "-c".into(),
             PATH_PRELUDE.into(),
             "taste-agent".into(),
-            path_arg(&relocation.node_bin),
+            front_arg(relocation),
             path_arg(&relocation.task_dir),
         ]);
     }
@@ -312,6 +321,17 @@ fn path_arg(dir: &Option<PathBuf>) -> String {
 /// Run before an agent: `$1` a directory for the front of `PATH` (the
 /// IDE's node), `$2` one for the end (the IDE's Task), either empty for
 /// none, and the agent's command after.
+/// What goes first on the agent's `PATH`, as one `PATH` fragment: the
+/// `task` wrapper's directory, then the IDE's node's `bin`, each when there
+/// is one.
+fn front_arg(relocation: &Relocation) -> String {
+    [&relocation.task_wrapper, &relocation.node_bin]
+        .into_iter()
+        .filter_map(|dir| dir.as_ref().map(|d| d.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 const PATH_PRELUDE: &str = r#"[ -n "$1" ] && PATH="$1:$PATH"; [ -n "$2" ] && PATH="$PATH:$2"; export PATH; shift 2; exec "$@""#;
 
 /// [`PATH_PRELUDE`] for Claude Code, with `$3` the settings script. A
@@ -373,6 +393,7 @@ mod tests {
             }),
             node_bin: None,
             task_dir: None,
+            task_wrapper: None,
         }
     }
 
@@ -664,6 +685,7 @@ mod tests {
                 auth: None,
                 node_bin: None,
                 task_dir: None,
+                task_wrapper: None,
             },
         );
         let container = args.iter().position(|a| a == "c").unwrap();

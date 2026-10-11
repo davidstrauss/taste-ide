@@ -3325,7 +3325,9 @@ impl Console {
         let prompt_env = [("PS1".to_string(), r"\u@\h:\w\$ ".to_string())];
         // `task` as the GUI resolves it, then the same interactive bash
         // (`taste_core::tasks::terminal_prelude`).
-        let prelude = taste_core::tasks::terminal_prelude();
+        let prelude = taste_core::tasks::terminal_prelude(
+            &taste_core::environment::container_task_wrapper_dir(&env),
+        );
         let spec = exec.resolve_interactive_with_env("/bin/bash", &["-c", &prelude], &prompt_env);
         // Name the shell by where it REALLY runs — "host" was ambiguous
         // when the IDE itself lives in a container.

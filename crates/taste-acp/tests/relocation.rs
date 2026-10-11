@@ -245,6 +245,7 @@ impl ChannelServices for TestServices {
         match service {
             Service::Mcp => self.mcp.clone().serve_stream(env.clone(), stream),
             Service::Auth => self.proxy.serve_stream(stream),
+            Service::Tasks => {}
         }
     }
 }
@@ -445,6 +446,7 @@ impl Relocated {
                 }),
                 node_bin: None,
                 task_dir: None,
+                task_wrapper: None,
             }),
             Some(terminals),
             false,
