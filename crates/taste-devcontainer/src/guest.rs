@@ -580,6 +580,89 @@ pub fn images_dir() -> PathBuf {
     base.join("taste-ide").join("guests")
 }
 
+/// The base images no VM's disk is built on any more, removed with their
+/// downloads and digest markers; the bytes that freed. The current
+/// release's base is always kept — the next VM is made from it — and when
+/// the current release cannot be told, nothing is removed, since removing
+/// it would cost the next launch a gigabyte's download.
+///
+/// Each release is a base of its own, and a VM keeps the release it was
+/// made from for life, so a base outlives its pin for as long as one disk
+/// overlays it — and nothing removed it after that (2026-10-11: a base and
+/// its download, three gigabytes, under VMs idle since September).
+pub fn prune_unused_bases() -> u64 {
+    let Ok(current) = image() else {
+        return 0;
+    };
+    prune_bases_in(
+        &images_dir(),
+        &crate::provision::disks_dir(),
+        &current.base_path(),
+    )
+}
+
+fn prune_bases_in(images: &Path, disks: &Path, current: &Path) -> u64 {
+    let used: std::collections::HashSet<std::ffi::OsString> = std::fs::read_dir(disks)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| qcow2_backing_file(&entry.path()))
+        .filter_map(|backing| backing.file_name().map(|n| n.to_os_string()))
+        .collect();
+    let mut freed = 0;
+    for entry in std::fs::read_dir(images).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let is_base = path.is_file() && path.extension().is_some_and(|x| x == "qcow2");
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        if !is_base || path == current || used.contains(name) {
+            continue;
+        }
+        for file in [
+            path.clone(),
+            path.with_extension("qcow2.xz"),
+            path.with_extension("qcow2.sha256"),
+        ] {
+            let size = std::fs::metadata(&file).map_or(0, |m| m.len());
+            if std::fs::remove_file(&file).is_ok() {
+                freed += size;
+                tracing::info!("removed {}: no VM is built on it", file.display());
+            }
+        }
+    }
+    freed
+}
+
+/// The file a qcow2 overlays, from its header: the backing file's offset
+/// as a big-endian u64 at 8 and its length as a u32 at 16 (the format's
+/// documented layout). `None` for a disk with no backing file, or
+/// anything that is not a qcow2.
+pub fn qcow2_backing_file(path: &Path) -> Option<PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header).ok()?;
+    if &header[..4] != b"QFI\xfb" {
+        return None;
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().ok()?);
+    let length = u32::from_be_bytes(header[16..20].try_into().ok()?) as usize;
+    if offset == 0 || length == 0 || length > 4096 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut name = vec![0u8; length];
+    file.read_exact(&mut name).ok()?;
+    use std::os::unix::ffi::OsStringExt;
+    let backing = PathBuf::from(std::ffi::OsString::from_vec(name));
+    Some(if backing.is_absolute() {
+        backing
+    } else {
+        path.parent()?.join(backing)
+    })
+}
+
 /// What a stream document says the current release is, and where its
 /// artifacts are.
 ///
@@ -700,6 +783,54 @@ pub fn check_stream(path: &Path, arch: &str) -> Result<StreamRelease> {
 
 #[cfg(test)]
 mod tests {
+    /// A qcow2 header, as much of it as the backing-file reader looks at,
+    /// overlaying `backing` (or nothing).
+    fn fake_qcow2(path: &Path, backing: Option<&str>) {
+        let mut bytes = vec![0u8; 512];
+        bytes[..4].copy_from_slice(b"QFI\xfb");
+        bytes[4..8].copy_from_slice(&3u32.to_be_bytes());
+        if let Some(backing) = backing {
+            bytes[8..16].copy_from_slice(&256u64.to_be_bytes());
+            bytes[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+            bytes[256..256 + backing.len()].copy_from_slice(backing.as_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A base no disk overlays goes with its download and marker; the
+    /// current one and one still under a disk stay.
+    #[test]
+    fn only_a_base_nothing_is_built_on_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path();
+        let disks = images.join("machines");
+        std::fs::create_dir_all(&disks).unwrap();
+        let old = images.join("fedora-coreos-44.1-qemu.x86_64.qcow2");
+        let used = images.join("fedora-coreos-44.2-qemu.x86_64.qcow2");
+        let current = images.join("fedora-coreos-44.3-qemu.x86_64.qcow2");
+        for base in [&old, &used, &current] {
+            fake_qcow2(base, None);
+            std::fs::write(base.with_extension("qcow2.xz"), "xz").unwrap();
+        }
+        std::fs::write(old.with_extension("qcow2.sha256"), "digest\n").unwrap();
+        fake_qcow2(
+            &disks.join("taste-a-b.qcow2"),
+            Some(&used.display().to_string()),
+        );
+        assert_eq!(
+            qcow2_backing_file(&disks.join("taste-a-b.qcow2")),
+            Some(used.clone())
+        );
+
+        let freed = prune_bases_in(images, &disks, &current);
+        assert!(freed > 0);
+        assert!(!old.exists());
+        assert!(!old.with_extension("qcow2.xz").exists());
+        assert!(!old.with_extension("qcow2.sha256").exists());
+        assert!(used.exists() && current.exists());
+        assert!(current.with_extension("qcow2.xz").exists());
+    }
+
     #[test]
     fn a_release_is_behind_by_its_fields_numerically() {
         assert!(release_is_behind("44.20260829.3.1", "44.20260912.3.0"));

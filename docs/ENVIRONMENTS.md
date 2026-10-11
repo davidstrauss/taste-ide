@@ -3252,6 +3252,34 @@ is shouted, but nothing runs either. The rows say what is missing, and
   enforcement needs root this design has nowhere (see "Egress policy" in
   the plan).
 
+- **A disk left behind says whether it may go** (2026-10-11,
+  `taste_devcontainer::disposable`). A VM stays on disk when its window
+  closes, so the next launch is a warm boot — and the capacity check
+  counts what every disk could still grow into, so a few projects opened
+  once were enough for a new one to be refused a VM (43.9 GiB free,
+  274.2 GiB claimed by five VMs, four idle for weeks). Only the IDE that
+  owned a VM knows what is on it without booting it, so it says so, on
+  disk, for every other IDE on the host (David: "leave an indication on
+  disk for other IDE instances to know if the VM that was owned has no
+  unique data on it … but not clutter the host disk in a way that's hard
+  to clean up"). At the close, after the last snapshot and sync, each
+  running VM of the workspace has its containers stopped — so nothing the
+  project runs writes after the look — and is looked at: every checkout
+  on it, and every submodule in those, must have its HEAD, every ref tip,
+  and its working tree's tree (through a throwaway index, so nothing is
+  touched) in the folder's repository on this host. One that passes gets
+  `<domain>.disposable` beside its disk, naming the disk's inode.
+  Ignored files, volumes, and images are not counted: they are derived,
+  and an environment is its refs plus its config. The marker is withdrawn
+  before the VM is used again, in `LibvirtSession::bring_up`, the one
+  path every local VM takes back into use. An IDE whose new VM does not
+  fit clears marked VMs that are shut off and whose owner is not open,
+  largest first, until it does, then the base images no disk overlays any
+  more; an unmarked disk is never touched, and the refusal names those
+  kept by project, with what would mark them (opening and closing it).
+  `Pool::stale` still only reports a VM whose folder is gone: with no
+  folder there is nothing to have held its work against.
+
 ### What did not change, and why that is the result
 
 Per-environment volumes were already the design, and the spike showed

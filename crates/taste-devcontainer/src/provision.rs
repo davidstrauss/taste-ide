@@ -1005,7 +1005,7 @@ impl LibvirtSession {
     }
 
     /// One step, told: the IDE log always, the VM log when there is one.
-    fn say(&self, domain: &str, line: impl Into<String>) {
+    pub(crate) fn say(&self, domain: &str, line: impl Into<String>) {
         let line = line.into();
         tracing::info!("{domain}: {line}");
         if let Some(sink) = &self.sink {
@@ -1161,7 +1161,7 @@ impl LibvirtSession {
         // The disk's ceiling is what this host can give it, so the VMs
         // together cannot take the desktop's disk under the floor.
         let sizing = &Sizing {
-            disk_gib: crate::sizing::disk_for_new_vm(&disks_dir())?,
+            disk_gib: crate::disposable::clear_for_room(self).await?,
             ..*sizing
         };
         let image = crate::guest::image()?;
@@ -1381,6 +1381,9 @@ impl LibvirtSession {
     /// seconds, and a launch that met it used to give up on the whole
     /// workspace.
     async fn bring_up(&self, vm: &Vm) -> Result<()> {
+        // In use from here on, so what it holds is no longer known: the
+        // marker its last window left goes before anything can write.
+        crate::disposable::withdraw(&vm.domain);
         if self.cancel_deferred_shutdown(&vm.workspace_root) {
             self.say(
                 &vm.domain,
@@ -1584,7 +1587,12 @@ impl LibvirtSession {
         self.virsh(&["undefine", &vm.domain])
             .await
             .with_context(|| format!("undefining {}", vm.domain))?;
-        for path in [vm.disk_path(), vm.ignition_path(), vm.serial_log_path()] {
+        for path in [
+            vm.disk_path(),
+            crate::disposable::marker_path(&vm.domain),
+            vm.ignition_path(),
+            vm.serial_log_path(),
+        ] {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

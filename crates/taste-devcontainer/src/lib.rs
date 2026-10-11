@@ -17,6 +17,7 @@ pub mod cloud;
 pub mod config;
 pub mod configwatch;
 pub mod console;
+pub mod disposable;
 pub mod guest;
 pub mod hash;
 pub mod image;

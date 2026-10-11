@@ -727,6 +727,19 @@ impl GitWorkspace {
             .unwrap_or_default()
     }
 
+    /// Whether this repository holds the object `oid` names, however it
+    /// got here — made, fetched, or packed. A commit or tree that is here
+    /// brings everything it reaches with it, since a fetch transfers the
+    /// whole closure; that is what lets a VM's checkout be judged as
+    /// holding nothing this machine lacks (`taste_devcontainer::disposable`)
+    /// from its ref tips and its working tree's tree alone.
+    pub fn has_object(&self, oid: &str) -> bool {
+        let Ok(oid) = git2::Oid::from_str(oid) else {
+            return false;
+        };
+        self.repo.odb().is_ok_and(|odb| odb.exists(oid))
+    }
+
     pub fn branch_name(&self) -> Option<String> {
         let head = self.repo.head().ok()?;
         head.shorthand().map(str::to_owned)

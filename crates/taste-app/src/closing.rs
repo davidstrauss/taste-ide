@@ -37,10 +37,19 @@ pub enum Step {
     Snapshot,
     /// The folder brought up to date with Personal.
     Sync,
+    /// The VMs looked at, and those holding nothing this machine lacks
+    /// marked as disks any IDE may clear (`taste_devcontainer::disposable`).
+    Mark,
 }
 
 impl Step {
-    pub const ALL: [Step; 4] = [Step::Save, Step::StopVms, Step::Snapshot, Step::Sync];
+    pub const ALL: [Step; 5] = [
+        Step::Save,
+        Step::StopVms,
+        Step::Snapshot,
+        Step::Sync,
+        Step::Mark,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -48,6 +57,7 @@ impl Step {
             Step::StopVms => "Schedule the VMs to stop",
             Step::Snapshot => "Keep Personal's uncommitted work",
             Step::Sync => "Bring your folder up to date",
+            Step::Mark => "Let the VMs' disks be cleared when space runs short",
         }
     }
 }

@@ -4923,7 +4923,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 "They stop in 2 minutes, unless this project opens again before then",
             );
             page.finish(Step::Snapshot, "Kept as a snapshot of Personal");
-            page.begin(Step::Sync, None);
+            // `=done`: the close at its last line, the VMs marked — the
+            // longest thing the page says.
+            if std::env::var("TASTE_PROBE_CLOSING").as_deref() == Ok("done") {
+                page.finish(Step::Sync, "Your folder is up to date");
+                page.finish(
+                    Step::Mark,
+                    "Their 2 disks hold nothing this machine lacks, so they can go if space \
+                     runs short",
+                );
+            } else {
+                page.begin(Step::Sync, None);
+            }
             std::mem::forget(page);
         });
     }
@@ -4971,6 +4982,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let chats_now = chats.snapshot();
             let (tabs, chat_count) = (open.len(), chats_now.len());
             let root = root.clone();
+            let root_for_mark = root.clone();
             let supervisor = primary_for_close.clone();
             let remote = !supervisor.checkout().is_local();
             let window = window.clone();
@@ -5138,6 +5150,37 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                     "Did not finish in time — your folder catches up next launch",
                                 );
                             }
+                        }
+                    }
+                    // Last, with the folder as up to date as it gets: each
+                    // VM is looked at with its containers stopped, and one
+                    // holding nothing this machine lacks is marked, so any
+                    // IDE short of disk may clear it rather than refuse a
+                    // VM (David, 2026-10-11). Its own budget; a VM not
+                    // looked at in it is simply left unmarked.
+                    if !skip.get() {
+                        page.begin(Step::Mark, None);
+                        let root = root_for_mark.clone();
+                        let marking = crate::runtime::runtime().spawn(async move {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                taste_devcontainer::disposable::mark_workspace_vms(&root),
+                            )
+                            .await
+                        });
+                        match marking.await {
+                            Ok(Ok(verdicts)) => {
+                                let (summary, failed) = mark_summary(&verdicts);
+                                if failed {
+                                    page.fail(Step::Mark, &summary);
+                                } else {
+                                    page.finish(Step::Mark, &summary);
+                                }
+                            }
+                            _ => page.fail(
+                                Step::Mark,
+                                "Did not finish in time — the VMs' disks are kept",
+                            ),
                         }
                     }
                 }
@@ -5705,6 +5748,58 @@ fn probe_port(
 /// parse and drew as an empty pill with a close button (David,
 /// 2026-09-16: "Got this on rebuild"). Every toast the window raises comes
 /// through here, escaped.
+/// What the close's look at the VMs came to, as the step's line, and
+/// whether it is a failure: marked VMs said as what they now allow, kept
+/// ones with the first reason, and a VM that could not be looked at as the
+/// failure it is.
+fn mark_summary(
+    verdicts: &[(
+        String,
+        anyhow::Result<taste_devcontainer::disposable::Verdict>,
+    )],
+) -> (String, bool) {
+    use taste_devcontainer::disposable::Verdict;
+    if verdicts.is_empty() {
+        return ("No VM was running to look at".to_string(), false);
+    }
+    let marked = verdicts
+        .iter()
+        .filter(|(_, v)| matches!(v, Ok(Verdict::Marked { .. })))
+        .count();
+    let kept: Vec<&String> = verdicts
+        .iter()
+        .filter_map(|(_, v)| match v {
+            Ok(Verdict::Kept { reasons }) => reasons.first(),
+            _ => None,
+        })
+        .collect();
+    let failed: Vec<String> = verdicts
+        .iter()
+        .filter_map(|(_, v)| v.as_ref().err().map(|e| format!("{e:#}")))
+        .collect();
+    if let Some(why) = failed.first() {
+        return (format!("Kept, unexamined: {why}"), true);
+    }
+    if let Some(why) = kept.first() {
+        return (
+            format!("Kept, since this machine lacks something on them — {why}"),
+            false,
+        );
+    }
+    (
+        if marked == 1 {
+            "Its disk holds nothing this machine lacks, so it can go if space runs short"
+                .to_string()
+        } else {
+            format!(
+                "Their {marked} disks hold nothing this machine lacks, so they can go if space \
+                 runs short"
+            )
+        },
+        false,
+    )
+}
+
 fn plain_toast(text: &str) -> adw::Toast {
     adw::Toast::new(&glib::markup_escape_text(text))
 }
