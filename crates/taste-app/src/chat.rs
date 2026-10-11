@@ -822,6 +822,12 @@ pub struct ChatPane {
     /// Tail latch: true while the transcript is parked at the bottom.
     /// Shared with the adjustment handlers, which is why it is an `Rc`.
     stick_to_bottom: Rc<Cell<bool>>,
+    /// While the reader is up the transcript: the row at the top of their
+    /// view, and how far below the view's top it starts. Whatever changes
+    /// height above it — a reply drawn as Markdown, a card filling in, a
+    /// row moved or let go — the view follows the row (`keep_anchor`), so
+    /// nothing they are reading moves but by their hand.
+    scroll_anchor: RefCell<Option<(gtk::Widget, f64)>>,
     /// "Jump to the newest" banner, revealed when content lands while the
     /// user is reading further up.
     jump_banner: gtk::Revealer,
@@ -3417,6 +3423,7 @@ impl ChatPane {
             quiet_tick: RefCell::new(None),
             weak_self: RefCell::new(std::rc::Weak::new()),
             stick_to_bottom: Rc::new(Cell::new(true)),
+            scroll_anchor: RefCell::new(None),
             jump_banner: jump_banner.clone(),
             pinned_plate: pinned_plate.clone(),
             open_jump_up: open_jump_up.clone(),
@@ -3581,6 +3588,38 @@ impl ChatPane {
                         adjustment.set_value(adjustment.upper() - adjustment.page_size());
                     }
                 });
+            });
+        }
+
+        // The reader's place, held: noted as they scroll, kept as the
+        // transcript's layout changes under it. After the tail's handlers,
+        // so `stick_to_bottom` is already this scroll's answer.
+        {
+            let adjustment = pane.transcript_scroller.vadjustment();
+            let weak = Rc::downgrade(&pane);
+            adjustment.connect_value_changed(move |adjustment| {
+                let Some(pane) = weak.upgrade() else { return };
+                pane.note_anchor();
+                // Back at the bottom: the rows kept while they read can go.
+                if at_bottom(adjustment) && pane.transcript_rows.get() > MAX_TRANSCRIPT_ROWS {
+                    let weak = Rc::downgrade(&pane);
+                    glib::idle_add_local_once(move || {
+                        if let Some(pane) = weak.upgrade() {
+                            pane.trim_transcript();
+                        }
+                    });
+                }
+            });
+            // In the same pass, not after it: the viewport places the list
+            // at the adjustment's value as it stands once its extent is set,
+            // so the row lands where it was, with no frame drawn in between
+            // in which it had moved. (Deferred to an idle, the frame showed
+            // the jump and then its undoing.)
+            let weak = Rc::downgrade(&pane);
+            adjustment.connect_changed(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.keep_anchor();
+                }
             });
         }
 
@@ -4088,8 +4127,10 @@ impl ChatPane {
                 ));
             }
         }
-        self.stick_to_bottom.set(true);
-        self.jump_banner.set_reveal_child(false);
+        // Not a jump to the bottom: this is an orchestrator's message, not
+        // the user's own act, and a reader up the transcript stays where
+        // they are (David, 2026-10-11: "If I'm not anchored to the bottom
+        // of the chat, don't move my viewport").
         self.finalize_stream();
         let written = self.written_now();
         let card = self.user_card(text.trim(), &[]);
@@ -5119,8 +5160,13 @@ impl ChatPane {
         written: Option<taste_core::queued::Queued>,
         first: bool,
     ) {
-        self.stick_to_bottom.set(true);
-        self.jump_banner.set_reveal_child(false);
+        // To the bottom for the user's own send, which is their act; an
+        // orchestrator's, or one put back after the agent died, leaves a
+        // reader where they are.
+        if typed {
+            self.stick_to_bottom.set(true);
+            self.jump_banner.set_reveal_child(false);
+        }
 
         // The card goes in now: the send was accepted, and a message that
         // vanished from the composer without appearing in the transcript
@@ -6936,23 +6982,106 @@ impl ChatPane {
         // When it landed, for the search listing (`row_time_text`).
         stamp_row(&row);
         self.transcript.append(&row);
-        // GtkListBox measures every row on every width change, so pane
-        // resizing costs O(rows × text). Cap the live widgets — the full
-        // conversation stays with the agent (session/load restores it).
-        let mut rows = self.transcript_rows.get() + 1;
-        while rows > MAX_TRANSCRIPT_ROWS {
-            if let Some(oldest) = self.transcript.first_child() {
-                self.transcript.remove(&oldest);
-                rows -= 1;
-            } else {
-                break;
-            }
-        }
-        self.transcript_rows.set(rows);
+        self.transcript_rows.set(self.transcript_rows.get() + 1);
+        self.trim_transcript();
         // No scroll here: appending grows the adjustment, and the tail
         // policy in `new` decides whether that should move the view. This
         // used to yank the view to the bottom even mid-history.
         row
+    }
+
+    /// Let the oldest rows go past the cap. GtkListBox measures every row
+    /// on every width change, so pane resizing costs O(rows × text): the
+    /// live widgets are capped, and the full conversation stays with the
+    /// agent (session/load restores it). Not while the reader is up the
+    /// transcript, though, up to twice the cap: a row let go above them
+    /// moved everything they were reading up by its height, at every new
+    /// step (David, 2026-10-11: "the IDE is moving my viewport even when
+    /// the content above and in my viewport has long settled"). They go
+    /// when the reader is back at the bottom.
+    fn trim_transcript(&self) {
+        let cap = if self.stick_to_bottom.get() {
+            MAX_TRANSCRIPT_ROWS
+        } else {
+            MAX_TRANSCRIPT_ROWS * 2
+        };
+        let mut rows = self.transcript_rows.get();
+        while rows > cap {
+            let Some(oldest) = self.transcript.first_child() else {
+                break;
+            };
+            self.transcript.remove(&oldest);
+            rows -= 1;
+        }
+        self.transcript_rows.set(rows);
+    }
+
+    /// Note the row at the top of the reader's view and where it starts in
+    /// it — nothing while the view follows the bottom. Walked from the last
+    /// anchor, so a scroll costs the rows it passed.
+    fn note_anchor(&self) {
+        if self.stick_to_bottom.get() {
+            self.scroll_anchor.borrow_mut().take();
+            return;
+        }
+        let value = self.transcript_scroller.vadjustment().value();
+        let transcript: &gtk::Widget = self.transcript.upcast_ref();
+        let mut row = self
+            .scroll_anchor
+            .borrow()
+            .as_ref()
+            .map(|(row, _)| row.clone())
+            .filter(|row| row.parent().as_ref() == Some(transcript))
+            .or_else(|| self.transcript.first_child());
+        // Back while the row starts below the view's top...
+        while let Some(current) = row.clone() {
+            match current.compute_bounds(transcript) {
+                Some(bounds) if f64::from(bounds.y()) > value => match current.prev_sibling() {
+                    Some(previous) => row = Some(previous),
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        // ...then on to the first that reaches into it.
+        while let Some(current) = row.clone() {
+            let Some(bounds) = current.compute_bounds(transcript) else {
+                break;
+            };
+            if f64::from(bounds.y() + bounds.height()) <= value {
+                row = current.next_sibling();
+                continue;
+            }
+            *self.scroll_anchor.borrow_mut() = Some((current, f64::from(bounds.y()) - value));
+            return;
+        }
+        self.scroll_anchor.borrow_mut().take();
+    }
+
+    /// The transcript's layout changed: put the reader's row back where it
+    /// was in their view. Nothing while the view follows the bottom, whose
+    /// own policy is in `new`; and when the row has gone, the next scroll
+    /// notes another.
+    fn keep_anchor(&self) {
+        if self.stick_to_bottom.get() {
+            return;
+        }
+        let Some((row, offset)) = self.scroll_anchor.borrow().clone() else {
+            return;
+        };
+        let transcript: &gtk::Widget = self.transcript.upcast_ref();
+        if row.parent().as_ref() != Some(transcript) {
+            return;
+        }
+        let Some(bounds) = row.compute_bounds(transcript) else {
+            return;
+        };
+        let adjustment = self.transcript_scroller.vadjustment();
+        let top = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        let target = (f64::from(bounds.y()) - offset).clamp(adjustment.lower(), top);
+        if (target - adjustment.value()).abs() >= 0.5 {
+            adjustment.set_value(target);
+        }
     }
 
     /// Append one step of the agent's turn: `content` beside the rail — the
@@ -12141,6 +12270,97 @@ impl ChatPane {
             let adjustment = self.transcript_scroller.vadjustment();
             glib::idle_add_local_once(move || adjustment.set_value(0.0));
         }
+        if std::env::var("TASTE_PROBE_ANCHOR").is_ok() {
+            self.probe_anchor();
+        }
+    }
+
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_ANCHOR=1` holds the reader's
+    /// place to account. The view is parked mid-transcript, as a reader up
+    /// the history has it; then what moved it happens — the oldest row let
+    /// go, a tall row put in above, rows added at the bottom, and the cap
+    /// reached with more rows still coming — and the row at the top of the
+    /// view is measured before and after each, in the view's own terms.
+    fn probe_anchor(self: &Rc<Self>) {
+        type Step = (&'static str, Box<dyn Fn(&Rc<ChatPane>)>);
+        /// The row at the top of the view, and where it starts in it.
+        fn place(pane: &ChatPane) -> Option<(String, f64)> {
+            let (row, _) = pane.scroll_anchor.borrow().clone()?;
+            let bounds = row.compute_bounds(&pane.transcript)?;
+            let value = pane.transcript_scroller.vadjustment().value();
+            Some((format!("{:p}", row.as_ptr()), f64::from(bounds.y()) - value))
+        }
+        fn run(pane: Rc<ChatPane>, mut steps: Vec<Step>, before: Option<(String, f64)>) {
+            if steps.is_empty() {
+                return;
+            }
+            let (what, step) = steps.remove(0);
+            step(&pane);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+                let after = place(&pane);
+                let held = matches!((&before, &after),
+                    (Some((a, x)), Some((b, y))) if a == b && (x - y).abs() < 1.0);
+                println!(
+                    "probe anchor: {what}: {} (before {before:?}, after {after:?}, rows {})",
+                    if held { "held" } else { "MOVED" },
+                    pane.transcript_rows.get()
+                );
+                run(pane, steps, after);
+            });
+        }
+        let pane = self.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+            let adjustment = pane.transcript_scroller.vadjustment();
+            adjustment.set_value((adjustment.upper() - adjustment.page_size()) / 2.0);
+            let before = place(&pane);
+            println!(
+                "probe anchor: parked, stuck {}, row {before:?}",
+                pane.stick_to_bottom.get()
+            );
+            let steps: Vec<Step> = vec![
+                (
+                    "the oldest row let go",
+                    Box::new(|pane: &Rc<ChatPane>| {
+                        if let Some(oldest) = pane.transcript.first_child() {
+                            pane.transcript.remove(&oldest);
+                            pane.transcript_rows.set(pane.transcript_rows.get() - 1);
+                        }
+                    }),
+                ),
+                (
+                    "a tall row put in above",
+                    Box::new(|pane: &Rc<ChatPane>| {
+                        let lines: Vec<String> = (0..12)
+                            .map(|n| format!("probe: a line above the reader ({n})"))
+                            .collect();
+                        pane.meta_row(&lines.join("\n"));
+                        if let Some(row) = pane.transcript.last_child() {
+                            pane.transcript.remove(&row);
+                            if let Ok(row) = row.downcast::<gtk::ListBoxRow>() {
+                                pane.transcript.prepend(&row);
+                            }
+                        }
+                    }),
+                ),
+                (
+                    "rows added at the bottom",
+                    Box::new(|pane: &Rc<ChatPane>| {
+                        for n in 0..3 {
+                            pane.meta_row(&format!("probe: a new step at the bottom ({n})"));
+                        }
+                    }),
+                ),
+                (
+                    "the cap reached, more rows coming",
+                    Box::new(|pane: &Rc<ChatPane>| {
+                        while pane.transcript_rows.get() < MAX_TRANSCRIPT_ROWS + 5 {
+                            pane.meta_row("probe: another step at the bottom");
+                        }
+                    }),
+                ),
+            ];
+            run(pane, steps, before);
+        });
     }
 
     /// TASTE_PROBE_CHECK only: the settings shade with this project's

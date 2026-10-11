@@ -574,7 +574,13 @@ to.
   TASTE_PROBE_DELAY_MS=60000` fills the transcript to its row cap and
   scrolls it down and back up, printing each frame's work and the time
   between frames (`=prose`, `=shell`, `=edit` for one kind of row,
-  `TASTE_PROBE_SCROLL_ROWS=N` for fewer rows). Run it on the machine that
+  `TASTE_PROBE_SCROLL_ROWS=N` for fewer rows). `TASTE_PROBE_ANCHOR=1` (with
+`TASTE_PROBE_CHAT=busy`) parks the transcript mid-history, as a reader up
+it has it, and prints whether the row at the top of the view stayed put
+through what used to move it — the oldest row let go, a row put in above,
+rows added below, the row cap reached — `held` or `MOVED` for each (its
+row put in above trips one GTK allocation CRITICAL of its own, with or
+without the anchoring). Run it on the machine that
   lags, in the build it runs: in the devcontainer it measures llvmpipe's
   software rendering, about 30ms a frame whatever the transcript holds.
 - **Convention over configuration over code.** Fixed locations for project
