@@ -820,68 +820,78 @@ impl McpServer {
             "ping" => Response::ok(id, json!({})),
             "tools/list" => Response::ok(id, json!({ "tools": tools })),
             "tools/call" => {
-                let name = params["name"].as_str().unwrap_or_default().to_string();
-                let args = params["arguments"].clone();
-                // What a role was not listed is refused, not merely unseen:
-                // hidden alone, a clone's socket could still call the
-                // primary's screenshot, selection, and editor tools by name
-                // (review, 2026-09-23). The four names `environment`
-                // replaced stay callable, unlisted, as the listing says.
-                const REPLACED: [&str; 4] = [
-                    "devcontainer_status",
-                    "devcontainer_logs",
-                    "devcontainer_resources",
-                    "ide_environment",
-                ];
-                // The tools with a refusal of their own, which says what
-                // the caller can do instead, keep it.
-                let own_gate = crate::orchestration::is_write(&name)
-                    || matches!(name.as_str(), "publish" | "update_from_main");
-                let listed = tools
-                    .iter()
-                    .any(|t| t["name"].as_str() == Some(name.as_str()));
-                if !listed && !own_gate && !REPLACED.contains(&name.as_str()) {
-                    return Response::ok(
-                        id,
-                        tool_result(
+                let result = 'call: {
+                    let name = params["name"].as_str().unwrap_or_default().to_string();
+                    let args = params["arguments"].clone();
+                    // What a role was not listed is refused, not merely unseen:
+                    // hidden alone, a clone's socket could still call the
+                    // primary's screenshot, selection, and editor tools by name
+                    // (review, 2026-09-23). The four names `environment`
+                    // replaced stay callable, unlisted, as the listing says.
+                    const REPLACED: [&str; 4] = [
+                        "devcontainer_status",
+                        "devcontainer_logs",
+                        "devcontainer_resources",
+                        "ide_environment",
+                    ];
+                    // The tools with a refusal of their own, which says what
+                    // the caller can do instead, keep it.
+                    let own_gate = crate::orchestration::is_write(&name)
+                        || matches!(name.as_str(), "publish" | "update_from_main");
+                    let listed = tools
+                        .iter()
+                        .any(|t| t["name"].as_str() == Some(name.as_str()));
+                    if !listed && !own_gate && !REPLACED.contains(&name.as_str()) {
+                        break 'call tool_result(
                             &json!({"error": format!("{name} is not a tool of this environment")}),
                             true,
-                        ),
-                    );
-                }
-                // The non-JSON tools: a screenshot's payload, and an issue's
-                // image attachment, are MCP image content blocks, not
-                // JSON-as-text.
-                if name == "ide_read_file" {
-                    return match self.read_file_tool(env, &args).await {
-                        Ok(result) => Response::ok(id, result),
-                        Err(e) => {
-                            Response::ok(id, tool_result(&json!({"error": format!("{e:#}")}), true))
-                        }
-                    };
-                }
-                if name == "ide_screenshot" || name == "issue_attachment" {
-                    let result = if name == "ide_screenshot" {
-                        self.screenshot_tool(args).await
-                    } else {
-                        self.issue_attachment_tool(args).await
-                    };
-                    return match result {
-                        Ok(result) => Response::ok(id, result),
-                        Err(e) => {
-                            Response::ok(id, tool_result(&json!({"error": format!("{e:#}")}), true))
-                        }
-                    };
-                }
-                match self.call_tool(env, &name, args).await {
-                    Ok(value) => Response::ok(id, tool_result(&value, false)),
-                    Err(e) => {
-                        Response::ok(id, tool_result(&json!({"error": format!("{e:#}")}), true))
+                        );
                     }
-                }
+                    // The non-JSON tools: a screenshot's payload, and an issue's
+                    // image attachment, are MCP image content blocks, not
+                    // JSON-as-text.
+                    if name == "ide_read_file" {
+                        break 'call match self.read_file_tool(env, &args).await {
+                            Ok(result) => result,
+                            Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
+                        };
+                    }
+                    if name == "ide_screenshot" || name == "issue_attachment" {
+                        let result = if name == "ide_screenshot" {
+                            self.screenshot_tool(args).await
+                        } else {
+                            self.issue_attachment_tool(args).await
+                        };
+                        break 'call match result {
+                            Ok(result) => result,
+                            Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
+                        };
+                    }
+                    match self.call_tool(env, &name, args).await {
+                        Ok(value) => tool_result(&value, false),
+                        Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
+                    }
+                };
+                Response::ok(id, self.nudged(env, result))
             }
             _ => Response::err(id, -32601, format!("method not found: {method}")),
         }
+    }
+
+    /// A tool's result, with the ask for a turn after it when the user has
+    /// made one for this environment and its agent has not been told yet
+    /// (`taste_core::nudge`): once, at whichever tool it calls next.
+    fn nudged(&self, env: &EnvironmentId, mut result: Value) -> Value {
+        if !self.workspace.nudges.take(env) {
+            return result;
+        }
+        if let Some(content) = result["content"].as_array_mut() {
+            content.push(json!({ "type": "text", "text": taste_core::nudge::NOTE }));
+        }
+        self.workspace
+            .events
+            .publish(taste_core::Event::NudgeDelivered(env.clone()));
+        result
     }
 
     /// The tools this connection can see, by role.
@@ -7527,6 +7537,52 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// Ask for a Turn reaches the agent once, at its next tool result,
+    /// whichever tool that is, and the chat hears that it has.
+    #[tokio::test]
+    async fn an_ask_for_a_turn_rides_the_next_tool_result_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let (socket, workspace) = start_test_server(dir.path()).await;
+        let events = workspace.events.subscribe();
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        async fn read(stream: &mut UnixStream) -> Value {
+            call_tool_raw(stream, "ide_read_file", json!({"path": "a.txt"})).await
+        }
+        let texts = |result: &Value| -> Vec<String> {
+            result["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c["text"].as_str().map(String::from))
+                .collect()
+        };
+        assert!(!texts(&read(&mut stream).await).contains(&taste_core::nudge::NOTE.to_string()));
+
+        workspace.nudges.ask(&EnvironmentId::primary());
+        let told = read(&mut stream).await;
+        assert_eq!(
+            texts(&told).last().map(String::as_str),
+            Some(taste_core::nudge::NOTE),
+            "{told}"
+        );
+        let delivered = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                taste_core::Event::NudgeDelivered(env) => break env,
+                _ => continue,
+            }
+        };
+        assert_eq!(delivered, EnvironmentId::primary());
+        assert!(
+            !texts(&read(&mut stream).await).contains(&taste_core::nudge::NOTE.to_string()),
+            "once"
+        );
     }
 
     #[tokio::test]

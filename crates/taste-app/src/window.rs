@@ -4028,6 +4028,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // held send — has to be able to end.
                     Event::Controller { pressed: true, .. }
                         if !window_for_pad.upgrade().is_some_and(|w| w.is_active()) => {}
+                    // An agent asked for a turn has been told: its chat's
+                    // queued message says so.
+                    Event::NudgeDelivered(env) => {
+                        if let Some(pane) = chats.pane_for(&env) {
+                            pane.nudge_delivered();
+                        }
+                    }
                     Event::Controller { button, pressed } => {
                         use taste_core::ControllerButton as B;
                         // The search's buttons first: the shoulders step the

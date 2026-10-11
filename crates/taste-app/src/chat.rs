@@ -1038,6 +1038,10 @@ pub struct ChatPane {
     /// (restore-text, transcript card, "queued" badge). A failed or dead
     /// prompt leaves the transcript and returns to the composer.
     pending_prompts: RefCell<std::collections::VecDeque<PendingPrompt>>,
+    /// The queued message whose Ask for a Turn was pressed, until its turn
+    /// comes: its badge says when the agent has been told
+    /// (`taste_core::nudge`).
+    nudged_badge: RefCell<Option<gtk::Label>>,
     /// One-shot capture of the next agent reply (commit-message suggestions
     /// and similar utility prompts). The exchange still renders in the
     /// transcript — the IDE never talks to the agent behind the user's back.
@@ -1204,12 +1208,36 @@ fn queued_badge(label: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(label)
         .xalign(0.0)
+        .hexpand(true)
+        .wrap(true)
         .css_classes(["dim-label", "caption"])
         .margin_top(CARD_INSET)
         .margin_bottom(CARD_INSET)
         .margin_start(CARD_INSET)
         .margin_end(CARD_INSET)
         .build()
+}
+
+/// The line a queued badge sits on, with room at its end for Ask for a Turn
+/// (`ChatPane::offer_nudge`).
+fn badge_row(badge: &gtk::Label) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.append(badge);
+    row
+}
+
+/// Take Ask for a Turn off a badge's line: the turn it was for is over.
+fn retire_nudge(badge: &gtk::Label) {
+    let Some(row) = badge.parent().and_downcast::<gtk::Box>() else {
+        return;
+    };
+    let mut child = row.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.is::<gtk::Button>() {
+            row.remove(&widget);
+        }
+    }
 }
 
 struct QueuedSend {
@@ -3414,6 +3442,7 @@ impl ChatPane {
             reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
             pending_prompts: RefCell::new(std::collections::VecDeque::new()),
+            nudged_badge: RefCell::new(None),
             capture: RefCell::new(None),
             relocated: Cell::new(false),
             hosting_refusal: RefCell::new(None),
@@ -4046,7 +4075,8 @@ impl ChatPane {
                 let queued = written.is_some();
                 let badge = written.map(|written| {
                     let badge = queued_badge("queued — sends when the current turn ends");
-                    card.append(&badge);
+                    card.append(&badge_row(&badge));
+                    self.offer_nudge(&badge);
                     (badge, written)
                 });
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
@@ -5076,7 +5106,7 @@ impl ChatPane {
             &self.environment.to_string(),
             for_the_environment,
         ));
-        card.append(&badge);
+        card.append(&badge_row(&badge));
         let item = QueuedSend {
             text: text.to_string(),
             attachments,
@@ -5158,7 +5188,7 @@ impl ChatPane {
             } else {
                 let card = self.user_card(item.text.trim(), &item.attachments);
                 let badge = queued_badge("queued — sends when the current turn ends");
-                card.append(&badge);
+                card.append(&badge_row(&badge));
                 (card, badge)
             };
             let mut blocks: Vec<ContentBlock> = item
@@ -5171,11 +5201,15 @@ impl ChatPane {
             }
             // Written a while ago, maybe: if it waits behind a turn now, the
             // note says how long, from when it was written.
+            let behind_a_turn = self.stop_button.get_visible();
             let result = self.send_blocks(blocks, Some(item.written.clone()));
             match result {
                 Ok(()) => {
                     self.mark_session_content();
                     badge.set_label("queued — sends when the current turn ends");
+                    if behind_a_turn {
+                        self.offer_nudge(&badge);
+                    }
                     let text = item.text.trim().to_string();
                     self.pending_prompts.borrow_mut().push_back(PendingPrompt {
                         // Back where it came from if it is orphaned again,
@@ -6607,6 +6641,52 @@ impl ChatPane {
         Reference::TurnStart
     }
 
+    /// Ask for a Turn at the end of a queued message's badge: the agent is
+    /// asked, at its next use of the IDE's tools, to finish its step and end
+    /// the turn (`taste_core::nudge`), which sends the message without
+    /// stopping anything.
+    fn offer_nudge(self: &Rc<Self>, badge: &gtk::Label) {
+        let Some(row) = badge.parent().and_downcast::<gtk::Box>() else {
+            return;
+        };
+        let button = gtk::Button::builder()
+            .label("Ask for a Turn")
+            .css_classes(["flat", "caption"])
+            .valign(gtk::Align::Center)
+            .margin_end(CARD_INSET)
+            .tooltip_text(
+                "Ask the agent to finish the step it is on and end its turn, so this \
+                 message goes",
+            )
+            .build();
+        let weak = Rc::downgrade(self);
+        let badge = badge.clone();
+        button.connect_clicked(move |button| {
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            pane.workspace.nudges.ask(&pane.environment);
+            button.set_visible(false);
+            badge.set_label("queued — asking the agent to end its turn after its current step");
+            *pane.nudged_badge.borrow_mut() = Some(badge.clone());
+        });
+        row.append(&button);
+    }
+
+    /// The agent has been told (`taste_core::Event::NudgeDelivered`).
+    pub fn nudge_delivered(&self) {
+        if let Some(badge) = self.nudged_badge.borrow().as_ref() {
+            badge.set_label("queued — the agent has been asked to end its turn");
+        }
+    }
+
+    /// The turn an ask was for is over, or the agent is gone: the ask is
+    /// taken back, told or not, so it cannot reach the next turn.
+    fn end_nudge(&self) {
+        self.workspace.nudges.withdraw(&self.environment);
+        self.nudged_badge.borrow_mut().take();
+    }
+
     /// When and where a message sent now is written, if a turn is running
     /// for it to wait behind; `None` when it goes straight to the agent.
     fn written_now(&self) -> Option<taste_core::queued::Queued> {
@@ -7925,7 +8005,7 @@ impl ChatPane {
             let card = self.user_card(&rest, &pending.attachments);
             let badge = queued_badge(&taste_core::queued::badge(&note));
             badge.set_tooltip_text(Some(&note));
-            card.append(&badge);
+            card.append(&badge_row(&badge));
             return;
         }
         self.user_card(&text, &pending.attachments);
@@ -8953,7 +9033,8 @@ impl ChatPane {
                 // Say so on the card until its turn starts.
                 let badge = written.map(|written| {
                     let badge = queued_badge("queued — sends when the current turn ends");
-                    card.append(&badge);
+                    card.append(&badge_row(&badge));
+                    self.offer_nudge(&badge);
                     (badge, written)
                 });
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
@@ -9220,6 +9301,7 @@ impl ChatPane {
             SessionEvent::Permission { request, reply } => self.on_permission(request, reply),
             SessionEvent::Elicitation { request, reply } => self.on_questions(request, reply),
             SessionEvent::PromptFailed { message } => {
+                self.end_nudge();
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
                 self.set_busy(false);
@@ -9268,6 +9350,9 @@ impl ChatPane {
                 self.touch();
                 self.finalize_stream();
                 self.settle_running_steps();
+                // A turn asked for is a turn given: whatever ask is still
+                // out was for this one.
+                self.end_nudge();
                 // The turn is the commit boundary for both durable
                 // things this chat produces: its transcript, and the work
                 // the agent just did to the checkout.
@@ -9296,6 +9381,7 @@ impl ChatPane {
                     // cost is ever visible, and it is worth keeping in the
                     // transcript after the fact.
                     // With the note the agent got, roughly to the second.
+                    retire_nudge(&badge);
                     badge.set_label(&format!("queued for {}", elapsed(written.at)));
                     badge.set_tooltip_text(Some(&taste_core::queued::note(
                         written.at.elapsed(),
@@ -9444,6 +9530,7 @@ impl ChatPane {
                 self.meta_row(&format!("setting failed: {message}"));
             }
             SessionEvent::Closed(error) => {
+                self.end_nudge();
                 tracing::info!(
                     "chat {}: connection closed ({})",
                     self.environment,
@@ -11749,6 +11836,16 @@ impl ChatPane {
         self.set_busy(true);
         match std::env::var("TASTE_PROBE_CHAT").as_deref() {
             Ok("busy") => self.set_activity("cargo test -p taste-app filetree"),
+            // `queued`: the same turn, with a message sent during it waiting
+            // behind it — its badge, and Ask for a Turn at the badge's end
+            // (`taste_core::nudge`).
+            Ok("queued") => {
+                self.set_activity("cargo test -p taste-app filetree");
+                let card = self.user_card("Look at the failing tests before the docs.", &[]);
+                let badge = queued_badge("queued — sends when the current turn ends");
+                card.append(&badge_row(&badge));
+                self.offer_nudge(&badge);
+            }
             // `quiet`: the same turn, silent for over a minute — the line
             // the user reads while a model's machine is asleep, before
             // the proxy gives up on the stream. The clock is posed, not

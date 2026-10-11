@@ -342,6 +342,9 @@ pub enum Event {
     /// Transient user-facing feedback (rendered as an AdwToast). The HIG
     /// convention for action outcomes: visible, non-blocking, ephemeral.
     Toast(String),
+    /// An agent asked for a turn (`crate::nudge`) has been told, in a tool
+    /// result: its chat's queued message says so.
+    NudgeDelivered(crate::environment::EnvironmentId),
     /// A face button on a game controller went down or up (taste-app's
     /// controller.rs reads the pad; compose.rs answers).
     Controller {
@@ -409,8 +412,11 @@ impl Event {
             // environment that has just stopped existing — nor in one that
             // has just been flagged for review, which is precisely the
             // announcement that it has *stopped* happening.
+            // Nor is the IDE telling an agent the user wants a turn: the
+            // tool call that carried it was the activity.
             Event::EnvironmentRemoved { .. }
             | Event::EnvironmentReviewChanged { .. }
+            | Event::NudgeDelivered(_)
             | Event::CheckoutMoved { .. } => None,
             // Untagged. A workspace-wide fact belongs to no row, and
             // attributing it to the primary would draw the user's own

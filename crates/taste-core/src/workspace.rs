@@ -92,6 +92,10 @@ pub struct Workspace {
     /// Every task run (taskfile.dev, [`crate::tasks`]), the user's and the
     /// agents' alike, so a run either starts shows in one row and one tab.
     pub tasks: crate::tasks::TaskBoard,
+    /// The agents asked for a turn and not yet told ([`crate::nudge`]): the
+    /// chat pane asks, and the MCP server tells at the agent's next tool
+    /// result.
+    pub nudges: crate::nudge::Nudges,
 }
 
 impl Workspace {
@@ -123,6 +127,7 @@ impl Workspace {
             review,
             standing,
             tasks,
+            nudges: crate::nudge::Nudges::default(),
         }
     }
 
