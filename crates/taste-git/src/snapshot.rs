@@ -235,10 +235,23 @@ impl GitWorkspace {
                     builder.upsert(rel, blob, git2::FileMode::Link);
                 }
                 Ok(meta) => {
-                    let blob = self
-                        .repo
-                        .blob_path(&absolute)
-                        .with_context(|| format!("reading {}", absolute.display()))?;
+                    // The file's own bytes, unfiltered — as the checkout's
+                    // snapshot in the VM takes them, where the repository's
+                    // attributes are not read (the files service's
+                    // GIT_ATTR_SOURCE). `blob_path` applied them here: under
+                    // `* text=auto eol=lf` a CRLF file hashed as its LF
+                    // form, so the folder's copy of every such file read as
+                    // a change of the folder's and went to the checkout
+                    // converted — 3,305 archived .eml files in the finance
+                    // checkout, rewritten with LF minutes after each was
+                    // saved (2026-10-11). Streamed, not read whole.
+                    let blob = (|| -> Result<Oid> {
+                        let mut file = std::fs::File::open(&absolute)?;
+                        let mut writer = self.repo.blob_writer(None)?;
+                        std::io::copy(&mut file, &mut writer)?;
+                        Ok(writer.commit()?)
+                    })()
+                    .with_context(|| format!("reading {}", absolute.display()))?;
                     // The executable bit is the only permission git keeps,
                     // and losing it would make a restored checkout fail to
                     // run its own scripts.
@@ -562,11 +575,20 @@ mod tests {
         // are not; and a filter that fails if anything runs it.
         std::fs::write(
             root.join(".gitattributes"),
-            "/target/keep/** taste-sync\n*.bin filter=boom\n",
+            "* text=auto eol=lf\n/target/keep/** taste-sync\n*.bin filter=boom\n",
         )
         .unwrap();
+
         std::fs::create_dir_all(root.join("target/keep/deep")).unwrap();
         std::fs::write(root.join("target/keep/deep/w.bin"), "weights").unwrap();
+        // A file with CRLF line endings under `eol=lf`: both snapshots keep
+        // its bytes, unconverted. The library converted it once, and the
+        // folder's copy then read as a change, sent to the checkout as LF.
+        std::fs::write(
+            root.join("target/keep/message.eml"),
+            "To: a\r\nSubject: b\r\n\r\nbody\r\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join("sub/out")).unwrap();
         std::fs::write(root.join("sub/.gitignore"), "out/\n").unwrap();
         std::fs::write(root.join("sub/.gitattributes"), "/out/*.txt taste-sync\n").unwrap();
@@ -610,6 +632,14 @@ mod tests {
 
         let tree_of = |oid: Oid| repo.find_commit(oid).unwrap().tree_id();
         let scripted_tree = repo.find_tree(tree_of(scripted.commit)).unwrap();
+        let eml = scripted_tree
+            .get_path(Path::new("target/keep/message.eml"))
+            .expect("the CRLF file is in the script's snapshot");
+        assert_eq!(
+            repo.find_blob(eml.id()).unwrap().content(),
+            b"To: a\r\nSubject: b\r\n\r\nbody\r\n",
+            "kept as its bytes"
+        );
         for (path, there) in [
             ("target/keep/deep/w.bin", true),
             ("sub/out/a.txt", true),

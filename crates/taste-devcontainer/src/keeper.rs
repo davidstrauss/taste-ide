@@ -163,7 +163,10 @@ async function handle(id,req){
     case 'stat':{const st=await fsp.lstat(req.path);return done(id,{kind:kindOf(st),size:st.size,mtime_ms:Math.floor(st.mtimeMs),mode:st.mode&0o7777})}
     case 'list':{const ents=await fsp.readdir(req.path,{withFileTypes:true});return done(id,{entries:ents.map(d=>({name:d.name,kind:kindOf(d)}))})}
     case 'read':{const fh=await fsp.open(req.path,'r');try{const buf=Buffer.alloc(CHUNK);for(;;){const {bytesRead}=await fh.read(buf,0,CHUNK,null);if(!bytesRead)break;if(!frame(id,1,Buffer.from(buf.subarray(0,bytesRead))))await new Promise(r=>out.once('drain',r))}}finally{await fh.close()}return done(id,{})}
-    case 'write':{fs.mkdirSync(path.dirname(req.path),{recursive:true});const tmp=req.path+'.taste-part';const stream=fs.createWriteStream(tmp,{mode:req.mode||0o644});stream.on('error',e=>{writes.delete(id);fail(id,e)});writes.set(id,{tmp,dest:req.path,stream});return}
+    // A write over a file keeps that file's mode: a read-only archive's
+    // files were written back writable by every sync that touched them
+    // (2026-10-11).
+    case 'write':{fs.mkdirSync(path.dirname(req.path),{recursive:true});const tmp=req.path+'.taste-part';let mode=req.mode;if(mode==null){try{const st=fs.lstatSync(req.path);mode=st.isFile()?st.mode&0o7777:0o644}catch{mode=0o644}}const stream=fs.createWriteStream(tmp,{mode});stream.on('error',e=>{writes.delete(id);fail(id,e)});writes.set(id,{tmp,dest:req.path,stream});return}
     case 'mkdir':await fsp.mkdir(req.path,{recursive:true});return done(id,{});
     case 'remove':await fsp.rm(req.path,{recursive:!!req.recursive,force:false});return done(id,{});
     case 'rename':await fsp.rename(req.from,req.to);return done(id,{});
@@ -1232,6 +1235,30 @@ mod tests {
         );
         let status = run("git status --porcelain");
         assert!(status.success(), "{}", status.stderr_utf8());
+    }
+
+    /// A write over a file keeps its mode — read-only stays read-only — and
+    /// a new file is the usual 0644.
+    #[test]
+    fn a_write_over_a_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        if !node_present() {
+            eprintln!("SKIP: no node on this machine");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("message.eml");
+        std::fs::write(&kept, "original\r\n").unwrap();
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let keeper = Keeper::local_node_for_tests().unwrap();
+        keeper.write(&kept, b"again\r\n").unwrap();
+        assert_eq!(std::fs::read(&kept).unwrap(), b"again\r\n");
+        let mode = std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444, "{mode:o}");
+        let fresh = dir.path().join("new.txt");
+        keeper.write(&fresh, b"new").unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o600, 0o600, "{mode:o}");
     }
 
     #[test]
