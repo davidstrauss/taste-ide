@@ -130,9 +130,18 @@ struct Drawing {
 /// ends the kernel.
 pub struct Session {
     path: PathBuf,
-    /// Where the kernel runs; `None` when this notebook is another
-    /// environment's, which is looked at and neither edited nor run.
+    /// The environment the notebook is in, whose container its kernel runs
+    /// in.
+    env: taste_core::environment::EnvironmentId,
+    /// Where the kernel runs: that environment's container; `None` when
+    /// the environment is gone, and the notebook is only looked at.
     exec: Option<taste_core::ExecContext>,
+    /// Whether the notebook is the user's own, whose cells are edited and
+    /// whose outputs are written into the file. Another environment's is
+    /// run in its own container and its outputs drawn, and its file is left
+    /// as it is: watching is reading (David, 2026-10-11: "I would want to
+    /// be able to run kernels in other environments, actually").
+    writable: bool,
     buffer: sourceview5::Buffer,
     /// Set while the session writes the buffer, so its own edit is not
     /// read back as the file changing under it.
@@ -174,7 +183,9 @@ impl Session {
     /// that environment's agent.
     pub fn new(
         path: PathBuf,
+        env: taste_core::environment::EnvironmentId,
         exec: Option<taste_core::ExecContext>,
+        writable: bool,
         buffer: sourceview5::Buffer,
         on_prompt_agent: Rc<dyn Fn(String, (String, String))>,
     ) -> Rc<Self> {
@@ -194,7 +205,9 @@ impl Session {
         };
         let session = Rc::new(Self {
             path,
+            env,
             exec,
+            writable,
             buffer,
             writing: Cell::new(false),
             kernel: RefCell::new(None),
@@ -235,8 +248,64 @@ impl Session {
         session
     }
 
-    fn editable(&self) -> bool {
+    /// Whether its cells can be run: there is a container to run them in.
+    fn runnable(&self) -> bool {
         self.exec.is_some()
+    }
+
+    /// Whether its cells are edited and its outputs written into the file.
+    fn editable(&self) -> bool {
+        self.writable && self.runnable()
+    }
+
+    /// The environment it runs in.
+    pub fn env(&self) -> &taste_core::environment::EnvironmentId {
+        &self.env
+    }
+
+    /// The notebook's file name, for the Tasks entry.
+    pub fn file_name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// How its kernel stands, and what it said when it did not start.
+    pub fn kernel_status(&self) -> (crate::kernels::KernelState, Option<String>) {
+        use crate::kernels::KernelState as K;
+        match &*self.state.borrow() {
+            State::Off | State::Stopped { .. } => (K::Off, None),
+            State::Starting | State::Restarting => (K::Starting, None),
+            State::Idle => (K::Idle, None),
+            State::Busy => (K::Busy, None),
+            State::Failed { message, .. } => (K::Failed, Some(message.clone())),
+        }
+    }
+
+    /// Start its kernel, afresh after a failure or a stop; nothing when it
+    /// is running.
+    pub fn start_kernel(self: &Rc<Self>) {
+        if matches!(
+            *self.state.borrow(),
+            State::Failed { .. } | State::Stopped { .. }
+        ) {
+            self.kernel.borrow_mut().take();
+            self.set_state(State::Off);
+        }
+        self.ensure_kernel();
+    }
+
+    /// Stop its kernel: the bridge's input ended, which shuts it down in
+    /// the container, and the runs in flight given up.
+    pub fn stop_kernel(&self) {
+        if self.kernel.borrow_mut().take().is_none()
+            && !matches!(*self.state.borrow(), State::Failed { .. })
+        {
+            return;
+        }
+        self.abandon_runs();
+        self.set_state(State::Off);
     }
 
     /// Draw `text` (the notebook's JSON). Returned at once, empty, with
@@ -322,15 +391,17 @@ impl Session {
             }));
         }
 
-        // The kernel's bar: what it is and where it stands, and the three
-        // things done to it.
+        // The kernel's bar: which kernel, and the three things done to it.
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         bar.add_css_class("notebook-bar");
         // On the cells' own inset, so the bar's words start where theirs do.
         bar.set_margin_start(16);
         bar.set_margin_end(10);
         bar.set_margin_top(4);
+        // The kernel it runs on, by name; how it stands is the Tasks
+        // entry's to say, and the bar above's when it is not running.
         let status = gtk::Label::builder()
+            .label(&display)
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -432,8 +503,8 @@ impl Session {
         if cell_list.is_empty() {
             column.append(&notice("This notebook has no cells."));
         }
-        root.append(&bar);
         root.append(&banner.widget);
+        root.append(&bar);
         root.append(&column);
 
         {
@@ -467,6 +538,14 @@ impl Session {
             banner.prompt.connect_clicked(move |_| {
                 if let Some(session) = weak.upgrade() {
                     session.prompt_agent();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            banner.start.connect_clicked(move |_| {
+                if let Some(session) = weak.upgrade() {
+                    session.start_kernel();
                 }
             });
         }
@@ -525,7 +604,7 @@ impl Session {
             .tooltip_text("Run this cell (Shift+Enter)")
             .css_classes(["flat", "circular"])
             .halign(gtk::Align::Center)
-            .sensitive(self.editable())
+            .sensitive(self.runnable())
             .build();
         let prompt = gtk::Label::builder()
             .css_classes(["caption", "dim-label", "monospace"])
@@ -890,6 +969,7 @@ impl Session {
         match event {
             Event::Ready { display_name } => {
                 if let Some(drawing) = self.drawing.borrow().as_ref() {
+                    drawing.status.set_label(&display_name);
                     drawing.status.set_tooltip_text(Some(&display_name));
                 }
                 self.set_state(State::Idle);
@@ -1197,6 +1277,7 @@ impl Session {
         }
         *self.state.borrow_mut() = state;
         self.show_state();
+        crate::kernels::kernels().changed();
     }
 
     fn show_state(&self) {
@@ -1205,40 +1286,67 @@ impl Session {
             return;
         };
         let state = self.state.borrow();
-        let editable = self.editable();
-        let (label, banner) = match &*state {
-            _ if !editable => (
-                "Another environment's notebook — read here, run in its own environment"
-                    .to_string(),
-                None,
+        let runnable = self.runnable();
+        // The bar's sentence, and which of its answers it offers: Start
+        // Kernel, and Prompt Agent.
+        let (said, start, prompt): (Option<String>, bool, bool) = match &*state {
+            _ if !runnable => (
+                Some(
+                    "This notebook's environment is gone, so its cells cannot run; it is shown \
+                     as it was saved."
+                        .to_string(),
+                ),
+                false,
+                false,
             ),
-            State::Off => ("Kernel not started — Run starts it".to_string(), None),
-            State::Starting => ("Kernel starting in this environment".to_string(), None),
-            State::Idle => ("Kernel idle".to_string(), None),
-            State::Busy => ("Kernel busy".to_string(), None),
-            State::Restarting => ("Kernel restarting".to_string(), None),
+            State::Idle | State::Busy => (None, false, false),
+            State::Off => (
+                Some(format!(
+                    "The kernel is not running. Cells run in {} once it starts.",
+                    self.where_it_runs()
+                )),
+                true,
+                false,
+            ),
+            State::Starting | State::Restarting => (
+                Some(format!(
+                    "The kernel is starting in {}.",
+                    self.where_it_runs()
+                )),
+                false,
+                false,
+            ),
             State::Failed { message, .. } => (
-                "Kernel not running".to_string(),
                 Some(format!("The kernel did not start: {message}")),
+                true,
+                true,
             ),
-            State::Stopped { .. } => (
-                "Kernel stopped".to_string(),
-                Some("The kernel stopped. Restart starts it again.".to_string()),
-            ),
+            State::Stopped { .. } => (Some("The kernel stopped.".to_string()), true, true),
         };
-        drawing.status.set_label(&label);
         let running = matches!(*state, State::Busy | State::Starting | State::Restarting);
-        drawing.run_all.set_sensitive(editable);
-        drawing.interrupt.set_sensitive(editable && running);
+        drawing.run_all.set_sensitive(runnable);
+        drawing.interrupt.set_sensitive(runnable && running);
         drawing
             .restart
-            .set_sensitive(editable && !matches!(*state, State::Off));
-        match banner {
-            Some(title) => {
-                drawing.banner.title.set_label(&title);
+            .set_sensitive(runnable && !matches!(*state, State::Off));
+        drawing.banner.start.set_visible(start);
+        drawing.banner.prompt.set_visible(prompt);
+        match said {
+            Some(said) => {
+                drawing.banner.title.set_label(&said);
                 drawing.banner.widget.set_reveal_child(true);
             }
             None => drawing.banner.widget.set_reveal_child(false),
+        }
+    }
+
+    /// Where its kernel runs, in the bar's words: this environment's
+    /// container, or which other one's.
+    fn where_it_runs(&self) -> String {
+        if self.writable {
+            "this environment's container".to_string()
+        } else {
+            format!("{}'s container", self.env)
         }
     }
 
@@ -1261,6 +1369,11 @@ impl Session {
     /// cell its id names, or the one at its index — when that cell's source
     /// is still the code that ran.
     fn write_outputs(&self, run: &Run, count: Option<i64>) {
+        // Another environment's notebook is run and its outputs drawn; its
+        // file is not written.
+        if !self.editable() {
+            return;
+        }
         let (id, index, code) = (run.cell_id.clone(), run.index, run.code.clone());
         let outputs = Value::Array(run.outputs.clone());
         self.queue_edit(std::sync::Arc::new(move |notebook: &mut Value| {
@@ -1284,6 +1397,9 @@ impl Session {
     /// the cell that still holds the source last filed for it, so an edit
     /// never lands on a cell something else moved into its place.
     fn write_source(&self, index: usize) {
+        if !self.editable() {
+            return;
+        }
         let (id, source, filed) = {
             let drawing = self.drawing.borrow();
             let Some(parts) = drawing.as_ref().and_then(|d| d.cells.get(&index)) else {
@@ -1828,16 +1944,23 @@ fn output_widget(
     }
 }
 
-/// The bar under the kernel's controls when it is not running: what it
-/// said, and Prompt Agent. Drawn as every tab's bar is (`viewer::ChangedBar`,
-/// `.changed-bar`): the sentence at the start, wrapping, and the answer at
-/// the end — not `AdwBanner`'s centred title over a wide button, which stood
-/// apart from every other document's (David, 2026-10-11: "ugly and
-/// inconsistent with other banners for other document types"). The text is
-/// the kernel's words as they are, selectable to copy.
+/// The bar at the top of a notebook whose kernel is not running: that it is
+/// not, or what it said when it would not start, Start Kernel, and — for a
+/// failure — Prompt Agent; gone while the kernel runs as it should (David,
+/// 2026-10-11: "Show a warning banner at the top of a Jupyter document that
+/// warns if it isn't running and offers a button to start it. But, have the
+/// banner go away if it's running properly"). How the kernels stand lives in
+/// the environment's Tasks entry (`crate::kernels`). Drawn as every tab's
+/// bar is (`viewer::ChangedBar`, `.changed-bar`), in the warning colour: the
+/// sentence at the start, wrapping, and the answers at the end — not
+/// `AdwBanner`'s centred title over a wide button, which stood apart from
+/// every other document's ("ugly and inconsistent with other banners for
+/// other document types"). The text is the kernel's words as they are,
+/// selectable to copy.
 struct KernelBar {
     widget: gtk::Revealer,
     title: gtk::Label,
+    start: gtk::Button,
     prompt: gtk::Button,
 }
 
@@ -1853,6 +1976,11 @@ impl KernelBar {
         let prompt = gtk::Button::builder()
             .label("Prompt Agent")
             .tooltip_text("Ask this environment's agent to make the kernel start")
+            .valign(gtk::Align::Center)
+            .build();
+        let start = gtk::Button::builder()
+            .label("Start Kernel")
+            .tooltip_text("Start this notebook's kernel in its environment")
             .css_classes(["suggested-action"])
             .valign(gtk::Align::Center)
             .build();
@@ -1861,6 +1989,7 @@ impl KernelBar {
         row.add_css_class("notebook-kernel");
         row.append(&title);
         row.append(&prompt);
+        row.append(&start);
         let widget = gtk::Revealer::builder()
             .child(&row)
             .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -1869,6 +1998,7 @@ impl KernelBar {
         Self {
             widget,
             title,
+            start,
             prompt,
         }
     }

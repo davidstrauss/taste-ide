@@ -4587,19 +4587,36 @@ impl Editor {
             .foreign_env
             .clone()
             .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
-        let exec = page
-            .foreign_env
-            .is_none()
-            .then(|| self.workspace.exec.clone());
+        // Its kernel runs in the container of the environment it belongs
+        // to, another environment's as much as the user's own.
+        let exec = match &page.foreign_env {
+            None => Some(self.workspace.exec.clone()),
+            Some(foreign) => self
+                .environments
+                .borrow()
+                .as_ref()
+                .and_then(|environments| environments.get(foreign))
+                .map(|supervisor| supervisor.exec().clone()),
+        };
+        let writable = page.foreign_env.is_none();
+        let env_for_session = env.clone();
         let hook = self.on_prompt_agent.borrow().clone();
         let on_prompt: Rc<dyn Fn(String, (String, String))> = Rc::new(move |prompt, attachment| {
             if let Some(hook) = hook.as_ref() {
                 hook(env.clone(), prompt, Some(attachment));
             }
         });
-        let session =
-            crate::notebook::Session::new(path.to_path_buf(), exec, page.buffer.clone(), on_prompt);
+        let session = crate::notebook::Session::new(
+            path.to_path_buf(),
+            env_for_session,
+            exec,
+            writable,
+            page.buffer.clone(),
+            on_prompt,
+        );
         *page.notebook.borrow_mut() = Some(session.clone());
+        // Its kernel is one of its environment's Tasks entry's.
+        crate::kernels::kernels().register(&session);
         session
     }
 
