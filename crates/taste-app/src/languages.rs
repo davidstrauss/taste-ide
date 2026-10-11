@@ -2,17 +2,26 @@
 //!
 //! GtkSourceView compiles its language definitions into the library, and
 //! has none for Typst (David, 2026-10-05: "Can I get syntax highlighting
-//! for .typ?"). Ours live in `data/language-specs/`, are compiled into the
+//! for .typ?"), and its JSON one is too slow for a notebook's pictures
+//! (`ipynb.lang`). Ours live in `data/language-specs/`, are compiled into the
 //! binary, and are written at startup into a directory of the IDE's cache
 //! that goes first on the language manager's search path — so they work
 //! the same in a dev run, on the host, and in the Flatpak, with nothing to
 //! install. Their styles map onto GtkSourceView's `def:` styles, so every
 //! colour scheme colours them.
 
-const LANGUAGES: &[(&str, &str)] = &[(
-    "typst.lang",
-    include_str!("../../../data/language-specs/typst.lang"),
-)];
+const LANGUAGES: &[(&str, &str)] = &[
+    (
+        "typst.lang",
+        include_str!("../../../data/language-specs/typst.lang"),
+    ),
+    // A notebook's JSON, with its picture lines highlighted in one match
+    // each rather than a character at a time.
+    (
+        "ipynb.lang",
+        include_str!("../../../data/language-specs/ipynb.lang"),
+    ),
+];
 
 /// Write the definitions where the language manager will look, and put
 /// that directory first on its search path. Once, at startup, before

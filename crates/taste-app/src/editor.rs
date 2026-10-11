@@ -557,11 +557,25 @@ pub(crate) fn file_type_icon(path: &Path) -> gtk::gio::Icon {
 
 /// Whether a file is safe to highlight (and, for markdown, to restyle per
 /// keystroke) without pathological layout/regex costs.
-fn highlighting_ok(content: &str) -> bool {
+///
+/// A notebook is held to the size alone: its long lines are its pictures,
+/// each one JSON string of base64, which the IDE's notebook grammar
+/// (`ipynb.lang`) crosses in a single match where a minified program's
+/// would backtrack (David, 2026-10-11: "Ensure .ipynb has syntax
+/// highlighting"; `perf_notebook_json_highlight`).
+fn highlighting_ok(path: &Path, content: &str) -> bool {
     content.len() <= MAX_HIGHLIGHT_FILE_BYTES
-        && content
-            .split('\n')
-            .all(|line| line.len() <= MAX_HIGHLIGHT_LINE_BYTES)
+        && (is_notebook(path)
+            || content
+                .split('\n')
+                .all(|line| line.len() <= MAX_HIGHLIGHT_LINE_BYTES))
+}
+
+/// The language a file is highlighted as: GtkSourceView's guess, which for
+/// a notebook is the IDE's own `ipynb` (`crate::languages`).
+fn source_language(path: &Path) -> Option<sourceview5::Language> {
+    sourceview5::LanguageManager::default()
+        .guess_language(Some(path.to_string_lossy().as_ref()), None)
 }
 
 use crate::hover::FullTextOnHover;
@@ -3434,7 +3448,7 @@ impl Editor {
             // the preview is opt-in and read-only. A notebook opens as a
             // notebook: its JSON is the face nobody reads first.
             raw_source: Cell::new(!is_notebook(path)),
-            plain: Cell::new(!highlighting_ok(&content)),
+            plain: Cell::new(!highlighting_ok(path, &content)),
             suggestion: RefCell::new(None),
             restyle_queued: Cell::new(false),
             map,
@@ -4252,7 +4266,7 @@ impl Editor {
             // Re-evaluate the performance guard: an agent may have rewritten
             // a small file into a huge one (or vice versa).
             let was_plain = page.plain.get();
-            page.plain.set(!highlighting_ok(&content));
+            page.plain.set(!highlighting_ok(&path, &content));
             // As the lines that differ, in one step Ctrl+Z takes back — a
             // `sed`, a `git checkout`, or a tool run in the container is
             // as undoable as an edit the agent made through the IDE — and
@@ -4478,9 +4492,7 @@ impl Editor {
             }
         } else {
             // The edit face is always a real, highlighted source editor.
-            let language = sourceview5::LanguageManager::default()
-                .guess_language(Some(path.to_string_lossy().as_ref()), None);
-            page.buffer.set_language(language.as_ref());
+            page.buffer.set_language(source_language(path).as_ref());
             page.view.set_show_line_numbers(true);
             // Another environment's file is read to the letter and edited
             // not at all: the buffer is not editable, so there is no way to
@@ -4958,7 +4970,8 @@ mod tests {
         });
     }
 
-    use super::highlighting_ok;
+    use super::{highlighting_ok, source_language};
+    use std::path::Path;
 
     /// Every checkout with a tab open gets a pass, and none gets two.
     ///
@@ -5105,19 +5118,66 @@ mod tests {
 
     #[test]
     fn normal_source_files_highlight() {
-        assert!(highlighting_ok("fn main() {\n    println!(\"hi\");\n}\n"));
+        assert!(highlighting_ok(
+            Path::new("main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n"
+        ));
     }
 
     #[test]
     fn very_long_lines_disable_highlighting() {
         let minified = format!("var x = [{}];", "1,".repeat(10_000));
-        assert!(!highlighting_ok(&minified));
+        assert!(!highlighting_ok(Path::new("app.min.js"), &minified));
     }
 
     #[test]
     fn very_large_files_disable_highlighting() {
         let big = "short line\n".repeat(1_000_000);
-        assert!(!highlighting_ok(&big));
+        assert!(!highlighting_ok(Path::new("big.txt"), &big));
+        assert!(!highlighting_ok(Path::new("big.ipynb"), &big));
+    }
+
+    /// A notebook's picture lines do not turn its highlighting off, and it
+    /// is highlighted with the IDE's notebook grammar.
+    #[test]
+    fn a_notebook_highlights_whatever_its_pictures() {
+        let picture = format!("  \"image/png\": \"{}\"\n", "A".repeat(200_000));
+        assert!(highlighting_ok(Path::new("figures.ipynb"), &picture));
+        crate::gtk_test::on_gtk_thread("editor: no display — skipped", || {
+            crate::languages::register();
+            let language = source_language(Path::new("figures.ipynb")).expect("a language");
+            assert_eq!(language.id(), "ipynb");
+        });
+    }
+
+    /// What highlighting a notebook full of pictures costs: the figures
+    /// fixture, highlighted whole.
+    /// `cargo test -p taste-app perf_notebook_json_highlight -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perf_notebook_json_highlight() {
+        crate::gtk_test::on_gtk_thread("editor: no display — skipped", || {
+            use gtk::prelude::*;
+            use sourceview5::prelude::*;
+            let text = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../build-aux/headless/fixtures/figures.ipynb"
+            ))
+            .unwrap();
+            crate::languages::register();
+            let buffer = sourceview5::Buffer::new(None);
+            buffer.set_language(source_language(Path::new("figures.ipynb")).as_ref());
+            assert_eq!(buffer.language().map(|l| l.id()).as_deref(), Some("ipynb"));
+            buffer.set_text(&text);
+            let started = std::time::Instant::now();
+            buffer.ensure_highlight(&buffer.start_iter(), &buffer.end_iter());
+            println!(
+                "perf: {} bytes, longest line {}, highlighted in {:?}",
+                text.len(),
+                text.lines().map(str::len).max().unwrap_or(0),
+                started.elapsed()
+            );
+        });
     }
 
     mod review_tabs {

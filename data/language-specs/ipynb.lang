@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Jupyter notebooks as JSON, for taste-ide's editor (taste-app's
+  languages.rs compiles this into the binary).
+
+  GtkSourceView's own json.lang walks a string a character at a time, and a
+  notebook's pictures are base64 strings a hundred thousand characters long
+  on one line: highlighting one took seconds. Here a string, and a key, is
+  ONE possessive match, linear and without backtracking, so a picture line
+  costs what reading it costs (editor.rs, perf_notebook_json_highlight).
+  The styles map onto GtkSourceView's def: styles, so every colour scheme
+  colours them.
+-->
+<language id="ipynb" name="Jupyter Notebook" version="2.0" _section="Other">
+  <metadata>
+    <property name="globs">*.ipynb</property>
+  </metadata>
+
+  <styles>
+    <style id="keyname" name="Key" map-to="def:keyword"/>
+    <style id="string" name="String" map-to="def:string"/>
+    <style id="number" name="Number" map-to="def:number"/>
+    <style id="special-constant" name="Constant" map-to="def:special-constant"/>
+  </styles>
+
+  <definitions>
+    <context id="ipynb">
+      <include>
+        <context id="keyname" style-ref="keyname">
+          <match>"(?:[^"\\]++|\\.)*+"(?=\s*:)</match>
+        </context>
+        <context id="string" style-ref="string">
+          <match>"(?:[^"\\]++|\\.)*+"</match>
+        </context>
+        <context id="number" style-ref="number">
+          <match>-?\b(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\b</match>
+        </context>
+        <context id="special-constant" style-ref="special-constant">
+          <keyword>true</keyword>
+          <keyword>false</keyword>
+          <keyword>null</keyword>
+        </context>
+      </include>
+    </context>
+  </definitions>
+</language>
