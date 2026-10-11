@@ -1142,6 +1142,22 @@ no-op at every other width.
   banner for the editor to prompt the agent to fix what the container
   needs in place"), and the devcontainer authoring prompt says what
   notebooks need. Another environment's notebook is read, not run.
+  **Interactive widgets are drawn natively** (`widgets.rs`; David: "I want
+  interactive widgets to work in the preview"): the bridge relays
+  ipywidgets' comms both ways, binary buffers included, and a widget
+  manager keeps each model's state and draws GTK views of the core widgets
+  — sliders (log and range among them), number and text fields,
+  checkboxes and toggles, dropdowns, radio and toggle buttons, selections,
+  buttons, labels, progress bars, Play, images, colour pickers, the
+  boxes, tabs, and accordions that hold them, and the Output widget
+  `interact` draws into, which takes every output whose parent its
+  `msg_id` names. A change made here is an `update`; its `echo_update` is
+  ignored for a key changed since, so a dragged slider does not jump
+  back; `jslink` is kept here, as the protocol has the frontend keep it.
+  Not a web page: a widget library's views are its own JavaScript, so one
+  whose views are not drawn here (plotly's, ipyleaflet's) shows the text
+  the kernel sent beside it. A notebook saved with its widgets' state
+  draws them from it, unusable, until a run opens live models.
 
 ### Bottom: console
 

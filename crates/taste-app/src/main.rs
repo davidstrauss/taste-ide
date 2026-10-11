@@ -76,6 +76,7 @@ mod textline;
 mod ui_probe;
 mod viewer;
 mod voice;
+mod widgets;
 mod window;
 
 use adw::prelude::*;

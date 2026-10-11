@@ -11,16 +11,21 @@
 # In (one JSON object per line):
 #   {"op": "start", "kernel": "python3", "cwd": "/path"}
 #   {"op": "execute", "cell": "<id>", "code": "..."}
+#   {"op": "comm_msg", "comm_id": ..., "data": {...}, "buffers": [base64, ...]}
 #   {"op": "interrupt"} | {"op": "restart"} | {"op": "shutdown"}
 # Out:
 #   {"ev": "ready", "kernel": ..., "display_name": ..., "language": ...}
 #   {"ev": "failed", "message": ..., "kernels": [...]}
-#   {"ev": "output", "cell": id, "type": msg_type, "content": {...}}
+#   {"ev": "output", "cell": id | null, "parent": msg_id, "type": msg_type,
+#    "content": {...}}
+#   {"ev": "comm", "type": "comm_open" | "comm_msg" | "comm_close",
+#    "content": {...}, "buffers": [base64, ...], "parent": msg_id}
 #   {"ev": "reply", "cell": id, "content": {...}}
 #   {"ev": "state", "state": "busy" | "idle" | "restarting" | "dead"}
 #
 # End of input shuts the kernel down: the IDE closing the page, or the
 # IDE itself going, must not leave a kernel running in the container.
+import base64
 import json
 import os
 import sys
@@ -46,7 +51,11 @@ except Exception as e:  # noqa: BLE001 - any import failure is the same answer
 km = None
 kc = None
 cells = {}  # parent msg_id -> the IDE's cell id
+ours = set()  # every msg_id this bridge sent, cells' and widgets' alike
 cells_lock = threading.Lock()
+# A ZeroMQ socket is not safe across threads: the shell socket is read by
+# pump_shell and written by main, so each holds this while it does.
+shell_lock = threading.Lock()
 stopping = threading.Event()
 
 
@@ -84,10 +93,22 @@ def start(name, cwd):
     return True
 
 
+def parent_of(message):
+    return (message.get("parent_header") or {}).get("msg_id")
+
+
 def cell_of(message):
-    parent = (message.get("parent_header") or {}).get("msg_id")
     with cells_lock:
-        return cells.get(parent)
+        return cells.get(parent_of(message))
+
+
+def is_ours(message):
+    with cells_lock:
+        return parent_of(message) in ours
+
+
+def encoded(buffers):
+    return [base64.b64encode(bytes(b)).decode("ascii") for b in buffers or []]
 
 
 def pump_iopub():
@@ -102,20 +123,41 @@ def pump_iopub():
         kind = message.get("msg_type") or message["header"].get("msg_type")
         content = message.get("content") or {}
         if kind == "status":
-            if cell_of(message) is not None or content.get("execution_state") == "restarting":
+            if is_ours(message) or content.get("execution_state") == "restarting":
                 say(ev="state", state=content.get("execution_state"))
             continue
-        cell = cell_of(message)
-        if cell is None:
+        # Widgets: their models open, change, and close on comms, whoever
+        # set the change off — a cell, a slider's update, or the kernel
+        # itself — so every comm message goes over.
+        if kind in ("comm_open", "comm_msg", "comm_close"):
+            say(
+                ev="comm",
+                type=kind,
+                content=content,
+                buffers=encoded(message.get("buffers")),
+                parent=parent_of(message),
+            )
             continue
-        say(ev="output", cell=cell, type=kind, content=content)
+        # An output goes over when this bridge set it off: a cell's, or a
+        # widget callback's, which an Output widget may be capturing.
+        if not is_ours(message):
+            continue
+        say(
+            ev="output",
+            cell=cell_of(message),
+            parent=parent_of(message),
+            type=kind,
+            content=content,
+        )
 
 
 def pump_shell():
     while not stopping.is_set():
         try:
-            message = kc.get_shell_msg(timeout=0.5)
-        except Exception:  # noqa: BLE001
+            with shell_lock:
+                message = kc.get_shell_msg(timeout=0.05)
+        except Exception:  # noqa: BLE001 - queue.Empty
+            stopping.wait(0.02)
             continue
         if (message.get("msg_type") or message["header"].get("msg_type")) != "execute_reply":
             continue
@@ -141,9 +183,25 @@ def main():
         elif not started:
             continue
         elif op == "execute":
-            msg_id = kc.execute(request.get("code", ""), store_history=True, allow_stdin=False)
+            with shell_lock:
+                msg_id = kc.execute(
+                    request.get("code", ""), store_history=True, allow_stdin=False
+                )
             with cells_lock:
                 cells[msg_id] = request.get("cell")
+                ours.add(msg_id)
+        elif op == "comm_msg":
+            # A widget's change, from the IDE's view of it, to its model in
+            # the kernel; binary buffers ride along as bytes.
+            message = kc.session.msg(
+                "comm_msg",
+                {"comm_id": request.get("comm_id"), "data": request.get("data") or {}},
+            )
+            buffers = [base64.b64decode(b) for b in request.get("buffers") or []]
+            with cells_lock:
+                ours.add(message["header"]["msg_id"])
+            with shell_lock:
+                kc.session.send(kc.shell_channel.socket, message, buffers=buffers)
         elif op == "interrupt":
             km.interrupt_kernel()
         elif op == "restart":

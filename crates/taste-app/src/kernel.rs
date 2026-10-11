@@ -57,13 +57,24 @@ pub enum Event {
     Ready { display_name: String },
     /// It did not start, and why — the bridge's own words, and its stderr.
     Failed { message: String, report: String },
-    /// One of a cell's iopub messages: `kind` is the Jupyter message type
-    /// (`stream`, `display_data`, `execute_result`, `error`,
-    /// `execute_input`, `clear_output`, …), `content` its content.
+    /// An iopub message something this side sent set off: `kind` is the
+    /// Jupyter message type (`stream`, `display_data`, `execute_result`,
+    /// `error`, `execute_input`, `clear_output`, …), `content` its content,
+    /// `parent` the id of the request it answers. `cell` names the cell for
+    /// a run's output, and is `None` for a widget callback's — which an
+    /// Output widget may be capturing by that parent.
     Output {
-        cell: String,
+        cell: Option<String>,
+        parent: String,
         kind: String,
         content: Value,
+    },
+    /// A widget's comm: `comm_open`, `comm_msg`, or `comm_close`, with its
+    /// binary buffers decoded (`crate::widgets`).
+    Comm {
+        kind: String,
+        content: Value,
+        buffers: Vec<Vec<u8>>,
     },
     /// A cell's `execute_reply`: done, with its status and count.
     Reply { cell: String, content: Value },
@@ -203,6 +214,18 @@ impl Kernel {
         self.send(serde_json::json!({"op": "execute", "cell": cell, "code": code}));
     }
 
+    /// A message to a widget's model in the kernel, on its comm.
+    pub fn comm_msg(&self, comm_id: &str, data: Value, buffers: &[Vec<u8>]) {
+        use base64::Engine as _;
+        let buffers: Vec<String> = buffers
+            .iter()
+            .map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+            .collect();
+        self.send(serde_json::json!({
+            "op": "comm_msg", "comm_id": comm_id, "data": data, "buffers": buffers,
+        }));
+    }
+
     pub fn interrupt(&self) {
         self.send(serde_json::json!({"op": "interrupt"}));
     }
@@ -242,9 +265,25 @@ fn parse_event(line: &str, stderr: &str) -> Option<Event> {
             }
         }
         "output" => Event::Output {
-            cell: text("cell"),
+            cell: message["cell"].as_str().map(str::to_string),
+            parent: text("parent"),
             kind: text("type"),
             content: message["content"].clone(),
+        },
+        "comm" => Event::Comm {
+            kind: text("type"),
+            content: message["content"].clone(),
+            buffers: message["buffers"]
+                .as_array()
+                .map(|buffers| {
+                    use base64::Engine as _;
+                    buffers
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter_map(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
         },
         "reply" => Event::Reply {
             cell: text("cell"),
@@ -278,7 +317,21 @@ mod tests {
         }
         assert!(matches!(
             parse_event(r#"{"ev": "output", "cell": "c1", "type": "stream", "content": {"name": "stdout", "text": "hi"}}"#, ""),
-            Some(Event::Output { cell, kind, .. }) if cell == "c1" && kind == "stream"
+            Some(Event::Output { cell, kind, .. }) if cell.as_deref() == Some("c1") && kind == "stream"
+        ));
+        match parse_event(
+            r#"{"ev": "comm", "type": "comm_msg", "content": {"comm_id": "m1"}, "buffers": ["aGk="], "parent": "p"}"#,
+            "",
+        ) {
+            Some(Event::Comm { kind, buffers, .. }) => {
+                assert_eq!(kind, "comm_msg");
+                assert_eq!(buffers, vec![b"hi".to_vec()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_event(r#"{"ev": "output", "cell": null, "parent": "p", "type": "stream", "content": {}}"#, ""),
+            Some(Event::Output { cell: None, parent, .. }) if parent == "p"
         ));
         assert!(parse_event("[IPKernelApp] WARNING | not json", "").is_none());
     }

@@ -117,6 +117,8 @@ pub struct Session {
     next_run: Cell<u64>,
     drawing: RefCell<Option<Drawing>>,
     on_prompt_agent: Rc<dyn Fn(String, (String, String))>,
+    /// The kernel's widget models, and their views (`crate::widgets`).
+    widgets: Rc<crate::widgets::Manager>,
 }
 
 impl Session {
@@ -141,7 +143,7 @@ impl Session {
             },
             _ => State::Off,
         };
-        Rc::new(Self {
+        let session = Rc::new(Self {
             path,
             exec,
             buffer,
@@ -153,7 +155,20 @@ impl Session {
             next_run: Cell::new(0),
             drawing: RefCell::new(None),
             on_prompt_agent,
-        })
+            widgets: crate::widgets::Manager::new(),
+        });
+        // A widget's change reaches its model through the kernel's bridge.
+        let weak = Rc::downgrade(&session);
+        session
+            .widgets
+            .set_sender(Rc::new(move |comm_id, data, buffers| {
+                if let Some(session) = weak.upgrade() {
+                    if let Some(kernel) = session.kernel.borrow().as_ref() {
+                        kernel.comm_msg(comm_id, data, &buffers);
+                    }
+                }
+            }));
+        session
     }
 
     fn editable(&self) -> bool {
@@ -225,6 +240,18 @@ impl Session {
             .as_str()
             .unwrap_or("Kernel")
             .to_string();
+        // A notebook saved with its widgets' state draws them from it until
+        // a kernel opens their models.
+        self.widgets
+            .load_saved(&metadata["widgets"]["application/vnd.jupyter.widget-state+json"]["state"]);
+        {
+            let (base, on_link) = (base.clone(), on_link.clone());
+            let widgets = Rc::downgrade(&self.widgets);
+            self.widgets.set_output_drawer(Rc::new(move |output| {
+                let widgets = widgets.upgrade();
+                output_widget(output, &base, &on_link, None, widgets.as_ref())
+            }));
+        }
 
         // The kernel's bar: what it is and where it stands, and the three
         // things done to it.
@@ -302,7 +329,9 @@ impl Session {
                         .clone()
                         .unwrap_or_else(|| cell["outputs"].as_array().cloned().unwrap_or_default());
                     for output in &outputs {
-                        if let Some(widget) = output_widget(output, &base, &on_link, Some(ready)) {
+                        if let Some(widget) =
+                            output_widget(output, &base, &on_link, Some(ready), Some(&self.widgets))
+                        {
                             parts.outputs.append(&widget);
                         }
                     }
@@ -660,9 +689,24 @@ impl Session {
             },
             Event::Output {
                 cell,
+                parent,
                 kind,
                 content,
-            } => self.on_output(&cell, &kind, content),
+            } => {
+                // An Output widget capturing this request takes its output
+                // first — a callback's, or a cell's own under `with out:`.
+                if self.widgets.capture(&parent, &kind, &content) {
+                    return;
+                }
+                if let Some(cell) = cell {
+                    self.on_output(&cell, &kind, content);
+                }
+            }
+            Event::Comm {
+                kind,
+                content,
+                buffers,
+            } => self.widgets.on_comm(&kind, &content, buffers),
             Event::Reply { cell, content } => self.on_reply(&cell, &content),
             Event::Exited { report } => {
                 self.kernel.borrow_mut().take();
@@ -718,7 +762,13 @@ impl Session {
             // one rather than add a line of its own.
             clear(&parts.outputs);
             for output in &run.outputs {
-                if let Some(widget) = output_widget(output, &drawing.base, &drawing.on_link, None) {
+                if let Some(widget) = output_widget(
+                    output,
+                    &drawing.base,
+                    &drawing.on_link,
+                    None,
+                    Some(&self.widgets),
+                ) {
                     parts.outputs.append(&widget);
                 }
             }
@@ -748,6 +798,14 @@ impl Session {
     }
 
     fn set_state(&self, state: State) {
+        // A kernel that is not running holds no widget models: their views
+        // stay, unusable, until a run opens new ones.
+        if matches!(
+            state,
+            State::Failed { .. } | State::Stopped { .. } | State::Restarting
+        ) {
+            self.widgets.disconnect();
+        }
         *self.state.borrow_mut() = state;
         self.show_state();
     }
@@ -936,7 +994,7 @@ fn nbformat_json(notebook: &Value) -> Option<String> {
 
 /// A kernel's iopub message as the output the file keeps; `None` for one
 /// that is not an output.
-fn nbformat_output(kind: &str, content: Value) -> Option<Value> {
+pub(crate) fn nbformat_output(kind: &str, content: Value) -> Option<Value> {
     let mut output = serde_json::Map::new();
     output.insert("output_type".into(), Value::from(kind));
     match kind {
@@ -970,7 +1028,7 @@ fn nbformat_output(kind: &str, content: Value) -> Option<Value> {
 
 /// Add an output to a run's list: a stream continues the last output when
 /// that is a stream of the same name, as Jupyter keeps them.
-fn push_output(outputs: &mut Vec<Value>, output: Value) {
+pub(crate) fn push_output(outputs: &mut Vec<Value>, output: Value) {
     if output["output_type"] == "stream" {
         if let Some(last) = outputs.last_mut() {
             if last["output_type"] == "stream" && last["name"] == output["name"] {
@@ -1070,6 +1128,7 @@ fn output_widget(
     base: &DocumentBase,
     on_link: &Rc<dyn Fn(&str)>,
     ready: Option<&Readiness>,
+    widgets: Option<&Rc<crate::widgets::Manager>>,
 ) -> Option<gtk::Widget> {
     match output["output_type"].as_str()? {
         "stream" => {
@@ -1099,6 +1158,16 @@ fn output_widget(
         }
         "display_data" | "execute_result" => {
             let data = &output["data"];
+            // An interactive widget: its live view, while its model is
+            // known; otherwise the text the kernel sent beside it.
+            if let (Some(view), Some(widgets)) = (
+                data.get("application/vnd.jupyter.widget-view+json"),
+                widgets,
+            ) {
+                if let Some(drawn) = view["model_id"].as_str().and_then(|id| widgets.view(id)) {
+                    return Some(drawn);
+                }
+            }
             // matplotlib's and Seaborn's figures: a PNG by default, with
             // the size to show it at beside it when it was drawn at twice
             // that (`figure_format = 'retina'`); an SVG when the notebook
