@@ -119,7 +119,7 @@ struct Drawing {
     run_all: gtk::Button,
     interrupt: gtk::Button,
     restart: gtk::Button,
-    banner: adw::Banner,
+    banner: KernelBar,
     cells: HashMap<usize, CellParts>,
     base: DocumentBase,
     on_link: Rc<dyn Fn(&str)>,
@@ -182,8 +182,11 @@ impl Session {
             // A kernel that did not start, which otherwise needs a
             // container without Jupyter.
             Ok("failed") => State::Failed {
-                message: "no Python in this environment can import jupyter_client (tried \
-                          .venv/bin/python, venv/bin/python, python3, and python)"
+                // With an apostrophe in it: the old banner read its title as
+                // markup and showed this one as `&apos;`.
+                message: "the kernel's bridge exited before the kernel started: no Python in \
+                          this environment can import jupyter_client (tried .venv/bin/python, \
+                          venv/bin/python, python3, and python)"
                     .into(),
                 report: String::new(),
             },
@@ -349,7 +352,7 @@ impl Session {
         bar.append(&run_all);
         bar.append(&interrupt);
         bar.append(&restart);
-        let banner = adw::Banner::builder().button_label("Prompt Agent").build();
+        let banner = KernelBar::new();
 
         let column = gtk::Box::new(gtk::Orientation::Vertical, 14);
         column.set_margin_top(16);
@@ -430,7 +433,7 @@ impl Session {
             column.append(&notice("This notebook has no cells."));
         }
         root.append(&bar);
-        root.append(&banner);
+        root.append(&banner.widget);
         root.append(&column);
 
         {
@@ -461,7 +464,7 @@ impl Session {
         }
         {
             let weak = Rc::downgrade(self);
-            banner.connect_button_clicked(move |_| {
+            banner.prompt.connect_clicked(move |_| {
                 if let Some(session) = weak.upgrade() {
                     session.prompt_agent();
                 }
@@ -1232,10 +1235,10 @@ impl Session {
             .set_sensitive(editable && !matches!(*state, State::Off));
         match banner {
             Some(title) => {
-                drawing.banner.set_title(&glib::markup_escape_text(&title));
-                drawing.banner.set_revealed(true);
+                drawing.banner.title.set_label(&title);
+                drawing.banner.widget.set_reveal_child(true);
             }
-            None => drawing.banner.set_revealed(false),
+            None => drawing.banner.widget.set_reveal_child(false),
         }
     }
 
@@ -1822,6 +1825,52 @@ fn output_widget(
             )))
         }
         _ => None,
+    }
+}
+
+/// The bar under the kernel's controls when it is not running: what it
+/// said, and Prompt Agent. Drawn as every tab's bar is (`viewer::ChangedBar`,
+/// `.changed-bar`): the sentence at the start, wrapping, and the answer at
+/// the end — not `AdwBanner`'s centred title over a wide button, which stood
+/// apart from every other document's (David, 2026-10-11: "ugly and
+/// inconsistent with other banners for other document types"). The text is
+/// the kernel's words as they are, selectable to copy.
+struct KernelBar {
+    widget: gtk::Revealer,
+    title: gtk::Label,
+    prompt: gtk::Button,
+}
+
+impl KernelBar {
+    fn new() -> Self {
+        let title = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .selectable(true)
+            .build();
+        let prompt = gtk::Button::builder()
+            .label("Prompt Agent")
+            .tooltip_text("Ask this environment's agent to make the kernel start")
+            .css_classes(["suggested-action"])
+            .valign(gtk::Align::Center)
+            .build();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.add_css_class("changed-bar");
+        row.add_css_class("notebook-kernel");
+        row.append(&title);
+        row.append(&prompt);
+        let widget = gtk::Revealer::builder()
+            .child(&row)
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .reveal_child(false)
+            .build();
+        Self {
+            widget,
+            title,
+            prompt,
+        }
     }
 }
 
