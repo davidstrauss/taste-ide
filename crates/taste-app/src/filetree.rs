@@ -7038,7 +7038,11 @@ impl FileTree {
         let root_store = gtk::gio::ListStore::new::<BoxedAnyObject>();
         let child_ghosts = ghosts.clone();
         let child_worktree = worktree.clone();
-        let child_synced = synced.clone();
+        // What syncs, read when a folder is OPENED, not when the model was
+        // built: it arrives with the first status, after the first build,
+        // and a copy taken here listed every synced folder empty (its
+        // children ignored, and not yet known to sync).
+        let child_tree = Rc::downgrade(self);
         fill_dir_store_async(
             &root_store,
             worktree,
@@ -7067,7 +7071,10 @@ impl FileTree {
                     child_worktree.clone(),
                     node.path.clone(),
                     show_ignored,
-                    child_synced.clone(),
+                    child_tree
+                        .upgrade()
+                        .map(|tree| std::sync::Arc::new(tree.sync_ignored.borrow().clone()))
+                        .unwrap_or_default(),
                     child_ghosts.clone(),
                     child_filter.as_ref().map(|f| (**f).clone()),
                 );
