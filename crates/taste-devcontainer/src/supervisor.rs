@@ -1199,15 +1199,32 @@ impl Supervisor {
             if (ref_moved || worktree_changed) && !snapshot_pending.swap(true, Ordering::SeqCst) {
                 let weak = weak.clone();
                 let snapshot_pending = snapshot_pending.clone();
+                let folder_events = folder_events.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     snapshot_pending.store(false, Ordering::SeqCst);
                     if let Some(supervisor) = weak.upgrade() {
-                        if let Err(e) = supervisor.snapshot_blocking() {
+                        let snapshot = supervisor.snapshot_blocking();
+                        if let Err(e) = &snapshot {
                             tracing::warn!("snapshot after a ref moved in the VM: {e:#}");
                         }
                         if let Err(e) = supervisor.sync_peer_blocking() {
                             tracing::warn!("peer sync after a ref moved in the VM: {e:#}");
+                        }
+                        // Said where the user looks, not only in the log:
+                        // without a snapshot the folder cannot follow, and
+                        // a sync that stopped for two hours went unseen
+                        // (2026-10-11). After the pass, so its "done" does
+                        // not cover it.
+                        if let (true, Err(e)) = (primary, snapshot) {
+                            folder_events.publish(Event::FolderSync(
+                                taste_core::FolderSync::Failed {
+                                    reason: format!(
+                                        "Personal's working copy could not be snapshotted, so \
+                                         your folder is not following it: {e:#}"
+                                    ),
+                                },
+                            ));
                         }
                     }
                 });

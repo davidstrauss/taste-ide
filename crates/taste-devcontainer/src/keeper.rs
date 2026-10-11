@@ -80,6 +80,14 @@ use taste_core::files::{Entry, ExecOutput, Kind, RemoteFiles, Stat};
 /// never fires keeps the loop alive whatever else is paused.
 pub const KEEPER: &str = r#"'use strict';
 const fs=require('fs'),fsp=fs.promises,path=require('path'),cp=require('child_process');
+// Every git the IDE runs here runs none of the repository's commands: its
+// attributes are read from the empty tree, so no filter, textconv, or
+// diff driver runs, and its fsmonitor and hooks are off. This process
+// reaches every environment's checkout, and a checkout's .git/config is
+// its agent's to write; and a filter installed in the dev container
+// (nbstripout, at a path only that container has) failed every snapshot
+// here, which stopped the folder's sync (2026-10-11).
+const GIT_SAFE={GIT_ATTR_SOURCE:'4b825dc642cb6eb9a060e54bf8d69288fbee4904',GIT_CONFIG_COUNT:'2',GIT_CONFIG_KEY_0:'core.fsmonitor',GIT_CONFIG_VALUE_0:'false',GIT_CONFIG_KEY_1:'core.hooksPath',GIT_CONFIG_VALUE_1:'/dev/null'};
 const out=process.stdout,CHUNK=65536;
 const frame=(id,kind,payload)=>{const h=Buffer.alloc(9);h.writeUInt32BE(id,0);h.writeUInt8(kind,4);h.writeUInt32BE(payload.length,5);return out.write(Buffer.concat([h,payload]))};
 const json=(id,kind,obj)=>frame(id,kind,Buffer.from(JSON.stringify(obj)));
@@ -126,7 +134,7 @@ async function handle(id,req){
     case 'mkdir':await fsp.mkdir(req.path,{recursive:true});return done(id,{});
     case 'remove':await fsp.rm(req.path,{recursive:!!req.recursive,force:false});return done(id,{});
     case 'rename':await fsp.rename(req.from,req.to);return done(id,{});
-    case 'exec':{const child=cp.spawn(req.argv[0],req.argv.slice(1),{cwd:req.cwd,stdio:['ignore','pipe','pipe'],env:Object.assign({},process.env,req.env||{})});procs.set(id,child);pushFrom(id,1,child.stdout);pushFrom(id,4,child.stderr);child.on('error',e=>{procs.delete(id);fail(id,e)});child.on('close',(code,signal)=>{procs.delete(id);done(id,{status:code===null?-1:code,signal:signal||null})});return}
+    case 'exec':{const child=cp.spawn(req.argv[0],req.argv.slice(1),{cwd:req.cwd,stdio:['ignore','pipe','pipe'],env:Object.assign({},process.env,GIT_SAFE,req.env||{})});procs.set(id,child);pushFrom(id,1,child.stdout);pushFrom(id,4,child.stderr);child.on('error',e=>{procs.delete(id);fail(id,e)});child.on('close',(code,signal)=>{procs.delete(id);done(id,{status:code===null?-1:code,signal:signal||null})});return}
     case 'watch':{const w=treeWatch(req.path,(event,name)=>json(id,3,{event,name}),e=>{watches.delete(id);w.close();fail(id,e)});watches.set(id,w);return}
     default:return fail(id,{code:'EINVAL',message:'unknown op '+req.op});
   }
