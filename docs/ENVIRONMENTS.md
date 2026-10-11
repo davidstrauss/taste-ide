@@ -3274,7 +3274,8 @@ is shouted, but nothing runs either. The rows say what is missing, and
   before the VM is used again, in `LibvirtSession::bring_up`, the one
   path every local VM takes back into use. An IDE whose new VM does not
   fit clears marked VMs that are shut off and whose owner is not open,
-  largest first, until it does, then the base images no disk overlays any
+  least recently used first (by the disk's modification time, which a
+  running guest keeps current), until it does, then the base images no disk overlays any
   more; an unmarked disk is never touched, and the refusal names those
   kept by project, with what would mark them (opening and closing it).
   `Pool::stale` still only reports a VM whose folder is gone: with no

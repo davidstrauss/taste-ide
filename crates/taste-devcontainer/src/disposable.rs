@@ -30,8 +30,8 @@
 //!   up (`LibvirtSession::bring_up`) — the one choke point every local VM
 //!   passes on its way back into use.
 //! - **Honoured by any IDE short of disk** ([`clear_for_room`]): marked
-//!   VMs that are shut off and whose owner is not open go, largest first,
-//!   until the new VM fits. An unmarked disk is never touched; the refusal
+//!   VMs that are shut off and whose owner is not open go, least recently
+//!   used first, until the new VM fits. An unmarked disk is never touched; the refusal
 //!   names it instead, with what would mark it.
 //!
 //! The marker is `<domain>.disposable` beside the disk, and it names the
@@ -346,13 +346,30 @@ fn allocated(vm: &Vm) -> u64 {
     std::fs::metadata(vm.disk_path()).map_or(0, |m| m.blocks() * 512)
 }
 
+/// When a VM was last used: its disk's modification time. A running guest
+/// writes its disk throughout, and its shutdown writes it last, so this is
+/// when it last ran — whoever marked it, and however (David, 2026-10-11:
+/// "prune using LRU VMs until it has enough space"). A disk whose time
+/// cannot be read sorts first.
+fn last_used(vm: &Vm) -> std::time::SystemTime {
+    std::fs::metadata(vm.disk_path())
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// `vms` in the order they are cleared: least recently used first.
+fn oldest_first(vms: &mut [Vm], used: impl Fn(&Vm) -> std::time::SystemTime) {
+    vms.sort_by_key(|vm| used(vm));
+}
+
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
 /// The disk a new VM gets ([`crate::sizing::disk_for_new_vm`]), making
 /// room first when there is not enough: marked VMs that may go
-/// ([`may_clear`]) are removed, largest first, until the new one fits —
+/// ([`may_clear`]) are removed, least recently used first ([`last_used`]),
+/// until the new one fits —
 /// and then the base images no disk is built on any more. Still short,
 /// the refusal names the VMs that were kept and what would mark them.
 pub async fn clear_for_room(libvirt: &LibvirtSession) -> Result<u64> {
@@ -362,7 +379,7 @@ pub async fn clear_for_room(libvirt: &LibvirtSession) -> Result<u64> {
         Err(e) => e,
     };
     let mut vms = libvirt.list_all().await.unwrap_or_default();
-    vms.sort_by_key(|vm| std::cmp::Reverse(allocated(vm)));
+    oldest_first(&mut vms, last_used);
     let mut cleared = false;
     for vm in vms.iter().filter(|vm| may_clear(vm)) {
         let size = allocated(vm);
@@ -454,6 +471,27 @@ fn kept_summary(vms: &[Vm]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The least recently used VM is cleared first, whatever its size.
+    #[test]
+    fn the_least_recently_used_vm_goes_first() {
+        let vm = |domain: &str| Vm {
+            domain: domain.into(),
+            ssh_port: 40001,
+            workspace_root: "/work/proj".into(),
+            state: DomainState::ShutOff,
+            cloud: None,
+        };
+        let day = |n: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(n * 86_400);
+        let mut vms = vec![vm("taste-a-week"), vm("taste-a-month"), vm("taste-a-day")];
+        oldest_first(&mut vms, |vm| match vm.domain.as_str() {
+            "taste-a-month" => day(1),
+            "taste-a-week" => day(24),
+            _ => day(30),
+        });
+        let order: Vec<&str> = vms.iter().map(|vm| vm.domain.as_str()).collect();
+        assert_eq!(order, ["taste-a-month", "taste-a-week", "taste-a-day"]);
+    }
 
     #[test]
     fn a_report_cut_short_is_not_read_as_a_short_one() {
