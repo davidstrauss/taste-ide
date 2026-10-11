@@ -109,6 +109,32 @@ pub fn locate_task() -> String {
     )
 }
 
+/// The prelude a user's terminal in an environment starts with: `task` made
+/// to resolve exactly as the GUI's runs resolve it ([`locate_task`]) — the
+/// image's own `task` first, else its `go-task` (as a `task` function, since
+/// that is the name everyone types), else the IDE's pinned Task, put last on
+/// `PATH` — and then the interactive bash the terminal always ran, in its
+/// place. Without it, `task` was the agents' and the GUI's and not the
+/// user's: an agent's "run `task gmail:add` in the terminal" met
+/// "task: command not found" in an image that has no Task of its own (David,
+/// 2026-10-11). It runs the task as itself, with the terminal's input, so a
+/// task that asks for a password or takes arguments works as it would
+/// anywhere.
+pub fn terminal_prelude() -> String {
+    format!(
+        "if ! command -v task >/dev/null 2>&1; then \
+           if command -v go-task >/dev/null 2>&1; then \
+             task() {{ go-task \"$@\"; }}; export -f task; \
+           else \
+             for d in {IDE_TASK_DIR}/task-v{IDE_TASK_VERSION}-linux-*; do \
+               if [ -x \"$d/task\" ]; then PATH=\"$PATH:$d\"; export PATH; break; fi; \
+             done; \
+           fi; \
+         fi; \
+         exec /bin/bash"
+    )
+}
+
 /// `task`, wherever [`locate_task`] finds it, with `args`: the program and
 /// argv to resolve in the container. The shell hands over with `exec`, so
 /// there is one process, and exits 127 when there is no Task at all, which
@@ -536,6 +562,22 @@ impl TaskBoard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal's `task` resolves as the GUI's runs do: the image's
+    /// `task`, then its `go-task`, then the IDE's pinned one — and the
+    /// terminal is still the interactive bash it was.
+    #[test]
+    fn a_terminal_resolves_task_as_the_gui_does() {
+        let prelude = terminal_prelude();
+        let own = prelude.find("command -v task").unwrap();
+        let go = prelude.find("command -v go-task").unwrap();
+        let ide = prelude
+            .find(&format!("{IDE_TASK_DIR}/task-v{IDE_TASK_VERSION}-linux-"))
+            .unwrap();
+        assert!(own < go && go < ide, "{prelude}");
+        assert!(prelude.contains("PATH=\"$PATH:$d\""), "the IDE's goes last");
+        assert!(prelude.trim_end().ends_with("exec /bin/bash"));
+    }
 
     #[test]
     fn terminal_lines_lose_their_returns_and_keep_what_a_redraw_left() {

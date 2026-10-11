@@ -3323,7 +3323,10 @@ impl Console {
         // name"). Set as environment, which bash keeps unless an rc file
         // has its own opinion, and Fedora's only replaces the bare default.
         let prompt_env = [("PS1".to_string(), r"\u@\h:\w\$ ".to_string())];
-        let spec = exec.resolve_interactive_with_env("/bin/bash", &[], &prompt_env);
+        // `task` as the GUI resolves it, then the same interactive bash
+        // (`taste_core::tasks::terminal_prelude`).
+        let prelude = taste_core::tasks::terminal_prelude();
+        let spec = exec.resolve_interactive_with_env("/bin/bash", &["-c", &prelude], &prompt_env);
         // Name the shell by where it REALLY runs — "host" was ambiguous
         // when the IDE itself lives in a container.
         let in_devcontainer = exec.container_id().is_some();
