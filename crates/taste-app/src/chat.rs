@@ -1041,6 +1041,11 @@ pub struct ChatPane {
     /// (restore-text, transcript card, "queued" badge). A failed or dead
     /// prompt leaves the transcript and returns to the composer.
     pending_prompts: RefCell<std::collections::VecDeque<PendingPrompt>>,
+    /// What each of the adapter's own shell calls printed, by tool call id:
+    /// it reports a command it ran itself as a terminal in the content and
+    /// its output in `_meta.terminal_output` (`taste_acp::terminal::
+    /// AgentOwnedTerminals`), so the card's OUT is read from here.
+    terminal_text: RefCell<HashMap<String, String>>,
     /// The queued message whose Ask for a Turn was pressed, until its turn
     /// comes: its badge says when the agent has been told
     /// (`taste_core::nudge`).
@@ -3462,6 +3467,7 @@ impl ChatPane {
             reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
             pending_prompts: RefCell::new(std::collections::VecDeque::new()),
+            terminal_text: RefCell::new(HashMap::new()),
             nudged_badge: RefCell::new(None),
             capture: RefCell::new(None),
             relocated: Cell::new(false),
@@ -4596,6 +4602,8 @@ impl ChatPane {
         }
         self.transcript_rows.set(0);
         self.last_prompt_row.borrow_mut().take();
+        // A replay reports each call's output again.
+        self.terminal_text.borrow_mut().clear();
         self.pinned_float.set_visible(false);
         self.current_agent.borrow_mut().take();
         self.current_agent_view.borrow_mut().take();
@@ -8287,6 +8295,29 @@ impl ChatPane {
         card.apply_trailing();
     }
 
+    /// Keep what a shell call printed, when the update reports it: the
+    /// adapter's own shell tool says it in `_meta.terminal_output`, the
+    /// whole capture at the end, which a later update's content (the same
+    /// terminal) then redraws the card with.
+    fn note_terminal_output(
+        &self,
+        id: &str,
+        meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) {
+        let Some(data) = meta
+            .and_then(|meta| meta.get("terminal_output"))
+            .and_then(|output| output.get("data"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        self.terminal_text
+            .borrow_mut()
+            .entry(id.to_string())
+            .or_default()
+            .push_str(data);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn upsert_tool_card(
         &self,
@@ -8320,6 +8351,8 @@ impl ChatPane {
         }
         let marked = id.clone();
         let mut cards = self.tool_cards.borrow_mut();
+        // What the adapter's own shell call printed, when it has said.
+        let terminal_text = self.terminal_text.borrow().get(&id).cloned();
         let card = cards.entry(id).or_insert_with(|| {
             // One line on the timeline, Claude Code's shape: the dot on the
             // rail says how the call went, the title says what it was, and
@@ -8648,7 +8681,13 @@ impl ChatPane {
         // the turn streams. So: rebuild when the snapshot actually differs,
         // and leave the card completely alone when it does not.
         if let Some(content) = content {
-            let signature = content_signature(content);
+            let mut signature = content_signature(content);
+            // The terminal's output comes in `_meta`, beside a content that
+            // stays the same terminal: what it printed is part of what the
+            // card shows, so its arrival redraws it.
+            if let Some(text) = &terminal_text {
+                signature.push(format!("terminal-output\u{0}{}", text.len()));
+            }
             let unchanged = card.signature.borrow().as_ref() == Some(&signature);
             if !unchanged {
                 *card.signature.borrow_mut() = Some(signature);
@@ -8680,7 +8719,7 @@ impl ChatPane {
                             command_input_line(&name, card.cmd_input.borrow().as_ref())
                         })
                         .unwrap_or(title_full);
-                    let output = content
+                    let mut output = content
                         .iter()
                         .filter_map(|item| match item {
                             ToolCallContent::Content(block) => content_text(&block.content),
@@ -8688,6 +8727,13 @@ impl ChatPane {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    // The adapter's own shell tool: a terminal in the
+                    // content, and what it printed reported beside it.
+                    if output.trim().is_empty() {
+                        if let Some(text) = &terminal_text {
+                            output = text.clone();
+                        }
+                    }
                     // The IDE's own command tools answer in JSON, for the
                     // agent; OUT is what the command printed, for the user.
                     let output = mcp_tool_name(&card.title_full.borrow())
@@ -11083,6 +11129,7 @@ impl ChatPane {
                 // card deliberately don't finalize — they arrive while
                 // later text is already streaming.
                 self.finalize_stream();
+                self.note_terminal_output(&call.tool_call_id.to_string(), call.meta.as_ref());
                 self.upsert_tool_card(
                     call.tool_call_id.to_string(),
                     Some(call.title.clone()),
@@ -11134,6 +11181,7 @@ impl ChatPane {
                         None => {}
                     }
                 }
+                self.note_terminal_output(&id, update.meta.as_ref());
                 self.upsert_tool_card(
                     update.tool_call_id.to_string(),
                     update.fields.title.clone(),
@@ -11774,13 +11822,39 @@ impl ChatPane {
 
         // A shell call whose output carries ANSI — the case a plain wrapped
         // label rendered as literal escape bytes.
-        let mut shell = ToolCall::new("probe-shell", PROBE_SHELL_COMMAND);
-        shell.kind = ToolKind::Execute;
-        shell.status = ToolCallStatus::Completed;
-        shell.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-            TextContent::new(PROBE_SHELL_OUTPUT),
-        )))];
-        self.render_update(SessionUpdate::ToolCall(shell));
+        // The adapter's own shell tool, as it reports one (a real session's
+        // updates, the command and its output aside): a terminal in the
+        // content, the output in `_meta.terminal_output`, the exit in
+        // `_meta.terminal_exit`. This fixture once carried the output as a
+        // text block, which the adapter never sends, and so no shot showed
+        // the OUT that every real one lacked (2026-10-11).
+        let terminal = serde_json::json!([{ "type": "terminal", "terminalId": "probe-shell" }]);
+        for update in [
+            serde_json::json!({
+                "sessionUpdate": "tool_call", "toolCallId": "probe-shell",
+                "title": PROBE_SHELL_COMMAND, "kind": "execute", "content": terminal,
+                "rawInput": { "command": PROBE_SHELL_COMMAND },
+                "_meta": { "claudeCode": { "toolName": "Bash" },
+                           "terminal_info": { "terminal_id": "probe-shell" } },
+            }),
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "probe-shell",
+                "_meta": { "terminal_output": { "terminal_id": "probe-shell",
+                                                "data": PROBE_SHELL_OUTPUT } },
+            }),
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "probe-shell",
+                "status": "completed", "content": terminal,
+                "_meta": { "claudeCode": { "toolName": "Bash" },
+                           "terminal_exit": { "terminal_id": "probe-shell",
+                                              "exit_code": 0, "signal": null } },
+            }),
+        ] {
+            match serde_json::from_value::<SessionUpdate>(update) {
+                Ok(update) => self.render_update(update),
+                Err(e) => tracing::warn!("probe: the shell fixture did not parse: {e}"),
+            }
+        }
         self.expand_tool_card_for_probe("probe-shell");
 
         // An edit call carrying a diff — the syntax-highlighting surface.
