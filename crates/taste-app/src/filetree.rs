@@ -4006,6 +4006,7 @@ impl FileTree {
             return;
         };
         let show_ignored = *self.show_ignored.borrow();
+        let synced = std::sync::Arc::new(self.sync_ignored.borrow().clone());
         let worktree = self.worktree();
         let ghosts_root = (!self.read_only()).then(|| self.view_root());
         let mut targets: Vec<(gtk::gio::ListStore, PathBuf, Option<PathBuf>)> =
@@ -4029,13 +4030,14 @@ impl FileTree {
         for (store, dir, ghosts_root) in targets {
             let weak = store.downgrade();
             let worktree = worktree.clone();
+            let synced = synced.clone();
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 // The ghosts' existence checks are filesystem reads too, so
                 // they come along rather than running on the main thread.
                 let ghosts = ghosts_root
                     .map(|root| ghost_candidates(&worktree.files(), &root))
                     .unwrap_or_default();
-                scan_dir_nodes(&worktree, &dir, show_ignored, &ghosts, None)
+                scan_dir_nodes(&worktree, &dir, show_ignored, &synced, &ghosts, None)
             });
             glib::spawn_future_local(async move {
                 let Ok(nodes) = handle.await else { return };
@@ -4900,7 +4902,14 @@ impl FileTree {
                 rebase_ended = self.abort_button.is_visible() && !snapshot.rebasing;
                 *self.status.borrow_mut() = snapshot.status;
                 *self.stashed.borrow_mut() = snapshot.stashed;
+                // What syncs is what the tree lists of what is ignored: a
+                // change to it is a change of rows, so they are listed again.
+                let synced_moved = *self.sync_ignored.borrow() != snapshot.sync_ignored;
                 *self.sync_ignored.borrow_mut() = snapshot.sync_ignored;
+                if synced_moved {
+                    let tree = self.clone();
+                    glib::idle_add_local_once(move || tree.refresh_tree());
+                }
                 *self.submodule_heads.borrow_mut() = snapshot.submodules;
                 self.ignore_rules.set(snapshot.ignore_rules);
                 self.sync_filter_counts();
@@ -6999,6 +7008,7 @@ impl FileTree {
         // paths relative to a different repository).
         self.rows.borrow_mut().clear();
         let show_ignored = *self.show_ignored.borrow();
+        let synced = std::sync::Arc::new(self.sync_ignored.borrow().clone());
         // Search shapes the tree: matches-only filters to matching files
         // (autoexpanded); ghost mode keeps every file and dims the rest.
         let search = self.search_view.borrow().clone();
@@ -7028,11 +7038,13 @@ impl FileTree {
         let root_store = gtk::gio::ListStore::new::<BoxedAnyObject>();
         let child_ghosts = ghosts.clone();
         let child_worktree = worktree.clone();
+        let child_synced = synced.clone();
         fill_dir_store_async(
             &root_store,
             worktree,
             view_root,
             show_ignored,
+            synced,
             ghosts,
             filter.as_ref().map(|f| (**f).clone()),
         );
@@ -7055,6 +7067,7 @@ impl FileTree {
                     child_worktree.clone(),
                     node.path.clone(),
                     show_ignored,
+                    child_synced.clone(),
                     child_ghosts.clone(),
                     child_filter.as_ref().map(|f| (**f).clone()),
                 );
@@ -8177,6 +8190,7 @@ fn scan_dir_nodes(
     worktree: &Worktree,
     dir: &Path,
     show_ignored: bool,
+    synced: &taste_devcontainer::worktree::SyncIgnored,
     ghosts: &[Ghost],
     filter: Option<&HashSet<PathBuf>>,
 ) -> Vec<FileNode> {
@@ -8219,7 +8233,17 @@ fn scan_dir_nodes(
                 path: dir.join(&entry.name),
                 ghost: false,
             })
-            .filter(|node| !ignored.contains(&node.path))
+            // Ignored and hidden — unless it syncs anyway, which makes it
+            // part of both working copies: listed, wearing its mark
+            // (`taste_git::sync_ignored`; David, 2026-10-11: "Shouldn't I
+            // see the data folder?").
+            .filter(|node| {
+                !ignored.contains(&node.path)
+                    || node
+                        .path
+                        .strip_prefix(worktree.root())
+                        .is_ok_and(|rel| synced.shows(rel, node.is_dir))
+            })
             .collect()
     };
     nodes.retain(|node| filter.map(|f| f.contains(&node.path)).unwrap_or(true));
@@ -8299,13 +8323,21 @@ fn fill_dir_store_async(
     worktree: Worktree,
     dir: PathBuf,
     show_ignored: bool,
+    synced: std::sync::Arc<taste_devcontainer::worktree::SyncIgnored>,
     ghosts: Ghosts,
     filter: Option<HashSet<PathBuf>>,
 ) {
     let weak = store.downgrade();
     let handle = crate::runtime::runtime().spawn_blocking(move || {
         let ghosts = ghosts.get(&worktree);
-        scan_dir_nodes(&worktree, &dir, show_ignored, ghosts, filter.as_ref())
+        scan_dir_nodes(
+            &worktree,
+            &dir,
+            show_ignored,
+            &synced,
+            ghosts,
+            filter.as_ref(),
+        )
     });
     glib::spawn_future_local(async move {
         let Ok(nodes) = handle.await else { return };
@@ -8470,6 +8502,75 @@ mod tests {
     /// listed as the tree lists a folder it opens, the folder that is not
     /// there yet holds `devcontainer.json` and the Containerfile, and the
     /// root holds the folder (2026-10-05).
+    /// An ignored folder that syncs anyway is listed though ignored files
+    /// are hidden, and so is what syncs inside it; another ignored folder
+    /// stays hidden. Through the files service's git, as a checkout in a VM
+    /// is listed.
+    #[test]
+    fn an_ignored_folder_that_syncs_is_listed() {
+        let root =
+            std::env::temp_dir().join(format!("taste-synced-listing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "data/\nbuild/\n").unwrap();
+        std::fs::create_dir_all(root.join("data/raw")).unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("data/raw/a.csv"), "1").unwrap();
+        std::fs::write(root.join("README.md"), "r").unwrap();
+        let worktree = super::Worktree::Remote {
+            files: taste_core::files::Files::Local,
+            path: root.clone(),
+            after_ref_change: None,
+        };
+        let mut synced = taste_devcontainer::worktree::SyncIgnored::default();
+        synced.toggled.dirs.insert(std::path::PathBuf::from("data"));
+        synced.ignored_dirs.insert(std::path::PathBuf::from("data"));
+        let names = |dir: &std::path::Path| -> Vec<String> {
+            let mut names: Vec<String> =
+                super::scan_dir_nodes(&worktree, dir, false, &synced, &[], None)
+                    .into_iter()
+                    .map(|node| {
+                        node.path
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&root), [".gitignore", "README.md", "data"]);
+        assert_eq!(names(&root.join("data")), ["raw"]);
+        // Nothing syncs: the folder is hidden, as any ignored one is.
+        let none = taste_devcontainer::worktree::SyncIgnored::default();
+        let listed: Vec<String> = super::scan_dir_nodes(&worktree, &root, false, &none, &[], None)
+            .into_iter()
+            .map(|node| {
+                node.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(!listed.contains(&"data".to_string()), "{listed:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_ghost_devcontainer_folder_opens_onto_its_files() {
         let root = std::env::temp_dir().join(format!("taste-ghosts-{}", std::process::id()));
@@ -8479,7 +8580,7 @@ mod tests {
         let worktree = super::Worktree::Local(root.clone());
         let ghosts = super::ghost_candidates(&taste_core::files::Files::Local, &root);
         let names = |dir: &std::path::Path| -> Vec<(String, bool, bool)> {
-            super::scan_dir_nodes(&worktree, dir, false, &ghosts, None)
+            super::scan_dir_nodes(&worktree, dir, false, &Default::default(), &ghosts, None)
                 .into_iter()
                 .map(|node| {
                     (
@@ -8993,7 +9094,14 @@ mod tests {
 
             // Before: what used to run inline in `rebuild()` / the create-func.
             let start = std::time::Instant::now();
-            let nodes = scan_dir_nodes(&Worktree::Local(dir.clone()), &dir, false, &[], None);
+            let nodes = scan_dir_nodes(
+                &Worktree::Local(dir.clone()),
+                &dir,
+                false,
+                &Default::default(),
+                &[],
+                None,
+            );
             let synchronous_walk = start.elapsed();
             assert_eq!(
                 nodes.len(),
@@ -9018,6 +9126,7 @@ mod tests {
                 Worktree::Local(dir.clone()),
                 dir.clone(),
                 false,
+                Default::default(),
                 Ghosts::new(None),
                 None,
             );
