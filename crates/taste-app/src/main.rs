@@ -466,12 +466,10 @@ fn main() -> glib::ExitCode {
                  .preview-map { color: @accent_bg_color; }\n\
                  .changed-bar { background-color: alpha(@accent_bg_color, 0.18); \
                    padding: 6px 12px; }\n\
-                 /* A notebook's kernel bar (notebook.rs), a warning: on the \
-                    insets of the kernel's controls below it, so its words \
-                    start where the cells' do and its buttons end over \
-                    Restart. */\n\
-                 .changed-bar.notebook-kernel { padding-left: 16px; \
-                   padding-right: 10px; \
+                 /* A notebook's kernel bar (notebook.rs), over the whole \
+                    page as the changed-on-disk bar is: its shape, in the \
+                    warning colour. */\n\
+                 .changed-bar.notebook-kernel { \
                    background-color: alpha(@warning_bg_color, 0.22); }\n\
                  /* The environment's startup page (startup.rs): a card for \
                     the checklist over the construction stripes, the log in \

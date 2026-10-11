@@ -125,6 +125,9 @@ struct EditorPage {
     /// A notebook's session — its kernel and its drawing — made the first
     /// time its notebook face is drawn (`crate::notebook`).
     notebook: RefCell<Option<Rc<crate::notebook::Session>>>,
+    /// Where a page's own bars go, over all of its faces and their maps,
+    /// under the changed-on-disk bar: a notebook's kernel bar.
+    notice: gtk::Box,
 }
 
 /// The widgets a review tab's judgment row is made of, so a fresh answer
@@ -3392,6 +3395,8 @@ impl Editor {
         }
         let page_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         page_box.append(&conflict_bar.widget);
+        let notice = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page_box.append(&notice);
         page_box.append(&stack);
         let tab = self.tabs.append(&page_box);
         let file_name = path
@@ -3471,6 +3476,7 @@ impl Editor {
             review,
             judgment,
             notebook: RefCell::new(None),
+            notice,
         });
         self.apply_editorconfig(&config, &page);
         self.apply_review_facts(&page);
@@ -4627,6 +4633,8 @@ impl Editor {
             on_prompt,
         );
         *page.notebook.borrow_mut() = Some(session.clone());
+        // Its kernel bar over the whole page, map and all.
+        page.notice.append(session.bar());
         // Its kernel is one of its environment's Tasks entry's.
         crate::kernels::kernels().register(&session);
         session

@@ -120,7 +120,6 @@ struct Drawing {
     run_all: gtk::Button,
     interrupt: gtk::Button,
     restart: gtk::Button,
-    banner: KernelBar,
     cells: HashMap<usize, CellParts>,
     base: DocumentBase,
     on_link: Rc<dyn Fn(&str)>,
@@ -148,6 +147,10 @@ pub struct Session {
     /// read back as the file changing under it.
     pub writing: Cell<bool>,
     kernel: RefCell<Option<Kernel>>,
+    /// The bar over the page — the notebook face and its map, and the Edit
+    /// face — while the kernel is not running (`KernelBar`); the editor puts
+    /// it in its place (`Session::bar`).
+    bar: KernelBar,
     /// The kernel has been asked for — Start Kernel, or a cell run — and
     /// is to be connected to once the task is found and running.
     wanted: Cell<bool>,
@@ -217,6 +220,7 @@ impl Session {
             buffer,
             writing: Cell::new(false),
             kernel: RefCell::new(None),
+            bar: KernelBar::new(),
             wanted: Cell::new(false),
             deferred: RefCell::new(Vec::new()),
             state: RefCell::new(state),
@@ -236,6 +240,21 @@ impl Session {
             this: RefCell::new(Weak::new()),
         });
         *session.this.borrow_mut() = Rc::downgrade(&session);
+        {
+            let weak = Rc::downgrade(&session);
+            session.bar.prompt.connect_clicked(move |_| {
+                if let Some(session) = weak.upgrade() {
+                    session.prompt_agent();
+                }
+            });
+            let weak = Rc::downgrade(&session);
+            session.bar.start.connect_clicked(move |_| {
+                if let Some(session) = weak.upgrade() {
+                    session.start_kernel();
+                }
+            });
+        }
+        session.show_state();
         {
             let changes = session.changes.clone();
             session
@@ -264,6 +283,12 @@ impl Session {
     /// Whether its cells are edited and its outputs written into the file.
     fn editable(&self) -> bool {
         self.writable && self.runnable()
+    }
+
+    /// The bar that says the kernel is not running, for the editor to put
+    /// over the whole page.
+    pub fn bar(&self) -> &gtk::Revealer {
+        &self.bar.widget
     }
 
     /// The environment it runs in.
@@ -465,7 +490,6 @@ impl Session {
         bar.append(&run_all);
         bar.append(&interrupt);
         bar.append(&restart);
-        let banner = KernelBar::new();
 
         let column = gtk::Box::new(gtk::Orientation::Vertical, 14);
         column.set_margin_top(16);
@@ -545,7 +569,6 @@ impl Session {
         if cell_list.is_empty() {
             column.append(&notice("This notebook has no cells."));
         }
-        root.append(&banner.widget);
         root.append(&bar);
         root.append(&column);
 
@@ -575,22 +598,6 @@ impl Session {
                 }
             });
         }
-        {
-            let weak = Rc::downgrade(self);
-            banner.prompt.connect_clicked(move |_| {
-                if let Some(session) = weak.upgrade() {
-                    session.prompt_agent();
-                }
-            });
-        }
-        {
-            let weak = Rc::downgrade(self);
-            banner.start.connect_clicked(move |_| {
-                if let Some(session) = weak.upgrade() {
-                    session.start_kernel();
-                }
-            });
-        }
         // Overtaken by a newer rendering while this one was parsed: it is
         // drawn, and dropped by the editor, and it is not the one runs draw
         // into.
@@ -603,7 +610,6 @@ impl Session {
             run_all,
             interrupt,
             restart,
-            banner,
             cells,
             base,
             on_link,
@@ -1349,10 +1355,6 @@ impl Session {
     }
 
     fn show_state(&self) {
-        let drawing = self.drawing.borrow();
-        let Some(drawing) = drawing.as_ref() else {
-            return;
-        };
         let state = self.state.borrow();
         let runnable = self.runnable();
         // The bar's sentence, and which of its answers it offers: Start
@@ -1400,25 +1402,27 @@ impl Session {
             State::Stopped { .. } => (Some("The kernel stopped.".to_string()), true, true),
         };
         let running = matches!(*state, State::Busy | State::Starting | State::Restarting);
-        drawing.run_all.set_sensitive(runnable);
-        drawing.interrupt.set_sensitive(runnable && running);
-        drawing
-            .restart
-            .set_sensitive(runnable && !matches!(*state, State::Off));
-        drawing.banner.start.set_visible(start);
-        drawing.banner.prompt.set_visible(prompt);
+        if let Some(drawing) = self.drawing.borrow().as_ref() {
+            drawing.run_all.set_sensitive(runnable);
+            drawing.interrupt.set_sensitive(runnable && running);
+            drawing
+                .restart
+                .set_sensitive(runnable && !matches!(*state, State::Off));
+        }
+        self.bar.start.set_visible(start);
+        self.bar.prompt.set_visible(prompt);
         // The one answer offered is the suggested one.
         if start {
-            drawing.banner.prompt.remove_css_class("suggested-action");
+            self.bar.prompt.remove_css_class("suggested-action");
         } else {
-            drawing.banner.prompt.add_css_class("suggested-action");
+            self.bar.prompt.add_css_class("suggested-action");
         }
         match said {
             Some(said) => {
-                drawing.banner.title.set_label(&said);
-                drawing.banner.widget.set_reveal_child(true);
+                self.bar.title.set_label(&said);
+                self.bar.widget.set_reveal_child(true);
             }
-            None => drawing.banner.widget.set_reveal_child(false),
+            None => self.bar.widget.set_reveal_child(false),
         }
     }
 
@@ -2031,7 +2035,9 @@ fn output_widget(
     }
 }
 
-/// The bar at the top of a notebook whose kernel is not running: that it is
+/// The bar over a notebook's page — above its face and its map, and above
+/// the Edit face, as the changed-on-disk bar stands — whose kernel is not
+/// running: that it is
 /// not, or what it said when it would not start, Start Kernel, and — for a
 /// failure — Prompt Agent; gone while the kernel runs as it should (David,
 /// 2026-10-11: "Show a warning banner at the top of a Jupyter document that
