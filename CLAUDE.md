@@ -155,7 +155,7 @@ before the reload for one whose earlier page is taller to check that a reload
 holds the place in the document rather than the pixel) opens it on its preview face in front,
 which is how the preview's rendering — its pictures, its tables, its
 path links — gets looked at; `build-aux/headless/fixtures/markdown-table.md`
-is a short document with a table and path links for exactly that, and
+is a short document with a table and path links for exactly that (`sample.ipynb` and `figures.ipynb` beside it are notebooks, the second made by running real matplotlib and Seaborn cells through the kernel bridge: a PNG, a retina PNG, an SVG, and the objects interface; `TASTE_PROBE_NOTEBOOK=failed` poses the kernel-failed banner, and `TASTE_PROBE_PREVIEW_AT=0.5` scrolls any preview that far down before the shot), and
 a SHORT document is the case to shoot, since a two-block preview once
 came out as a blank window while a long one rendered; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
 the search's Tab stop on that section, for the lit lozenge and an empty

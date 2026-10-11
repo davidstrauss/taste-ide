@@ -815,6 +815,12 @@ pub(crate) fn author_prompt() -> String {
      Containerfile instead. If the checkout has a Taskfile.yml (taskfile.dev), install Task \
      in the Containerfile too (Fedora's package is go-task; either binary name works): the \
      IDE lists and runs the project's tasks through it.\n\
+     If the checkout has Jupyter notebooks (.ipynb files): install ipykernel, which brings \
+     jupyter_client, into the Python the project uses, and the packages the notebooks import. \
+     The IDE runs a notebook's kernel in this container with the first of .venv/bin/python, \
+     venv/bin/python, python3, and python that can import jupyter_client, then starts the \
+     kernel the notebook's metadata names (python3 when it names none); a kernel of another \
+     language needs that kernel installed too.\n\
      If the project runs podman or docker itself (its build, tests, or tasks call it): \
      install podman, fuse-overlayfs, and passt; set \"privileged\": true in devcontainer.json (the \
      IDE grants exactly what nested podman needs for it, and VS Code reads it too); after the \
@@ -955,6 +961,17 @@ pub(crate) fn repair_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The authoring prompt says what a notebook needs of the container,
+    /// in the order the IDE looks for it, so a first environment can run
+    /// the project's notebooks.
+    #[test]
+    fn the_authoring_prompt_says_what_notebooks_need() {
+        let prompt = author_prompt();
+        assert!(prompt.contains("ipykernel"));
+        assert!(prompt.contains("jupyter_client"));
+        assert!(prompt.contains(".venv/bin/python, venv/bin/python, python3, and python"));
+    }
 
     #[test]
     fn the_touch_countdown_counts_down_and_then_waits() {

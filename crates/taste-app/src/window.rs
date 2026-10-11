@@ -1507,6 +1507,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             prompt_agent(&env, prompt, Some(attachment));
         });
     }
+    // A notebook whose kernel would not start: what it said, handed to
+    // the agent of the environment the notebook is in.
+    {
+        let prompt_agent = prompt_agent.clone();
+        editor.set_on_prompt_agent(Rc::new(move |env, prompt, attachment| {
+            prompt_agent(&env, prompt, attachment)
+        }));
+    }
     toolbar_view.set_content(Some(&surfaces));
 
     // Toasts: transient action outcomes (commit/push/sync failures and the

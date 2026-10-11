@@ -14,9 +14,15 @@
 //! it out of `/`; a launch that skipped confinement — a bug in a caller, or
 //! someone running it by hand — gets a refusal, not a renderer.
 //!
+//! It also draws plain SVG — a notebook's figure, as matplotlib and
+//! Seaborn write it with `figure_formats = ['svg']` — for the same reason:
+//! it is a document a project chose, parsed by usvg, and the IDE's process
+//! is no place for that.
+//!
 //! Protocol, on stdin and stdout:
 //!   ← `{"ready": true}` once the fonts are read, or `{"error": "…"}`
-//!   → `{"source": "…", "dark": bool, "family": "…", "scale": n}`
+//!   → `{"source": "…", "dark": bool, "family": "…", "scale": n}`, with
+//!     `"kind": "svg"` when `source` is an SVG document rather than Mermaid
 //!   ← `{"width": w, "height": h, "logical_width": x}` and then exactly
 //!     `w * h * 4` bytes of premultiplied RGBA, or `{"error": "…"}`
 //! One request at a time; the process lives until stdin closes.
@@ -33,10 +39,17 @@ struct Request {
     dark: bool,
     family: String,
     scale: f32,
+    /// `"svg"` for an SVG document; Mermaid otherwise.
+    #[serde(default)]
+    kind: String,
 }
 
 /// The longest source accepted: a diagram, not a document.
 const MAX_SOURCE: usize = 64 * 1024;
+/// The longest SVG accepted. A figure with an image in it carries that
+/// image inline, so this is larger than a diagram's source, and still a
+/// figure's size rather than a document's.
+const MAX_SVG: usize = 16 * 1024 * 1024;
 
 fn main() {
     let stdout = std::io::stdout();
@@ -70,22 +83,24 @@ fn main() {
                 continue;
             }
         };
-        if request.source.len() > MAX_SOURCE {
+        let svg = request.kind == "svg";
+        let limit = if svg { MAX_SVG } else { MAX_SOURCE };
+        if request.source.len() > limit {
             say(
                 &mut out,
-                serde_json::json!({ "error": format!("the diagram is longer than {} KiB", MAX_SOURCE / 1024) }),
+                serde_json::json!({ "error": format!("the {} is longer than {} KiB", if svg { "picture" } else { "diagram" }, limit / 1024) }),
             );
             continue;
         }
         // A panic in the renderer is one diagram's failure, said as one,
         // not the end of the process every later diagram needs.
         let drawn = std::panic::catch_unwind(|| {
-            render::render(
-                &request.source,
-                request.dark,
-                &request.family,
-                request.scale.clamp(1.0, 4.0),
-            )
+            let scale = request.scale.clamp(1.0, 4.0);
+            if svg {
+                render::render_svg(&request.source, &request.family, scale)
+            } else {
+                render::render(&request.source, request.dark, &request.family, scale)
+            }
         })
         .unwrap_or_else(|_| Err("the renderer failed on this diagram".to_string()));
         match drawn {

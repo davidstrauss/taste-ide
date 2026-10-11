@@ -27,6 +27,10 @@
 //! Finished pictures are cached by source, theme, face, and scale, so a
 //! preview that redraws on every edit redraws an unchanged diagram from
 //! memory, without the flash of an empty box.
+//!
+//! The same helper draws a notebook's SVG figures ([`svg_figure`]):
+//! matplotlib and Seaborn write SVG when a notebook asks them to, and an
+//! SVG is a document the project chose, parsed by the same usvg.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -180,9 +184,11 @@ impl Helper {
         dark: bool,
         family: &str,
         scale: f32,
+        kind: Kind,
     ) -> Result<Raster, (String, bool)> {
         let request = serde_json::json!({
             "source": source, "dark": dark, "family": family, "scale": scale,
+            "kind": kind.word(),
         });
         writeln!(self.stdin, "{request}")
             .and_then(|()| self.stdin.flush())
@@ -236,14 +242,20 @@ fn checked_size(header: &serde_json::Value) -> Result<(u64, u64, f32), String> {
 /// Draw through the helper, starting it if it is not running; a helper
 /// that fails mid-request is discarded, and the next request starts
 /// another. Blocking: called off the main thread.
-fn render(source: &str, dark: bool, family: &str, scale: f32) -> Result<Raster, String> {
+fn render(
+    source: &str,
+    dark: bool,
+    family: &str,
+    scale: f32,
+    kind: Kind,
+) -> Result<Raster, String> {
     let mut slot = HELPER.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_none() {
         *slot = Some(Helper::start(family)?);
     }
     let helper = slot.as_mut().expect("started above");
     helper
-        .draw(source, dark, family, scale)
+        .draw(source, dark, family, scale, kind)
         .map_err(|(why, in_step)| {
             if !in_step {
                 // Gone, or out of step: the next diagram starts a fresh
@@ -261,6 +273,25 @@ struct Key {
     dark: bool,
     family: String,
     scale: i32,
+    kind: Kind,
+}
+
+/// What the helper is asked to draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Kind {
+    /// A ```mermaid block's source.
+    Mermaid,
+    /// An SVG document: a notebook's figure (`crate::notebook`).
+    Svg,
+}
+
+impl Kind {
+    fn word(self) -> &'static str {
+        match self {
+            Kind::Mermaid => "mermaid",
+            Kind::Svg => "svg",
+        }
+    }
 }
 
 /// A finished picture: the texture, the size it stands for, and what it
@@ -349,6 +380,7 @@ pub fn diagram(
             dark: adw::StyleManager::default().is_dark(),
             family: interface_family(),
             scale,
+            kind: Kind::Mermaid,
         };
         if let Some(drawn) = cached(&key) {
             show(holder, &drawn, &key.source);
@@ -368,7 +400,13 @@ pub fn diagram(
             let job = key.clone();
             let rendered = crate::runtime::runtime()
                 .spawn_blocking(move || {
-                    render(&job.source, job.dark, &job.family, job.scale as f32)
+                    render(
+                        &job.source,
+                        job.dark,
+                        &job.family,
+                        job.scale as f32,
+                        job.kind,
+                    )
                 })
                 .await
                 .unwrap_or_else(|e| Err(format!("the renderer stopped: {e}")));
@@ -433,6 +471,86 @@ pub fn diagram(
     holder.connect_destroy(move |_| {
         if let Some(handler) = handler.take() {
             adw::StyleManager::default().disconnect(handler);
+        }
+    });
+    holder.upcast()
+}
+
+/// An SVG figure — a notebook output's `image/svg+xml` — drawn by the
+/// helper, at the window's scale and never larger than the size the SVG
+/// states. Held until drawn (`hold`), like a diagram; one that cannot be
+/// drawn says why where it would have been.
+pub fn svg_figure(svg: &str, hold: Option<crate::markdown_view::Hold>) -> gtk::Widget {
+    let holder = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    holder.set_hexpand(true);
+    let key = Key {
+        source: svg.to_string(),
+        dark: false,
+        family: interface_family(),
+        scale: display_scale(),
+        kind: Kind::Svg,
+    };
+    if let Some(drawn) = cached(&key) {
+        show(&holder, &drawn, "figure");
+        if let Some(clamp) = holder.first_child() {
+            clamp.set_halign(gtk::Align::Start);
+        }
+        return holder.upcast();
+    }
+    holder.append(&drawing());
+    let weak = holder.downgrade();
+    glib::spawn_future_local(async move {
+        let _hold = hold;
+        let job = key.clone();
+        let rendered = crate::runtime::runtime()
+            .spawn_blocking(move || {
+                render(
+                    &job.source,
+                    job.dark,
+                    &job.family,
+                    job.scale as f32,
+                    job.kind,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("the renderer stopped: {e}")));
+        let Some(holder) = weak.upgrade() else { return };
+        match rendered {
+            Ok(raster) => {
+                let bytes = raster.rgba.len();
+                let texture = gtk::gdk::MemoryTexture::new(
+                    raster.width as i32,
+                    raster.height as i32,
+                    gtk::gdk::MemoryFormat::R8g8b8a8Premultiplied,
+                    &glib::Bytes::from_owned(raster.rgba),
+                    raster.width as usize * 4,
+                );
+                let drawn = Drawn {
+                    texture: texture.upcast(),
+                    width: raster.logical_width,
+                    bytes,
+                };
+                keep(key, drawn.clone());
+                show(&holder, &drawn, "figure");
+                // An output sits at the start of its column, as Jupyter
+                // draws it, not centred as a diagram is.
+                if let Some(clamp) = holder.first_child() {
+                    clamp.set_halign(gtk::Align::Start);
+                }
+            }
+            Err(why) => {
+                tracing::info!("an SVG figure was not drawn: {why}");
+                clear(&holder);
+                holder.append(
+                    &gtk::Label::builder()
+                        .label(format!("This SVG figure could not be drawn: {why}"))
+                        .xalign(0.0)
+                        .wrap(true)
+                        .wrap_mode(gtk::pango::WrapMode::WordChar)
+                        .css_classes(["caption", "dim-label"])
+                        .build(),
+                );
+            }
         }
     });
     holder.upcast()

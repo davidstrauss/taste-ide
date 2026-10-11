@@ -42,12 +42,14 @@ mod hover;
 mod inset;
 mod intervention;
 mod issue_pill;
+mod kernel;
 mod languages;
 mod logview;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
 mod markdown_view;
 mod mermaid;
+mod notebook;
 mod notify;
 mod orchestration;
 mod pages_menu;

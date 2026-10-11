@@ -1111,6 +1111,38 @@ no-op at every other width.
   content is untrusted, and raw HTML in documents renders as inert, dimmed
   text.
 
+- **A Jupyter notebook opens as a notebook, and runs in its environment**
+  (2026-10-11; `notebook.rs`, `kernel.rs`, `kernel_bridge.py`). The
+  `.ipynb` is the page's buffer like any file, and its JSON is the Edit
+  face; the notebook face draws its cells into the same preview holder a
+  Markdown preview uses, so it is double-buffered and has the overview
+  strip. Markdown cells render through `markdown_view`; code cells are
+  editable, highlighted in the notebook's language, and run with their
+  gutter button, Shift+Enter (and on), or Ctrl+Enter (in place); outputs
+  are text with its ANSI colour, Markdown, and figures — PNG and JPEG, a
+  retina PNG at the width its metadata gives, and SVG drawn by the
+  confined `taste-diagram` helper, which is how matplotlib's and Seaborn's
+  every output format is covered. HTML is named, not drawn; a DataFrame's
+  text beside its HTML is what shows. A run's outputs and count are
+  written back into the buffer when it finishes — one undoable edit, kept
+  by a save — and only into a cell whose source is still what ran.
+  **The kernel runs in the notebook's environment's container**, through
+  `podman exec` as rust-analyzer does, and is refused when there is no
+  container (David: "I expect that to happen in the sandboxed
+  workspace"). **The runtime is the container's**: the launcher takes the
+  first of the project's `.venv/bin/python`, `venv/bin/python`,
+  `python3`, and `python` that can import `jupyter_client`, and the bridge
+  — the one thing the IDE brings, a page of glue — starts the notebook's
+  kernel with it and relays the Jupyter messaging protocol as JSON lines
+  over the exec's stdio. The kernel's ZeroMQ stays on the container's
+  loopback. It starts on the first Run, never on opening; dropping the
+  page ends the bridge's input, which shuts the kernel down. A kernel that
+  cannot start raises a banner whose Prompt Agent hands what it said to
+  that environment's agent to fix in place (David: "give me a button in a
+  banner for the editor to prompt the agent to fix what the container
+  needs in place"), and the devcontainer authoring prompt says what
+  notebooks need. Another environment's notebook is read, not run.
+
 ### Bottom: console
 
 The **machine room** for the environment the panes are aimed at: what

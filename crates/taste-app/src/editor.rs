@@ -122,6 +122,9 @@ struct EditorPage {
     /// A review tab's judgment row: the mergedness sentence, and the two
     /// buttons that settle it. `None` on every other kind of tab.
     judgment: Option<Judgment>,
+    /// A notebook's session — its kernel and its drawing — made the first
+    /// time its notebook face is drawn (`crate::notebook`).
+    notebook: RefCell<Option<Rc<crate::notebook::Session>>>,
 }
 
 /// The widgets a review tab's judgment row is made of, so a fresh answer
@@ -623,6 +626,13 @@ pub struct Editor {
     /// What a task tab's Prompt Agent does (`set_on_prompt_task`).
     #[allow(clippy::type_complexity)]
     on_prompt_task: RefCell<Option<Rc<dyn Fn(taste_core::environment::EnvironmentId, String)>>>,
+    /// Where a notebook's Prompt Agent goes (`set_on_prompt_agent`).
+    #[allow(clippy::type_complexity)]
+    on_prompt_agent: RefCell<
+        Option<
+            Rc<dyn Fn(taste_core::environment::EnvironmentId, String, Option<(String, String)>)>,
+        >,
+    >,
     /// The startup page's tab while a start is on screen: the one the
     /// selection is held to (`show_startup`).
     startup_tab: RefCell<Option<adw::TabPage>>,
@@ -813,6 +823,7 @@ impl Editor {
             surfaces: RefCell::new(HashMap::new()),
             task_prompts: RefCell::new(HashMap::new()),
             on_prompt_task: RefCell::new(None),
+            on_prompt_agent: RefCell::new(None),
             startup_tab: RefCell::new(None),
             headless: RefCell::new(HashMap::new()),
             git_dirty: RefCell::new(HashMap::new()),
@@ -2108,7 +2119,7 @@ impl Editor {
             .map(|(path, page)| {
                 if page.changes_view.get() {
                     "view-dual-symbolic"
-                } else if is_markdown(path) && !page.raw_source.get() {
+                } else if has_preview(path) && !page.raw_source.get() {
                     "x-office-document-symbolic"
                 } else {
                     "document-edit-symbolic"
@@ -2132,7 +2143,7 @@ impl Editor {
         let Some((path, page)) = self.selected() else {
             return;
         };
-        let is_md = is_markdown(&path);
+        let is_md = has_preview(&path);
         let changes = page.changes_view.get();
         let preview = is_md && !page.raw_source.get() && !changes;
         let list = gtk::ListBox::builder()
@@ -2712,6 +2723,25 @@ impl Editor {
             editor.set_changes_view(&path, &page, false);
             editor.refresh_markdown_mode(&path, &page);
             editor.sync_toggle_to_selection();
+            // `TASTE_PROBE_PREVIEW_AT=<0..1>`: scrolled that far down once
+            // its pictures are in, for the part of a long document a pane's
+            // height does not reach.
+            if let Some(at) = std::env::var("TASTE_PROBE_PREVIEW_AT")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+            {
+                let holder = page.preview_holder.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
+                    if let Some(scroller) = holder
+                        .ancestor(gtk::ScrolledWindow::static_type())
+                        .and_downcast::<gtk::ScrolledWindow>()
+                    {
+                        let adjustment = scroller.vadjustment();
+                        let top = (adjustment.upper() - adjustment.page_size()).max(0.0);
+                        adjustment.set_value(top * at.clamp(0.0, 1.0));
+                    }
+                });
+            }
         });
     }
 
@@ -3393,8 +3423,9 @@ impl Editor {
             eol_override: Cell::new(None),
             bom: Cell::new(false),
             // Markdown defaults to the editing interface (raw source);
-            // the preview is opt-in and read-only.
-            raw_source: Cell::new(true),
+            // the preview is opt-in and read-only. A notebook opens as a
+            // notebook: its JSON is the face nobody reads first.
+            raw_source: Cell::new(!is_notebook(path)),
             plain: Cell::new(!highlighting_ok(&content)),
             suggestion: RefCell::new(None),
             restyle_queued: Cell::new(false),
@@ -3417,6 +3448,7 @@ impl Editor {
             origin_safe_mode: owner.as_ref().map(|(_, _, safe_mode)| *safe_mode),
             review,
             judgment,
+            notebook: RefCell::new(None),
         });
         self.apply_editorconfig(&config, &page);
         self.apply_review_facts(&page);
@@ -3474,6 +3506,16 @@ impl Editor {
                     return;
                 };
                 if !editor.wysiwyg_active(&path, &page) || page.restyle_queued.get() {
+                    return;
+                }
+                // A notebook writing its own outputs or a cell's source has
+                // its drawing already; redrawing would only lose the place.
+                if page
+                    .notebook
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| session.writing.get())
+                {
                     return;
                 }
                 // Coalesce typing bursts: restyle at most ~12×/sec instead
@@ -4398,6 +4440,12 @@ impl Editor {
     }
 
     fn wysiwyg_active(&self, path: &Path, page: &EditorPage) -> bool {
+        // A notebook is drawn whatever its size and however long its lines
+        // — a picture output is one line of base64 — since it is parsed
+        // off this thread (`crate::notebook`).
+        if is_notebook(path) {
+            return !page.raw_source.get();
+        }
         is_markdown(path)
             && !page.raw_source.get()
             && !page.plain.get()
@@ -4414,17 +4462,23 @@ impl Editor {
             page.buffer.set_language(None);
             page.view.set_show_line_numbers(true);
             page.view.set_editable(page.foreign_env.is_none());
-            return;
+            // A notebook's face is drawn whatever its source's lines —
+            // its pictures are base64 on one line each — and anything
+            // else plain has no other face.
+            if !is_notebook(path) {
+                return;
+            }
+        } else {
+            // The edit face is always a real, highlighted source editor.
+            let language = sourceview5::LanguageManager::default()
+                .guess_language(Some(path.to_string_lossy().as_ref()), None);
+            page.buffer.set_language(language.as_ref());
+            page.view.set_show_line_numbers(true);
+            // Another environment's file is read to the letter and edited
+            // not at all: the buffer is not editable, so there is no way to
+            // type work that a save would then have to refuse.
+            page.view.set_editable(page.foreign_env.is_none());
         }
-        // The edit face is always a real, highlighted source editor.
-        let language = sourceview5::LanguageManager::default()
-            .guess_language(Some(path.to_string_lossy().as_ref()), None);
-        page.buffer.set_language(language.as_ref());
-        page.view.set_show_line_numbers(true);
-        // Another environment's file is read to the letter and edited not
-        // at all: the buffer is not editable, so there is no way to type
-        // work that a save would then have to refuse.
-        page.view.set_editable(page.foreign_env.is_none());
         if self.wysiwyg_active(path, page) {
             // Full-quality preview: pulldown-cmark rendered into native
             // widgets, with copy affordances on code spans and blocks.
@@ -4459,8 +4513,12 @@ impl Editor {
             // clamped (David, 2026-10-09: "Ensure Markdown preview updates
             // get double-buffered to avoid jank"). The first rendering has
             // nothing to stand behind, and shows as it fills.
-            let (fresh, ready) =
-                crate::markdown_view::render_document_buffered(&text, on_link, images);
+            let (fresh, ready) = if is_notebook(path) {
+                self.notebook_session(path, page)
+                    .render(text, images, on_link)
+            } else {
+                crate::markdown_view::render_document_buffered(&text, on_link, images)
+            };
             let generation = page.preview_generation.get() + 1;
             page.preview_generation.set(generation);
             let holder = page.preview_holder.clone();
@@ -4507,6 +4565,43 @@ impl Editor {
                     "edit"
                 });
         }
+    }
+
+    /// The page's notebook session, made the first time it is asked for:
+    /// its kernel runs in the workspace's own environment, and a notebook
+    /// of another environment's is looked at and not run — watching is
+    /// looking, as every other file of a watched environment is.
+    fn notebook_session(&self, path: &Path, page: &EditorPage) -> Rc<crate::notebook::Session> {
+        if let Some(session) = page.notebook.borrow().as_ref() {
+            return session.clone();
+        }
+        let env = page
+            .foreign_env
+            .clone()
+            .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+        let exec = page
+            .foreign_env
+            .is_none()
+            .then(|| self.workspace.exec.clone());
+        let hook = self.on_prompt_agent.borrow().clone();
+        let on_prompt: Rc<dyn Fn(String, (String, String))> = Rc::new(move |prompt, attachment| {
+            if let Some(hook) = hook.as_ref() {
+                hook(env.clone(), prompt, Some(attachment));
+            }
+        });
+        let session =
+            crate::notebook::Session::new(path.to_path_buf(), exec, page.buffer.clone(), on_prompt);
+        *page.notebook.borrow_mut() = Some(session.clone());
+        session
+    }
+
+    /// Where a notebook's Prompt Agent goes: the window hands the prompt
+    /// and its attachment to the environment's agent.
+    pub fn set_on_prompt_agent(
+        &self,
+        hook: Rc<dyn Fn(taste_core::environment::EnvironmentId, String, Option<(String, String)>)>,
+    ) {
+        *self.on_prompt_agent.borrow_mut() = Some(hook);
     }
 
     // --- AI ghost text (Tab accepts, Esc dismisses) ---------------------
@@ -4650,6 +4745,16 @@ fn render_changes(holder: &gtk::Box, face: ChangesFace) {
             holder.append(&view.widget);
         }
     }
+}
+
+fn is_notebook(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("ipynb")
+}
+
+/// Whether a file has a face besides its source: Markdown's preview, a
+/// notebook's cells.
+fn has_preview(path: &Path) -> bool {
+    is_markdown(path) || is_notebook(path)
 }
 
 fn is_markdown(path: &Path) -> bool {

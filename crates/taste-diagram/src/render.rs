@@ -99,6 +99,22 @@ pub fn render(source: &str, dark: bool, family: &str, scale: f32) -> Result<Rast
     };
     let options = svg_options(family, regular_id, bold_id);
     let tree = usvg::Tree::from_str(&svg, &options).map_err(|e| e.to_string())?;
+    raster(&tree, scale, "the diagram is too large to draw")
+}
+
+/// An SVG document — a notebook's figure — drawn at `scale`, read with the
+/// same options a diagram's SVG is: no file reached, text in `family`
+/// where the document has text rather than paths. Its own colours: a
+/// figure is drawn as its author made it, light or dark.
+pub fn render_svg(svg: &str, family: &str, scale: f32) -> Result<Raster, String> {
+    let measure = measure_for(family)?;
+    let options = svg_options(family, measure.regular.id, measure.bold.id);
+    let tree = usvg::Tree::from_str(svg, &options).map_err(|e| e.to_string())?;
+    raster(&tree, scale, "the picture is too large to draw")
+}
+
+/// A parsed SVG's pixels at `scale`, held under the raster caps.
+fn raster(tree: &usvg::Tree, scale: f32, too_large: &str) -> Result<Raster, String> {
     let size = tree.size();
     let longest = size.width().max(size.height()) * scale;
     let scale = if longest > MAX_RASTER_SIDE {
@@ -114,10 +130,9 @@ pub fn render(source: &str, dark: bool, family: &str, scale: f32) -> Result<Rast
     };
     let width = (size.width() * scale).ceil().max(1.0) as u32;
     let height = (size.height() * scale).ceil().max(1.0) as u32;
-    let mut pixmap =
-        resvg::tiny_skia::Pixmap::new(width, height).ok_or("the diagram is too large to draw")?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).ok_or(too_large)?;
     resvg::render(
-        &tree,
+        tree,
         resvg::tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
@@ -515,6 +530,22 @@ mod tests {
             .err()
             .expect("an unfinished edge is an error");
         assert!(error.contains("parse"), "{error}");
+    }
+
+    /// A figure as matplotlib writes one — sized in points, its own white
+    /// background — comes out as its own pixels at the asked scale, and a
+    /// document that is not SVG says so.
+    #[test]
+    fn an_svg_figure_is_drawn_in_its_own_colours() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="72pt" height="36pt" viewBox="0 0 72 36"><rect width="72" height="36" fill="#ffffff"/><path d="M 4 30 L 68 6" stroke="#1f77b4" stroke-width="3"/></svg>"##;
+        let raster = render_svg(svg, "Adwaita Sans", 2.0).expect("a figure draws");
+        assert_eq!(
+            raster.rgba.len(),
+            (raster.width * raster.height * 4) as usize
+        );
+        assert_eq!(&raster.rgba[0..4], &[255, 255, 255, 255], "its own white");
+        assert!(raster.width >= (raster.logical_width * 2.0) as u32);
+        assert!(render_svg("not a picture", "Adwaita Sans", 1.0).is_err());
     }
 
     /// An SVG that names a file on this machine draws nothing for it:
