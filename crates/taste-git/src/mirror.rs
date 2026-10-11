@@ -283,7 +283,8 @@ impl GitWorkspace {
             // Each side's changes since the base, path by path, as the
             // entry each now has (`None`: deleted).
             let mut here = self.entries_between(baseline, current)?;
-            here.retain(|path, entry| self.folder_owns(path, entry));
+            let rules = self.sync_rules();
+            here.retain(|path, entry| self.folder_owns(path, entry, &rules));
             let there = self.entries_between(baseline, target.id())?;
             // What the checkout holds because the folder sent it is the
             // folder's own, not a change of the checkout's.
@@ -689,9 +690,10 @@ impl GitWorkspace {
         };
         let current = self.worktree_tree()?;
         let current_tree = self.repo.find_tree(current)?;
+        let rules = self.sync_rules();
         self.entries_between(baseline, current)?
             .iter()
-            .filter(|(path, entry)| self.folder_owns(path, entry))
+            .filter(|(path, entry)| self.folder_owns(path, entry, &rules))
             .map(|(path, _)| self.change_at(&current_tree, path))
             .collect()
     }
@@ -706,8 +708,14 @@ impl GitWorkspace {
     /// not absent from the folder (2026-10-04: a Drupal install, ignored
     /// here and not yet in the checkout, was deleted from the checkout
     /// file by file).
-    fn folder_owns(&self, path: &Path, entry: &Option<(Oid, i32)>) -> bool {
-        if self.repo.is_path_ignored(path).unwrap_or(true) {
+    fn folder_owns(
+        &self,
+        path: &Path,
+        entry: &Option<(Oid, i32)>,
+        rules: &crate::sync_ignored::Rules,
+    ) -> bool {
+        // Ignored, unless it syncs anyway (`crate::sync_ignored`).
+        if self.ignored_unsynced(path, rules) {
             return false;
         }
         entry.is_some() || std::fs::symlink_metadata(self.workdir.join(path)).is_err()
@@ -891,11 +899,21 @@ impl GitWorkspace {
         // decluttering, not a lock (David, 2026-10-09: "It isn't a
         // security mechanism"): once a pass carries a rule's removal here,
         // what it ignored is an ordinary path on both sides.
+        //
+        // Except what syncs anyway (`crate::sync_ignored`), by the folder's
+        // `.gitattributes` or by those of either tree — the one being
+        // written brings its own before it is in the folder to be read.
+        let mut rules = self.sync_rules();
+        for tree in [from, to] {
+            rules.add_set(crate::sync_ignored::attribute_files_in_tree(
+                &self.repo, tree,
+            ));
+        }
         let protected: std::collections::BTreeSet<PathBuf> = diff
             .deltas()
             .flat_map(|d| [d.old_file().path(), d.new_file().path()])
             .flatten()
-            .filter(|path| self.repo.is_path_ignored(path).unwrap_or(true))
+            .filter(|path| self.ignored_unsynced(path, &rules))
             .map(Path::to_path_buf)
             .collect();
         let skip = |delta: &git2::DiffDelta| {
@@ -1033,6 +1051,48 @@ mod tests {
             .unwrap();
         let _ = folder;
         (tip, snap)
+    }
+
+    /// An ignored path whose `taste-sync` is set is carried to the folder —
+    /// and other ignored files still are not — and the folder's edit to it
+    /// is sent back like any change of its own.
+    #[test]
+    fn an_ignored_path_set_to_sync_syncs_both_ways() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join(".gitignore"), "data/\n").unwrap();
+        ws.stage(Path::new(".gitignore")).unwrap();
+        ws.commit("ignore data").unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+            let attributes = crate::sync_ignored::with_path("", Path::new("data/keep"), true);
+            fs::write(vm.join(".gitattributes"), attributes).unwrap();
+            fs::create_dir_all(vm.join("data/keep")).unwrap();
+            fs::write(vm.join("data/keep/model.bin"), "weights\n").unwrap();
+            fs::write(vm.join("data/other.bin"), "not this\n").unwrap();
+        });
+        assert!(matches!(
+            ws.mirror_from(&main, tip, snap, false).unwrap(),
+            Mirror::Applied { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("data/keep/model.bin")).unwrap(),
+            "weights\n"
+        );
+        assert!(dir.path().join(".gitattributes").exists());
+        assert!(
+            !dir.path().join("data/other.bin").exists(),
+            "not set to sync"
+        );
+
+        fs::write(dir.path().join("data/keep/model.bin"), "retrained\n").unwrap();
+        let changes = ws.folder_changes().unwrap();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == Path::new("data/keep/model.bin")
+                    && c.content.as_deref() == Some(&b"retrained\n"[..])),
+            "{changes:?}"
+        );
     }
 
     #[test]

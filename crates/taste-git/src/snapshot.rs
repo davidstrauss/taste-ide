@@ -161,7 +161,10 @@ impl GitWorkspace {
         // Sorted for a stable walk. The tree is content-addressed either
         // way, but a deterministic order makes a failure reproducible.
         let mut paths: Vec<PathBuf> = status.into_keys().collect();
+        // And what is ignored but syncs anyway (`crate::sync_ignored`).
+        paths.extend(self.synced_ignored_files(&self.sync_rules()));
         paths.sort();
+        paths.dedup();
 
         // A directory the working copy has made a file, or a link: libgit2
         // will not put a blob where its base has a tree ("cannot replace
@@ -284,6 +287,7 @@ pub fn script(name: &str) -> Result<String> {
     {
         bail!("{name} is not a snapshot ref name this script will take");
     }
+    let synced = crate::sync_ignored::snapshot_lines();
     Ok(format!(
         r#"set -eu
 export GIT_AUTHOR_NAME=taste-ide GIT_AUTHOR_EMAIL=taste-ide@localhost
@@ -292,12 +296,12 @@ export GIT_OPTIONAL_LOCKS=0
 name='{name}'
 gitdir=$(git rev-parse --git-dir)
 export GIT_INDEX_FILE="$gitdir/taste-snapshot-index.$$"
-trap 'rm -f "$GIT_INDEX_FILE"' EXIT
+trap 'rm -f "$GIT_INDEX_FILE" "$GIT_INDEX_FILE.roots"' EXIT
 rm -f "$GIT_INDEX_FILE"
 head=$(git rev-parse --verify -q HEAD || true)
 if [ -n "$head" ]; then git read-tree "$head"; fi
 git add -A -- .
-tree=$(git write-tree)
+{synced}tree=$(git write-tree)
 rm -f "$GIT_INDEX_FILE"
 prev=$(git rev-parse --verify -q "$name" || true)
 if [ -n "$head" ]; then msg="taste snapshot against $head"; else msg="taste snapshot against an unborn branch"; fi
@@ -553,6 +557,30 @@ mod tests {
                 .unwrap();
         }
 
+        // Ignored but set to sync (`crate::sync_ignored`), by the root's
+        // `.gitattributes` and by a nested one, beside ignored files that
+        // are not; and a filter that fails if anything runs it.
+        std::fs::write(
+            root.join(".gitattributes"),
+            "/target/keep/** taste-sync\n*.bin filter=boom\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("target/keep/deep")).unwrap();
+        std::fs::write(root.join("target/keep/deep/w.bin"), "weights").unwrap();
+        std::fs::create_dir_all(root.join("sub/out")).unwrap();
+        std::fs::write(root.join("sub/.gitignore"), "out/\n").unwrap();
+        std::fs::write(root.join("sub/.gitattributes"), "/out/*.txt taste-sync\n").unwrap();
+        std::fs::write(root.join("sub/out/a.txt"), "a").unwrap();
+        std::fs::write(root.join("sub/out/b.o"), "b").unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("filter.boom.clean", "false")
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("filter.boom.required", true)
+            .unwrap();
+
         let ws = GitWorkspace::discover(root).unwrap();
         let library = ws.snapshot_worktree("refs/taste/snapshot/lib").unwrap();
         assert!(library.wrote);
@@ -563,6 +591,11 @@ mod tests {
                 .arg("-c")
                 .arg(script)
                 .current_dir(root)
+                // As the keeper runs it: no attribute of the repository's.
+                .env(
+                    "GIT_ATTR_SOURCE",
+                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                )
                 .output()
                 .unwrap()
         };
@@ -576,6 +609,19 @@ mod tests {
         assert!(scripted.wrote);
 
         let tree_of = |oid: Oid| repo.find_commit(oid).unwrap().tree_id();
+        let scripted_tree = repo.find_tree(tree_of(scripted.commit)).unwrap();
+        for (path, there) in [
+            ("target/keep/deep/w.bin", true),
+            ("sub/out/a.txt", true),
+            ("target/ignored.o", false),
+            ("sub/out/b.o", false),
+        ] {
+            assert_eq!(
+                scripted_tree.get_path(Path::new(path)).is_ok(),
+                there,
+                "{path} in the script's snapshot"
+            );
+        }
         assert_eq!(
             tree_of(scripted.commit),
             tree_of(library.commit),

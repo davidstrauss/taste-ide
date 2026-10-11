@@ -15,6 +15,7 @@ pub mod clone;
 pub mod issues;
 pub mod mediate;
 pub mod merge;
+pub mod sync_ignored;
 /// Object ids, for callers that name commits without depending on git2.
 pub use git2::Oid;
 pub mod mirror;
@@ -125,6 +126,10 @@ pub enum FileState {
     Untracked,
     Conflicted,
     Ignored,
+    /// Ignored, and synced between the folder and Personal anyway
+    /// (`sync_ignored`). Never from git's status: the file tree paints it
+    /// on a row whose own state is clean.
+    Synced,
 }
 
 /// How the user's push treats submodules: push any commit the branch

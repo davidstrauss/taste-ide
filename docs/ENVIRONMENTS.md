@@ -3625,12 +3625,28 @@ asked about and ruled out of scope (David, same day):
   checkout both ways (`taste_git::mirror`, `peer::sync_primary_peer_with`):
   its HEAD onto the checkout's branch, its index onto that commit, its
   working tree onto the checkout's latest snapshot, which is `git
-  status`'s working copy, so ignored files are never written or removed.
+  status`'s working copy, so ignored files are never written or removed
+  — except those whose `taste-sync` git attribute is set, which are part
+  of both working copies and sync like any other path
+  (`taste_git::sync_ignored`). The file tree's Sync Ignored Files (on a
+  folder) and Sync Though Ignored (on a file) write that line to the root
+  `.gitattributes` — `/dir/** taste-sync`, `/file taste-sync` — which is a
+  change to commit like any other, and any line setting it counts the
+  same; such a row wears ⇅ in the status letter's place, which a real
+  state of its own takes back. It is an attribute because `.gitattributes`
+  is git's place for per-path facts a tool acts on (Git LFS, Linguist,
+  `export-ignore`), and because a marker file inside an ignored directory
+  would have to be un-ignored itself, line by line (2026-10-11). In the
+  VM git decides, through `:(attr:taste-sync)` pathspecs that read the
+  repository's attributes for that listing only — no filter runs on one —
+  while the snapshot's `add` reads none, so no filter the repository
+  names runs on what it takes. It replaced Copy Ignored Files to Your
+  Folder, a one-way copy on request.
   A path changed only in the folder goes to the checkout first, before
   anything is written back; a path changed on both sides to different
   content is a conflict, asked about with nothing written either way.
-  Every write a VM names — the mirror's, a first commit's adoption, an
-  ignored-file copy — goes through `taste_git::beneath`: inside the
+  Every write a VM names — the mirror's and a first commit's adoption —
+  goes through `taste_git::beneath`: inside the
   folder, never into `.git`, never through a directory that is a link,
   and staged under a name created fresh, since a link the checkout
   planted at the staging name once carried a file's bytes to wherever it
@@ -3795,8 +3811,8 @@ they do not run.
   clean folder to what the VM has (`taste_git::merge`). No hooks, no
   external filter drivers, git's own path checks on `.git`; a checkout
   bug in libgit2 would be exposed here, on commits the VM already holds.
-  The IDE's own writes from VM data (the mirror, `adopt_first_commit`,
-  ignored-file copies) do not go through libgit2's checkout and carry
+  The IDE's own writes from VM data (the mirror and `adopt_first_commit`)
+  do not go through libgit2's checkout and carry
   their own checks (`taste_git::beneath`).
 - **Your own Push and Pull run the host `git` with your config and your
   keys**, against your remotes. That is the point — the credential never

@@ -492,9 +492,9 @@ pub struct FileTree {
     on_open: RefCell<Option<OpenCallback>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
     on_open_diff: RefCell<Option<OpenDiffCallback>>,
-    /// Where a request for ignored files in the user's folder goes: the
-    /// window's, to Personal's sync (`Supervisor::request_copy_home`).
-    on_copy_home: RefCell<Option<OpenDiffCallback>>,
+    /// What syncs though git ignores it (`Worktree::sync_ignored`): the
+    /// rows that wear the synced mark, and the Sync Ignored toggle's state.
+    sync_ignored: RefCell<taste_devcontainer::worktree::SyncIgnored>,
     /// A REVIEW row opens a different diff: the branch's blob against the
     /// merge target's, which has no working-tree side and no file on disk.
     on_open_review_diff: RefCell<Option<OpenReviewDiffCallback>>,
@@ -748,6 +748,8 @@ struct StatusSnapshot {
     rebasing: bool,
     /// Each submodule's path and where it is (`Worktree::submodule_heads`).
     submodules: HashMap<PathBuf, taste_devcontainer::worktree::SubmoduleHead>,
+    /// What syncs though git ignores it (`Worktree::sync_ignored`).
+    sync_ignored: taste_devcontainer::worktree::SyncIgnored,
 }
 
 /// How long a fetch, rebase or push may run before it is called failed. A
@@ -1508,7 +1510,7 @@ impl FileTree {
             folder_syncing: Cell::new(false),
             on_open: RefCell::new(None),
             on_open_diff: RefCell::new(None),
-            on_copy_home: RefCell::new(None),
+            sync_ignored: RefCell::new(Default::default()),
             commit_suggester: RefCell::new(None),
             open_menu: RefCell::new(None),
             rows: RefCell::new(HashMap::new()),
@@ -2726,11 +2728,6 @@ impl FileTree {
 
     pub fn set_on_open_diff(&self, f: impl Fn(PathBuf) + 'static) {
         *self.on_open_diff.borrow_mut() = Some(Box::new(f));
-    }
-
-    /// Where Copy to Your Folder sends its path in the checkout.
-    pub fn set_on_copy_home(&self, f: impl Fn(PathBuf) + 'static) {
-        *self.on_copy_home.borrow_mut() = Some(Box::new(f));
     }
 
     /// Where a review row's diff goes. Separate from `set_on_open_diff`
@@ -4433,27 +4430,42 @@ impl FileTree {
             }
         }
 
-        // Ignored files reach this machine only when asked for: the mirror
-        // never carries them, and the checkout they are in is in the VM.
-        // Offered on a folder, for the ignored files under it, and on a
-        // file whenever ignored files are shown, which is the only time
-        // one can be right-clicked.
+        // Ignored paths sync between the folder and Personal when asked
+        // to: a line in the root `.gitattributes`
+        // (`taste_git::sync_ignored`). On a folder, for the ignored files
+        // under it, and on a file whenever ignored files are shown, which is
+        // the only time one can be right-clicked. Checked and fixed when a
+        // folder above already syncs it, or a line the IDE did not write.
         let remote = self.watching.borrow().is_none() && !self.workspace.files().is_local();
-        if remote && !node.ghost && (node.is_dir || *self.show_ignored.borrow()) {
-            let home_section = gio::Menu::new();
-            home_section.append(
+        let rel = self.repo_relative(&node.path);
+        if let (true, false, Some(rel)) = (
+            remote && (node.is_dir || *self.show_ignored.borrow()),
+            node.ghost,
+            rel,
+        ) {
+            let (own, other) = {
+                let shown = self.sync_ignored.borrow();
+                let own = shown.toggled.has(&rel, node.is_dir);
+                let other =
+                    shown.toggled.covers(&rel) || (!node.is_dir && shown.synced.contains(&rel));
+                (own, other && !own)
+            };
+            let sync_section = gio::Menu::new();
+            sync_section.append(
                 Some(if node.is_dir {
-                    "Copy Ignored Files to Your Folder"
+                    "Sync Ignored Files"
                 } else {
-                    "Copy to Your Folder"
+                    "Sync Though Ignored"
                 }),
-                Some("row.copy-home"),
+                Some("row.sync-ignored"),
             );
-            menu.append_section(None, &home_section);
+            menu.append_section(None, &sync_section);
+            let action =
+                gio::SimpleAction::new_stateful("sync-ignored", None, &(own || other).to_variant());
+            action.set_enabled(writable && !other);
             let tree = self.clone();
-            let path = node.path.clone();
-            let action = gio::SimpleAction::new("copy-home", None);
-            action.connect_activate(move |_, _| tree.copy_home(&path));
+            let is_dir = node.is_dir;
+            action.connect_activate(move |_, _| tree.set_sync_ignored(&rel, is_dir, !own));
             actions.add_action(&action);
         }
 
@@ -4470,16 +4482,25 @@ impl FileTree {
         popover.popup();
     }
 
-    /// Ask for the ignored files at or under `path` in the user's folder:
-    /// the sync carries them, and says how it went where it says the rest.
-    fn copy_home(self: &Rc<Self>, path: &Path) {
-        let checkout = self.workspace.checkout_path();
-        let Ok(rel) = path.strip_prefix(&checkout).map(Path::to_path_buf) else {
-            return;
-        };
-        if let Some(hook) = self.on_copy_home.borrow().as_ref() {
-            hook(rel);
-        }
+    /// Sync `rel` though it is ignored, or stop: the root `.gitattributes`
+    /// rewritten beside the files, off the main thread, then the tree
+    /// brought current. The sync carries the files from there.
+    fn set_sync_ignored(self: &Rc<Self>, rel: &Path, is_dir: bool, on: bool) {
+        let worktree = self.worktree();
+        let rel = rel.to_path_buf();
+        self.file_op(
+            if on {
+                "Syncing ignored files failed".to_string()
+            } else {
+                "Stopping the sync of ignored files failed".to_string()
+            },
+            move || {
+                worktree
+                    .set_sync_ignored(&rel, is_dir, on)
+                    .map_err(|e| std::io::Error::other(format!("{e:#}")))
+            },
+            None,
+        );
     }
 
     /// Close the context menu, if open, before its anchor may be disposed.
@@ -4598,6 +4619,8 @@ impl FileTree {
                 });
                 Ok(StatusSnapshot {
                     submodules: worktree.submodule_heads(),
+                    sync_ignored: synced_for_probe()
+                        .unwrap_or_else(|| worktree.sync_ignored(&status)),
                     status,
                     stashed: worktree.stashed_paths().unwrap_or_default(),
                     ignore_rules: worktree
@@ -4725,6 +4748,7 @@ impl FileTree {
                     && !heads_changed
                     && *self.status.borrow() == snapshot.status
                     && *self.stashed.borrow() == snapshot.stashed
+                    && *self.sync_ignored.borrow() == snapshot.sync_ignored
                     && self.ignore_rules.get() == snapshot.ignore_rules;
                 states_only = !mode_changed
                     && !heads_changed
@@ -4742,6 +4766,7 @@ impl FileTree {
                 rebase_ended = self.abort_button.is_visible() && !snapshot.rebasing;
                 *self.status.borrow_mut() = snapshot.status;
                 *self.stashed.borrow_mut() = snapshot.stashed;
+                *self.sync_ignored.borrow_mut() = snapshot.sync_ignored;
                 *self.submodule_heads.borrow_mut() = snapshot.submodules;
                 self.ignore_rules.set(snapshot.ignore_rules);
                 self.sync_filter_counts();
@@ -6822,7 +6847,12 @@ impl FileTree {
         let Some(rel) = self.repo_relative(&node.path) else {
             return FileState::Clean;
         };
-        state_for(&self.status.borrow(), &rel, node.is_dir)
+        synced_or(
+            state_for(&self.status.borrow(), &rel, node.is_dir),
+            &self.sync_ignored.borrow(),
+            &rel,
+            node.is_dir,
+        )
     }
 
     /// Build the (fresh) tree model. Called on construction and when the
@@ -7241,6 +7271,7 @@ impl FileTree {
             badge_label.add_css_class(css);
             label.add_css_class(css);
         }
+        badge_label.set_tooltip_text(state_tooltip(state));
 
         row.append(&icon);
         row.append(&label);
@@ -7738,6 +7769,7 @@ impl FileTree {
             .map(|(path, handle)| (self.repo_relative(path), handle))
             .collect();
         let status = self.status.borrow();
+        let sync_ignored = self.sync_ignored.borrow();
         let folders = aggregate_dir_states(
             &status,
             resolved
@@ -7753,6 +7785,10 @@ impl FileTree {
                     .copied()
                     .unwrap_or(FileState::Clean),
                 Some(rel) => status.get(rel).copied().unwrap_or(FileState::Clean),
+            };
+            let state = match rel {
+                Some(rel) => synced_or(state, &sync_ignored, rel, handle.is_dir),
+                None => state,
             };
             let painted = handle.state.get();
             if state == painted {
@@ -7772,6 +7808,7 @@ impl FileTree {
             }
             let (text, css) = state_style(state);
             badge.set_label(text);
+            badge.set_tooltip_text(state_tooltip(state));
             if let Some(css) = css {
                 badge.add_css_class(css);
                 label.add_css_class(css);
@@ -7820,6 +7857,51 @@ fn state_style(state: FileState) -> (&'static str, Option<&'static str>) {
         FileState::Untracked => ("U", Some("accent")),
         FileState::Conflicted => ("!", Some("error")),
         FileState::Ignored => ("·", Some("dim-label")),
+        // In the letters' place: an ignored path wears none of them, and
+        // a real state of its own (staged by force, say) is shown instead.
+        FileState::Synced => ("⇅", None),
+    }
+}
+
+/// TASTE_PROBE_CHECK only: `TASTE_PROBE_SYNCED=docs/,README.md` poses those
+/// paths as ignored and synced anyway (a trailing slash for a folder),
+/// since a folder on this host, which is what a probe opens, never syncs.
+fn synced_for_probe() -> Option<taste_devcontainer::worktree::SyncIgnored> {
+    std::env::var_os("TASTE_PROBE_CHECK")?;
+    let posed = std::env::var("TASTE_PROBE_SYNCED").ok()?;
+    let mut shown = taste_devcontainer::worktree::SyncIgnored::default();
+    for path in posed.split(',').filter(|p| !p.is_empty()) {
+        match path.strip_suffix('/') {
+            Some(dir) => {
+                shown.toggled.dirs.insert(PathBuf::from(dir));
+                shown.ignored_dirs.insert(PathBuf::from(dir));
+            }
+            None => {
+                shown.toggled.files.insert(PathBuf::from(path));
+                shown.synced.insert(PathBuf::from(path));
+            }
+        }
+    }
+    Some(shown)
+}
+
+/// What the synced mark means, on the mark; the letters say it themselves.
+fn state_tooltip(state: FileState) -> Option<&'static str> {
+    (state == FileState::Synced).then_some("Ignored, and synced with Personal anyway")
+}
+
+/// A row's state, or the synced mark when git has nothing to say about it
+/// and it is ignored but syncs anyway (`taste_git::sync_ignored`).
+fn synced_or(
+    state: FileState,
+    sync_ignored: &taste_devcontainer::worktree::SyncIgnored,
+    rel: &Path,
+    is_dir: bool,
+) -> FileState {
+    if state == FileState::Clean && sync_ignored.shows(rel, is_dir) {
+        FileState::Synced
+    } else {
+        state
     }
 }
 
@@ -7831,7 +7913,7 @@ fn dir_rank(state: FileState) -> u8 {
         FileState::Conflicted => 3,
         FileState::Staged => 2,
         FileState::Modified | FileState::Untracked => 1,
-        FileState::Clean | FileState::Ignored => 0,
+        FileState::Clean | FileState::Ignored | FileState::Synced => 0,
     }
 }
 

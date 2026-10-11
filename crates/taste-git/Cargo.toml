@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 getrandom.workspace = true
 git2.workspace = true
+ignore.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

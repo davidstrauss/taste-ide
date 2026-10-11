@@ -34,6 +34,31 @@ use taste_core::environment::Checkout;
 use taste_core::files::{ExecOutput, Files};
 use taste_git::{FileState, GitWorkspace, StashEntry};
 
+/// What syncs though git ignores it, as the file tree shows it
+/// ([`Worktree::sync_ignored`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncIgnored {
+    /// The paths the root `.gitattributes` names in the toggle's own form.
+    pub toggled: taste_git::sync_ignored::Toggled,
+    /// The ignored files whose `taste-sync` git says is set.
+    pub synced: HashSet<PathBuf>,
+    /// Which of `toggled`'s directories git ignores.
+    pub ignored_dirs: HashSet<PathBuf>,
+}
+
+impl SyncIgnored {
+    /// Whether `rel`'s row wears the synced mark: an ignored file that
+    /// syncs, or a directory at or under an ignored one that is toggled on.
+    pub fn shows(&self, rel: &Path, is_dir: bool) -> bool {
+        if is_dir {
+            rel.ancestors()
+                .any(|dir| self.toggled.dirs.contains(dir) && self.ignored_dirs.contains(dir))
+        } else {
+            self.synced.contains(rel)
+        }
+    }
+}
+
 /// git ran beside the files and said no — as distinct from the files
 /// service not answering, which is an error of its own kind. The file tree
 /// tells the two apart: a VM that is not answering is one thing to say, and
@@ -170,6 +195,142 @@ impl Worktree {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .collect())
+    }
+
+    /// What syncs though git ignores it (`taste_git::sync_ignored`), as the
+    /// file tree shows it. Empty for a tree on this host, which is the
+    /// folder itself and has nothing to sync with. `status` is this tree's,
+    /// for the new `.gitattributes` files it names, so the walk of untracked
+    /// files the status already did is not done twice.
+    pub fn sync_ignored(&self, status: &HashMap<PathBuf, FileState>) -> SyncIgnored {
+        use taste_git::sync_ignored::{Rules, Toggled, ATTR};
+        if self.is_local() {
+            return SyncIgnored::default();
+        }
+        let files = self.files();
+        let root = self.root().to_path_buf();
+        let mut found: std::collections::BTreeSet<PathBuf> = self
+            .git_ok(&[
+                "-c",
+                "core.quotePath=false",
+                "ls-files",
+                "-z",
+                "--",
+                ":(glob)**/.gitattributes",
+            ])
+            .unwrap_or_default()
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        found.extend(
+            status
+                .keys()
+                .filter(|p| p.file_name().is_some_and(|n| n == ".gitattributes"))
+                .cloned(),
+        );
+        let mut sources: Vec<(PathBuf, String)> = Vec::new();
+        if let Ok(text) = files.read_to_string(&root.join(".git/info/attributes")) {
+            sources.push((PathBuf::new(), text));
+        }
+        let mut top = String::new();
+        for path in found {
+            let Ok(text) = files.read_to_string(&root.join(&path)) else {
+                continue;
+            };
+            if path == Path::new(".gitattributes") {
+                top = text.clone();
+            }
+            sources.push((
+                path.parent().map(Path::to_path_buf).unwrap_or_default(),
+                text,
+            ));
+        }
+        let mut rules = Rules::default();
+        rules.add_set(sources);
+        let toggled = Toggled::from_text(&top);
+        let mut shown = SyncIgnored::default();
+        if !rules.is_empty() {
+            // git's own answer, the one the snapshot acts on: the ignored
+            // files under each walk's root whose attribute is set.
+            let mut args: Vec<String> = ["ls-files", "-z", "-o", "-i", "--exclude-standard", "--"]
+                .map(String::from)
+                .to_vec();
+            args.extend(rules.roots().iter().map(|root| {
+                let root = root.display().to_string();
+                format!(
+                    ":(attr:{ATTR},literal){}",
+                    if root.is_empty() { "." } else { &root }
+                )
+            }));
+            if let Ok(out) = self.run_git_reading_attributes(&args) {
+                if out.success() {
+                    shown.synced = out
+                        .stdout_utf8()
+                        .split('\0')
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .collect();
+                }
+            }
+        }
+        let named: Vec<PathBuf> = toggled.dirs.iter().cloned().collect();
+        shown.ignored_dirs = self.ignored(&named).unwrap_or_default();
+        shown.toggled = toggled;
+        shown
+    }
+
+    /// Sync `rel` (relative to the root) though it is ignored, or stop: its
+    /// line in the root `.gitattributes` written or taken out
+    /// (`taste_git::sync_ignored::with_path`), the file made or removed as
+    /// that leaves it. The `.gitattributes` is a change like any other, to
+    /// commit or not.
+    pub fn set_sync_ignored(&self, rel: &Path, is_dir: bool, on: bool) -> Result<()> {
+        use taste_git::sync_ignored::{with_path, without_path};
+        let files = self.files();
+        let path = self.root().join(".gitattributes");
+        let text = match files.read_to_string(&path) {
+            Ok(text) => text,
+            Err(_) if !files.exists(&path) => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let next = if on {
+            with_path(&text, rel, is_dir)
+        } else {
+            without_path(&text, rel, is_dir)
+        };
+        if next == text {
+            return Ok(());
+        }
+        if next.is_empty() {
+            files.remove(&path, false)
+        } else {
+            files.write(&path, next.as_bytes())
+        }
+        .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// `run_git`, with the repository's own attributes read: the files
+    /// service's git otherwise reads none (`GIT_ATTR_SOURCE`, the keeper's),
+    /// so that no filter a repository names runs. Only for commands that run
+    /// no filter, which only report what the attributes say.
+    fn run_git_reading_attributes(&self, args: &[String]) -> Result<ExecOutput> {
+        match self {
+            Worktree::Local(_) => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                self.run_git(&args, &[])
+            }
+            Worktree::Remote { files, path, .. } => {
+                let mut argv: Vec<String> =
+                    ["env", "-u", "GIT_ATTR_SOURCE", "git", "--no-optional-locks"]
+                        .map(String::from)
+                        .to_vec();
+                argv.extend(args.iter().cloned());
+                files
+                    .exec(path, &argv)
+                    .with_context(|| format!("running git in {}", files.describe()))
+            }
+        }
     }
 
     /// How this tree's files are reached.
@@ -1041,6 +1202,77 @@ mod tests {
             config.set_str("user.email", "t@t").unwrap();
         }
         repo
+    }
+
+    /// Sync Ignored Files on a directory and on a file: each a line in the
+    /// root `.gitattributes`, read back as toggled, the ignored files under
+    /// it named as synced and nothing else ignored, and both off again
+    /// leaving the project's own `.gitattributes` as it was.
+    #[test]
+    fn sync_ignored_comes_and_goes_in_the_gitattributes() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_commit(root);
+        std::fs::write(root.join(".gitignore"), "data/\n*.log\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.png binary\n").unwrap();
+        std::fs::create_dir_all(root.join("data/keep/deep")).unwrap();
+        std::fs::write(root.join("data/keep/deep/model.bin"), "w").unwrap();
+        std::fs::write(root.join("data/other.bin"), "o").unwrap();
+        std::fs::write(root.join("trace.log"), "l").unwrap();
+        std::fs::write(root.join("other.log"), "l").unwrap();
+        let worktree = Worktree::Remote {
+            files: Files::Local,
+            path: root.to_path_buf(),
+            after_ref_change: None,
+        };
+        assert_eq!(
+            Worktree::Local(root.to_path_buf()).sync_ignored(&HashMap::new()),
+            SyncIgnored::default(),
+            "nothing to sync with on this host"
+        );
+        worktree
+            .set_sync_ignored(Path::new("data/keep"), true, true)
+            .unwrap();
+        worktree
+            .set_sync_ignored(Path::new("trace.log"), false, true)
+            .unwrap();
+        let shown = worktree.sync_ignored(&worktree.status().unwrap());
+        assert!(shown.toggled.has(Path::new("data/keep"), true));
+        assert!(shown.toggled.has(Path::new("trace.log"), false));
+        assert_eq!(
+            shown.synced,
+            [
+                PathBuf::from("data/keep/deep/model.bin"),
+                PathBuf::from("trace.log")
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(shown.shows(Path::new("data/keep"), true));
+        assert!(shown.shows(Path::new("data/keep/deep"), true));
+        assert!(shown.shows(Path::new("data/keep/deep/model.bin"), false));
+        assert!(!shown.shows(Path::new("data"), true));
+        assert!(!shown.shows(Path::new("data/other.bin"), false));
+        assert!(!shown.shows(Path::new("other.log"), false));
+
+        worktree
+            .set_sync_ignored(Path::new("data/keep"), true, false)
+            .unwrap();
+        worktree
+            .set_sync_ignored(Path::new("trace.log"), false, false)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).unwrap(),
+            "*.png binary\n"
+        );
+        assert_eq!(
+            worktree.sync_ignored(&worktree.status().unwrap()),
+            SyncIgnored::default()
+        );
     }
 
     #[test]

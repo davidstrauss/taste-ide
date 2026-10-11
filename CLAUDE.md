@@ -182,6 +182,11 @@ indicator that far into a fetch (MiB), rate and time left in its tooltip
 poses the backlog's status filter on that button, through the toggle
 itself — the filtered list, and the panel's height, which a filter must
 not move;
+`TASTE_PROBE_SYNCED=crates/taste-app/src/fleet.rs,docs/` poses those
+file-tree rows as ignored and synced anyway (a trailing slash for a folder),
+the ⇅ in the status letter's place (`taste_git::sync_ignored`) — a probe
+opens a folder on this host, which never syncs; the two `taste-app/src`
+files are the rows the hero frame shows;
 `TASTE_PROBE_SYNC=running` (or `conflict`, `failed`, `done`) poses the
 title bar's cloud — the folder's sync and the Google Cloud connection,
 one badge — in that state with its popover open;
