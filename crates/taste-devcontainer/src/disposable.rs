@@ -123,16 +123,38 @@ fn write_marker(vm: &Vm, checkouts: Vec<String>) -> Result<()> {
 /// short one. `NONE` when the VM never had a checkout placed.
 ///
 /// With `stop_containers`, the guest's containers are stopped first, so
-/// nothing the project runs writes after the look.
+/// nothing the project runs writes after the look — with two seconds'
+/// grace, not podman's ten: the IDE's own containers run `sleep infinity`,
+/// which ignores the polite signal, so every stop waited the whole grace out
+/// and the close sat on this step for it.
+///
+/// Its git runs none of the repository's commands, as the files service's
+/// does (`keeper.rs`): attributes from the empty tree, every filter driver a
+/// checkout's config defines a passthrough, no fsmonitor, no hooks. And it
+/// records the working tree's own bytes, which is how the snapshots this
+/// is compared with were taken: under `eol=lf` a CRLF file hashed as its LF
+/// form here, a tree no snapshot had, and the VM was kept for content it did
+/// not have; a filter the guest could not run (nbstripout's, from
+/// `.git/info/attributes`) failed the look outright, and the VM was never
+/// marked (2026-10-11).
 fn report_script(workspace_dir: &Path, stop_containers: bool) -> String {
     let stop = if stop_containers {
-        "podman stop --all --time 10 >/dev/null 2>&1 || true\n"
+        "podman stop --all --time 2 >/dev/null 2>&1 || true\n"
     } else {
         ""
     };
     format!(
         r#"set -u
 {stop}cd '{dir}' 2>/dev/null || {{ echo NONE; echo END; exit 0; }}
+export GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false
+export GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null
+# Each filter driver a checkout defines, made a passthrough for its git.
+passthrough() {{
+  git -C "$1" config --name-only --get-regexp '^filter\..*\.(clean|smudge|process|required)$' 2>/dev/null \
+    | sed 's/\.[^.]*$//' | sort -u \
+    | while IFS= read -r f; do printf -- '-c %s.clean=cat -c %s.smudge=cat -c %s.process= -c %s.required=false\n' "$f" "$f" "$f" "$f"; done
+}}
 report() {{
   echo "CHECKOUT $2"
   if h=$(git -C "$1" rev-parse -q --verify HEAD); then echo "OBJ $h"; fi
@@ -140,9 +162,15 @@ report() {{
   idx=$(mktemp) || {{ echo "FAIL $2: no temporary index"; return; }}
   real=$(git -C "$1" rev-parse --git-path index)
   case "$real" in /*) ;; *) real="$1/$real" ;; esac
-  [ -f "$real" ] && cp "$real" "$idx"
-  if GIT_INDEX_FILE="$idx" git -C "$1" add -A >/dev/null 2>&1 \
-     && t=$(GIT_INDEX_FILE="$idx" git -C "$1" write-tree); then
+  # The checkout's index to start from; none, and the scratch one goes too:
+  # an empty file is not an index, and git refuses it.
+  if [ -f "$real" ]; then cp "$real" "$idx"; else rm -f "$idx"; fi
+  # Word-split on purpose: one `-c` pair per word; a driver's name with a
+  # space in it is not one git would take either.
+  safe=$(passthrough "$1")
+  # shellcheck disable=SC2086
+  if GIT_INDEX_FILE="$idx" git $safe -C "$1" add -A >/dev/null 2>&1 \
+     && t=$(GIT_INDEX_FILE="$idx" git $safe -C "$1" write-tree); then
     echo "TREE $t"
   else
     echo "FAIL $2: its working tree could not be read"
@@ -314,20 +342,31 @@ pub async fn mark_workspace_vms(workspace_root: &Path) -> Vec<(String, Result<Ve
         Ok(vms) => vms,
         Err(e) => return vec![(String::new(), Err(e))],
     };
-    let mut verdicts = Vec::new();
+    // All at once: each VM is its own machine, and the close waits on the
+    // slowest of them rather than on their sum.
+    let mut looks = tokio::task::JoinSet::new();
     for vm in vms
         .into_iter()
         .filter(|vm| vm.domain.starts_with(&prefix) && vm.state == DomainState::Running)
     {
-        let verdict = match tokio::time::timeout(MARK_TIMEOUT, look_and_mark(&vm, true)).await {
-            Ok(verdict) => verdict,
-            Err(_) => Err(anyhow::anyhow!(
-                "did not answer within {}s",
-                MARK_TIMEOUT.as_secs()
-            )),
-        };
-        verdicts.push((vm.domain.clone(), verdict));
+        looks.spawn(async move {
+            let verdict = match tokio::time::timeout(MARK_TIMEOUT, look_and_mark(&vm, true)).await {
+                Ok(verdict) => verdict,
+                Err(_) => Err(anyhow::anyhow!(
+                    "did not answer within {}s",
+                    MARK_TIMEOUT.as_secs()
+                )),
+            };
+            (vm.domain, verdict)
+        });
     }
+    let mut verdicts = Vec::new();
+    while let Some(done) = looks.join_next().await {
+        if let Ok(verdict) = done {
+            verdicts.push(verdict);
+        }
+    }
+    verdicts.sort_by(|a, b| a.0.cmp(&b.0));
     verdicts
 }
 
@@ -567,6 +606,57 @@ mod tests {
         };
         let reasons = unique_content(&report, dir.path());
         assert!(reasons[0].contains("no repository at"), "{reasons:?}");
+    }
+
+    /// The look reads a checkout as the snapshots do: a filter its own
+    /// `.git/info/attributes` names, which cannot run here, does not fail it,
+    /// and a CRLF file under `eol=lf` is recorded as its bytes.
+    #[test]
+    fn the_look_runs_none_of_the_checkouts_commands_and_keeps_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("primary");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&checkout)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "filter.nb.clean", "/nowhere/python -m nbstripout"]);
+        git(&["config", "filter.nb.required", "true"]);
+        std::fs::create_dir_all(checkout.join(".git/info")).unwrap();
+        std::fs::write(checkout.join(".git/info/attributes"), "*.ipynb filter=nb\n").unwrap();
+        std::fs::write(checkout.join(".gitattributes"), "* text=auto eol=lf\n").unwrap();
+        std::fs::write(checkout.join("a.ipynb"), "{}\n").unwrap();
+        std::fs::write(checkout.join("m.eml"), "To: a\r\n\r\nbody\r\n").unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(report_script(dir.path(), false))
+            .output()
+            .unwrap();
+        let report = String::from_utf8_lossy(&out.stdout);
+        assert!(!report.contains("FAIL"), "{report}");
+        let tree = report
+            .lines()
+            .find_map(|l| l.strip_prefix("TREE "))
+            .expect("a tree")
+            .to_string();
+        let blob = git(&["rev-parse", &format!("{tree}:m.eml")]);
+        let bytes = std::process::Command::new("git")
+            .current_dir(&checkout)
+            .args(["cat-file", "blob", &blob])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(bytes, b"To: a\r\n\r\nbody\r\n");
     }
 
     #[test]
