@@ -368,6 +368,12 @@ pub struct ChatEntry {
     /// environment like any other here.
     #[serde(default = "EnvironmentId::primary")]
     pub environment: EnvironmentId,
+    /// The revision of the IDE's guidance this conversation was last given
+    /// (taste-mcp's `GUIDANCE_REVISION`): one below the current revision is
+    /// sent the current text before its next prompt. 0 for a conversation
+    /// from before the revisions were counted.
+    #[serde(default)]
+    pub guidance_seen: u32,
 }
 
 impl Default for ChatEntry {
@@ -384,6 +390,7 @@ impl Default for ChatEntry {
             auto_approve: false,
             restart_when_silent: false,
             environment: EnvironmentId::primary(),
+            guidance_seen: 0,
         }
     }
 }

@@ -191,12 +191,38 @@ impl McpServer {
         env.is_primary()
     }
 
-    /// What every agent is told before its first tool call, and what the
-    /// coordinator is told besides. The backlog rule is the project's:
-    /// work the user asks for is written down first, in words they have
-    /// seen (David, 2026-09-06).
+    /// What every agent is told before its first tool call: [`guidance`].
     fn instructions(&self, env: &EnvironmentId) -> String {
-        let mut text = String::from(
+        guidance(self.workspace.root(), env)
+    }
+}
+
+/// The revision of [`guidance`]: its high-water mark. A conversation that
+/// last saw an older one is sent the current text before its next prompt,
+/// saying why (taste-app's chat), since an agent reads these instructions
+/// once, when its session starts, and a conversation outlives the IDE that
+/// briefed it. Raise it whenever what [`guidance`] says changes — the test
+/// `the_guidance_revision_moves_with_its_text` fails until it is.
+pub const GUIDANCE_REVISION: u32 = 1;
+
+/// What every agent is told before its first tool call, and what the
+/// coordinator is told besides — the MCP instructions, and what `ide_guide`
+/// answers. The backlog rule is the project's: work the user asks for is
+/// written down first, in words they have seen (David, 2026-09-06).
+/// `root` is the workspace's, for the project's memory.
+pub fn guidance(root: &std::path::Path, env: &EnvironmentId) -> String {
+    compose_guidance(env, Some(&memory_section(root)))
+}
+
+/// [`guidance`] without the project's memory, which reading takes the disk:
+/// what a conversation briefed before the current revision is sent, from
+/// the GTK thread, with its memory tools to read the notes by.
+pub fn guidance_without_memory(env: &EnvironmentId) -> String {
+    compose_guidance(env, None)
+}
+
+fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
+    let mut text = String::from(
             // First, so it survives any cut: an agent that reached for its
             // own Read out of habit had the call fail in the user's
             // transcript (2026-10-05).
@@ -254,9 +280,9 @@ impl McpServer {
              input runs from a shell; the play button runs a task by name only.\n\n\
              SERVICES. ",
         );
-        text.push_str(taste_core::conventions::SERVICES);
-        text.push_str(
-            "\n\n\
+    text.push_str(taste_core::conventions::SERVICES);
+    text.push_str(
+        "\n\n\
              MARKDOWN. Your replies here and the editor's preview of a .md file are \
              rendered Markdown: tables, images, and Mermaid diagrams in ```mermaid \
              fences, which are drawn as diagrams. To show a diagram, write it as \
@@ -266,10 +292,10 @@ impl McpServer {
              NOTEBOOKS. The editor opens a .ipynb as a notebook the user runs: Markdown \
              cells rendered, code cells editable and run in a Jupyter kernel inside this \
              environment's container. ",
-        );
-        text.push_str(&taste_core::kernel_task::convention());
-        text.push_str(
-            " For a notebook to run here, the kernel's Python needs the packages the notebook \
+    );
+    text.push_str(&taste_core::kernel_task::convention());
+    text.push_str(
+        " For a notebook to run here, the kernel's Python needs the packages the notebook \
              imports, installed the way the project manages packages or in .devcontainer/. \
              Drawn outputs: text with ANSI colour, Markdown, PNG and \
              JPEG (retina too), SVG, and interactive ipywidgets drawn natively — sliders, \
@@ -288,43 +314,46 @@ impl McpServer {
              this, pick one of these — call suggest_replies last, with the replies they \
              are likeliest to give, so they can answer with a click. Each reply names \
              what it chooses, so it reads right with only the question above it.",
-        );
+    );
+    if let Some(memory) = memory {
         text.push_str("\n\n");
-        text.push_str(&self.memory_section());
-        if env.is_primary() {
-            // The brief is one text, kept in taste-core, because the chat
-            // puts it before the coordinator's first prompt as well: not
-            // every agent's adapter surfaces these instructions.
-            text.push_str("\n\n");
-            text.push_str(&taste_core::orchestration::coordinator_brief());
-        }
-        text
+        text.push_str(memory);
     }
+    if env.is_primary() {
+        // The brief is one text, kept in taste-core, because the chat
+        // puts it before the coordinator's first prompt as well: not
+        // every agent's adapter surfaces these instructions.
+        text.push_str("\n\n");
+        text.push_str(&taste_core::orchestration::coordinator_brief());
+    }
+    text
+}
 
-    /// The project's memory as an agent starts with it: what the tools are
-    /// for, and the index of the notes kept so far (`taste_core::memory`),
-    /// read once per connection, which is once per session.
-    fn memory_section(&self) -> String {
-        let index = self.memory().index();
-        let mut text = String::from(
-            "MEMORY. This project keeps notes for you across sessions and environments, \
+/// The project's memory as an agent starts with it: what the tools are
+/// for, and the index of the notes kept so far (`taste_core::memory`),
+/// read once per connection, which is once per session.
+fn memory_section(root: &std::path::Path) -> String {
+    let index = taste_core::memory::Memory::for_workspace(root).index();
+    let mut text = String::from(
+        "MEMORY. This project keeps notes for you across sessions and environments, \
              on the user's machine. memory_save keeps something worth knowing next time \
              (a name, a one-line description, the note); memory_read reads one; \
              memory_delete removes one that is wrong. One fact to a note: update a note \
              rather than adding a second.",
-        );
-        if index.is_empty() {
-            text.push_str(
-                " There are none yet. If you kept notes before under \
+    );
+    if index.is_empty() {
+        text.push_str(
+            " There are none yet. If you kept notes before under \
                  ~/.claude/projects/*/memory/ in your home, save each with memory_save.",
-            );
-        } else {
-            text.push_str(" The notes:\n");
-            text.push_str(index.trim_end());
-        }
-        text
+        );
+    } else {
+        text.push_str(" The notes:\n");
+        text.push_str(index.trim_end());
     }
+    text
+}
 
+impl McpServer {
     fn memory(&self) -> taste_core::memory::Memory {
         taste_core::memory::Memory::for_workspace(self.workspace.root())
     }
@@ -967,6 +996,19 @@ impl McpServer {
                     }
                 }),
             ),
+            // The instructions read again, as they stand now: an agent reads
+            // them once, when its session starts, and the IDE goes on
+            // learning things after that (David, 2026-10-11: "Let agents
+            // query the latest advice on using the IDE and what it
+            // supports").
+            tool(
+                "ide_guide",
+                "The IDE's current guidance for you: what it supports and how to use it — \
+                 files, tasks, services, notebooks, Markdown, memory, and more — as its \
+                 instructions say now, with their revision. Read it when unsure what the IDE \
+                 offers or how.",
+                empty.clone(),
+            ),
             // The workspace's files the way the editor has them: a file the
             // user has open is read from, and changed in, the buffer they
             // are looking at — their unsaved typing included, each change
@@ -1548,6 +1590,10 @@ impl McpServer {
             | "devcontainer_logs"
             | "devcontainer_resources"
             | "ide_environment" => self.environment_tool(env, name, &args).await,
+            "ide_guide" => Ok(json!({
+                "revision": GUIDANCE_REVISION,
+                "guidance": guidance(self.workspace.root(), env),
+            })),
             "devcontainer_reload" => {
                 // Nobody is asked. The agent may write `.devcontainer/` and
                 // may apply it: the build and every lifecycle command run
@@ -5785,6 +5831,33 @@ async fn read_pdf(files: &taste_core::files::Files, path: &Path, args: &Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guidance's high-water mark moves with its text: a change to
+    /// what agents are told, as a coordinator or an environment's agent,
+    /// fails here until GUIDANCE_REVISION is raised, so a conversation
+    /// briefed before it is sent the new text (taste-app's chat).
+    #[test]
+    fn the_guidance_revision_moves_with_its_text() {
+        use sha2::Digest;
+        const GUIDANCE_SHA256: &str =
+            "e3b22a067594c9bdb8c84f519adf52f94ad875296ee230297b43b7cf543f2b78";
+        const AT_REVISION: u32 = 1;
+        let root = tempfile::tempdir().unwrap();
+        let text = guidance(root.path(), &EnvironmentId::primary())
+            + "\u{0}"
+            + &guidance(root.path(), &EnvironmentId::parse("i-0001").unwrap());
+        let digest: String = sha2::Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            (digest.as_str(), GUIDANCE_REVISION),
+            (GUIDANCE_SHA256, AT_REVISION),
+            "what agents are told changed: raise GUIDANCE_REVISION to {}, and set AT_REVISION to \
+             it and GUIDANCE_SHA256 to \"{digest}\" here",
+            AT_REVISION + 1
+        );
+    }
     use taste_core::ExecContext;
 
     async fn start_test_server(root: &Path) -> (PathBuf, taste_core::Workspace) {

@@ -990,6 +990,9 @@ pub struct ChatPane {
     /// clobber the stored, restorable id with a sterile one (which is how
     /// "session/load failed" became every launch's greeting).
     session_has_content: Cell<bool>,
+    /// The revision of the IDE's guidance this conversation was last given
+    /// (`taste_mcp::GUIDANCE_REVISION`), kept with it in workspace state.
+    guidance_seen: Cell<u32>,
     /// A resumed session's replay is about to arrive, and the transcript
     /// on screen is the previous rendering of the same record: cleared
     /// when the first replayed update lands, not when the spawn begins,
@@ -1200,6 +1203,22 @@ enum Unfinished {
 /// so what is kept here is what it takes to hand the same message to the
 /// agent once there is one: the blocks, and the badge that says what it is
 /// waiting for.
+/// What goes ahead of a prompt to a conversation briefed before the IDE's
+/// current guidance: what happened, and the guidance as it stands.
+fn guidance_update(seen: u32, current: u32, guidance: &str) -> String {
+    let before = if seen == 0 {
+        "before the IDE numbered its guidance".to_string()
+    } else {
+        format!("at revision {seen}")
+    };
+    format!(
+        "[The IDE was updated since this conversation was briefed ({before}); its guidance \
+         is now revision {current}. The current guidance follows; where it differs from what \
+         you were told before, it replaces it. The project's memory is as it was: memory_list \
+         lists the notes. ide_guide gives this guidance again at any time.]\n\n{guidance}"
+    )
+}
+
 /// The dim line under a queued prompt's card saying why it has not gone
 /// yet. Built in two places — when the send is accepted, and again if a
 /// session replay clears the transcript before it goes (see
@@ -3433,6 +3452,7 @@ impl ChatPane {
             restore_notice,
             placeholder,
             session_has_content: Cell::new(false),
+            guidance_seen: Cell::new(0),
             clear_on_replay: Cell::new(false),
             replaying: Cell::new(false),
             stash_replayed: Cell::new(false),
@@ -5666,6 +5686,7 @@ impl ChatPane {
             auto_approve: self.approval_picker.is_active(),
             restart_when_silent: self.restart_picker.is_active(),
             environment: self.environment.clone(),
+            guidance_seen: self.guidance_seen.get(),
         }
     }
 
@@ -5695,6 +5716,7 @@ impl ChatPane {
         }
         *self.model_value.borrow_mut() = entry.model_value.clone();
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
+        self.guidance_seen.set(entry.guidance_seen);
         *self.config_values.borrow_mut() = entry.config_values.clone();
         self.syncing.set(true);
         self.approval_picker.set_active(entry.auto_approve);
@@ -6604,22 +6626,6 @@ impl ChatPane {
         }
     }
 
-    /// What the IDE puts ahead of a prompt so the agent does not have to
-    /// ask: the coordinator's brief, and the orientation.
-    ///
-    /// The brief goes ahead of the first prompt of a fresh session in the
-    /// primary environment's chat — and nowhere else. The MCP server says
-    /// the same thing in its initialize instructions; this is the delivery
-    /// that does not depend on an adapter surfacing them
-    /// (`taste_core::orchestration::coordinator_brief`). A restored session
-    /// replays its history first, so it already has content and is not
-    /// briefed twice.
-    ///
-    /// The orientation goes ahead of the first prompt of every session, in
-    /// every environment, and ahead of the first prompt after the
-    /// environment settled into a new state (`orientation_due`). The
-    /// transcript shows the user's words and a note that each went with
-    /// them.
     /// Where in the conversation a message written now is written: the
     /// agent's message as far as it has streamed, else its last finished
     /// message or step, which is the last thing the user could see.
@@ -6713,6 +6719,22 @@ impl ChatPane {
         }
     }
 
+    /// What the IDE puts ahead of a prompt so the agent does not have to
+    /// ask: the coordinator's brief, and the orientation.
+    ///
+    /// The brief goes ahead of the first prompt of a fresh session in the
+    /// primary environment's chat — and nowhere else. The MCP server says
+    /// the same thing in its initialize instructions; this is the delivery
+    /// that does not depend on an adapter surfacing them
+    /// (`taste_core::orchestration::coordinator_brief`). A restored session
+    /// replays its history first, so it already has content and is not
+    /// briefed twice.
+    ///
+    /// The orientation goes ahead of the first prompt of every session, in
+    /// every environment, and ahead of the first prompt after the
+    /// environment settled into a new state (`orientation_due`). The
+    /// transcript shows the user's words and a note that each went with
+    /// them.
     fn with_briefing(&self, blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
         let mut front: Vec<String> = Vec::new();
         if self.environment.is_primary() && !self.session_has_content.get() {
@@ -6724,6 +6746,30 @@ impl ChatPane {
                 self.meta_row(&summary);
                 front.push(text);
             }
+        }
+        // The IDE's guidance, when it has changed since this conversation
+        // was given it: an agent reads its instructions when its session
+        // starts, and a conversation outlives the IDE that briefed it
+        // (David, 2026-10-11: "track the high water mark on changes for the
+        // system/IDE prompt, and send the new one to an agent that still
+        // hasn't seen it. Prepend it with what's going on"). A new
+        // conversation's agent has just read the current text.
+        let current = taste_mcp::GUIDANCE_REVISION;
+        let seen = self.guidance_seen.get();
+        if seen < current {
+            if self.session_has_content.get() {
+                self.meta_row(&format!(
+                    "the IDE's guidance changed since this conversation was briefed \
+                     (revision {current}); sent with this prompt"
+                ));
+                front.push(guidance_update(
+                    seen,
+                    current,
+                    &taste_mcp::guidance_without_memory(&self.environment),
+                ));
+            }
+            self.guidance_seen.set(current);
+            self.notify_persist();
         }
         if front.is_empty() {
             return blocks;
@@ -14098,6 +14144,7 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "ide_app_log" => "Read the IDE's own log".into(),
         "ide_permission_log" => "Read what has been allowed and refused".into(),
         "ide_conventions" => "Read the project's conventions".into(),
+        "ide_guide" => "Read the IDE's guidance".into(),
         "environment" | "ide_environment" => "Read where it is running".into(),
         "ide_write_policy" => "Check what it may write".into(),
         "ide_screenshot" => "Photograph a pane".into(),
@@ -15529,6 +15576,18 @@ fn centre_dot_after_layout(row_box: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conversation briefed before the current guidance is told what
+    /// happened before it is given the text: from which revision, or from
+    /// before they were counted.
+    #[test]
+    fn the_guidance_update_says_what_happened() {
+        let fresh = guidance_update(0, 3, "FILES: …");
+        assert!(fresh.starts_with("[The IDE was updated since this conversation was briefed (before the IDE numbered its guidance)"));
+        assert!(fresh.contains("now revision 3"));
+        assert!(fresh.ends_with("]\n\nFILES: …"));
+        assert!(guidance_update(2, 3, "x").contains("(at revision 2)"));
+    }
 
     /// The working line tells working from gone by what the proxy sees,
     /// not by silence alone.

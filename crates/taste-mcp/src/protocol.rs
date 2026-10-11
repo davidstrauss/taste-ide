@@ -133,6 +133,7 @@ pub fn effect(tool: &str) -> Effect {
         | "ide_references"
         | "ide_write_policy"
         | "ide_conventions"
+        | "ide_guide"
         | "ide_environment"
         | "ide_screenshot"
         | "ide_widget_geometry"
@@ -333,7 +334,10 @@ pub fn asks_nobody(tool: &str) -> bool {
 /// refusal of it only leaves the agent guessing where its commands land
 /// (David, 2026-10-03: "We should never deny 'read where it is running'").
 pub fn never_refused(tool: &str) -> bool {
-    matches!(tool, "environment" | "ide_environment" | "ide_read_file")
+    matches!(
+        tool,
+        "environment" | "ide_environment" | "ide_read_file" | "ide_guide"
+    )
 }
 
 /// Whether the IDE may remember a standing **allow** for this tool.

@@ -390,7 +390,11 @@ to.
   one — so it is stated as the design, not as an accommodation, in code
   comments and docs alike (David, 2026-09-16: "quit it with the
   frustration in coaching a dumb model. This is also an optimization for
-  token efficiency even for frontier models").
+  token efficiency even for frontier models"). What every agent is told
+  at the start lives in `taste_mcp::guidance` (and `ide_guide` gives it
+  back); its `GUIDANCE_REVISION` is the high-water mark a conversation
+  briefed under an older one is caught up to before its next prompt, and a
+  test fails until the revision is raised with the text.
 - **Supervision happens at the orchestrator level.** David works from the
   coordinator's chat by preference rather than habit (2026-09-13: "I
   mostly want to mostly work at the orchestrator/supervisor level"), so

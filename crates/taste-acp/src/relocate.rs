@@ -292,10 +292,12 @@ fn exec_in_environment(
 /// `permissions.deny` setting. Search (Glob, Grep) and the shell stay.
 pub const CLAUDE_DENIED_TOOLS: [&str; 4] = ["Read", "Edit", "Write", "MultiEdit"];
 
-/// And the IDE's read, allowed without asking, as Read was — and the
-/// project's memory, the agent's own notes, which it kept without asking.
-pub const CLAUDE_ALLOWED_TOOLS: [&str; 5] = [
+/// And the IDE's read, allowed without asking, as Read was — the project's
+/// memory, the agent's own notes, which it kept without asking — and the
+/// IDE's own guidance, which is its instructions read again.
+pub const CLAUDE_ALLOWED_TOOLS: [&str; 6] = [
     "mcp__taste-ide__ide_read_file",
+    "mcp__taste-ide__ide_guide",
     "mcp__taste-ide__memory_list",
     "mcp__taste-ide__memory_read",
     "mcp__taste-ide__memory_save",

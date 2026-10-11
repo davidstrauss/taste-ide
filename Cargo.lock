@@ -3865,6 +3865,7 @@ dependencies = [
  "git2",
  "serde",
  "serde_json",
+ "sha2",
  "taste-core",
  "taste-devcontainer",
  "taste-flatpak",
