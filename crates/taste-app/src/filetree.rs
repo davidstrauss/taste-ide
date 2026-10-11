@@ -535,10 +535,6 @@ pub struct FileTree {
     tasks_empty: gtk::Box,
     tasks_ghost_label: gtk::Label,
     tasks: RefCell<(Vec<TaskRow>, Option<String>, bool)>,
-    /// The aimed environment's notebook kernels, as the entry the IDE adds
-    /// at the top of Tasks (`crate::kernels`); `None` with none of its
-    /// notebooks open.
-    kernel_entry: RefCell<Option<crate::kernels::KernelSummary>>,
     task_in_front: RefCell<Option<String>>,
     /// The file whose tab is in front, when the tab in front is a file's:
     /// the one row the tree may light (`select_for_editor`).
@@ -1478,7 +1474,6 @@ impl FileTree {
             tasks_empty,
             tasks_ghost_label,
             tasks: RefCell::new((Vec::new(), None, false)),
-            kernel_entry: RefCell::new(None),
             task_in_front: RefCell::new(None),
             file_in_front: RefCell::new(None),
             task_hits: RefCell::new(HashMap::new()),
@@ -1816,12 +1811,13 @@ impl FileTree {
         tree.refresh_status();
         tree.rebuild();
         tree.rebuild_index();
-        // The notebook kernels' entry follows them.
+        // The kernel task's row says how the notebooks' kernel stands, and
+        // follows it.
         {
             let weak = Rc::downgrade(&tree);
             crate::kernels::kernels().connect(move || {
                 if let Some(tree) = weak.upgrade() {
-                    tree.refresh_kernel_entry();
+                    tree.render_tasks();
                 }
             });
         }
@@ -1957,7 +1953,6 @@ impl FileTree {
         }
         self.close_open_menu();
         *self.watching.borrow_mut() = target;
-        self.refresh_kernel_entry();
         let root = self.view_root();
         // Opening the repository touches disk (`.git`, packed-refs, HEAD),
         // so it runs on the blocking pool. Cleared to `None` right away
@@ -2800,92 +2795,6 @@ impl FileTree {
         self.render_tasks();
     }
 
-    /// The kernels' entry again, for the environment the panes are aimed
-    /// at; redrawn when it moved.
-    pub fn refresh_kernel_entry(self: &Rc<Self>) {
-        let entry = crate::kernels::kernels().summary(&self.aimed_environment());
-        if *self.kernel_entry.borrow() == entry {
-            return;
-        }
-        *self.kernel_entry.borrow_mut() = entry;
-        self.render_tasks();
-    }
-
-    /// The entry the IDE adds at the top of Tasks for the aimed
-    /// environment's notebook kernels: how they stand, and the button that
-    /// starts them, or stops them while any runs. Opens nothing.
-    fn kernel_row(self: &Rc<Self>, entry: &crate::kernels::KernelSummary) -> gtk::ListBoxRow {
-        use crate::kernels::KernelState as K;
-        let running = matches!(entry.state, K::Idle | K::Busy | K::Starting);
-        let button = gtk::Button::builder()
-            .icon_name(if running {
-                "media-playback-stop-symbolic"
-            } else {
-                "media-playback-start-symbolic"
-            })
-            .tooltip_text(if running {
-                "Stop the notebooks' kernels"
-            } else {
-                "Start the open notebooks' kernels in the environment"
-            })
-            .css_classes(["flat", "circular"])
-            .valign(gtk::Align::Center)
-            .build();
-        {
-            let weak = Rc::downgrade(self);
-            button.connect_clicked(move |_| {
-                let Some(tree) = weak.upgrade() else { return };
-                let env = tree.aimed_environment();
-                if running {
-                    crate::kernels::kernels().stop_all(&env);
-                } else {
-                    crate::kernels::kernels().start_all(&env);
-                }
-            });
-        }
-        let dot = match entry.state {
-            K::Idle => "green",
-            K::Failed => "red",
-            K::Off | K::Starting | K::Busy => "unknown",
-        };
-        let item = section_row(
-            Some(dot),
-            None,
-            "Jupyter kernel",
-            &entry.detail,
-            Some(button.upcast_ref()),
-        );
-        item.set_activatable(false);
-        item.set_selectable(false);
-        item.set_tooltip_text(Some(
-            "Added by the IDE for the open notebooks: each runs its own kernel in this \
-             environment's container",
-        ));
-        // Starting, or running a cell, spins where the light is, as a task's
-        // run does (`task_row`).
-        if matches!(entry.state, K::Starting | K::Busy) {
-            if let Some(slot) = item
-                .child()
-                .and_then(|line| line.first_child())
-                .and_downcast::<gtk::Box>()
-            {
-                while let Some(child) = slot.first_child() {
-                    slot.remove(&child);
-                }
-                let spinner = gtk::Spinner::builder()
-                    .spinning(true)
-                    .width_request(12)
-                    .height_request(12)
-                    .valign(gtk::Align::Center)
-                    .halign(gtk::Align::Center)
-                    .hexpand(true)
-                    .build();
-                slot.append(&spinner);
-            }
-        }
-        item
-    }
-
     fn render_tasks(self: &Rc<Self>) {
         while let Some(child) = self.tasks_list.first_child() {
             self.tasks_list.remove(&child);
@@ -2914,28 +2823,8 @@ impl FileTree {
         let total: usize = hits.iter().sum();
         let names: Vec<String> = rows.iter().map(|row| row.info.name.clone()).collect();
         let outline = crate::tasks::outline(&names);
-        let mut row_names = Vec::with_capacity(outline.len() + 1);
+        let mut row_names = Vec::with_capacity(outline.len());
         let mut kept_height = 0;
-        // The IDE's own entry first, ahead of the Taskfile's: the notebook
-        // kernels. A query dims it when it does not name it, as any row.
-        if let Some(entry) = self.kernel_entry.borrow().clone() {
-            let item = self.kernel_row(&entry);
-            if !query.is_empty()
-                && query.ranges("Jupyter kernel").is_empty()
-                && query.ranges(&entry.detail).is_empty()
-            {
-                if query.ghost {
-                    item.add_css_class("search-dim");
-                } else {
-                    item.set_visible(false);
-                }
-            }
-            if item.is_visible() {
-                kept_height += 40;
-            }
-            row_names.push(None);
-            self.tasks_list.append(&item);
-        }
         // Which namespaces are open: the ones opened by hand, and — while a
         // query stands — every one with a hit inside, so a match is never
         // folded out of sight.
@@ -3145,7 +3034,13 @@ impl FileTree {
                 }
             });
         }
-        let subtitle = match (row.state.words(), row.info.desc.as_str()) {
+        // The kernel's task says how the notebooks' kernel stands in place
+        // of what it does (`crate::kernels`), while a notebook is open.
+        let kernel_note = (row.info.name == taste_core::kernel_task::TASK)
+            .then(|| crate::kernels::kernels().row_note(&self.aimed_environment()))
+            .flatten();
+        let desc = kernel_note.as_deref().unwrap_or(row.info.desc.as_str());
+        let subtitle = match (row.state.words(), desc) {
             ("", desc) => desc.to_string(),
             (words, "") => words.to_string(),
             (words, desc) => format!("{words} · {desc}"),

@@ -1,4 +1,4 @@
-//! A notebook's kernel, run in the environment the notebook belongs to.
+//! A notebook's connection to its environment's kernel.
 //!
 //! Running a notebook runs the project's code, so the kernel lives where
 //! the project's code always runs: in that environment's container, in its
@@ -10,22 +10,22 @@
 //! is no container — never the host passthrough an `ExecContext` falls
 //! back to.
 //!
-//! **The runtime is the container's.** The IDE does not ship or install
-//! Jupyter (David: "It's okay to require Jupyter tooling of the
-//! container's choice in the container"): the launcher picks the first of
-//! the project's `.venv/bin/python`, `venv/bin/python`, `python3`, and
-//! `python` that can import `jupyter_client` — the Jupyter project's own
-//! client library, which ships with `ipykernel` — and runs the bridge
+//! **The kernel is the project's.** The IDE does not ship, install, or
+//! start Jupyter (David: "It's okay to require Jupyter tooling of the
+//! container's choice in the container"): the project's `jupyter:kernel`
+//! task starts the kernel and it writes its connection file at a fixed
+//! place (`taste_core::kernel_task`). The launcher picks the first of the
+//! project's `.venv/bin/python`, `venv/bin/python`, `python3`, and `python`
+//! that can import `jupyter_client` — the Jupyter project's own client
+//! library, which ships with `ipykernel` — and runs the bridge
 //! (`kernel_bridge.py`) on it. The bridge is the one thing the IDE brings:
-//! a page of glue that starts the notebook's kernel through
-//! `jupyter_client` and relays the Jupyter messaging protocol as JSON
-//! lines over the exec's stdio. The kernel's ZeroMQ sockets stay on the
-//! container's loopback; this process reads lines and nothing else.
+//! a page of glue that connects to that kernel as a client and relays the
+//! Jupyter messaging protocol as JSON lines over the exec's stdio. The
+//! kernel's ZeroMQ sockets stay on the container's loopback; this process
+//! reads lines and nothing else.
 //!
-//! When it cannot start, what it said comes back as [`Event::Failed`], and
-//! the notebook offers it to the agent to fix in the container.
-
-use std::path::Path;
+//! When it cannot connect, what it said comes back as [`Event::Failed`],
+//! and the notebook offers it to the agent to fix.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -44,7 +44,7 @@ const LAUNCHER: &str = r#"for p in "$PWD/.venv/bin/python" "$PWD/venv/bin/python
   esac
   if "$p" -c 'import jupyter_client' >/dev/null 2>&1; then exec "$p" -u -c "$1"; fi
 done
-echo '{"ev": "failed", "message": "no Python in this environment can import jupyter_client (tried .venv/bin/python, venv/bin/python, python3, and python)", "kernels": []}'
+echo '{"ev": "failed", "message": "no Python in this environment can import jupyter_client, which the IDE connects to the kernel with (tried .venv/bin/python, venv/bin/python, python3, and python)"}'
 "#;
 
 /// How much of the bridge's stderr is kept, for a failure's report.
@@ -99,21 +99,21 @@ pub enum Event {
     Exited { report: String },
 }
 
-/// A running kernel. Dropping it ends the bridge's input, which shuts the
-/// kernel down in the container; the exec is killed if it has not gone
-/// within a few seconds of that.
+/// A connection to the environment's kernel. Dropping it ends the bridge's
+/// input, which ends the connection; the kernel goes on until its task
+/// stops. The exec is killed if it has not gone within a few seconds.
 pub struct Kernel {
     lines: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 impl Kernel {
-    /// Start the kernel `name` (empty: the bridge's choice) with `cwd` as
-    /// its directory, in the container `exec` reaches. `on_event` hears
-    /// everything it says, on the GTK thread.
-    pub fn start(
+    /// Connect to the kernel the `jupyter:kernel` task runs in the
+    /// container `exec` reaches, waiting up to `wait` seconds for it to
+    /// write its connection file and answer. `on_event` hears everything it
+    /// says, on the GTK thread.
+    pub fn connect(
         exec: &taste_core::ExecContext,
-        name: &str,
-        cwd: &Path,
+        wait: u64,
         on_event: impl Fn(Event) + 'static,
     ) -> Result<Self> {
         // The host passthrough would run the project's code on the user's
@@ -129,9 +129,9 @@ impl Kernel {
         let (lines_tx, mut lines_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<Event>(EVENT_QUEUE);
         let start = serde_json::json!({
-            "op": "start",
-            "kernel": name,
-            "cwd": cwd.display().to_string(),
+            "op": "connect",
+            "file": taste_core::kernel_task::CONNECTION_FILE,
+            "wait": wait,
         })
         .to_string();
         lines_tx.send(start).ok();
@@ -278,10 +278,6 @@ impl Kernel {
     pub fn interrupt(&self) {
         self.send(serde_json::json!({"op": "interrupt"}));
     }
-
-    pub fn restart(&self) {
-        self.send(serde_json::json!({"op": "restart"}));
-    }
 }
 
 /// What one read of the bridge's output came to.
@@ -335,17 +331,7 @@ fn parse_event(line: &str, stderr: &dyn Fn() -> String) -> Option<Event> {
             display_name: text("display_name"),
         },
         "failed" => {
-            let kernels: Vec<&str> = message["kernels"]
-                .as_array()
-                .map(|k| k.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
             let mut report = text("message");
-            if !kernels.is_empty() {
-                report.push_str(&format!(
-                    "\nKernels this environment has: {}",
-                    kernels.join(", ")
-                ));
-            }
             let stderr = stderr();
             if !stderr.trim().is_empty() {
                 report.push_str(&format!("\n\nThe bridge's stderr:\n{stderr}"));
@@ -402,12 +388,11 @@ mod tests {
             Some(Event::Ready { display_name }) if display_name == "Python 3"
         ));
         match parse_event(
-            r#"{"ev": "failed", "message": "no kernel named 'ir'", "kernels": ["python3"]}"#,
+            r#"{"ev": "failed", "message": "the kernel at /tmp/k.json did not answer"}"#,
             &|| "Traceback: x".to_string(),
         ) {
             Some(Event::Failed { message, report }) => {
-                assert_eq!(message, "no kernel named 'ir'");
-                assert!(report.contains("python3"));
+                assert_eq!(message, "the kernel at /tmp/k.json did not answer");
                 assert!(report.contains("Traceback: x"));
             }
             other => panic!("{other:?}"),
@@ -458,7 +443,7 @@ mod tests {
     #[test]
     fn no_container_is_refused_rather_than_run_here() {
         let exec = taste_core::ExecContext::for_tests(false);
-        let refused = Kernel::start(&exec, "python3", Path::new("/tmp"), |_| {});
+        let refused = Kernel::connect(&exec, 1, |_| {});
         let Err(why) = refused else {
             panic!("a kernel started with no container");
         };

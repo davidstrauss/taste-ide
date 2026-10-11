@@ -800,7 +800,7 @@ fn touch_countdown(base: &str, elapsed_secs: u64) -> String {
 /// a project that has none — set-up, not repair: nothing failed, so there
 /// is no log to attach and no cause to find.
 pub(crate) fn author_prompt() -> String {
-    "Write this project's devcontainer definition.\n\n\
+    let mut text = "Write this project's devcontainer definition.\n\n\
      WHAT IS TRUE\n\
      The project has no .devcontainer/ yet. The IDE is running its own baseline environment \
      (safe mode) so that one can be written: .devcontainer/ is writable, and the rest of the \
@@ -816,11 +816,12 @@ pub(crate) fn author_prompt() -> String {
      in the Containerfile too (Fedora's package is go-task; either binary name works): the \
      IDE lists and runs the project's tasks through it.\n\
      If the checkout has Jupyter notebooks (.ipynb files): install ipykernel, which brings \
-     jupyter_client, into the Python the project uses, and the packages the notebooks import. \
-     The IDE runs a notebook's kernel in this container with the first of .venv/bin/python, \
-     venv/bin/python, python3, and python that can import jupyter_client, then starts the \
-     kernel the notebook's metadata names (python3 when it names none); a kernel of another \
-     language needs that kernel installed too.\n\
+     jupyter_client, into the Python the project uses, and the packages the notebooks import, \
+     install Task, and add the notebook kernel's task to the Taskfile. "
+        .to_string();
+    text.push_str(&taste_core::kernel_task::convention());
+    text.push_str(
+        "\n\
      If the project runs podman or docker itself (its build, tests, or tasks call it): \
      install podman, fuse-overlayfs, and passt; set \"privileged\": true in devcontainer.json (the \
      IDE grants exactly what nested podman needs for it, and VS Code reads it too); after the \
@@ -836,7 +837,8 @@ pub(crate) fn author_prompt() -> String {
      Task and for nested podman; a failure names what is missing and the change that fixes it. Stop after three attempts and report what you \
      tried.\n\
      5. Finish with one short paragraph: what the environment provides, and why."
-        .to_string()
+    );
+    text
 }
 
 /// The prompt Prompt Agent sends for `supervisor`'s environment, and the

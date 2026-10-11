@@ -296,6 +296,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // are aimed at, opened as a log tab, run in that environment's
     // container.
     let task_runs = workspace.tasks.clone();
+    // The notebooks' kernel is each environment's `jupyter:kernel` task: how
+    // to list an environment's tasks for it, and the board that runs them.
+    {
+        let environments = environments.clone();
+        crate::kernels::kernels().set_hooks(crate::kernels::Hooks {
+            lister: Rc::new(move |env| {
+                let supervisor = environments.get(env)?;
+                Some((
+                    supervisor.exec().clone(),
+                    supervisor.files(),
+                    supervisor.checkout().path().to_path_buf(),
+                ))
+            }),
+            board: task_runs.clone(),
+        });
+    }
     let refresh_tasks: Rc<dyn Fn()> = {
         let filetree = filetree.clone();
         let environments = environments.clone();
@@ -319,6 +335,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if filetree.aimed_environment() != env {
                     return;
                 }
+                // Whether it defines the notebooks' kernel task, for them.
+                crate::kernels::kernels().set_defined(
+                    &env,
+                    matches!(&listing, crate::tasks::Listing::Tasks { tasks, .. }
+                        if tasks.iter().any(|task| task.name == taste_core::kernel_task::TASK)),
+                );
                 match listing {
                     crate::tasks::Listing::NoTaskfile => {
                         filetree.set_tasks(Vec::new(), None, false)
@@ -4413,6 +4435,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         editor.append_task(&env, &name, &lines);
                     }
                     Event::TaskState { env, name } => {
+                        // The kernel's task: its environment's notebooks
+                        // follow it (`crate::kernels`).
+                        crate::kernels::kernels().task_changed(&env, &name);
                         editor.set_task_failed(
                             &env,
                             &name,

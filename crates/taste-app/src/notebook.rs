@@ -42,6 +42,7 @@ use sourceview5::prelude::*;
 
 use crate::kernel::{Event, Kernel};
 use crate::markdown_view::{DocumentBase, Readiness};
+use taste_core::tasks::RunState;
 
 /// The most lines of one text output drawn; the rest stay in the file.
 const MAX_OUTPUT_LINES: usize = 400;
@@ -147,6 +148,9 @@ pub struct Session {
     /// read back as the file changing under it.
     pub writing: Cell<bool>,
     kernel: RefCell<Option<Kernel>>,
+    /// The kernel has been asked for — Start Kernel, or a cell run — and
+    /// is to be connected to once the task is found and running.
+    wanted: Cell<bool>,
     state: RefCell<State>,
     kernel_name: RefCell<String>,
     runs: RefCell<HashMap<String, Run>>,
@@ -195,9 +199,8 @@ impl Session {
             Ok("failed") => State::Failed {
                 // With an apostrophe in it: the old banner read its title as
                 // markup and showed this one as `&apos;`.
-                message: "the kernel's bridge exited before the kernel started: no Python in \
-                          this environment can import jupyter_client (tried .venv/bin/python, \
-                          venv/bin/python, python3, and python)"
+                message: "the jupyter:kernel task failed: the kernel's Python could not import \
+                          ipykernel"
                     .into(),
                 report: String::new(),
             },
@@ -211,6 +214,7 @@ impl Session {
             buffer,
             writing: Cell::new(false),
             kernel: RefCell::new(None),
+            wanted: Cell::new(false),
             state: RefCell::new(state),
             kernel_name: RefCell::new(String::new()),
             runs: RefCell::new(HashMap::new()),
@@ -263,14 +267,6 @@ impl Session {
         &self.env
     }
 
-    /// The notebook's file name, for the Tasks entry.
-    pub fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    }
-
     /// How its kernel stands, and what it said when it did not start.
     pub fn kernel_status(&self) -> (crate::kernels::KernelState, Option<String>) {
         use crate::kernels::KernelState as K;
@@ -283,8 +279,9 @@ impl Session {
         }
     }
 
-    /// Start its kernel, afresh after a failure or a stop; nothing when it
-    /// is running.
+    /// Connect to the environment's kernel, starting its task when it is
+    /// not running; afresh after a failure or a stop, and nothing when
+    /// connected.
     pub fn start_kernel(self: &Rc<Self>) {
         if matches!(
             *self.state.borrow(),
@@ -293,19 +290,48 @@ impl Session {
             self.kernel.borrow_mut().take();
             self.set_state(State::Off);
         }
+        self.wanted.set(true);
         self.ensure_kernel();
     }
 
-    /// Stop its kernel: the bridge's input ended, which shuts it down in
-    /// the container, and the runs in flight given up.
-    pub fn stop_kernel(&self) {
-        if self.kernel.borrow_mut().take().is_none()
-            && !matches!(*self.state.borrow(), State::Failed { .. })
-        {
+    /// The kernel's task was found or lost, or started or stopped
+    /// (`crate::kernels`): connect when it has just started for a notebook
+    /// that asked, let go when it has stopped, and say so either way.
+    pub fn task_changed(self: &Rc<Self>) {
+        let kernels = crate::kernels::kernels();
+        let state = kernels.task_state(&self.env);
+        if state == RunState::Running {
+            if self.wanted.get() && self.kernel.borrow().is_none() {
+                self.ensure_kernel();
+            }
+            self.show_state();
             return;
         }
-        self.abandon_runs();
-        self.set_state(State::Off);
+        let connected = self.kernel.borrow_mut().take().is_some();
+        let live = matches!(
+            *self.state.borrow(),
+            State::Starting | State::Idle | State::Busy | State::Restarting
+        );
+        if connected || live {
+            self.abandon_runs();
+            let lines = kernels.task_lines(&self.env);
+            let from = lines.len().saturating_sub(60);
+            let report = lines[from..]
+                .iter()
+                .map(|line| taste_core::tasks::plain_line(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.set_state(if state == RunState::Failed {
+                State::Failed {
+                    message: format!("the {} task failed", taste_core::kernel_task::TASK),
+                    report,
+                }
+            } else {
+                State::Stopped { report }
+            });
+            return;
+        }
+        self.show_state();
     }
 
     /// Draw `text` (the notebook's JSON). Returned at once, empty, with
@@ -719,14 +745,35 @@ impl Session {
         let Some(exec) = self.exec.clone() else {
             return false;
         };
-        let cwd = self
-            .path
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"));
+        self.wanted.set(true);
+        let kernels = crate::kernels::kernels();
+        // The kernel is the project's task's. Not defined: the bar says so,
+        // and offers the agent; not yet known: it is being listed, and this
+        // goes on when it is (`task_changed`).
+        match kernels.defined(&self.env) {
+            Some(true) => {}
+            Some(false) => {
+                kernels.check(&self.env);
+                self.show_state();
+                return false;
+            }
+            None => {
+                kernels.check(&self.env);
+                return false;
+            }
+        }
+        if let Err(why) = kernels.start_task(&self.env, &exec) {
+            self.set_state(State::Failed {
+                message: format!(
+                    "the {} task did not start: {why}",
+                    taste_core::kernel_task::TASK
+                ),
+                report: why,
+            });
+            return false;
+        }
         let weak = Rc::downgrade(self);
-        let name = self.kernel_name.borrow().clone();
-        match Kernel::start(&exec, &name, &cwd, move |event| {
+        match Kernel::connect(&exec, 120, move |event| {
             if let Some(session) = weak.upgrade() {
                 session.on_event(event);
             }
@@ -937,21 +984,12 @@ impl Session {
         }
     }
 
+    /// Restart the kernel: its task, which every notebook of the
+    /// environment shares, stopped and started again (`crate::kernels`).
     fn restart(self: &Rc<Self>) {
-        // A kernel that never started, or stopped, is started afresh.
-        if matches!(
-            *self.state.borrow(),
-            State::Failed { .. } | State::Stopped { .. }
-        ) {
-            self.kernel.borrow_mut().take();
-            self.set_state(State::Off);
-            self.ensure_kernel();
-            return;
-        }
-        if let Some(kernel) = self.kernel.borrow().as_ref() {
-            kernel.restart();
-        }
+        self.wanted.set(true);
         self.abandon_runs();
+        crate::kernels::kernels().restart(&self.env);
     }
 
     /// Every run in flight given up: their prompts back to unrun.
@@ -1038,7 +1076,7 @@ impl Session {
                 match state {
                     State::Failed { .. } => {}
                     State::Starting => self.set_state(State::Failed {
-                        message: "the kernel's bridge exited before the kernel started".into(),
+                        message: "the IDE's client exited before it reached the kernel".into(),
                         report,
                     }),
                     _ => self.set_state(State::Stopped { report }),
@@ -1300,6 +1338,14 @@ impl Session {
                 false,
             ),
             State::Idle | State::Busy => (None, false, false),
+            _ if crate::kernels::kernels().defined(&self.env) == Some(false) => (
+                Some(format!(
+                    "This project does not define a {} task, which runs its notebooks' kernel.",
+                    taste_core::kernel_task::TASK
+                )),
+                false,
+                true,
+            ),
             State::Off => (
                 Some(format!(
                     "The kernel is not running. Cells run in {} once it starts.",
@@ -1331,6 +1377,12 @@ impl Session {
             .set_sensitive(runnable && !matches!(*state, State::Off));
         drawing.banner.start.set_visible(start);
         drawing.banner.prompt.set_visible(prompt);
+        // The one answer offered is the suggested one.
+        if start {
+            drawing.banner.prompt.remove_css_class("suggested-action");
+        } else {
+            drawing.banner.prompt.add_css_class("suggested-action");
+        }
         match said {
             Some(said) => {
                 drawing.banner.title.set_label(&said);
@@ -1353,13 +1405,18 @@ impl Session {
     /// Hand what the kernel said to the environment's agent, to fix in the
     /// container.
     fn prompt_agent(&self) {
+        if crate::kernels::kernels().defined(&self.env) == Some(false) {
+            let name = self.kernel_name.borrow().clone();
+            let (prompt, attachment) = define_prompt(&self.path, &name);
+            (self.on_prompt_agent)(prompt, attachment);
+            return;
+        }
         let (message, report) = match &*self.state.borrow() {
             State::Failed { message, report } => (message.clone(), report.clone()),
             State::Stopped { report } => ("the kernel stopped".to_string(), report.clone()),
             _ => return,
         };
-        let name = self.kernel_name.borrow().clone();
-        let (prompt, attachment) = repair_prompt(&self.path, &name, &message, &report);
+        let (prompt, attachment) = repair_prompt(&self.path, &message, &report);
         (self.on_prompt_agent)(prompt, attachment);
     }
 
@@ -2004,12 +2061,48 @@ impl KernelBar {
     }
 }
 
-/// The prompt Prompt Agent sends when the kernel would not start, and what
-/// it said as the attachment — written to the house rule on agent-facing
-/// text: the evidence rides along, and the steps name the tools.
+/// The prompt Prompt Agent sends when the project does not define the
+/// kernel's task: the convention (`taste_core::kernel_task`), which the
+/// agent's instructions carry too, and the notebook that asked.
+pub fn define_prompt(path: &std::path::Path, kernel: &str) -> (String, (String, String)) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "the notebook".into());
+    let kernel = if kernel.is_empty() {
+        String::new()
+    } else {
+        format!(" Its metadata names the kernel `{kernel}`.")
+    };
+    let task = taste_core::kernel_task::TASK;
+    let prompt = format!(
+        "The notebook `{name}` cannot run: this project defines no `{task}` task.{kernel}\n\n\
+         WHAT IS TRUE\n\
+         {convention}\n\n\
+         HOW TO WORK\n\
+         1. Find how this project runs Python (its .venv, requirements, pyproject, or the \
+         image in .devcontainer/), and make sure ipykernel and the packages the notebook \
+         imports are installed that way; after changing .devcontainer/, call \
+         devcontainer_reload.\n\
+         2. Add the `{task}` task to the Taskfile, creating the Taskfile if there is none.\n\
+         3. Check it: task_run `{task}`, then task_output shows the kernel started; stop it \
+         with task_stop. The user starts it from the notebook.\n\
+         4. Finish with one short paragraph: the task you added, and anything you installed.",
+        convention = taste_core::kernel_task::convention(),
+    );
+    (
+        prompt,
+        ("notebook.txt".to_string(), path.display().to_string()),
+    )
+}
+
+/// The prompt Prompt Agent sends when the kernel would not start or
+/// stopped, and what it said, as the attachment it names. Written to the
+/// house rule on agent-facing text: what is true, the evidence attached,
+/// and the steps, so any model can act on it without first going to fetch
+/// what happened.
 pub fn repair_prompt(
     path: &std::path::Path,
-    kernel: &str,
     message: &str,
     report: &str,
 ) -> (String, (String, String)) {
@@ -2017,27 +2110,22 @@ pub fn repair_prompt(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "the notebook".into());
-    let kernel = if kernel.is_empty() {
-        "the default Python kernel".to_string()
-    } else {
-        format!("the kernel `{kernel}`")
-    };
+    let task = taste_core::kernel_task::TASK;
     let prompt = format!(
         "The notebook `{name}` cannot run: its kernel did not start in this environment.\n\n\
          WHAT IS TRUE\n\
-         The IDE runs a notebook's kernel inside this environment's container, with the \
-         container's own Jupyter: the first of .venv/bin/python, venv/bin/python, python3, and \
-         python that can import jupyter_client, then {kernel}, which the notebook names. It \
-         reported: {message}. Its full report is attached as notebook-kernel.log.\n\n\
+         {convention}\n\
+         It reported: {message}. Its full report — the task's output, or the IDE client's \
+         — is attached as notebook-kernel.log.\n\n\
          HOW TO WORK\n\
-         1. Read the attached report.\n\
-         2. Make the container provide what is missing: ipykernel (which brings \
-         jupyter_client) and {kernel}, and the packages the notebook imports. Install them the \
-         way this project already manages packages (its .venv, requirements, pyproject, or the \
-         image in .devcontainer/); after changing .devcontainer/, call devcontainer_reload.\n\
-         3. Check with ide_exec: `python3 -c \"import jupyter_client\"` and `jupyter \
-         kernelspec list`.\n\
-         4. Finish with one short paragraph: what was missing, and what you changed."
+         1. Read the attached report, and the Taskfile's `{task}` task.\n\
+         2. Fix the cause: the task's command, or what the container lacks (ipykernel, \
+         jupyter_client, the packages the notebook imports), installed the way this project \
+         already manages packages; after changing .devcontainer/, call devcontainer_reload.\n\
+         3. Check it: task_run `{task}`, and task_output shows the kernel started; stop it with \
+         task_stop. The user starts it from the notebook.\n\
+         4. Finish with one short paragraph: what was wrong, and what you changed.",
+        convention = taste_core::kernel_task::convention(),
     );
     let attachment = if report.trim().is_empty() {
         message.to_string()
@@ -2162,14 +2250,24 @@ mod tests {
     fn the_repair_prompt_carries_what_the_kernel_said() {
         let (prompt, (file, log)) = repair_prompt(
             std::path::Path::new("/w/analysis.ipynb"),
-            "ir",
-            "no kernel named 'ir' in this environment",
-            "no kernel named 'ir'\nKernels this environment has: python3",
+            "the jupyter:kernel task failed",
+            "ModuleNotFoundError: No module named 'ipykernel'",
         );
         assert!(prompt.contains("analysis.ipynb"));
-        assert!(prompt.contains("the kernel `ir`"));
+        assert!(prompt.contains("`jupyter:kernel`"));
         assert!(prompt.contains("devcontainer_reload"));
         assert_eq!(file, "notebook-kernel.log");
-        assert!(log.contains("python3"));
+        assert!(log.contains("ipykernel"));
+    }
+
+    /// A project without the kernel's task is told the convention, with
+    /// the notebook that asked.
+    #[test]
+    fn the_define_prompt_teaches_the_convention() {
+        let (prompt, (_, notebook)) = define_prompt(std::path::Path::new("/w/a.ipynb"), "python3");
+        assert!(prompt.contains("defines no `jupyter:kernel` task"));
+        assert!(prompt.contains("/tmp/taste-ide-kernel.json"));
+        assert!(prompt.contains("`python3`"));
+        assert_eq!(notebook, "/w/a.ipynb");
     }
 }

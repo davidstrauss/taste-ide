@@ -1,21 +1,24 @@
 # The notebook kernel's bridge, run INSIDE an environment's container.
 #
 # The IDE starts this with `podman exec` (crate::kernel) and speaks JSON
-# lines with it over stdin and stdout. It starts the notebook's kernel
-# through jupyter_client, the Jupyter project's own client library (it
-# ships with ipykernel), and relays the Jupyter messaging protocol: the
-# kernel, its ZeroMQ sockets, and every byte of project code it runs stay
-# in the container. Nothing here listens on a network socket the IDE
-# reaches; the kernel's ports are on the container's own loopback.
+# lines with it over stdin and stdout. It connects to the kernel the
+# project's `jupyter:kernel` task runs (taste_core::kernel_task), through
+# the connection file that kernel writes, with jupyter_client, the Jupyter
+# project's own client library (it ships with ipykernel), and relays the
+# Jupyter messaging protocol: the kernel, its ZeroMQ sockets, and every
+# byte of project code it runs stay in the container. Nothing here listens
+# on a network socket the IDE reaches; the kernel's ports are on the
+# container's own loopback. The kernel is the task's: this client neither
+# starts it nor shuts it down, and several notebooks' clients share it.
 #
 # In (one JSON object per line):
-#   {"op": "start", "kernel": "python3", "cwd": "/path"}
+#   {"op": "connect", "file": "/tmp/...json", "wait": seconds}
 #   {"op": "execute", "cell": "<id>", "code": "..."}
 #   {"op": "comm_msg", "comm_id": ..., "data": {...}, "buffers": [base64, ...]}
-#   {"op": "interrupt"} | {"op": "restart"} | {"op": "shutdown"}
+#   {"op": "interrupt"} | {"op": "shutdown"}
 # Out:
 #   {"ev": "ready", "kernel": ..., "display_name": ..., "language": ...}
-#   {"ev": "failed", "message": ..., "kernels": [...]}
+#   {"ev": "failed", "message": ...}
 #   {"ev": "output", "cell": id | null, "parent": msg_id, "type": msg_type,
 #    "content": {...}}
 #   {"ev": "comm", "type": "comm_open" | "comm_msg" | "comm_close",
@@ -25,14 +28,14 @@
 #    "cell": id | null, "parent": msg_id | null}
 #   {"ev": "error", "message": ...} — an operation that failed, said
 #
-# End of input shuts the kernel down: the IDE closing the page, or the
-# IDE itself going, must not leave a kernel running in the container.
+# End of input ends this client; the kernel goes on until its task stops.
 import base64
 import json
 import math
 import os
 import sys
 import threading
+import time
 
 out_lock = threading.Lock()
 
@@ -60,13 +63,11 @@ def say(**message):
 
 
 try:
-    from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel
-    from jupyter_client.manager import KernelManager
+    from jupyter_client import BlockingKernelClient
 except Exception as e:  # noqa: BLE001 - any import failure is the same answer
-    say(ev="failed", message="jupyter_client is not importable here: %s" % e, kernels=[])
+    say(ev="failed", message="jupyter_client is not importable here: %s" % e)
     sys.exit(0)
 
-km = None
 kc = None
 cells = {}  # parent msg_id -> the IDE's cell id, until its reply
 ours = set()  # every msg_id this bridge sent, until its idle
@@ -75,46 +76,43 @@ cells_lock = threading.Lock()
 # pump_shell and written by main, so each holds this while it does.
 shell_lock = threading.Lock()
 stopping = threading.Event()
-# Set while a restart runs: the pumps leave the sockets to it, since
-# wait_for_ready reads both shell and iopub itself.
+# Unused while connected: kept so the pumps read as they did.
 paused = threading.Event()
 
 
-def kernel_names():
+def connect(path, wait):
+    """Connect to the task's kernel through its connection file, waiting
+    for the file to appear and the kernel to answer: the task may have
+    been started a moment ago."""
+    global kc
+    deadline = time.monotonic() + wait
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            say(
+                ev="failed",
+                message="no kernel wrote %s within %d seconds of being asked for; the "
+                "jupyter:kernel task must start a kernel that writes its connection file "
+                "there" % (path, wait),
+            )
+            return False
+        time.sleep(0.25)
     try:
-        return sorted(KernelSpecManager().find_kernel_specs().keys())
-    except Exception:  # noqa: BLE001
-        return []
-
-
-def start(name, cwd):
-    global km, kc
-    names = kernel_names()
-    if not name:
-        name = "python3" if "python3" in names or not names else names[0]
-    # The notebook's directory as the IDE sees it, which the container has
-    # at the same path; where it does not, the container's own directory
-    # rather than a kernel that cannot start.
-    if cwd and not os.path.isdir(cwd):
-        cwd = None
-    try:
-        km = KernelManager(kernel_name=name)
-        spec = km.kernel_spec
-        km.start_kernel(cwd=cwd or None)
-        kc = km.client()
+        kc = BlockingKernelClient(connection_file=path)
+        kc.load_connection_file()
         kc.start_channels()
-        kc.wait_for_ready(timeout=120)
-    except NoSuchKernel:
-        say(ev="failed", message="no kernel named %r in this environment" % name, kernels=names)
-        return False
+        kc.wait_for_ready(timeout=max(5, deadline - time.monotonic()))
+        info = kc.kernel_info(reply=True, timeout=10)["content"]
     except Exception as e:  # noqa: BLE001
-        say(ev="failed", message="the kernel did not start: %s" % e, kernels=names)
+        say(ev="failed", message="the kernel at %s did not answer: %s" % (path, e))
         return False
+    language = (info.get("language_info") or {}).get("name", "")
+    name = info.get("implementation") or language or "kernel"
+    version = (info.get("language_info") or {}).get("version", "")
     say(
         ev="ready",
         kernel=name,
-        display_name=getattr(spec, "display_name", name),
-        language=getattr(spec, "language", ""),
+        display_name=("%s %s" % (language.capitalize() or name, version)).strip(),
+        language=language,
     )
     return True
 
@@ -146,7 +144,7 @@ def pump_iopub():
         try:
             message = kc.get_iopub_msg(timeout=0.5)
         except Exception:  # noqa: BLE001 - queue.Empty, or channels closing
-            alive = km is not None and km.is_alive()
+            alive = kc is not None and kc.hb_channel.is_beating()
             if not alive and not dead and not paused.is_set() and not stopping.is_set():
                 dead = True
                 say(ev="state", state="dead", cell=None, parent=None)
@@ -225,19 +223,9 @@ def handle(request):
         with shell_lock:
             kc.session.send(kc.shell_channel.socket, message, buffers=buffers)
     elif op == "interrupt":
-        km.interrupt_kernel()
-    elif op == "restart":
-        say(ev="state", state="restarting", cell=None, parent=None)
-        paused.set()
-        try:
-            km.restart_kernel(now=False)
-            kc.wait_for_ready(timeout=120)
-        finally:
-            paused.clear()
-        with cells_lock:
-            cells.clear()
-            ours.clear()
-        say(ev="state", state="idle", cell=None, parent=None)
+        # This client did not start the kernel, so it has no process to
+        # signal: the protocol's own interrupt, on the control channel.
+        kc.control_channel.send(kc.session.msg("interrupt_request", {}))
 
 
 def prune():
@@ -263,10 +251,10 @@ def main():
         op = request.get("op")
         if op == "shutdown":
             break
-        if op == "start":
+        if op == "connect":
             if started:
                 continue
-            if not start(request.get("kernel"), request.get("cwd")):
+            if not connect(request.get("file"), int(request.get("wait") or 120)):
                 break
             started = True
             threading.Thread(target=pump_iopub, daemon=True).start()
@@ -281,22 +269,16 @@ def main():
             handle(request)
         except Exception as e:  # noqa: BLE001
             say(ev="error", message="%s failed: %s" % (op, e))
-            if op == "restart":
-                say(ev="state", state="dead", cell=None, parent=None)
     stopping.set()
-    if km is not None:
+    if kc is not None:
         try:
             kc.stop_channels()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            km.shutdown_kernel(now=True)
         except Exception:  # noqa: BLE001
             pass
 
 
 main()
-# Straight out: the kernel is down, and jupyter_client's finalizers only
-# print tracebacks about sockets already closed.
+# Straight out: jupyter_client's finalizers only print tracebacks about
+# sockets already closed.
 sys.stdout.flush()
 os._exit(0)

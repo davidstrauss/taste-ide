@@ -260,12 +260,13 @@ impl McpServer {
              screenshot a diagram.\n\n\
              NOTEBOOKS. The editor opens a .ipynb as a notebook the user runs: Markdown \
              cells rendered, code cells editable and run in a Jupyter kernel inside this \
-             environment's container. The kernel is the container's own Jupyter: the first \
-             of .venv/bin/python, venv/bin/python, python3, and python that can import \
-             jupyter_client, then the kernel the notebook's metadata names (python3 when it \
-             names none). For a notebook to run here, the container needs ipykernel and the \
-             packages the notebook imports, installed the way the project manages packages \
-             or in .devcontainer/. Drawn outputs: text with ANSI colour, Markdown, PNG and \
+             environment's container. ",
+        );
+        text.push_str(&taste_core::kernel_task::convention());
+        text.push_str(
+            " For a notebook to run here, the kernel's Python needs the packages the notebook \
+             imports, installed the way the project manages packages or in .devcontainer/. \
+             Drawn outputs: text with ANSI colour, Markdown, PNG and \
              JPEG (retina too), SVG, and interactive ipywidgets drawn natively — sliders, \
              text and number fields, checkboxes, toggles, dropdowns, radio and toggle \
              buttons, selections, buttons, labels, progress bars, Play, images, colour \

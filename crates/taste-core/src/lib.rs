@@ -17,6 +17,7 @@ pub mod exec;
 pub mod files;
 pub mod ide_state;
 pub mod instance;
+pub mod kernel_task;
 pub mod logfile;
 pub mod mcp;
 pub mod memory;
