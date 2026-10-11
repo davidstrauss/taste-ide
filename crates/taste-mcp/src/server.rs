@@ -961,8 +961,10 @@ impl McpServer {
             tool(
                 "ide_read_file",
                 "Read a file: its text with line numbers, from the user's editor when \
-                 it is open there (unsaved edits included), else from disk. Images \
-                 come back as images; a PDF as each page's text and picture. Use this \
+                 it is open there (unsaved edits included), else from disk. At most \
+                 40000 characters a read; a longer line comes back in parts, and the \
+                 last line says the offset and column to read on from. Images come \
+                 back as images; a PDF as each page's text and picture. Use this \
                  before ide_edit_file.",
                 json!({
                     "type": "object",
@@ -970,6 +972,7 @@ impl McpServer {
                         "path": { "type": "string", "description": "workspace-relative or absolute path" },
                         "offset": { "type": "integer", "minimum": 1, "description": "first line to return (default 1)" },
                         "limit": { "type": "integer", "minimum": 1, "description": "lines to return (default 2000)" },
+                        "column": { "type": "integer", "minimum": 1, "description": "first character of the offset line (default 1)" },
                         "pages": { "type": "string", "description": "PDF pages, e.g. \"3\" or \"2-5\"; at most 20, and required past 10 pages" }
                     },
                     "required": ["path"]
@@ -4687,21 +4690,25 @@ impl McpServer {
             }
         };
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
+        let column = args["column"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = args["limit"].as_u64().unwrap_or(2000).max(1) as usize;
-        let (mut body, total) = taste_core::agentedit::numbered(&text, offset, limit);
-        let last = (offset - 1 + limit).min(total);
-        if total == 0 {
-            body = format!("{shown} is empty\n");
-        } else if last < total || offset > 1 {
-            body.push_str(&format!(
-                "[lines {offset}-{last} of {total}{}]\n",
-                if last < total {
-                    format!("; pass offset {} for more", last + 1)
-                } else {
-                    String::new()
-                }
-            ));
-        }
+        // Bounded in characters as well as lines: one line of a hundred
+        // thousand characters was past what the agent takes as one result,
+        // and whole lines were the only unit, so the rest of it could not
+        // be reached at all (2026-10-11).
+        let page = taste_core::agentedit::page(
+            &text,
+            offset,
+            column,
+            limit,
+            taste_core::agentedit::READ_BUDGET,
+        );
+        let body = if page.total == 0 {
+            format!("{shown} is empty\n")
+        } else {
+            let footer = page.footer().unwrap_or_default();
+            page.body + &footer
+        };
         Ok(json!({ "content": [{ "type": "text", "text": body }] }))
     }
 
@@ -7545,6 +7552,40 @@ mod tests {
         let text = read["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("     2\t  \"image\": \"old\""), "{text}");
         assert!(text.contains("of 3; pass offset 3"), "{text}");
+
+        // A line past one read's budget comes back in parts, the column
+        // to go on from named, and the next part read from there.
+        let record = format!("{{\"senders\": [{}]}}", "\"s\",".repeat(30_000));
+        std::fs::write(dir.path().join("src/record.json"), format!("{record}\n")).unwrap();
+        let part = call_tool_raw(
+            &mut stream,
+            "ide_read_file",
+            json!({"path": "src/record.json"}),
+        )
+        .await;
+        let text = part["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.len() <= taste_core::agentedit::READ_BUDGET + 200,
+            "{}",
+            text.len()
+        );
+        assert!(
+            text.contains("pass offset 1, column 39993 for more"),
+            "{}",
+            &text[text.len() - 200..]
+        );
+        let rest = call_tool_raw(
+            &mut stream,
+            "ide_read_file",
+            json!({"path": "src/record.json", "offset": 1, "column": 39993}),
+        )
+        .await;
+        let text = rest["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("line 1 from character 39993"),
+            "{}",
+            &text[text.len() - 200..]
+        );
 
         let edited = call_tool(
             &mut stream,
