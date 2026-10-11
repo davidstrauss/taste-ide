@@ -1158,6 +1158,10 @@ no-op at every other width.
   whose views are not drawn here (plotly's, ipyleaflet's) shows the text
   the kernel sent beside it. A notebook saved with its widgets' state
   draws them from it, unusable, until a run opens live models.
+  Agents are told all of this in the MCP instructions' NOTEBOOKS section
+  — what is drawn, what is not, and what the container must have — so
+  they write notebooks to what this frontend does (David: "Ensure the
+  agent knows about the full breadth of Jupyter capabilities we have").
 
 ### Bottom: console
 

@@ -2723,6 +2723,14 @@ impl Editor {
             editor.set_changes_view(&path, &page, false);
             editor.refresh_markdown_mode(&path, &page);
             editor.sync_toggle_to_selection();
+            // `TASTE_PROBE_NOTEBOOK=drag`: a notebook run, and its first
+            // slider dragged (`notebook::Session::probe_drag`).
+            if is_notebook(&path) && std::env::var("TASTE_PROBE_NOTEBOOK").as_deref() == Ok("drag")
+            {
+                if let Some(session) = page.notebook.borrow().as_ref() {
+                    session.probe_drag();
+                }
+            }
             // `TASTE_PROBE_PREVIEW_AT=<0..1>`: scrolled that far down once
             // its pictures are in, for the part of a long document a pane's
             // height does not reach.

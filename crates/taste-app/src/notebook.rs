@@ -624,6 +624,139 @@ impl Session {
         }
     }
 
+    /// `TASTE_PROBE_NOTEBOOK=drag`: run every cell, wait for the kernel to
+    /// settle, then drag the first slider the outputs hold from where it
+    /// is to its end at sixty changes a second — as a pointer drag sets it
+    /// — and print what the widgets did: the changes made, the updates the
+    /// throttle let through, the echoes set aside, and where the slider's
+    /// model and the Output widgets ended up. The real path end to end, in
+    /// a container that has Jupyter, which is the environment when the IDE
+    /// runs inside one.
+    pub fn probe_drag(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let pause = |ms| glib::timeout_future(std::time::Duration::from_millis(ms));
+            // The drawing first, then the run.
+            for _ in 0..100 {
+                if weak.upgrade().is_some_and(|s| s.drawing.borrow().is_some()) {
+                    break;
+                }
+                pause(100).await;
+            }
+            let Some(session) = weak.upgrade() else {
+                return;
+            };
+            session.run_all();
+            drop(session);
+            let started = std::time::Instant::now();
+            loop {
+                pause(250).await;
+                let Some(session) = weak.upgrade() else {
+                    return;
+                };
+                let state = session.state.borrow().clone();
+                if let State::Failed { message, .. } = state {
+                    println!("probe notebook: the kernel did not start: {message}");
+                    return;
+                }
+                if session.runs.borrow().is_empty() && state == State::Idle {
+                    break;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(90) {
+                    println!("probe notebook: the run did not finish in 90s ({state:?})");
+                    return;
+                }
+            }
+            println!(
+                "probe notebook: ran in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+            let Some(session) = weak.upgrade() else {
+                return;
+            };
+            let scale = {
+                let drawing = session.drawing.borrow();
+                let mut cells: Vec<_> = drawing
+                    .as_ref()
+                    .map(|d| {
+                        d.cells
+                            .iter()
+                            .map(|(i, p)| (*i, p.outputs.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                cells.sort_by_key(|(i, _)| *i);
+                cells
+                    .into_iter()
+                    .find_map(|(_, outputs)| first_scale(outputs.upcast_ref()))
+            };
+            let Some(scale) = scale else {
+                println!("probe notebook: no slider in the outputs");
+                return;
+            };
+            let sent_before = session.widgets.updates_sent.get();
+            let adjustment = scale.adjustment();
+            let (from, to) = (adjustment.value(), adjustment.upper());
+            let steps = 60;
+            drop(session);
+            for step in 1..=steps {
+                scale.set_value(from + (to - from) * step as f64 / steps as f64);
+                pause(16).await;
+            }
+            // In view for the shot: the preview scrolled to the slider.
+            if let Some(scroller) = scale
+                .ancestor(gtk::ScrolledWindow::static_type())
+                .and_downcast::<gtk::ScrolledWindow>()
+            {
+                if let Some(content) = scroller.child() {
+                    if let Some(point) =
+                        scale.compute_point(&content, &gtk::graphene::Point::new(0.0, 0.0))
+                    {
+                        scroller
+                            .vadjustment()
+                            .set_value((point.y() as f64 - 60.0).max(0.0));
+                    }
+                }
+            }
+            // The throttle's last send, the kernel's redraw, and its echo.
+            pause(4000).await;
+            let Some(session) = weak.upgrade() else {
+                return;
+            };
+            let widgets = &session.widgets;
+            let sliders = widgets.models_named("IntSliderModel");
+            let outputs = widgets.models_named("OutputModel");
+            println!(
+                "probe notebook: dragged {from} -> {to} in {steps} changes; {} updates sent; \
+                 {} echoes set aside",
+                widgets.updates_sent.get() - sent_before,
+                widgets.echoes_set_aside.get()
+            );
+            for slider in &sliders {
+                println!(
+                    "probe notebook: slider model value {}; on screen {}",
+                    crate::widgets::Manager::state_of(slider, "value"),
+                    scale.value()
+                );
+            }
+            for output in &outputs {
+                let kinds: Vec<String> = crate::widgets::Manager::state_of(output, "outputs")
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|o| {
+                        let data: Vec<&str> = o["data"]
+                            .as_object()
+                            .map(|d| d.keys().map(String::as_str).collect())
+                            .unwrap_or_default();
+                        format!("{}{:?}", o["output_type"].as_str().unwrap_or("?"), data)
+                    })
+                    .collect();
+                println!("probe notebook: an Output widget holds {kinds:?}");
+            }
+        });
+    }
+
     fn run_all(self: &Rc<Self>) {
         let mut indices: Vec<usize> = self
             .drawing
@@ -912,6 +1045,21 @@ impl Session {
         self.buffer.end_user_action();
         self.writing.set(false);
     }
+}
+
+/// The first slider under `widget`, depth first.
+fn first_scale(widget: &gtk::Widget) -> Option<gtk::Scale> {
+    if let Some(scale) = widget.downcast_ref::<gtk::Scale>() {
+        return Some(scale.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        if let Some(found) = first_scale(&next) {
+            return Some(found);
+        }
+        child = next.next_sibling();
+    }
+    None
 }
 
 /// The text of a buffer, whole.

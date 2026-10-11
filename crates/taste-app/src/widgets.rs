@@ -105,6 +105,11 @@ impl Model {
 /// The models of one notebook's kernel, and how to reach them.
 pub struct Manager {
     models: RefCell<HashMap<String, Rc<Model>>>,
+    /// How many updates went to the kernel, and how many echoes were set
+    /// aside for a key changed since: what a probe reports
+    /// (`crate::notebook`'s `TASTE_PROBE_NOTEBOOK=drag`).
+    pub updates_sent: Cell<u32>,
+    pub echoes_set_aside: Cell<u32>,
     /// How a message reaches a model's comm in the kernel.
     send: RefCell<Option<Rc<dyn Fn(&str, Value, Vec<Vec<u8>>)>>>,
     /// How an output is drawn, for an Output widget's outputs: the
@@ -116,6 +121,8 @@ impl Manager {
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
             models: RefCell::new(HashMap::new()),
+            updates_sent: Cell::new(0),
+            echoes_set_aside: Cell::new(0),
             send: RefCell::new(None),
             draw_output: RefCell::new(None),
         })
@@ -131,6 +138,21 @@ impl Manager {
 
     pub fn model(&self, id: &str) -> Option<Rc<Model>> {
         self.models.borrow().get(id).cloned()
+    }
+
+    /// The live models of a kind, for a probe's report.
+    pub fn models_named(&self, name: &str) -> Vec<Rc<Model>> {
+        self.models
+            .borrow()
+            .values()
+            .filter(|m| m.live.get() && m.name == name)
+            .cloned()
+            .collect()
+    }
+
+    /// A key of a model's state, for a probe's report.
+    pub fn state_of(model: &Model, key: &str) -> Value {
+        model.get(key)
     }
 
     /// The kernel went: every model kept for what it shows, none usable.
@@ -199,6 +221,7 @@ impl Manager {
                             if echo {
                                 let mut pending = model.pending.borrow_mut();
                                 if let Some(count) = pending.get_mut(&key) {
+                                    self.echoes_set_aside.set(self.echoes_set_aside.get() + 1);
                                     *count -= 1;
                                     if *count == 0 {
                                         pending.remove(&key);
@@ -266,6 +289,9 @@ impl Manager {
     }
 
     fn send_to(&self, model: &Model, data: Value) {
+        if data["method"] == "update" {
+            self.updates_sent.set(self.updates_sent.get() + 1);
+        }
         if let Some(send) = self.send.borrow().as_ref() {
             send(&model.id, data, Vec::new());
         }

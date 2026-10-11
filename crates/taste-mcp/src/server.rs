@@ -255,6 +255,26 @@ impl McpServer {
              Mermaid, in a reply or in a .md file; the user sees it drawn. There is no \
              rendering step to offer or ask about: do not offer to render, export, or \
              screenshot a diagram.\n\n\
+             NOTEBOOKS. The editor opens a .ipynb as a notebook the user runs: Markdown \
+             cells rendered, code cells editable and run in a Jupyter kernel inside this \
+             environment's container. The kernel is the container's own Jupyter: the first \
+             of .venv/bin/python, venv/bin/python, python3, and python that can import \
+             jupyter_client, then the kernel the notebook's metadata names (python3 when it \
+             names none). For a notebook to run here, the container needs ipykernel and the \
+             packages the notebook imports, installed the way the project manages packages \
+             or in .devcontainer/. Drawn outputs: text with ANSI colour, Markdown, PNG and \
+             JPEG (retina too), SVG, and interactive ipywidgets drawn natively — sliders, \
+             text and number fields, checkboxes, toggles, dropdowns, radio and toggle \
+             buttons, selections, buttons, labels, progress bars, Play, images, colour \
+             pickers, boxes, tabs, accordions, Output, interact, and jslink. So matplotlib and \
+             Seaborn figures, and interact over them, work as written. Not drawn: HTML (a \
+             DataFrame shows its text form), %matplotlib widget (ipympl), and widgets whose \
+             views are their own JavaScript (plotly, ipyleaflet, bqplot); use static figures \
+             and the core ipywidgets instead. A run's outputs are written into the .ipynb in \
+             the user's buffer. Write a notebook as nbformat 4 JSON with ide_write_file; to \
+             execute one yourself, use ide_exec with the container's Jupyter tooling (for \
+             example `jupyter nbconvert --to notebook --execute --inplace NAME.ipynb` when \
+             nbconvert is installed).\n\n\
              REPLIES. When a turn ends on a question or a choice for the user — confirm \
              this, pick one of these — call suggest_replies last, with the replies they \
              are likeliest to give, so they can answer with a click. Each reply names \
@@ -8192,6 +8212,10 @@ mod tests {
             // Diagrams are drawn where they are written: nothing to offer.
             assert!(text.contains("```mermaid"), "{text}");
             assert!(text.contains("do not offer to render"), "{text}");
+            // What a notebook gets here, and what the container must have.
+            assert!(text.contains("NOTEBOOKS."), "{text}");
+            assert!(text.contains("jupyter_client"), "{text}");
+            assert!(text.contains("interactive ipywidgets"), "{text}");
         }
         let coordinator = instructions(&primary_socket).await;
         assert!(
