@@ -151,6 +151,9 @@ pub struct Session {
     /// The kernel has been asked for — Start Kernel, or a cell run — and
     /// is to be connected to once the task is found and running.
     wanted: Cell<bool>,
+    /// Cells run before the kernel could be reached — its task being
+    /// listed or started — run, in order, once it can.
+    deferred: RefCell<Vec<usize>>,
     state: RefCell<State>,
     kernel_name: RefCell<String>,
     runs: RefCell<HashMap<String, Run>>,
@@ -215,6 +218,7 @@ impl Session {
             writing: Cell::new(false),
             kernel: RefCell::new(None),
             wanted: Cell::new(false),
+            deferred: RefCell::new(Vec::new()),
             state: RefCell::new(state),
             kernel_name: RefCell::new(String::new()),
             runs: RefCell::new(HashMap::new()),
@@ -313,6 +317,10 @@ impl Session {
             State::Starting | State::Idle | State::Busy | State::Restarting
         );
         if connected || live {
+            // Stopped, by its row or by itself: nothing is to start it again
+            // until it is asked for again.
+            self.wanted.set(false);
+            self.deferred.borrow_mut().clear();
             self.abandon_runs();
             let lines = kernels.task_lines(&self.env);
             let from = lines.len().saturating_sub(60);
@@ -329,6 +337,14 @@ impl Session {
             } else {
                 State::Stopped { report }
             });
+            return;
+        }
+        // Asked for while its task was being listed: found, so started now.
+        if self.wanted.get()
+            && kernels.defined(&self.env) == Some(true)
+            && matches!(*self.state.borrow(), State::Off)
+        {
+            self.ensure_kernel();
             return;
         }
         self.show_state();
@@ -781,6 +797,12 @@ impl Session {
             Ok(kernel) => {
                 *self.kernel.borrow_mut() = Some(kernel);
                 self.set_state(State::Starting);
+                // What was run while it could not be reached goes now: the
+                // client sends it once connected.
+                let deferred: Vec<usize> = self.deferred.borrow_mut().drain(..).collect();
+                for index in deferred {
+                    self.run_cell(index);
+                }
                 true
             }
             Err(e) => {
@@ -806,6 +828,14 @@ impl Session {
             (buffer_text(&parts.source), parts.id.clone())
         };
         if !self.ensure_kernel() {
+            // Not reachable yet but coming — its task being listed, or a
+            // project that has it: run once it is.
+            let coming = self.runnable()
+                && crate::kernels::kernels().defined(&self.env) != Some(false)
+                && !matches!(*self.state.borrow(), State::Failed { .. });
+            if coming && !self.deferred.borrow().contains(&index) {
+                self.deferred.borrow_mut().push(index);
+            }
             return;
         }
         let token = format!("run-{}", self.next_run.get());
