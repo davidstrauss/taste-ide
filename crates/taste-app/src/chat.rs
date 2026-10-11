@@ -282,6 +282,9 @@ struct SendFacts {
     awaiting_container: bool,
     /// The container is on its way — building or starting.
     environment_in_transition: bool,
+    /// Messages already on the hold queue: a new one waits behind them, so
+    /// that what was written first is sent first.
+    held_ahead: bool,
 }
 
 /// Whether an accepted prompt goes, waits, or is refused.
@@ -294,6 +297,9 @@ struct SendFacts {
 /// container the agent is waiting for, which `issue_start` started before
 /// the chat existed — and refuses otherwise.
 fn delivery(facts: SendFacts) -> Delivery {
+    if facts.held_ahead {
+        return Delivery::Hold;
+    }
     if facts.live_agent {
         return Delivery::Send;
     }
@@ -1157,9 +1163,10 @@ struct PendingPrompt {
     /// Where this goes if the agent dies before it is finished with.
     unfinished: Unfinished,
     card: gtk::Box,
-    /// The "queued" badge and when it started waiting — absent when nothing
-    /// was running to wait behind.
-    queued: Option<(gtk::Label, std::time::Instant)>,
+    /// The "queued" badge, and when and where in the conversation it was
+    /// written (`taste_core::queued`) — absent when nothing was running to
+    /// wait behind.
+    queued: Option<(gtk::Label, taste_core::queued::Queued)>,
     /// Once the card has been moved to where the agent accepted it, the
     /// marker left behind at the point it was typed.
     origin: Option<gtk::ListBoxRow>,
@@ -1210,6 +1217,9 @@ struct QueuedSend {
     attachments: Vec<(String, ContentBlock)>,
     card: gtk::Box,
     badge: gtk::Label,
+    /// When and where in the conversation it was written, for the note it
+    /// goes out after if it ends up waiting behind a turn.
+    written: taste_core::queued::Queued,
     /// Whether a person typed this. Carried so that a send orphaned a
     /// second time — handed over, and the agent dies again before it
     /// finishes — goes back where it came from rather than swapping
@@ -4007,6 +4017,9 @@ impl ChatPane {
             Delivery::Send => {}
             Delivery::Hold => {
                 self.hold_send(&text, Vec::new(), true, false);
+                // Behind messages held for an agent that is here now: they
+                // go, in order, and this one with them.
+                self.flush_revive_queue();
                 return Ok(taste_core::orchestration::SendOutcome {
                     queued: true,
                     held: true,
@@ -4023,28 +4036,18 @@ impl ChatPane {
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
         self.finalize_stream();
+        let written = self.written_now();
         let card = self.user_card(text.trim(), &[]);
         let blocks = vec![ContentBlock::Text(TextContent::new(text.clone()))];
-        let result = match self.client.borrow().as_ref() {
-            Some(client) => client.prompt_blocks(self.with_briefing(blocks)),
-            None => Ok(()),
-        };
+        let result = self.send_blocks(blocks, written.clone());
         match result {
             Ok(()) => {
                 self.mark_session_content();
-                let queued = self.stop_button.get_visible();
-                let badge = queued.then(|| {
-                    let badge = gtk::Label::builder()
-                        .label("queued — sends when the current turn ends")
-                        .xalign(0.0)
-                        .css_classes(["dim-label", "caption"])
-                        .margin_top(CARD_INSET)
-                        .margin_bottom(CARD_INSET)
-                        .margin_start(CARD_INSET)
-                        .margin_end(CARD_INSET)
-                        .build();
+                let queued = written.is_some();
+                let badge = written.map(|written| {
+                    let badge = queued_badge("queued — sends when the current turn ends");
                     card.append(&badge);
-                    (badge, std::time::Instant::now())
+                    (badge, written)
                 });
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
                     // No composer to hand it back to, so a death under it
@@ -5003,6 +5006,7 @@ impl ChatPane {
             live_agent: self.client.borrow().is_some(),
             awaiting_container: self.container_wait.get() == ContainerWait::Waiting,
             environment_in_transition: self.environment_in_transition(),
+            held_ahead: !self.revive_queue.borrow().is_empty(),
         }
     }
 
@@ -5043,25 +5047,49 @@ impl ChatPane {
         for_the_environment: bool,
         typed: bool,
     ) {
+        self.hold_send_at(text, attachments, for_the_environment, typed, None, false);
+    }
+
+    /// [`Self::hold_send`], for a message written earlier (`written`, when
+    /// it was) and, with `first`, held ahead of everything already held.
+    fn hold_send_at(
+        self: &Rc<Self>,
+        text: &str,
+        attachments: Vec<(String, ContentBlock)>,
+        for_the_environment: bool,
+        typed: bool,
+        written: Option<taste_core::queued::Queued>,
+        first: bool,
+    ) {
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
 
         // The card goes in now: the send was accepted, and a message that
         // vanished from the composer without appearing in the transcript
         // would read as lost.
+        let written = written.unwrap_or_else(|| taste_core::queued::Queued {
+            at: std::time::Instant::now(),
+            after: self.feed_reference(),
+        });
         let card = self.user_card(text.trim(), &attachments);
         let badge = queued_badge(&holding_label(
             &self.environment.to_string(),
             for_the_environment,
         ));
         card.append(&badge);
-        self.revive_queue.borrow_mut().push_back(QueuedSend {
+        let item = QueuedSend {
             text: text.to_string(),
             attachments,
             card,
             badge,
+            written,
             typed,
-        });
+        };
+        if first {
+            self.revive_queue.borrow_mut().push_front(item);
+        } else {
+            self.revive_queue.borrow_mut().push_back(item);
+        }
         self.sync_revive_bar();
     }
 
@@ -5141,10 +5169,9 @@ impl ChatPane {
             if !item.text.trim().is_empty() {
                 blocks.push(ContentBlock::Text(TextContent::new(item.text.clone())));
             }
-            let result = match self.client.borrow().as_ref() {
-                Some(client) => client.prompt_blocks(self.with_briefing(blocks)),
-                None => Ok(()),
-            };
+            // Written a while ago, maybe: if it waits behind a turn now, the
+            // note says how long, from when it was written.
+            let result = self.send_blocks(blocks, Some(item.written.clone()));
             match result {
                 Ok(()) => {
                     self.mark_session_content();
@@ -5159,7 +5186,7 @@ impl ChatPane {
                             Unfinished::Requeue(text)
                         },
                         card,
-                        queued: Some((badge, std::time::Instant::now())),
+                        queued: Some((badge, item.written)),
                         origin: None,
                     });
                     self.stop_button.set_visible(true);
@@ -6559,6 +6586,53 @@ impl ChatPane {
     /// environment settled into a new state (`orientation_due`). The
     /// transcript shows the user's words and a note that each went with
     /// them.
+    /// Where in the conversation a message written now is written: the
+    /// agent's message as far as it has streamed, else its last finished
+    /// message or step, which is the last thing the user could see.
+    fn feed_reference(&self) -> taste_core::queued::Reference {
+        use taste_core::queued::Reference;
+        if let Some(buffer) = self.current_agent.borrow().as_ref() {
+            let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+            if !text.trim().is_empty() {
+                return Reference::Writing(text.to_string());
+            }
+        }
+        for line in self.transcript_log.borrow().iter().rev() {
+            match line.speaker {
+                "agent" => return Reference::Message(line.text.clone()),
+                "tool" => return Reference::Step(line.text.clone()),
+                _ => {}
+            }
+        }
+        Reference::TurnStart
+    }
+
+    /// When and where a message sent now is written, if a turn is running
+    /// for it to wait behind; `None` when it goes straight to the agent.
+    fn written_now(&self) -> Option<taste_core::queued::Queued> {
+        self.stop_button
+            .get_visible()
+            .then(|| taste_core::queued::Queued {
+                at: std::time::Instant::now(),
+                after: self.feed_reference(),
+            })
+    }
+
+    /// Hand a prompt to the agent, briefing and all; `written` when it may
+    /// wait behind a turn, for the note it then goes out after.
+    fn send_blocks(
+        &self,
+        blocks: Vec<ContentBlock>,
+        written: Option<taste_core::queued::Queued>,
+    ) -> anyhow::Result<()> {
+        let blocks = self.with_briefing(blocks);
+        match (self.client.borrow().as_ref(), written) {
+            (Some(client), Some(written)) => client.prompt_blocks_queued(blocks, written),
+            (Some(client), None) => client.prompt_blocks(blocks),
+            (None, _) => Ok(()),
+        }
+    }
+
     fn with_briefing(&self, blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
         let mut front: Vec<String> = Vec::new();
         if self.environment.is_primary() && !self.session_has_content.get() {
@@ -7844,6 +7918,16 @@ impl ChatPane {
             }
             text = rest;
         }
+        // A message that waited behind a turn went out after a note saying
+        // so (`taste_core::queued`): drawn as the card's badge, as it was
+        // when it was sent, not as words the user typed.
+        if let Some((note, rest)) = taste_core::queued::split(&text) {
+            let card = self.user_card(&rest, &pending.attachments);
+            let badge = queued_badge(&taste_core::queued::badge(&note));
+            badge.set_tooltip_text(Some(&note));
+            card.append(&badge);
+            return;
+        }
         self.user_card(&text, &pending.attachments);
     }
 
@@ -8826,6 +8910,15 @@ impl ChatPane {
             }
             return Ok(());
         }
+        // Behind messages already held: it waits its turn after them, and
+        // goes with them if the agent they waited for is here now.
+        if !self.revive_queue.borrow().is_empty() {
+            let facts = self.send_facts();
+            let for_the_environment = facts.awaiting_container || facts.environment_in_transition;
+            self.hold_send(&text, attachments, for_the_environment, true);
+            self.flush_revive_queue();
+            return Ok(());
+        }
         // Nothing is taken until the agent is actually accepting: a failed
         // launch must not eat the prompt.
         self.activate();
@@ -8845,33 +8938,23 @@ impl ChatPane {
         self.jump_banner.set_reveal_child(false);
         self.finalize_stream();
 
+        let written = self.written_now();
         let card = self.user_card(text.trim(), &attachments);
         let mut blocks: Vec<ContentBlock> =
             attachments.into_iter().map(|(_, block)| block).collect();
         if !text.trim().is_empty() {
             blocks.push(ContentBlock::Text(TextContent::new(text.clone())));
         }
-        let result = match self.client.borrow().as_ref() {
-            Some(client) => client.prompt_blocks(self.with_briefing(blocks)),
-            None => Ok(()),
-        };
+        let result = self.send_blocks(blocks, written.clone());
         match result {
             Ok(()) => {
                 self.mark_session_content();
                 // Sending mid-turn is fine: the session layer queues it.
                 // Say so on the card until its turn starts.
-                let badge = self.stop_button.get_visible().then(|| {
-                    let badge = gtk::Label::builder()
-                        .label("queued — sends when the current turn ends")
-                        .xalign(0.0)
-                        .css_classes(["dim-label", "caption"])
-                        .margin_top(CARD_INSET)
-                        .margin_bottom(CARD_INSET)
-                        .margin_start(CARD_INSET)
-                        .margin_end(CARD_INSET)
-                        .build();
+                let badge = written.map(|written| {
+                    let badge = queued_badge("queued — sends when the current turn ends");
                     card.append(&badge);
-                    (badge, std::time::Instant::now())
+                    (badge, written)
                 });
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
                     unfinished: Unfinished::Composer(text.trim().to_string()),
@@ -9199,7 +9282,7 @@ impl ChatPane {
                         prompt.queued.take().map(|queued| (card, queued))
                     })
                 };
-                if let Some((card, (badge, queued_at))) = accepted {
+                if let Some((card, (badge, written))) = accepted {
                     // The card was appended where the prompt was TYPED, which
                     // is not where it joins the conversation — a whole turn's
                     // output has landed in between. Move it to the end and
@@ -9212,7 +9295,12 @@ impl ChatPane {
                     // sat behind the previous turn is the one place that
                     // cost is ever visible, and it is worth keeping in the
                     // transcript after the fact.
-                    badge.set_label(&format!("queued for {}", elapsed(queued_at)));
+                    // With the note the agent got, roughly to the second.
+                    badge.set_label(&format!("queued for {}", elapsed(written.at)));
+                    badge.set_tooltip_text(Some(&taste_core::queued::note(
+                        written.at.elapsed(),
+                        &written.after,
+                    )));
                 }
                 // What is still queued decides everything below: either the
                 // next prompt starts now, or the turn is genuinely over and
@@ -9415,12 +9503,23 @@ impl ChatPane {
                 let pending: Vec<PendingPrompt> =
                     self.pending_prompts.borrow_mut().drain(..).collect();
                 let mut restored: Vec<String> = Vec::new();
-                let mut requeued: Vec<String> = Vec::new();
+                let mut requeued: Vec<(String, Option<taste_core::queued::Queued>)> = Vec::new();
+                // In the order they were written, whoever wrote them: once one
+                // goes back to the composer, each written after it goes there
+                // too, to be sent again after it rather than ahead of it
+                // (David, 2026-10-11: "ensure queued messages stay ordered for
+                // dispatch").
+                let mut to_composer = false;
                 for prompt in pending {
                     self.drop_prompt_rows(&prompt);
+                    let written = prompt.queued.map(|(_, written)| written);
                     match prompt.unfinished {
-                        Unfinished::Composer(text) => restored.push(text),
-                        Unfinished::Requeue(text) => requeued.push(text),
+                        Unfinished::Composer(text) => {
+                            to_composer = true;
+                            restored.push(text);
+                        }
+                        Unfinished::Requeue(text) if to_composer => restored.push(text),
+                        Unfinished::Requeue(text) => requeued.push((text, written)),
                         Unfinished::Nothing => {}
                     }
                 }
@@ -9431,10 +9530,11 @@ impl ChatPane {
                     }
                     self.entry.buffer().set_text(&restored.join("\n\n"));
                 }
-                for text in requeued {
-                    // Not for the environment: this one is waiting on the
-                    // process, which the reconnect below is bringing back.
-                    self.hold_send(&text, Vec::new(), false, false);
+                // Not for the environment: these wait on the process, which
+                // the reconnect below is bringing back. Ahead of anything
+                // held since, which was written after them.
+                for (text, written) in requeued.into_iter().rev() {
+                    self.hold_send_at(&text, Vec::new(), false, false, written, true);
                 }
                 // Captured before reset_session, which clears it.
                 let resume = self
@@ -11180,6 +11280,32 @@ impl ChatPane {
         say("Kept the old names as aliases in lib.typ.");
     }
 
+    fn seed_noted_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::ContentChunk;
+        let user = |text: &str| {
+            self.render_update(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(text)),
+            )));
+        };
+        let say = |text: &str| {
+            self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(text)),
+            )));
+            self.finalize_stream();
+        };
+        user("Move the session cache out of the request path.");
+        say("Moving the cache next; the request path reads it in three places.");
+        let note = taste_core::queued::note(
+            std::time::Duration::from_secs(192),
+            &taste_core::queued::Reference::Message(
+                "Moving the cache next; the request path reads it in three places.".into(),
+            ),
+        );
+        user(&note);
+        user("Look at the failing tests first.");
+        say("Looking at the tests first: two fail on the cache's warm-up.");
+    }
+
     fn seed_acts_for_probe(self: &Rc<Self>) {
         use agent_client_protocol::schema::v1::{ContentChunk, ToolCall};
         use serde_json::json;
@@ -11426,6 +11552,13 @@ impl ChatPane {
         // the rail runs through, and the prompt seated below the turn.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("reseat") {
             self.seed_reseat_for_probe();
+            return;
+        }
+        // `TASTE_PROBE_CHAT=noted` is a message that waited behind a turn,
+        // as a replay reads it back: the note it went out after
+        // (`taste_core::queued`) drawn as its card's badge, not as words.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("noted") {
+            self.seed_noted_for_probe();
             return;
         }
         // `TASTE_PROBE_CHAT=stash` is the conversation this machine kept
@@ -15945,6 +16078,7 @@ mod tests {
             live_agent: false,
             awaiting_container: true,
             environment_in_transition: true,
+            held_ahead: false,
         };
         assert_eq!(
             delivery(waiting),
@@ -15966,6 +16100,7 @@ mod tests {
                 live_agent: false,
                 awaiting_container: false,
                 environment_in_transition: false,
+                held_ahead: false,
             }),
             "nothing is handed to an agent that is not there"
         );
@@ -15986,6 +16121,7 @@ mod tests {
             live_agent: true,
             awaiting_container: false,
             environment_in_transition: false,
+            held_ahead: false,
         }));
         // Not a moment sooner: an environment still on its way keeps its
         // queue, because the point of holding was to reach an agent living
@@ -15994,11 +16130,13 @@ mod tests {
             live_agent: true,
             awaiting_container: false,
             environment_in_transition: true,
+            held_ahead: false,
         }));
         assert!(!flush_wanted(SendFacts {
             live_agent: true,
             awaiting_container: true,
             environment_in_transition: false,
+            held_ahead: false,
         }));
     }
 
@@ -16015,10 +16153,20 @@ mod tests {
         for live_agent in [false, true] {
             for awaiting_container in [false, true] {
                 for environment_in_transition in [false, true] {
+                    // With messages already held, a send waits behind them,
+                    // whatever else is true: written later, sent later.
+                    let behind = SendFacts {
+                        live_agent,
+                        awaiting_container,
+                        environment_in_transition,
+                        held_ahead: true,
+                    };
+                    assert_eq!(delivery(behind), Delivery::Hold, "{behind:?}");
                     let facts = SendFacts {
                         live_agent,
                         awaiting_container,
                         environment_in_transition,
+                        held_ahead: false,
                     };
                     match delivery(facts) {
                         Delivery::Send => assert!(live_agent, "{facts:?}"),

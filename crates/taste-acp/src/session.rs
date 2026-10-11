@@ -43,8 +43,13 @@ pub type ElicitationReply = tokio::sync::oneshot::Sender<CreateElicitationRespon
 /// Instructions from the UI to the session task.
 pub enum Command {
     /// A full prompt: text plus any attached context blocks (files,
-    /// selections, images).
-    Prompt(Vec<ContentBlock>),
+    /// selections, images) — and, for one written while a turn ran, when
+    /// and where it was written, for the note it goes out after if it does
+    /// wait behind that turn (`taste_core::queued`).
+    Prompt {
+        blocks: Vec<ContentBlock>,
+        queued: Option<taste_core::queued::Queued>,
+    },
     /// Cancel the in-flight turn.
     Cancel,
     Authenticate(AuthMethodId),
@@ -164,7 +169,24 @@ impl AgentClient {
 
     /// Queue a prompt with attached context blocks.
     pub fn prompt_blocks(&self, blocks: Vec<ContentBlock>) -> Result<()> {
-        self.send(Command::Prompt(blocks))
+        self.send(Command::Prompt {
+            blocks,
+            queued: None,
+        })
+    }
+
+    /// [`Self::prompt_blocks`] for a prompt written while a turn runs: if
+    /// it waits behind that turn, it goes out after a note saying how long
+    /// and where in the conversation it was written.
+    pub fn prompt_blocks_queued(
+        &self,
+        blocks: Vec<ContentBlock>,
+        queued: taste_core::queued::Queued,
+    ) -> Result<()> {
+        self.send(Command::Prompt {
+            blocks,
+            queued: Some(queued),
+        })
     }
 
     /// Cancel the in-flight turn (no-op when idle).
@@ -1134,7 +1156,9 @@ async fn run_session(
 
 /// The post-setup command loop, shared by fresh and restored sessions.
 /// Commands arriving while a turn is in flight are queued (Cancel excepted),
-/// never dropped: a prompt typed during a turn runs right after it.
+/// never dropped, and run in the order they came: a prompt typed during a
+/// turn runs right after it, after a note that it waited
+/// (`taste_core::queued`).
 async fn serve_commands(
     connection: &ConnectionTo<Agent>,
     session_id: agent_client_protocol::schema::v1::SessionId,
@@ -1144,15 +1168,24 @@ async fn serve_commands(
     auth_methods: Vec<AuthMethod>,
 ) -> Result<(), agent_client_protocol::Error> {
     loop {
-        let command = match queued.pop_front() {
-            Some(command) => command,
+        // Whether it waited: taken from the queue rather than straight off
+        // the channel to an idle loop.
+        let (command, waited) = match queued.pop_front() {
+            Some(command) => (command, true),
             None => match command_rx.recv().await {
-                Ok(command) => command,
+                Ok(command) => (command, false),
                 Err(_) => return Ok(()), // UI dropped the client
             },
         };
         match command {
-            Command::Prompt(blocks) => {
+            Command::Prompt {
+                mut blocks,
+                queued: written,
+            } => {
+                if let (true, Some(written)) = (waited, written) {
+                    let note = taste_core::queued::note(written.at.elapsed(), &written.after);
+                    blocks.insert(0, ContentBlock::Text(TextContent::new(note)));
+                }
                 // Keep serving Cancel while the turn runs; the prompt then
                 // resolves with StopReason::Cancelled on its own.
                 let request =

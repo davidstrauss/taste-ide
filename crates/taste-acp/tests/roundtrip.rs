@@ -384,3 +384,76 @@ async fn the_agents_questions_come_to_the_chat_and_the_answer_goes_back() {
     );
     assert_eq!(ask(&client, None).await, r#"ask {"action": "cancel"}"#);
 }
+
+/// A prompt sent while a turn runs waits behind it and goes out after the
+/// client's note — how long it waited, and where in the conversation it was
+/// written — in the order it was sent; one sent to an idle session goes as
+/// it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_sent_during_a_turn_goes_after_it_with_a_note() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client =
+        AgentClient::spawn_unconfined_for_tests(fake_agent_spec(), workspace.path().to_path_buf());
+    assert!(matches!(
+        next_event(&client).await,
+        SessionEvent::Ready { .. }
+    ));
+
+    async fn replies(client: &AgentClient, turns: usize) -> Vec<String> {
+        let mut said = Vec::new();
+        let mut ended = 0;
+        while ended < turns {
+            match next_event(client).await {
+                SessionEvent::Update(SessionUpdate::AgentMessageChunk(chunk)) => {
+                    if let ContentBlock::Text(text) = chunk.content {
+                        said.push(text.text);
+                    }
+                }
+                SessionEvent::TurnEnded { .. } => ended += 1,
+                SessionEvent::Closed(error) => panic!("closed: {error:?}"),
+                _ => {}
+            }
+        }
+        said
+    }
+    let written = |after: &str| taste_core::queued::Queued {
+        at: std::time::Instant::now(),
+        after: taste_core::queued::Reference::Message(after.into()),
+    };
+    let text = |t: &str| {
+        vec![ContentBlock::Text(
+            agent_client_protocol::schema::v1::TextContent::new(t.to_string()),
+        )]
+    };
+
+    client.prompt("/slow 1.2").unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client
+        .prompt_blocks_queued(
+            text("look at the tests first"),
+            written("Moving the cache next."),
+        )
+        .unwrap();
+    client
+        .prompt_blocks_queued(text("and then the docs"), written("Moving the cache next."))
+        .unwrap();
+    let said = replies(&client, 3).await;
+    assert_eq!(said[0], "slow done");
+    for (reply, message) in said[1..]
+        .iter()
+        .zip(["look at the tests first", "and then the docs"])
+    {
+        assert!(reply.starts_with("noted [Queued for "), "{reply}");
+        assert!(
+            reply.contains("s. Written after your message ending \"Moving the cache next.\";"),
+            "{reply}"
+        );
+        assert!(reply.ends_with(&format!(" | {message}")), "{reply}");
+    }
+
+    // Idle: nothing to wait behind, so no note.
+    client
+        .prompt_blocks_queued(text("/echo plain"), written("slow done"))
+        .unwrap();
+    assert_eq!(replies(&client, 1).await, ["echo /echo plain"]);
+}

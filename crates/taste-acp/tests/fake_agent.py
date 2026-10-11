@@ -44,6 +44,7 @@ console's Kill button exists for. "/termstatus ID" and "/termrelease ID"
 finish the job afterwards.
 """
 import json
+import time
 import os
 import subprocess
 import sys
@@ -195,6 +196,20 @@ while True:
             })
             respond(_req, {"stopReason": "end_turn"})
 
+        texts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
+        # A prompt that waited behind a turn: the client's note first, the
+        # message after it (taste_core::queued).
+        if prompt.startswith("[Queued for "):
+            reply("noted " + texts[0] + " | " + texts[-1])
+            continue
+        if prompt.startswith("/echo "):
+            reply("echo " + " | ".join(texts))
+            continue
+        # A turn that takes a while, for a prompt to be sent during.
+        if prompt.startswith("/slow "):
+            time.sleep(float(prompt[len("/slow "):]))
+            reply("slow done")
+            continue
         if prompt.startswith("/write "):
             path, _, text = prompt[len("/write "):].partition(" ")
             result = call_client("fs/write_text_file", {
