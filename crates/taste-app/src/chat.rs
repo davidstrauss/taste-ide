@@ -9357,6 +9357,9 @@ impl ChatPane {
         ) {
             Ok(client) => client,
             Err(e) => {
+                // Said, so a log of a launch that waits on its container
+                // does not read as the same agent spawned twice.
+                tracing::info!("chat {}: its agent was not started: {e}", self.environment);
                 self.status_spinner.stop();
                 self.status_label.set_label("");
                 // Keyed, so the launch that follows rewrites this row
@@ -9406,7 +9409,20 @@ impl ChatPane {
                     );
                     break;
                 }
-                pane.handle_event(event);
+                // One event that fails to draw costs that event, not the
+                // conversation: GLib keeps a panic in this future for a
+                // join handle nobody holds, so the loop ended silently and
+                // every later update — the turn's answer, its end — went
+                // nowhere while the pane said "streaming" (2026-10-11).
+                let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pane.handle_event(without_nul(event))
+                }));
+                if drawn.is_err() {
+                    pane.meta_row(
+                        "the IDE failed to show one of the agent's updates; the log has \
+                         the error, and later updates still arrive",
+                    );
+                }
             }
         });
     }
@@ -11031,7 +11047,8 @@ impl ChatPane {
                 // than fatal: a stash is a convenience, and half a
                 // conversation beats an error where one used to be.
                 if let Ok(update) = serde_json::from_value::<SessionUpdate>(record.update) {
-                    pane.render_update(update);
+                    // A stash written before `without_nul` may hold one.
+                    pane.render_update(nul_free(update));
                 }
             }
             // The last streamed block's markdown pass, for the reason the
@@ -15541,6 +15558,68 @@ fn next_doc_key(prefix: &str) -> String {
     format!("{prefix}-{n}")
 }
 
+/// What the agent sent, with every NUL in its text shown as ␀. GTK takes C
+/// strings, so a NUL ends a label's text where it stands — and in a debug
+/// build glib-rs panics on one instead, which is how a command whose output
+/// read `/proc/*/cmdline` stopped a pane (2026-10-11). What goes to the
+/// agent is untouched: this is the pane's copy.
+fn without_nul(event: SessionEvent) -> SessionEvent {
+    let text = |text: String| {
+        if text.contains('\0') {
+            text.replace('\0', "\u{2400}")
+        } else {
+            text
+        }
+    };
+    match event {
+        SessionEvent::Update(update) => SessionEvent::Update(nul_free(update)),
+        SessionEvent::Permission { request, reply } => SessionEvent::Permission {
+            request: nul_free(request),
+            reply,
+        },
+        SessionEvent::Elicitation { request, reply } => SessionEvent::Elicitation {
+            request: nul_free(request),
+            reply,
+        },
+        SessionEvent::PromptFailed { message } => SessionEvent::PromptFailed {
+            message: text(message),
+        },
+        SessionEvent::CommandFailed { message } => SessionEvent::CommandFailed {
+            message: text(message),
+        },
+        SessionEvent::ModeChangeFailed { mode, message } => SessionEvent::ModeChangeFailed {
+            mode,
+            message: text(message),
+        },
+        SessionEvent::Closed(reason) => SessionEvent::Closed(reason.map(text)),
+        other => other,
+    }
+}
+
+/// `value` with every NUL in its strings shown as ␀; `value` itself, and
+/// no walk, when it has none, which is every update but the rare one.
+fn nul_free<T: serde::Serialize + serde::de::DeserializeOwned>(value: T) -> T {
+    fn walk(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) if text.contains('\0') => {
+                *text = text.replace('\0', "\u{2400}");
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            serde_json::Value::Object(fields) => fields.values_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    let has_nul = serde_json::to_string(&value).is_ok_and(|json| json.contains("\\u0000"));
+    if !has_nul {
+        return value;
+    }
+    let Ok(mut json) = serde_json::to_value(&value) else {
+        return value;
+    };
+    walk(&mut json);
+    serde_json::from_value(json).unwrap_or(value)
+}
+
 fn content_text(block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text(text) => Some(text.text.clone()),
@@ -15870,6 +15949,34 @@ fn centre_dot_after_layout(row_box: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A NUL in what the agent sent reaches the pane as ␀, wherever in the
+    /// update it is, and an update without one comes through as it was.
+    #[test]
+    fn a_nul_from_the_agent_is_shown_not_passed_to_gtk() {
+        use agent_client_protocol::schema::v1::{
+            ContentChunk, ToolCallContent, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let mut fields = ToolCallUpdateFields::new();
+        fields.content = Some(vec![ToolCallContent::from(ContentBlock::Text(
+            TextContent::new("1332 :: sh -c tr '\0' ' '"),
+        ))]);
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new("call", fields));
+        let SessionEvent::Update(SessionUpdate::ToolCallUpdate(clean)) =
+            without_nul(SessionEvent::Update(update))
+        else {
+            panic!("not an update");
+        };
+        let json = serde_json::to_string(&clean).unwrap();
+        assert!(!json.contains("\\u0000"), "{json}");
+        assert!(json.contains("tr '\u{2400}' ' '"), "{json}");
+
+        let plain = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+            TextContent::new("C:\\u0000 is a path, not a NUL"),
+        )));
+        let before = serde_json::to_string(&plain).unwrap();
+        assert_eq!(serde_json::to_string(&nul_free(plain)).unwrap(), before);
+    }
 
     /// A conversation briefed before the current guidance is told what
     /// happened before it is given the text: from which revision, or from

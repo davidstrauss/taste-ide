@@ -219,6 +219,22 @@ fn main() -> glib::ExitCode {
     if std::env::var("TASTE_PROBE_CHECK").is_err() {
         keep_app_log_on_disk();
     }
+    // A panic goes to the log too, with where it happened. GLib catches a
+    // panic in a future spawned on the main loop and keeps it for a join
+    // handle nobody holds, so the default hook's line on a terminal was
+    // its only trace: a chat pane's event loop died that way on a tool
+    // result with a NUL in it, and the pane sat on "streaming" while the
+    // agent's answers went nowhere (2026-10-11).
+    {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!(
+                "panic: {info}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+            default(info);
+        }));
+    }
     // GLib's structured log (GTK CSS parse errors, missing icons,
     // unparented-widget warnings) is mirrored the same way, then handed to
     // the default writer so stderr behaves exactly as before.
