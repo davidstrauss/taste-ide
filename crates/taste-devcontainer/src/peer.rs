@@ -777,7 +777,9 @@ pub struct PeerSync {
     /// The folder's working tree was fast-forwarded to the checkout's
     /// branch.
     pub fast_forwarded: bool,
-    /// The folder's branch was ahead of the checkout's and was pushed in.
+    /// The folder's branch — the parent's, or a submodule's — was ahead
+    /// of the checkout's and was pushed in. That pass's mirror waits for
+    /// the commits to settle, so another pass is due.
     pub pushed: bool,
     /// Commits the folder has that the checkout does not, still.
     pub host_ahead: usize,
@@ -1278,6 +1280,11 @@ fn sync_submodules(
                 sync.sent += inner.sent;
                 sync.received += inner.received;
                 sync.missed += inner.missed;
+                // A push skips that pass's mirror, so it asks for another
+                // pass, which the parent's account carries: left out, a
+                // submodule's working copy waited for something else to set
+                // one off (the sync's simulation, 2026-10-12).
+                sync.pushed |= inner.pushed;
                 sync.conflicts
                     .extend(inner.conflicts.into_iter().map(|p| sub.join(p)));
                 if let Some(note) = inner.note {
@@ -3042,6 +3049,12 @@ mod tests {
             pair.git("folder/tpl", &["rev-parse", "HEAD"]),
             "and the submodule's with it, in the same pass"
         );
+        // A commit in the submodule alone: the pass that pushes it says so,
+        // since its mirror waited and another pass is due.
+        pair.write("folder/tpl", "lib.txt", "once more\n");
+        pair.git("folder/tpl", &["commit", "-q", "-am", "once more"]);
+        let pass = sync("pass 9");
+        assert!(pass.pushed, "{pass:?}");
     }
 
     /// A directory renamed on either side arrives renamed on the other:

@@ -334,6 +334,11 @@ What it found, and what was fixed (each with a test of its own):
   directories it empties with it.
 - The stale-snapshot guard refused a fresh snapshot with the stale one's
   very commit, above, on every pass (P4).
+- A pass that pushes the folder's commits in mirrors nothing, and leaves
+  the working copies to the next pass; a submodule's push was not reported
+  up, so its working copy waited for something else to start one (P4).
+  It is reported now, and the IDE runs that pass at once, as it does for a
+  write that missed.
 
 Not in its schedule: a detached HEAD, a link where a directory is (an
 actor's later write would travel through it, which is the actor's doing,

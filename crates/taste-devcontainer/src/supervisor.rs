@@ -1569,9 +1569,11 @@ impl Supervisor {
 
     /// The primary's sync, and what follows from it: a write that did not
     /// land, because its side changed the path after the pass observed it,
-    /// is decided by another pass at once (a pass or two, never a loop:
-    /// `depth` stops it); a conflict is published for the window to ask
-    /// about, and its going is published too.
+    /// is decided by another pass at once, as are the working copies after
+    /// a pass that pushed the folder's commits in and so mirrored nothing
+    /// (a pass or two, never a loop: `depth` stops it); a conflict is
+    /// published for the window to ask about, and its going is published
+    /// too.
     fn sync_primary_blocking(
         &self,
         vm: &crate::provision::Vm,
@@ -1645,7 +1647,7 @@ impl Supervisor {
                 sync.sent
             ));
         }
-        if sync.missed > 0 && depth < 2 {
+        if (sync.missed > 0 || sync.pushed) && depth < 2 {
             return self.sync_primary_blocking(vm, keys, path, None, depth + 1);
         }
         Ok(())
