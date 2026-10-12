@@ -573,6 +573,9 @@ pub struct Supervisor {
     /// send an older version of a file after a newer one (review,
     /// 2026-09-23).
     folder_sync: Mutex<()>,
+    /// When the checkout's git was last tidied of what its replaced
+    /// snapshots left (`taste_git::snapshot::TIDY_SCRIPT`).
+    last_tidy: Mutex<Option<std::time::Instant>>,
     /// What the last hosting probe found of the IDE's own node
     /// (`Supervisor::agent_node_bin`).
     agent_node: Mutex<Option<String>>,
@@ -913,6 +916,7 @@ impl Supervisor {
             folder_conflicts: Mutex::new(Vec::new()),
             folder_watch: Mutex::new(None),
             folder_sync: Mutex::new(()),
+            last_tidy: Mutex::new(None),
             agent_node: Mutex::new(None),
             agent_task: Mutex::new(None),
             pending: AtomicBool::new(false),
@@ -1148,6 +1152,9 @@ impl Supervisor {
         let weak = Arc::downgrade(self);
         let pending = self.recheck_pending.clone();
         let snapshot_pending = self.snapshot_pending.clone();
+        // When the working tree or a ref last changed: the snapshot waits
+        // for the checkout to be quiet.
+        let last_change = Arc::new(Mutex::new(std::time::Instant::now()));
         let primary = self.env.id.is_primary();
         let folder_events = self.events.clone();
         if primary {
@@ -1196,12 +1203,32 @@ impl Supervisor {
             if worktree_changed && !snapshot_pending.load(Ordering::SeqCst) {
                 folder_events.publish(Event::FolderSync(taste_core::FolderSync::Pending));
             }
+            if ref_moved || worktree_changed {
+                *last_change.lock().unwrap() = std::time::Instant::now();
+            }
             if (ref_moved || worktree_changed) && !snapshot_pending.swap(true, Ordering::SeqCst) {
                 let weak = weak.clone();
                 let snapshot_pending = snapshot_pending.clone();
                 let folder_events = folder_events.clone();
+                let last_change = last_change.clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // Two seconds after the LAST change, not the first, and
+                    // no more than five minutes after the first. A file
+                    // written over minutes — a backup — was snapshotted
+                    // every few seconds as it grew, each snapshot another
+                    // copy of it in the checkout's git, and a 16 GiB VM
+                    // filled (2026-10-12). The bound is for a tree that
+                    // never goes quiet, which still reaches the folder.
+                    let quiet = std::time::Duration::from_secs(2);
+                    let bound = std::time::Duration::from_secs(300);
+                    let first = std::time::Instant::now();
+                    loop {
+                        let since = last_change.lock().unwrap().elapsed();
+                        if since >= quiet || first.elapsed() >= bound {
+                            break;
+                        }
+                        std::thread::sleep(quiet - since);
+                    }
                     snapshot_pending.store(false, Ordering::SeqCst);
                     if let Some(supervisor) = weak.upgrade() {
                         let snapshot = supervisor.snapshot_blocking();
@@ -1470,9 +1497,38 @@ impl Supervisor {
                 let snapshot = taste_git::snapshot::parse_script_output(&out.stdout_utf8())?;
                 if snapshot.wrote {
                     self.sync_peer_blocking()?;
+                    self.tidy_checkout(&files, &path);
                 }
                 Ok(Some(snapshot))
             }
+        }
+    }
+
+    /// Clear what the checkout's replaced snapshots left in its git
+    /// (`taste_git::snapshot::TIDY_SCRIPT`), at most every ten minutes,
+    /// the first time at once. Best effort: a tidy that fails costs disk,
+    /// not work, and is said in the log.
+    fn tidy_checkout(&self, files: &taste_core::files::Files, path: &Path) {
+        {
+            let mut last = self.last_tidy.lock().unwrap();
+            if last.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(600)) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let script = taste_git::snapshot::TIDY_SCRIPT.to_string();
+        match files.exec(path, &["sh".into(), "-c".into(), script]) {
+            Ok(out) if out.success() => {
+                let freed = taste_git::snapshot::tidy_freed(&out.stdout_utf8());
+                if freed >= 1024 * 1024 {
+                    self.log(format!(
+                        "cleared {:.1} MB its replaced snapshots left in the checkout's git",
+                        freed as f64 / 1e6
+                    ));
+                }
+            }
+            Ok(out) => tracing::warn!("tidying the checkout's git: {}", out.stderr_utf8().trim()),
+            Err(e) => tracing::warn!("tidying the checkout's git: {e:#}"),
         }
     }
 

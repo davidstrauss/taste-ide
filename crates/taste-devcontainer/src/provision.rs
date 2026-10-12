@@ -1321,6 +1321,9 @@ impl LibvirtSession {
                     if let Err(e) = self.tune_guest_shutdown(vm).await {
                         tracing::debug!("{}: guest stop timeouts not set: {e:#}", vm.domain);
                     }
+                    if let Err(e) = self.grow_disk(vm).await {
+                        self.say(&vm.domain, format!("its disk could not be grown: {e:#}"));
+                    }
                     return Ok(());
                 }
                 Err(_)
@@ -1583,6 +1586,68 @@ impl LibvirtSession {
         Ok(())
     }
 
+    /// Grow a running VM's disk into what the host can now give
+    /// ([`crate::sizing::grown_disk_gib`]) — the qcow2 by libvirt, then the
+    /// guest's root partition and filesystem — when it can grow by a step.
+    /// A disk is sized to what the host can spare when it is made, and one
+    /// made while the host was short kept that size after the space came
+    /// back. Sparse: the host gives what the guest writes, and the
+    /// capacity check counts the rest. A VM on a cloud host is sized there.
+    pub async fn grow_disk(&self, vm: &Vm) -> Result<()> {
+        if vm.cloud.is_some() {
+            return Ok(());
+        }
+        let disk = vm.disk_path();
+        let Some(current) = crate::sizing::qcow2_virtual_size(&disk) else {
+            return Ok(());
+        };
+        let dir = disks_dir();
+        let Some(free) = taste_core::environment::free_bytes(&dir) else {
+            return Ok(());
+        };
+        let unclaimed = crate::sizing::unclaimed_bytes(&dir);
+        let Some(target) = crate::sizing::grown_disk_gib(current, free, unclaimed) else {
+            return Ok(());
+        };
+        self.say(
+            &vm.domain,
+            format!(
+                "growing its disk from {} GiB to {target} GiB, now that this host has room",
+                current / (1024 * 1024 * 1024)
+            ),
+        );
+        self.virsh(&["blockresize", &vm.domain, "vda", &format!("{target}G")])
+            .await
+            .context("resizing the disk")?;
+        let want = (target * 1024 * 1024 * 1024).to_string();
+        let keys = Keys::for_workspace(&vm.workspace_root);
+        let (program, argv) =
+            keys.ssh_argv(vm.ssh_port, ["sudo", "-n", "sh", "-s", "--", want.as_str()]);
+        let mut child = tokio::process::Command::new(&program)
+            .args(&argv)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("running sh in the guest")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(GUEST_GROW_SCRIPT.as_bytes()).await?;
+        }
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            bail!(
+                "growing the guest's filesystem: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        self.say(
+            &vm.domain,
+            format!("its disk is {target} GiB, and the guest's filesystem with it"),
+        );
+        Ok(())
+    }
+
     /// ACPI shutdown. The guest stops cleanly and keeps its disk; the next
     /// `start` is a warm boot.
     pub async fn stop(&self, vm: &Vm) -> Result<()> {
@@ -1706,6 +1771,26 @@ fn deferred_shutdown_pin(workspace_root: &Path) -> PathBuf {
         .dir()
         .join("shutdown.pid")
 }
+
+/// The script [`LibvirtSession::grow_disk`] runs as root in the guest,
+/// `$1` the disk's new size in bytes: the root filesystem's partition grown
+/// to the end of its disk, once the guest sees the disk's new capacity, and
+/// the filesystem grown into it. Fedora CoreOS's root is XFS, grown live.
+/// `growpart` exits 1 when there is nothing to grow, which is not a
+/// failure: a resize the guest had already taken.
+const GUEST_GROW_SCRIPT: &str = r#"set -eu
+want="$1"
+src=$(findmnt -n -o SOURCE /sysroot)
+name=$(basename "$src")
+disk=$(lsblk -no PKNAME "$src")
+part=$(cat "/sys/class/block/$name/partition")
+i=0
+while [ $(( $(cat "/sys/block/$disk/size") * 512 )) -lt "$want" ] && [ "$i" -lt 40 ]; do
+  sleep 0.25; i=$((i + 1))
+done
+growpart "/dev/$disk" "$part" >/dev/null 2>&1 || [ $? -eq 1 ]
+xfs_growfs /sysroot >/dev/null
+"#;
 
 /// The script `tune_guest_shutdown` runs as root in the guest: every
 /// file the Ignition would have written — the stop timeouts, the idle

@@ -136,6 +136,27 @@ fn disk_for(free: u64, unclaimed: u64) -> Result<u64> {
     Ok(gib)
 }
 
+/// The least a disk is grown by: growing it a little at every launch would
+/// be a resize, and the guest's filesystem with it, for nothing much.
+pub const DISK_GROW_STEP_GIB: u64 = 4;
+
+/// The virtual size, in GiB, an existing VM's disk of `current` bytes can
+/// grow to, when that is at least [`DISK_GROW_STEP_GIB`] more: what is free
+/// on this host, less the floor, less what every disk — this one included —
+/// could still grow into, added to its size, capped at [`DISK_GIB`]. A VM
+/// made while the host was short of space got the [`DISK_MIN_GIB`] it could
+/// have, and kept it after the space came back: the finance project's, at
+/// 16 GiB, filled with a 2.3 GB data folder, its snapshots, and its
+/// backups while the host had 55 GB free (2026-10-12; David: "Grow VMs when
+/// room allows"). `None` when it cannot grow by a step.
+pub fn grown_disk_gib(current: u64, free: u64, unclaimed: u64) -> Option<u64> {
+    let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
+    let current_gib = current / GIB;
+    let room_gib = free.saturating_sub(floor).saturating_sub(unclaimed) / GIB;
+    let target = current_gib.saturating_add(room_gib).min(DISK_GIB);
+    (target >= current_gib + DISK_GROW_STEP_GIB).then_some(target)
+}
+
 /// What the qcow2 disks in `dir` could still take from the host: each one's
 /// virtual size less what it already occupies.
 pub fn unclaimed_bytes(dir: &Path) -> u64 {
@@ -231,6 +252,39 @@ mod tests {
     /// A new VM gets what the disk can give once the floor and the other
     /// VMs' room are set aside, at most the ceiling, and is refused when
     /// that is too little to be worth making.
+    /// A disk made small grows when the host has room again, by a step at
+    /// least, never past the ceiling, and never so far that every disk
+    /// together could take the host under its floor.
+    #[test]
+    fn a_small_disk_grows_into_what_the_host_can_give() {
+        let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
+        // 55 GiB free, this 16 GiB disk with 2 GiB still unclaimed.
+        assert_eq!(
+            grown_disk_gib(16 * GIB, floor + 55 * GIB, 2 * GIB),
+            Some(DISK_GIB),
+            "16 + 53 GiB, capped"
+        );
+        assert_eq!(
+            grown_disk_gib(16 * GIB, floor + 30 * GIB, 2 * GIB),
+            Some(44)
+        );
+        assert_eq!(
+            grown_disk_gib(16 * GIB, floor + 5 * GIB, 2 * GIB),
+            None,
+            "under a step"
+        );
+        assert_eq!(
+            grown_disk_gib(16 * GIB, floor, 0),
+            None,
+            "nothing past the floor"
+        );
+        assert_eq!(
+            grown_disk_gib(DISK_GIB * GIB, floor + 500 * GIB, 0),
+            None,
+            "at the ceiling"
+        );
+    }
+
     #[test]
     fn a_new_disk_is_sized_to_what_the_host_can_give() {
         let floor = taste_core::environment::MIN_FREE_DISK_BYTES;

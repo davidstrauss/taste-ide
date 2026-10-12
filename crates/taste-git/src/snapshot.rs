@@ -454,6 +454,58 @@ printf '%s wrote
     ))
 }
 
+/// What a checkout's git keeps after its snapshots have moved on, cleared:
+/// run in the checkout, it removes loose objects and whole packs that no
+/// ref, reflog, or index reaches and that are over half an hour old, and
+/// the temporary packs a snapshot that ran out of room left; the last line
+/// is `freed <bytes>`.
+///
+/// A snapshot is parented on HEAD alone, so the one it replaces is
+/// unreachable at once; but git keeps what is unreachable two weeks, and a
+/// big synced file's every version, each in a pack of its own, filled a
+/// 16 GiB VM: 3.9 GB of packs for 2.3 GB of data, and 0.5 GB of temporary
+/// packs from snapshots that failed for want of room (2026-10-12). Half an
+/// hour is long past any git operation that has written an object and not
+/// yet referenced it — and while one that can pause midway is in progress
+/// (a rebase, a merge, a cherry-pick, a revert, a bisect), nothing is
+/// removed. It touches only the checkout in the VM, never the user's
+/// folder, whose git keeps its own two weeks.
+pub const TIDY_SCRIPT: &str = r#"set -eu
+gd=$(git rev-parse --git-dir)
+for s in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG sequencer; do
+  if [ -e "$gd/$s" ]; then echo "freed 0"; exit 0; fi
+done
+before=$(du -sk "$gd/objects" | cut -f1)
+git prune --expire=30.minutes.ago
+reach="$gd/taste-reach.$$"
+trap 'rm -f "$reach"' EXIT
+git rev-list --objects --all --reflog --indexed-objects --no-object-names | LC_ALL=C sort -u > "$reach"
+for idx in "$gd"/objects/pack/pack-*.idx; do
+  [ -e "$idx" ] || continue
+  base=${idx%.idx}
+  [ -e "$base.pack" ] || continue
+  [ -e "$base.keep" ] && continue
+  [ -n "$(find "$base.pack" -mmin -30)" ] && continue
+  if git show-index < "$idx" | awk '{print $2}' | LC_ALL=C sort | LC_ALL=C comm -12 - "$reach" | grep -q .; then
+    continue
+  fi
+  rm -f "$base.pack" "$base.idx" "$base.rev" "$base.bitmap" "$base.mtimes"
+done
+find "$gd/objects/pack" -maxdepth 1 \( -name 'tmp_*' -o -name '.tmp-*' \) -mmin +30 -exec rm -f {} +
+after=$(du -sk "$gd/objects" | cut -f1)
+echo "freed $(( (before - after) * 1024 ))"
+"#;
+
+/// The bytes [`TIDY_SCRIPT`] says it freed.
+pub fn tidy_freed(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("freed "))
+        .and_then(|n| n.trim().parse::<i64>().ok())
+        .map_or(0, |n| n.max(0) as u64)
+}
+
 /// [`GitWorkspace::restore_snapshot`] as a shell script, for a working
 /// copy this process cannot open: the snapshot's tree unpacked over the
 /// working tree with `git archive`, the paths the snapshot removed
@@ -649,6 +701,93 @@ mod tests {
     /// The script and the library agree byte for byte: run on the same
     /// dirty working copy, both produce the same tree. The script needs
     /// `git`, which the devcontainer has; a machine without it skips.
+    /// The tidy takes a replaced snapshot's big file — a pack of its own,
+    /// unreachable, old — and stale temporary packs, and leaves what any
+    /// ref reaches, what is new, and the repository whole.
+    #[test]
+    fn the_tidy_clears_what_replaced_snapshots_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        fs::write(root.join(".gitignore"), "data/\n").unwrap();
+        fs::write(root.join(".gitattributes"), "/data/** taste-sync\n").unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        let text = script("refs/taste/snapshot/script").unwrap();
+        let sh = |script: &str| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(root)
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "core.bigFileThreshold")
+                .env("GIT_CONFIG_VALUE_0", "1k")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        let packs = || -> Vec<PathBuf> {
+            fs::read_dir(root.join(".git/objects/pack"))
+                .map(|d| {
+                    d.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|x| x == "pack"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // Two versions of a big file, each snapshotted into a pack of its
+        // own; the first is then unreachable.
+        fs::write(root.join("data/backup.bin"), vec![1u8; 64 * 1024]).unwrap();
+        sh(&text);
+        let first = packs();
+        assert_eq!(first.len(), 1, "a big file streams into a pack");
+        fs::write(root.join("data/backup.bin"), vec![2u8; 64 * 1024]).unwrap();
+        sh(&text);
+        assert_eq!(packs().len(), 2);
+        let stale = root.join(".git/objects/pack/tmp_pack_leftover");
+        fs::write(&stale, b"half a pack").unwrap();
+        // New: nothing goes yet.
+        sh(TIDY_SCRIPT);
+        assert_eq!(packs().len(), 2, "a new pack is never taken");
+        // Aged past the half hour.
+        // Git makes its packs read-only; touch sets their time all the same.
+        for path in fs::read_dir(root.join(".git/objects/pack"))
+            .unwrap()
+            .flatten()
+        {
+            let ok = std::process::Command::new("touch")
+                .args(["-d", "2 hours ago"])
+                .arg(path.path())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        let freed = tidy_freed(&sh(TIDY_SCRIPT));
+        assert!(freed > 0, "{freed}");
+        assert_eq!(packs().len(), 1, "the replaced snapshot's pack went");
+        assert!(!first.iter().any(|p| p.exists()), "and it was the first");
+        assert!(!stale.exists(), "the stale temporary pack went");
+        let fsck = std::process::Command::new("git")
+            .args(["fsck", "--connectivity-only"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            fsck.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+        // While a rebase is under way, nothing is touched.
+        fs::create_dir_all(root.join(".git/rebase-merge")).unwrap();
+        assert_eq!(tidy_freed(&sh(TIDY_SCRIPT)), 0);
+    }
+
     /// A sync rule that matches nothing yet — a directory set to sync
     /// with no files in it — is a snapshot like any other, not a failure
     /// (the sync's simulation found every pass failing on one).
