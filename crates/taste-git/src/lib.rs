@@ -19,6 +19,7 @@ pub mod sync_ignored;
 /// Object ids, for callers that name commits without depending on git2.
 pub use git2::Oid;
 pub mod mirror;
+pub mod plan;
 pub mod presence;
 pub mod private;
 pub mod refs;
