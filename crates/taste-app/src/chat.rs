@@ -14605,7 +14605,7 @@ fn shell_script(command: &str, args: Option<&serde_json::Value>) -> Option<Strin
 /// result that is not that JSON (an error string, an older shape), which
 /// the card then shows as it came.
 fn command_console_text(result: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(result.trim()).ok()?;
+    let value = decode_answer(result)?;
     let object = value.as_object()?;
     let text = |keys: &[&str]| {
         keys.iter()
@@ -14658,7 +14658,7 @@ fn quote_command_arg(arg: &str) -> String {
 /// out. `None` for anything that is not a JSON object.
 fn json_fields(text: &str) -> Option<Vec<(String, String)>> {
     use serde_json::Value;
-    let Value::Object(map) = serde_json::from_str::<Value>(text.trim()).ok()? else {
+    let Value::Object(map) = decode_answer(text)? else {
         return None;
     };
     fn words(key: &str) -> String {
@@ -14757,11 +14757,11 @@ fn fields_grid(fields: &[(String, String)]) -> gtk::Box {
 fn act_output_json(raw: &serde_json::Value) -> Option<serde_json::Value> {
     use serde_json::Value;
     match raw {
-        Value::String(text) => serde_json::from_str(text).ok(),
+        Value::String(text) => decode_answer(text),
         Value::Array(blocks) => blocks
             .iter()
             .find_map(|block| block.get("text").and_then(Value::as_str))
-            .and_then(|text| serde_json::from_str(text).ok()),
+            .and_then(decode_answer),
         Value::Object(map) => match map.get("content") {
             Some(Value::Array(blocks)) if !blocks.is_empty() => {
                 act_output_json(&Value::Array(blocks.clone()))
@@ -15120,6 +15120,12 @@ pub(crate) fn ansi_spans(text: &str) -> Vec<AnsiSpan> {
         }
     };
     while let Some(c) = chars.next() {
+        // A NUL is shown, never passed on: GTK takes C strings (see
+        // `without_nul`), and this is what every OUT block is drawn from.
+        if c == '\0' {
+            current.push('\u{2400}');
+            continue;
+        }
         if c != '\u{1b}' {
             current.push(c);
             continue;
@@ -15599,16 +15605,6 @@ fn without_nul(event: SessionEvent) -> SessionEvent {
 /// `value` with every NUL in its strings shown as ␀; `value` itself, and
 /// no walk, when it has none, which is every update but the rare one.
 fn nul_free<T: serde::Serialize + serde::de::DeserializeOwned>(value: T) -> T {
-    fn walk(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::String(text) if text.contains('\0') => {
-                *text = text.replace('\0', "\u{2400}");
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
-            serde_json::Value::Object(fields) => fields.values_mut().for_each(walk),
-            _ => {}
-        }
-    }
     let has_nul = serde_json::to_string(&value).is_ok_and(|json| json.contains("\\u0000"));
     if !has_nul {
         return value;
@@ -15616,8 +15612,31 @@ fn nul_free<T: serde::Serialize + serde::de::DeserializeOwned>(value: T) -> T {
     let Ok(mut json) = serde_json::to_value(&value) else {
         return value;
     };
-    walk(&mut json);
+    show_nul(&mut json);
     serde_json::from_value(json).unwrap_or(value)
+}
+
+/// Every NUL in `value`'s strings shown as ␀.
+fn show_nul(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) if text.contains('\0') => {
+            *text = text.replace('\0', "\u{2400}");
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(show_nul),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(show_nul),
+        _ => {}
+    }
+}
+
+/// A tool's JSON answer, decoded for the pane. Decoding is where a NUL
+/// appears that the update did not have: the IDE's own tools answer in
+/// JSON, so a command's NUL travels as the six characters `\u0000`, which
+/// `without_nul` rightly leaves alone, and becomes a NUL only here — which
+/// stopped an OUT block from drawing (2026-10-12).
+fn decode_answer(text: &str) -> Option<serde_json::Value> {
+    let mut value = serde_json::from_str(text.trim()).ok()?;
+    show_nul(&mut value);
+    Some(value)
 }
 
 fn content_text(block: &ContentBlock) -> Option<String> {
@@ -15976,6 +15995,18 @@ mod tests {
         )));
         let before = serde_json::to_string(&plain).unwrap();
         assert_eq!(serde_json::to_string(&nul_free(plain)).unwrap(), before);
+    }
+
+    /// The IDE's command tools answer in JSON, where a NUL is `\u0000`:
+    /// the console text decoded from it shows the NUL, and so does any OUT
+    /// block drawn from text that has one.
+    #[test]
+    fn a_nul_decoded_from_a_tools_answer_is_shown() {
+        let answer = r#"{"exit_code": 0, "stdout": "1332 :: tr '\u0000' ' '"}"#;
+        let text = command_console_text(answer).unwrap();
+        assert_eq!(text, "1332 :: tr '\u{2400}' ' '");
+        let spans = ansi_spans("a\0b");
+        assert_eq!(spans[0].text, "a\u{2400}b");
     }
 
     /// A conversation briefed before the current guidance is told what
