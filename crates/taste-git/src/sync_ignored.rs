@@ -366,6 +366,15 @@ pub const ROOTS_AWK: &str = r#"/^[ \t]*(#|\[attr\])/ { next }
 /// will not read keeps the previous snapshot's copy (`$prev`, which the
 /// script has read by now): left out, it would read as deleted in the
 /// checkout, and go from the folder.
+///
+/// And they go through an index of their own, kept between snapshots
+/// (`taste-synced-index` in the git directory), so a file whose stat is
+/// what it was is not read again: the scratch index starts from HEAD every
+/// time, and every snapshot read and compressed the whole of a project's
+/// data, 12 s for 1.7 GB, several times a sync (2026-10-12). What is no
+/// longer listed leaves it first. Each run works on its own copy and puts
+/// it back, so two at once do not meet on its lock; the last one's stands,
+/// which is only ever a cache.
 pub fn snapshot_lines() -> String {
     format!(
         r#"taste_sync_roots='{awk}'
@@ -382,16 +391,24 @@ rm -f "$roots"
 if [ $# -gt 0 ]; then
   synced="$GIT_INDEX_FILE.synced"
   ( unset GIT_ATTR_SOURCE; git ls-files -z -o -i --exclude-standard -- "$@" ) > "$synced"
-  if ! git update-index --add --remove -z --stdin < "$synced" 2>/dev/null; then
+  own="$GIT_INDEX_FILE.own"
+  cp -p "$gitdir/taste-synced-index" "$own" 2>/dev/null || rm -f "$own"
+  LC_ALL=C sort -z "$synced" > "$synced.now"
+  GIT_INDEX_FILE="$own" git ls-files -z | LC_ALL=C sort -z > "$synced.had"
+  LC_ALL=C comm -z -23 "$synced.had" "$synced.now" \
+    | GIT_INDEX_FILE="$own" git update-index -z --force-remove --stdin
+  if ! GIT_INDEX_FILE="$own" git update-index --add --remove -z --stdin < "$synced" 2>/dev/null; then
     kept="$GIT_INDEX_FILE.kept"
-    xargs -0 -r -n 64 sh -c 'git update-index --add --remove -- "$@" 2>/dev/null && exit 0
+    GIT_INDEX_FILE="$own" xargs -0 -r -n 64 sh -c 'git update-index --add --remove -- "$@" 2>/dev/null && exit 0
       for f; do git update-index --add --remove -- "$f" 2>/dev/null || printf "%s\0" "$f"; done' sh \
       < "$synced" > "$kept" || true
-    if [ -n "$prev" ] && [ -s "$kept" ]; then
-      xargs -0 sh -c 'GIT_LITERAL_PATHSPECS=1 git ls-tree -z "$0" -- "$@"' "$prev" < "$kept" \
-        | git update-index -z --index-info
-    fi
   fi
+  GIT_INDEX_FILE="$own" git ls-files -z -s | git update-index -z --index-info
+  if [ -n "$prev" ] && [ -s "${{kept:-/dev/null}}" ]; then
+    xargs -0 sh -c 'GIT_LITERAL_PATHSPECS=1 git ls-tree -z "$0" -- "$@"' "$prev" < "$kept" \
+      | git update-index -z --index-info
+  fi
+  mv -f "$own" "$gitdir/taste-synced-index"
 fi
 "#,
         awk = ROOTS_AWK

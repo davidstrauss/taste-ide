@@ -207,6 +207,7 @@ impl GitWorkspace {
             })
             .collect();
 
+        let odb = self.repo.odb().context("opening the object database")?;
         let mut builder = git2::build::TreeUpdateBuilder::new();
         for rel in &paths {
             let absolute = self.workdir.join(rel);
@@ -250,17 +251,26 @@ impl GitWorkspace {
                     // converted — 3,305 archived .eml files in the finance
                     // checkout, rewritten with LF minutes after each was
                     // saved (2026-10-11). Streamed, not read whole.
-                    let blob = (|| -> Result<Option<Oid>> {
-                        let mut file = match std::fs::File::open(&absolute) {
-                            Ok(file) => file,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                            Err(e) => return Err(e.into()),
-                        };
-                        let mut writer = self.repo.blob_writer(None)?;
-                        std::io::copy(&mut file, &mut writer)?;
-                        Ok(Some(writer.commit()?))
-                    })()
-                    .with_context(|| format!("reading {}", absolute.display()))?;
+                    let known = hashed_before(&absolute, &meta).filter(|oid| odb.exists(*oid));
+                    let blob = known
+                        .map(|oid| Ok(Some(oid)))
+                        .unwrap_or_else(|| {
+                            (|| -> Result<Option<Oid>> {
+                                let mut file = match std::fs::File::open(&absolute) {
+                                    Ok(file) => file,
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                        return Ok(None)
+                                    }
+                                    Err(e) => return Err(e.into()),
+                                };
+                                let mut writer = self.repo.blob_writer(None)?;
+                                std::io::copy(&mut file, &mut writer)?;
+                                let oid = writer.commit()?;
+                                remember_hashed(&absolute, &meta, oid);
+                                Ok(Some(oid))
+                            })()
+                        })
+                        .with_context(|| format!("reading {}", absolute.display()))?;
                     // Gone since its metadata was read, as a database's
                     // write-ahead log comes and goes: gone, as above.
                     let Some(blob) = blob else {
@@ -289,6 +299,72 @@ impl GitWorkspace {
     }
 }
 
+/// A file's stat, as far as telling whether it changed goes: what git's
+/// index compares, nanoseconds included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    ino: u64,
+    dev: u64,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Stamp {
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+            ino: meta.ino(),
+            dev: meta.dev(),
+        }
+    }
+}
+
+/// The blobs files hashed to, by path and stat, for this process's life.
+///
+/// What syncs though ignored (`crate::sync_ignored`) is in no index, so
+/// nothing remembered its hashes, and every snapshot of the folder read and
+/// compressed all of it again: 30 s a pass over a project's 1.7 GB of data,
+/// several passes a sync, so a file dropped in the folder reached the
+/// checkout minutes later (2026-10-12). A file whose stat is what it was
+/// when it was hashed is the blob it was, as git's index has it; one
+/// changed within the last two seconds is not remembered, since a write in
+/// the same tick as the hash would leave its stat as it was.
+static HASHED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (Stamp, Oid)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// How many files [`HASHED`] remembers before it starts over.
+const HASHED_MAX: usize = 500_000;
+
+fn hashed_before(path: &std::path::Path, meta: &std::fs::Metadata) -> Option<Oid> {
+    let hashed = HASHED.lock().unwrap_or_else(|e| e.into_inner());
+    hashed
+        .get(path)
+        .filter(|(stamp, _)| *stamp == Stamp::of(meta))
+        .map(|(_, oid)| *oid)
+}
+
+fn remember_hashed(path: &std::path::Path, meta: &std::fs::Metadata, oid: Oid) {
+    let settled = meta
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= std::time::Duration::from_secs(2));
+    let mut hashed = HASHED.lock().unwrap_or_else(|e| e.into_inner());
+    if !settled {
+        hashed.remove(path);
+        return;
+    }
+    if hashed.len() >= HASHED_MAX {
+        hashed.clear();
+    }
+    hashed.insert(path.to_path_buf(), (Stamp::of(meta), oid));
+}
+
 /// The snapshot, as a shell script for a working copy this process cannot
 /// open — one in a VM, run there by the files service beside the files.
 ///
@@ -305,7 +381,10 @@ impl GitWorkspace {
 /// ([`crate::sync_ignored::snapshot_lines`]). Two at once still meet on the
 /// ref: the one that loses the race compares its tree with the winner's and
 /// tries again, where it once failed the snapshot ("cannot lock ref …
-/// expected", 2026-10-12). Nothing in it takes an optional lock on the
+/// expected", 2026-10-12). A `write-tree` that fails takes the synced
+/// files' kept index with it, since gc counts no such index as a reference
+/// and a blob it named may be gone; the next snapshot builds it again.
+/// Nothing in it takes an optional lock on the
 /// repository the agent is working in (`GIT_OPTIONAL_LOCKS=0`). An unchanged working
 /// copy writes nothing and says so. The last line is what
 /// [`parse_script_output`] reads: the commit, and `wrote` or `unchanged`.
@@ -330,13 +409,13 @@ export GIT_OPTIONAL_LOCKS=0
 name='{name}'
 gitdir=$(git rev-parse --git-dir)
 export GIT_INDEX_FILE="$gitdir/taste-snapshot-index.$$"
-trap 'rm -f "$GIT_INDEX_FILE" "$GIT_INDEX_FILE.roots" "$GIT_INDEX_FILE.synced" "$GIT_INDEX_FILE.kept"' EXIT
+trap 'rm -f "$GIT_INDEX_FILE" "$GIT_INDEX_FILE".*' EXIT
 rm -f "$GIT_INDEX_FILE"
 prev=$(git rev-parse --verify -q "$name" || true)
 head=$(git rev-parse --verify -q HEAD || true)
 if [ -n "$head" ]; then git read-tree "$head"; fi
 git add -A -- . 2>/dev/null || git add -A -- .
-{synced}tree=$(git write-tree)
+{synced}tree=$(git write-tree) || {{ rm -f "$gitdir/taste-synced-index"; exit 1; }}
 rm -f "$GIT_INDEX_FILE"
 if [ -n "$head" ]; then msg="taste snapshot against $head"; else msg="taste snapshot against an unborn branch"; fi
 tries=0
@@ -610,6 +689,99 @@ mod tests {
         assert_eq!(read("data/a.txt"), b"a2");
         assert_eq!(read("data/c.txt"), b"c1");
         assert_eq!(read("data/b.db"), b"b1", "kept from the last snapshot");
+    }
+
+    /// A file hashed once is not read again while its stat holds — and a
+    /// rewrite is seen even when it keeps the length and the mtime, by its
+    /// ctime.
+    #[test]
+    fn a_remembered_hash_gives_way_to_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        std::fs::write(root.join(".gitignore"), "data/\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "/data/** taste-sync\n").unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let file = root.join("data/a.db");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let write = |text: &str| {
+            std::fs::write(&file, text).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        write("one");
+        let ws = GitWorkspace::discover(root).unwrap();
+        let blob_in = |tree: Oid| {
+            let tree = ws.repo.find_tree(tree).unwrap();
+            let entry = tree.get_path(Path::new("data/a.db")).unwrap();
+            ws.repo.find_blob(entry.id()).unwrap().content().to_vec()
+        };
+        let first = ws.worktree_tree().unwrap();
+        assert_eq!(blob_in(first), b"one");
+        assert!(hashed_before(&file, &std::fs::symlink_metadata(&file).unwrap()).is_some());
+        assert_eq!(ws.worktree_tree().unwrap(), first, "unchanged, from memory");
+        write("two");
+        assert_eq!(blob_in(ws.worktree_tree().unwrap()), b"two");
+    }
+
+    /// The VM's snapshot keeps the synced files' index between runs: a
+    /// rewritten file is read again, a deleted one leaves it, and a new
+    /// one joins it.
+    #[test]
+    fn the_scripts_kept_index_follows_the_synced_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        std::fs::write(root.join(".gitignore"), "data/\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "/data/** taste-sync\n").unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(root.join("data/a.txt"), "a1").unwrap();
+        std::fs::write(root.join("data/b.txt"), "b1").unwrap();
+        let text = script("refs/taste/snapshot/script").unwrap();
+        let run = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&text)
+                .current_dir(root)
+                .env(
+                    "GIT_ATTR_SOURCE",
+                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                )
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            parse_script_output(&String::from_utf8_lossy(&out.stdout)).unwrap()
+        };
+        run();
+        assert!(root.join(".git/taste-synced-index").exists());
+        std::fs::write(root.join("data/a.txt"), "a2").unwrap();
+        std::fs::remove_file(root.join("data/b.txt")).unwrap();
+        std::fs::write(root.join("data/c.txt"), "c1").unwrap();
+        let second = run();
+        let repo = git2::Repository::open(root).unwrap();
+        let tree = repo.find_commit(second.commit).unwrap().tree().unwrap();
+        let read = |path: &str| {
+            tree.get_path(Path::new(path))
+                .ok()
+                .map(|entry| repo.find_blob(entry.id()).unwrap().content().to_vec())
+        };
+        assert_eq!(read("data/a.txt").as_deref(), Some(&b"a2"[..]));
+        assert_eq!(read("data/b.txt"), None, "deleted, so gone");
+        assert_eq!(read("data/c.txt").as_deref(), Some(&b"c1"[..]));
+        let leftovers: Vec<_> = std::fs::read_dir(root.join(".git"))
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("taste-snapshot-index"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
