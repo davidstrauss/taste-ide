@@ -270,6 +270,33 @@ impl GitWorkspace {
             });
         }
 
+        // What the working tree becomes, before anything moves: the forced
+        // checkout below would write over an untracked or ignored file
+        // wherever the merge adds a tracked one — the dirty check sees
+        // neither kind — and that version may exist nowhere else (the
+        // sync's simulation lost one that way in the checkout's own git,
+        // 2026-10-12). Refused, naming them, while nothing has changed.
+        let target_tree = if fast_forward {
+            theirs.tree_id()
+        } else {
+            merged
+                .write_tree_to(&self.repo)
+                .context("writing the merged tree")?
+        };
+        let in_the_way =
+            self.untracked_in_the_way(&ours.tree()?, &self.repo.find_tree(target_tree)?)?;
+        if !in_the_way.is_empty() {
+            bail!(
+                "files of this folder's own that git does not track are where {branch} has \
+                 files, and merging would write over them: {}",
+                in_the_way
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         let short = theirs_ref
             .strip_prefix("refs/heads/")
             .unwrap_or(&theirs_ref)
@@ -287,10 +314,7 @@ impl GitWorkspace {
                 .with_context(|| format!("advancing {head_ref}"))?;
             MergeStatus::FastForward
         } else {
-            let tree_oid = merged
-                .write_tree_to(&self.repo)
-                .context("writing the merged tree")?;
-            let tree = self.repo.find_tree(tree_oid)?;
+            let tree = self.repo.find_tree(target_tree)?;
             // The user's identity: this is the user's merge, in the user's
             // repository, exactly like a commit from the composer.
             let sig = self
@@ -327,6 +351,49 @@ impl GitWorkspace {
         })
     }
 
+    /// The files on disk that checking out `target` over `ours` would
+    /// write over or remove, though `ours` does not track them: untracked
+    /// or ignored, at a path `target` adds, or beneath a directory of
+    /// `ours` that `target` makes a file.
+    fn untracked_in_the_way(&self, ours: &git2::Tree, target: &git2::Tree) -> Result<Vec<PathBuf>> {
+        let mut added: Vec<PathBuf> = Vec::new();
+        target.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if entry.kind() != Some(git2::ObjectType::Tree) {
+                let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
+                let tracked = ours
+                    .get_path(&path)
+                    .is_ok_and(|e| e.kind() != Some(git2::ObjectType::Tree));
+                if !tracked {
+                    added.push(path);
+                }
+            }
+            git2::TreeWalkResult::Ok
+        })?;
+        let mut out = Vec::new();
+        for path in added {
+            let at = self.workdir.join(&path);
+            let Ok(meta) = std::fs::symlink_metadata(&at) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                out.push(path);
+                continue;
+            }
+            // A directory where the file goes: anything in it that `ours`
+            // does not track goes with it.
+            for found in walkdir_files(&at) {
+                let rel = found
+                    .strip_prefix(&self.workdir)
+                    .unwrap_or(&found)
+                    .to_path_buf();
+                if ours.get_path(&rel).is_err() {
+                    out.push(rel);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Any uncommitted work in the tree (staged, modified, or conflicted).
     /// Untracked files do not count — a merge does not overwrite them, and
     /// refusing over a stray build artifact would make the op unusable.
@@ -340,6 +407,28 @@ impl GitWorkspace {
             })
         })
     }
+}
+
+/// Every file and link beneath `dir`, the repository's own left out.
+fn walkdir_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(entry.path()),
+                Ok(_) => out.push(entry.path()),
+                Err(_) => {}
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -612,6 +701,32 @@ mod tests {
             .to_string();
         assert!(error.contains("commit or stash"), "{error}");
         assert!(!dir.path().join("new.txt").exists(), "nothing was written");
+    }
+
+    /// An ignored file where the branch has a tracked one is the user's,
+    /// and git would count it expendable: the merge is refused, naming it,
+    /// before anything moves.
+    #[test]
+    fn an_ignored_file_in_the_way_is_refused_rather_than_written_over() {
+        let (dir, git) = hub();
+        branch_with(
+            &git,
+            "refs/heads/agents/one/topic",
+            &[("data.log", "theirs\n")],
+        );
+        std::fs::write(dir.path().join(".git/info/exclude"), "data.log\n").unwrap();
+        std::fs::write(dir.path().join("data.log"), "mine, ignored\n").unwrap();
+        let head = git.repo.head().unwrap().target();
+        let error = git
+            .fast_forward_branch("agents/one/topic")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("data.log"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("data.log")).unwrap(),
+            "mine, ignored\n"
+        );
+        assert_eq!(git.repo.head().unwrap().target(), head, "nothing moved");
     }
 
     #[test]

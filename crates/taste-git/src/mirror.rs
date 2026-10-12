@@ -330,15 +330,23 @@ impl GitWorkspace {
             },
         };
         let folder_tree = self.worktree_tree()?;
-        // One set of rules for both sides: the folder's, and the
-        // `.gitattributes` each of the three trees carries — the one being
-        // written brings its own before it is in the folder to be read.
-        let mut rules = self.sync_rules();
-        for tree in [archive_tree, folder_tree, target.id()] {
-            rules.add_set(crate::sync_ignored::attribute_files_in_tree(
-                &self.repo, tree,
-            ));
-        }
+        // Each side's rules, its own: the folder's from its disk, the
+        // checkout's — what it ignores and what syncs anyway — from its
+        // snapshot. A path is in scope only where both sides have it so.
+        // Pooled, a sync rule only the folder had took a path the checkout
+        // ignores for in scope; the checkout's snapshot, by its own rules,
+        // left the path out; and the sync, rightly refusing to read that
+        // snapshot as the checkout removing the path, stood still (the
+        // sync's simulation, P4). While the two disagree — a rule changed on
+        // one side and not yet agreed — such a path is left as it is on
+        // both, and a rule's change reaches its paths a pass after the
+        // rule itself has.
+        let folder_rules = self.sync_rules();
+        let mut their_rules = crate::sync_ignored::Rules::default();
+        their_rules.add_set(crate::sync_ignored::attribute_files_in_tree(
+            &self.repo,
+            target.id(),
+        ));
         let archive = self.entries(archive_tree)?;
         let folder = self.entries(folder_tree)?;
         let theirs = self.entries(target.id())?;
@@ -354,6 +362,15 @@ impl GitWorkspace {
             })
             .cloned()
             .collect();
+        // In scope only where neither side ignores the path without
+        // syncing it: the checkout's own `.gitignore` files, from its
+        // snapshot, as well as the folder's. While the two disagree — a
+        // rule changed on one side, or both, and not yet agreed — a path
+        // one of them ignores is left as it is on both, rather than taken
+        // for removed on the side whose snapshot left it out; the sync's
+        // simulation found a write into the checkout refused forever by
+        // the checkout's ignored copy there (P4, P7).
+        let theirs_ignore = crate::sync_ignored::ignores_in_tree(&self.repo, target.id());
         let plan = crate::plan::plan(
             &crate::plan::Observed {
                 archive: &archive,
@@ -361,7 +378,10 @@ impl GitWorkspace {
                 checkout: &theirs,
                 folder_unseen: &unseen,
             },
-            |path| !self.ignored_unsynced(path, &rules),
+            |path| {
+                !self.ignored_unsynced(path, &folder_rules)
+                    && !(theirs_ignore.ignored(path) && !their_rules.syncs(path))
+            },
             resolve,
         );
         if let Some(reason) = room(self.bytes_of(&plan.to_folder)?) {
@@ -1099,6 +1119,16 @@ mod tests {
             fs::write(vm.join("data/keep/model.bin"), "weights\n").unwrap();
             fs::write(vm.join("data/other.bin"), "not this\n").unwrap();
         };
+        // The rule first: until the folder has it, the folder ignores
+        // data/ outright, and a path one side ignores is left on both.
+        let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
+        assert!(dir.path().join(".gitattributes").exists());
+        assert!(!dir.path().join("data/keep/model.bin").exists());
+        // Then what it brings back.
         let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
         done(
             ws.mirror_from(&main, tip, snap, None, &Took::default())
@@ -1108,7 +1138,6 @@ mod tests {
             fs::read_to_string(dir.path().join("data/keep/model.bin")).unwrap(),
             "weights\n"
         );
-        assert!(dir.path().join(".gitattributes").exists());
         assert!(
             !dir.path().join("data/other.bin").exists(),
             "not set to sync"

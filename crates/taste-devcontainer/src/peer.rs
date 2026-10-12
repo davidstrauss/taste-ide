@@ -1773,18 +1773,40 @@ stashed=0
 if [ -n "$(git status --porcelain)" ]; then
   git stash push --include-untracked -q -m taste-ide-sync && stashed=1
 fi
+# Neither move overwrites a file of the checkout's own that git is not
+# tracking. A stash leaves an ignored file where it is, and git's own
+# defaults count one expendable: a fast-forward overwrote, and a hard reset
+# deleted, an ignored file wherever the folder's commit had a tracked one,
+# and that version existed nowhere else (the sync's simulation, 2026-10-12).
+# So the fast-forward is told not to, and the rewrite goes through read-tree,
+# which refuses untracked and ignored files alike; a refusal names the file,
+# and the user moves it.
 if [ -n "$expected" ]; then
-  # The tree is clean here (its changes are in the stash), so this moves
-  # the branch and its files and loses nothing.
-  git reset -q --hard "$staging"
-elif ! git merge --ff-only -q "$staging"; then
+  if ! git read-tree -m -u HEAD "$staging"; then
+    [ "$stashed" = 1 ] && git stash pop -q || true
+    cleanup; echo "the checkout would not move to the folder's rewritten $branch" >&2; exit 3
+  fi
+  git update-ref "refs/heads/$branch" "$staging"
+elif ! git merge --ff-only --no-overwrite-ignore -q "$staging"; then
   [ "$stashed" = 1 ] && git stash pop -q || true
   cleanup; echo "the checkout would not fast-forward to the folder's $branch" >&2; exit 3
 fi
 cleanup
 if [ "$stashed" = 1 ] && ! git stash pop -q 2>/dev/null; then
   git reset -q --hard
-  git clean -fdq
+  # Only what the failed pop itself put back, each file exactly as the
+  # stash holds it — and the stash is kept. A `git clean` here removed
+  # every untracked file, among them one the stash never held: ignored when
+  # the stash was made, and no longer once the commits it moved to changed
+  # the rules (the sync's simulation, 2026-10-12).
+  if git rev-parse -q --verify 'stash@{0}^3' >/dev/null; then
+    git ls-tree -r --name-only 'stash@{0}^3' | while IFS= read -r p; do
+      if [ -f "$p" ] && [ ! -L "$p" ] \
+         && [ "$(git hash-object -- "$p")" = "$(git rev-parse "stash@{0}^3:$p")" ]; then
+        rm -f -- "$p"
+      fi
+    done
+  fi
   prune_superseded
   if git stash list | grep -q 'taste-ide-sync$'; then
     echo "its uncommitted changes do not apply over them and are kept in its stash (taste-ide-sync), for the file tree's Unstash" >&2
@@ -1816,7 +1838,7 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 # Not a branch: the folder is detached at the commit, and so is Personal.
 if [ -z "$branch" ]; then
-  if ! git switch -q --detach "$staging" 2>&1; then
+  if ! git switch -q --no-overwrite-ignore --detach "$staging" 2>&1; then
     cleanup; exit 5
   fi
   cleanup; exit 0
@@ -1827,7 +1849,9 @@ if git rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
   fi
 fi
 git update-ref "refs/heads/$branch" "$staging"
-if ! git switch -q "$branch" 2>&1; then
+# Not over an ignored file of Personal's own, which git would count
+# expendable (see SYNC_SCRIPT).
+if ! git switch -q --no-overwrite-ignore "$branch" 2>&1; then
   cleanup; exit 5
 fi
 cleanup

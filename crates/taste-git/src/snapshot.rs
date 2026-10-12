@@ -649,6 +649,37 @@ mod tests {
     /// The script and the library agree byte for byte: run on the same
     /// dirty working copy, both produce the same tree. The script needs
     /// `git`, which the devcontainer has; a machine without it skips.
+    /// A sync rule that matches nothing yet — a directory set to sync
+    /// with no files in it — is a snapshot like any other, not a failure
+    /// (the sync's simulation found every pass failing on one).
+    #[test]
+    fn a_sync_rule_matching_nothing_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        fs::write(root.join(".gitignore"), "/ign/\n").unwrap();
+        fs::write(root.join(".gitattributes"), "/ign/** taste-sync\n").unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        let text = script("refs/taste/snapshot/script").unwrap();
+        for _ in 0..2 {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&text)
+                .current_dir(root)
+                .env(
+                    "GIT_ATTR_SOURCE",
+                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                )
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     /// A synced file that will not read — as one being written fails, and
     /// as an unreadable one does here — costs that file, not the snapshot:
     /// the rest land, new files with them, and it keeps the previous

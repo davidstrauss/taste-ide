@@ -118,10 +118,14 @@ taken for that side's change. What the folder sent the checkout, observed
 in the checkout, is agreement.
 
 **P7 — Scope.** Nothing out of scope on a side is read as a change, written,
-or removed there. A path entering scope — an ignore rule removed, sync set
-on an ignored path — is decided by the table with A(p) absent: the same
-content on both sides is agreement, different content a conflict, one side
-only propagated. A path leaving scope on one side is left as it is there.
+or removed there. Each side's scope is its own rules — what it ignores, and
+what syncs anyway — and a path is synced only where both sides have it in
+scope; while their rules disagree, a path one side leaves out is left as it
+is on both. A path entering scope — an ignore rule removed, sync set on an
+ignored path, on both sides — is decided by the table with A(p) absent: the
+same content on both sides is agreement, different content a conflict, one
+side only propagated. A rule's change reaches its paths a pass after the
+rule itself has reached the other side.
 
 **P8 — Containment.** Every write lands beneath its working tree: never
 through a link, never into `.git`, never at a path that escapes the root
@@ -243,43 +247,86 @@ In order, each building on the one before.
 `crates/taste-devcontainer/src/sync_sim.rs` runs the real sync, both ways,
 between two repositories on one machine — the VM's end stood in for by an
 ssh that runs git's far end locally — under a seeded schedule. The actors
-write, remove, and rename files, rename a directory whole, make a file a
-directory and back, flip the executable bit, write an ignored file, and
-commit (one side at a time between passes that bring the two onto one
-commit: both committing is a divergence this document leaves to the user).
-They act at every step a pass reports — before it observes the checkout,
-during the fetch, before each write it sends — and a pass may be stopped at
-any of those steps, or have a directory in the folder refuse its writes.
+write, remove, and rename files; rename a directory whole; make a file a
+directory and back; make and replace symbolic links; flip the executable
+bit; write and commit inside a submodule (a pair of its own); change the
+rules — `.gitignore` taking a path in and out, and `taste-sync` bringing an
+ignored directory back — on either side, so the two disagree for a while;
+switch among three branches on either side, so each can move somewhere the
+other did not; and commit on either side, both at once included. They act
+at every step a pass reports — before it observes the checkout, during the
+fetch, while it moves Personal's branch, before each write it sends — and a
+pass may be stopped at any of those steps, or have a directory in the
+folder refuse its writes.
 
-Then the two sides are left quiet, every conflict is answered (a side the
-seed picks), and the specification is checked against what the actors did:
+Then the two sides are left quiet, and the simulation's user does what a
+person reading the sync's notes would: answers every conflict (a side the
+seed picks); where the two have diverged or stand on different branches,
+commits their own work, moves to Personal's branch, and merges Personal's
+commits, keeping their own side where the two clash — in the submodule
+first, then the parent; and where Personal will not take the folder's
+commits because a file of its own that git does not track is in the way,
+moves that file aside. Then the specification is checked against what the
+actors did:
 
 - **P1 by a ledger.** Every version an actor writes records what it
   replaced on its side, and every version ever written must be held — in a
-  working copy, a commit, or the sync's stash — or replaced, through that
-  chain, by one that is. The ledger knows a version by its bytes: git
-  merges one side's new bytes with the other's new mode cleanly, into a
-  version neither wrote whole, and the mode is held by P4.
+  working copy, in a commit a branch reaches on either side or in either
+  submodule, or in a stash — or replaced, through that chain, by one that
+  is. Only commits a branch reaches: the sync's own snapshots and archive
+  are commits too, and a version only they hold is one the user cannot
+  find. The ledger knows a version by its bytes, which are unique to each
+  write, wherever they are: git merges one side's new bytes with the
+  other's new mode cleanly, and carries a change along a rename (a
+  modification of `d/x` stashed over a commit that renamed `d` comes back
+  at `d2/x`), into versions no actor wrote whole or at that path. The mode
+  is held by P4.
 - **Nothing the actors did not write** is in either working copy.
-- **P4**: the same files and modes on both sides, one commit, and a further
-  pass that writes nothing.
-- **P7**: each side's ignored file is its own last write.
+- **P4**: on one branch at one commit, the submodule at one commit, the same
+  files, modes, and links at every path in scope under the rules both sides
+  end with, and a further pass that writes nothing.
+- **P7**: an always-ignored file on each side is that side's own.
 
 `cargo test -p taste-devcontainer sync_sim` runs three seeds;
 `cargo test -p taste-devcontainer sim_ -- --ignored` runs
 `TASTE_SYNC_SIM_SEEDS` (default 50) from `TASTE_SYNC_SIM_FROM` (default
-1000); `TASTE_SYNC_SIM_SEED=<n>` replays one, printing its schedule on
-failure. It found, in its first runs: the folder's snapshot failing every
-pass once the checkout made a file a directory (`snapshot::worktree_tree`
-cleared only the other direction from its base), and an answered conflict
-of kinds asked about again forever (`plan` applied an answer only where
-both sides had changed the path). Both are fixed, with tests of their own,
-and the planner's exhaustive test now holds that an answer leaves no
-conflict.
+1000) and prints how often each case came up; `TASTE_SYNC_SIM_SEED=<n>`
+replays one, printing its schedule on failure, and `TASTE_SYNC_SIM_KEEP=1`
+leaves its repositories behind to be looked at.
 
-Not yet in its schedule: symbolic links, submodules, rule changes
-(`.gitignore` and `taste-sync` moving under the sync), branch switches, and
-commits on both sides at once.
+What it found, and what was fixed (each with a test of its own):
+
+- The folder's snapshot failed every pass once the checkout made a file a
+  directory (`snapshot::worktree_tree` cleared only the other direction).
+- An answered conflict of kinds was asked about again forever (`plan`
+  applied an answer only where both sides had changed the path).
+- The checkout's snapshot failed every pass while a `taste-sync` rule
+  matched no file (its kept index was never written, then moved).
+- Scope was one pooled set of rules. A path one side ignores and the
+  other does not was taken by the side that ignores it for removed, and the
+  write that would have carried that over was refused at the checkout
+  forever; and a sync rule only the folder had took a path the checkout
+  ignores for in scope, which the checkout's snapshot, by its own rules,
+  left out — so the stale-snapshot guard stood the sync still (P4). Each
+  side's scope is now its own rules, the checkout's read from its
+  snapshot, and a path is synced where both have it in scope (P7).
+- Git counts an ignored file expendable: a fast-forward of the folder's
+  commits into Personal overwrote, a rewrite's `reset --hard` would have
+  deleted, and a switch of Personal's branch would have overwritten, an
+  ignored file of Personal's own where the commit tracks one — and a stash
+  never holds an ignored file, so the version was gone (P1). Each now
+  refuses (`--no-overwrite-ignore`, `read-tree -m -u`), naming the file,
+  and the user moves it. The folder's own merge and fast-forward refused
+  likewise, before anything moves (`GitWorkspace::merge_with`).
+- After a stash would not apply, `git clean` deleted every untracked file,
+  among them one the stash never held: ignored when the stash was made, and
+  no longer once the commits it moved to changed the rules (P1). Only what
+  the failed pop itself put back, byte for byte, is removed now.
+
+Not in its schedule: a detached HEAD, a link where a directory is (an
+actor's later write would travel through it, which is the actor's doing,
+not the sync's), and `info/exclude` or a global excludes file differing
+between the sides.
 
 ## The model, as built
 

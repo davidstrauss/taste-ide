@@ -408,7 +408,8 @@ if [ $# -gt 0 ]; then
     xargs -0 sh -c 'GIT_LITERAL_PATHSPECS=1 git ls-tree -z "$0" -- "$@"' "$prev" < "$kept" \
       | git update-index -z --index-info
   fi
-  mv -f "$own" "$gitdir/taste-synced-index"
+  # Nothing to write, and update-index wrote no index: there is none to keep.
+  if [ -f "$own" ]; then mv -f "$own" "$gitdir/taste-synced-index"; else rm -f "$gitdir/taste-synced-index"; fi
 fi
 "#,
         awk = ROOTS_AWK
@@ -524,6 +525,57 @@ pub fn attribute_files_in_tree(repo: &git2::Repository, tree: git2::Oid) -> Vec<
         git2::TreeWalkResult::Ok
     });
     files
+}
+
+/// The `.gitignore` files a tree carries, as matchers, deepest first: what
+/// a working copy that tree was taken from ignores, judged on this host —
+/// the checkout's, from its snapshot, which is how the sync knows a path
+/// the checkout ignores and so left out of its snapshot is not one it
+/// removed (docs/SYNC.md, P7).
+#[derive(Debug, Default)]
+pub struct Ignores {
+    files: Vec<(PathBuf, Gitignore)>,
+}
+
+impl Ignores {
+    /// Whether `path` is ignored: the deepest file with a say decides.
+    pub fn ignored(&self, path: &Path) -> bool {
+        for (base, matcher) in &self.files {
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            match matcher.matched_path_or_any_parents(rel, false) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
+            }
+        }
+        false
+    }
+}
+
+/// Every `.gitignore` in `tree`, as [`Ignores`].
+pub fn ignores_in_tree(repo: &git2::Repository, tree: git2::Oid) -> Ignores {
+    let mut files: Vec<(PathBuf, Gitignore)> = Vec::new();
+    let Ok(tree) = repo.find_tree(tree) else {
+        return Ignores::default();
+    };
+    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+        if entry.name() == Some(".gitignore") && entry.kind() == Some(git2::ObjectType::Blob) {
+            if let Ok(blob) = repo.find_blob(entry.id()) {
+                let mut builder = GitignoreBuilder::new("");
+                for line in String::from_utf8_lossy(blob.content()).lines() {
+                    let _ = builder.add_line(None, line);
+                }
+                if let Ok(matcher) = builder.build() {
+                    files.push((PathBuf::from(dir.trim_end_matches('/')), matcher));
+                }
+            }
+        }
+        git2::TreeWalkResult::Ok
+    });
+    files.sort_by_key(|(base, _)| std::cmp::Reverse(base.components().count()));
+    Ignores { files }
 }
 
 impl crate::GitWorkspace {
