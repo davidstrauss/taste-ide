@@ -47,6 +47,25 @@ build_image() {
         fi
     done
 }
+# Host-side desktop integration for dev runs: GNOME resolves the dock's
+# and the app switcher's icon by matching the window's app-id against a
+# desktop file on the host, so install the .Devel-badged identity into the
+# user's data dirs — on the container path and on --host, which execs the
+# binary before the container path's steps and so showed the generic icon
+# on a machine that had only ever launched that way (David, 2026-10-12:
+# "I'm fine with installing them in --host mode"). The entry's Exec is
+# the container path whichever way this run came: --host opens the
+# shell's working directory, and a launcher's is the home directory.
+# Idempotent; the packaged Flatpak ships the unbadged identity.
+install_desktop_integration() {
+    local id="net.davidstrauss.Taste.Devel"
+    install -Dm644 "$ROOT/data/icons/hicolor/scalable/apps/$id.svg" \
+        "$HOME/.local/share/icons/hicolor/scalable/apps/$id.svg"
+    mkdir -p "$HOME/.local/share/applications"
+    sed "s|@BOOTSTRAP@|$ROOT/bootstrap.sh|" "$ROOT/data/$id.desktop" \
+        > "$HOME/.local/share/applications/$id.desktop"
+}
+
 WAYLAND="${WAYLAND_DISPLAY:-wayland-0}"
 
 # --flatpak: the production build — build, install, and run the real
@@ -71,6 +90,7 @@ fi
 # host (works: libgit2 is vendored). Real portals, real devcontainer
 # supervision; agents run confined in the devcontainer image.
 if [ "${1:-}" = "--host" ]; then
+    install_desktop_integration
     build_image
     # :z (shared), never :Z (private). A private relabel stamps this
     # container's own MCS categories onto the workspace, taking it from
@@ -99,16 +119,7 @@ command -v podman >/dev/null || {
     exit 1
 }
 
-# Host-side desktop integration for dev runs: GNOME resolves the app
-# switcher icon by matching the window's app-id against a desktop file on
-# the host, so install the .Devel-badged identity into the user's data
-# dirs. Idempotent; the packaged Flatpak ships the unbadged identity.
-DEV_ID="net.davidstrauss.Taste.Devel"
-install -Dm644 "$ROOT/data/icons/hicolor/scalable/apps/$DEV_ID.svg" \
-    "$HOME/.local/share/icons/hicolor/scalable/apps/$DEV_ID.svg"
-mkdir -p "$HOME/.local/share/applications"
-sed "s|@BOOTSTRAP@|$ROOT/bootstrap.sh|" "$ROOT/data/$DEV_ID.desktop" \
-    > "$HOME/.local/share/applications/$DEV_ID.desktop"
+install_desktop_integration
 
 echo "==> devcontainer image ($IMAGE)"
 build_image
