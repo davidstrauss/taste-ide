@@ -1775,9 +1775,13 @@ fn deferred_shutdown_pin(workspace_root: &Path) -> PathBuf {
 /// The script [`LibvirtSession::grow_disk`] runs as root in the guest,
 /// `$1` the disk's new size in bytes: the root filesystem's partition grown
 /// to the end of its disk, once the guest sees the disk's new capacity, and
-/// the filesystem grown into it. Fedora CoreOS's root is XFS, grown live.
-/// `growpart` exits 1 when there is nothing to grow, which is not a
-/// failure: a resize the guest had already taken.
+/// the filesystem grown into it. Fedora CoreOS's root is XFS, grown live,
+/// through a mount of it that is writable: `/sysroot` is mounted read-only
+/// there, and growing through it failed ("Read-only file system") on the
+/// first VM this ran on, its partition grown and its filesystem not; `/var`
+/// is the same filesystem, writable (2026-10-12). `growpart` exits 1 when
+/// there is nothing to grow, which is not a failure: a resize the guest had
+/// already taken.
 const GUEST_GROW_SCRIPT: &str = r#"set -eu
 want="$1"
 src=$(findmnt -n -o SOURCE /sysroot)
@@ -1789,7 +1793,7 @@ while [ $(( $(cat "/sys/block/$disk/size") * 512 )) -lt "$want" ] && [ "$i" -lt 
   sleep 0.25; i=$((i + 1))
 done
 growpart "/dev/$disk" "$part" >/dev/null 2>&1 || [ $? -eq 1 ]
-xfs_growfs /sysroot >/dev/null
+xfs_growfs "$(findmnt -rn -S "$src" -O rw -o TARGET | head -1)" >/dev/null
 "#;
 
 /// The script `tune_guest_shutdown` runs as root in the guest: every
