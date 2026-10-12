@@ -35,6 +35,8 @@ pub mod seed;
 pub mod sizing;
 pub mod substrate;
 pub mod supervisor;
+#[cfg(test)]
+mod sync_sim;
 pub mod worktree;
 
 pub use channel::{ChannelPaths, ChannelServices, ChannelStream, EnvChannel, Service};

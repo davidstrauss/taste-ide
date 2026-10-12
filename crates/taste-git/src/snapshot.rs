@@ -185,11 +185,27 @@ impl GitWorkspace {
             })
             .cloned()
             .collect();
-        let base_tree = if replaced.is_empty() {
+        // ...and the other way: a file or a link the working copy has made
+        // a directory, which libgit2 will not put a tree beneath ("D/F
+        // conflict when updating tree"). Cleared from the base too, its new
+        // contents kept: the sync's simulation found every snapshot of the
+        // folder failing once the checkout made `a` a directory
+        // (docs/SYNC.md, P12).
+        let became_dirs: Vec<PathBuf> = paths
+            .iter()
+            .filter(|rel| {
+                base_tree
+                    .get_path(rel)
+                    .is_ok_and(|entry| entry.kind() == Some(git2::ObjectType::Blob))
+                    && std::fs::symlink_metadata(self.workdir.join(rel)).is_ok_and(|m| m.is_dir())
+            })
+            .cloned()
+            .collect();
+        let base_tree = if replaced.is_empty() && became_dirs.is_empty() {
             base_tree
         } else {
             let mut clear = git2::build::TreeUpdateBuilder::new();
-            for rel in &replaced {
+            for rel in replaced.iter().chain(&became_dirs) {
                 clear.remove(rel);
             }
             let cleared = clear
@@ -1161,6 +1177,26 @@ mod tests {
         assert!(
             commit.message().unwrap().contains(&head.to_string()),
             "the message names the commit the working copy sat on"
+        );
+    }
+
+    /// A committed file the working copy made a directory: the snapshot
+    /// holds the directory's files and not the file.
+    #[test]
+    fn a_file_made_a_directory_is_snapshotted() {
+        let (dir, ws) = temp_repo();
+        fs::remove_file(dir.path().join("tracked.txt")).unwrap();
+        fs::create_dir_all(dir.path().join("tracked.txt")).unwrap();
+        fs::write(dir.path().join("tracked.txt/inside"), "now a directory\n").unwrap();
+        let tree = ws.repo.find_tree(ws.worktree_tree().unwrap()).unwrap();
+        let entry = tree.get_path(Path::new("tracked.txt/inside")).unwrap();
+        assert_eq!(
+            ws.repo.find_blob(entry.id()).unwrap().content(),
+            b"now a directory\n"
+        );
+        assert_eq!(
+            tree.get_path(Path::new("tracked.txt")).unwrap().kind(),
+            Some(git2::ObjectType::Tree)
         );
     }
 

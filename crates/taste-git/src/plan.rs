@@ -128,6 +128,22 @@ pub fn plan<E: Clone + Eq>(
             entry: entry.cloned(),
             expect: expect.cloned(),
         };
+        // A path the user answered for takes the kept side's entry,
+        // whichever side changed it: a conflict of kinds — a file one side
+        // made where the other holds a directory — is answered as surely
+        // as one of contents (the simulation found an answered conflict
+        // over `a` and `a/q` asked about again forever).
+        if let Some(r) = resolve.filter(|r| r.paths.contains(path) && !unseen) {
+            if f != c {
+                match r.keep {
+                    Side::Folder => plan.to_checkout.push(write(f, c)),
+                    Side::Checkout => plan.to_folder.push(write(c, f)),
+                }
+            } else if f != a {
+                plan.agreed.push((path.clone(), f.cloned()));
+            }
+            continue;
+        }
         match (f != a, c != a) {
             (false, false) => {}
             (true, false) => plan.to_checkout.push(write(f, c)),
@@ -135,11 +151,7 @@ pub fn plan<E: Clone + Eq>(
             (false, true) if unseen => {}
             (false, true) => plan.to_folder.push(write(c, f)),
             (true, true) if f == c => plan.agreed.push((path.clone(), f.cloned())),
-            (true, true) => match resolve.filter(|r| r.paths.contains(path)) {
-                Some(r) if r.keep == Side::Folder && !unseen => plan.to_checkout.push(write(f, c)),
-                Some(r) if r.keep == Side::Checkout && !unseen => plan.to_folder.push(write(c, f)),
-                _ => plan.conflicts.push(path.clone()),
-            },
+            (true, true) => plan.conflicts.push(path.clone()),
         }
     }
     // A file and a directory never meet at one path (P12): a write that
@@ -482,6 +494,25 @@ mod tests {
             let to_checkout = plan.to_checkout.iter().any(|w| w.path == path);
             let to_folder = plan.to_folder.iter().any(|w| w.path == path);
             let held = plan.conflicts.contains(&path);
+            // Answered: the kept side's entry goes to the other side,
+            // whichever changed it, unless a clash holds it.
+            if let Some(r) = resolve.filter(|r| r.paths.contains(&path)) {
+                let wrote = match r.keep {
+                    Side::Folder => plan
+                        .to_checkout
+                        .iter()
+                        .any(|w| w.path == path && w.entry.as_ref() == f),
+                    Side::Checkout => plan
+                        .to_folder
+                        .iter()
+                        .any(|w| w.path == path && w.entry.as_ref() == c),
+                };
+                assert!(
+                    f == c || wrote || held,
+                    "P2: the answer did not write {path:?}: {why}"
+                );
+                continue;
+            }
             if f != a && c == a {
                 assert!(to_checkout || held, "P3: {path:?} not sent: {why}");
             }
@@ -680,6 +711,23 @@ mod tests {
                                 };
                                 let answered = case.plan(Some(&resolve));
                                 check(&case, &answered, Some(&resolve));
+                                // Once answered, a path is decided as if
+                                // only the kept side had changed it: no
+                                // conflict is left (P2) — but one whose
+                                // write would meet a file the folder
+                                // ignores, which the sync never removes
+                                // (P7), and which the user has to move.
+                                let blocked = |p: &PathBuf| {
+                                    case.unseen
+                                        .iter()
+                                        .any(|u| u.starts_with(p) || p.starts_with(u))
+                                };
+                                assert!(
+                                    answered.conflicts.iter().all(blocked),
+                                    "P2: answered {keep:?}, still {:?}: {}",
+                                    answered.conflicts,
+                                    case.describe()
+                                );
                                 for w in answered.to_folder.iter().chain(&answered.to_checkout) {
                                     let was_conflict = plan.conflicts.contains(&w.path);
                                     let was_write = plan
