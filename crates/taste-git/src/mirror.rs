@@ -279,21 +279,42 @@ impl GitWorkspace {
             },
         };
         let mut current = self.worktree_tree()?;
-        if current != baseline {
+        // What the checkout holds because the folder sent it is the
+        // folder's own, not a change of the checkout's.
+        let sent = match self.read_ref(SENT_REF)? {
+            Some(oid) => self.entries_between(baseline, self.repo.find_commit(oid)?.tree_id())?,
+            None => Default::default(),
+        };
+        let current_tree = self.repo.find_tree(current)?;
+        let entry_now = |path: &PathBuf| {
+            current_tree
+                .get_path(path)
+                .ok()
+                .map(|entry| (entry.id(), entry.filemode()))
+        };
+        // A path sent since the two last agreed that the folder no longer
+        // holds as it sent it.
+        let unsent = sent.iter().any(|(path, entry)| entry_now(path) != *entry);
+        if current != baseline || unsent {
             // Each side's changes since the base, path by path, as the
             // entry each now has (`None`: deleted).
             let mut here = self.entries_between(baseline, current)?;
+            // ...and each path the folder sent and has since moved on
+            // from, measured from what it sent rather than from the base:
+            // a file dropped in, sent, and renamed before the two agreed
+            // was in neither the base nor the folder, so its removal was
+            // nobody's, and the next pass wrote the checkout's copy —
+            // the folder's own file, under its old name — back beside the
+            // new one (2026-10-12).
+            for (path, entry) in &sent {
+                let now = entry_now(path);
+                if now != *entry {
+                    here.entry(path.clone()).or_insert(now);
+                }
+            }
             let rules = self.sync_rules();
             here.retain(|path, entry| self.folder_owns(path, entry, &rules));
             let there = self.entries_between(baseline, target.id())?;
-            // What the checkout holds because the folder sent it is the
-            // folder's own, not a change of the checkout's.
-            let sent = match self.read_ref(SENT_REF)? {
-                Some(oid) => {
-                    self.entries_between(baseline, self.repo.find_commit(oid)?.tree_id())?
-                }
-                None => Default::default(),
-            };
             let theirs = |path: &PathBuf| {
                 there
                     .get(path)
@@ -1334,6 +1355,62 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A file dropped in, sent, and renamed before the two agree: the
+    /// rename goes out whole — the new name and the old one's removal — and
+    /// the checkout's copy under the old name is never written back.
+    #[test]
+    fn a_file_renamed_after_it_was_sent_is_not_written_back() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        ws.mirror_from(&main, tip, snap, false).unwrap();
+
+        fs::write(dir.path().join("activity.qfx"), "statement\n").unwrap();
+        let (tip2, snap2) = checkout_state(&ws, dir.path(), |_, _| {});
+        let Mirror::Outgoing { changes } = ws.mirror_from(&main, tip2, snap2, false).unwrap()
+        else {
+            panic!("the new file goes out");
+        };
+        ws.record_sent(&changes).unwrap();
+
+        // Renamed here; the checkout has the file under its first name.
+        fs::rename(dir.path().join("activity.qfx"), dir.path().join("amex.qfx")).unwrap();
+        let (tip3, snap3) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join("activity.qfx"), "statement\n").unwrap();
+        });
+        let Mirror::Outgoing { changes } = ws.mirror_from(&main, tip3, snap3, false).unwrap()
+        else {
+            panic!("the rename goes out");
+        };
+        let mut sent: Vec<(String, bool)> = changes
+            .iter()
+            .map(|c| (c.path.display().to_string(), c.content.is_some()))
+            .collect();
+        sent.sort();
+        assert_eq!(
+            sent,
+            vec![("activity.qfx".into(), false), ("amex.qfx".into(), true)]
+        );
+        ws.record_sent(&changes).unwrap();
+
+        // The checkout took both, and the two agree.
+        let (tip4, snap4) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join("amex.qfx"), "statement\n").unwrap();
+        });
+        ws.mirror_from(&main, tip4, snap4, false).unwrap();
+        assert!(
+            !dir.path().join("activity.qfx").exists(),
+            "not written back"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("amex.qfx")).unwrap(),
+            "statement\n"
+        );
     }
 
     #[test]
