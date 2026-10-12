@@ -3629,8 +3629,9 @@ asked about and ruled out of scope (David, same day):
 
 - **The folder mirrors the checkout, and that widens the line on
   purpose** (2026-09-23). The user's folder follows the primary's
-  checkout both ways (`taste_git::mirror`, `peer::sync_primary_peer_with`):
-  its HEAD onto the checkout's branch, its index onto that commit, its
+  checkout both ways (`taste_git::mirror`, `peer::sync_primary_peer_with`;
+  what it must guarantee under every interleaving of edits is
+  [SYNC.md](SYNC.md)): its HEAD onto the checkout's branch, its index onto that commit, its
   working tree onto the checkout's latest snapshot, which is `git
   status`'s working copy, so ignored files are never written or removed
   — except those whose `taste-sync` git attribute is set, which are part

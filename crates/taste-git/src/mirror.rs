@@ -32,6 +32,10 @@
 //! [`Mirror::Stale`]: nothing is written until a fresh one arrives. A
 //! snapshot whose tree IS the tip's (a clean checkout just after a commit,
 //! which writes no new snapshot) is current whatever it names.
+//!
+//! **What it must guarantee** — safety, propagation, convergence, and the
+//! rest, under every interleaving of edits on both sides — is
+//! docs/SYNC.md, which this module is measured against.
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
