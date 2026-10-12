@@ -145,6 +145,21 @@ fn clear(absolute: &Path) -> Result<()> {
 /// — by the user's editor, a build, or a close that stops the pass
 /// partway.
 pub fn write_file(root: &Path, rel: &Path, content: &[u8], executable: bool) -> Result<()> {
+    write_file_if(root, rel, content, executable, &|| true).map(|_| ())
+}
+
+/// [`write_file`], asking `ready` once the new file is staged beside its
+/// place and before it is renamed over it — the last moment a write can
+/// still decide not to land — whether it should: `Ok(false)`, and nothing
+/// was written, when it says no. The sync asks whether the folder still
+/// holds what it observed there (docs/SYNC.md, P1).
+pub fn write_file_if(
+    root: &Path,
+    rel: &Path,
+    content: &[u8],
+    executable: bool,
+    ready: &dyn Fn() -> bool,
+) -> Result<bool> {
     let absolute = checked(root, rel)?;
     make_parents(root, rel)?;
     // The file it replaces, for its bits — only a real file's, never a
@@ -153,8 +168,7 @@ pub fn write_file(root: &Path, rel: &Path, content: &[u8], executable: bool) -> 
         .ok()
         .filter(|m| m.file_type().is_file())
         .map(|m| m.permissions().mode());
-    let name = absolute.file_name().unwrap_or_default().to_string_lossy();
-    let staging = absolute.with_file_name(format!(".{name}{STAGING_SUFFIX}"));
+    let staging = staging_name(&absolute);
     clear(&staging)?;
     let written = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
@@ -176,11 +190,7 @@ pub fn write_file(root: &Path, rel: &Path, content: &[u8], executable: bool) -> 
         let _ = std::fs::remove_file(&staging);
         return Err(e).with_context(|| format!("writing {}", absolute.display()));
     }
-    if let Err(e) = std::fs::rename(&staging, &absolute) {
-        let _ = std::fs::remove_file(&staging);
-        return Err(e).with_context(|| format!("writing {}", absolute.display()));
-    }
-    Ok(())
+    land(&staging, &absolute, ready)
 }
 
 /// Make `rel` inside `root` a link to `target`, replacing a file or link
@@ -188,11 +198,45 @@ pub fn write_file(root: &Path, rel: &Path, content: &[u8], executable: bool) -> 
 /// here; what keeps it from being followed later is that every write
 /// looks for links on its way ([`checked`]).
 pub fn write_link(root: &Path, rel: &Path, target: &std::ffi::OsStr) -> Result<()> {
+    write_link_if(root, rel, target, &|| true).map(|_| ())
+}
+
+/// [`write_link`], made beside its place and renamed over it, as a file
+/// is, with `ready` asked between ([`write_file_if`]).
+pub fn write_link_if(
+    root: &Path,
+    rel: &Path,
+    target: &std::ffi::OsStr,
+    ready: &dyn Fn() -> bool,
+) -> Result<bool> {
     let absolute = checked(root, rel)?;
     make_parents(root, rel)?;
-    clear(&absolute)?;
-    std::os::unix::fs::symlink(target, &absolute)
-        .with_context(|| format!("linking {}", absolute.display()))
+    let staging = staging_name(&absolute);
+    clear(&staging)?;
+    std::os::unix::fs::symlink(target, &staging)
+        .with_context(|| format!("linking {}", absolute.display()))?;
+    land(&staging, &absolute, ready)
+}
+
+/// Where a write to `absolute` is staged: beside it, under a name this
+/// module refuses as a path of its own.
+fn staging_name(absolute: &Path) -> PathBuf {
+    let name = absolute.file_name().unwrap_or_default().to_string_lossy();
+    absolute.with_file_name(format!(".{name}{STAGING_SUFFIX}"))
+}
+
+/// The staged file renamed over its place, if `ready` still says so;
+/// otherwise removed, and nothing written.
+fn land(staging: &Path, absolute: &Path, ready: &dyn Fn() -> bool) -> Result<bool> {
+    if !ready() {
+        let _ = std::fs::remove_file(staging);
+        return Ok(false);
+    }
+    if let Err(e) = std::fs::rename(staging, absolute) {
+        let _ = std::fs::remove_file(staging);
+        return Err(e).with_context(|| format!("writing {}", absolute.display()));
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

@@ -33,6 +33,7 @@ use taste_core::files::Files;
 
 use crate::keys::Keys;
 use crate::provision::{Vm, GUEST_USER};
+pub use taste_git::mirror::{Resolve, Side};
 
 /// The refspecs a checkout's peer tracks: the branches, the tags, and the
 /// IDE's own refs — snapshots among them.
@@ -797,6 +798,9 @@ pub struct PeerSync {
     pub conflicts: Vec<PathBuf>,
     /// The checkout's changes written into the folder this pass.
     pub received: usize,
+    /// Writes not made, either way, because their side changed the path
+    /// after the pass observed it: another pass decides them again.
+    pub missed: usize,
     /// The folder was switched onto the checkout's branch this pass.
     pub switched: bool,
 }
@@ -828,7 +832,7 @@ pub fn sync_primary_peer(
             next.display()
         ))
     };
-    sync_primary_peer_with(peer, vm, keys, files, path, false, &on_send, say)
+    sync_primary_peer_with(peer, vm, keys, files, path, None, &on_send, say)
 }
 
 /// Told of each of the folder's changes as it is sent to the checkout:
@@ -842,8 +846,8 @@ pub type OnSend<'a> = &'a dyn Fn(usize, usize, &Path);
 /// 2026-10-09: "Could this show more progress detail?").
 pub type Say<'a> = &'a dyn Fn(&str);
 
-/// [`sync_primary_peer`], with `force` to write the checkout's side over
-/// paths both sides changed — the user's answer to a conflict.
+/// [`sync_primary_peer`], with `resolve` the user's answer to a conflict:
+/// the side to keep, for the paths they were asked about.
 ///
 /// Then the folder is made the checkout's MIRROR (`taste_git::mirror`):
 /// HEAD onto the checkout's branch, and its working tree onto the
@@ -859,11 +863,17 @@ pub fn sync_primary_peer_with(
     keys: &Keys,
     files: &Files,
     path: &Path,
-    force: bool,
+    resolve: Option<&Resolve>,
     on_send: OnSend,
     say: Say,
 ) -> Result<PeerSync> {
     use taste_git::mirror::Head;
+    // The checkout observed by this pass, now — not by whatever last took
+    // a snapshot of it, seconds or minutes ago: a pass that decided on an
+    // older picture took an agent's edit since for no change at all, and
+    // sent the folder's over it (docs/SYNC.md → "The design as built").
+    say("looking at Personal's working copy");
+    snapshot_in_checkout(files, path)?;
     // What Personal's HEAD names, from its own file. A detached one is
     // pinned to a ref first, so the fetch brings its commit: a commit no
     // branch holds is otherwise one the folder never receives.
@@ -1185,7 +1195,7 @@ pub fn sync_primary_peer_with(
             ));
         } else {
             say("bringing Personal's working copy into this folder");
-            mirror_into_folder(&git, &head, files, path, force, on_send, &mut sync)?;
+            mirror_into_folder(&git, &head, files, path, resolve, on_send, &mut sync)?;
         }
     }
     // Then each submodule, as a pair of its own, after the parent — in
@@ -1196,7 +1206,7 @@ pub fn sync_primary_peer_with(
     // pass (2026-10-06: "I shouldn't see this error while the env
     // builds").
     sync_submodules(
-        &git, peer, vm, keys, files, path, force, on_send, say, &mut sync,
+        &git, peer, vm, keys, files, path, resolve, on_send, say, &mut sync,
     );
     Ok(sync)
 }
@@ -1217,7 +1227,7 @@ fn sync_submodules(
     keys: &Keys,
     files: &Files,
     path: &Path,
-    force: bool,
+    resolve: Option<&Resolve>,
     on_send: OnSend,
     say: Say,
     sync: &mut PeerSync,
@@ -1239,13 +1249,31 @@ fn sync_submodules(
         let prefixed = |done: usize, of: usize, p: &Path| on_send(done, of, &sub.join(p));
         let within = |line: &str| say(&format!("{}: {line}", sub.display()));
         say(&format!("syncing the submodule {}", sub.display()));
-        let inner = snapshot_in_checkout(files, &there).and_then(|()| {
-            sync_primary_peer_with(&clone, vm, keys, files, &there, force, &prefixed, &within)
+        // The answer's paths inside this submodule, as its own pair names
+        // them.
+        let inner_resolve = resolve.map(|r| Resolve {
+            keep: r.keep,
+            paths: r
+                .paths
+                .iter()
+                .filter_map(|p| p.strip_prefix(&sub).ok().map(Path::to_path_buf))
+                .collect(),
         });
+        let inner = sync_primary_peer_with(
+            &clone,
+            vm,
+            keys,
+            files,
+            &there,
+            inner_resolve.as_ref(),
+            &prefixed,
+            &within,
+        );
         match inner {
             Ok(inner) => {
                 sync.sent += inner.sent;
                 sync.received += inner.received;
+                sync.missed += inner.missed;
                 sync.conflicts
                     .extend(inner.conflicts.into_iter().map(|p| sub.join(p)));
                 if let Some(note) = inner.note {
@@ -1363,37 +1391,6 @@ fn snapshot_in_checkout(files: &Files, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The folder's side of a conflict, inside each submodule: every change
-/// the folder's clone made since the two last agreed, sent to the
-/// checkout's copy and snapshotted there, nested submodules too — the
-/// parent's half is the caller's.
-pub fn send_submodules_folder_side(
-    git: &taste_git::GitWorkspace,
-    peer: &Path,
-    files: &Files,
-    path: &Path,
-) -> Result<()> {
-    for (_, sub) in git.submodules() {
-        let clone = peer.join(&sub);
-        let there = path.join(&sub);
-        if !clone.join(".git").exists() || !files.exists(&there.join(".git")) {
-            continue;
-        }
-        let Some(inner) = taste_git::GitWorkspace::discover(&clone) else {
-            continue;
-        };
-        let changes = inner.folder_changes()?;
-        for change in &changes {
-            send_change(files, &there, change)?;
-        }
-        prune_emptied(files, &there, &changes);
-        inner.record_sent(&changes)?;
-        snapshot_in_checkout(files, &there)?;
-        send_submodules_folder_side(&inner, &clone, files, &there)?;
-    }
-    Ok(())
-}
-
 /// Personal's snapshot, from where the fetch put it to where the mirror
 /// reads it; every other snapshot the checkout holds stays where it landed.
 fn adopt_snapshot(git: &taste_git::GitWorkspace) -> Result<()> {
@@ -1419,19 +1416,28 @@ fn adopt_tags(git: &taste_git::GitWorkspace) -> Result<()> {
     Ok(())
 }
 
-/// The mirror step of [`sync_primary_peer_with`]: the folder onto the
-/// checkout's `branch` and latest snapshot, the folder's own changes
-/// written into the checkout first.
+/// The mirror step of [`sync_primary_peer_with`]: one pass both ways
+/// (`taste_git::mirror`, docs/SYNC.md), the folder onto the checkout's
+/// `branch` and the checkout's changes, the folder's own into the checkout
+/// over the files service.
+#[allow(clippy::too_many_arguments)]
 fn mirror_into_folder(
     git: &taste_git::GitWorkspace,
     head: &taste_git::mirror::Head,
     files: &Files,
     path: &Path,
-    force: bool,
+    resolve: Option<&Resolve>,
     on_send: OnSend,
     sync: &mut PeerSync,
 ) -> Result<()> {
     use taste_git::mirror::Head;
+    let checkout = FilesCheckout {
+        files,
+        path,
+        on_send,
+    };
+    let folder = git.workdir().to_path_buf();
+    let room = move |bytes: u64| room_for(&folder, bytes, "bringing the checkout's changes in");
     let branch = match head {
         Head::Branch(branch) => branch.as_str(),
         // Detached: the folder goes to the commit, which the fetch brought
@@ -1443,13 +1449,11 @@ fn mirror_into_folder(
             let Some(snapshot) = git.read_ref(&taste_git::snapshot_ref("primary"))? else {
                 return Ok(());
             };
-            let folder = git.workdir().to_path_buf();
-            let room =
-                move |bytes: u64| room_for(&folder, bytes, "bringing the checkout's changes in");
             let outcome = git
-                .mirror_detached_within(*tip, snapshot, force, &room)
+                .mirror_detached_within(*tip, snapshot, resolve, &checkout, &room)
                 .context("mirroring the checkout into this folder")?;
-            return settle_mirror(git, outcome, None, files, path, on_send, sync);
+            settle_mirror(outcome, None, sync);
+            return Ok(());
         }
     };
     let vm_ref = format!("{VM_BRANCH_NAMESPACE}{branch}");
@@ -1478,159 +1482,205 @@ fn mirror_into_folder(
     let Some(snapshot) = git.read_ref(&taste_git::snapshot_ref("primary"))? else {
         return Ok(());
     };
-    let folder = git.workdir().to_path_buf();
-    let room = move |bytes: u64| room_for(&folder, bytes, "bringing the checkout's changes in");
     let outcome = git
-        .mirror_from_within(branch, tip, snapshot, force, &room)
+        .mirror_from_within(branch, tip, snapshot, resolve, &checkout, &room)
         .context("mirroring the checkout into this folder")?;
-    settle_mirror(git, outcome, Some(branch), files, path, on_send, sync)
+    settle_mirror(outcome, Some(branch), sync);
+    Ok(())
 }
 
-/// What a mirror pass came to, said in `sync` — and the folder's own
-/// changes it found, sent to the checkout. `branch` is the branch the
+/// What a mirror pass came to, said in `sync`. `branch` is the branch the
 /// folder is now on, `None` for a detached HEAD.
-fn settle_mirror(
-    git: &taste_git::GitWorkspace,
-    outcome: taste_git::mirror::Mirror,
-    branch: Option<&str>,
-    files: &Files,
-    path: &Path,
-    on_send: OnSend,
-    sync: &mut PeerSync,
-) -> Result<()> {
+fn settle_mirror(outcome: taste_git::mirror::Mirror, branch: Option<&str>, sync: &mut PeerSync) {
     use taste_git::mirror::Mirror;
     match outcome {
-        Mirror::Applied { changed, switched } => {
-            sync.received = changed;
-            sync.switched = switched;
+        Mirror::Done(pass) => {
+            sync.received += pass.received;
+            sync.sent += pass.sent;
+            sync.missed += pass.missed;
+            sync.switched = pass.switched;
             sync.mirrored = true;
-            sync.branch = branch.map(str::to_string);
-            sync.note = None;
+            sync.branch = branch.map(str::to_string).or(sync.branch.take());
+            sync.note = (!pass.conflicts.is_empty()).then(|| {
+                format!(
+                    "{} path(s) changed both here and in the checkout in the VM since they last \
+                     agreed; neither side's was written",
+                    pass.conflicts.len()
+                )
+            });
+            sync.conflicts = pass.conflicts;
         }
-        Mirror::Unchanged => sync.mirrored = true,
         Mirror::Stale => {}
         Mirror::Paused { reason } => sync.note = Some(reason),
-        Mirror::Outgoing { changes } => {
-            let mut sent = Vec::new();
-            let mut failed = None;
-            for (done, change) in changes.iter().enumerate() {
-                on_send(done, changes.len(), &change.path);
-                match send_change(files, path, change) {
-                    Ok(()) => sent.push(change.clone()),
-                    Err(e) => {
-                        failed = Some(
-                            e.context(format!("sending {} to the checkout", change.path.display())),
-                        );
-                        break;
+    }
+}
+
+/// The checkout's side of a pass, over the files service: each of the
+/// folder's writes staged in the checkout's git directory, then landed by
+/// [`APPLY_SCRIPT`] only where the checkout still holds what the pass
+/// observed — checked at the write, which is the last moment there is
+/// (docs/SYNC.md, P1): an agent's edit since the pass observed the
+/// checkout is kept, and decided by the next pass.
+struct FilesCheckout<'a> {
+    files: &'a Files,
+    path: &'a Path,
+    on_send: OnSend<'a>,
+}
+
+impl taste_git::mirror::CheckoutWriter for FilesCheckout<'_> {
+    fn apply(&self, sends: &[taste_git::mirror::Send]) -> Result<Vec<bool>> {
+        let git_dir = checkout_git_dir(self.files, self.path);
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        let incoming = git_dir.join(format!("taste-apply-{stamp}"));
+        let ops_file = git_dir.join(format!("taste-apply-{stamp}.ops"));
+        // Removals first, deepest first, then writes, shallowest first, so
+        // a file and a directory never meet at one path (P12).
+        let mut order: Vec<usize> = (0..sends.len()).collect();
+        order.sort_by(|a, b| {
+            let (a, b) = (&sends[*a].change, &sends[*b].change);
+            match (a.content.is_none(), b.content.is_none()) {
+                (true, true) => b.path.cmp(&a.path),
+                (false, false) => a.path.cmp(&b.path),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+            }
+        });
+        self.files.mkdir_all(&incoming)?;
+        let mut ops: Vec<u8> = Vec::new();
+        let mut field = |bytes: &[u8]| {
+            ops.extend_from_slice(bytes);
+            ops.push(0);
+        };
+        for (done, i) in order.iter().enumerate() {
+            let send = &sends[*i];
+            let change = &send.change;
+            // Only plain names: a tree's paths are, and a path that is not
+            // is not this script's to resolve.
+            if !change
+                .path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            (self.on_send)(done, sends.len(), &change.path);
+            let kind = match &change.content {
+                None => "rm",
+                Some(bytes) => {
+                    self.files.write(&incoming.join(i.to_string()), bytes)?;
+                    if change.link {
+                        "link"
+                    } else if change.executable {
+                        "exe"
+                    } else {
+                        "file"
                     }
                 }
-            }
-            prune_emptied(files, path, &sent);
-            // What did go is recorded as sent even when a later path
-            // failed, so the next pass does not mistake it for the
-            // checkout's own change.
-            if !sent.is_empty() {
-                git.record_sent(&sent)?;
-            }
-            if let Some(e) = failed {
-                return Err(e);
-            }
-            sync.sent = changes.len();
+            };
+            let expect = match send.expect {
+                Some((id, mode)) => format!("{id} {mode:o}"),
+                None => "none".to_string(),
+            };
+            field(i.to_string().as_bytes());
+            field(kind.as_bytes());
+            field(expect.as_bytes());
+            field(change.path.as_os_str().as_encoded_bytes());
         }
-        Mirror::Drift { paths } => {
-            sync.note = Some(format!(
-                "{} path(s) changed both here and in the checkout in the VM since they last \
-                 agreed; the folder was left as it is",
-                paths.len()
-            ));
-            sync.conflicts = paths;
+        self.files.write(&ops_file, &ops)?;
+        let out = self.files.exec(
+            self.path,
+            &[
+                "bash".into(),
+                "-c".into(),
+                APPLY_SCRIPT.into(),
+                "taste-apply".into(),
+                ops_file.display().to_string(),
+                incoming.display().to_string(),
+            ],
+        )?;
+        let mut landed = vec![false; sends.len()];
+        for line in out.stdout_utf8().lines() {
+            if let Some(i) = line
+                .strip_prefix("ok ")
+                .and_then(|i| i.trim().parse::<usize>().ok())
+            {
+                if let Some(slot) = landed.get_mut(i) {
+                    *slot = true;
+                }
+            }
         }
+        if !out.success() {
+            tracing::warn!(
+                "landing the folder's changes in the checkout: {}",
+                out.stderr_utf8().trim()
+            );
+        }
+        Ok(landed)
     }
-    Ok(())
 }
 
-/// The directories the folder's removals in `changes` left empty in the
-/// checkout at `path`, removed, up to the checkout and never past it — as
-/// the mirror does in the folder for the checkout's removals. A directory
-/// renamed in the folder otherwise went over as its files, moved, and an
-/// empty directory under the old name stayed in the checkout, which is
-/// what the panes show (2026-10-12). `rmdir` removes only what is empty,
-/// so a directory something else has written into since stays. Best
-/// effort: nothing depends on an empty directory going.
-pub fn prune_emptied(files: &Files, path: &Path, changes: &[taste_git::mirror::Change]) {
-    let mut dirs: Vec<String> = changes
-        .iter()
-        .filter(|change| change.content.is_none())
-        .filter_map(|change| change.path.parent())
-        .filter(|parent| {
-            !parent.as_os_str().is_empty()
-                && parent
-                    .components()
-                    .all(|c| matches!(c, std::path::Component::Normal(_)))
-        })
-        .map(|parent| parent.display().to_string())
-        .collect();
-    if dirs.is_empty() {
-        return;
-    }
-    dirs.sort();
-    dirs.dedup();
-    let mut argv: Vec<String> = ["rmdir", "--ignore-fail-on-non-empty", "-p", "--"]
-        .iter()
-        .map(|arg| arg.to_string())
-        .collect();
-    argv.extend(dirs);
-    let _ = files.exec(path, &argv);
+/// [`FilesCheckout`]'s script, run in the checkout with `$1` the file of
+/// writes — index, kind (`rm`, `file`, `exe`, `link`), the entry the
+/// checkout must hold (`none`, or "<blob> <mode>"), and the path, each
+/// NUL-terminated — and `$2` the directory the new contents were staged in,
+/// by index. Prints "ok <index>" for each write that landed and "no
+/// <index>" for each that did not. Each is checked twice against what the
+/// checkout holds — before anything is done, and again just before the
+/// rename — and a path a link on the way would carry out of the checkout
+/// is refused. A removal takes the directories it empties with it (P11),
+/// and a file is never renamed onto a directory (`mv -T`). Both inputs are
+/// removed after.
+const APPLY_SCRIPT: &str = r#"set -u
+ops="$1"; incoming="$2"
+now_of() {
+  if [ -L "$1" ]; then
+    printf '%s 120000' "$(printf %s "$(readlink -- "$1")" | git hash-object --stdin)"
+  elif [ -f "$1" ]; then
+    if [ -x "$1" ]; then m=100755; else m=100644; fi
+    printf '%s %s' "$(git hash-object --no-filters -- "$1")" "$m"
+  elif [ -e "$1" ]; then printf other
+  else printf none; fi
 }
-
-/// One of the folder's changes, written into the checkout at `path` over
-/// the files service: the bytes, the executable bit, a link as a link, a
-/// deletion as a deletion.
-pub fn send_change(files: &Files, path: &Path, change: &taste_git::mirror::Change) -> Result<()> {
-    let target = path.join(&change.path);
-    match &change.content {
-        None => match files.remove(&target, false) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        },
-        Some(bytes) if change.link => {
-            let link_target = String::from_utf8_lossy(bytes).to_string();
-            let out = files.exec(
-                path,
-                &[
-                    "ln".into(),
-                    "-sfn".into(),
-                    "--".into(),
-                    link_target,
-                    target.display().to_string(),
-                ],
-            )?;
-            if !out.success() {
-                bail!("linking: {}", out.stderr_utf8().trim());
-            }
-        }
-        Some(bytes) => {
-            if let Some(parent) = target.parent() {
-                files.mkdir_all(parent)?;
-            }
-            files.write(&target, bytes)?;
-            let out = files.exec(
-                path,
-                &[
-                    "chmod".into(),
-                    if change.executable { "+x" } else { "-x" }.into(),
-                    "--".into(),
-                    target.display().to_string(),
-                ],
-            )?;
-            if !out.success() {
-                bail!("setting its mode: {}", out.stderr_utf8().trim());
-            }
-        }
-    }
-    Ok(())
+inside() {
+  case "$(realpath -m --relative-base=. -- "$(dirname -- "$1")")" in /*) return 1;; esac
 }
+while IFS= read -r -d '' i && IFS= read -r -d '' kind && IFS= read -r -d '' expect && IFS= read -r -d '' p; do
+  if ! inside "$p" || [ "$(now_of "$p")" != "$expect" ]; then echo "no $i"; continue; fi
+  if [ "$kind" = rm ]; then
+    if rm -f -- "$p"; then
+      d=$(dirname -- "$p")
+      [ "$d" = . ] || rmdir -p --ignore-fail-on-non-empty -- "$d" 2>/dev/null
+      echo "ok $i"
+    else
+      echo "no $i"
+    fi
+    continue
+  fi
+  src="$incoming/$i"
+  d=$(dirname -- "$p")
+  if [ "$d" != . ] && ! mkdir -p -- "$d" 2>/dev/null; then echo "no $i"; continue; fi
+  if [ "$kind" = link ]; then
+    t=$(cat -- "$src"; printf x); t=${t%x}
+    if ! { rm -f -- "$src" && ln -s -- "$t" "$src"; }; then echo "no $i"; continue; fi
+  else
+    if [ -f "$p" ] && [ ! -L "$p" ]; then chmod --reference="$p" -- "$src" 2>/dev/null; fi
+    if [ "$kind" = exe ]; then chmod a+x -- "$src"; else chmod a-x -- "$src"; fi
+  fi
+  if [ "$(now_of "$p")" = "$expect" ] && mv -T -f -- "$src" "$p" 2>/dev/null; then
+    echo "ok $i"
+  else
+    echo "no $i"
+  fi
+done < "$ops"
+rm -rf -- "$incoming" "$ops"
+"#;
 
 /// The checkout's side of [`push_ahead_into_checkout`], run in the
 /// checkout with `$1` the staging ref, `$2` the branch, `$3` the folder's
@@ -1644,7 +1694,6 @@ staging="$1"
 branch="$2"
 folder_tree="$3"
 expected="$4"
-sent="${5:-}"
 cleanup() { git update-ref -d "$staging" 2>/dev/null || true; }
 # Every taste-ide-sync stash whose every file, as stashed, is the file as
 # some commit since the stash's base has it: work that reached history, so
@@ -1702,25 +1751,6 @@ if git ls-files -u | grep -q .; then
     echo "the checkout has unresolved conflicts in $(git ls-files -u | awk '{print $4}' | sort -u | tr '\n' ' ')- resolve or discard them in the file tree, and the folder's commits follow" >&2
     exit 5
   fi
-fi
-# A file the checkout still holds as the folder sent it, where the folder
-# has since changed it again, is the folder's stale copy and not Personal's
-# work: it goes back to its commit, and the folder's version comes with the
-# move or the mirror after it. Carried through the stash below instead, an
-# edit the folder had reverted came back out over the revert, which left
-# the file as it was before the edit and so took the stash cleanly
-# (2026-10-04: bootstrap.sh "modified" in Personal, clean in the folder).
-# `$sent` is "sent<TAB>now<TAB>path" a line, objects by id ("none": absent).
-if [ -n "$sent" ]; then
-  tab=$(printf '\t')
-  printf '%s\n' "$sent" | while IFS="$tab" read -r was now p; do
-    [ -n "$p" ] && [ "$was" != "$now" ] || continue
-    [ -L "$p" ] && continue
-    if [ -e "$p" ]; then here=$(git hash-object -- "$p"); else here=none; fi
-    [ "$here" = "$was" ] || continue
-    if git cat-file -e "HEAD:$p" 2>/dev/null; then git checkout -q HEAD -- "$p"
-    else rm -f -- "$p"; fi
-  done
 fi
 # The checkout's files are the folder's: move the branch, keep the files.
 # The scratch index lives in the checkout's own git directory: the keeper
@@ -1938,31 +1968,6 @@ struct Arrival<'a> {
     rewrite_from: Option<&'a str>,
 }
 
-/// What the folder has sent the checkout since the two last agreed, as the
-/// sync script's `$5`: "sent<TAB>now<TAB>path" a line
-/// (`GitWorkspace::sent_against_folder`). A path that would not survive
-/// the format — a tab or a newline in it — is left out, and keeps the old
-/// behaviour.
-fn sent_lines(peer: &Path) -> String {
-    let Some(git) = taste_git::GitWorkspace::discover(peer) else {
-        return String::new();
-    };
-    let Ok(sent) = git.sent_against_folder() else {
-        return String::new();
-    };
-    fn id(oid: Option<impl std::fmt::Display>) -> String {
-        oid.map_or_else(|| "none".to_string(), |o| o.to_string())
-    }
-    sent.into_iter()
-        .filter_map(|sent| {
-            let path = sent.path.to_str()?.to_string();
-            (!path.contains(['\t', '\n']))
-                .then(|| format!("{}\t{}\t{path}", id(sent.sent), id(sent.now)))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn push_ahead_into_checkout(
     peer: &Path,
     vm: &Vm,
@@ -1999,7 +2004,6 @@ fn push_ahead_into_checkout(
                 branch.to_string(),
                 folder_tree.unwrap_or_default().to_string(),
                 rewrite_from.unwrap_or_default().to_string(),
-                sent_lines(peer),
             ],
         )
         .with_context(|| format!("fast-forwarding {branch} in VM {}", vm.domain))?;
@@ -2165,43 +2169,148 @@ mod tests {
         assert_eq!(pair.git("checkout", &["status", "--porcelain"]), "M a.txt");
     }
 
-    /// An edit the folder sent, committed and then reverted in the folder
-    /// before the checkout took either commit, does not come back out of
-    /// the sync's stash over the revert (2026-10-04: bootstrap.sh showed as
-    /// modified in Personal while the folder was clean).
+    /// The whole sync, both ways, against a stand-in ssh that runs git's far
+    /// end on this machine: what a test of the sync as the IDE runs it
+    /// needs — the pair, its stand-in VM, and a pass.
+    struct Whole {
+        pair: Pair,
+        vm: Vm,
+        keys: Keys,
+    }
+
+    impl Whole {
+        fn new(name: &str) -> Self {
+            let pair = Pair::new(name);
+            pair.git(
+                "checkout",
+                &["config", "receive.denyCurrentBranch", "updateInstead"],
+            );
+            let ssh = pair.dir.join("ssh");
+            std::fs::write(
+                &ssh,
+                "#!/bin/sh\nfor last; do :; done\nexec sh -c \"$last\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            let keys = Keys::at(pair.dir.join("keys")).with_ssh_for_tests(&ssh);
+            let vm = Vm {
+                domain: "test".into(),
+                ssh_port: 22,
+                workspace_root: pair.dir.join("folder"),
+                state: crate::provision::DomainState::Running,
+                cloud: None,
+            };
+            Whole { pair, vm, keys }
+        }
+
+        fn pass(&self, step: &str) -> PeerSync {
+            sync_primary_peer_with(
+                &self.pair.dir.join("folder"),
+                &self.vm,
+                &self.keys,
+                &Files::Local,
+                &self.pair.dir.join("checkout"),
+                None,
+                &|_, _, _| {},
+                &|_| {},
+            )
+            .unwrap_or_else(|e| panic!("{step}: {e:#}"))
+        }
+
+        /// Passes until one writes nothing, as the watchers would run them;
+        /// the last one's account.
+        fn settle(&self, step: &str) -> PeerSync {
+            for n in 0..6 {
+                let pass = self.pass(&format!("{step}, pass {n}"));
+                if pass.sent == 0 && pass.received == 0 && pass.missed == 0 && !pass.pushed {
+                    return pass;
+                }
+            }
+            panic!("{step}: still writing after six passes");
+        }
+
+        fn read(&self, p: &str) -> Option<String> {
+            std::fs::read_to_string(self.pair.dir.join(p)).ok()
+        }
+    }
+
+    /// An edit the folder sent, then committed and reverted in the folder
+    /// before the checkout took either commit, does not come back over the
+    /// revert: the checkout holds the sent copy, which the archive records
+    /// as agreed, so the folder's revert is the only change and wins
+    /// (2026-10-04: bootstrap.sh showed as modified in Personal while the
+    /// folder was clean).
     #[test]
     fn a_reverted_edit_the_folder_sent_does_not_come_back() {
-        let pair = Pair::new("revert");
-        let blob = |side: &str, text: &str| {
-            std::fs::write(pair.dir.join(side).join(".probe"), text).unwrap();
-            let id = pair.git(side, &["hash-object", ".probe"]);
-            std::fs::remove_file(pair.dir.join(side).join(".probe")).unwrap();
-            id
-        };
-        // The edit, sent: the checkout holds it uncommitted …
-        pair.write("checkout", "a.txt", "two\n");
-        // … the folder commits it, then reverts it, and the revert has not
-        // been sent yet when the sync runs.
+        let whole = Whole::new("revert");
+        let pair = &whole.pair;
+        whole.settle("agreed");
         pair.write("folder", "a.txt", "two\n");
+        whole.settle("the edit, sent");
+        assert_eq!(whole.read("checkout/a.txt").as_deref(), Some("two\n"));
         pair.git("folder", &["add", "-A"]);
         pair.commit("folder", "the edit");
         pair.write("folder", "a.txt", "one\n");
         pair.git("folder", &["add", "-A"]);
         pair.commit("folder", "revert the edit");
-        let sent = format!(
-            "{}\t{}\ta.txt",
-            blob("folder", "two\n"),
-            blob("folder", "one\n")
-        );
-        assert_eq!(pair.sync_with("", &sent), 0);
+        let last = whole.settle("the commits");
+        assert!(last.conflicts.is_empty(), "{last:?}");
         assert_eq!(
             pair.git("checkout", &["rev-parse", "HEAD"]),
             pair.git("folder", &["rev-parse", "HEAD"])
         );
+        assert_eq!(whole.read("checkout/a.txt").as_deref(), Some("one\n"));
         assert_eq!(pair.git("checkout", &["status", "--porcelain"]), "");
+    }
+
+    /// An agent's edit the pass did not observe — made after the checkout
+    /// was looked at, before the folder's change to the same file landed —
+    /// is never written over: the write checks the checkout at the last
+    /// moment, does not land, and the next pass asks (docs/SYNC.md, P1).
+    #[test]
+    fn an_edit_in_the_checkout_after_it_was_observed_is_kept() {
+        let whole = Whole::new("late-edit");
+        let pair = &whole.pair;
+        whole.settle("agreed");
+        pair.write("folder", "a.txt", "the folder's\n");
+        // The agent writes between the pass's look and its write: the
+        // stand-in for the checkout's side lands nothing it did not check,
+        // which a write in this window is how a test reaches.
+        let checkout = pair.dir.join("checkout");
+        let files = Files::Local;
+        let late = std::cell::Cell::new(false);
+        let on_send = |_: usize, _: usize, path: &Path| {
+            if path == Path::new("a.txt") && !late.replace(true) {
+                std::fs::write(checkout.join("a.txt"), "the agent's\n").unwrap();
+            }
+        };
+        let pass = sync_primary_peer_with(
+            &pair.dir.join("folder"),
+            &whole.vm,
+            &whole.keys,
+            &files,
+            &checkout,
+            None,
+            &on_send,
+            &|_| {},
+        )
+        .unwrap();
+        assert!(late.get(), "the write was attempted");
+        assert_eq!((pass.sent, pass.missed), (0, 1), "{pass:?}");
         assert_eq!(
-            std::fs::read_to_string(pair.dir.join("checkout/a.txt")).unwrap(),
-            "one\n"
+            whole.read("checkout/a.txt").as_deref(),
+            Some("the agent's\n")
+        );
+        let next = whole.pass("after");
+        assert_eq!(next.conflicts, vec![PathBuf::from("a.txt")], "{next:?}");
+        assert_eq!(
+            whole.read("checkout/a.txt").as_deref(),
+            Some("the agent's\n")
+        );
+        assert_eq!(
+            whole.read("folder/a.txt").as_deref(),
+            Some("the folder's\n")
         );
     }
 
@@ -2677,7 +2786,7 @@ mod tests {
                 &keys,
                 &files,
                 &checkout,
-                false,
+                None,
                 &|_, _, _| {},
                 &|line| said.borrow_mut().push(line.to_string()),
             )
@@ -2812,7 +2921,7 @@ mod tests {
                 &keys,
                 &files,
                 &checkout,
-                false,
+                None,
                 &|_, _, _| {},
                 &|_| {},
             )
@@ -2885,7 +2994,7 @@ mod tests {
                 &keys,
                 &files,
                 &checkout,
-                false,
+                None,
                 &|_, _, _| {},
                 &|_| {},
             )

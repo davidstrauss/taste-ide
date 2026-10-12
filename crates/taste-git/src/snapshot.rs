@@ -340,7 +340,7 @@ static HASHED: std::sync::LazyLock<
 /// How many files [`HASHED`] remembers before it starts over.
 const HASHED_MAX: usize = 500_000;
 
-fn hashed_before(path: &std::path::Path, meta: &std::fs::Metadata) -> Option<Oid> {
+pub(crate) fn hashed_before(path: &std::path::Path, meta: &std::fs::Metadata) -> Option<Oid> {
     let hashed = HASHED.lock().unwrap_or_else(|e| e.into_inner());
     hashed
         .get(path)

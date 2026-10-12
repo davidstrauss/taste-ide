@@ -132,43 +132,53 @@ out of scope, is never removed.
 is an ordinary change, and a file and a directory never meet at one path
 during a write.
 
-## The design as built, against the model (2026-10-12)
+## The design as built, against the model
 
-What follows maps the code onto the model, and names where it falls short.
-Each shortfall is a property broken under some interleaving.
+**Where it fell short (2026-10-12, before the planner).** The archive was
+two refs — `refs/taste/mirror/primary`, recorded whole when a pass wrote
+the folder, and `refs/taste/mirror/sent`, what the folder had sent since —
+and the rename resurrection (P5) was the gap between them. A pass planned
+against the checkout's newest snapshot, taken by whatever last asked —
+the VM's watcher two seconds after a change, a chat turn's end, a commit
+— so an agent's edit since was not in the decision, and the folder's
+change to the same path was sent over it (P1). Neither side's writes were
+checked at the write: `write_tree_over` wrote the checkout's tree over the
+folder as the pass had read it, and `send_change` wrote the folder's entry
+over whatever the checkout held by then (P1). Directories the folder's
+removals emptied stayed in the checkout until 096b680 (P11).
 
-- **A is two refs.** `refs/taste/mirror/primary` is A as of the last pass
-  that wrote the folder; what the folder has sent since lives in a second
-  ref, `refs/taste/mirror/sent`, which the planner consults to discount the
-  checkout holding what the folder sent (P6). The two together are A, but
-  only by convention, and the rename resurrection (P5) was the gap between
-  them. Unison updates its one archive per path as each write lands, which
-  needs no second ref.
-- **C is observed late.** A pass plans against the checkout's newest
-  snapshot, taken by whatever last asked for one — the VM's watcher, two
-  seconds after a change; a chat turn's end; a commit — not by the pass. An
-  agent's edit since then is not in the decision, so the folder's change to
-  the same path is taken for "only F changed" and sent over it: P1 broken.
-- **Writes into F are not checked at the write.** `write_tree_over` diffs
-  the folder as the pass read it against the checkout's tree and writes the
-  difference; a save the user made after the read is overwritten (P1).
-- **Writes into C are not checked at the write.** `send_change` writes the
-  folder's entry over whatever the checkout holds by then (P1).
-- **A is recorded whole, not per path.** After the folder takes the
-  checkout's tree, A becomes that tree; paths the pass did not write because
-  they had changed would be recorded as agreed once the two gaps above are
-  closed, so the record must be per path too (P10).
-- **Directories.** The checkout removed the directories it emptied in the
-  folder; the folder's removals left empty ones in the checkout until
-  096b680 (P11).
-- **Files changing while observed.** A synced file that changed while a
-  snapshot read it failed the whole snapshot until 4aa3dc0; it now keeps its
-  last copy for that pass, so the observation is of C a moment ago for that
-  path alone, which P1's check at the write covers.
-- **Held and fine.** P2 (`Mirror::Drift`, answered by `force` for the paths
-  asked about), P7 (rules read from both trees and the folder, decided
-  before a write), P8 (`beneath`), P9 (staging and rename on both sides), and
-  the position's table.
+**How it is now.**
+
+- **One archive, per path.** `refs/taste/mirror/primary` is A: its tree is
+  the agreed working copy, its message the agreed position. A pass records
+  it per path — each write that landed, each agreement, each path let go
+  out of scope — and nothing for a write that did not land (P10). The
+  second ref is retired, and deleted where found.
+- **The pass observes the checkout itself.** Every pass begins by
+  snapshotting the checkout, so it decides on C as it stands, not as it
+  stood when something last asked (`peer::sync_primary_peer_with`).
+- **Every write is a compare-and-swap.** Each carries the entry its side
+  held when the pass observed it, and lands only if that is still there —
+  checked once before anything is done and again after the new content is
+  staged beside its place, just before the rename. In the folder,
+  `beneath::write_file_if` and `write_link_if`; in the checkout,
+  `peer::APPLY_SCRIPT`, which also refuses a path a link on the way would
+  carry out of the checkout. A write that does not land is counted
+  (`Pass::missed`) and another pass runs at once to decide it again.
+- **The decision is `taste_git::plan`**, a pure function over A, F, and C,
+  with the table above, the user's answer to a conflict limited to the
+  paths they were asked about, and a write that would leave a file and a
+  directory at one path made a conflict instead (P12).
+- **Both directions in one pass.** The folder's changes no longer go out
+  first in a pass of their own, with the checkout's waiting for the next.
+
+**What remains.** Between the second check and the rename is a window of
+a system call or two; a write landing in it is lost. Unison has the same
+window, and closing it needs a filesystem that can rename only if a file
+is unchanged, which neither side has. The checkout's side hashes each path
+it writes with `git hash-object`, twice, which is a process per write: fine
+for what people and agents change by hand, slow for a pass that writes
+thousands of files at once (a first sync of a large synced directory).
 
 ## Making it hold: four layers
 

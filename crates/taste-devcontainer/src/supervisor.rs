@@ -1497,7 +1497,7 @@ impl Supervisor {
         // checkout's word whole.
         if self.env.id.is_primary() {
             let _one = self.folder_sync.lock().unwrap_or_else(|e| e.into_inner());
-            self.sync_primary_blocking(&vm_info, &keys, &path, false, 0)?;
+            self.sync_primary_blocking(&vm_info, &keys, &path, None, 0)?;
         } else {
             crate::peer::fetch_from_guest(
                 &self.env.peer,
@@ -1511,17 +1511,17 @@ impl Supervisor {
         Ok(())
     }
 
-    /// The primary's sync, and what follows from it: the folder's own
-    /// changes, once sent, come back as agreement only after the checkout
-    /// is snapshotted again, so that is done here (a pass or two, never a
-    /// loop: `depth` stops it); a conflict is published for the window to
-    /// ask about, and its going is published too.
+    /// The primary's sync, and what follows from it: a write that did not
+    /// land, because its side changed the path after the pass observed it,
+    /// is decided by another pass at once (a pass or two, never a loop:
+    /// `depth` stops it); a conflict is published for the window to ask
+    /// about, and its going is published too.
     fn sync_primary_blocking(
         &self,
         vm: &crate::provision::Vm,
         keys: &crate::keys::Keys,
         path: &Path,
-        force: bool,
+        resolve: Option<&crate::peer::Resolve>,
         depth: u8,
     ) -> Result<()> {
         let events = self.events.clone();
@@ -1563,7 +1563,7 @@ impl Supervisor {
             keys,
             &self.files(),
             path,
-            force,
+            resolve,
             &on_send,
             &say,
         );
@@ -1583,21 +1583,14 @@ impl Supervisor {
         events.publish(Event::FolderSync(taste_core::FolderSync::Done {
             summary: folder_sync_summary(&sync),
         }));
-        if sync.sent > 0 && depth < 2 {
+        if sync.sent > 0 {
             self.log(format!(
                 "sent {} change(s) from your folder to the checkout in the VM",
                 sync.sent
             ));
-            let name = taste_git::snapshot_ref(self.env.id.as_str());
-            let script = taste_git::snapshot::script(&name)?;
-            let out = self
-                .files()
-                .exec(path, &["sh".into(), "-c".into(), script])
-                .context("snapshotting the checkout after sending the folder's changes")?;
-            if !out.success() {
-                bail!("snapshotting the checkout: {}", out.stderr_utf8().trim());
-            }
-            return self.sync_primary_blocking(vm, keys, path, false, depth + 1);
+        }
+        if sync.missed > 0 && depth < 2 {
+            return self.sync_primary_blocking(vm, keys, path, None, depth + 1);
         }
         Ok(())
     }
@@ -1694,10 +1687,11 @@ impl Supervisor {
     }
 
     /// The user's answer to a conflict between their folder and the
-    /// primary's checkout: `keep_folder` sends every change the folder
-    /// made since they last agreed — the conflicting paths among them —
-    /// into the checkout; otherwise the checkout's side is written over
-    /// the folder. Blocking.
+    /// primary's checkout: `keep_folder` sends the folder's side of each
+    /// path they were asked about into the checkout; otherwise the
+    /// checkout's side is written over the folder's. Only those paths: one
+    /// that came into conflict since is asked about in its turn
+    /// (docs/SYNC.md, P2). Blocking.
     pub fn resolve_folder_conflict(&self, keep_folder: bool) -> Result<()> {
         let Checkout::Remote { vm, path } = self.checkout() else {
             return Ok(());
@@ -1709,27 +1703,21 @@ impl Supervisor {
             .with_context(|| format!("{}'s substrate is not its VM {vm}", self.env.id))?;
         let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
         let _one = self.folder_sync.lock().unwrap_or_else(|e| e.into_inner());
-        if keep_folder {
-            let git = taste_git::GitWorkspace::discover(&self.env.peer)
-                .context("the folder is not a git working tree")?;
-            let files = self.files();
-            let changes = git.folder_changes()?;
-            for change in &changes {
-                crate::peer::send_change(&files, &path, change)?;
-            }
-            crate::peer::prune_emptied(&files, &path, &changes);
-            git.record_sent(&changes)?;
-            crate::peer::send_submodules_folder_side(&git, &self.env.peer, &files, &path)?;
-            let name = taste_git::snapshot_ref(self.env.id.as_str());
-            let script = taste_git::snapshot::script(&name)?;
-            let out = files.exec(&path, &["sh".into(), "-c".into(), script])?;
-            if !out.success() {
-                bail!("snapshotting the checkout: {}", out.stderr_utf8().trim());
-            }
-            self.sync_primary_blocking(&vm_info, &keys, &path, false, 0)
-        } else {
-            self.sync_primary_blocking(&vm_info, &keys, &path, true, 0)
-        }
+        let resolve = crate::peer::Resolve {
+            keep: if keep_folder {
+                crate::peer::Side::Folder
+            } else {
+                crate::peer::Side::Checkout
+            },
+            paths: self
+                .folder_conflicts
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect(),
+        };
+        self.sync_primary_blocking(&vm_info, &keys, &path, Some(&resolve), 0)
     }
 
     /// Write the peer's `refnames` into the checkout in the VM, forced: a

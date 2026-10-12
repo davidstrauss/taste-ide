@@ -10,21 +10,24 @@
 //! changes (other than what's ignored) from the VM, too").
 //!
 //! So the folder follows the checkout, whole: its HEAD onto the checkout's
-//! branch at the checkout's commit, its index to that commit's tree, and
-//! its working tree to the checkout's latest snapshot (`crate::snapshot`)
-//! — which is `git status`'s definition of the working copy, so what
-//! `.gitignore` excludes is never written and never removed.
+//! branch at the checkout's commit, its index to that commit's tree when
+//! HEAD moves, and its working tree to the checkout's — observed as a
+//! snapshot (`crate::snapshot`), which is `git status`'s definition of the
+//! working copy, so what `.gitignore` excludes is never written and never
+//! removed.
 //!
-//! **Both ways, and never over the user's own edits.** The mirror
-//! remembers what it last wrote ([`MIRROR_REF`]), the base both sides are
-//! measured from. A path changed only in the folder since — a file
-//! dropped in on this machine — is the user's, and goes to the checkout
-//! ([`Mirror::Outgoing`]) BEFORE anything is written here, so a failure
-//! halfway can never delete it (David: "If there isn't a conflict, I want
-//! the sync to be two-way"). A path changed on both sides, to different
-//! content, is a conflict: [`Mirror::Drift`], nothing written, the caller
-//! asks (David: "Stop and ask") and either sends the folder's side
-//! ([`GitWorkspace::folder_changes`]) or forces the checkout's.
+//! **Both ways, and never over anyone's own edits.** This is Unison's
+//! design (docs/SYNC.md): an archive of what the two last agreed on
+//! ([`MIRROR_REF`]), each side's changes measured from it, and every path
+//! decided by `crate::plan` — a change on one side goes to the other, the
+//! same change on both is agreement, and different changes on both are a
+//! conflict, written on neither side until the user answers (David: "If
+//! there isn't a conflict, I want the sync to be two-way"; "Stop and
+//! ask"). Both directions go in one pass. Every write lands only while
+//! its side still holds what the pass observed there, checked at the last
+//! moment before the rename, so a save made during a pass is kept and
+//! decided by the next; and the archive records, per path, only what
+//! landed, so a pass stopped anywhere loses nothing.
 //!
 //! **Only a snapshot of the tip it is on.** A snapshot names the HEAD it
 //! was taken against; one taken before the checkout switched branch or
@@ -38,6 +41,7 @@
 //! docs/SYNC.md, which this module is measured against.
 
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -49,24 +53,35 @@ use crate::GitWorkspace;
 /// folder's working copy as the mirror left it.
 pub const MIRROR_REF: &str = "refs/taste/mirror/primary";
 
-/// What the folder has sent the checkout since the mirror last agreed with
-/// it: [`MIRROR_REF`]'s tree with each sent path at the entry it was sent
-/// as ([`GitWorkspace::record_sent`]). The checkout holding one of these is
-/// holding the folder's own earlier version, so a later save of the same
-/// file here is the folder's to send, not a conflict with itself (review,
-/// 2026-09-23: two quick saves raised "your folder and Personal disagree"
-/// over the user's own file).
-pub const SENT_REF: &str = "refs/taste/mirror/sent";
+/// Where an earlier version kept what the folder had sent since the two
+/// last agreed, as a second archive beside [`MIRROR_REF`]; the archive is
+/// one ref, recorded per path, since 2026-10-12 (docs/SYNC.md → "The
+/// design as built"), and a stale one is deleted when found.
+const RETIRED_SENT_REF: &str = "refs/taste/mirror/sent";
 
-/// One path the folder has sent the checkout since the two last agreed
-/// ([`GitWorkspace::sent_against_folder`]).
+pub use crate::plan::{Resolve, Side};
+
+/// A path's entry in a working copy, as a tree holds it: its blob and its
+/// mode.
+pub type Entry = (Oid, i32);
+
+/// One of the folder's writes for the checkout: the entry, with its bytes,
+/// and what the checkout must still hold at its path for it to land
+/// (docs/SYNC.md, P1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SentPath {
-    pub path: PathBuf,
-    /// The object it was sent as; `None`, sent as removed.
-    pub sent: Option<Oid>,
-    /// The object the folder's working copy holds now; `None`, absent.
-    pub now: Option<Oid>,
+pub struct Send {
+    pub change: Change,
+    pub expect: Option<Entry>,
+}
+
+/// What carries a pass's writes into the checkout, wherever it is.
+pub trait CheckoutWriter {
+    /// Land each of `sends` whose path the checkout still holds as its
+    /// `expect`, checked at the write, and say which landed, in order. The
+    /// directories a removal empties go too (P11). A write that did not
+    /// land is not an error: its side changed, and the next pass decides
+    /// it again.
+    fn apply(&self, sends: &[Send]) -> Result<Vec<bool>>;
 }
 
 /// How the mirror's baseline commit names the branch the folder was on
@@ -128,30 +143,37 @@ impl Head {
 /// How the mirror's baseline records a detached HEAD in place of a branch.
 const DETACHED: &str = "HEAD";
 
-/// What mirroring did.
+/// What a mirror pass did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mirror {
-    /// The folder now matches the checkout; `changed` paths were written or
-    /// removed, and `switched` says whether HEAD moved to another branch.
-    Applied { changed: usize, switched: bool },
-    /// The folder already matched.
-    Unchanged,
+    /// The pass ran: every path decided, every write that could land
+    /// landed, the archive recorded per path.
+    Done(Pass),
     /// The snapshot is of another commit than the branch's tip: wait for a
     /// fresh one.
     Stale,
-    /// The folder has changes the checkout does not, and none of them
-    /// conflicts: the caller writes these into the checkout, snapshots it,
-    /// and mirrors again — which then finds them on both sides. Nothing
-    /// was written here.
-    Outgoing { changes: Vec<Change> },
-    /// Paths changed on both sides, to different content, since the last
-    /// mirror: relative to the folder. Nothing was written.
-    Drift { paths: Vec<PathBuf> },
     /// The folder is in the middle of something of git's or the user's own
-    /// — a merge, a rebase, a detached HEAD, a branch the user switched to
-    /// here — and a diff across it would read git's work as the user's
-    /// edits. Nothing was written or sent; `reason` says what to do.
+    /// — a merge, a rebase, a branch the user switched to here — or its
+    /// disk cannot take what the pass would write. Nothing was written or
+    /// sent; `reason` says what to do.
     Paused { reason: String },
+}
+
+/// What a pass that ran did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pass {
+    /// The checkout's changes written into the folder.
+    pub received: usize,
+    /// The folder's changes written into the checkout.
+    pub sent: usize,
+    /// Writes not made, because their side changed the path after the
+    /// pass observed it: the next pass decides those again.
+    pub missed: usize,
+    /// Paths both sides changed, differently, since they last agreed:
+    /// written on neither, until the user answers.
+    pub conflicts: Vec<PathBuf>,
+    /// The folder was switched onto the checkout's branch.
+    pub switched: bool,
 }
 
 /// One path's new state in the folder, for the checkout to take.
@@ -178,18 +200,20 @@ fn snapshot_base(message: &str) -> Option<Oid> {
 }
 
 impl GitWorkspace {
-    /// Make this folder the checkout's mirror: HEAD on `branch` at `tip`,
-    /// the index at `tip`'s tree, the working tree at `snapshot`'s. With
-    /// `force`, a folder that drifted is written over; without, it is
-    /// reported and left alone.
+    /// Make this folder and the checkout each other's mirror, one pass
+    /// (docs/SYNC.md): HEAD onto `branch` at `tip`, and each working copy
+    /// onto the other's changes since they last agreed, the checkout's
+    /// observed as `snapshot`. `resolve` is the user's answer to a
+    /// conflict; `checkout` carries the folder's writes over there.
     pub fn mirror_from(
         &self,
         branch: &str,
         tip: Oid,
         snapshot: Oid,
-        force: bool,
+        resolve: Option<&Resolve>,
+        checkout: &dyn CheckoutWriter,
     ) -> Result<Mirror> {
-        self.mirror_from_within(branch, tip, snapshot, force, &|_| None)
+        self.mirror_from_within(branch, tip, snapshot, resolve, checkout, &|_| None)
     }
 
     /// [`Self::mirror_from`], asking `room` before anything is written
@@ -203,36 +227,42 @@ impl GitWorkspace {
         branch: &str,
         tip: Oid,
         snapshot: Oid,
-        force: bool,
+        resolve: Option<&Resolve>,
+        checkout: &dyn CheckoutWriter,
         room: &dyn Fn(u64) -> Option<String>,
     ) -> Result<Mirror> {
         let local = format!("refs/heads/{branch}");
         if !git2::Reference::is_valid_name(&local) {
             bail!("{branch} is not a branch name");
         }
-        self.mirror_at(Some(&local), tip, snapshot, force, room)
+        self.mirror_at(Some(&local), tip, snapshot, resolve, checkout, room)
     }
 
     /// [`Self::mirror_from_within`] for a checkout whose HEAD is detached
-    /// at `tip`: the folder detached there too, its files Personal's.
+    /// at `tip`: the folder detached there too.
     pub fn mirror_detached_within(
         &self,
         tip: Oid,
         snapshot: Oid,
-        force: bool,
+        resolve: Option<&Resolve>,
+        checkout: &dyn CheckoutWriter,
         room: &dyn Fn(u64) -> Option<String>,
     ) -> Result<Mirror> {
-        self.mirror_at(None, tip, snapshot, force, room)
+        self.mirror_at(None, tip, snapshot, resolve, checkout, room)
     }
 
-    /// The mirror itself, onto the branch `local` names or — `None` — onto
-    /// `tip` with no branch.
+    /// The pass itself, onto the branch `local` names or — `None` — onto
+    /// `tip` with no branch: the three working copies observed, every path
+    /// decided (`crate::plan`), each write landed only where its side
+    /// still holds what the pass observed, and the archive recorded per
+    /// path for what landed.
     fn mirror_at(
         &self,
         local: Option<&str>,
         tip: Oid,
         snapshot: Oid,
-        force: bool,
+        resolve: Option<&Resolve>,
+        checkout: &dyn CheckoutWriter,
         room: &dyn Fn(u64) -> Option<String>,
     ) -> Result<Mirror> {
         let branch = local.map(|l| l.trim_start_matches("refs/heads/").to_string());
@@ -272,151 +302,129 @@ impl GitWorkspace {
                 });
             }
         }
-        // What the folder should still look like: what the mirror last
-        // wrote, or — the first time — its own HEAD, which a folder with no
-        // uncommitted work matches and one with some does not.
-        let baseline = match self.read_ref(MIRROR_REF)? {
+        // The archive: what the two last agreed on, or — the first time —
+        // the folder's own HEAD, which a folder with no uncommitted work
+        // matches and one with some does not.
+        let archive_tree = match self.read_ref(MIRROR_REF)? {
             Some(oid) => self.repo.find_commit(oid)?.tree_id(),
             None => match self.repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
                 Some(tree) => tree.id(),
                 None => self.repo.treebuilder(None)?.write()?,
             },
         };
-        let mut current = self.worktree_tree()?;
-        // What the checkout holds because the folder sent it is the
-        // folder's own, not a change of the checkout's.
-        let sent = match self.read_ref(SENT_REF)? {
-            Some(oid) => self.entries_between(baseline, self.repo.find_commit(oid)?.tree_id())?,
-            None => Default::default(),
-        };
-        let current_tree = self.repo.find_tree(current)?;
-        let entry_now = |path: &PathBuf| {
-            current_tree
-                .get_path(path)
-                .ok()
-                .map(|entry| (entry.id(), entry.filemode()))
-        };
-        // A path sent since the two last agreed that the folder no longer
-        // holds as it sent it.
-        let unsent = sent.iter().any(|(path, entry)| entry_now(path) != *entry);
-        if current != baseline || unsent {
-            // Each side's changes since the base, path by path, as the
-            // entry each now has (`None`: deleted).
-            let mut here = self.entries_between(baseline, current)?;
-            // ...and each path the folder sent and has since moved on
-            // from, measured from what it sent rather than from the base:
-            // a file dropped in, sent, and renamed before the two agreed
-            // was in neither the base nor the folder, so its removal was
-            // nobody's, and the next pass wrote the checkout's copy —
-            // the folder's own file, under its old name — back beside the
-            // new one (2026-10-12).
-            for (path, entry) in &sent {
-                let now = entry_now(path);
-                if now != *entry {
-                    here.entry(path.clone()).or_insert(now);
-                }
-            }
-            let rules = self.sync_rules();
-            here.retain(|path, entry| self.folder_owns(path, entry, &rules));
-            let there = self.entries_between(baseline, target.id())?;
-            let theirs = |path: &PathBuf| {
-                there
-                    .get(path)
-                    .filter(|entry| sent.get(path) != Some(*entry))
-            };
-            let conflicts: Vec<PathBuf> = here
-                .iter()
-                .filter(|(path, entry)| theirs(path).is_some_and(|t| t != *entry))
-                .map(|(path, _)| path.clone())
-                .collect();
-            if !conflicts.is_empty() {
-                if !force {
-                    return Ok(Mirror::Drift { paths: conflicts });
-                }
-                // "Keep Personal's" is about the paths it was asked about:
-                // those take the checkout's side here, and every other
-                // change of the folder's still goes out below (review,
-                // 2026-09-23: forcing the whole tree dropped new files
-                // nobody had been asked about).
-                let forced: std::collections::BTreeMap<_, _> = conflicts
-                    .iter()
-                    .map(|path| (path.clone(), there.get(path).cloned().flatten()))
-                    .collect();
-                let resolved = self.tree_with(current, &forced)?;
-                self.write_tree_over(current, resolved)?;
-                current = resolved;
-                for path in &conflicts {
-                    here.remove(path);
-                }
-            }
-            // The folder's own changes the checkout does not yet have go
-            // there first; the ones it already has are agreement.
-            let outgoing: Vec<&PathBuf> = here
-                .iter()
-                .filter(|(path, entry)| there.get(*path) != Some(*entry))
-                .map(|(path, _)| path)
-                .collect();
-            if !outgoing.is_empty() {
-                let current_tree = self.repo.find_tree(current)?;
-                let changes = outgoing
-                    .into_iter()
-                    .map(|path| self.change_at(&current_tree, path))
-                    .collect::<Result<Vec<_>>>()?;
-                return Ok(Mirror::Outgoing { changes });
-            }
+        let folder_tree = self.worktree_tree()?;
+        // One set of rules for both sides: the folder's, and the
+        // `.gitattributes` each of the three trees carries — the one being
+        // written brings its own before it is in the folder to be read.
+        let mut rules = self.sync_rules();
+        for tree in [archive_tree, folder_tree, target.id()] {
+            rules.add_set(crate::sync_ignored::attribute_files_in_tree(
+                &self.repo, tree,
+            ));
         }
-
-        // On the branch — or, for a detached checkout, detached too.
-        let on_branch = self.head_ref_name().as_deref() == local;
-        let at_tip = self.repo.head().ok().and_then(|h| h.target()) == Some(tip);
-        if current == target.id() && on_branch && at_tip {
-            self.record_at(target.id(), local, tip)?;
-            return Ok(Mirror::Unchanged);
-        }
-
-        if let Some(reason) = room(self.bytes_written_over(current, target.id())?) {
+        let archive = self.entries(archive_tree)?;
+        let folder = self.entries(folder_tree)?;
+        let theirs = self.entries(target.id())?;
+        // A file the folder's working copy leaves out and its disk holds is
+        // ignored there, whatever the rules read here say. A directory is
+        // not: what is beneath it is in the copy, or is not, on its own.
+        let unseen: std::collections::BTreeSet<PathBuf> = archive
+            .keys()
+            .chain(theirs.keys())
+            .filter(|path| !folder.contains_key(*path))
+            .filter(|path| {
+                std::fs::symlink_metadata(self.workdir.join(path)).is_ok_and(|m| !m.is_dir())
+            })
+            .cloned()
+            .collect();
+        let plan = crate::plan::plan(
+            &crate::plan::Observed {
+                archive: &archive,
+                folder: &folder,
+                checkout: &theirs,
+                folder_unseen: &unseen,
+            },
+            |path| !self.ignored_unsynced(path, &rules),
+            resolve,
+        );
+        if let Some(reason) = room(self.bytes_of(&plan.to_folder)?) {
             return Ok(Mirror::Paused { reason });
         }
-        let (changed, skipped) = self.write_tree_over(current, target.id())?;
-        match (local, branch.as_deref()) {
-            (Some(local), Some(branch)) => {
-                self.set_ref(local, tip)?;
-                if !on_branch {
-                    self.repo
-                        .set_head(local)
-                        .with_context(|| format!("switching this folder to {branch}"))?;
-                }
-            }
-            _ => self
-                .repo
-                .set_head_detached(tip)
-                .with_context(|| format!("detaching this folder at {tip}"))?,
-        }
-        // The index is the tip's tree: the checkout's changes read as
-        // changes here, as they do there. What it has STAGED is not
-        // carried — a snapshot holds a working copy, not an index.
-        let mut index = self.repo.index()?;
-        index.read_tree(&tip_commit.tree()?)?;
-        index.write()?;
-        // What the pass did not write — the folder ignored it — is not
-        // what the folder holds, so the baseline does not say it is: it is
-        // recorded absent, as the folder's own working copy (which leaves
-        // ignored files out) reads it. If the rule that kept it out goes,
-        // the folder's file and the checkout's are then two sides of one
-        // path — the same, agreement; different, a question; only the
-        // folder's, sent — never the checkout's version assumed to be
-        // here and the folder's sent over it as an edit.
-        let written = if skipped.is_empty() {
-            target.id()
+
+        // The folder's changes to the checkout, then the checkout's to the
+        // folder: neither order is safer, since every write checks its own
+        // side first, and a pass stopped between them records nothing.
+        let sends = plan
+            .to_checkout
+            .iter()
+            .map(|w| {
+                Ok(Send {
+                    change: self.change_for(&w.path, w.entry)?,
+                    expect: w.expect,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let landed_checkout = if sends.is_empty() {
+            Vec::new()
         } else {
-            let absent = skipped.into_iter().map(|path| (path, None)).collect();
-            self.tree_with(target.id(), &absent)?
+            checkout.apply(&sends)?
         };
-        self.record_at(written, local, tip)?;
-        Ok(Mirror::Applied {
-            changed,
+        if landed_checkout.len() != sends.len() {
+            bail!(
+                "the checkout answered for {} of {} writes",
+                landed_checkout.len(),
+                sends.len()
+            );
+        }
+        let landed_folder = self.apply_to_folder(&plan.to_folder)?;
+
+        // The position: on the branch — or, for a detached checkout,
+        // detached too — at the checkout's tip, and the index there when
+        // HEAD moved. An index the user staged in, at the tip already, is
+        // theirs and stays.
+        let on_branch = self.head_ref_name().as_deref() == local;
+        let at_tip = self.repo.head().ok().and_then(|h| h.target()) == Some(tip);
+        if !(on_branch && at_tip) {
+            match (local, branch.as_deref()) {
+                (Some(local), Some(branch)) => {
+                    self.set_ref(local, tip)?;
+                    if !on_branch {
+                        self.repo
+                            .set_head(local)
+                            .with_context(|| format!("switching this folder to {branch}"))?;
+                    }
+                }
+                _ => self
+                    .repo
+                    .set_head_detached(tip)
+                    .with_context(|| format!("detaching this folder at {tip}"))?,
+            }
+            // The index is the tip's tree: the checkout's changes read as
+            // changes here, as they do there. What it has STAGED is not
+            // carried — a snapshot holds a working copy, not an index.
+            let mut index = self.repo.index()?;
+            index.read_tree(&tip_commit.tree()?)?;
+            index.write()?;
+        }
+
+        let next = crate::plan::archived(
+            &archive,
+            &plan,
+            |i| landed_folder[i],
+            |i| landed_checkout[i],
+        );
+        let tree = self.tree_from(archive_tree, &next)?;
+        self.record_at(tree, local, tip)?;
+        let landed = |l: &[bool]| l.iter().filter(|x| **x).count();
+        Ok(Mirror::Done(Pass {
+            received: landed(&landed_folder),
+            sent: landed(&landed_checkout),
+            missed: landed_folder.len() + landed_checkout.len()
+                - landed(&landed_folder)
+                - landed(&landed_checkout),
+            conflicts: plan.conflicts,
             switched: !on_branch,
-        })
+        }))
     }
 
     /// Why the mirror should leave the folder alone this pass, if it
@@ -548,8 +556,8 @@ impl GitWorkspace {
     }
 
     fn record_mirror_detached(&self, tree: Oid, tip: Oid) -> Result<()> {
-        if self.read_ref(SENT_REF)?.is_some() {
-            if let Ok(mut sent) = self.repo.find_reference(SENT_REF) {
+        if self.read_ref(RETIRED_SENT_REF)?.is_some() {
+            if let Ok(mut sent) = self.repo.find_reference(RETIRED_SENT_REF) {
                 sent.delete()?;
             }
         }
@@ -601,212 +609,93 @@ impl GitWorkspace {
             .and_then(|tip| Oid::from_str(tip.trim()).ok()))
     }
 
-    /// Note that `changes` were written into the checkout: until the mirror
-    /// next agrees with it, the checkout holding one of them is holding
-    /// the folder's own version ([`SENT_REF`]).
-    pub fn record_sent(&self, changes: &[Change]) -> Result<()> {
-        let base = match self.read_ref(SENT_REF)?.or(self.read_ref(MIRROR_REF)?) {
-            Some(oid) => self.repo.find_commit(oid)?.tree_id(),
-            None => match self.repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
-                Some(tree) => tree.id(),
-                None => self.repo.treebuilder(None)?.write()?,
-            },
-        };
-        let mut entries = std::collections::BTreeMap::new();
-        for change in changes {
-            let entry = match &change.content {
-                None => None,
-                Some(bytes) => {
-                    let mode = if change.link {
-                        git2::FileMode::Link
-                    } else if change.executable {
-                        git2::FileMode::BlobExecutable
-                    } else {
-                        git2::FileMode::Blob
-                    };
-                    Some((self.repo.blob(bytes)?, i32::from(mode)))
-                }
-            };
-            entries.insert(change.path.clone(), entry);
-        }
-        let tree = self.repo.find_tree(self.tree_with(base, &entries)?)?;
-        let signature = git2::Signature::now("taste-ide", "taste-ide@localhost")?;
-        let commit = self.repo.commit(
-            None,
-            &signature,
-            &signature,
-            "taste mirror: what the folder has sent since they last agreed",
-            &tree,
-            &[],
-        )?;
-        self.set_ref(SENT_REF, commit)
+    /// A tree's working copy as the sync sees it: every file and link,
+    /// path by path. A submodule's pointer is a commit in another
+    /// repository, synced as a pair of its own (`taste_devcontainer::peer`),
+    /// and is not in it.
+    fn entries(&self, tree: Oid) -> Result<std::collections::BTreeMap<PathBuf, Entry>> {
+        let tree = self.repo.find_tree(tree)?;
+        let mut out = std::collections::BTreeMap::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                let mut path = PathBuf::from(std::ffi::OsStr::from_bytes(root.as_bytes()));
+                path.push(std::ffi::OsStr::from_bytes(entry.name_bytes()));
+                out.insert(path, (entry.id(), entry.filemode()));
+            }
+            git2::TreeWalkResult::Ok
+        })?;
+        Ok(out)
     }
 
-    /// `base` with each of `entries` put in place (`None`: removed).
-    fn tree_with(
+    /// The tree holding `copy`, and the submodule pointers `base` holds,
+    /// which the sync leaves where they are. Built whole rather than as
+    /// updates to `base`, which libgit2 refuses where a file takes a
+    /// directory's place.
+    fn tree_from(
         &self,
         base: Oid,
-        entries: &std::collections::BTreeMap<PathBuf, Option<(Oid, i32)>>,
+        copy: &std::collections::BTreeMap<PathBuf, Entry>,
     ) -> Result<Oid> {
-        let base = self.repo.find_tree(base)?;
-        let mut update = git2::build::TreeUpdateBuilder::new();
-        for (path, entry) in entries {
-            match entry {
-                Some((oid, mode)) => {
-                    let mode = match *mode {
-                        m if m == i32::from(git2::FileMode::BlobExecutable) => {
-                            git2::FileMode::BlobExecutable
-                        }
-                        m if m == i32::from(git2::FileMode::Link) => git2::FileMode::Link,
-                        m if m == i32::from(git2::FileMode::Commit) => git2::FileMode::Commit,
-                        _ => git2::FileMode::Blob,
-                    };
-                    update.upsert(path, *oid, mode);
-                }
-                // Only what the base has: removing an absent path is an
-                // error in libgit2, and a removal recorded as sent can name
-                // a path the agreed tree never held.
-                None => {
-                    if base.get_path(path).is_ok() {
-                        update.remove(path);
-                    }
-                }
-            }
-        }
-        Ok(update.create_updated(&self.repo, &base)?)
-    }
-
-    /// Each path the folder has sent the checkout since the two last
-    /// agreed ([`SENT_REF`]), with the object it was sent as and the one
-    /// the folder's working copy holds now (`None`: absent). A checkout
-    /// still holding what was sent, where the folder has since moved on —
-    /// reverted it, most often — holds the folder's stale copy rather than
-    /// work of its own; the sync drops it rather than carry it through its
-    /// stash (`taste_devcontainer::peer`'s sync script).
-    pub fn sent_against_folder(&self) -> Result<Vec<SentPath>> {
-        let (Some(sent), Some(agreed)) = (self.read_ref(SENT_REF)?, self.read_ref(MIRROR_REF)?)
-        else {
-            return Ok(Vec::new());
-        };
-        let sent = self.repo.find_commit(sent)?.tree_id();
-        let agreed = self.repo.find_commit(agreed)?.tree_id();
-        let current = self.repo.find_tree(self.worktree_tree()?)?;
-        Ok(self
-            .entries_between(agreed, sent)?
-            .into_iter()
-            .map(|(path, entry)| SentPath {
-                now: current.get_path(&path).ok().map(|e| e.id()),
-                sent: entry.map(|(oid, _)| oid),
-                path,
+        let mut index = git2::Index::new()?;
+        let mut add = |path: &[u8], id: Oid, mode: u32| {
+            index.add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id,
+                flags: 0,
+                flags_extended: 0,
+                path: path.to_vec(),
             })
-            .collect())
-    }
-
-    /// Every path the folder changed since the last mirror, as the
-    /// checkout should take it: what a conflict's "keep the folder's"
-    /// sends, conflicting paths included. Empty when nothing changed.
-    pub fn folder_changes(&self) -> Result<Vec<Change>> {
-        let baseline = match self.read_ref(MIRROR_REF)? {
-            Some(oid) => self.repo.find_commit(oid)?.tree_id(),
-            None => match self.repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
-                Some(tree) => tree.id(),
-                None => return Ok(Vec::new()),
-            },
         };
-        let current = self.worktree_tree()?;
-        let current_tree = self.repo.find_tree(current)?;
-        let rules = self.sync_rules();
-        self.entries_between(baseline, current)?
-            .iter()
-            .filter(|(path, entry)| self.folder_owns(path, entry, &rules))
-            .map(|(path, _)| self.change_at(&current_tree, path))
-            .collect()
-    }
-
-    /// Whether a difference between the baseline and the folder's working
-    /// copy is the folder's own change to send. Ignored paths never are,
-    /// in this direction as in the other ([`Self::write_tree_over`]): the
-    /// working copy's tree leaves them out, so a baseline that holds them —
-    /// one recorded from a checkout that did not ignore them yet — reads
-    /// every one as deleted here. And a removal is never sent for a path
-    /// still on this disk, whatever the rules say: absent from the tree is
-    /// not absent from the folder (2026-10-04: a Drupal install, ignored
-    /// here and not yet in the checkout, was deleted from the checkout
-    /// file by file).
-    fn folder_owns(
-        &self,
-        path: &Path,
-        entry: &Option<(Oid, i32)>,
-        rules: &crate::sync_ignored::Rules,
-    ) -> bool {
-        // Ignored, unless it syncs anyway (`crate::sync_ignored`).
-        if self.ignored_unsynced(path, rules) {
-            return false;
+        for (path, (id, mode)) in copy {
+            add(path.as_os_str().as_bytes(), *id, *mode as u32)?;
         }
-        entry.is_some() || std::fs::symlink_metadata(self.workdir.join(path)).is_err()
+        let base = self.repo.find_tree(base)?;
+        let mut pointers = Vec::new();
+        base.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.filemode() == i32::from(git2::FileMode::Commit) {
+                let mut path = root.as_bytes().to_vec();
+                path.extend_from_slice(entry.name_bytes());
+                pointers.push((path, entry.id()));
+            }
+            git2::TreeWalkResult::Ok
+        })?;
+        for (path, id) in pointers {
+            let path_buf = PathBuf::from(std::ffi::OsStr::from_bytes(&path));
+            // A pointer where the copy now has a file, or beneath one, has
+            // gone with what replaced it.
+            let taken =
+                copy.contains_key(&path_buf) || path_buf.ancestors().any(|a| copy.contains_key(a));
+            if !taken {
+                add(&path, id, u32::from(git2::FileMode::Commit))?;
+            }
+        }
+        Ok(index.write_tree_to(&self.repo)?)
     }
 
-    fn change_at(&self, tree: &git2::Tree, path: &Path) -> Result<Change> {
-        Ok(match tree.get_path(path) {
-            Ok(entry) => {
-                let blob = self.repo.find_blob(entry.id())?;
-                Change {
-                    path: path.to_path_buf(),
-                    content: Some(blob.content().to_vec()),
-                    executable: entry.filemode() == i32::from(git2::FileMode::BlobExecutable),
-                    link: entry.filemode() == i32::from(git2::FileMode::Link),
-                }
-            }
-            Err(_) => Change {
+    /// The entry at `path` as the checkout should take it: its bytes, its
+    /// executable bit, a link as a link, absent as a removal.
+    fn change_for(&self, path: &Path, entry: Option<Entry>) -> Result<Change> {
+        Ok(match entry {
+            Some((id, mode)) => Change {
+                path: path.to_path_buf(),
+                content: Some(self.repo.find_blob(id)?.content().to_vec()),
+                executable: mode == i32::from(git2::FileMode::BlobExecutable),
+                link: mode == i32::from(git2::FileMode::Link),
+            },
+            None => Change {
                 path: path.to_path_buf(),
                 content: None,
                 executable: false,
                 link: false,
             },
         })
-    }
-
-    /// The paths that differ between two trees, each with the entry it has
-    /// in `to` — its object and mode — or `None` where `to` removed it.
-    fn entries_between(
-        &self,
-        from: Oid,
-        to: Oid,
-    ) -> Result<std::collections::BTreeMap<PathBuf, Option<(Oid, i32)>>> {
-        let from_tree = self.repo.find_tree(from)?;
-        let to_tree = self.repo.find_tree(to)?;
-        let diff = self
-            .repo
-            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
-        let mut out = std::collections::BTreeMap::new();
-        for delta in diff.deltas() {
-            // A submodule's pointer is a commit in another repository, and
-            // the submodule is a pair of its own, synced inside its own
-            // working tree (`taste_devcontainer::peer`): its pointer moving
-            // is nothing for the parent to write, send, or ask about. A
-            // file put where a submodule was is still the file it is.
-            let gone = matches!(delta.status(), Delta::Deleted);
-            let side = if gone {
-                delta.old_file()
-            } else {
-                delta.new_file()
-            };
-            if side.mode() == git2::FileMode::Commit {
-                continue;
-            }
-            if gone {
-                if let Some(path) = delta.old_file().path() {
-                    out.insert(path.to_path_buf(), None);
-                }
-            } else if let Some(path) = delta.new_file().path() {
-                let file = delta.new_file();
-                out.insert(
-                    path.to_path_buf(),
-                    Some((file.id(), i32::from(file.mode()))),
-                );
-            }
-        }
-        Ok(out)
     }
 
     /// Whether this folder's `branch` is where the mirror last left it: no
@@ -851,8 +740,8 @@ impl GitWorkspace {
     /// the user makes here is told from one the checkout made
     /// ([`Self::switched_here`]). What was sent before is agreement now.
     fn record_mirror(&self, tree: Oid, local: &str) -> Result<()> {
-        if self.read_ref(SENT_REF)?.is_some() {
-            if let Ok(mut sent) = self.repo.find_reference(SENT_REF) {
+        if self.read_ref(RETIRED_SENT_REF)?.is_some() {
+            if let Ok(mut sent) = self.repo.find_reference(RETIRED_SENT_REF) {
                 sent.delete()?;
             }
         }
@@ -878,124 +767,117 @@ impl GitWorkspace {
         self.set_ref(MIRROR_REF, commit)
     }
 
-    /// The bytes writing `to` over `from` would put in the folder: every
-    /// file the pass would write, whole — the room the write needs at its
-    /// peak, since each is staged beside its old copy before replacing it.
-    fn bytes_written_over(&self, from: Oid, to: Oid) -> Result<u64> {
-        let from_tree = self.repo.find_tree(from)?;
-        let to_tree = self.repo.find_tree(to)?;
-        let diff = self
-            .repo
-            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
+    /// The bytes `writes` would put in the folder: every file whole — the
+    /// room a write needs at its peak, since each is staged beside its old
+    /// copy before replacing it.
+    fn bytes_of(&self, writes: &[crate::plan::Write<Entry>]) -> Result<u64> {
         let odb = self.repo.odb()?;
         let mut bytes = 0u64;
-        for delta in diff.deltas() {
-            if matches!(delta.status(), Delta::Deleted) {
-                continue;
-            }
-            let file = delta.new_file();
-            if file.mode() == git2::FileMode::Commit {
-                continue;
-            }
-            if let Ok((size, _)) = odb.read_header(file.id()) {
+        for (id, _) in writes.iter().filter_map(|w| w.entry) {
+            if let Ok((size, _)) = odb.read_header(id) {
                 bytes = bytes.saturating_add(size as u64);
             }
         }
         Ok(bytes)
     }
 
-    /// Write `to`'s files over a working tree that holds `from`'s: each
-    /// path that differs written or removed, nothing else touched — so what
-    /// neither tree has (ignored files, `.git`) is left exactly as it is.
-    ///
-    /// Returns how many paths it wrote or removed, and the paths it left
-    /// alone because the folder ignores them.
-    fn write_tree_over(&self, from: Oid, to: Oid) -> Result<(usize, Vec<PathBuf>)> {
-        let from_tree = self.repo.find_tree(from)?;
-        let to_tree = self.repo.find_tree(to)?;
-        let diff = self
-            .repo
-            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
-        // Decided before anything is written, so a `.gitignore` this pass
-        // writes cannot change the answer halfway: what the folder ignores
-        // now is never written over or removed — a checkout that adds
-        // `.env` does not get to replace the user's (the docs' promise that
-        // ignored files are never written or removed). The rules are
-        // decluttering, not a lock (David, 2026-10-09: "It isn't a
-        // security mechanism"): once a pass carries a rule's removal here,
-        // what it ignored is an ordinary path on both sides.
-        //
-        // Except what syncs anyway (`crate::sync_ignored`), by the folder's
-        // `.gitattributes` or by those of either tree — the one being
-        // written brings its own before it is in the folder to be read.
-        let mut rules = self.sync_rules();
-        for tree in [from, to] {
-            rules.add_set(crate::sync_ignored::attribute_files_in_tree(
-                &self.repo, tree,
-            ));
-        }
-        let protected: std::collections::BTreeSet<PathBuf> = diff
-            .deltas()
-            .flat_map(|d| [d.old_file().path(), d.new_file().path()])
-            .flatten()
-            .filter(|path| self.ignored_unsynced(path, &rules))
-            .map(Path::to_path_buf)
-            .collect();
-        let skip = |delta: &git2::DiffDelta| {
-            let path = delta.new_file().path().or(delta.old_file().path());
-            path.is_some_and(|p| protected.contains(p))
+    /// What the folder's disk holds at `rel` now, as an entry: `Ok(None)`
+    /// for nothing there, `Err` for something no entry describes — a
+    /// directory, a socket — which no write expects.
+    fn on_disk(&self, rel: &Path) -> Result<Option<Entry>, ()> {
+        let absolute = self.workdir.join(rel);
+        let meta = match std::fs::symlink_metadata(&absolute) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(()),
         };
-        // Every removal before any write: the delta lists `a` (now a file)
-        // before `a/b` (a file of the directory it replaces), and written
-        // in that order the file met the directory still standing and
-        // failed the pass, every pass (review, 2026-09-23).
-        let mut changed = 0;
-        for delta in diff.deltas() {
-            if skip(&delta) {
-                continue;
-            }
-            if matches!(delta.status(), Delta::Deleted | Delta::Typechange) {
-                if let Some(rel) = delta.old_file().path() {
-                    self.remove_in_worktree(rel)?;
-                }
-            }
-            if matches!(delta.status(), Delta::Deleted) {
-                changed += 1;
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&absolute).map_err(|_| ())?;
+            let id = Oid::hash_object(git2::ObjectType::Blob, target.as_os_str().as_bytes())
+                .map_err(|_| ())?;
+            return Ok(Some((id, i32::from(git2::FileMode::Link))));
+        }
+        if !meta.is_file() {
+            return Err(());
+        }
+        let mode = if meta.permissions().mode() & 0o111 != 0 {
+            git2::FileMode::BlobExecutable
+        } else {
+            git2::FileMode::Blob
+        };
+        let id = match crate::snapshot::hashed_before(&absolute, &meta) {
+            Some(id) => id,
+            None => Oid::hash_file(git2::ObjectType::Blob, &absolute).map_err(|_| ())?,
+        };
+        Ok(Some((id, i32::from(mode))))
+    }
+
+    /// Land the checkout's changes in the folder, each only while the
+    /// folder still holds at its path what the pass observed there —
+    /// checked again after the new file is staged and before it is renamed
+    /// into place, which is the last moment there is (docs/SYNC.md, P1):
+    /// a save the user made since the pass read the folder is kept, and
+    /// decided by the next pass. Removals first, deepest first, then
+    /// writes, shallowest first, so a file and a directory never meet at
+    /// one path (P12). Through `beneath`, which refuses a path out of the
+    /// folder, a directory on the way that is a link, and a staging name
+    /// planted as one — the checkout chose these paths, and it does not get
+    /// to choose where on this host they land. Which landed, in order.
+    fn apply_to_folder(&self, writes: &[crate::plan::Write<Entry>]) -> Result<Vec<bool>> {
+        let mut landed = vec![false; writes.len()];
+        let still = |w: &crate::plan::Write<Entry>| self.on_disk(&w.path) == Ok(w.expect);
+        let mut removals: Vec<usize> = (0..writes.len())
+            .filter(|i| writes[*i].entry.is_none())
+            .collect();
+        removals.sort_by(|a, b| writes[*b].path.cmp(&writes[*a].path));
+        // A write that fails — a path `beneath` refuses, a directory that
+        // appeared at the last moment — costs that path, said in the log,
+        // and not the pass: it did not land, so the archive does not
+        // record it, and the next pass decides it again (P10).
+        let failed = |w: &crate::plan::Write<Entry>, e: anyhow::Error| {
+            tracing::warn!("not writing {} in the folder: {e:#}", w.path.display());
+            false
+        };
+        for i in removals {
+            let w = &writes[i];
+            if still(w) {
+                landed[i] = match self.remove_in_worktree(&w.path) {
+                    Ok(()) => true,
+                    Err(e) => failed(w, e),
+                };
             }
         }
-        for delta in diff.deltas() {
-            if skip(&delta) || matches!(delta.status(), Delta::Deleted) {
+        let mut puts: Vec<usize> = (0..writes.len())
+            .filter(|i| writes[*i].entry.is_some())
+            .collect();
+        puts.sort_by(|a, b| writes[*a].path.cmp(&writes[*b].path));
+        for i in puts {
+            let w = &writes[i];
+            let Some((id, mode)) = w.entry else { continue };
+            if !still(w) {
                 continue;
             }
-            changed += 1;
-            let Some(rel) = delta.new_file().path() else {
-                continue;
-            };
-            let file = delta.new_file();
-            if file.mode() == git2::FileMode::Commit {
-                // A submodule's pointer: nothing to write here.
-                continue;
-            }
-            let blob = self.repo.find_blob(file.id())?;
-            // Through `beneath`, which refuses a path out of the folder, a
-            // directory on the way that is a link, and a staging name
-            // planted as one — the checkout chose this path, and it does
-            // not get to choose where on this host it lands.
-            match file.mode() {
-                git2::FileMode::Link => crate::beneath::write_link(
+            let blob = self.repo.find_blob(id)?;
+            let ready = || still(w);
+            let written = if mode == i32::from(git2::FileMode::Link) {
+                crate::beneath::write_link_if(
                     &self.workdir,
-                    rel,
+                    &w.path,
                     std::ffi::OsStr::from_bytes(blob.content()),
-                )?,
-                mode => crate::beneath::write_file(
+                    &ready,
+                )
+            } else {
+                crate::beneath::write_file_if(
                     &self.workdir,
-                    rel,
+                    &w.path,
                     blob.content(),
-                    mode == git2::FileMode::BlobExecutable,
-                )?,
-            }
+                    mode == i32::from(git2::FileMode::BlobExecutable),
+                    &ready,
+                )
+            };
+            landed[i] = written.unwrap_or_else(|e| failed(w, e));
         }
-        Ok((changed, protected.into_iter().collect()))
+        Ok(landed)
     }
 
     /// A path inside the working tree, refused when it would reach outside
@@ -1026,6 +908,7 @@ impl GitWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs;
 
     fn repo() -> (tempfile::TempDir, GitWorkspace) {
@@ -1037,6 +920,54 @@ mod tests {
         drop(repo);
         let ws = GitWorkspace::discover(dir.path()).unwrap();
         (dir, ws)
+    }
+
+    /// The checkout's side, for these tests: every write lands, and is
+    /// kept to be looked at; `during` runs first, which is the moment
+    /// between a pass's decision and the folder's writes.
+    #[derive(Default)]
+    struct Took {
+        sends: RefCell<Vec<Send>>,
+        during: RefCell<Option<Box<dyn FnOnce()>>>,
+    }
+
+    impl CheckoutWriter for Took {
+        fn apply(&self, sends: &[Send]) -> Result<Vec<bool>> {
+            if let Some(during) = self.during.borrow_mut().take() {
+                during();
+            }
+            self.sends.borrow_mut().extend(sends.iter().cloned());
+            Ok(vec![true; sends.len()])
+        }
+    }
+
+    impl Took {
+        /// What was sent, path by path: the bytes, or `None` for a removal.
+        fn sent(&self) -> Vec<(String, Option<String>)> {
+            let mut out: Vec<_> = self
+                .sends
+                .borrow()
+                .iter()
+                .map(|s| {
+                    (
+                        s.change.path.display().to_string(),
+                        s.change
+                            .content
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).to_string()),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    }
+
+    fn done(outcome: Mirror) -> Pass {
+        match outcome {
+            Mirror::Done(pass) => pass,
+            other => panic!("the pass did not run: {other:?}"),
+        }
     }
 
     /// A second repository standing in for the checkout in the VM, its
@@ -1078,6 +1009,22 @@ mod tests {
         (tip, snap)
     }
 
+    /// A folder with `a.txt` committed, mirrored once with a checkout that
+    /// matches it: the archive in place.
+    fn agreed() -> (tempfile::TempDir, GitWorkspace, String) {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
+        (dir, ws, main)
+    }
+
     /// An ignored path whose `taste-sync` is set is carried to the folder —
     /// and other ignored files still are not — and the folder's edit to it
     /// is sent back like any change of its own.
@@ -1088,17 +1035,18 @@ mod tests {
         ws.stage(Path::new(".gitignore")).unwrap();
         ws.commit("ignore data").unwrap();
         let main = ws.branch_name().unwrap();
-        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+        let checkout = |vm: &Path, _: &GitWorkspace| {
             let attributes = crate::sync_ignored::with_path("", Path::new("data/keep"), true);
             fs::write(vm.join(".gitattributes"), attributes).unwrap();
             fs::create_dir_all(vm.join("data/keep")).unwrap();
             fs::write(vm.join("data/keep/model.bin"), "weights\n").unwrap();
             fs::write(vm.join("data/other.bin"), "not this\n").unwrap();
-        });
-        assert!(matches!(
-            ws.mirror_from(&main, tip, snap, false).unwrap(),
-            Mirror::Applied { .. }
-        ));
+        };
+        let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
         assert_eq!(
             fs::read_to_string(dir.path().join("data/keep/model.bin")).unwrap(),
             "weights\n"
@@ -1110,13 +1058,12 @@ mod tests {
         );
 
         fs::write(dir.path().join("data/keep/model.bin"), "retrained\n").unwrap();
-        let changes = ws.folder_changes().unwrap();
-        assert!(
-            changes
-                .iter()
-                .any(|c| c.path == Path::new("data/keep/model.bin")
-                    && c.content.as_deref() == Some(&b"retrained\n"[..])),
-            "{changes:?}"
+        let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
+        let took = Took::default();
+        done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert_eq!(
+            took.sent(),
+            vec![("data/keep/model.bin".into(), Some("retrained\n".into()))]
         );
     }
 
@@ -1140,11 +1087,11 @@ mod tests {
             fs::write(vm.join("new/dir/c.txt"), "untracked\n").unwrap();
         });
 
-        let outcome = ws.mirror_from("feature", tip, snap, false).unwrap();
-        assert!(
-            matches!(outcome, Mirror::Applied { switched: true, .. }),
-            "{outcome:?}"
+        let pass = done(
+            ws.mirror_from("feature", tip, snap, None, &Took::default())
+                .unwrap(),
         );
+        assert!(pass.switched, "{pass:?}");
         assert_eq!(ws.branch_name().as_deref(), Some("feature"));
         assert_eq!(
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
@@ -1166,8 +1113,11 @@ mod tests {
         assert!(!status.contains_key(Path::new("b.txt")));
         // Again: nothing to do.
         assert_eq!(
-            ws.mirror_from("feature", tip, snap, false).unwrap(),
-            Mirror::Unchanged
+            done(
+                ws.mirror_from("feature", tip, snap, None, &Took::default())
+                    .unwrap()
+            ),
+            Pass::default()
         );
     }
 
@@ -1188,7 +1138,10 @@ mod tests {
             vm_ws.stage(Path::new("b.txt")).unwrap();
             vm_ws.commit("second").unwrap();
         });
-        ws.mirror_from(&main, tip, snap, false).unwrap();
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
         assert!(ws.unmoved_since_mirror(&main).unwrap());
         fs::write(dir.path().join("c.txt"), "mine\n").unwrap();
         ws.stage(Path::new("c.txt")).unwrap();
@@ -1231,47 +1184,23 @@ mod tests {
         assert!(!ws.unmoved_since_mirror(&main).unwrap());
     }
 
+    /// Both ways in one pass: a file dropped into the folder goes to the
+    /// checkout, and the checkout's edit elsewhere comes in, neither
+    /// waiting on the other (docs/SYNC.md, P3).
     #[test]
-    fn a_file_dropped_in_here_goes_out_first_and_is_never_lost() {
-        let (dir, ws) = repo();
-        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-        ws.stage(Path::new("a.txt")).unwrap();
-        ws.commit("first").unwrap();
-        let main = ws.branch_name().unwrap();
-        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
-            fs::write(vm.join("a.txt"), "from the vm\n").unwrap();
-        });
-        ws.mirror_from(&main, tip, snap, false).unwrap();
-
-        // A file dropped into the folder, and the checkout moving on
-        // elsewhere: no conflict.
+    fn a_file_dropped_in_here_goes_out_as_the_checkouts_edit_comes_in() {
+        let (dir, ws, main) = agreed();
         fs::write(dir.path().join("dropped.txt"), "mine\n").unwrap();
-        let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, _| {
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
             fs::write(vm.join("a.txt"), "the vm moved on\n").unwrap();
         });
-        match ws.mirror_from(&main, tip2, snap2, false).unwrap() {
-            Mirror::Outgoing { changes } => {
-                assert_eq!(changes.len(), 1);
-                assert_eq!(changes[0].path, PathBuf::from("dropped.txt"));
-                assert_eq!(changes[0].content.as_deref(), Some(&b"mine\n"[..]));
-            }
-            other => panic!("{other:?}"),
-        }
+        let took = Took::default();
+        let pass = done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert_eq!((pass.sent, pass.received, pass.missed), (1, 1, 0));
         assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "from the vm\n",
-            "nothing is written here until the checkout has the folder's change"
+            took.sent(),
+            vec![("dropped.txt".into(), Some("mine\n".into()))]
         );
-        // The checkout took it: the next pass carries the checkout's change
-        // in and keeps the dropped file.
-        let (tip3, snap3) = checkout_state(&ws, dir.path(), |vm, _| {
-            fs::write(vm.join("a.txt"), "the vm moved on\n").unwrap();
-            fs::write(vm.join("dropped.txt"), "mine\n").unwrap();
-        });
-        assert!(matches!(
-            ws.mirror_from(&main, tip3, snap3, false).unwrap(),
-            Mirror::Applied { .. }
-        ));
         assert_eq!(
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "the vm moved on\n"
@@ -1280,46 +1209,60 @@ mod tests {
             fs::read_to_string(dir.path().join("dropped.txt")).unwrap(),
             "mine\n"
         );
+        // The checkout as it now is: the two agree, and nothing moves.
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join("a.txt"), "the vm moved on\n").unwrap();
+            fs::write(vm.join("dropped.txt"), "mine\n").unwrap();
+        });
+        let took = Took::default();
+        assert_eq!(
+            done(ws.mirror_from(&main, tip, snap, None, &took).unwrap()),
+            Pass::default()
+        );
+        assert!(took.sent().is_empty());
     }
 
+    /// A path both sides changed, differently, is written on neither and
+    /// asked about, while everything else still goes; and the answer
+    /// writes the paths it was about and no others (P2).
     #[test]
-    fn the_same_path_changed_on_both_sides_is_drift() {
-        let (dir, ws) = repo();
-        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-        ws.stage(Path::new("a.txt")).unwrap();
-        ws.commit("first").unwrap();
-        let main = ws.branch_name().unwrap();
-        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
-        ws.mirror_from(&main, tip, snap, false).unwrap();
-
+    fn the_same_path_changed_on_both_sides_is_asked_about() {
+        let (dir, ws, main) = agreed();
         fs::write(dir.path().join("a.txt"), "edited in the folder\n").unwrap();
-        let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, _| {
+        fs::write(dir.path().join("new.txt"), "unasked\n").unwrap();
+        let checkout = |vm: &Path, _: &GitWorkspace| {
             fs::write(vm.join("a.txt"), "edited in the vm\n").unwrap();
-        });
-        match ws.mirror_from(&main, tip2, snap2, false).unwrap() {
-            Mirror::Drift { paths } => assert_eq!(paths, vec![PathBuf::from("a.txt")]),
-            other => panic!("{other:?}"),
-        }
+        };
+        let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
+        let took = Took::default();
+        let pass = done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert_eq!(pass.conflicts, vec![PathBuf::from("a.txt")]);
+        assert_eq!(
+            took.sent(),
+            vec![("new.txt".into(), Some("unasked\n".into()))]
+        );
         assert_eq!(
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "edited in the folder\n",
             "never written over on a guess"
         );
-        let mine = ws.folder_changes().unwrap();
-        assert_eq!(
-            mine[0].content.as_deref(),
-            Some(&b"edited in the folder\n"[..])
+
+        // Answered: keep Personal's, for a.txt.
+        let resolve = Resolve {
+            keep: Side::Checkout,
+            paths: [PathBuf::from("a.txt")].into(),
+        };
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, ws| {
+            checkout(vm, ws);
+            fs::write(vm.join("new.txt"), "unasked\n").unwrap();
+        });
+        let took = Took::default();
+        let pass = done(
+            ws.mirror_from(&main, tip, snap, Some(&resolve), &took)
+                .unwrap(),
         );
-        // Forced: the checkout's wins for the path asked about, and a file
-        // nobody was asked about still goes out rather than being deleted.
-        fs::write(dir.path().join("new.txt"), "unasked\n").unwrap();
-        match ws.mirror_from(&main, tip2, snap2, true).unwrap() {
-            Mirror::Outgoing { changes } => {
-                assert_eq!(changes.len(), 1);
-                assert_eq!(changes[0].path, PathBuf::from("new.txt"));
-            }
-            other => panic!("{other:?}"),
-        }
+        assert!(pass.conflicts.is_empty(), "{pass:?}");
+        assert!(took.sent().is_empty());
         assert_eq!(
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "edited in the vm\n"
@@ -1330,83 +1273,63 @@ mod tests {
         );
     }
 
+    /// Saved again before the checkout's snapshot came back with the first
+    /// save: the folder's to send, never a conflict with itself (P6).
     #[test]
     fn a_second_save_after_a_send_is_the_folders_not_a_conflict() {
-        let (dir, ws) = repo();
-        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-        ws.stage(Path::new("a.txt")).unwrap();
-        ws.commit("first").unwrap();
-        let main = ws.branch_name().unwrap();
-        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
-        ws.mirror_from(&main, tip, snap, false).unwrap();
-
+        let (dir, ws, main) = agreed();
         fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
-        let (tip2, snap2) = checkout_state(&ws, dir.path(), |_, _| {});
-        let Mirror::Outgoing { changes } = ws.mirror_from(&main, tip2, snap2, false).unwrap()
-        else {
-            panic!("v1 goes out");
-        };
-        ws.record_sent(&changes).unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        let took = Took::default();
+        done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert_eq!(took.sent(), vec![("a.txt".into(), Some("v1\n".into()))]);
 
-        // Saved again before the checkout's snapshot came back with v1.
         fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
-        let (tip3, snap3) = checkout_state(&ws, dir.path(), |vm, _| {
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
             fs::write(vm.join("a.txt"), "v1\n").unwrap();
         });
-        match ws.mirror_from(&main, tip3, snap3, false).unwrap() {
-            Mirror::Outgoing { changes } => {
-                assert_eq!(changes[0].content.as_deref(), Some(&b"v2\n"[..]));
-            }
-            other => panic!("{other:?}"),
-        }
+        let took = Took::default();
+        let pass = done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert!(pass.conflicts.is_empty(), "{pass:?}");
+        assert_eq!(took.sent(), vec![("a.txt".into(), Some("v2\n".into()))]);
     }
 
     /// A file dropped in, sent, and renamed before the two agree: the
     /// rename goes out whole — the new name and the old one's removal — and
-    /// the checkout's copy under the old name is never written back.
+    /// the checkout's copy under the old name is never written back (P5).
     #[test]
     fn a_file_renamed_after_it_was_sent_is_not_written_back() {
-        let (dir, ws) = repo();
-        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-        ws.stage(Path::new("a.txt")).unwrap();
-        ws.commit("first").unwrap();
-        let main = ws.branch_name().unwrap();
-        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
-        ws.mirror_from(&main, tip, snap, false).unwrap();
-
+        let (dir, ws, main) = agreed();
         fs::write(dir.path().join("activity.qfx"), "statement\n").unwrap();
-        let (tip2, snap2) = checkout_state(&ws, dir.path(), |_, _| {});
-        let Mirror::Outgoing { changes } = ws.mirror_from(&main, tip2, snap2, false).unwrap()
-        else {
-            panic!("the new file goes out");
-        };
-        ws.record_sent(&changes).unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
 
         // Renamed here; the checkout has the file under its first name.
         fs::rename(dir.path().join("activity.qfx"), dir.path().join("amex.qfx")).unwrap();
-        let (tip3, snap3) = checkout_state(&ws, dir.path(), |vm, _| {
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
             fs::write(vm.join("activity.qfx"), "statement\n").unwrap();
         });
-        let Mirror::Outgoing { changes } = ws.mirror_from(&main, tip3, snap3, false).unwrap()
-        else {
-            panic!("the rename goes out");
-        };
-        let mut sent: Vec<(String, bool)> = changes
-            .iter()
-            .map(|c| (c.path.display().to_string(), c.content.is_some()))
-            .collect();
-        sent.sort();
+        let took = Took::default();
+        done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
         assert_eq!(
-            sent,
-            vec![("activity.qfx".into(), false), ("amex.qfx".into(), true)]
+            took.sent(),
+            vec![
+                ("activity.qfx".into(), None),
+                ("amex.qfx".into(), Some("statement\n".into()))
+            ]
         );
-        ws.record_sent(&changes).unwrap();
 
         // The checkout took both, and the two agree.
-        let (tip4, snap4) = checkout_state(&ws, dir.path(), |vm, _| {
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
             fs::write(vm.join("amex.qfx"), "statement\n").unwrap();
         });
-        ws.mirror_from(&main, tip4, snap4, false).unwrap();
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
         assert!(
             !dir.path().join("activity.qfx").exists(),
             "not written back"
@@ -1417,23 +1340,57 @@ mod tests {
         );
     }
 
+    /// A save the user makes after the pass observed the folder, and
+    /// before its write to that path lands, is kept: the write checks the
+    /// folder at the last moment, does not land, and the next pass finds
+    /// the two sides both changed (P1).
+    #[test]
+    fn a_save_during_the_pass_is_never_written_over() {
+        let (dir, ws, main) = agreed();
+        // Something to send, so the checkout's side runs — which is the
+        // moment between the pass's decision and its writes here.
+        fs::write(dir.path().join("dropped.txt"), "mine\n").unwrap();
+        let checkout = |vm: &Path, _: &GitWorkspace| {
+            fs::write(vm.join("a.txt"), "from the vm\n").unwrap();
+        };
+        let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
+        let took = Took::default();
+        let saved = dir.path().join("a.txt");
+        *took.during.borrow_mut() = Some(Box::new(move || {
+            fs::write(&saved, "saved meanwhile\n").unwrap();
+        }));
+        let pass = done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert_eq!((pass.sent, pass.received, pass.missed), (1, 0, 1));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "saved meanwhile\n"
+        );
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, ws| {
+            checkout(vm, ws);
+            fs::write(vm.join("dropped.txt"), "mine\n").unwrap();
+        });
+        let pass = done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
+        assert_eq!(pass.conflicts, vec![PathBuf::from("a.txt")]);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "saved meanwhile\n"
+        );
+    }
+
     #[test]
     fn a_branch_the_user_switched_to_here_pauses_the_mirror() {
-        let (dir, ws) = repo();
-        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-        ws.stage(Path::new("a.txt")).unwrap();
-        ws.commit("first").unwrap();
-        let main = ws.branch_name().unwrap();
-        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
-        ws.mirror_from(&main, tip, snap, false).unwrap();
-
+        let (dir, ws, main) = agreed();
         let head = ws.repo.head().unwrap().peel_to_commit().unwrap();
         ws.repo.branch("mine", &head, false).unwrap();
         ws.repo.set_head("refs/heads/mine").unwrap();
         fs::write(dir.path().join("a.txt"), "on my branch\n").unwrap();
-        let (tip2, snap2) = checkout_state(&ws, dir.path(), |_, _| {});
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
         assert!(matches!(
-            ws.mirror_from(&main, tip2, snap2, false).unwrap(),
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
             Mirror::Paused { .. }
         ));
         assert_eq!(
@@ -1454,7 +1411,10 @@ mod tests {
         let first = ws.commit("first").unwrap();
         let main = ws.branch_name().unwrap();
         let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
-        ws.mirror_from(&main, tip, snap, false).unwrap();
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
 
         let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, vm_ws| {
             fs::write(vm.join("b.txt"), "two\n").unwrap();
@@ -1472,10 +1432,10 @@ mod tests {
             fs::write(vm.join("a.txt"), "edited while detached\n").unwrap();
         });
         assert_eq!(tip2, first);
-        let outcome = ws
-            .mirror_detached_within(tip2, snap2, false, &|_| None)
-            .unwrap();
-        assert!(matches!(outcome, Mirror::Applied { .. }), "{outcome:?}");
+        done(
+            ws.mirror_detached_within(tip2, snap2, None, &Took::default(), &|_| None)
+                .unwrap(),
+        );
         assert_eq!(ws.checked_out(), Some(Head::Commit(first)));
         assert_eq!(
             ws.mirror_recorded_head().unwrap(),
@@ -1488,9 +1448,11 @@ mod tests {
         assert!(!dir.path().join("b.txt").exists());
         // Again: nothing to do, and a detached folder is not a paused one.
         assert_eq!(
-            ws.mirror_detached_within(tip2, snap2, false, &|_| None)
-                .unwrap(),
-            Mirror::Unchanged
+            done(
+                ws.mirror_detached_within(tip2, snap2, None, &Took::default(), &|_| None)
+                    .unwrap()
+            ),
+            Pass::default()
         );
     }
 
@@ -1500,35 +1462,27 @@ mod tests {
     /// direction (2026-10-04: a Drupal install deleted from Personal).
     #[test]
     fn what_the_folder_ignores_is_never_sent_as_deleted() {
-        let (dir, ws) = repo();
-        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-        ws.stage(Path::new("a.txt")).unwrap();
-        ws.commit("first").unwrap();
-        let main = ws.branch_name().unwrap();
-        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+        let (dir, ws, main) = agreed();
+        let installed = |vm: &Path, _: &GitWorkspace| {
             fs::create_dir_all(vm.join("dep/sub")).unwrap();
             fs::write(vm.join("dep/sub/x.txt"), "installed\n").unwrap();
-        });
-        ws.mirror_from(&main, tip, snap, false).unwrap();
+        };
+        let (tip, snap) = checkout_state(&ws, dir.path(), installed);
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
         assert!(dir.path().join("dep/sub/x.txt").exists());
 
         fs::write(dir.path().join(".gitignore"), "/dep/\n").unwrap();
-        let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, _| {
-            fs::create_dir_all(vm.join("dep/sub")).unwrap();
-            fs::write(vm.join("dep/sub/x.txt"), "installed\n").unwrap();
-        });
-        match ws.mirror_from(&main, tip2, snap2, false).unwrap() {
-            Mirror::Outgoing { changes } => {
-                let paths: Vec<_> = changes.iter().map(|c| c.path.clone()).collect();
-                assert_eq!(paths, [PathBuf::from(".gitignore")]);
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(ws
-            .folder_changes()
-            .unwrap()
-            .iter()
-            .all(|c| !c.path.starts_with("dep")));
+        let (tip, snap) = checkout_state(&ws, dir.path(), installed);
+        let took = Took::default();
+        done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert_eq!(
+            took.sent(),
+            vec![(".gitignore".into(), Some("/dep/\n".into()))]
+        );
+        assert!(dir.path().join("dep/sub/x.txt").exists());
     }
 
     #[test]
@@ -1563,27 +1517,23 @@ mod tests {
         });
         let main = ws.branch_name().unwrap();
         assert_eq!(
-            ws.mirror_from(&main, new_tip, old_snap, false).unwrap(),
+            ws.mirror_from(&main, new_tip, old_snap, None, &Took::default())
+                .unwrap(),
             Mirror::Stale
         );
     }
 
     #[test]
     fn a_pass_the_disk_cannot_take_writes_nothing() {
-        let (dir, ws) = repo();
-        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-        ws.stage(Path::new("a.txt")).unwrap();
-        ws.commit("first").unwrap();
-        let main = ws.branch_name().unwrap();
-        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
-        ws.mirror_from(&main, tip, snap, false).unwrap();
-
-        let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, _| {
+        let (dir, ws, main) = agreed();
+        fs::write(dir.path().join("dropped.txt"), "mine\n").unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
             fs::write(vm.join("big.bin"), vec![7u8; 4096]).unwrap();
         });
         let asked = std::cell::Cell::new(0u64);
+        let took = Took::default();
         let result = ws
-            .mirror_from_within(&main, tip2, snap2, false, &|bytes| {
+            .mirror_from_within(&main, tip, snap, None, &took, &|bytes| {
                 asked.set(bytes);
                 Some("no room".into())
             })
@@ -1596,6 +1546,7 @@ mod tests {
         );
         assert_eq!(asked.get(), 4096, "the bytes the pass would write");
         assert!(!dir.path().join("big.bin").exists());
+        assert!(took.sent().is_empty(), "nor anything sent");
     }
 
     #[test]
@@ -1607,16 +1558,20 @@ mod tests {
         ws.commit("first").unwrap();
         let main = ws.branch_name().unwrap();
         let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
-        ws.mirror_from(&main, tip, snap, false).unwrap();
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
 
         let (tip2, snap2) = checkout_state(&ws, dir.path(), |vm, _| {
             fs::remove_dir_all(vm.join("a")).unwrap();
             fs::write(vm.join("a"), "a file now\n").unwrap();
         });
-        assert!(matches!(
-            ws.mirror_from(&main, tip2, snap2, false).unwrap(),
-            Mirror::Applied { .. }
-        ));
+        let pass = done(
+            ws.mirror_from(&main, tip2, snap2, None, &Took::default())
+                .unwrap(),
+        );
+        assert_eq!((pass.received, pass.missed), (2, 0), "{pass:?}");
         assert_eq!(
             fs::read_to_string(dir.path().join("a")).unwrap(),
             "a file now\n"
@@ -1651,7 +1606,7 @@ mod tests {
     /// An ignored file is never written over; once the rule that ignored
     /// it is gone, it is an ordinary path, and the folder's version and
     /// the checkout's are two sides of it — different, so asked about,
-    /// with neither sent over the other.
+    /// with neither sent over the other (P7).
     #[test]
     fn an_unignored_file_on_both_sides_is_asked_about_never_overwritten() {
         let (dir, ws) = repo();
@@ -1669,7 +1624,10 @@ mod tests {
             fs::write(vm.join(".env"), "SECRET=theirs\n").unwrap();
         };
         let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
-        ws.mirror_from(&main, tip, snap, false).unwrap();
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
         assert_eq!(
             fs::read_to_string(dir.path().join(".env")).unwrap(),
             "SECRET=mine\n",
@@ -1677,10 +1635,10 @@ mod tests {
         );
         // The rule is gone here too now: the two versions are a conflict.
         let (tip, snap) = checkout_state(&ws, dir.path(), checkout);
-        match ws.mirror_from(&main, tip, snap, false).unwrap() {
-            Mirror::Drift { paths } => assert_eq!(paths, vec![PathBuf::from(".env")]),
-            other => panic!("expected the two .env files asked about, got {other:?}"),
-        }
+        let took = Took::default();
+        let pass = done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert_eq!(pass.conflicts, vec![PathBuf::from(".env")]);
+        assert!(took.sent().is_empty());
         assert_eq!(
             fs::read_to_string(dir.path().join(".env")).unwrap(),
             "SECRET=mine\n"
@@ -1705,27 +1663,57 @@ mod tests {
         let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
             fs::write(vm.join(".gitignore"), "/ext/\n").unwrap();
         });
-        ws.mirror_from(&main, tip, snap, false).unwrap();
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
         fs::create_dir_all(dir.path().join("ext")).unwrap();
         fs::write(dir.path().join("ext/notes.txt"), "mine\n").unwrap();
-        assert!(ws.folder_changes().unwrap().is_empty(), "ignored for now");
+        let ignoring = |vm: &Path, _: &GitWorkspace| {
+            fs::write(vm.join(".gitignore"), "/ext/\n").unwrap();
+        };
+        let (tip, snap) = checkout_state(&ws, dir.path(), ignoring);
+        let took = Took::default();
+        done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert!(took.sent().is_empty(), "ignored for now");
 
         // ...and takes the rule back out.
         let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
             fs::write(vm.join(".gitignore"), "").unwrap();
         });
-        ws.mirror_from(&main, tip, snap, false).unwrap();
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
         let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
             fs::write(vm.join(".gitignore"), "").unwrap();
         });
-        match ws.mirror_from(&main, tip, snap, false).unwrap() {
-            Mirror::Outgoing { changes } => assert!(
-                changes.iter().any(|c| c.path == Path::new("ext/notes.txt")),
-                "{changes:?}"
-            ),
-            other => panic!("expected the folder's ext/ to go out, got {other:?}"),
-        }
+        let took = Took::default();
+        done(ws.mirror_from(&main, tip, snap, None, &took).unwrap());
+        assert!(
+            took.sent().iter().any(|(path, _)| path == "ext/notes.txt"),
+            "{:?}",
+            took.sent()
+        );
         assert!(!dir.path().join(".git").join(RETIRED_HELD_FILE).exists());
+    }
+
+    /// A ref an earlier version kept beside the archive is let go at the
+    /// first record.
+    #[test]
+    fn the_retired_sent_ref_is_deleted() {
+        let (dir, ws) = repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        let first = ws.commit("first").unwrap();
+        ws.set_ref(RETIRED_SENT_REF, first).unwrap();
+        let main = ws.branch_name().unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
+        assert_eq!(ws.read_ref(RETIRED_SENT_REF).unwrap(), None);
     }
 
     #[test]
