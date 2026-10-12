@@ -363,3 +363,50 @@ TLC returned an eleven-step trace in which it loses an edit — the case
 under "The pass observes the checkout itself" above, which the sync now
 guards against as well as avoiding.
 
+### The model with git in it
+
+`docs/models/SyncGit.tla` puts the pass inside what the sync asks of git.
+Each side has branches, a HEAD, and a working tree in which a path is
+tracked, untracked, or ignored by that side's own rules; commits are
+shared, each a tree and a parent. The actors edit, commit, switch branches
+as git does — overwriting an ignored file in the way, which is theirs to
+do — and change what their side ignores. The sync's protocol runs a step at
+a time, the actors free to act between any two steps: the folder behind
+follows Personal's commits; the folder ahead carries Personal onto its
+commits, moving the branch alone where the two trees already agree, and
+otherwise stashing Personal's uncommitted work, fast-forwarding, and
+popping it back, with a pop that will not apply cleaned up; either side
+follows the other's switch, Personal refusing over a change of its own;
+divergence and both sides moving are said and left; and then the mirror of
+`Sync.tla`. Git's rules are modelled as git has them: a fast-forward or a
+switch refuses over a local change to a path it changes and over an
+untracked file in the way, and overwrites an ignored one unless told not
+to; a stash takes tracked changes and untracked files but never an ignored
+one; a pop refuses over a local change to a path it touches, and conflicts
+where both changed it.
+
+TLC checks safety — every value an actor wrote held by a working tree, a
+commit, or a listed stash entry, or knowingly replaced — that no conflict's
+markers are left in either tree, and that once the actors stop the sync
+comes to rest agreed or having said why not: 18.2 million distinct states
+over two paths, one of them new, two branches, three edits, two commits
+beyond the first, a switch, a rule change, and a stopped pass, in about
+twenty minutes. Two switches restore what git and the scripts once did, and
+each loses an edit within nine steps: `ProtectIgnored` false (a switch
+Personal follows overwrites an ignored file of its own) and `Cleanup` —
+`"old"`, `reset --hard` and `git clean`, and `"hardreset"`, which is what
+the script still did on 2026-10-12. That one TLC found: Personal's own
+change stashed, the folder's commit fast-forwarded in, and the agent
+editing another tracked file before the pop failed on a conflict; `reset
+--hard` reverted the agent's edit, which no stash or commit held. The
+script now reverts only the paths the stash touched, and of those only one
+holding the stash's version or git's conflict markers (`peer::SYNC_SCRIPT`,
+with a test that reaches the window through a `post-merge` hook), and the
+older cleanup of a stash's conflict leftovers does likewise.
+
+What it leaves out: rebases and other history rewrites (history here only
+grows), merges of divergent branches (said, and left to the user), more
+than one parent, a detached HEAD, submodules, and directories (Sync.tla's
+planner test covers kinds). `build-aux/check-sync-model.sh` runs all eight
+configurations; `--quick` leaves out the long one.
+

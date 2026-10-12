@@ -1744,8 +1744,14 @@ if git ls-files -u | grep -q .; then
   if git stash list | grep -q taste-ide-sync && ! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
     # The leftovers of a taste-ide-sync stash that did not apply, from
     # before the sync learned to leave the tree clean: the stash holds the
-    # changes, so the tree goes back to its commit.
-    git reset -q --hard
+    # changes, so the conflicted paths go back to their commit — those
+    # alone, since their markers are git's and every other path may hold
+    # someone's edit (a reset --hard here took those too; see the cleanup
+    # below).
+    git diff --name-only --diff-filter=U | while IFS= read -r p; do
+      if git cat-file -e "HEAD:$p" 2>/dev/null; then git checkout -q HEAD -- "$p"; else rm -f -- "$p"; fi
+    done
+    git reset -q
   else
     cleanup
     echo "the checkout has unresolved conflicts in $(git ls-files -u | awk '{print $4}' | sort -u | tr '\n' ' ')- resolve or discard them in the file tree, and the folder's commits follow" >&2
@@ -1793,12 +1799,26 @@ elif ! git merge --ff-only --no-overwrite-ignore -q "$staging"; then
 fi
 cleanup
 if [ "$stashed" = 1 ] && ! git stash pop -q 2>/dev/null; then
-  git reset -q --hard
-  # Only what the failed pop itself put back, each file exactly as the
-  # stash holds it — and the stash is kept. A `git clean` here removed
-  # every untracked file, among them one the stash never held: ignored when
-  # the stash was made, and no longer once the commits it moved to changed
-  # the rules (the sync's simulation, 2026-10-12).
+  # The stash is kept; what the failed pop put in the working tree goes,
+  # and nothing else does. Only the paths the stash touched, and of those
+  # only one holding the stash's own version or git's conflict markers:
+  # a `reset --hard` here reverted every tracked file, among them one the
+  # agent had just edited — after the stash, before the pop — which no
+  # stash or commit held (TLC, docs/models/SyncGit.tla, 2026-10-12).
+  conflicted=$(git diff --name-only --diff-filter=U)
+  git reset -q
+  git diff --name-only 'stash@{0}^1' 'stash@{0}' | while IFS= read -r p; do
+    want=$(git rev-parse -q --verify "stash@{0}:$p" 2>/dev/null || echo none)
+    if [ -f "$p" ] && [ ! -L "$p" ]; then here=$(git hash-object --no-filters -- "$p"); else here=none; fi
+    if printf '%s\n' "$conflicted" | grep -qxF -- "$p" || [ "$here" = "$want" ]; then
+      if git cat-file -e "HEAD:$p" 2>/dev/null; then git checkout -q HEAD -- "$p"; else rm -f -- "$p"; fi
+    fi
+  done
+  # Untracked files likewise: only what the failed pop itself put back,
+  # each exactly as the stash holds it. A `git clean` here removed every
+  # untracked file, among them one the stash never held: ignored when the
+  # stash was made, and no longer once the commits it moved to changed the
+  # rules (the sync's simulation, 2026-10-12).
   if git rev-parse -q --verify 'stash@{0}^3' >/dev/null; then
     git ls-tree -r --name-only 'stash@{0}^3' | while IFS= read -r p; do
       if [ -f "$p" ] && [ ! -L "$p" ] \
@@ -2257,6 +2277,58 @@ mod tests {
         fn read(&self, p: &str) -> Option<String> {
             std::fs::read_to_string(self.pair.dir.join(p)).ok()
         }
+    }
+
+    /// TLC's trace (docs/models/SyncGit.tla, Cleanup = "hardreset"): the
+    /// folder's commit carried into Personal over Personal's own change to
+    /// the same file, whose stash will not pop back; meanwhile — after the
+    /// stash, before the pop — the agent edits another file. Its edit is
+    /// in no stash and no commit, and the failed pop's cleanup must leave
+    /// it: a `reset --hard` there reverted it. The window is reached with a
+    /// post-merge hook, which git runs between the fast-forward and the pop.
+    #[test]
+    fn an_edit_during_a_failed_pop_is_kept() {
+        let whole = Whole::new("pop-race");
+        let pair = &whole.pair;
+        pair.write("folder", "b.txt", "b\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "b");
+        whole.settle("agreed");
+        // Personal's own change to a.txt, unsynced: the folder's commit to
+        // the same file will conflict with it when the stash pops back.
+        pair.write("checkout", "a.txt", "Personal's\n");
+        pair.write("folder", "a.txt", "the folder's\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "the folder's a");
+        let hook = pair.dir.join("checkout/.git/hooks/post-merge");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'the agent, meanwhile\\n' > b.txt\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let pass = whole.pass("the commit, over Personal's change");
+        std::fs::remove_file(&hook).unwrap();
+        assert!(
+            pass.note.as_deref().is_some_and(|n| n.contains("stash")),
+            "{pass:?}"
+        );
+        assert_eq!(
+            whole.read("checkout/b.txt").as_deref(),
+            Some("the agent, meanwhile\n"),
+            "the agent's edit is kept"
+        );
+        assert_eq!(
+            whole.read("checkout/a.txt").as_deref(),
+            Some("the folder's\n"),
+            "the pop's own conflict is cleared"
+        );
+        assert!(
+            pair.git("checkout", &["stash", "list"])
+                .contains("taste-ide-sync"),
+            "Personal's own change is kept in the stash"
+        );
     }
 
     /// An edit the folder sent, then committed and reverted in the folder

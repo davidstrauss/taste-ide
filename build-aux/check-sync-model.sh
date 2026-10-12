@@ -22,9 +22,23 @@
 # can see the bugs the redesign closed, rather than passing because it sees
 # nothing — and why the sync needs both halves of it.
 #
+# Then docs/models/SyncGit.tla, the same pass with git around it — commits,
+# branches, Personal carried onto the folder's commits through a stash, each
+# side following the other's switch — on four more:
+#
+#   SyncGit           the sync as it is: every property holds. The longest
+#                     run here, about twenty minutes.
+#   SyncGitIgnored    a fast-forward or a switch overwrites an ignored file,
+#                     as git's defaults do: a version of Personal's is lost.
+#   SyncGitHardReset  a stash that will not pop back is cleaned with reset
+#                     --hard: an agent's edit made meanwhile is lost.
+#   SyncGitClean      reset --hard and git clean: likewise.
+#
+# `--quick` leaves out the long run.
+#
 # TLC runs from the release's own jar, checked against its digest, in a JRE
 # image pinned by digest; neither is installed on this host. Each run is
-# capped at 4 GiB.
+# capped at 6 GiB.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -46,10 +60,11 @@ failed=0
 check() {
     config=$1
     want=$2
-    out=$(podman run --rm --memory=4g --memory-swap=4g \
+    module=${3:-Sync}
+    out=$(podman run --rm --memory=6g --memory-swap=6g \
         -v "$ROOT/docs/models:/models:ro,z" -v "$CACHE:/tla:ro,z" \
-        "$IMAGE" java -XX:+UseParallelGC -cp "/tla/tla2tools-$JAR_VERSION.jar" \
-        tlc2.TLC -workers 4 -metadir /tmp/tlc -config "/models/$config.cfg" /models/Sync.tla 2>&1) || true
+        "$IMAGE" java -Xmx4g -XX:+UseParallelGC -cp "/tla/tla2tools-$JAR_VERSION.jar" \
+        tlc2.TLC -workers 4 -metadir /tmp/tlc -config "/models/$config.cfg" "/models/$module.tla" 2>&1) || true
     states=$(printf '%s\n' "$out" | grep -E 'distinct states found' | tail -1)
     if printf '%s\n' "$out" | grep -q 'No error has been found'; then
         got=holds
@@ -71,4 +86,8 @@ check Sync holds
 check SyncNotFresh loses-an-edit
 check SyncNoCas loses-an-edit
 check SyncOld loses-an-edit
+check SyncGitIgnored loses-an-edit SyncGit
+check SyncGitHardReset loses-an-edit SyncGit
+check SyncGitClean loses-an-edit SyncGit
+[ "${1:-}" = "--quick" ] || check SyncGit holds SyncGit
 exit $failed
