@@ -1717,6 +1717,7 @@ impl Supervisor {
             for change in &changes {
                 crate::peer::send_change(&files, &path, change)?;
             }
+            crate::peer::prune_emptied(&files, &path, &changes);
             git.record_sent(&changes)?;
             crate::peer::send_submodules_folder_side(&git, &self.env.peer, &files, &path)?;
             let name = taste_git::snapshot_ref(self.env.id.as_str());

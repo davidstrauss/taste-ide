@@ -1386,6 +1386,7 @@ pub fn send_submodules_folder_side(
         for change in &changes {
             send_change(files, &there, change)?;
         }
+        prune_emptied(files, &there, &changes);
         inner.record_sent(&changes)?;
         snapshot_in_checkout(files, &there)?;
         send_submodules_folder_side(&inner, &clone, files, &there)?;
@@ -1524,6 +1525,7 @@ fn settle_mirror(
                     }
                 }
             }
+            prune_emptied(files, path, &sent);
             // What did go is recorded as sent even when a later path
             // failed, so the next pass does not mistake it for the
             // checkout's own change.
@@ -1545,6 +1547,40 @@ fn settle_mirror(
         }
     }
     Ok(())
+}
+
+/// The directories the folder's removals in `changes` left empty in the
+/// checkout at `path`, removed, up to the checkout and never past it — as
+/// the mirror does in the folder for the checkout's removals. A directory
+/// renamed in the folder otherwise went over as its files, moved, and an
+/// empty directory under the old name stayed in the checkout, which is
+/// what the panes show (2026-10-12). `rmdir` removes only what is empty,
+/// so a directory something else has written into since stays. Best
+/// effort: nothing depends on an empty directory going.
+pub fn prune_emptied(files: &Files, path: &Path, changes: &[taste_git::mirror::Change]) {
+    let mut dirs: Vec<String> = changes
+        .iter()
+        .filter(|change| change.content.is_none())
+        .filter_map(|change| change.path.parent())
+        .filter(|parent| {
+            !parent.as_os_str().is_empty()
+                && parent
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+        })
+        .map(|parent| parent.display().to_string())
+        .collect();
+    if dirs.is_empty() {
+        return;
+    }
+    dirs.sort();
+    dirs.dedup();
+    let mut argv: Vec<String> = ["rmdir", "--ignore-fail-on-non-empty", "-p", "--"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    argv.extend(dirs);
+    let _ = files.exec(path, &argv);
 }
 
 /// One of the folder's changes, written into the checkout at `path` over
@@ -2737,6 +2773,79 @@ mod tests {
             pair.git("folder/tpl", &["rev-parse", "HEAD"]),
             "and the submodule's with it, in the same pass"
         );
+    }
+
+    /// A directory renamed on either side arrives renamed on the other:
+    /// its files under the new name, and nothing — not an empty directory —
+    /// under the old one.
+    #[test]
+    fn a_directory_renamed_on_either_side_moves_on_the_other() {
+        let pair = Pair::new("dirmove");
+        pair.git(
+            "checkout",
+            &["config", "receive.denyCurrentBranch", "updateInstead"],
+        );
+        let ssh = pair.dir.join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\nfor last; do :; done\nexec sh -c \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let keys = Keys::at(pair.dir.join("keys")).with_ssh_for_tests(&ssh);
+        let vm = Vm {
+            domain: "test".into(),
+            ssh_port: 22,
+            workspace_root: pair.dir.join("folder"),
+            state: crate::provision::DomainState::Running,
+            cloud: None,
+        };
+        let files = Files::Local;
+        let folder = pair.dir.join("folder");
+        let checkout = pair.dir.join("checkout");
+        let sync = |step: &str| {
+            snapshot_in_checkout(&files, &checkout).unwrap();
+            sync_primary_peer_with(
+                &folder,
+                &vm,
+                &keys,
+                &files,
+                &checkout,
+                false,
+                &|_, _, _| {},
+                &|_| {},
+            )
+            .unwrap_or_else(|e| panic!("{step}: {e:#}"))
+        };
+        let settle = |step: &str| {
+            for pass in 0..4 {
+                let done = sync(&format!("{step}, pass {pass}"));
+                assert!(done.conflicts.is_empty(), "{step}: {done:?}");
+            }
+        };
+        let read = |p: &str| std::fs::read_to_string(pair.dir.join(p)).ok();
+        let gone = |p: &str| !pair.dir.join(p).exists();
+
+        std::fs::create_dir_all(folder.join("docs/deep")).unwrap();
+        pair.write("folder", "docs/a.md", "a\n");
+        pair.write("folder", "docs/deep/b.md", "b\n");
+        settle("the folder adds docs/");
+        assert_eq!(read("checkout/docs/deep/b.md").as_deref(), Some("b\n"));
+
+        std::fs::rename(folder.join("docs"), folder.join("notes")).unwrap();
+        settle("the folder renames docs/ to notes/");
+        assert_eq!(read("checkout/notes/a.md").as_deref(), Some("a\n"));
+        assert_eq!(read("checkout/notes/deep/b.md").as_deref(), Some("b\n"));
+        assert!(gone("checkout/docs"), "no docs/ left in the checkout");
+        assert!(gone("folder/docs"), "nor written back to the folder");
+
+        std::fs::rename(checkout.join("notes"), checkout.join("papers")).unwrap();
+        settle("the checkout renames notes/ to papers/");
+        assert_eq!(read("folder/papers/a.md").as_deref(), Some("a\n"));
+        assert_eq!(read("folder/papers/deep/b.md").as_deref(), Some("b\n"));
+        assert!(gone("folder/notes"), "no notes/ left in the folder");
+        assert!(gone("checkout/notes"), "nor written back to the checkout");
     }
 
     /// A branch rewritten in Personal — an agent's rebase — follows into
