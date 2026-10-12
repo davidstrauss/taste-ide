@@ -79,11 +79,23 @@ writes or removes p on a side only while that side holds A(p) there, and it
 checks that at the moment of the write, not at the moment of the decision. A
 side that changed p after the pass observed it keeps its change, which the
 next pass finds. This is the property every other one serves; Unison calls
-it "never overwrites a change".
+it "never overwrites a change". "Nowhere else" counts the two working
+copies, every commit either repository holds, and one more place: when a
+commit reaches the checkout over uncommitted work that does not apply on
+top of it, that work is kept in the checkout's `taste-ide-sync` stash, said
+in the sync's note and offered by the file tree's Unstash
+(`peer::push_ahead_into_checkout`). A commit made over a pending conflict
+is the committer's choice, as git has it: they committed their working
+copy over what HEAD held there, and what HEAD held is in history.
 
 **P2 — Conflicts are asked, never guessed.** A path both sides changed,
 differently, is written on neither side until the user answers, and the
-answer writes only the paths it was about.
+answer writes only the paths it was about. An answer decides its paths
+whichever side changed them — a file one side made where the other holds a
+directory is a conflict of kinds, and answered as surely — with one
+exception: an answer whose write would meet a file the folder ignores is
+held, since the sync never removes an ignored file (P7), and the user moves
+it.
 
 **P3 — Propagation.** A path changed on exactly one side reaches the other
 within a bounded number of passes once both sides are quiet, unless a
@@ -156,7 +168,16 @@ removals emptied stayed in the checkout until 096b680 (P11).
   second ref is retired, and deleted where found.
 - **The pass observes the checkout itself.** Every pass begins by
   snapshotting the checkout, so it decides on C as it stands, not as it
-  stood when something last asked (`peer::sync_primary_peer_with`).
+  stood when something last asked (`peer::sync_primary_peer_with`). This is
+  a safety requirement, not a convenience: a snapshot from before a pass's
+  own writes reads them as the checkout changing the paths back, and the
+  write carrying that "change" into the folder passes its check, since the
+  folder holds exactly what the pass expected — so the folder's edit is
+  gone from both sides a pass later. The check at the write guards the
+  side written; only a fresh look guards the side read from. The archive
+  records the snapshot each pass decided on and whether it wrote into the
+  checkout, and a pass offered that same snapshot again is `Stale`.
+  (The model checker found this; see below.)
 - **Every write is a compare-and-swap.** Each carries the entry its side
   held when the pass observed it, and lands only if that is still there —
   checked once before anything is done and again after the new content is
@@ -197,7 +218,8 @@ In order, each building on the one before.
    path as each write lands; C observed by the pass itself, at its start;
    and every write a compare-and-swap against what the pass observed, on
    both sides.
-3. **Seeded simulation of whole passes.** The real sync, both ways, over
+3. **Seeded simulation of whole passes.** (Built: `taste_devcontainer`'s
+   `sync_sim`, described below.) The real sync, both ways, over
    local repositories with a stand-in for the VM, driven by a random
    schedule of edits on both sides — writes, removals, renames of files and
    directories, kind changes, rule changes — interleaved at every step of a
@@ -208,9 +230,89 @@ In order, each building on the one before.
    prints its seed, and the seed replays it. This is Dropbox's practice for
    its sync engine (*Testing sync at Dropbox*, 2020: CanopyCheck for the
    planner, Trinity for the whole engine).
-4. **A model of the protocol, model-checked.** A TLA+ specification of the
+4. **A model of the protocol, model-checked.** (Built: `docs/models`,
+   described below.) A TLA+ specification of the
    pass — observations, decisions, writes, archive updates — with
    concurrent edits on both sides at every step, checked with TLC for every
    interleaving over a small universe rather than a sample of them. It
    proves the design rather than the code; the simulation ties the code to
    it.
+
+## The simulation, as built
+
+`crates/taste-devcontainer/src/sync_sim.rs` runs the real sync, both ways,
+between two repositories on one machine — the VM's end stood in for by an
+ssh that runs git's far end locally — under a seeded schedule. The actors
+write, remove, and rename files, rename a directory whole, make a file a
+directory and back, flip the executable bit, write an ignored file, and
+commit (one side at a time between passes that bring the two onto one
+commit: both committing is a divergence this document leaves to the user).
+They act at every step a pass reports — before it observes the checkout,
+during the fetch, before each write it sends — and a pass may be stopped at
+any of those steps, or have a directory in the folder refuse its writes.
+
+Then the two sides are left quiet, every conflict is answered (a side the
+seed picks), and the specification is checked against what the actors did:
+
+- **P1 by a ledger.** Every version an actor writes records what it
+  replaced on its side, and every version ever written must be held — in a
+  working copy, a commit, or the sync's stash — or replaced, through that
+  chain, by one that is. The ledger knows a version by its bytes: git
+  merges one side's new bytes with the other's new mode cleanly, into a
+  version neither wrote whole, and the mode is held by P4.
+- **Nothing the actors did not write** is in either working copy.
+- **P4**: the same files and modes on both sides, one commit, and a further
+  pass that writes nothing.
+- **P7**: each side's ignored file is its own last write.
+
+`cargo test -p taste-devcontainer sync_sim` runs three seeds;
+`cargo test -p taste-devcontainer sim_ -- --ignored` runs
+`TASTE_SYNC_SIM_SEEDS` (default 50) from `TASTE_SYNC_SIM_FROM` (default
+1000); `TASTE_SYNC_SIM_SEED=<n>` replays one, printing its schedule on
+failure. It found, in its first runs: the folder's snapshot failing every
+pass once the checkout made a file a directory (`snapshot::worktree_tree`
+cleared only the other direction from its base), and an answered conflict
+of kinds asked about again forever (`plan` applied an answer only where
+both sides had changed the path). Both are fixed, with tests of their own,
+and the planner's exhaustive test now holds that an answer leaves no
+conflict.
+
+Not yet in its schedule: symbolic links, submodules, rule changes
+(`.gitignore` and `taste-sync` moving under the sync), branch switches, and
+commits on both sides at once.
+
+## The model, as built
+
+`docs/models/Sync.tla` is the pass as a protocol: two working copies, the
+archive, a pass that observes both, decides every path by the table,
+writes each decision to its side, and records what landed — with the
+actors editing either side at every step, a snapshot of the checkout taken
+whenever something asks, and a pass that may stop partway. Kinds and scope
+are left to the planner's exhaustive test; here a path holds a value, every
+value an actor writes is new, and a removal is one more new value. It
+checks, for every interleaving over three paths, four edits, and two
+stopped passes (672,714 distinct states, under a minute):
+
+- **Safety (P1)**: every value an actor wrote is held by a side, or was
+  replaced by an actor with one that is.
+- **QuietIsQuiet (P4, P6)**: a pass over settled copies plans no write.
+- **Converges (P4)**: once the actors are done, the sync reaches a state
+  where the two agree on every path that is not a conflict — given that it
+  keeps running.
+
+Two switches put the sync as it was into the same model: `CAS`, whether a
+write checks its side at the write, and `Fresh`, whether a pass observes
+the checkout itself. `build-aux/check-sync-model.sh` runs TLC (the
+release's jar, digest checked, in a JRE image pinned by digest, neither
+installed on the host) on all four combinations and holds each to its
+outcome: the sync as it is holds every property; each of the other three
+loses an edit, which is the model showing it can see the bug rather than
+passing because it sees nothing.
+
+It found one thing the simulation had not, because the simulation never
+runs a pass on an old snapshot: checked writes alone are not safe. The
+configuration with them and a lagging snapshot was expected to hold, and
+TLC returned an eleven-step trace in which it loses an edit — the case
+under "The pass observes the checkout itself" above, which the sync now
+guards against as well as avoiding.
+

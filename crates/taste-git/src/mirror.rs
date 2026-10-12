@@ -91,6 +91,11 @@ const RECORDED_ON: &str = "taste mirror on ";
 /// How the mirror's baseline commit names the commit that branch was at.
 const RECORDED_TIP: &str = "Tip: ";
 
+/// How the archive names the snapshot the pass that recorded it observed
+/// the checkout through, and says that pass wrote into the checkout.
+const RECORDED_SNAPSHOT: &str = "Snapshot: ";
+const RECORDED_WROTE: &str = "Wrote the checkout.";
+
 /// What a side's HEAD names, which is where it stands. Whatever commit-ish
 /// is checked out — a branch, a tag, a remote branch, `HEAD~2`, a hash —
 /// HEAD ends up holding one of two things: a branch, or the commit the
@@ -284,6 +289,18 @@ impl GitWorkspace {
         if !based_on_tip && target.id() != tip_commit.tree_id() {
             return Ok(Mirror::Stale);
         }
+        // The snapshot the last pass decided on, when that pass wrote into
+        // the checkout, is from before those writes: it would read each of
+        // them as the checkout changing the path back, and the write that
+        // carried that "change" here would pass its check, since the folder
+        // holds what the pass expected — and the folder's edit would be
+        // gone from both sides a pass later. The check at the write guards
+        // the side written; only a fresh look guards the side read from.
+        // TLC found this (docs/models, SyncNotFresh); every pass takes a
+        // fresh snapshot, and this holds it to that.
+        if self.recorded_observation()? == Some((snapshot, true)) {
+            return Ok(Mirror::Stale);
+        }
 
         // A folder switched here to a branch of its own is not followed
         // back to Personal's: the switch is the folder's act, and the peer
@@ -414,7 +431,8 @@ impl GitWorkspace {
             |i| landed_checkout[i],
         );
         let tree = self.tree_from(archive_tree, &next)?;
-        self.record_at(tree, local, tip)?;
+        let wrote_checkout = landed_checkout.iter().any(|l| *l);
+        self.record_observed(tree, local, tip, Some((snapshot, wrote_checkout)))?;
         let landed = |l: &[bool]| l.iter().filter(|x| **x).count();
         Ok(Mirror::Done(Pass {
             received: landed(&landed_folder),
@@ -492,7 +510,7 @@ impl GitWorkspace {
             bail!("this folder has no branch {branch}");
         };
         let tree = self.repo.find_commit(tip)?.tree_id();
-        self.record_mirror(tree, &local)
+        self.record_mirror(tree, &local, "")
     }
 
     /// Record that Personal followed this folder to its detached HEAD at
@@ -549,20 +567,58 @@ impl GitWorkspace {
     /// [`Self::record_mirror`] for either position: the branch `local`
     /// names, or — `None` — a HEAD detached at `tip`.
     fn record_at(&self, tree: Oid, local: Option<&str>, tip: Oid) -> Result<()> {
+        self.record_observed(tree, local, tip, None)
+    }
+
+    /// [`Self::record_at`], with the snapshot a pass observed the checkout
+    /// through and whether it wrote there, which the next pass reads
+    /// ([`Self::recorded_observation`]).
+    fn record_observed(
+        &self,
+        tree: Oid,
+        local: Option<&str>,
+        tip: Oid,
+        observed: Option<(Oid, bool)>,
+    ) -> Result<()> {
+        let observed = observed
+            .map(|(snapshot, wrote)| {
+                let wrote = if wrote {
+                    format!("\n{RECORDED_WROTE}")
+                } else {
+                    String::new()
+                };
+                format!("\n\n{RECORDED_SNAPSHOT}{snapshot}{wrote}")
+            })
+            .unwrap_or_default();
         match local {
-            Some(local) => self.record_mirror(tree, local),
-            None => self.record_mirror_detached(tree, tip),
+            Some(local) => self.record_mirror(tree, local, &observed),
+            None => self.record_mirror_detached(tree, tip, &observed),
         }
     }
 
-    fn record_mirror_detached(&self, tree: Oid, tip: Oid) -> Result<()> {
+    /// The snapshot the pass that last recorded the archive observed the
+    /// checkout through, and whether that pass wrote into the checkout.
+    fn recorded_observation(&self) -> Result<Option<(Oid, bool)>> {
+        let Some(oid) = self.read_ref(MIRROR_REF)? else {
+            return Ok(None);
+        };
+        let last = self.repo.find_commit(oid)?;
+        let message = last.message().unwrap_or_default();
+        Ok(message
+            .lines()
+            .find_map(|line| line.strip_prefix(RECORDED_SNAPSHOT))
+            .and_then(|id| Oid::from_str(id.trim()).ok())
+            .map(|id| (id, message.lines().any(|line| line == RECORDED_WROTE))))
+    }
+
+    fn record_mirror_detached(&self, tree: Oid, tip: Oid, observed: &str) -> Result<()> {
         if self.read_ref(RETIRED_SENT_REF)?.is_some() {
             if let Ok(mut sent) = self.repo.find_reference(RETIRED_SENT_REF) {
                 sent.delete()?;
             }
         }
         let message = format!(
-            "{RECORDED_ON}{DETACHED}\n\nThe folder as the IDE last wrote it.\n\n{RECORDED_TIP}{tip}"
+            "{RECORDED_ON}{DETACHED}\n\nThe folder as the IDE last wrote it.\n\n{RECORDED_TIP}{tip}{observed}"
         );
         if let Some(oid) = self.read_ref(MIRROR_REF)? {
             let last = self.repo.find_commit(oid)?;
@@ -739,7 +795,7 @@ impl GitWorkspace {
     /// with the branch the folder is on (`local`), which is how a switch
     /// the user makes here is told from one the checkout made
     /// ([`Self::switched_here`]). What was sent before is agreement now.
-    fn record_mirror(&self, tree: Oid, local: &str) -> Result<()> {
+    fn record_mirror(&self, tree: Oid, local: &str, observed: &str) -> Result<()> {
         if self.read_ref(RETIRED_SENT_REF)?.is_some() {
             if let Ok(mut sent) = self.repo.find_reference(RETIRED_SENT_REF) {
                 sent.delete()?;
@@ -752,7 +808,8 @@ impl GitWorkspace {
             .read_ref(local)?
             .map(|oid| format!("\n\n{RECORDED_TIP}{oid}"))
             .unwrap_or_default();
-        let message = format!("{RECORDED_ON}{local}\n\nThe folder as the IDE last wrote it.{tip}");
+        let message =
+            format!("{RECORDED_ON}{local}\n\nThe folder as the IDE last wrote it.{tip}{observed}");
         if let Some(oid) = self.read_ref(MIRROR_REF)? {
             let last = self.repo.find_commit(oid)?;
             if last.tree_id() == tree && last.message() == Some(message.as_str()) {
@@ -1696,6 +1753,41 @@ mod tests {
             took.sent()
         );
         assert!(!dir.path().join(".git").join(RETIRED_HELD_FILE).exists());
+    }
+
+    /// The snapshot a pass decided on is stale once that pass wrote into
+    /// the checkout: decided on again, it would read the pass's own writes
+    /// as the checkout changing back (TLC's SyncNotFresh).
+    #[test]
+    fn a_snapshot_from_before_the_passs_own_writes_is_stale() {
+        let (dir, ws, main) = agreed();
+        fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |_, _| {});
+        let took = Took::default();
+        assert_eq!(
+            done(ws.mirror_from(&main, tip, snap, None, &took).unwrap()).sent,
+            1
+        );
+        assert_eq!(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+            Mirror::Stale
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "two\n"
+        );
+        // A fresh look, holding the write, is decided as ever.
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join("a.txt"), "two\n").unwrap();
+        });
+        assert_eq!(
+            done(
+                ws.mirror_from(&main, tip, snap, None, &Took::default())
+                    .unwrap()
+            ),
+            Pass::default()
+        );
     }
 
     /// A ref an earlier version kept beside the archive is let go at the
