@@ -245,13 +245,25 @@ impl GitWorkspace {
                     // converted — 3,305 archived .eml files in the finance
                     // checkout, rewritten with LF minutes after each was
                     // saved (2026-10-11). Streamed, not read whole.
-                    let blob = (|| -> Result<Oid> {
-                        let mut file = std::fs::File::open(&absolute)?;
+                    let blob = (|| -> Result<Option<Oid>> {
+                        let mut file = match std::fs::File::open(&absolute) {
+                            Ok(file) => file,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                            Err(e) => return Err(e.into()),
+                        };
                         let mut writer = self.repo.blob_writer(None)?;
                         std::io::copy(&mut file, &mut writer)?;
-                        Ok(writer.commit()?)
+                        Ok(Some(writer.commit()?))
                     })()
                     .with_context(|| format!("reading {}", absolute.display()))?;
+                    // Gone since its metadata was read, as a database's
+                    // write-ahead log comes and goes: gone, as above.
+                    let Some(blob) = blob else {
+                        if base_tree.get_path(rel).is_ok() {
+                            builder.remove(rel);
+                        }
+                        continue;
+                    };
                     // The executable bit is the only permission git keeps,
                     // and losing it would make a restored checkout fail to
                     // run its own scripts.
@@ -284,8 +296,13 @@ impl GitWorkspace {
 /// scratch index is the script's own — named for its process, so two
 /// snapshots at once do not meet on one index lock, as six did after a
 /// burst of ref moves (2026-10-02) — and is removed however the script
-/// ends. Nothing in it takes an optional lock on the repository the agent
-/// is working in (`GIT_OPTIONAL_LOCKS=0`). An unchanged working
+/// ends. A file that changes while it is read, the commonest of them, has
+/// a second `add -A`, and a synced file one of its own
+/// ([`crate::sync_ignored::snapshot_lines`]). Two at once still meet on the
+/// ref: the one that loses the race parents its commit on the winner's and
+/// tries again, where it once failed the snapshot ("cannot lock ref …
+/// expected", 2026-10-12). Nothing in it takes an optional lock on the
+/// repository the agent is working in (`GIT_OPTIONAL_LOCKS=0`). An unchanged working
 /// copy writes nothing and says so. The last line is what
 /// [`parse_script_output`] reads: the commit, and `wrote` or `unchanged`.
 ///
@@ -309,24 +326,30 @@ export GIT_OPTIONAL_LOCKS=0
 name='{name}'
 gitdir=$(git rev-parse --git-dir)
 export GIT_INDEX_FILE="$gitdir/taste-snapshot-index.$$"
-trap 'rm -f "$GIT_INDEX_FILE" "$GIT_INDEX_FILE.roots"' EXIT
-rm -f "$GIT_INDEX_FILE"
-head=$(git rev-parse --verify -q HEAD || true)
-if [ -n "$head" ]; then git read-tree "$head"; fi
-git add -A -- .
-{synced}tree=$(git write-tree)
+trap 'rm -f "$GIT_INDEX_FILE" "$GIT_INDEX_FILE.roots" "$GIT_INDEX_FILE.synced" "$GIT_INDEX_FILE.kept"' EXIT
 rm -f "$GIT_INDEX_FILE"
 prev=$(git rev-parse --verify -q "$name" || true)
+head=$(git rev-parse --verify -q HEAD || true)
+if [ -n "$head" ]; then git read-tree "$head"; fi
+git add -A -- . 2>/dev/null || git add -A -- .
+{synced}tree=$(git write-tree)
+rm -f "$GIT_INDEX_FILE"
 if [ -n "$head" ]; then msg="taste snapshot against $head"; else msg="taste snapshot against an unborn branch"; fi
-if [ -n "$prev" ] && [ "$(git rev-parse "$prev^{{tree}}")" = "$tree" ] \
-   && [ "$(git log -1 --format=%B "$prev")" = "$msg" ]; then
-  printf '%s unchanged
+tries=0
+while :; do
+  if [ -n "$prev" ] && [ "$(git rev-parse "$prev^{{tree}}")" = "$tree" ] \
+     && [ "$(git log -1 --format=%B "$prev")" = "$msg" ]; then
+    printf '%s unchanged
 ' "$prev"
-  exit 0
-fi
-parent="${{prev:-$head}}"
-if [ -n "$parent" ]; then commit=$(git commit-tree "$tree" -p "$parent" -m "$msg"); else commit=$(git commit-tree "$tree" -m "$msg"); fi
-if [ -n "$prev" ]; then git update-ref "$name" "$commit" "$prev"; else git update-ref "$name" "$commit"; fi
+    exit 0
+  fi
+  parent="${{prev:-$head}}"
+  if [ -n "$parent" ]; then commit=$(git commit-tree "$tree" -p "$parent" -m "$msg"); else commit=$(git commit-tree "$tree" -m "$msg"); fi
+  if git update-ref "$name" "$commit" "$prev" 2>/dev/null; then break; fi
+  tries=$((tries + 1))
+  if [ "$tries" -ge 3 ]; then git update-ref "$name" "$commit" "$prev"; fi
+  prev=$(git rev-parse --verify -q "$name" || true)
+done
 printf '%s wrote
 ' "$commit"
 "#
@@ -528,6 +551,64 @@ mod tests {
     /// The script and the library agree byte for byte: run on the same
     /// dirty working copy, both produce the same tree. The script needs
     /// `git`, which the devcontainer has; a machine without it skips.
+    /// A synced file that will not read — as one being written fails, and
+    /// as an unreadable one does here — costs that file, not the snapshot:
+    /// the rest land, new files with them, and it keeps the previous
+    /// snapshot's copy rather than reading as deleted.
+    #[test]
+    fn a_synced_file_that_will_not_read_keeps_its_last_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        std::fs::write(root.join(".gitignore"), "data/\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "/data/** taste-sync\n").unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(root.join("data/a.txt"), "a1").unwrap();
+        std::fs::write(root.join("data/b.db"), "b1").unwrap();
+        let text = script("refs/taste/snapshot/script").unwrap();
+        let run = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&text)
+                .current_dir(root)
+                .env(
+                    "GIT_ATTR_SOURCE",
+                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                )
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            parse_script_output(&String::from_utf8_lossy(&out.stdout)).unwrap()
+        };
+        run();
+        std::fs::write(root.join("data/a.txt"), "a2").unwrap();
+        std::fs::write(root.join("data/b.db"), "b2").unwrap();
+        std::fs::write(root.join("data/c.txt"), "c1").unwrap();
+        let db = root.join("data/b.db");
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&db).is_ok() {
+            eprintln!("SKIP: running as a user every file is readable to");
+            return;
+        }
+        let second = run();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(second.wrote);
+        let repo = git2::Repository::open(root).unwrap();
+        let tree = repo.find_commit(second.commit).unwrap().tree().unwrap();
+        let read = |path: &str| {
+            let entry = tree.get_path(Path::new(path)).expect(path);
+            repo.find_blob(entry.id()).unwrap().content().to_vec()
+        };
+        assert_eq!(read("data/a.txt"), b"a2");
+        assert_eq!(read("data/c.txt"), b"c1");
+        assert_eq!(read("data/b.db"), b"b1", "kept from the last snapshot");
+    }
+
     #[test]
     fn the_script_snapshots_exactly_what_the_library_does() {
         if std::process::Command::new("git")

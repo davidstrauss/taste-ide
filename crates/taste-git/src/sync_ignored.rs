@@ -353,6 +353,19 @@ pub const ROOTS_AWK: &str = r#"/^[ \t]*(#|\[attr\])/ { next }
 /// listing — the IDE's git otherwise reads none (`GIT_ATTR_SOURCE`, the
 /// keeper's), and a listing runs no filter — while the `add` keeps reading
 /// none, so no filter the repository names runs on what it adds.
+///
+/// What syncs is often a program's live data, which changes under the
+/// snapshot, and one file that did failed the whole snapshot, so the folder
+/// stopped hearing of anything — a backup written into `data/backups/`
+/// never arrived while a database beside it kept its write-ahead log
+/// coming and going (2026-10-12). So the files go through `update-index
+/// --remove`, which passes over one listed and gone before its turn, as
+/// `add` would not (a download's `.partial`, that log). One that changes
+/// while it is read stops update-index where it stands; then the files go
+/// again in batches, a failing batch file by file, and a file that still
+/// will not read keeps the previous snapshot's copy (`$prev`, which the
+/// script has read by now): left out, it would read as deleted in the
+/// checkout, and go from the folder.
 pub fn snapshot_lines() -> String {
     format!(
         r#"taste_sync_roots='{awk}'
@@ -367,8 +380,18 @@ set --
 while IFS= read -r root; do set -- "$@" ":(attr:{ATTR},literal)${{root:-.}}"; done < "$roots"
 rm -f "$roots"
 if [ $# -gt 0 ]; then
-  ( unset GIT_ATTR_SOURCE; git ls-files -z -o -i --exclude-standard -- "$@" ) \
-    | GIT_LITERAL_PATHSPECS=1 git -c advice.addEmptyPathspec=false add -f --pathspec-from-file=- --pathspec-file-nul
+  synced="$GIT_INDEX_FILE.synced"
+  ( unset GIT_ATTR_SOURCE; git ls-files -z -o -i --exclude-standard -- "$@" ) > "$synced"
+  if ! git update-index --add --remove -z --stdin < "$synced" 2>/dev/null; then
+    kept="$GIT_INDEX_FILE.kept"
+    xargs -0 -r -n 64 sh -c 'git update-index --add --remove -- "$@" 2>/dev/null && exit 0
+      for f; do git update-index --add --remove -- "$f" 2>/dev/null || printf "%s\0" "$f"; done' sh \
+      < "$synced" > "$kept" || true
+    if [ -n "$prev" ] && [ -s "$kept" ]; then
+      xargs -0 sh -c 'GIT_LITERAL_PATHSPECS=1 git ls-tree -z "$0" -- "$@"' "$prev" < "$kept" \
+        | git update-index -z --index-info
+    fi
+  fi
 fi
 "#,
         awk = ROOTS_AWK
