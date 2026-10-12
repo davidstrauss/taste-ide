@@ -3263,13 +3263,20 @@ is shouted, but nothing runs either. The rows say what is missing, and
   disk for other IDE instances to know if the VM that was owned has no
   unique data on it … but not clutter the host disk in a way that's hard
   to clean up"). At the close, after the last snapshot and sync, each
-  running VM of the workspace has its containers stopped — so nothing the
-  project runs writes after the look — and is looked at: every checkout
+  running VM of the workspace is looked at as it runs: every checkout
   on it, and every submodule in those, must have its HEAD, every ref tip,
   and its working tree's tree (through a throwaway index, so nothing is
   touched) in the folder's repository on this host. One that passes gets
-  `<domain>.disposable` beside its disk, naming the disk's inode.
-  Ignored files, volumes, and images are not counted: they are derived,
+  `<domain>.disposable` beside its disk, naming the disk's inode, and a
+  `<domain>.recheck` beside that. The look once stopped every container
+  first, so nothing could write after it, and a relaunch inside the
+  shutdown's grace found the jobs an agent had left running killed (a
+  mail restore, twice). Now the deferred shutdown's sleeper runs the
+  re-check just before it shuts the VM down: the same look, with the
+  containers stopped then, when that costs nothing, and the marker taken
+  back unless the report is byte for byte the one the close saw. A
+  relaunch cancels the sleeper's whole process group, re-check included,
+  and finds the containers up. Ignored files, volumes, and images are not counted: they are derived,
   and an environment is its refs plus its config. The marker is withdrawn
   before the VM is used again, in `LibvirtSession::bring_up`, the one
   path every local VM takes back into use. An IDE whose new VM does not

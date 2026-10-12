@@ -1477,18 +1477,31 @@ impl LibvirtSession {
         }
         // `setsid`, so the sleeper is in its own session and a terminal
         // the IDE was launched from closing does not take it along.
+        // Before each VM goes down, its disposable marker's re-check, when
+        // the close left one (`disposable::recheck_script`): the look again
+        // with the containers stopped, which only now costs nothing.
         let script = format!(
             "echo $$ > \"$2\"; sleep {}; for d in $(virsh -c {SESSION_URI} list --name); do \
-             case \"$d\" in \"$1\"*) virsh -c {SESSION_URI} shutdown \"$d\" >/dev/null 2>&1;; esac; \
+             case \"$d\" in \"$1\"*) r=\"$3/$d.recheck\"; [ -f \"$r\" ] && timeout 60 sh \"$r\"; \
+             virsh -c {SESSION_URI} shutdown \"$d\" >/dev/null 2>&1;; esac; \
              done; rm -f \"$2\"",
             grace.as_secs()
         );
         let prefix = domain_prefix(workspace_root);
         let pin_text = pin.display().to_string();
+        let disks = disks_dir().display().to_string();
         let (program, args) = host_argv(
             self.sandboxed,
             "setsid",
-            ["sh", "-c", &script, "taste-shutdown", &prefix, &pin_text],
+            [
+                "sh",
+                "-c",
+                &script,
+                "taste-shutdown",
+                &prefix,
+                &pin_text,
+                &disks,
+            ],
         );
         std::process::Command::new(program)
             .args(args)
@@ -1524,7 +1537,10 @@ impl LibvirtSession {
         if !ours {
             return false;
         }
-        let (program, args) = host_argv(self.sandboxed, "kill", [pid.to_string()]);
+        // Its whole process group, which `setsid` made its own: a re-check
+        // it is running (`disposable::recheck_script`) stops containers,
+        // and must not go on doing that under the window that cancelled it.
+        let (program, args) = host_argv(self.sandboxed, "kill", ["--".into(), format!("-{pid}")]);
         std::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())

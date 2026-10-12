@@ -221,6 +221,17 @@ impl Keys {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        taste_core::podman::host_argv(self.sandboxed, "ssh", self.ssh_args(port, remote))
+    }
+
+    /// [`Self::ssh_argv`]'s arguments to `ssh`, for a script that already
+    /// runs on the host — the deferred shutdown's sleeper — and so needs no
+    /// way out of the sandbox.
+    pub fn ssh_args<I, S>(&self, port: u16, remote: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let mut args: Vec<String> = vec![
             "-i".into(),
             self.identity().display().to_string(),
@@ -245,7 +256,7 @@ impl Keys {
             format!("{}@127.0.0.1", crate::provision::GUEST_USER),
         ];
         args.extend(remote.into_iter().map(Into::into));
-        taste_core::podman::host_argv(self.sandboxed, "ssh", args)
+        args
     }
 }
 

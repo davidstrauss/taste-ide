@@ -37,6 +37,18 @@
 //! The marker is `<domain>.disposable` beside the disk, and it names the
 //! disk's inode, so a disk that was replaced under the same name does not
 //! inherit it.
+//!
+//! **The close looks without stopping anything.** It used to stop every
+//! container first, so nothing could write after the look; but a relaunch
+//! within the shutdown's grace — the common case — then found every job an
+//! agent had left running killed (2026-10-11: a mail restore, twice). So
+//! the close looks at the VM as it runs, marks it, and leaves beside the
+//! marker a re-check ([`recheck_script`]): the deferred shutdown's sleeper
+//! runs it just before it shuts the VM down, which is when stopping the
+//! containers costs nothing, and it looks again with them stopped and takes
+//! the marker back when anything moved since. A relaunch cancels the
+//! sleeper and finds the containers up; a shutdown still marks only a VM
+//! that was quiet.
 
 use std::path::{Path, PathBuf};
 
@@ -70,9 +82,16 @@ pub fn marker_path(domain: &str) -> PathBuf {
     disks_dir().join(format!("{domain}.disposable"))
 }
 
+/// Where a VM's re-check lives, beside its marker: the script the deferred
+/// shutdown runs before it shuts the VM down ([`recheck_script`]).
+pub fn recheck_path(domain: &str) -> PathBuf {
+    disks_dir().join(format!("{domain}.recheck"))
+}
+
 /// Take a VM's marker back: it is about to be used, and what it holds is
 /// no longer known. Absent is the same as withdrawn.
 pub fn withdraw(domain: &str) {
+    let _ = std::fs::remove_file(recheck_path(domain));
     match std::fs::remove_file(marker_path(domain)) {
         Ok(()) => tracing::info!("{domain}: no longer marked disposable — it is in use"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -190,6 +209,49 @@ echo END
     )
 }
 
+/// The re-check the deferred shutdown runs for a marked VM just before it
+/// shuts it down: the same look, with the containers stopped now, since the
+/// VM is going down; the marker taken back unless the report is the one the
+/// close's look saw (`digest`, the SHA-256 of its output). A guest that does
+/// not answer reports nothing, which is not that report either. It removes
+/// itself.
+pub fn recheck_script(vm: &Vm, digest: &str) -> String {
+    let keys = Keys::for_workspace(&vm.workspace_root);
+    let quote = |arg: &str| format!("'{}'", arg.replace('\'', "'\\''"));
+    let ssh: Vec<String> = keys
+        .ssh_args(vm.ssh_port, ["sh", "-s"])
+        .iter()
+        .map(|arg| quote(arg))
+        .collect();
+    let look = report_script(
+        &crate::provision::guest_workspace_dir(&vm.workspace_root),
+        true,
+    );
+    recheck_text(
+        &vm.domain,
+        &format!("ssh {}", ssh.join(" ")),
+        &look,
+        digest,
+        &marker_path(&vm.domain),
+    )
+}
+
+/// [`recheck_script`] with what it runs `look` through spelled out:
+/// `remote` is a shell command that runs the script on its stdin.
+fn recheck_text(domain: &str, remote: &str, look: &str, digest: &str, marker: &Path) -> String {
+    let quote = |arg: &str| format!("'{}'", arg.replace('\'', "'\\''"));
+    format!(
+        "# taste-ide: before {domain}'s deferred shutdown, confirm its disposable marker\n\
+         got=$({remote} <<'TASTE_REPORT_EOF' | sha256sum | cut -d' ' -f1\n\
+         {look}TASTE_REPORT_EOF\n\
+         )\n\
+         [ \"$got\" = {digest} ] || rm -f {marker}\n\
+         rm -f \"$0\"\n",
+        digest = quote(digest),
+        marker = quote(&marker.display().to_string()),
+    )
+}
+
 /// One checkout's part of a report.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Checkout {
@@ -292,7 +354,7 @@ pub enum Verdict {
 /// Look at a running VM — stopping its containers first when asked — and
 /// mark it when nothing on it is missing here, or take back any marker it
 /// had when something is.
-pub async fn look_and_mark(vm: &Vm, stop_containers: bool) -> Result<Verdict> {
+pub async fn look_and_mark(vm: &Vm, stop_containers: bool, recheck: bool) -> Result<Verdict> {
     let script = report_script(
         &crate::provision::guest_workspace_dir(&vm.workspace_root),
         stop_containers,
@@ -325,6 +387,16 @@ pub async fn look_and_mark(vm: &Vm, stop_containers: bool) -> Result<Verdict> {
         let places: Vec<String> = report.checkouts.iter().map(|c| c.place.clone()).collect();
         let count = places.len();
         write_marker(vm, places)?;
+        if recheck {
+            use sha2::Digest;
+            let digest: String = sha2::Sha256::digest(&output.stdout)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let path = recheck_path(&vm.domain);
+            std::fs::write(&path, recheck_script(vm, &digest))
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
         Ok(Verdict::Marked { checkouts: count })
     } else {
         withdraw(&vm.domain);
@@ -332,9 +404,10 @@ pub async fn look_and_mark(vm: &Vm, stop_containers: bool) -> Result<Verdict> {
     }
 }
 
-/// The window's close: every running VM of the workspace looked at, its
-/// containers stopped first, and marked when nothing on it is missing
-/// here. A VM that does not answer within [`MARK_TIMEOUT`] is left as it
+/// The window's close: every running VM of the workspace looked at as it
+/// runs, and marked when nothing on it is missing here — the marker to be
+/// confirmed, with the containers stopped, just before the VM's deferred
+/// shutdown ([`recheck_script`]). A VM that does not answer within [`MARK_TIMEOUT`] is left as it
 /// is — unmarked, since bringing it up withdrew any marker it had.
 pub async fn mark_workspace_vms(workspace_root: &Path) -> Vec<(String, Result<Verdict>)> {
     let prefix = crate::provision::domain_prefix(workspace_root);
@@ -350,13 +423,14 @@ pub async fn mark_workspace_vms(workspace_root: &Path) -> Vec<(String, Result<Ve
         .filter(|vm| vm.domain.starts_with(&prefix) && vm.state == DomainState::Running)
     {
         looks.spawn(async move {
-            let verdict = match tokio::time::timeout(MARK_TIMEOUT, look_and_mark(&vm, true)).await {
-                Ok(verdict) => verdict,
-                Err(_) => Err(anyhow::anyhow!(
-                    "did not answer within {}s",
-                    MARK_TIMEOUT.as_secs()
-                )),
-            };
+            let verdict =
+                match tokio::time::timeout(MARK_TIMEOUT, look_and_mark(&vm, false, true)).await {
+                    Ok(verdict) => verdict,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "did not answer within {}s",
+                        MARK_TIMEOUT.as_secs()
+                    )),
+                };
             (vm.domain, verdict)
         });
     }
@@ -668,5 +742,55 @@ mod tests {
         assert!(stop < look);
         assert!(!report_script(Path::new("/x"), false).contains("podman stop"));
         assert!(script.trim_end().ends_with("echo END"));
+    }
+
+    /// The re-check keeps the marker when the look reports what the close's
+    /// did, takes it back when the checkout moved since or the guest did not
+    /// answer, and removes itself either way.
+    #[test]
+    fn the_recheck_keeps_the_marker_only_for_the_report_the_close_saw() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("guest");
+        let checkout = workspace.join("primary");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(checkout.join("a.txt"), "one\n").unwrap();
+        let look = report_script(&workspace, false);
+        let report = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&look)
+            .output()
+            .unwrap()
+            .stdout;
+        let digest: String = sha2::Sha256::digest(&report)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let marker = dir.path().join("vm.disposable");
+        let run = |remote: &str| {
+            std::fs::write(&marker, "").unwrap();
+            let script = dir.path().join("vm.recheck");
+            std::fs::write(&script, recheck_text("vm", remote, &look, &digest, &marker)).unwrap();
+            assert!(std::process::Command::new("sh")
+                .arg(&script)
+                .status()
+                .unwrap()
+                .success());
+            assert!(!script.exists(), "the re-check removes itself");
+            marker.exists()
+        };
+        assert!(run("sh -s"), "nothing moved: the marker stays");
+        assert!(!run("false"), "no answer: the marker goes");
+        std::fs::write(checkout.join("a.txt"), "two\n").unwrap();
+        assert!(!run("sh -s"), "the checkout moved: the marker goes");
     }
 }
