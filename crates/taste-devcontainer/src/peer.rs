@@ -873,7 +873,11 @@ pub fn sync_primary_peer_with(
     // older picture took an agent's edit since for no change at all, and
     // sent the folder's over it (docs/SYNC.md → "The design as built").
     say("looking at Personal's working copy");
-    snapshot_in_checkout(files, path)?;
+    let written_over = taste_git::GitWorkspace::discover(peer)
+        .map(|git| git.snapshot_written_over())
+        .transpose()?
+        .flatten();
+    snapshot_in_checkout_avoiding(files, path, written_over)?;
     // What Personal's HEAD names, from its own file. A detached one is
     // pinned to a ref first, so the fetch brings its commit: a commit no
     // branch holds is otherwise one the folder never receives.
@@ -1378,8 +1382,19 @@ pub fn share_submodules_remotes(peer: &Path, vm: &Vm, keys: &Keys, files: &Files
 }
 
 /// Personal's snapshot of the working copy at `path`, taken there.
+#[cfg(test)]
 fn snapshot_in_checkout(files: &Files, path: &Path) -> Result<()> {
-    let script = taste_git::snapshot::script(&taste_git::snapshot_ref("primary"))?;
+    snapshot_in_checkout_avoiding(files, path, None)
+}
+
+/// [`snapshot_in_checkout`], never `avoid`
+/// ([`taste_git::snapshot::script_avoiding`]).
+fn snapshot_in_checkout_avoiding(
+    files: &Files,
+    path: &Path,
+    avoid: Option<taste_git::Oid>,
+) -> Result<()> {
+    let script = taste_git::snapshot::script_avoiding(&taste_git::snapshot_ref("primary"), avoid)?;
     let out = files.exec(path, &["sh".into(), "-c".into(), script])?;
     if !out.success() {
         bail!(
@@ -1635,8 +1650,10 @@ impl taste_git::mirror::CheckoutWriter for FilesCheckout<'_> {
 /// checkout holds — before anything is done, and again just before the
 /// rename — and a path a link on the way would carry out of the checkout
 /// is refused. A removal takes the directories it empties with it (P11),
-/// and a file is never renamed onto a directory (`mv -T`). Both inputs are
-/// removed after.
+/// and a file is never renamed onto a directory (`mv -T`); a directory
+/// holding nothing but directories reads as nothing, as it does to git and
+/// so to the plan, and gives way to the write. Both inputs are removed
+/// after.
 const APPLY_SCRIPT: &str = r#"set -u
 ops="$1"; incoming="$2"
 now_of() {
@@ -1645,6 +1662,8 @@ now_of() {
   elif [ -f "$1" ]; then
     if [ -x "$1" ]; then m=100755; else m=100644; fi
     printf '%s %s' "$(git hash-object --no-filters -- "$1")" "$m"
+  elif [ -d "$1" ] && [ -z "$(find "$1" ! -type d -print -quit 2>/dev/null)" ]; then
+    printf none
   elif [ -e "$1" ]; then printf other
   else printf none; fi
 }
@@ -1673,6 +1692,7 @@ while IFS= read -r -d '' i && IFS= read -r -d '' kind && IFS= read -r -d '' expe
     if [ -f "$p" ] && [ ! -L "$p" ]; then chmod --reference="$p" -- "$src" 2>/dev/null; fi
     if [ "$kind" = exe ]; then chmod a+x -- "$src"; else chmod a-x -- "$src"; fi
   fi
+  if [ -d "$p" ] && [ ! -L "$p" ]; then find "$p" -depth -type d -empty -delete 2>/dev/null; fi
   if [ "$(now_of "$p")" = "$expect" ] && mv -T -f -- "$src" "$p" 2>/dev/null; then
     echo "ok $i"
   else
@@ -1695,6 +1715,15 @@ branch="$2"
 folder_tree="$3"
 expected="$4"
 cleanup() { git update-ref -d "$staging" 2>/dev/null || true; }
+# A file removed, and the directories that removing it emptied: git sees
+# no empty directory, so a snapshot does not either, and one left behind
+# stood where the folder's file of that name was to go (the sync's
+# simulation, 2026-10-12).
+remove() {
+  rm -f -- "$1"
+  d=$(dirname -- "$1")
+  [ "$d" = . ] || rmdir -p --ignore-fail-on-non-empty -- "$d" 2>/dev/null || true
+}
 # Every taste-ide-sync stash whose every file, as stashed, is the file as
 # some commit since the stash's base has it: work that reached history, so
 # the stash only holds a copy of it. Dropped, newest index last so the
@@ -1749,7 +1778,7 @@ if git ls-files -u | grep -q .; then
     # someone's edit (a reset --hard here took those too; see the cleanup
     # below).
     git diff --name-only --diff-filter=U | while IFS= read -r p; do
-      if git cat-file -e "HEAD:$p" 2>/dev/null; then git checkout -q HEAD -- "$p"; else rm -f -- "$p"; fi
+      if git cat-file -e "HEAD:$p" 2>/dev/null; then git checkout -q HEAD -- "$p"; else remove "$p"; fi
     done
     git reset -q
   else
@@ -1811,7 +1840,7 @@ if [ "$stashed" = 1 ] && ! git stash pop -q 2>/dev/null; then
     want=$(git rev-parse -q --verify "stash@{0}:$p" 2>/dev/null || echo none)
     if [ -f "$p" ] && [ ! -L "$p" ]; then here=$(git hash-object --no-filters -- "$p"); else here=none; fi
     if printf '%s\n' "$conflicted" | grep -qxF -- "$p" || [ "$here" = "$want" ]; then
-      if git cat-file -e "HEAD:$p" 2>/dev/null; then git checkout -q HEAD -- "$p"; else rm -f -- "$p"; fi
+      if git cat-file -e "HEAD:$p" 2>/dev/null; then git checkout -q HEAD -- "$p"; else remove "$p"; fi
     fi
   done
   # Untracked files likewise: only what the failed pop itself put back,
@@ -1823,7 +1852,7 @@ if [ "$stashed" = 1 ] && ! git stash pop -q 2>/dev/null; then
     git ls-tree -r --name-only 'stash@{0}^3' | while IFS= read -r p; do
       if [ -f "$p" ] && [ ! -L "$p" ] \
          && [ "$(git hash-object -- "$p")" = "$(git rev-parse "stash@{0}^3:$p")" ]; then
-        rm -f -- "$p"
+        remove "$p"
       fi
     done
   fi
@@ -2408,6 +2437,41 @@ mod tests {
             whole.read("folder/a.txt").as_deref(),
             Some("the folder's\n")
         );
+    }
+
+    /// The checkout put back exactly as it was before a pass wrote into it
+    /// — the file sent there moved away again before anything else looked —
+    /// is a snapshot with the stale one's very tree; it is a new commit all
+    /// the same, so the pass reads it rather than refusing it, as it once
+    /// did on every pass after.
+    #[test]
+    fn a_checkout_put_back_as_it_was_is_still_read() {
+        let whole = Whole::new("put-back");
+        let pair = &whole.pair;
+        whole.settle("agreed");
+        pair.write("folder", "n.txt", "the folder's\n");
+        let sent = whole.pass("sent");
+        assert_eq!(sent.sent, 1, "{sent:?}");
+        std::fs::remove_file(pair.dir.join("checkout/n.txt")).unwrap();
+        let next = whole.settle("removed there");
+        assert!(next.conflicts.is_empty(), "{next:?}");
+        assert_eq!(whole.read("folder/n.txt"), None);
+    }
+
+    /// An empty directory in the checkout — left by a removal, git's or
+    /// anyone's — is nothing to git, so the plan sends the folder's file of
+    /// that name as onto an empty path, and the directory gives way rather
+    /// than missing that write on every pass.
+    #[test]
+    fn an_empty_directory_in_the_checkout_gives_way_to_the_folders_file() {
+        let whole = Whole::new("empty-dir");
+        let pair = &whole.pair;
+        whole.settle("agreed");
+        std::fs::create_dir_all(pair.dir.join("checkout/e/inner")).unwrap();
+        pair.write("folder", "e", "a file here\n");
+        let pass = whole.pass("sent");
+        assert_eq!((pass.sent, pass.missed), (1, 0), "{pass:?}");
+        assert_eq!(whole.read("checkout/e").as_deref(), Some("a file here\n"));
     }
 
     /// Personal's own work — a file the folder never sent — still rides

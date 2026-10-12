@@ -409,6 +409,18 @@ fn remember_hashed(path: &std::path::Path, meta: &std::fs::Metadata, oid: Oid) {
 /// safe to single-quote; anything else is refused here rather than
 /// interpolated into a shell.
 pub fn script(name: &str) -> Result<String> {
+    script_avoiding(name, None)
+}
+
+/// [`script`], never answering with `avoid`: unchanged or not, the working
+/// copy gets a new commit rather than that one. A mirror pass that wrote
+/// into the checkout refuses the snapshot it observed through, which is
+/// from before its writes (`taste_git::mirror`); but a checkout put back
+/// exactly as it was — the file the pass wrote moved away again — has
+/// that snapshot's very tree, and an unchanged snapshot is the old commit,
+/// so every pass after was refused and the sync stood still (the sync's
+/// simulation, 2026-10-12).
+pub fn script_avoiding(name: &str, avoid: Option<Oid>) -> Result<String> {
     if !name.starts_with(SNAPSHOT_REF_PREFIX)
         || !name
             .chars()
@@ -417,12 +429,14 @@ pub fn script(name: &str) -> Result<String> {
         bail!("{name} is not a snapshot ref name this script will take");
     }
     let synced = crate::sync_ignored::snapshot_lines();
+    let avoid = avoid.map(|oid| oid.to_string()).unwrap_or_default();
     Ok(format!(
         r#"set -eu
 export GIT_AUTHOR_NAME=taste-ide GIT_AUTHOR_EMAIL=taste-ide@localhost
 export GIT_COMMITTER_NAME=taste-ide GIT_COMMITTER_EMAIL=taste-ide@localhost
 export GIT_OPTIONAL_LOCKS=0
 name='{name}'
+avoid='{avoid}'
 gitdir=$(git rev-parse --git-dir)
 export GIT_INDEX_FILE="$gitdir/taste-snapshot-index.$$"
 trap 'rm -f "$GIT_INDEX_FILE" "$GIT_INDEX_FILE".*' EXIT
@@ -436,13 +450,19 @@ rm -f "$GIT_INDEX_FILE"
 if [ -n "$head" ]; then msg="taste snapshot against $head"; else msg="taste snapshot against an unborn branch"; fi
 tries=0
 while :; do
-  if [ -n "$prev" ] && [ "$(git rev-parse "$prev^{{tree}}")" = "$tree" ] \
+  if [ -n "$prev" ] && [ "$prev" != "$avoid" ] && [ "$(git rev-parse "$prev^{{tree}}")" = "$tree" ] \
      && [ "$(git log -1 --format=%B "$prev")" = "$msg" ]; then
     printf '%s unchanged
 ' "$prev"
     exit 0
   fi
   if [ -n "$head" ]; then commit=$(git commit-tree "$tree" -p "$head" -m "$msg"); else commit=$(git commit-tree "$tree" -m "$msg"); fi
+  # The same tree, parent, and message in the same second is the same
+  # commit: the one to avoid, said apart by a line of its own.
+  if [ "$commit" = "$avoid" ]; then
+    again="Taken again after $avoid."
+    if [ -n "$head" ]; then commit=$(git commit-tree "$tree" -p "$head" -m "$msg" -m "$again"); else commit=$(git commit-tree "$tree" -m "$msg" -m "$again"); fi
+  fi
   if git update-ref "$name" "$commit" "$prev" 2>/dev/null; then break; fi
   tries=$((tries + 1))
   if [ "$tries" -ge 3 ]; then git update-ref "$name" "$commit" "$prev"; fi

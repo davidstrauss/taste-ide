@@ -204,6 +204,31 @@ fn snapshot_base(message: &str) -> Option<Oid> {
     Oid::from_str(rest.split_whitespace().next()?).ok()
 }
 
+/// A directory with no file or link anywhere under it: nothing, to git and
+/// so to a snapshot and the plan. One left behind where the other side's
+/// file of that name was to go missed that write on every pass (the sync's
+/// simulation, 2026-10-12).
+fn holds_nothing(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| {
+        entries.all(|e| {
+            e.is_ok_and(|e| e.file_type().is_ok_and(|t| t.is_dir()) && holds_nothing(&e.path()))
+        })
+    })
+}
+
+/// The empty directories at and under `dir`, deepest first. One that is not
+/// empty by the time it is reached — a file just written into it — stays.
+fn remove_empty_dirs(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_empty_dirs(&e.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 impl GitWorkspace {
     /// Make this folder and the checkout each other's mirror, one pass
     /// (docs/SYNC.md): HEAD onto `branch` at `tip`, and each working copy
@@ -616,6 +641,16 @@ impl GitWorkspace {
         }
     }
 
+    /// The snapshot the last pass observed the checkout through, when that
+    /// pass wrote there: the one the next pass refuses, and so the one the
+    /// checkout's next snapshot must not be
+    /// ([`crate::snapshot::script_avoiding`]).
+    pub fn snapshot_written_over(&self) -> Result<Option<Oid>> {
+        Ok(self
+            .recorded_observation()?
+            .and_then(|(snapshot, wrote)| wrote.then_some(snapshot)))
+    }
+
     /// The snapshot the pass that last recorded the archive observed the
     /// checkout through, and whether that pass wrote into the checkout.
     fn recorded_observation(&self) -> Result<Option<(Oid, bool)>> {
@@ -874,6 +909,9 @@ impl GitWorkspace {
                 .map_err(|_| ())?;
             return Ok(Some((id, i32::from(git2::FileMode::Link))));
         }
+        if meta.is_dir() && holds_nothing(&absolute) {
+            return Ok(None);
+        }
         if !meta.is_file() {
             return Err(());
         }
@@ -933,6 +971,13 @@ impl GitWorkspace {
             let Some((id, mode)) = w.entry else { continue };
             if !still(w) {
                 continue;
+            }
+            // A directory holding nothing reads as nothing (`on_disk`), so
+            // it gives way to the file.
+            if let Ok(dir) = crate::beneath::checked(&self.workdir, &w.path) {
+                if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+                    remove_empty_dirs(&dir);
+                }
             }
             let blob = self.repo.find_blob(id)?;
             let ready = || still(w);
@@ -1668,6 +1713,27 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".taste-mirror"))
             .collect();
         assert!(strays.is_empty(), "no staging file is left behind");
+    }
+
+    /// A directory with nothing in it is nothing to git, so the plan
+    /// writes the checkout's file of that name as onto an empty path; the
+    /// directory gives way rather than missing that write on every pass.
+    #[test]
+    fn an_empty_directory_here_gives_way_to_the_checkouts_file() {
+        let (dir, ws, main) = agreed();
+        fs::create_dir_all(dir.path().join("e/inner")).unwrap();
+        let (tip, snap) = checkout_state(&ws, dir.path(), |vm, _| {
+            fs::write(vm.join("e"), "a file there\n").unwrap();
+        });
+        let pass = done(
+            ws.mirror_from(&main, tip, snap, None, &Took::default())
+                .unwrap(),
+        );
+        assert_eq!((pass.received, pass.missed), (1, 0), "{pass:?}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("e")).unwrap(),
+            "a file there\n"
+        );
     }
 
     #[test]

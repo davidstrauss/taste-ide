@@ -181,7 +181,11 @@ removals emptied stayed in the checkout until 096b680 (P11).
   side written; only a fresh look guards the side read from. The archive
   records the snapshot each pass decided on and whether it wrote into the
   checkout, and a pass offered that same snapshot again is `Stale`.
-  (The model checker found this; see below.)
+  (The model checker found this; see below.) The next snapshot is told
+  that one and is never it (`snapshot::script_avoiding`): an unchanged
+  working copy otherwise keeps its old snapshot commit, and a checkout put
+  back exactly as it was before the pass wrote — the file sent there moved
+  away again — was that commit, refused on every pass after.
 - **Every write is a compare-and-swap.** Each carries the entry its side
   held when the pass observed it, and lands only if that is still there —
   checked once before anything is done and again after the new content is
@@ -322,6 +326,14 @@ What it found, and what was fixed (each with a test of its own):
   among them one the stash never held: ignored when the stash was made, and
   no longer once the commits it moved to changed the rules (P1). Only what
   the failed pop itself put back, byte for byte, is removed now.
+- A directory left empty on one side — by that cleanup, or by anyone's
+  removal — is nothing to git and so to the plan, which sent the other
+  side's file of that name as onto an empty path; the write found a
+  directory and missed, on every pass (P4). An empty directory now reads
+  as nothing at the write and gives way to it, and the cleanup takes the
+  directories it empties with it.
+- The stale-snapshot guard refused a fresh snapshot with the stale one's
+  very commit, above, on every pass (P4).
 
 Not in its schedule: a detached HEAD, a link where a directory is (an
 actor's later write would travel through it, which is the actor's doing,
