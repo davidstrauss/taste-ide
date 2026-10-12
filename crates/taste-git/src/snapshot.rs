@@ -36,11 +36,17 @@
 //! ([`crate::refs`]). A snapshot of the checkout the user is typing in has
 //! to be invisible to them.
 //!
-//! Snapshots chain. The parent is the previous snapshot, so the ref is a
-//! walkable history of what the working copy looked like over time, and the
-//! first one parents itself on HEAD so the chain joins the branch it came
-//! from. Trees are content-addressed, so a snapshot of an unchanged working
-//! copy writes nothing at all and says so.
+//! **Snapshots do not chain.** Each is parented on HEAD alone, so the ref
+//! holds the working copy as it is now and nothing older. They chained once,
+//! the parent the previous snapshot, for a walkable history nothing read —
+//! and with files that sync though ignored (`crate::sync_ignored`) that
+//! history was every version of a project's database and its backups,
+//! reachable for ever: 2,311 snapshots, 3.4 GiB in the checkout and
+//! 1.3 GiB in the folder, which gc could neither drop nor, in a 4 GiB
+//! container, pack (2026-10-12). The snapshot a new one replaces is
+//! unreachable, and git's own pruning takes it. Trees are
+//! content-addressed, so a snapshot of an unchanged working copy writes
+//! nothing at all and says so.
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
@@ -98,8 +104,8 @@ impl GitWorkspace {
             None => None,
         };
         // The message names the commit the working copy was sitting on, so
-        // a restore can tell what this is a snapshot OF without walking the
-        // chain to find a parent that is on a branch.
+        // a restore can tell what this is a snapshot OF without reading
+        // its parent.
         let message = match &head {
             Some(commit) => format!("taste snapshot against {}", commit.id()),
             None => "taste snapshot against an unborn branch".to_string(),
@@ -122,10 +128,9 @@ impl GitWorkspace {
         }
 
         let tree = self.repo.find_tree(tree_id)?;
-        // Parent: the previous snapshot when there is one, so the ref is a
-        // history; HEAD for the first, so the chain is rooted in the branch
-        // rather than floating free.
-        let parent = previous.as_ref().or(head.as_ref());
+        // Parent: HEAD, never the previous snapshot (see the module's
+        // docs: a chain kept every version of every synced file).
+        let parent = head.as_ref();
         let commit = self.commit_tree_to_ref(name, expected, parent, &tree, &message)?;
         Ok(Snapshot {
             commit,
@@ -291,15 +296,14 @@ impl GitWorkspace {
 /// git's own plumbing: a temporary index seeded from HEAD's tree (so the
 /// snapshot is the whole working copy and deletions land), `add -A` (which
 /// honours `.gitignore` for free and is exactly what `git status` would
-/// show), `write-tree`, `commit-tree` parented on the previous snapshot or
-/// on HEAD, `update-ref`. Neither HEAD nor the real index is touched; the
+/// show), `write-tree`, `commit-tree` parented on HEAD, `update-ref`. Neither HEAD nor the real index is touched; the
 /// scratch index is the script's own — named for its process, so two
 /// snapshots at once do not meet on one index lock, as six did after a
 /// burst of ref moves (2026-10-02) — and is removed however the script
 /// ends. A file that changes while it is read, the commonest of them, has
 /// a second `add -A`, and a synced file one of its own
 /// ([`crate::sync_ignored::snapshot_lines`]). Two at once still meet on the
-/// ref: the one that loses the race parents its commit on the winner's and
+/// ref: the one that loses the race compares its tree with the winner's and
 /// tries again, where it once failed the snapshot ("cannot lock ref …
 /// expected", 2026-10-12). Nothing in it takes an optional lock on the
 /// repository the agent is working in (`GIT_OPTIONAL_LOCKS=0`). An unchanged working
@@ -343,8 +347,7 @@ while :; do
 ' "$prev"
     exit 0
   fi
-  parent="${{prev:-$head}}"
-  if [ -n "$parent" ]; then commit=$(git commit-tree "$tree" -p "$parent" -m "$msg"); else commit=$(git commit-tree "$tree" -m "$msg"); fi
+  if [ -n "$head" ]; then commit=$(git commit-tree "$tree" -p "$head" -m "$msg"); else commit=$(git commit-tree "$tree" -m "$msg"); fi
   if git update-ref "$name" "$commit" "$prev" 2>/dev/null; then break; fi
   tries=$((tries + 1))
   if [ "$tries" -ge 3 ]; then git update-ref "$name" "$commit" "$prev"; fi
@@ -961,17 +964,15 @@ mod tests {
         );
         assert_eq!(again.commit, first.commit);
 
-        // A real change does write, and chains onto the first.
+        // A real change does write, on HEAD rather than on the first: the
+        // snapshot it replaces is left unreachable, for git to prune.
         fs::write(dir.path().join("untracked.txt"), "changed\n").unwrap();
         let third = ws.snapshot_worktree(REF).unwrap();
         assert!(third.wrote);
         assert_ne!(third.commit, first.commit);
         let commit = ws.repo.find_commit(third.commit).unwrap();
-        assert_eq!(
-            commit.parent_id(0).unwrap(),
-            first.commit,
-            "snapshots chain, so the ref is a history"
-        );
+        let head = ws.repo.head().unwrap().peel_to_commit().unwrap().id();
+        assert_eq!(commit.parent_ids().collect::<Vec<_>>(), vec![head]);
     }
 
     /// The first snapshot is rooted in the branch it came from, and says

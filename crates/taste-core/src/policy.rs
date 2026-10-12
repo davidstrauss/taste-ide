@@ -246,8 +246,19 @@ pub fn agent_git_config() -> Vec<(String, String)> {
         })
         .collect();
     config.push(("core.hooksPath".into(), AGENT_HOOKS_PATH.into()));
+    // Not policy but a ceiling: git delta-compresses every file under this
+    // size when it packs, and a few blobs of a few hundred MB — a project's
+    // encrypted backups, its database, which the IDE's snapshots carry when
+    // they sync (`taste_git::sync_ignored`) — took the automatic gc after a
+    // commit past the dev container's 4 GiB, killed every time
+    // (2026-10-12). Above it a blob is stored whole, in bounded memory.
+    config.push(("core.bigFileThreshold".into(), BIG_FILE_THRESHOLD.into()));
     config
 }
+
+/// `core.bigFileThreshold` for every git the IDE runs or hands an agent in
+/// an environment: see [`agent_git_config`].
+pub const BIG_FILE_THRESHOLD: &str = "32m";
 
 /// [`agent_git_config`] rendered as `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n`
 /// environment variables — git's own way to carry config in an environment.
@@ -516,10 +527,14 @@ mod tests {
         for scheme in ["https://", "ssh://", "git://", "git@"] {
             assert!(values.contains(&scheme), "{scheme} not blocked: {config:?}");
         }
-        // pushInsteadOf only — fetch and pull must keep working.
+        // pushInsteadOf only — fetch and pull must keep working — beside
+        // the hooks and the packing ceiling.
+        assert!(config.iter().all(|(k, _)| k.ends_with("pushInsteadOf")
+            || k == "core.hooksPath"
+            || k == "core.bigFileThreshold"));
         assert!(config
             .iter()
-            .all(|(k, _)| k.ends_with("pushInsteadOf") || k == "core.hooksPath"));
+            .any(|(k, v)| k == "core.bigFileThreshold" && v == BIG_FILE_THRESHOLD));
         assert!(config
             .iter()
             .any(|(k, v)| k == "core.hooksPath" && v == AGENT_HOOKS_PATH));

@@ -87,8 +87,10 @@ const fs=require('fs'),fsp=fs.promises,path=require('path'),cp=require('child_pr
 // process reaches every environment's checkout, and a checkout's
 // .git/config is its agent's to write; and a filter installed in the dev
 // container (nbstripout, at a path only that container has) failed every
-// snapshot here, which stopped the folder's sync (2026-10-11).
-const GIT_SAFE={GIT_ATTR_SOURCE:'4b825dc642cb6eb9a060e54bf8d69288fbee4904',GIT_CONFIG_COUNT:'2',GIT_CONFIG_KEY_0:'core.fsmonitor',GIT_CONFIG_VALUE_0:'false',GIT_CONFIG_KEY_1:'core.hooksPath',GIT_CONFIG_VALUE_1:'/dev/null'};
+// snapshot here, which stopped the folder's sync (2026-10-11). And a blob
+// above taste_core::policy::BIG_FILE_THRESHOLD is packed whole, in bounded
+// memory, as the agent's git packs it.
+const GIT_SAFE={GIT_ATTR_SOURCE:'4b825dc642cb6eb9a060e54bf8d69288fbee4904',GIT_CONFIG_COUNT:'3',GIT_CONFIG_KEY_0:'core.fsmonitor',GIT_CONFIG_VALUE_0:'false',GIT_CONFIG_KEY_1:'core.hooksPath',GIT_CONFIG_VALUE_1:'/dev/null',GIT_CONFIG_KEY_2:'core.bigFileThreshold',GIT_CONFIG_VALUE_2:'32m'};
 // GIT_SAFE for a git run in cwd, with the drivers its repository's config
 // defines made harmless: GIT_ATTR_SOURCE reaches only .gitattributes, and
 // .git/info/attributes, where `nbstripout --install` writes, still names
@@ -874,6 +876,17 @@ fn podman_capture(substrate: &crate::substrate::Substrate, args: &[String]) -> R
 mod tests {
     use super::*;
     use taste_core::files::Files;
+
+    /// The keeper's git packs big blobs as the agent's does: one ceiling,
+    /// spelled in the keeper's JavaScript because it is a string constant.
+    #[test]
+    fn the_keepers_git_has_the_big_file_threshold() {
+        assert!(KEEPER.contains(&format!(
+            "GIT_CONFIG_KEY_2:'core.bigFileThreshold',GIT_CONFIG_VALUE_2:'{}'",
+            taste_core::policy::BIG_FILE_THRESHOLD
+        )));
+        assert!(KEEPER.contains("GIT_CONFIG_COUNT:'3'"));
+    }
 
     fn node_present() -> bool {
         Command::new("node")

@@ -626,7 +626,7 @@ mod tests {
         let spec = ctx.resolve_for_agent("git", &["push"]);
         assert_eq!(spec.program, "podman");
         let joined = spec.args.join(" ");
-        assert!(joined.contains("--env GIT_CONFIG_COUNT=5"), "{joined}");
+        assert!(joined.contains("--env GIT_CONFIG_COUNT=6"), "{joined}");
         assert!(joined.contains("pushInsteadOf"), "{joined}");
         assert!(joined.contains("core.hooksPath"), "{joined}");
         // The command still runs in the workspace, as the user's would.
@@ -646,7 +646,7 @@ mod tests {
         let spec = ctx.resolve_for_agent("git", &["push"]);
         assert_eq!(spec.program, "env");
         let joined = spec.args.join(" ");
-        assert!(joined.contains("GIT_CONFIG_COUNT=5"), "{joined}");
+        assert!(joined.contains("GIT_CONFIG_COUNT=6"), "{joined}");
         assert!(joined.ends_with("git push"), "{joined}");
     }
 
@@ -692,7 +692,7 @@ mod tests {
         );
         let joined = spec.args.join(" ");
         let theirs = joined.find("--env GIT_CONFIG_COUNT=0").expect("theirs");
-        let ours = joined.find("--env GIT_CONFIG_COUNT=5").expect("ours");
+        let ours = joined.find("--env GIT_CONFIG_COUNT=6").expect("ours");
         assert!(ours > theirs, "the policy must come last: {joined}");
     }
 
