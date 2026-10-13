@@ -2986,6 +2986,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             filetree.seed_ports_for_probe(port_state_for_probe());
         }
         filetree.seed_log_activity_for_probe();
+        // `TASTE_PROBE_EXPAND=<folder>`: that folder of the tree expanded,
+        // and the longest the main thread went without a turn printed.
+        if let Ok(folder) = std::env::var("TASTE_PROBE_EXPAND") {
+            filetree.expand_bench_for_probe(PathBuf::from(folder));
+        }
         // `TASTE_PROBE_TASKS=none` leaves the Tasks section empty, for its
         // ghost row alone.
         if std::env::var("TASTE_PROBE_TASKS").ok().as_deref() != Some("none") {

@@ -3356,6 +3356,76 @@ impl FileTree {
     /// Select a file's row, expanding the folders above it. A folder just
     /// expanded lists its children asynchronously, so a file whose row is
     /// not there yet is remembered and retried as rows arrive.
+    /// TASTE_PROBE_EXPAND: `folder` (relative to the tree's root) expanded
+    /// once the tree is up, a ticker every 5ms meanwhile, and the longest
+    /// gap between its ticks — how long the main thread was held — printed
+    /// with the rows the folder brought.
+    #[doc(hidden)]
+    pub fn expand_bench_for_probe(self: &Rc<Self>, folder: PathBuf) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(3000), move || {
+            let Some(tree) = weak.upgrade() else { return };
+            let Some((_, _, model)) = tree.tree_selection() else {
+                println!("expand bench: no tree");
+                return;
+            };
+            let target = tree.view_root().join(&folder);
+            let before = model.n_items();
+            let row = (0..model.n_items())
+                .filter_map(|i| model.row(i))
+                .find(|row| {
+                    row.item()
+                        .and_downcast::<BoxedAnyObject>()
+                        .is_some_and(|item| item.borrow::<FileNode>().path == target)
+                });
+            let Some(row) = row else {
+                println!("expand bench: no row for {}", target.display());
+                return;
+            };
+            let longest = Rc::new(Cell::new(0.0f64));
+            let last = Rc::new(Cell::new(std::time::Instant::now()));
+            let ticks = Rc::new(Cell::new(0u32));
+            {
+                let (longest, last, ticks) = (longest.clone(), last.clone(), ticks.clone());
+                glib::timeout_add_local(std::time::Duration::from_millis(5), move || {
+                    let now = std::time::Instant::now();
+                    let gap = now.duration_since(last.get()).as_secs_f64() * 1000.0;
+                    longest.set(longest.get().max(gap));
+                    last.set(now);
+                    ticks.set(ticks.get() + 1);
+                    if ticks.get() < 1000 {
+                        glib::ControlFlow::Continue
+                    } else {
+                        glib::ControlFlow::Break
+                    }
+                });
+            }
+            // `TASTE_PROBE_EXPAND_PENDING=<file>`: that file of the folder
+            // waiting to be selected as the rows land, as a tab open on it
+            // leaves it.
+            if let Ok(file) = std::env::var("TASTE_PROBE_EXPAND_PENDING") {
+                *tree.pending_select.borrow_mut() = Some(target.join(file));
+            }
+            let started = std::time::Instant::now();
+            row.set_expanded(true);
+            let weak = Rc::downgrade(&tree);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(6000), move || {
+                let Some(tree) = weak.upgrade() else { return };
+                let rows = tree
+                    .tree_selection()
+                    .map(|(_, _, m)| m.n_items())
+                    .unwrap_or(0);
+                println!(
+                    "expand bench: {} rows came in; the main thread was held for {:.0}ms at \
+                     most ({:.1}s after the expand)",
+                    rows.saturating_sub(before),
+                    longest.get(),
+                    started.elapsed().as_secs_f64()
+                );
+            });
+        });
+    }
+
     fn select_file(self: &Rc<Self>, path: PathBuf) {
         if !path.starts_with(self.view_root()) {
             self.clear_tree_selection();
@@ -8468,9 +8538,14 @@ fn fill_dir_store_async(
     glib::spawn_future_local(async move {
         let Ok(nodes) = handle.await else { return };
         let Some(store) = weak.upgrade() else { return };
-        for node in nodes {
-            store.append(&BoxedAnyObject::new(node));
-        }
+        // In one splice: an append a row was a change a row, each passed up
+        // through the tree's model, its selection, the list, and the
+        // tree's own handler, which took a folder of thousands of files
+        // seconds to open with the window held (David, 2026-10-13:
+        // "Expanding large directories in the file view also hangs the
+        // GUI").
+        let items: Vec<BoxedAnyObject> = nodes.into_iter().map(BoxedAnyObject::new).collect();
+        store.splice(store.n_items(), 0, &items);
     });
 }
 

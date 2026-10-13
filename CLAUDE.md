@@ -588,7 +588,11 @@ without the anchoring). `TASTE_PROBE_SELECT=1` (with
 `TASTE_PROBE_PREVIEW=<a long .md>`) grows a selection across the preview's
 longest label a step a frame, as a drag does, and prints its frames;
 `=nomap` hides the overview strip first, which tells the label's cost apart
-from the strip's. Run it on the machine that
+from the strip's. `TASTE_PROBE_EXPAND=<folder>` expands that folder of the
+file tree and prints the longest the main thread was held while its rows
+landed (`TASTE_PROBE_EXPAND_PENDING=<file>` with a tab's selection waiting
+on a file in it); open a scratch repository with a folder of thousands of
+files to make it mean something. Run it on the machine that
   lags, in the build it runs: in the devcontainer it measures llvmpipe's
   software rendering, about 30ms a frame whatever the transcript holds.
 - **Convention over configuration over code.** Fixed locations for project
