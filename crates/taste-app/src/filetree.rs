@@ -489,6 +489,12 @@ pub struct FileTree {
     /// submodule caught halfway through one — its parent's commit there,
     /// its own not yet — is not warned about until the pass has ended.
     folder_syncing: Cell<bool>,
+    /// The folder's submodules that are not yet the commit the project
+    /// records and can be made so, and the banner whose one button does it
+    /// (`crate::submodule_bar`); `submodule_busy` while it runs.
+    submodule_setup: RefCell<Vec<taste_git::submodule_setup::SubmoduleSetup>>,
+    submodule_bar: crate::submodule_bar::SubmoduleBar,
+    submodule_busy: Cell<bool>,
     on_open: RefCell<Option<OpenCallback>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
     on_open_diff: RefCell<Option<OpenDiffCallback>>,
@@ -753,6 +759,10 @@ struct StatusSnapshot {
     rebasing: bool,
     /// Each submodule's path and where it is (`Worktree::submodule_heads`).
     submodules: HashMap<PathBuf, taste_devcontainer::worktree::SubmoduleHead>,
+    /// The folder's submodules to set up (`GitWorkspace::submodules_to_set_up`):
+    /// the folder's, not the checkout's, since the folder is where they are
+    /// cloned and fetched, with the user's keys.
+    submodule_setup: Vec<taste_git::submodule_setup::SubmoduleSetup>,
     /// What syncs though git ignores it (`Worktree::sync_ignored`).
     sync_ignored: taste_devcontainer::worktree::SyncIgnored,
 }
@@ -787,11 +797,25 @@ async fn run_git_step(
     args: Vec<String>,
     envs: Vec<(String, String)>,
 ) -> Result<std::process::Output, String> {
+    run_git_step_within(program, args, envs, GIT_NETWORK_TIMEOUT).await
+}
+
+/// How long a submodule's setup may run: a clone is a whole repository,
+/// which a fetch's bound would call failed halfway through a big one.
+const SUBMODULE_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// [`run_git_step`], bounded by `limit`.
+async fn run_git_step_within(
+    program: String,
+    args: Vec<String>,
+    envs: Vec<(String, String)>,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
     let run = tokio::process::Command::new(&program)
         .envs(envs)
         .args(&args)
         .output();
-    match tokio::time::timeout(GIT_NETWORK_TIMEOUT, run).await {
+    match tokio::time::timeout(limit, run).await {
         Ok(Ok(out)) if out.status.success() => Ok(out),
         Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr)
             .lines()
@@ -799,10 +823,7 @@ async fn run_git_step(
             .unwrap_or("failed")
             .to_string()),
         Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err(format!(
-            "timed out after {}s",
-            GIT_NETWORK_TIMEOUT.as_secs()
-        )),
+        Err(_) => Err(format!("timed out after {}s", limit.as_secs())),
     }
 }
 
@@ -1369,6 +1390,11 @@ impl FileTree {
         widget.set_width_request(180);
         widget.append(&header);
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let submodule_bar = crate::submodule_bar::SubmoduleBar::new(
+            CHROME_INSET,
+            sync_button_with_label("Set Up", "").0,
+        );
+        widget.append(&submodule_bar.widget);
         // The project folder itself: always the first row, never
         // collapsible; its context menu creates top-level items.
         let root_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1514,6 +1540,9 @@ impl FileTree {
             show_ignored: Rc::new(RefCell::new(false)),
             submodule_heads: RefCell::new(HashMap::new()),
             folder_syncing: Cell::new(false),
+            submodule_setup: RefCell::new(Vec::new()),
+            submodule_bar,
+            submodule_busy: Cell::new(false),
             on_open: RefCell::new(None),
             on_open_diff: RefCell::new(None),
             sync_ignored: RefCell::new(Default::default()),
@@ -1646,6 +1675,14 @@ impl FileTree {
         }
 
         let weak = Rc::downgrade(&tree);
+        {
+            let weak = Rc::downgrade(&tree);
+            tree.submodule_bar.button.connect_clicked(move |_| {
+                if let Some(tree) = weak.upgrade() {
+                    tree.set_up_submodules();
+                }
+            });
+        }
         {
             let weak = Rc::downgrade(&tree);
             init_button.connect_clicked(move |button| {
@@ -4744,17 +4781,23 @@ impl FileTree {
                 // read a branch just made in the VM as main against
                 // origin/main.
                 let branch = worktree.branch_name();
-                let sync = GitWorkspace::discover(if worktree.is_local() {
+                let folder = GitWorkspace::discover(if worktree.is_local() {
                     &root
                 } else {
                     &refs_root
-                })
-                .and_then(|git| match &branch {
+                });
+                let sync = folder.as_ref().and_then(|git| match &branch {
                     Some(branch) => git.sync_status_of(branch).ok(),
                     None => git.sync_status().ok(),
                 });
                 Ok(StatusSnapshot {
                     submodules: worktree.submodule_heads(),
+                    submodule_setup: crate::submodule_bar::posed_for_probe().unwrap_or_else(|| {
+                        folder
+                            .as_ref()
+                            .map(|git| git.submodules_to_set_up())
+                            .unwrap_or_default()
+                    }),
                     sync_ignored: synced_for_probe()
                         .unwrap_or_else(|| worktree.sync_ignored(&status)),
                     status,
@@ -4911,6 +4954,9 @@ impl FileTree {
                     glib::idle_add_local_once(move || tree.refresh_tree());
                 }
                 *self.submodule_heads.borrow_mut() = snapshot.submodules;
+                self.submodule_bar
+                    .show(&snapshot.submodule_setup, self.submodule_busy.get());
+                *self.submodule_setup.borrow_mut() = snapshot.submodule_setup;
                 self.ignore_rules.set(snapshot.ignore_rules);
                 self.sync_filter_counts();
                 *self.status_branch.borrow_mut() = snapshot.branch.clone();
@@ -6621,6 +6667,79 @@ impl FileTree {
     /// button's fetch: every remote, the push target's tip, and the issues
     /// ref, and the counts redrawn. Push stays a separate, deliberate
     /// action.
+    /// The submodule banner's Set Up: each submodule the folder has not set
+    /// up, cloned, fetched, or moved forward in the folder with the user's
+    /// keys, as Fetch runs (`taste_git::submodule_setup`); then all of them
+    /// decided again, since a fetch can leave one behind and so to be moved
+    /// forward, until a round finds nothing left or the same as before. One
+    /// that fails says so and the rest go on. The sync gives Personal what
+    /// the folder now has.
+    fn set_up_submodules(self: &Rc<Self>) {
+        if self.submodule_busy.replace(true) {
+            return;
+        }
+        button_busy(&self.submodule_bar.button);
+        let root = self.refs_root();
+        let events = self.workspace.events.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let mut before = Vec::new();
+            loop {
+                let found = crate::runtime::runtime()
+                    .spawn_blocking({
+                        let root = root.clone();
+                        move || {
+                            let Some(git) = GitWorkspace::discover(&root) else {
+                                return Vec::new();
+                            };
+                            git.submodules_to_set_up()
+                                .into_iter()
+                                .filter_map(|setup| {
+                                    let command = git.submodule_setup_command(&setup)?;
+                                    Some((setup, command))
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                    .await
+                    .unwrap_or_default();
+                let now: Vec<_> = found
+                    .iter()
+                    .map(|(setup, _)| (setup.path.clone(), setup.need))
+                    .collect();
+                if found.is_empty() || now == before {
+                    break;
+                }
+                before = now;
+                for (setup, (program, args)) in found {
+                    let envs = crate::ssh_agent::network_env(root.clone(), setup.url.clone()).await;
+                    let handle = crate::runtime::runtime().spawn(run_git_step_within(
+                        program,
+                        args,
+                        envs,
+                        SUBMODULE_SETUP_TIMEOUT,
+                    ));
+                    let failure = match handle.await {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(reason)) => Some(reason),
+                        Err(_) => Some("interrupted".to_string()),
+                    };
+                    if let Some(reason) = failure {
+                        events.publish(Event::Toast(format!(
+                            "setting up the submodule {} failed: {reason}",
+                            setup.path.display()
+                        )));
+                    }
+                }
+            }
+            let Some(tree) = weak.upgrade() else { return };
+            tree.submodule_busy.set(false);
+            button_idle(&tree.submodule_bar.button);
+            tree.submodule_bar.button.set_sensitive(true);
+            tree.refresh_status();
+        });
+    }
+
     fn sync(self: &Rc<Self>, rebase: bool) {
         // The working tree's branch, as the push has it: for a checkout in
         // a VM, not this repository's HEAD, whose upstream is main's.

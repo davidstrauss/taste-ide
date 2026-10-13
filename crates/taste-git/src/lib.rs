@@ -27,6 +27,7 @@ mod relation;
 pub use relation::{record_remote_tip, PushTarget};
 pub mod review;
 pub mod snapshot;
+pub mod submodule_setup;
 
 pub use clone::strip_worktree;
 pub use clone::{clone_local, unpublished_work, unshare_inodes, UnpublishedBranch};

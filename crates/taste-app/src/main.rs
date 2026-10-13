@@ -68,6 +68,7 @@ mod sparkline;
 mod ssh_agent;
 mod startup;
 mod stripes;
+mod submodule_bar;
 mod submodule_diff;
 mod syncstatus;
 mod tabfamily;
@@ -487,6 +488,12 @@ fn main() -> glib::ExitCode {
                     warning colour. */\n\
                  .changed-bar.notebook-kernel { \
                    background-color: alpha(@warning_bg_color, 0.22); }\n\
+                 /* The file tree's submodule banner (submodule_bar.rs): \
+                    the same, its edges the tree's own column, which its \
+                    children are inset to. */\n\
+                 .changed-bar.submodule-setup { \
+                   background-color: alpha(@warning_bg_color, 0.22); \
+                   padding: 6px 0; }\n\
                  /* The environment's startup page (startup.rs): a card for \
                     the checklist over the construction stripes, the log in \
                     a card of its own below; the strip's other tabs dimmed \

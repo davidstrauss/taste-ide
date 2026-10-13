@@ -187,6 +187,10 @@ file-tree rows as ignored and synced anyway (a trailing slash for a folder),
 the ⇅ in the status letter's place (`taste_git::sync_ignored`) — a probe
 opens a folder on this host, which never syncs; the two `taste-app/src`
 files are the rows the hero frame shows;
+`TASTE_PROBE_SUBMODULES=tpl:clone,ext/lib:behind` poses the file tree's
+submodule banner (`submodule_bar.rs`) for those submodules (`clone`,
+`fetch`, or `behind`), since the folder a probe opens has none — with
+`TASTE_PROBE_VIEW=dirty` for the pane's geometry in the dump;
 `TASTE_PROBE_SYNC=running` (or `conflict`, `failed`, `done`) poses the
 title bar's cloud — the folder's sync and the Google Cloud connection,
 one badge — in that state with its popover open;
