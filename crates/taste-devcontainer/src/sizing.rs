@@ -143,7 +143,10 @@ pub const DISK_GROW_STEP_GIB: u64 = 4;
 /// The virtual size, in GiB, an existing VM's disk of `current` bytes can
 /// grow to, when that is at least [`DISK_GROW_STEP_GIB`] more: what is free
 /// on this host, less the floor, less what every disk — this one included —
-/// could still grow into, added to its size, capped at [`DISK_GIB`]. A VM
+/// could still grow into, less the [`DISK_MIN_GIB`] a workspace with no VM
+/// yet needs for its first, added to its size, capped at [`DISK_GIB`]. Taking
+/// that last share too grew finance's disk to 54 GiB and left another
+/// project's VM nothing to start with (2026-10-13). A VM
 /// made while the host was short of space got the [`DISK_MIN_GIB`] it could
 /// have, and kept it after the space came back: the finance project's, at
 /// 16 GiB, filled with a 2.3 GB data folder, its snapshots, and its
@@ -152,7 +155,11 @@ pub const DISK_GROW_STEP_GIB: u64 = 4;
 pub fn grown_disk_gib(current: u64, free: u64, unclaimed: u64) -> Option<u64> {
     let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
     let current_gib = current / GIB;
-    let room_gib = free.saturating_sub(floor).saturating_sub(unclaimed) / GIB;
+    let room_gib = free
+        .saturating_sub(floor)
+        .saturating_sub(unclaimed)
+        .saturating_sub(DISK_MIN_GIB * GIB)
+        / GIB;
     let target = current_gib.saturating_add(room_gib).min(DISK_GIB);
     (target >= current_gib + DISK_GROW_STEP_GIB).then_some(target)
 }
@@ -254,19 +261,31 @@ mod tests {
     /// that is too little to be worth making.
     /// A disk made small grows when the host has room again, by a step at
     /// least, never past the ceiling, and never so far that every disk
-    /// together could take the host under its floor.
+    /// together could take the host under its floor, or leave a new VM less
+    /// than it needs.
     #[test]
     fn a_small_disk_grows_into_what_the_host_can_give() {
         let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
-        // 55 GiB free, this 16 GiB disk with 2 GiB still unclaimed.
+        // 80 GiB free, this 16 GiB disk with 2 GiB still unclaimed.
         assert_eq!(
-            grown_disk_gib(16 * GIB, floor + 55 * GIB, 2 * GIB),
+            grown_disk_gib(16 * GIB, floor + 80 * GIB, 2 * GIB),
             Some(DISK_GIB),
-            "16 + 53 GiB, capped"
+            "16 + 78 - 16 GiB, capped"
         );
         assert_eq!(
             grown_disk_gib(16 * GIB, floor + 30 * GIB, 2 * GIB),
-            Some(44)
+            Some(28),
+            "16 + 28 - 16 GiB"
+        );
+        assert_eq!(
+            grown_disk_gib(16 * GIB, floor + (DISK_MIN_GIB + 4) * GIB, 0),
+            Some(20),
+            "a step past a new VM's share"
+        );
+        assert_eq!(
+            grown_disk_gib(16 * GIB, floor + (DISK_MIN_GIB + 3) * GIB, 0),
+            None,
+            "a new VM's share is not grown into"
         );
         assert_eq!(
             grown_disk_gib(16 * GIB, floor + 5 * GIB, 2 * GIB),
