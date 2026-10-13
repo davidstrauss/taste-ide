@@ -851,13 +851,28 @@ const PDF_VIEWER_CSS: &[u8] = include_bytes!("../vendor/pdfjs/pdf_viewer.css");
 /// does not parse — a PDF caught half-written by the build making it —
 /// leaves the one on screen as it is: the write that finishes it is a
 /// change of its own.
+///
+/// Down the right edge, the document's overview strip — the source map's
+/// and the markdown preview's twin (`preview_map.rs`), for a PDF (David,
+/// 2026-10-13: "it needs one"): every page drawn small at the strip's
+/// width, a document taller than the strip scrolling within it in step
+/// with the view, the visible part a translucent block in the accent
+/// colour, a press or a drag putting that point at the middle of the view,
+/// and the wheel scrolling the document. Where the view is maps to the
+/// strip page by page — a place a fraction of the way down a page is that
+/// fraction of the way down its picture — so the block is exact at any
+/// zoom and over the gaps between pages. The pictures are drawn again
+/// from the document a reload brings, and swapped in once all are.
 const PDF_PAGE: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="color-scheme" content="light dark">
 <link rel="stylesheet" href="pdf_viewer.css">
 <style>
 html, body { margin: 0; height: 100%; background: transparent; }
-.pane { position: absolute; inset: 0; overflow: auto; }
+:root { --map-width: 96px; --map-accent: #3584e4; }
+.pane { position: absolute; inset: 0 var(--map-width) 0 0; overflow: auto; }
+#map { position: absolute; top: 0; right: 0; width: var(--map-width); height: 100%;
+  cursor: default; touch-action: none; }
 .pane.behind { visibility: hidden; z-index: -1; }
 .pdfViewer .page { border: none; margin: 12px auto;
   box-shadow: 0 1px 3px rgba(0,0,0,.25); }
@@ -872,6 +887,7 @@ window.tasteReady = new Promise((resolve) => { window.tasteReadyResolve = resolv
 </script>
 <div id="a" class="pane"><div class="pdfViewer"></div></div>
 <div id="b" class="pane behind"><div class="pdfViewer"></div></div>
+<canvas id="map"></canvas>
 <script type="module">
 try {
   const pdfjsLib = await import("./pdf.min.mjs");
@@ -983,6 +999,7 @@ try {
     from.container.classList.add("behind");
     shown = into;
     behind = from;
+    if (window.tasteMapBuild) window.tasteMapBuild();
     const old = from.doc;
     from.doc = null;
     from.viewer.setDocument(null);
@@ -996,6 +1013,154 @@ try {
     if (top !== undefined) shown.container.scrollTop = top;
     return shown.container.scrollTop + " (page " + shown.viewer.currentPageNumber + ")";
   };
+  // The overview strip.
+  const map = document.getElementById("map");
+  const GAP = 2;
+  // Each page's picture, as tall as the strip's width makes it, and the
+  // canvas it is drawn on once it has been.
+  let thumbs = [];
+  let mapGeneration = 0;
+  const mapWidth = () => map.clientWidth;
+  const build = async (doc) => {
+    const mine = ++mapGeneration;
+    const first = thumbs.length === 0;
+    const next = [];
+    if (first) thumbs = next;
+    const ratio = window.devicePixelRatio || 1;
+    for (let n = 1; n <= doc.numPages; n++) {
+      let page;
+      try { page = await doc.getPage(n); } catch (error) { return; }
+      if (mine !== mapGeneration) return;
+      const unit = page.getViewport({ scale: 1 });
+      const width = mapWidth();
+      const entry = { h: width * unit.height / unit.width, canvas: null };
+      next.push(entry);
+      const viewport = page.getViewport({ scale: width * ratio / unit.width });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.floor(viewport.width));
+      canvas.height = Math.max(1, Math.floor(viewport.height));
+      try {
+        await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+      } catch (error) {
+        continue;
+      }
+      if (mine !== mapGeneration) return;
+      entry.canvas = canvas;
+      if (first) draw();
+    }
+    if (mine === mapGeneration) { thumbs = next; draw(); }
+  };
+  // Each page's span in the view and in the strip, top to bottom.
+  const spans = () => {
+    const out = [];
+    let y = 0;
+    for (let i = 0; i < thumbs.length; i++) {
+      const view = shown.viewer.getPageView(i);
+      const div = view && view.div;
+      if (!div) break;
+      out.push({ top: div.offsetTop, bottom: div.offsetTop + div.offsetHeight,
+                 mapTop: y, mapBottom: y + thumbs[i].h });
+      y += thumbs[i].h + GAP;
+    }
+    return out;
+  };
+  // A place in the view as a place in the strip, and back; between pages,
+  // the edge of the nearer one.
+  const toMap = (list, y) => {
+    for (const s of list) {
+      if (y <= s.bottom) {
+        const f = Math.min(Math.max((y - s.top) / Math.max(s.bottom - s.top, 1), 0), 1);
+        return s.mapTop + f * (s.mapBottom - s.mapTop);
+      }
+    }
+    return list.length ? list[list.length - 1].mapBottom : 0;
+  };
+  const toView = (list, y) => {
+    for (const s of list) {
+      if (y <= s.mapBottom) {
+        const f = Math.min(Math.max((y - s.mapTop) / Math.max(s.mapBottom - s.mapTop, 1), 0), 1);
+        return s.top + f * (s.bottom - s.top);
+      }
+    }
+    return list.length ? list[list.length - 1].bottom : 0;
+  };
+  // How far the pictures are scrolled up in the strip: none while they
+  // fit, and in step with the view while they do not.
+  const offsetOf = (list) => {
+    const pane = shown.container;
+    const drawn = list.length ? list[list.length - 1].mapBottom : 0;
+    const room = map.clientHeight;
+    const most = pane.scrollHeight - pane.clientHeight;
+    return drawn > room && most > 0 ? (drawn - room) * Math.min(Math.max(pane.scrollTop / most, 0), 1) : 0;
+  };
+  let queued = false;
+  const draw = () => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      const ratio = window.devicePixelRatio || 1;
+      const w = map.clientWidth, h = map.clientHeight;
+      if (map.width !== Math.round(w * ratio) || map.height !== Math.round(h * ratio)) {
+        map.width = Math.round(w * ratio);
+        map.height = Math.round(h * ratio);
+      }
+      const ctx = map.getContext("2d");
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+      const list = spans();
+      if (!list.length) return;
+      const offset = offsetOf(list);
+      for (let i = 0; i < list.length; i++) {
+        const top = list[i].mapTop - offset;
+        const height = list[i].mapBottom - list[i].mapTop;
+        if (top > h || top + height < 0) continue;
+        if (thumbs[i].canvas) {
+          ctx.drawImage(thumbs[i].canvas, 0, top, w, height);
+        } else {
+          ctx.fillStyle = "rgba(255,255,255,.6)";
+          ctx.fillRect(0, top, w, height);
+        }
+      }
+      const pane = shown.container;
+      const top = toMap(list, pane.scrollTop) - offset;
+      const bottom = toMap(list, pane.scrollTop + pane.clientHeight) - offset;
+      ctx.globalAlpha = 0.25;
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--map-accent").trim() || '#3584e4';
+      ctx.fillRect(0, top, w, Math.max(bottom - top, 2));
+      ctx.globalAlpha = 1;
+    });
+  };
+  // A press puts that point of the document at the middle of the view; a
+  // drag keeps doing so.
+  const jump = (event) => {
+    const list = spans();
+    if (!list.length) return;
+    const y = event.clientY - map.getBoundingClientRect().top + offsetOf(list);
+    const pane = shown.container;
+    pane.scrollTop = toView(list, y) - pane.clientHeight / 2;
+  };
+  map.addEventListener("pointerdown", (event) => {
+    map.setPointerCapture(event.pointerId);
+    jump(event);
+    event.preventDefault();
+  });
+  map.addEventListener("pointermove", (event) => {
+    if (map.hasPointerCapture(event.pointerId)) jump(event);
+  });
+  map.addEventListener("wheel", (event) => {
+    if (event.ctrlKey) return;
+    shown.container.scrollBy({ top: event.deltaY });
+    event.preventDefault();
+  }, { passive: false });
+  for (const it of [shown, behind]) {
+    it.container.addEventListener("scroll", draw, { passive: true });
+    it.eventBus.on("updateviewarea", draw);
+    it.eventBus.on("pagesloaded", draw);
+  }
+  new ResizeObserver(draw).observe(map);
+  window.tasteMapBuild = () => { if (shown.doc) build(shown.doc); };
+  build(shown.doc);
   window.tasteReadyResolve();
   // The keys a reader pages with. The document scrolls inside a pane, not
   // the page, so the browser's own Page Up and Down — which scroll the
@@ -1174,6 +1339,22 @@ fn pdf_view(id: u64) -> webkit6::WebView {
             );
         }
         true
+    });
+    // The overview strip's block in this desktop's accent colour, as the
+    // source map's is; the page cannot ask GTK for it.
+    webkit6::prelude::WebViewExt::connect_load_changed(&view, |view, event| {
+        if event != webkit6::LoadEvent::Finished {
+            return;
+        }
+        let accent = adw::StyleManager::default().accent_color_rgba();
+        webkit6::prelude::WebViewExt::evaluate_javascript(
+            view,
+            &format!("document.documentElement.style.setProperty('--map-accent', '{accent}')"),
+            None,
+            None,
+            None::<&gtk::gio::Cancellable>,
+            |_| {},
+        );
     });
     webkit6::prelude::WebViewExt::load_uri(&view, &format!("{PDF_SCHEME}://{id}/index.html"));
     view
