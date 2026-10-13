@@ -517,9 +517,9 @@ const SUBMODULE_STAGING: &str = ".git/taste/submodules";
 /// submodule already there is moved only by `meet`, at the two's first
 /// meeting ([`share_submodules`]), and only when it holds no work of its
 /// own (exit 4 when it does); after that, where it stands is the mirror's
-/// to follow. With `check` as the mode, it only asks: 0 when the
-/// submodule is there, 1 when it is not — which is how a sync that
-/// changes nothing pushes nothing.
+/// to follow. One cloned and never checked out is not there yet. With
+/// `check` as the mode, it only asks: 0 when the submodule is there, 1 when
+/// it is not — which is how a sync that changes nothing pushes nothing.
 pub const SUBMODULE_SCRIPT: &str = r#"set -e
 name="$1"; path="$2"; staging="$3"; mode="$4"; head="$5"
 # Not yet: Personal's own commit does not record the submodule — the
@@ -529,8 +529,15 @@ name="$1"; path="$2"; staging="$3"; mode="$4"; head="$5"
 # and every snapshot after failed on (2026-10-09).
 git ls-files --stage -- "$path" | grep -q '^160000 ' || exit 6
 if [ -e "$path/.git" ]; then
-  [ "$mode" = meet ] || exit 0
-  [ -z "$(git -C "$path" status --porcelain)" ] || exit 4
+  if git -C "$path" rev-parse -q --verify HEAD >/dev/null; then
+    [ "$mode" = meet ] || exit 0
+    [ -z "$(git -C "$path" status --porcelain)" ] || exit 4
+  else
+    # Cloned and never checked out: a share that stopped between the two
+    # left one, which counted as there and so stayed empty (2026-10-13).
+    # Nothing in it is anyone's work; it is placed as a new one is.
+    [ "$mode" = check ] && exit 1
+  fi
   git -C "$path" fetch -q "$staging" "+refs/heads/*:refs/remotes/origin/*"
 else
   [ "$mode" = check ] && exit 1
@@ -599,6 +606,19 @@ fn share_submodules(
     Ok(())
 }
 
+/// Where the folder's clone of a submodule is, as [`SUBMODULE_SCRIPT`]
+/// takes it: `branch:<name>` on a branch, else `detached`. Not
+/// `branch_name`, which is libgit2's shorthand and says "HEAD" for a
+/// detached HEAD — the way `git submodule update` leaves every submodule —
+/// so the script ran `checkout -B HEAD`, which git refuses, after the clone
+/// and before anything was checked out (2026-10-13).
+fn submodule_head_arg(git: Option<&taste_git::GitWorkspace>) -> String {
+    match git.and_then(|g| g.checked_out()) {
+        Some(taste_git::mirror::Head::Branch(branch)) => format!("branch:{branch}"),
+        _ => "detached".to_string(),
+    }
+}
+
 /// [`share_submodules`] for one: `name` and `sub` as `.gitmodules` gives
 /// them, the path already checked to lie inside the folder.
 #[allow(clippy::too_many_arguments)]
@@ -621,10 +641,7 @@ fn share_submodule(
         .join(SUBMODULE_STAGING)
         .join(format!("{}.git", staging_name(name)));
     let folder_git = taste_git::GitWorkspace::discover(&clone);
-    let head = match folder_git.as_ref().and_then(|g| g.branch_name()) {
-        Some(branch) => format!("branch:{branch}"),
-        None => "detached".to_string(),
-    };
+    let head = submodule_head_arg(folder_git.as_ref());
     let script = |mode: &str| {
         files.exec(
             path,
@@ -2893,6 +2910,108 @@ mod tests {
         assert!(!pair
             .git("checkout", &["diff", "--name-only"])
             .contains(".gitmodules"));
+    }
+
+    /// A submodule the folder has detached — as `git submodule update`
+    /// leaves one — is shared detached, never as a branch named "HEAD"; and
+    /// one a share left cloned and never checked out is placed, not taken
+    /// for there.
+    #[test]
+    fn a_detached_submodule_is_placed_and_a_half_made_one_finished() {
+        let pair = Pair::new("subdetached");
+        pair.git(".", &["init", "-q", "-b", "main", "sub"]);
+        pair.write("sub", "lib.txt", "template\n");
+        pair.git("sub", &["add", "-A"]);
+        pair.commit("sub", "the template");
+        let sub = pair.dir.join("sub").display().to_string();
+        pair.git(
+            "folder",
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub,
+                "tpl",
+            ],
+        );
+        pair.commit("folder", "add the template");
+        pair.git("folder/tpl", &["checkout", "-q", "--detach"]);
+        let folder_tpl = taste_git::GitWorkspace::discover(&pair.dir.join("folder/tpl"));
+        assert_eq!(submodule_head_arg(folder_tpl.as_ref()), "detached");
+        let folder = taste_git::GitWorkspace::discover(&pair.dir.join("folder"));
+        assert_eq!(submodule_head_arg(folder.as_ref()), "branch:main");
+
+        pair.git("checkout", &["pull", "-q"]);
+        let staging = pair.dir.join("checkout/.git/taste/submodules/tpl.git");
+        pair.git(".", &["init", "-q", "--bare", staging.to_str().unwrap()]);
+        pair.git(
+            "folder/tpl",
+            &[
+                "push",
+                "-q",
+                "--force",
+                staging.to_str().unwrap(),
+                "+refs/heads/*:refs/heads/*",
+                "+HEAD:refs/heads/taste-folder-head",
+            ],
+        );
+        // What the failed share left: the clone, absorbed, HEAD unborn.
+        pair.git(
+            "checkout",
+            &[
+                "clone",
+                "-q",
+                "--no-checkout",
+                staging.to_str().unwrap(),
+                "tpl",
+            ],
+        );
+        pair.git(
+            "checkout",
+            &["config", "submodule.tpl.url", staging.to_str().unwrap()],
+        );
+        pair.git(
+            "checkout",
+            &["submodule", "--quiet", "absorbgitdirs", "--", "tpl"],
+        );
+        pair.git(
+            "checkout/tpl",
+            &["symbolic-ref", "HEAD", "refs/heads/master"],
+        );
+        let run = |mode: &str| {
+            std::process::Command::new("sh")
+                .current_dir(pair.dir.join("checkout"))
+                .args([
+                    "-c",
+                    SUBMODULE_SCRIPT,
+                    "taste-submodule",
+                    "tpl",
+                    "tpl",
+                    staging.to_str().unwrap(),
+                    mode,
+                    "detached",
+                ])
+                .output()
+                .unwrap()
+        };
+        assert_eq!(run("check").status.code(), Some(1), "not there yet");
+        let out = run("update");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(pair.dir.join("checkout/tpl/lib.txt")).unwrap(),
+            "template\n"
+        );
+        assert_eq!(
+            pair.git("checkout/tpl", &["rev-parse", "HEAD"]),
+            pair.git("folder/tpl", &["rev-parse", "HEAD"])
+        );
+        assert_eq!(run("check").status.code(), Some(0), "now nothing to do");
     }
 
     /// Changes inside a submodule travel as the parent's do: one made in
