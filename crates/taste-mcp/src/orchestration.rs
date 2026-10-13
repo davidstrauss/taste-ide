@@ -73,6 +73,39 @@ pub(crate) fn is_write(tool: &str) -> bool {
     )
 }
 
+/// What issue_start's `model` takes, before the values this IDE has seen
+/// advertised are added to it ([`naming_models`]).
+const MODEL_ARG: &str = "omit for the user's choice; otherwise one of the values the agent \
+     advertises, exactly as written — Claude Code's are aliases like `opus[1m]` or \
+     `sonnet`, never a model's full name. chat_status reports what actually runs";
+
+/// `tools` with issue_start's `model` naming the values each agent has
+/// advertised in this workspace (`taste_core::models`), so the coordinator
+/// chooses from the list rather than guessing at it: it asked for
+/// `claude-opus-5-5[1m]` where Claude Code takes `opus[1m]` (David,
+/// 2026-10-13).
+pub(crate) fn naming_models(
+    mut tools: Vec<Value>,
+    models: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<Value> {
+    if models.is_empty() {
+        return tools;
+    }
+    let known: Vec<String> = models
+        .iter()
+        .map(|(agent, ids)| format!("{agent}: {ids:?}"))
+        .collect();
+    for tool in &mut tools {
+        if tool["name"] == "issue_start" {
+            tool["inputSchema"]["properties"]["model"]["description"] = Value::String(format!(
+                "{MODEL_ARG}. Advertised here — {}",
+                known.join("; ")
+            ));
+        }
+    }
+    tools
+}
+
 /// The orchestration tools every socket serves: the reads.
 pub(crate) fn read_tools() -> Vec<Value> {
     tools()
@@ -119,7 +152,7 @@ pub(crate) fn tools() -> Vec<Value> {
                     },
                     "model": {
                         "type": "string",
-                        "description": "omit to follow the user's choice; otherwise an exact model id the agent advertises, not a family name — chat_status reports what actually runs"
+                        "description": MODEL_ARG
                     },
                     "where": {
                         "type": "string",
@@ -411,4 +444,34 @@ pub(crate) fn transcript_json(chat: &str, tail: &TranscriptTail) -> Value {
         "note": "a bounded mirror of what the tab shows; the full conversation lives \
                  with the agent, and the user can read it in that tab",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// issue_start's `model` names what each agent advertised here, once
+    /// some session has said; before then it says only what kind of value
+    /// it takes.
+    #[test]
+    fn the_model_argument_names_the_advertised_values() {
+        let describe = |tools: Vec<Value>| -> String {
+            tools
+                .iter()
+                .find(|t| t["name"] == "issue_start")
+                .map(|t| t["inputSchema"]["properties"]["model"]["description"].to_string())
+                .unwrap()
+        };
+        let none = describe(naming_models(tools(), &Default::default()));
+        assert!(none.contains("never a model's full name"), "{none}");
+        assert!(!none.contains("Advertised here"), "{none}");
+        let mut models = std::collections::BTreeMap::new();
+        models.insert(
+            "claude-code".to_string(),
+            vec!["default".to_string(), "opus[1m]".to_string()],
+        );
+        let named = describe(naming_models(tools(), &models));
+        assert!(named.contains("claude-code"), "{named}");
+        assert!(named.contains("opus[1m]"), "{named}");
+    }
 }

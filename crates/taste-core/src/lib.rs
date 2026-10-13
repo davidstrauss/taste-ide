@@ -21,6 +21,7 @@ pub mod kernel_task;
 pub mod logfile;
 pub mod mcp;
 pub mod memory;
+pub mod models;
 pub mod network;
 pub mod nudge;
 pub mod orchestration;

@@ -203,7 +203,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 1;
+pub const GUIDANCE_REVISION: u32 = 2;
 
 /// What every agent is told before its first tool call, and what the
 /// coordinator is told besides — the MCP instructions, and what `ide_guide`
@@ -278,6 +278,17 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              shell or ide_exec, or in the user's terminal: each is shown in the user's Tasks \
              section with its output. A task that takes arguments after `--` or asks for \
              input runs from a shell; the play button runs a task by name only.\n\n\
+             SYNC. The user's folder on their machine and Personal's checkout mirror each \
+             other: a file changed on one side is written on the other, and a path both \
+             sides changed is asked about, never overwritten. Ignored files stay where \
+             they are, except paths with the `taste-sync` attribute: lines such as \
+             `/data/** taste-sync` in the root .gitattributes, under the comment \
+             \"# Ignored paths that sync between the folder and Personal (taste-ide)\". \
+             They are the user's choice of ignored paths to sync, made in the file tree, \
+             and the IDE writes them, creating .gitattributes when there is none. So an \
+             untracked .gitattributes holding only those lines is the IDE's, not stray \
+             work: leave the lines as they are, and do not commit or delete the file \
+             unless the user asks.\n\n\
              SERVICES. ",
         );
     text.push_str(taste_core::conventions::SERVICES);
@@ -1572,7 +1583,10 @@ impl McpServer {
         // the orchestrator's alone, because the writes spawn agents. See
         // `crate::orchestration`.
         if self.is_orchestrator(env) {
-            tools.extend(crate::orchestration::tools());
+            tools.extend(crate::orchestration::naming_models(
+                crate::orchestration::tools(),
+                &self.workspace.models.all(),
+            ));
         } else {
             tools.extend(crate::orchestration::read_tools());
         }
@@ -5840,8 +5854,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "e3b22a067594c9bdb8c84f519adf52f94ad875296ee230297b43b7cf543f2b78";
-        const AT_REVISION: u32 = 1;
+            "9e6076168c9b5998089f21a398f8a479d0134007f128cd4ec6ac3edbe87995f4";
+        const AT_REVISION: u32 = 2;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

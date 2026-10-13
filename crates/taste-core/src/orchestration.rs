@@ -131,12 +131,13 @@ pub fn coordinator_brief() -> String {
          the user's choice. Choose the model per issue: the strongest model \
          with the largest context for design-heavy, cross-cutting or unknown-mechanism \
          work; a lighter one for a scoped fix, a document, a rename. The models a session \
-         advertises are the values issue_start accepts, and they are exact ids rather \
-         than family names — `opus` is not `opus[1m]`. The container starts before the \
-         agent, so a start cannot validate the id it was given: it comes back as \
-         `model_pending`, and chat_status is what reports the model actually running and \
-         names a choice the agent refused. Read it once the chat is up if the model \
-         mattered. Until then the issue is STARTING: a container being built, no agent \
+         advertises are the values issue_start accepts, exactly as written: Claude Code's \
+         are aliases like `opus[1m]` and `sonnet`, never a model's full name, and `opus` \
+         is not `opus[1m]`. issue_start's `model` description lists what each agent has \
+         advertised here; a value outside that list is refused before the environment is \
+         given its task. A start can still come back with `model_pending`, and \
+         chat_status is what reports the model actually running and names a choice the \
+         agent refused. Read it once the chat is up if the model mattered. Until then the issue is STARTING: a container being built, no agent \
          in it, the prompt held — nothing has been read or done, so say \"starting\", \
          never \"working on it\". Every issue row and chat_status answer carries `next`, \
          the step its state calls for; take it. The agent `claude-code-custom` is Claude Code against the endpoint the user \

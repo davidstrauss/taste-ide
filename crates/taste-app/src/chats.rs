@@ -991,6 +991,27 @@ impl Chats {
                 return;
             }
         }
+        // A model outside what this agent advertises here is refused now,
+        // before the chat is given anything, with the values it takes — the
+        // list a session of the same agent gave, the coordinator's own as
+        // likely as any (`taste_core::models`). Unknown until some session
+        // of the agent has said, and then the verdict waits for this chat's
+        // own, as below.
+        if let (Some(wanted), Some(ids)) =
+            (model.as_ref(), self.workspace.models.of(&pane.agent_id()))
+        {
+            if !ids.contains(wanted) {
+                self.forget_environment(&env);
+                done(Err(format!(
+                    "{} does not offer a model {wanted:?}; it takes one of {ids:?}, \
+                     exactly as written, or no `model` for the user's choice. The chat \
+                     was not created. Call issue_start again with one of these: it \
+                     finishes the start.",
+                    pane.agent_name()
+                )));
+                return;
+            }
+        }
         pane.set_model_value(model.clone());
         // A chat created for an orchestrator is prompted immediately, so it
         // connects now rather than waiting for its environment to be

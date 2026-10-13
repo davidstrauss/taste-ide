@@ -10141,6 +10141,18 @@ impl ChatPane {
         } else {
             model_choices(&config_options)
         };
+        // Kept for the workspace too, by agent, where a start checks a model
+        // against it before the environment's own session exists and the
+        // coordinator's tool list shows it (`taste_core::models`).
+        if !custom {
+            self.workspace.models.record(
+                &self.agent_id(),
+                self.advertised_models()
+                    .into_iter()
+                    .map(|(value, _)| value)
+                    .collect(),
+            );
+        }
         // An agent that exposes no model choice at all is the one case
         // `build_model_controls` never gets to answer, because it is never
         // called. A value chosen for such a chat has nowhere to land, and
