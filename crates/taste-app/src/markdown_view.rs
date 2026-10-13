@@ -21,6 +21,12 @@ use std::cell::RefCell;
 use std::path::{Component, PathBuf};
 use std::rc::Rc;
 
+/// A run of prose this long ends before its next heading (`render`).
+const RUN_AT_HEADING: usize = 1500;
+
+/// A run of prose this long ends after its next paragraph or list.
+const RUN_MOST: usize = 4000;
+
 /// Where a document stands: its directory, read through the files
 /// service the document itself came through, and the checkout that
 /// bounds it. Relative image paths resolve against it, and so do links
@@ -251,6 +257,18 @@ fn render_full(
     // A block joins the run when it ends (`end_block`); the run becomes a
     // label when something that is not prose interrupts it, or the
     // document ends (`flush`, which ends the open block first).
+    //
+    // And when it has grown long: before a heading once it holds
+    // `RUN_AT_HEADING` bytes of markup, and after a paragraph, a list, or
+    // a list's item, none deeper than a top-level item, once it holds
+    // `RUN_MOST`. A label draws
+    // itself whole for every change of its selection, so a document of one
+    // run — ARCHITECTURE.md's prose was a single label of 37,556
+    // characters — took 370ms a frame to select in, and the whole window
+    // waited on it (David, 2026-10-13: "selecting text in a MD preview
+    // seems to be really slow and bog down the entire UI"). A section is
+    // where a selection rarely crosses; a short document, a chat answer
+    // with headings among them, stays one run.
     let run: RefCell<(String, Option<Block>)> = RefCell::new((String::new(), None));
     let end_block = |markup: &mut String, heading: &mut Option<HeadingLevel>, block: Block| {
         let level = heading.take();
@@ -348,7 +366,19 @@ fn render_full(
     for event in parser {
         match event {
             Event::Start(tag) => match tag {
-                Tag::Heading { level, .. } => heading = Some(level),
+                Tag::Heading { level, .. } => {
+                    if run.borrow().0.len() >= RUN_AT_HEADING {
+                        flush(
+                            &mut markup,
+                            &mut spans,
+                            &mut heading,
+                            quote_depth,
+                            &root,
+                            &on_link,
+                        );
+                    }
+                    heading = Some(level);
+                }
                 Tag::CodeBlock(kind) => {
                     flush(
                         &mut markup,
@@ -435,8 +465,35 @@ fn render_full(
                         Block::Item
                     };
                     end_block(&mut markup, &mut heading, block);
+                    // Inside a top-level item too: one bullet of many
+                    // paragraphs was a label of 14,097 characters.
+                    if list_stack.len() <= 1 && run.borrow().0.len() >= RUN_MOST {
+                        flush(
+                            &mut markup,
+                            &mut spans,
+                            &mut heading,
+                            quote_depth,
+                            &root,
+                            &on_link,
+                        );
+                    }
                 }
-                TagEnd::Item => end_block(&mut markup, &mut heading, Block::Item),
+                TagEnd::Item => {
+                    end_block(&mut markup, &mut heading, Block::Item);
+                    // Between the items of a list that is not inside
+                    // another, too: a long list is a run of its own, and
+                    // its numbering is the list's, not the label's.
+                    if list_stack.len() == 1 && run.borrow().0.len() >= RUN_MOST {
+                        flush(
+                            &mut markup,
+                            &mut spans,
+                            &mut heading,
+                            quote_depth,
+                            &root,
+                            &on_link,
+                        );
+                    }
+                }
                 TagEnd::CodeBlock => {
                     if let Some(code) = code_block.take() {
                         let code = code.trim_end_matches('\n');
@@ -457,6 +514,16 @@ fn render_full(
                 }
                 TagEnd::List(_) => {
                     list_stack.pop();
+                    if list_stack.is_empty() && run.borrow().0.len() >= RUN_MOST {
+                        flush(
+                            &mut markup,
+                            &mut spans,
+                            &mut heading,
+                            quote_depth,
+                            &root,
+                            &on_link,
+                        );
+                    }
                 }
                 TagEnd::BlockQuote(_) => {
                     flush(
@@ -919,6 +986,34 @@ mod tests {
             }
             assert!(!first.contains("code"), "{first:?}");
             assert_eq!(runs[1], "After the code.");
+        });
+    }
+
+    /// A long document is several runs, each a section or so: a label
+    /// draws itself whole for each change of its selection.
+    #[test]
+    fn a_long_document_is_runs_of_bounded_length() {
+        crate::gtk_test::on_gtk_thread("markdown runs: no display — skipped", || {
+            let paragraph = "Words in a paragraph that goes on for a while. ".repeat(12);
+            let mut doc = String::new();
+            for section in 0..20 {
+                doc.push_str(&format!("## Section {section}\n\n"));
+                for _ in 0..4 {
+                    doc.push_str(&paragraph);
+                    doc.push_str("\n\n");
+                }
+            }
+            let runs = prose(&render(&doc, Rc::new(|_: &str| {})));
+            assert!(runs.len() > 5, "{} runs", runs.len());
+            for run in &runs {
+                assert!(run.len() < RUN_MOST + 2 * paragraph.len(), "{}", run.len());
+            }
+            // A short one with headings among it is still one.
+            let short = prose(&render(
+                "## One\n\nA line.\n\n## Two\n\nAnother.",
+                Rc::new(|_: &str| {}),
+            ));
+            assert_eq!(short.len(), 1, "{short:?}");
         });
     }
 

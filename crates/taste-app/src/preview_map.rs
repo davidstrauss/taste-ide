@@ -27,6 +27,9 @@ pub const WIDTH: i32 = 96;
 /// it (`textview.GtkSourceMap > slider`).
 const SLIDER_ALPHA: f32 = 0.25;
 
+/// How often the strip follows the document's contents while they change.
+const CONTENTS_EVERY: std::time::Duration = std::time::Duration::from_millis(150);
+
 mod imp {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -36,6 +39,8 @@ mod imp {
         pub(super) paintable: RefCell<Option<gtk::WidgetPaintable>>,
         pub(super) adjustment: RefCell<Option<gtk::Adjustment>>,
         pub(super) width: Cell<i32>,
+        /// A redraw for changed contents is already waiting.
+        pub(super) pending: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -124,11 +129,25 @@ impl PreviewMap {
         imp.width.set(width.max(1));
         let paintable = gtk::WidgetPaintable::new(Some(content));
         {
+            // Drawing the strip draws the whole document again, scaled. A
+            // change of contents — a selection growing under a drag changes
+            // them every frame — is followed at most every
+            // `CONTENTS_EVERY`, not every frame, which had the strip
+            // drawing the document twice a frame for as long as the drag
+            // lasted (2026-10-13). Scrolling still moves the slider at once.
             let weak = this.downgrade();
             paintable.connect_invalidate_contents(move |_| {
-                if let Some(this) = weak.upgrade() {
-                    this.queue_draw();
+                let Some(this) = weak.upgrade() else { return };
+                if this.imp().pending.replace(true) {
+                    return;
                 }
+                let weak = this.downgrade();
+                glib::timeout_add_local_once(CONTENTS_EVERY, move || {
+                    if let Some(this) = weak.upgrade() {
+                        this.imp().pending.set(false);
+                        this.queue_draw();
+                    }
+                });
             });
             let weak = this.downgrade();
             paintable.connect_invalidate_size(move |_| {

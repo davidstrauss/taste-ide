@@ -584,7 +584,11 @@ it has it, and prints whether the row at the top of the view stayed put
 through what used to move it — the oldest row let go, a row put in above,
 rows added below, the row cap reached — `held` or `MOVED` for each (its
 row put in above trips one GTK allocation CRITICAL of its own, with or
-without the anchoring). Run it on the machine that
+without the anchoring). `TASTE_PROBE_SELECT=1` (with
+`TASTE_PROBE_PREVIEW=<a long .md>`) grows a selection across the preview's
+longest label a step a frame, as a drag does, and prints its frames;
+`=nomap` hides the overview strip first, which tells the label's cost apart
+from the strip's. Run it on the machine that
   lags, in the build it runs: in the devcontainer it measures llvmpipe's
   software rendering, about 30ms a frame whatever the transcript holds.
 - **Convention over configuration over code.** Fixed locations for project

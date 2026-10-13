@@ -2748,6 +2748,17 @@ impl Editor {
                     session.probe_drag();
                 }
             }
+            // `TASTE_PROBE_SELECT=1`: a selection grown across the
+            // preview's longest label, a step a frame as a drag grows one,
+            // with the frames timed (`select_bench`); `=nomap` with the
+            // overview strip hidden, which tells the label's cost apart
+            // from the strip's.
+            if let Ok(mode) = std::env::var("TASTE_PROBE_SELECT") {
+                let holder = page.preview_holder.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
+                    select_bench(&holder, mode == "nomap");
+                });
+            }
             // `TASTE_PROBE_PREVIEW_AT=<0..1>`: scrolled that far down once
             // its pictures are in, for the part of a long document a pane's
             // height does not reach.
@@ -4869,6 +4880,113 @@ pub(crate) fn apply_scheme_for_style(buffer: &sourceview5::Buffer) {
     if let Some(scheme) = sourceview5::StyleSchemeManager::default().scheme(scheme_id) {
         buffer.set_style_scheme(Some(&scheme));
     }
+}
+
+/// TASTE_PROBE_SELECT: the preview's longest selectable label selected from
+/// its start further each frame, 240 frames to its end, and each frame's
+/// work (the frame clock's update to its after-paint) and the time between
+/// frames printed as p50/p95/max — the measure of "selecting text in a
+/// preview bogs down the UI". `no_map` hides the overview strip first.
+fn select_bench(holder: &gtk::Box, no_map: bool) {
+    use std::time::Instant;
+    let mut labels = Vec::new();
+    let mut stack = vec![holder.clone().upcast::<gtk::Widget>()];
+    while let Some(widget) = stack.pop() {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            if label.is_selectable() {
+                labels.push(label.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            stack.push(c.clone());
+            child = c.next_sibling();
+        }
+    }
+    let Some(label) = labels.into_iter().max_by_key(|l| l.text().len()) else {
+        println!("select bench: no selectable label");
+        return;
+    };
+    if no_map {
+        if let Some(body) = holder
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_then(|s| s.parent())
+        {
+            if let Some(map) = body.last_child() {
+                map.set_visible(false);
+            }
+        }
+    }
+    let Some(clock) = label.frame_clock() else {
+        println!("select bench: no frame clock");
+        return;
+    };
+    let chars = label.text().chars().count() as i32;
+    println!(
+        "select bench: a label of {chars} characters, {}px tall, opening {:?}; the strip {}",
+        label.height(),
+        label.text().chars().take(120).collect::<String>(),
+        if no_map { "hidden" } else { "shown" }
+    );
+    let begun: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+    let last: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+    let frames: Rc<RefCell<Vec<(f64, f64)>>> = Rc::new(RefCell::new(Vec::new()));
+    let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1000.0;
+    let update = {
+        let begun = begun.clone();
+        clock.connect_update(move |_| begun.set(Some(Instant::now())))
+    };
+    let after = {
+        let (begun, last, frames) = (begun.clone(), last.clone(), frames.clone());
+        clock.connect_after_paint(move |_| {
+            let now = Instant::now();
+            if let Some(start) = begun.take() {
+                let gap = last.get().map(|end| ms(end, now)).unwrap_or(0.0);
+                frames.borrow_mut().push((ms(start, now), gap));
+            }
+            last.set(Some(now));
+        })
+    };
+    let handlers = RefCell::new(Some([update, after]));
+    let step = Cell::new(0);
+    let started = Instant::now();
+    label.add_tick_callback(move |label, clock| {
+        let n = step.get() + 1;
+        step.set(n);
+        if n <= 240 {
+            label.select_region(0, chars * n / 240);
+            return glib::ControlFlow::Continue;
+        }
+        if let Some(handlers) = handlers.borrow_mut().take() {
+            for handler in handlers {
+                clock.disconnect(handler);
+            }
+        }
+        let quantiles = |mut v: Vec<f64>| -> (f64, f64, f64) {
+            if v.is_empty() {
+                return (0.0, 0.0, 0.0);
+            }
+            v.sort_by(|a, b| a.total_cmp(b));
+            let at = |q: f64| v[((v.len() as f64 - 1.0) * q).round() as usize];
+            (at(0.5), at(0.95), v[v.len() - 1])
+        };
+        let frames = frames.borrow().clone();
+        let work = quantiles(frames.iter().map(|f| f.0).collect());
+        let gap = quantiles(frames.iter().skip(1).map(|f| f.1).collect());
+        println!(
+            "select bench: {} frames in {:.1}s; ms p50/p95/max — work {:.1}/{:.1}/{:.1}, \
+             between frames {:.1}/{:.1}/{:.1}",
+            frames.len(),
+            started.elapsed().as_secs_f64(),
+            work.0,
+            work.1,
+            work.2,
+            gap.0,
+            gap.1,
+            gap.2,
+        );
+        glib::ControlFlow::Break
+    });
 }
 
 #[cfg(test)]
