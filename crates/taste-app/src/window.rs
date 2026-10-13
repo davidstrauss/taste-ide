@@ -3,7 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -50,6 +50,18 @@ const FLANK_OPENING_WIDTH: i32 = 335;
 /// its prose reflows, and we cope with it narrow. The number is the chat
 /// column's own natural width, so the pane asks for what it opens at.
 const CHAT_OPENING_WIDTH: i32 = crate::chat_column::NATURAL_WIDTH;
+
+/// The window's own title, which the header bar does not show (its middle is
+/// the search) but the desktop does: the overview, Alt+Tab, the dock's list
+/// of windows. The project's folder by its name alone, so two windows of the
+/// IDE say which project each is (David, 2026-10-13: "should show up as
+/// taste-ide: amutable-presentations").
+fn window_title(root: &Path) -> String {
+    match root.file_name() {
+        Some(name) => format!("taste-ide: {}", name.to_string_lossy()),
+        None => "taste-ide".to_string(),
+    }
+}
 
 pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWindow {
     // A TASTE_PROBE_CHECK instance is scaffolding, not a session: it must
@@ -1548,6 +1560,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
+        .title(window_title(&root))
         .default_width(1440)
         .default_height(900)
         .content(&toast_overlay)
@@ -5941,4 +5954,21 @@ fn ask_folder_conflict(
 /// page that is drawing the next start.
 fn startup_state_now(startup: &crate::startup::StartupPage) -> Option<bool> {
     Some(startup.underway() && !startup.settled())
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::window_title;
+    use std::path::Path;
+
+    #[test]
+    fn the_title_names_the_project_folder_without_its_path() {
+        assert_eq!(
+            window_title(Path::new(
+                "/var/home/straussd/Projects/amutable/amutable-presentations"
+            )),
+            "taste-ide: amutable-presentations"
+        );
+        assert_eq!(window_title(Path::new("/")), "taste-ide");
+    }
 }
