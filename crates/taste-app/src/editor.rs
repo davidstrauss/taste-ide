@@ -586,10 +586,12 @@ use taste_core::files::Files;
 use taste_core::textfile::{self, content_hash, normalize_load, FileFormat};
 use taste_devcontainer::Worktree;
 
-/// A file the agent is working on that the user has NOT opened. Text and
-/// the format to write it back with — no widgets, no realized view, no
-/// display. Writes here go straight to disk, so there is never unsaved
-/// state hiding behind an invisible tab.
+/// A file the agent is writing that the user has NOT opened, for the length
+/// of one write: text and the format to write it back with — no widgets, no
+/// realized view, no display. It is loaded from the disk, edited, and saved
+/// in one call and then dropped, never kept: the agent's shell writes the
+/// same files, so a copy kept from an earlier call would answer the next
+/// read with what was there before a script rewrote it.
 struct HeadlessBuffer {
     text: String,
     format: FileFormat,
@@ -653,8 +655,6 @@ pub struct Editor {
     /// The startup page's tab while a start is on screen: the one the
     /// selection is held to (`show_startup`).
     startup_tab: RefCell<Option<adw::TabPage>>,
-    /// Files the agent holds that the user has not opened.
-    headless: RefCell<HashMap<PathBuf, HeadlessBuffer>>,
     /// Guards toggle updates driven by page switches from re-triggering.
     /// Edit ↔ changes-view toggle for the selected tab.
     /// Latest git states of uncommitted files (absolute paths), for the
@@ -842,7 +842,6 @@ impl Editor {
             on_prompt_task: RefCell::new(None),
             on_prompt_agent: RefCell::new(None),
             startup_tab: RefCell::new(None),
-            headless: RefCell::new(HashMap::new()),
             git_dirty: RefCell::new(HashMap::new()),
             git_refresh: crate::filetree::RefreshGate::default(),
             environments: RefCell::new(None),
@@ -3123,9 +3122,6 @@ impl Editor {
         review: Option<ReviewSource>,
         prepared: Option<Prepared>,
     ) {
-        // The user owns this file now; any headless copy is redundant (its
-        // writes were saved as they happened, so disk is already current).
-        self.headless.borrow_mut().remove(path);
         // Whose file is this, and what does `.editorconfig` say about it? A
         // file from another environment's checkout opens read-only and
         // badged, in that environment's own tab set. Both answers cost
@@ -3986,26 +3982,24 @@ impl Editor {
 /// without a display, and is exercised by taste-core's tests.
 ///
 /// The ACP handlers are the caller, through `taste_core::ui_probe`. The
-/// settle helpers below (`has_unsaved`, `buffer_save`, `buffer_revert`,
-/// `buffer_close`) are the conflict-resolution half and have no caller
-/// yet, so the block carries its own allow rather than leaving the build
+/// settle helpers below (`has_unsaved`, `buffer_save`, and `buffer_revert`)
+/// are the conflict-resolution half and have no caller yet, so the block carries its own allow rather than leaving the build
 /// noisy.
 #[allow(dead_code)]
 impl Editor {
     /// What the agent should see: the live buffer when the user has one
-    /// open (unsaved edits included), else the headless copy, else `None`
-    /// for "read the file yourself".
+    /// open (unsaved edits included), else `None` for "read the file
+    /// yourself" — the disk, which is what the agent's shell last left.
     pub fn buffer_text(&self, path: &Path) -> Option<String> {
-        if let Some(page) = self.pages.borrow().get(path) {
-            let (start, end) = page.buffer.bounds();
-            return Some(page.buffer.text(&start, &end, true).to_string());
-        }
-        self.headless.borrow().get(path).map(|b| b.text.clone())
+        let pages = self.pages.borrow();
+        let page = pages.get(path)?;
+        let (start, end) = page.buffer.bounds();
+        Some(page.buffer.text(&start, &end, true).to_string())
     }
 
-    /// Whether `path` has edits the user has not saved. Headless buffers
-    /// are written through on every change, so only a real tab can be
-    /// unsaved.
+    /// Whether `path` has edits the user has not saved. Only a real tab
+    /// can be: an agent's write to an unopened file is saved as it is
+    /// made.
     pub fn has_unsaved(&self, path: &Path) -> bool {
         self.pages
             .borrow()
@@ -4036,9 +4030,6 @@ impl Editor {
             // environment before this request was made.
             return self.persist_page(path, &page);
         }
-        // Read afresh: a copy kept from an earlier call would be written
-        // over whatever changed on the disk since.
-        self.headless.borrow_mut().remove(path);
         self.write_headless(path, |buffer| {
             buffer.text = text.to_string();
             Ok(())
@@ -4065,7 +4056,6 @@ impl Editor {
             self.persist_page(path, &page)?;
             return Ok(done);
         }
-        self.headless.borrow_mut().remove(path);
         let mut outcome = None;
         self.write_headless(path, |buffer| {
             let done = taste_core::agentedit::replace(&buffer.text, old, new, all)?;
@@ -4082,7 +4072,8 @@ impl Editor {
         if let Some(page) = self.pages.borrow().get(path).cloned() {
             return self.save_page(path, &page);
         }
-        self.write_headless(path, |_| Ok(()))
+        // Nothing unopened is ever unsaved.
+        Ok(())
     }
 
     /// Drop unsaved edits and take what is on disk — the "stash it" half.
@@ -4097,38 +4088,23 @@ impl Editor {
                 .set(Some(content_hash(&textfile::render(&disk, &format))));
             return Ok(());
         }
-        self.headless.borrow_mut().remove(path);
         Ok(())
     }
 
-    /// Release a buffer the agent opened. A file the user has since opened
-    /// is theirs — closing it under them is not ours to do.
-    pub fn buffer_close(&self, path: &Path) {
-        self.headless.borrow_mut().remove(path);
-    }
-
-    /// Load-or-create the headless copy, apply `edit`, and write it out.
-    /// No GTK on this path at all.
+    /// Load `path` from the disk, apply `edit`, and write it out. No GTK on
+    /// this path at all.
     fn write_headless(
         &self,
         path: &Path,
         edit: impl FnOnce(&mut HeadlessBuffer) -> Result<(), String>,
     ) -> Result<(), String> {
         let files = files_among(path, &self.access());
-        let mut headless = self.headless.borrow_mut();
-        let buffer = match headless.get_mut(path) {
-            Some(buffer) => buffer,
-            None => {
-                // Loaded even though the caller usually replaces the text:
-                // detection plus .editorconfig is what lets the write
-                // preserve line endings, BOM and whitespace policy.
-                let (text, format) = textfile::load_via(&files, path).map_err(|e| e.to_string())?;
-                headless
-                    .entry(path.to_path_buf())
-                    .or_insert(HeadlessBuffer { text, format })
-            }
-        };
-        edit(buffer)?;
+        // Loaded even though the caller usually replaces the text:
+        // detection plus .editorconfig is what lets the write preserve line
+        // endings, BOM, and whitespace policy.
+        let (text, format) = textfile::load_via(&files, path).map_err(|e| e.to_string())?;
+        let mut buffer = HeadlessBuffer { text, format };
+        edit(&mut buffer)?;
         // Same rule as an open page: the file's own checkout bounds the
         // write. An agent in `calm-1` writing a file it has not asked the
         // user to open still writes inside `calm-1`.
@@ -5038,6 +5014,36 @@ mod tests {
             // Handed over late, after the move: opened at once.
             editor.await_checkout(&folder, vec!["notes.md".into()], None);
             assert!(wait_for(&checkout.join("notes.md")));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// An agent's write to a file the user has not opened keeps no copy:
+    /// a script that rewrites the file afterwards is what the agent's next
+    /// read and its next edit see, never the text it wrote before.
+    #[test]
+    fn an_unopened_file_is_read_from_the_disk_after_the_agent_writes_it() {
+        crate::gtk_test::on_gtk_thread("buffer_write: no display — skipped", || {
+            let dir = std::env::temp_dir().join(format!("taste-unopened-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            // `.devcontainer/` is writable in safe mode, which is the mode
+            // a workspace with no container is in.
+            let notes = dir.join(".devcontainer/notes.md");
+            std::fs::create_dir_all(notes.parent().unwrap()).unwrap();
+            std::fs::write(&notes, "one\n").unwrap();
+            crate::languages::register();
+            let editor = super::Editor::new(taste_core::Workspace::open(dir.clone()));
+            editor.buffer_write(&notes, "two\n").unwrap();
+            assert_eq!(std::fs::read_to_string(&notes).unwrap(), "two\n");
+            // The renumbering script, in the agent's shell.
+            std::fs::write(&notes, "three\n").unwrap();
+            assert_eq!(
+                editor.buffer_text(&notes),
+                None,
+                "an unopened file is read from the disk"
+            );
+            editor.buffer_edit(&notes, "three", "four", false).unwrap();
+            assert_eq!(std::fs::read_to_string(&notes).unwrap(), "four\n");
             let _ = std::fs::remove_dir_all(&dir);
         });
     }

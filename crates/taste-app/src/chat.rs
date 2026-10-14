@@ -8945,7 +8945,10 @@ impl ChatPane {
                                             .iter()
                                             .find(|(k, _)| k == "Status" || k == "State")
                                             .map(|(_, v)| v.clone())
-                                            .unwrap_or_else(|| format!("{} fields", fields.len()))
+                                            .unwrap_or_else(|| match fields.len() {
+                                                1 => "1 field".to_string(),
+                                                n => format!("{n} fields"),
+                                            })
                                     });
                                 } else if let Some(text) = content_text(&block.content) {
                                     let (head, hidden) =
