@@ -393,7 +393,9 @@ follows Personal's commits; the folder ahead carries Personal onto its
 commits, moving the branch alone where the two trees already agree, and
 otherwise stashing Personal's uncommitted work, fast-forwarding, and
 popping it back, with a pop that will not apply cleaned up; either side
-follows the other's switch, Personal refusing over a change of its own;
+follows the other's switch, Personal refusing over a change of its own
+(an edit inside a submodule is the submodule's pair's, not the parent's,
+and does not hold the switch);
 divergence and both sides moving are said and left; and then the mirror of
 `Sync.tla`. Git's rules are modelled as git has them: a fast-forward or a
 switch refuses over a local change to a path it changes and over an

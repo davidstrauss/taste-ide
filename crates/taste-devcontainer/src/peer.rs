@@ -1906,7 +1906,12 @@ here=$(git symbolic-ref --short -q HEAD || git rev-parse -q --verify HEAD)
 if [ "$here" != "$from" ]; then
   cleanup; echo "Personal has moved off $from since it last agreed with the folder" >&2; exit 2
 fi
-if ! git diff --quiet || ! git diff --cached --quiet; then
+# A submodule's own working tree is not the parent's uncommitted work: it
+# is synced as a pair of its own, and a switch carries it as git switch
+# does in the folder. Counting it held Personal on its branch for as long
+# as a submodule had an edit in it, whatever the folder did (2026-10-14).
+if ! git diff --quiet --ignore-submodules=dirty \
+  || ! git diff --cached --quiet --ignore-submodules=dirty; then
   cleanup; echo "Personal has uncommitted changes on $from" >&2; exit 3
 fi
 # Not a branch: the folder is detached at the commit, and so is Personal.
@@ -2178,6 +2183,25 @@ mod tests {
 
         fn commit(&self, side: &str, message: &str) {
             self.git(side, &["commit", "-q", "-m", message]);
+        }
+
+        /// The folder's `branch` fetched into the checkout's staging ref,
+        /// and [`SWITCH_SCRIPT`] run there from `from`; its exit status.
+        fn switch(&self, branch: &str, from: &str) -> i32 {
+            let folder = self.dir.join("folder").display().to_string();
+            let staging = format!("refs/taste/staging/{branch}");
+            self.git(
+                "checkout",
+                &["fetch", "-q", &folder, &format!("+{branch}:{staging}")],
+            );
+            std::process::Command::new("sh")
+                .current_dir(self.dir.join("checkout"))
+                .args(["-c", SWITCH_SCRIPT, "taste-switch", &staging, branch, from])
+                .output()
+                .unwrap()
+                .status
+                .code()
+                .unwrap_or(-1)
         }
 
         fn write(&self, side: &str, file: &str, text: &str) {
@@ -2560,28 +2584,7 @@ mod tests {
         pair.write("folder", "t.txt", "topic\n");
         pair.git("folder", &["add", "-A"]);
         pair.commit("folder", "on topic");
-        let folder = pair.dir.join("folder").display().to_string();
-        let switch = |from: &str| {
-            pair.git(
-                "checkout",
-                &["fetch", "-q", &folder, "+topic:refs/taste/staging/topic"],
-            );
-            std::process::Command::new("sh")
-                .current_dir(pair.dir.join("checkout"))
-                .args([
-                    "-c",
-                    SWITCH_SCRIPT,
-                    "taste-switch",
-                    "refs/taste/staging/topic",
-                    "topic",
-                    from,
-                ])
-                .output()
-                .unwrap()
-                .status
-                .code()
-                .unwrap_or(-1)
-        };
+        let switch = |from: &str| pair.switch("topic", from);
         pair.write("checkout", "a.txt", "personal's edit\n");
         assert_eq!(switch("main"), 3, "Personal's uncommitted work holds it");
         pair.git("checkout", &["checkout", "-q", "--", "a.txt"]);
@@ -2598,6 +2601,48 @@ mod tests {
         assert_eq!(
             pair.git("checkout", &["rev-parse", "HEAD"]),
             pair.git("folder", &["rev-parse", "HEAD"])
+        );
+    }
+
+    /// An edit inside a submodule is not Personal's uncommitted work: the
+    /// switch goes ahead, onto a branch whose name has a slash in it, and
+    /// carries the edit with it, as git switch did in the folder.
+    #[test]
+    fn a_submodule_with_an_edit_in_it_does_not_hold_the_switch() {
+        let pair = Pair::new("switch-submodule");
+        pair.git(".", &["init", "-q", "-b", "main", "sub"]);
+        pair.write("sub", "s.txt", "sub\n");
+        pair.git("sub", &["add", "-A"]);
+        pair.commit("sub", "sub's first");
+        let sub = pair.dir.join("sub").display().to_string();
+        pair.git(
+            "checkout",
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub,
+                "sub",
+            ],
+        );
+        pair.commit("checkout", "add sub");
+        let checkout = pair.dir.join("checkout").display().to_string();
+        pair.git("folder", &["pull", "-q", "--ff-only", &checkout, "main"]);
+        pair.git("folder", &["switch", "-q", "-c", "someone/topic"]);
+        pair.write("folder", "t.txt", "topic\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "on topic");
+        pair.write("checkout", "sub/s.txt", "an edit in the submodule\n");
+        assert_eq!(pair.switch("someone/topic", "main"), 0);
+        assert_eq!(
+            pair.git("checkout", &["symbolic-ref", "--short", "HEAD"]),
+            "someone/topic"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pair.dir.join("checkout/sub/s.txt")).unwrap(),
+            "an edit in the submodule\n"
         );
     }
 
