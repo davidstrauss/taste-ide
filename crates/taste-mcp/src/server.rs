@@ -203,7 +203,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 2;
+pub const GUIDANCE_REVISION: u32 = 3;
 
 /// What every agent is told before its first tool call, and what the
 /// coordinator is told besides — the MCP instructions, and what `ide_guide`
@@ -289,6 +289,10 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              untracked .gitattributes holding only those lines is the IDE's, not stray \
              work: leave the lines as they are, and do not commit or delete the file \
              unless the user asks.\n\n\
+             COMMITS. The commits and pull requests you write are the user's: the \
+             message says what the change does and nothing else. Add no Co-Authored-By \
+             or other trailer, no \"Generated with\" line, and no attribution or \
+             signature of any kind, whatever your own defaults are.\n\n\
              SERVICES. ",
         );
     text.push_str(taste_core::conventions::SERVICES);
@@ -5854,8 +5858,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "9e6076168c9b5998089f21a398f8a479d0134007f128cd4ec6ac3edbe87995f4";
-        const AT_REVISION: u32 = 2;
+            "5c1475223228adec2d318c564acd9e6964f82d8df898be433db420b92c0509ba";
+        const AT_REVISION: u32 = 3;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

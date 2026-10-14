@@ -351,8 +351,11 @@ fn is_claude_code(spec: &AgentSpec) -> bool {
 /// and turns Claude Code's own auto memory off (`autoMemoryEnabled`): the
 /// project's memory is the IDE's, on the user's machine, shared by every
 /// environment (`taste_core::memory`), where Claude Code's was a
-/// directory in this one environment's home, in the VM. A file that does
-/// not parse is left alone rather than replaced.
+/// directory in this one environment's home, in the VM. It also empties
+/// Claude Code's commit and pull request attribution (`attribution`), so
+/// no Co-Authored-By trailer or "Generated with" line goes into the
+/// user's history: the commits are theirs. A file that does not parse is
+/// left alone rather than replaced.
 fn claude_settings_script() -> String {
     let list = |tools: &[&str]| serde_json::to_string(tools).unwrap_or_else(|_| "[]".into());
     format!(
@@ -363,6 +366,7 @@ fn claude_settings_script() -> String {
          const p=s.permissions=s.permissions||{{}};\
          const add=(k,v)=>{{p[k]=[...new Set([...(p[k]||[]),...v])]}};\
          add('deny',{deny});add('allow',{allow});s.autoMemoryEnabled=false;\
+         s.attribution={{...s.attribution,commit:'',pr:''}};\
          fs.mkdirSync(path.dirname(f),{{recursive:true}});\
          fs.writeFileSync(f+'.taste-part',JSON.stringify(s,null,2)+'\\n');\
          fs.renameSync(f+'.taste-part',f);",
@@ -768,6 +772,10 @@ mod tests {
             "mcp__taste-ide__ide_read_file"
         );
         assert_eq!(merged["autoMemoryEnabled"], false);
+        assert_eq!(
+            merged["attribution"],
+            serde_json::json!({"commit": "", "pr": ""})
+        );
         std::fs::write(&file, "{ not json").unwrap();
         run();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ not json");
