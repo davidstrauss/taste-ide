@@ -28,6 +28,7 @@ pub use relation::{record_remote_tip, PushTarget};
 pub mod review;
 pub mod snapshot;
 pub mod submodule_setup;
+pub mod transport;
 
 pub use clone::strip_worktree;
 pub use clone::{clone_local, unpublished_work, unshare_inodes, UnpublishedBranch};
@@ -924,6 +925,21 @@ impl GitWorkspace {
             Ok(found) => found.url().map(str::to_string),
             Err(_) => Some(remote.to_string()),
         }
+    }
+
+    /// The URL this repository is fetched from: the current branch's
+    /// upstream remote's, else that of `origin` or the only remote. Its
+    /// scheme is the one the submodules on its host are fetched with
+    /// ([`transport`]).
+    pub fn base_url(&self) -> Option<String> {
+        self.upstream_remote_url()
+            .or_else(|| self.url_of_remote(&self.default_remote()))
+    }
+
+    /// [`transport::align_args`] for this repository's [`Self::base_url`]:
+    /// what goes before a subcommand that fetches its submodules.
+    pub(crate) fn align_args(&self) -> Vec<String> {
+        transport::align_args(self.base_url().as_deref())
     }
 
     /// Fetch from the branch's remote (read-only remote operation).

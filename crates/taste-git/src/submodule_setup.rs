@@ -40,8 +40,9 @@ pub struct SubmoduleSetup {
     pub path: PathBuf,
     pub need: SubmoduleNeed,
     pub pin: Oid,
-    /// Where `.gitmodules` says it is fetched from: the remote whose keys
-    /// the setup asks for.
+    /// Where it is fetched from: `.gitmodules`'s URL, in the parent's
+    /// scheme when it is on the parent's host ([`crate::transport`]). The
+    /// remote whose keys the setup asks for.
     pub url: Option<String>,
 }
 
@@ -57,6 +58,7 @@ impl GitWorkspace {
         };
         // As it is on disk now, whatever this handle read before.
         let _ = index.read(false);
+        let base = self.base_url();
         self.submodules()
             .into_iter()
             .filter_map(|(name, path)| {
@@ -65,11 +67,10 @@ impl GitWorkspace {
                     return None;
                 }
                 let need = need_of(&self.workdir.join(&path), entry.id)?;
-                let url = self
-                    .repo
-                    .find_submodule(&name)
-                    .ok()
-                    .and_then(|sub| sub.url().map(str::to_owned));
+                let url = self.repo.find_submodule(&name).ok().and_then(|sub| {
+                    sub.url()
+                        .map(|url| crate::transport::aligned(base.as_deref(), url))
+                });
                 Some(SubmoduleSetup {
                     path,
                     need,
@@ -83,22 +84,21 @@ impl GitWorkspace {
     /// The git that answers `setup`'s need, run as [`Self::fetch_all_command`]
     /// is. A clone is the parent's `submodule update --init`, recursive so a
     /// submodule's own come with it; a fetch is the submodule's own, of every
-    /// remote; a move forward fast-forwards the branch it is on, or checks
-    /// the commit out where it is on none.
+    /// remote ([`Self::submodule_fetch_command`]); a move forward
+    /// fast-forwards the branch it is on, or checks the commit out where it
+    /// is on none. A clone and a fetch reach the submodule's remote in the
+    /// parent's scheme when it is on the parent's host ([`crate::transport`]).
     pub fn submodule_setup_command(&self, setup: &SubmoduleSetup) -> Option<(String, Vec<String>)> {
         let path = setup.path.to_str()?;
         match setup.need {
-            SubmoduleNeed::Clone => Some(self.git_command(&[
-                "submodule",
-                "update",
-                "--init",
-                "--recursive",
-                "--",
-                path,
-            ])),
-            SubmoduleNeed::Fetch => {
-                Some(GitWorkspace::open_at(&self.workdir.join(path))?.fetch_all_command())
+            SubmoduleNeed::Clone => {
+                let mut args = self.align_args();
+                args.extend(
+                    ["submodule", "update", "--init", "--recursive", "--", path].map(String::from),
+                );
+                Some(self.git_command_owned(args))
             }
+            SubmoduleNeed::Fetch => self.submodule_fetch_command(&setup.path),
             SubmoduleNeed::Advance => {
                 let inner = GitWorkspace::open_at(&self.workdir.join(path))?;
                 let pin = setup.pin.to_string();
@@ -110,6 +110,17 @@ impl GitWorkspace {
                 })
             }
         }
+    }
+
+    /// The fetch of the submodule cloned at `path`, of every remote, as the
+    /// parent's own fetch is — with the parent's rewrites, so a remote on the
+    /// parent's host is reached in the parent's scheme ([`crate::transport`]).
+    /// `None` when it is not cloned.
+    pub fn submodule_fetch_command(&self, path: &Path) -> Option<(String, Vec<String>)> {
+        let inner = GitWorkspace::open_at(&self.workdir.join(path))?;
+        let mut args = self.align_args();
+        args.extend(["fetch", "--all", "--prune"].map(String::from));
+        Some(inner.git_command_owned(args))
     }
 
     /// The repository whose working tree is exactly `dir` — never one
@@ -228,6 +239,47 @@ mod tests {
             "two\n"
         );
         assert!(folder.submodules_to_set_up().is_empty());
+    }
+
+    /// A folder cloned over HTTPS whose `.gitmodules` names a submodule
+    /// on the same host over SSH: the setup asks for the HTTPS remote's
+    /// keys, and its clone and its fetch carry the rewrite that takes it
+    /// there; the parent's own fetch, which reaches into submodules, too.
+    #[test]
+    fn a_submodule_on_the_parents_host_is_set_up_in_the_parents_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        cloned_without_submodules(dir.path());
+        let folder_dir = dir.path().join("folder");
+        git(
+            &folder_dir,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/org/deck.git",
+            ],
+        );
+        git(
+            &folder_dir,
+            &[
+                "config",
+                "-f",
+                ".gitmodules",
+                "submodule.tpl.url",
+                "git@github.com:org/tpl.git",
+            ],
+        );
+        let folder = GitWorkspace::discover(&folder_dir).unwrap();
+        let needs = folder.submodules_to_set_up();
+        assert_eq!(
+            needs[0].url.as_deref(),
+            Some("https://github.com/org/tpl.git")
+        );
+        let rewrite = "url.https://github.com/.insteadOf=git@github.com:".to_string();
+        let (_, clone) = folder.submodule_setup_command(&needs[0]).unwrap();
+        assert!(clone.contains(&rewrite), "{clone:?}");
+        let (_, fetch) = folder.fetch_all_command();
+        assert!(fetch.contains(&rewrite), "{fetch:?}");
     }
 
     #[test]

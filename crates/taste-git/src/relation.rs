@@ -228,9 +228,14 @@ impl GitWorkspace {
     }
 
     /// Fetch every configured remote: the base and a named push remote
-    /// both, which in a fork's setup are two.
+    /// both, which in a fork's setup are two. The fetch reaches into the
+    /// submodules whose commits it brings, so it carries the rewrites that
+    /// fetch those on this repository's host by its scheme
+    /// ([`crate::transport`]).
     pub fn fetch_all_command(&self) -> (String, Vec<String>) {
-        self.git_command(&["fetch", "--all", "--prune"])
+        let mut args = self.align_args();
+        args.extend(["fetch", "--all", "--prune"].map(String::from));
+        self.git_command_owned(args)
     }
 
     /// For a push target that is a URL: the ask for its tip there, whose

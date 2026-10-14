@@ -772,7 +772,8 @@ struct StatusSnapshot {
 const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The fetch of each submodule cloned in the folder at `root`, by its
-/// path: every remote, as the parent's own fetch is.
+/// path: every remote, as the parent's own fetch is, and on the parent's
+/// host in the parent's scheme (`taste_git::transport`).
 fn submodule_fetch_commands(root: &Path) -> Vec<(String, (String, Vec<String>))> {
     let Some(git) = taste_git::GitWorkspace::discover(root) else {
         return Vec::new();
@@ -780,12 +781,13 @@ fn submodule_fetch_commands(root: &Path) -> Vec<(String, (String, Vec<String>))>
     git.submodules()
         .into_iter()
         .filter_map(|(_, sub)| {
-            let clone = root.join(&sub);
-            if !clone.join(".git").exists() {
+            if !root.join(&sub).join(".git").exists() {
                 return None;
             }
-            let inner = taste_git::GitWorkspace::discover(&clone)?;
-            Some((sub.display().to_string(), inner.fetch_all_command()))
+            Some((
+                sub.display().to_string(),
+                git.submodule_fetch_command(&sub)?,
+            ))
         })
         .collect()
 }
