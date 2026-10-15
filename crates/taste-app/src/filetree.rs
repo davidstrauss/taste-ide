@@ -372,6 +372,9 @@ pub struct FileTree {
     /// Pull's hold: a click fast-forwards, a hold rebases ([`Pull`]). Kept
     /// here because the button holds itself only weakly.
     _pull_hold: Rc<crate::holdbutton::HoldButton>,
+    /// Push's hold: a click pushes, and a push that replaces commits on
+    /// the remote is held for ([`FileTree::push`]).
+    _push_hold: Rc<crate::holdbutton::HoldButton>,
     push_button: gtk::Button,
     /// A push or sync is running. Status refreshes land constantly (the
     /// watcher, every save, the agent), and one arriving mid-operation
@@ -1029,6 +1032,14 @@ impl FileTree {
         // positions of anything should change").
         let (push_button, push_face) = sync_button_with_label("↑ 0", "Push commits to the remote");
         push_button.set_sensitive(false);
+        let push_hold = crate::holdbutton::HoldButton::around(
+            &push_button,
+            &push_button
+                .child()
+                .and_downcast::<gtk::Stack>()
+                .expect("a sync button's child is its stack"),
+            "face",
+        );
         let (pull_button, pull_face) = sync_button_with_label(
             "↓ 0",
             "Pull: a click fetches and fast-forwards; hold to rebase onto the remote tip",
@@ -1486,6 +1497,7 @@ impl FileTree {
             sync_button: sync_button.clone(),
             pull_button: pull_button.clone(),
             _pull_hold: pull_hold.clone(),
+            _push_hold: push_hold.clone(),
             push_button: push_button.clone(),
             sync_busy: std::cell::Cell::new(false),
             abort_button: abort_button.clone(),
@@ -1738,12 +1750,19 @@ impl FileTree {
                 });
             });
         }
-        push_button.connect_clicked(move |button| {
-            if let Some(tree) = weak.upgrade() {
-                tree.begin_sync_op(button);
-                tree.push();
+        for held in [false, true] {
+            let weak = weak.clone();
+            let run = move || {
+                if let Some(tree) = weak.upgrade() {
+                    tree.push(held);
+                }
+            };
+            if held {
+                push_hold.set_on_confirm(run);
+            } else {
+                push_hold.set_on_click(run);
             }
-        });
+        }
         let weak = Rc::downgrade(&tree);
         let weak_branches = Rc::downgrade(&tree);
         branch_popover.connect_show(move |_| {
@@ -5079,6 +5098,10 @@ impl FileTree {
                     }
                     self.sync_button.set_sensitive(!snapshot.rebasing);
                     if snapshot.rebasing {
+                        // A pull or a push of a branch halfway through a
+                        // rebase is neither: Continue or Abort first.
+                        self.push_button.set_sensitive(false);
+                        self.pull_button.set_sensitive(false);
                         self.set_sync_label("rebase paused — resolve, mark, Continue");
                     } else {
                         match snapshot.sync {
@@ -5136,9 +5159,14 @@ impl FileTree {
                                     self.pull_face.set_label(&format!("↓ {}", sync.behind));
                                     // Against a base, a branch the push
                                     // target lacks still has a base to
-                                    // catch up with.
+                                    // catch up with. With the background
+                                    // fetch held back for a key's touch the
+                                    // count is as old as the last Pull, so
+                                    // Pull stays pressable: it is what
+                                    // fetches.
+                                    let stale = self.fetch_hold.borrow().is_some();
                                     self.pull_button.set_sensitive(
-                                        sync.behind > 0
+                                        (sync.behind > 0 || stale)
                                             && (sync.base.is_some() || !sync.new_branch),
                                     );
                                     let held = self
@@ -8019,7 +8047,9 @@ impl FileTree {
         self.sync_busy.set(false);
     }
 
-    fn push(self: &Rc<Self>) {
+    /// Push, from a click or, `held`, a hold: the hold is what a push that
+    /// replaces commits on the remote needs.
+    fn push(self: &Rc<Self>, held: bool) {
         // Push stays user-only and host-side, and it pushes the USER's
         // checkout. There is no reading of an agent's clone that turns
         // into publishing it to the world.
@@ -8042,42 +8072,39 @@ impl FileTree {
         // A branch rebased onto a base its push target is not — a fork's
         // pull request after Sync — replaces what the push target has.
         // That is the push the workflow wants, and it overwrites commits on
-        // a remote, so it is asked about by name, and leased on the tip
-        // last seen there so commits someone pushed since are refused
-        // rather than lost. Without a base the same divergence means the
-        // push target moved: Pull first, and git's own refusal says so.
+        // a remote, so it is held for, as every destructive button here is
+        // (David, 2026-10-15: "It should change to hold semantics"), a
+        // click saying so by name; and it is leased on the tip last seen
+        // there so commits someone pushed since are refused rather than
+        // lost. Without a base the same divergence means the push target
+        // moved: Pull first, and git's own refusal says so.
         let replacing = sync.as_ref().and_then(|sync| {
             sync.base.as_ref()?;
             sync.replaces.clone()
         });
         match replacing {
-            Some((expected, dropped)) => {
-                // The click started the spinner; the question comes first.
-                self.end_sync_op();
-                self.workspace.events.publish(Event::GitStatusChanged);
+            Some((_, dropped)) if !held => {
                 let target = sync
                     .as_ref()
                     .and_then(|s| s.upstream.clone())
                     .unwrap_or_else(|| "the remote".to_string());
-                let body = format!(
-                    "{dropped} commit{} on {target} {} not in this branch — the ones \
-                     it had before the rebase — and the push replaces {}. It is refused \
-                     if {target} has changed since it was last fetched.",
+                self.workspace.events.publish(Event::Toast(format!(
+                    "Not pushed: {target} has {dropped} commit{} this branch does not, from \
+                     before the rebase. Hold Push for {} seconds to replace {}; it is \
+                     refused if {target} has changed since it was last fetched",
                     if dropped == 1 { "" } else { "s" },
-                    if dropped == 1 { "is" } else { "are" },
+                    crate::holdbutton::HOLD.as_secs(),
                     if dropped == 1 { "it" } else { "them" },
-                );
-                self.clone().confirm_destructive_as(
-                    &format!("Replace {target}?"),
-                    &body,
-                    "Push and Replace",
-                    move |tree| {
-                        tree.begin_sync_op(&tree.push_button);
-                        tree.push_now(Some(expected.clone()));
-                    },
-                );
+                )));
             }
-            None => self.push_now(None),
+            Some((expected, _)) => {
+                self.begin_sync_op(&self.push_button);
+                self.push_now(Some(expected));
+            }
+            None => {
+                self.begin_sync_op(&self.push_button);
+                self.push_now(None);
+            }
         }
     }
 
