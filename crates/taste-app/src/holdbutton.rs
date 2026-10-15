@@ -15,6 +15,12 @@
 //! says why in a toast, so a tap on a destructive button is a lesson, not
 //! a loss. The hold is [`HOLD`] long — long enough that no click is a
 //! hold, short enough that a meant one does not feel like a wait.
+//!
+//! A button can also do something lighter on a click and the heavier
+//! thing on a hold ([`HoldButton::set_on_click`]): Pull fast-forwards on a
+//! click and rebases on a hold (David, 2026-10-15), and says when a click
+//! could not do what was needed, from its own result, since only the
+//! fetch the click makes can tell.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -39,6 +45,8 @@ const RING_SIZE: i32 = 16;
 pub struct HoldButton {
     pub widget: gtk::Button,
     faces: gtk::Stack,
+    /// The face the button wears at rest, which the ring stands in for.
+    idle: &'static str,
     ring: gtk::DrawingArea,
     progress: Cell<f64>,
     started: Cell<Option<Instant>>,
@@ -48,6 +56,9 @@ pub struct HoldButton {
     confirmed: Cell<bool>,
     on_confirm: RefCell<Option<Rc<dyn Fn()>>>,
     on_early: RefCell<Option<Rc<dyn Fn(String)>>>,
+    /// What a click does, when the button does something on one
+    /// ([`Self::set_on_click`]); otherwise a click is an early release.
+    on_click: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 impl HoldButton {
@@ -56,6 +67,26 @@ impl HoldButton {
             .icon_name(icon)
             .pixel_size(RING_SIZE)
             .build();
+        let faces = gtk::Stack::builder()
+            .hhomogeneous(true)
+            .vhomogeneous(true)
+            .transition_type(gtk::StackTransitionType::None)
+            .build();
+        faces.add_named(&image, Some("icon"));
+        faces.set_visible_child_name("icon");
+        let widget = gtk::Button::builder()
+            .child(&faces)
+            .tooltip_text(tooltip)
+            .css_classes(["hold-button"])
+            .build();
+        Self::around(&widget, &faces, "icon")
+    }
+
+    /// The hold, on a button that already has a face: `faces` is the
+    /// stack that is its child, `idle` the page it wears at rest, and the
+    /// ring is added beside it. A press while another page is up — a
+    /// spinner — starts nothing.
+    pub fn around(widget: &gtk::Button, faces: &gtk::Stack, idle: &'static str) -> Rc<Self> {
         let ring = gtk::DrawingArea::builder()
             .content_width(RING_SIZE)
             .content_height(RING_SIZE)
@@ -63,22 +94,11 @@ impl HoldButton {
             .valign(gtk::Align::Center)
             .css_classes(["hold-ring"])
             .build();
-        let faces = gtk::Stack::builder()
-            .hhomogeneous(true)
-            .vhomogeneous(true)
-            .transition_type(gtk::StackTransitionType::None)
-            .build();
-        faces.add_named(&image, Some("icon"));
         faces.add_named(&ring, Some("ring"));
-        faces.set_visible_child_name("icon");
-        let widget = gtk::Button::builder()
-            .child(&faces)
-            .tooltip_text(tooltip)
-            .css_classes(["hold-button"])
-            .build();
         let this = Rc::new(Self {
-            widget,
-            faces,
+            widget: widget.clone(),
+            faces: faces.clone(),
+            idle,
             ring,
             progress: Cell::new(0.0),
             started: Cell::new(None),
@@ -86,6 +106,7 @@ impl HoldButton {
             confirmed: Cell::new(false),
             on_confirm: RefCell::new(None),
             on_early: RefCell::new(None),
+            on_click: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&this);
@@ -109,13 +130,13 @@ impl HoldButton {
             let weak = Rc::downgrade(&this);
             gesture.connect_released(move |_, _, _, _| {
                 if let Some(this) = weak.upgrade() {
-                    this.end();
+                    this.end(false);
                 }
             });
             let weak = Rc::downgrade(&this);
             gesture.connect_cancel(move |_, _| {
                 if let Some(this) = weak.upgrade() {
-                    this.end();
+                    this.end(true);
                 }
             });
             this.widget.add_controller(gesture);
@@ -129,8 +150,8 @@ impl HoldButton {
                 if this.confirmed.replace(false) {
                     return;
                 }
-                if this.started.get().is_none() {
-                    this.say_early();
+                if this.started.get().is_none() && this.at_rest() {
+                    this.clicked();
                 }
             });
         }
@@ -142,13 +163,24 @@ impl HoldButton {
         *self.on_confirm.borrow_mut() = Some(Rc::new(hook));
     }
 
+    /// What a click does — a press released before the ring closes, or a
+    /// keyboard activation — in place of the early-release note.
+    pub fn set_on_click(&self, hook: impl Fn() + 'static) {
+        *self.on_click.borrow_mut() = Some(Rc::new(hook));
+    }
+
     /// Where the early-release note goes: the home's toast.
     pub fn set_on_early_release(&self, hook: impl Fn(String) + 'static) {
         *self.on_early.borrow_mut() = Some(Rc::new(hook));
     }
 
+    /// Wearing the face it rests in: not a spinner, not mid-hold.
+    fn at_rest(&self) -> bool {
+        self.faces.visible_child_name().as_deref() == Some(self.idle)
+    }
+
     fn begin(self: &Rc<Self>) {
-        if !self.widget.is_sensitive() || self.started.get().is_some() {
+        if !self.widget.is_sensitive() || self.started.get().is_some() || !self.at_rest() {
             return;
         }
         self.started.set(Some(Instant::now()));
@@ -180,15 +212,17 @@ impl HoldButton {
         self.started.set(None);
         self.tick.borrow_mut().take();
         self.confirmed.set(true);
-        self.faces.set_visible_child_name("icon");
+        self.faces.set_visible_child_name(self.idle);
         if let Some(hook) = self.on_confirm.borrow().clone() {
             hook();
         }
     }
 
     /// The finger lifted, or the gesture was cancelled, before the ring
-    /// closed: nothing fires, and the button says how long a hold is.
-    fn end(self: &Rc<Self>) {
+    /// closed: the hold's action does not fire. A release is a click; a
+    /// cancel is not, and on a button with a click of its own does nothing,
+    /// while on one without it says how long a hold is, as a release does.
+    fn end(self: &Rc<Self>, cancelled: bool) {
         let Some(_started) = self.started.take() else {
             return;
         };
@@ -196,11 +230,21 @@ impl HoldButton {
             id.remove();
         }
         self.progress.set(0.0);
-        self.faces.set_visible_child_name("icon");
-        // The button's `clicked` follows this release and says the note;
-        // a cancel has no click, so say it here.
-        self.say_early();
+        self.faces.set_visible_child_name(self.idle);
+        // The button's own `clicked` follows a release, and is swallowed
+        // (`confirmed`): this is where the click is answered.
+        if !cancelled || self.on_click.borrow().is_none() {
+            self.clicked();
+        }
         self.confirmed.set(true);
+    }
+
+    /// A click: the button's own action when it has one, else the note.
+    fn clicked(&self) {
+        match self.on_click.borrow().clone() {
+            Some(hook) => hook(),
+            None => self.say_early(),
+        }
     }
 
     fn say_early(&self) {

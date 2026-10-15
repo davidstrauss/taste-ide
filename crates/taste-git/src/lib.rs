@@ -24,7 +24,7 @@ pub mod presence;
 pub mod private;
 pub mod refs;
 mod relation;
-pub use relation::{record_remote_tip, PushTarget};
+pub use relation::{record_remote_tip, PullPlan, PushTarget};
 pub mod review;
 pub mod snapshot;
 pub mod submodule_setup;
@@ -1633,6 +1633,65 @@ mod tests {
     /// The user's push takes a submodule commit the branch records to the
     /// submodule's remote first: against real git, with local bare
     /// repositories for both remotes.
+    /// Pull's plan, against real git: nothing to take, the remote ahead
+    /// of a branch with nothing of its own, and both having moved; the
+    /// click's fast-forward refuses the last rather than replay it.
+    #[test]
+    fn a_pull_fast_forwards_or_asks_for_a_rebase() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let ok = |cwd: &Path, args: &[&str]| {
+            let (success, stderr) = git(cwd, args);
+            assert!(success, "git {args:?}: {stderr}");
+        };
+        ok(root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        ok(root, &["clone", "-q", "remote.git", "theirs"]);
+        let theirs = root.join("theirs");
+        ok(&theirs, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        ok(&theirs, &["push", "-q", "origin", "HEAD:main"]);
+        ok(root, &["clone", "-q", "remote.git", "mine"]);
+        let mine = root.join("mine");
+        let plan = || GitWorkspace::discover(&mine).unwrap().pull_plan_of("main");
+        assert_eq!(plan(), Some(PullPlan::UpToDate));
+
+        ok(&theirs, &["commit", "-q", "--allow-empty", "-m", "second"]);
+        ok(&theirs, &["push", "-q", "origin", "HEAD:main"]);
+        ok(&mine, &["fetch", "-q"]);
+        assert_eq!(plan(), Some(PullPlan::FastForward { theirs: 1 }));
+        let (_, args) = GitWorkspace::discover(&mine)
+            .unwrap()
+            .fast_forward_onto_command("refs/remotes/origin/main");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        ok(&mine, &args);
+        assert_eq!(plan(), Some(PullPlan::UpToDate));
+
+        ok(&mine, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+        ok(&theirs, &["commit", "-q", "--allow-empty", "-m", "third"]);
+        ok(&theirs, &["push", "-q", "origin", "HEAD:main"]);
+        ok(&mine, &["fetch", "-q"]);
+        assert_eq!(plan(), Some(PullPlan::Rebase { mine: 1, theirs: 1 }));
+        let (success, _) = git(&mine, &args);
+        assert!(
+            !success,
+            "a fast-forward never replays a commit of the branch's own"
+        );
+    }
+
     #[test]
     fn a_push_takes_the_submodule_commit_it_records_along() {
         let dir = tempfile::tempdir().unwrap();

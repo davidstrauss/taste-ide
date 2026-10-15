@@ -369,6 +369,9 @@ pub struct FileTree {
     sync_label: gtk::Label,
     sync_button: gtk::Button,
     pull_button: gtk::Button,
+    /// Pull's hold: a click fast-forwards, a hold rebases ([`Pull`]). Kept
+    /// here because the button holds itself only weakly.
+    _pull_hold: Rc<crate::holdbutton::HoldButton>,
     push_button: gtk::Button,
     /// A push or sync is running. Status refreshes land constantly (the
     /// watcher, every save, the agent), and one arriving mid-operation
@@ -767,6 +770,16 @@ struct StatusSnapshot {
     sync_ignored: taste_devcontainer::worktree::SyncIgnored,
 }
 
+/// What a sync does once it has fetched: Fetch (⟳) nothing more; Pull's
+/// click moves the branch forward only, and says so when that was not
+/// enough; Pull's hold rebases (David, 2026-10-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pull {
+    Fetch,
+    FastForward,
+    Rebase,
+}
+
 /// How long a fetch, rebase or push may run before it is called failed. A
 /// hung network step must not leave the sync row spinning for ever.
 const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -1016,9 +1029,19 @@ impl FileTree {
         // positions of anything should change").
         let (push_button, push_face) = sync_button_with_label("↑ 0", "Push commits to the remote");
         push_button.set_sensitive(false);
-        let (pull_button, pull_face) =
-            sync_button_with_label("↓ 0", "Pull: fetch, then rebase onto the remote tip");
+        let (pull_button, pull_face) = sync_button_with_label(
+            "↓ 0",
+            "Pull: a click fetches and fast-forwards; hold to rebase onto the remote tip",
+        );
         pull_button.set_sensitive(false);
+        let pull_hold = crate::holdbutton::HoldButton::around(
+            &pull_button,
+            &pull_button
+                .child()
+                .and_downcast::<gtk::Stack>()
+                .expect("a sync button's child is its stack"),
+            "face",
+        );
         let ignored_toggle = gtk::ToggleButton::builder()
             .icon_name("view-conceal-symbolic")
             .tooltip_text("Show ignored files")
@@ -1462,6 +1485,7 @@ impl FileTree {
             sync_label,
             sync_button: sync_button.clone(),
             pull_button: pull_button.clone(),
+            _pull_hold: pull_hold.clone(),
             push_button: push_button.clone(),
             sync_busy: std::cell::Cell::new(false),
             abort_button: abort_button.clone(),
@@ -1745,13 +1769,24 @@ impl FileTree {
             });
             root_row.add_controller(context);
         }
-        let weak_pull = Rc::downgrade(&tree);
-        pull_button.connect_clicked(move |button| {
-            if let Some(tree) = weak_pull.upgrade() {
-                tree.begin_sync_op(button);
-                tree.sync(true);
+        // A click takes what moves the branch forward and nothing else; a
+        // hold rebases, replaying the branch's own commits, which a click
+        // that needed it says (David, 2026-10-15: "Like with other
+        // press-and-hold buttons, show a toast if the user needs to hold").
+        for (mode, hold) in [(Pull::FastForward, false), (Pull::Rebase, true)] {
+            let weak_pull = Rc::downgrade(&tree);
+            let run = move || {
+                if let Some(tree) = weak_pull.upgrade() {
+                    tree.begin_sync_op(&tree.pull_button);
+                    tree.sync(mode);
+                }
+            };
+            if hold {
+                pull_hold.set_on_confirm(run);
+            } else {
+                pull_hold.set_on_click(run);
             }
-        });
+        }
         // Fetch, as its tooltip says, and nothing else: it ran the whole
         // Pull, which was a no-op only while the rebase target was the
         // branch's own tip, and became an 8274-commit rebase the moment it
@@ -1761,7 +1796,7 @@ impl FileTree {
         sync_button.connect_clicked(move |button| {
             if let Some(tree) = weak.upgrade() {
                 tree.begin_sync_op(button);
-                tree.sync(false);
+                tree.sync(Pull::Fetch);
             }
         });
         let weak = Rc::downgrade(&tree);
@@ -5118,15 +5153,18 @@ impl FileTree {
                                             )
                                         })
                                         .unwrap_or_default();
+                                    let hold = crate::holdbutton::HOLD.as_secs();
                                     self.pull_button.set_tooltip_text(Some(&match &sync.base {
                                         Some(base) => format!(
-                                            "Rebase onto {base}: {} commit{} there that this \
-                                             branch lacks (fetch + rebase){held}",
+                                            "Catch up with {base}: {} commit{} there that this \
+                                             branch lacks. Click to fetch and fast-forward; \
+                                             hold for {hold} seconds to rebase onto it{held}",
                                             sync.behind,
                                             plural(sync.behind)
                                         ),
                                         None => format!(
-                                            "Pull {} commit{} (fetch + rebase){held}",
+                                            "Pull {} commit{}. Click to fetch and fast-forward; \
+                                             hold for {hold} seconds to rebase onto them{held}",
                                             sync.behind,
                                             plural(sync.behind)
                                         ),
@@ -6812,7 +6850,7 @@ impl FileTree {
         });
     }
 
-    fn sync(self: &Rc<Self>, rebase: bool) {
+    fn sync(self: &Rc<Self>, mode: Pull) {
         // The working tree's branch, as the push has it: for a checkout in
         // a VM, not this repository's HEAD, whose upstream is main's.
         let branch = self.status_branch.borrow().clone();
@@ -6820,18 +6858,20 @@ impl FileTree {
         // base it rebases onto and the fork it pushes to. The rebase is
         // onto the base when the branch has one (`rebase_target_of`), its
         // upstream otherwise.
-        let Some((fetch, fetch_issues, rebase_command, remote, upstream)) =
+        let Some((fetch, fetch_issues, move_command, remote, upstream)) =
             self.git.borrow().as_ref().map(|git| {
                 let target = match &branch {
                     Some(branch) => git.rebase_target_of(branch),
                     None => git.upstream_ref(),
                 };
+                let onto = target.as_deref().unwrap_or("@{upstream}");
                 (
                     git.fetch_all_command(),
                     git.fetch_issues_command(),
-                    match &target {
-                        Some(target) => git.rebase_onto_command(target),
-                        None => git.rebase_command(),
+                    match mode {
+                        Pull::Rebase => Some(git.rebase_onto_command(onto)),
+                        Pull::FastForward => Some(git.fast_forward_onto_command(onto)),
+                        Pull::Fetch => None,
                     },
                     git.upstream_remote_url(),
                     target,
@@ -6848,7 +6888,11 @@ impl FileTree {
         let worktree = self.worktree();
         let share_remotes = self.share_remotes.borrow().clone();
         self.sync_button.set_sensitive(false);
-        self.set_sync_label(if rebase { "syncing…" } else { "fetching…" });
+        self.set_sync_label(if mode == Pull::Fetch {
+            "fetching…"
+        } else {
+            "syncing…"
+        });
         self.last_fetch.set(Some(std::time::Instant::now()));
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
@@ -6859,16 +6903,15 @@ impl FileTree {
             // through the IDE's own agent, whose touch notices land on the
             // same strip (`ssh_agent`).
             let envs = crate::ssh_agent::network_env(root.clone(), remote).await;
-            let mut steps: Vec<(&str, (String, Vec<String>))> = vec![("fetch", fetch)];
-            if rebase && worktree.is_local() {
-                steps.push(("rebase", rebase_command));
-            }
             let mut failed = false;
             // How far behind the branch was once the fetch had landed — the
             // commits the rebase is about to take — for the toast at the
             // end (David, 2026-09-22: "Same for pull").
             let mut behind: Option<(usize, Option<String>)> = None;
-            for (label, (program, args)) in steps {
+            // What the click can do, which only the fetch can say.
+            let mut plan: Option<taste_git::PullPlan> = None;
+            {
+                let (program, args) = fetch;
                 let handle =
                     crate::runtime::runtime().spawn(run_git_step(program, args, envs.clone()));
                 let failure = match handle.await {
@@ -6877,11 +6920,9 @@ impl FileTree {
                     Err(_) => Some("interrupted".to_string()),
                 };
                 if let Some(reason) = failure {
-                    events.publish(Event::Toast(format!("{label} failed: {reason}")));
+                    events.publish(Event::Toast(format!("fetch failed: {reason}")));
                     failed = true;
-                    break;
-                }
-                if label == "fetch" {
+                } else {
                     // A push target named by URL is asked for its tip here
                     // too, so the counts after this Sync are true ones.
                     let _ = crate::runtime::runtime()
@@ -6891,16 +6932,20 @@ impl FileTree {
                     let measure_branch = branch.clone();
                     let measured = crate::runtime::runtime()
                         .spawn_blocking(move || {
-                            taste_git::GitWorkspace::discover(&measure_root)
-                                .and_then(|git| match &measure_branch {
-                                    Some(branch) => git.sync_status_of(branch).ok(),
-                                    None => git.sync_status().ok(),
-                                })
-                                .map(|sync| (sync.behind, sync.base.or(sync.upstream)))
+                            let git = taste_git::GitWorkspace::discover(&measure_root)?;
+                            let sync = match &measure_branch {
+                                Some(branch) => git.sync_status_of(branch).ok(),
+                                None => git.sync_status().ok(),
+                            }?;
+                            let plan = measure_branch
+                                .as_deref()
+                                .and_then(|branch| git.pull_plan_of(branch));
+                            Some(((sync.behind, sync.base.or(sync.upstream)), plan))
                         })
                         .await;
-                    if let Ok(Some(measured)) = measured {
+                    if let Ok(Some((measured, measured_plan))) = measured {
                         behind = Some(measured);
+                        plan = measured_plan;
                     }
                 }
             }
@@ -6953,36 +6998,84 @@ impl FileTree {
                     "the fetched refs did not reach Personal: {reason}"
                 )));
             }
-            if rebase && !failed && !worktree.is_local() {
-                let worktree = worktree.clone();
-                let handle = crate::runtime::runtime().spawn_blocking(move || {
-                    let Some(upstream) = upstream else {
-                        return Err("this branch has no upstream to rebase onto".to_string());
+            let plural = |n: usize| if n == 1 { "" } else { "s" };
+            let (count, upstream_name) = behind.clone().unwrap_or((0, None));
+            let upstream_name = upstream_name.unwrap_or_else(|| "the remote".to_string());
+            // A click with commits of the branch's own to replay moves
+            // nothing, and says the hold that would.
+            let held_back = match (mode, plan) {
+                (Pull::FastForward, Some(taste_git::PullPlan::Rebase { mine, theirs })) => {
+                    Some(format!(
+                        "Not pulled: this branch has {mine} commit{} of its own. Hold Pull for \
+                         {} seconds to rebase {} onto the {theirs} new commit{} on \
+                         {upstream_name}",
+                        plural(mine),
+                        crate::holdbutton::HOLD.as_secs(),
+                        if mine == 1 { "it" } else { "them" },
+                        plural(theirs)
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(note) = &held_back {
+                events.publish(Event::Toast(note.clone()));
+            }
+            let moving = !failed
+                && held_back.is_none()
+                && !matches!(plan, Some(taste_git::PullPlan::UpToDate));
+            let verb = if mode == Pull::Rebase {
+                "rebase"
+            } else {
+                "fast-forward"
+            };
+            match move_command {
+                Some((program, args)) if moving && worktree.is_local() => {
+                    let handle =
+                        crate::runtime::runtime().spawn(run_git_step(program, args, envs.clone()));
+                    let failure = match handle.await {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(reason)) => Some(reason),
+                        Err(_) => Some("interrupted".to_string()),
                     };
-                    shared?;
-                    worktree.rebase_onto(&upstream).map_err(|e| e.to_string())
-                });
-                match handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(reason)) => {
+                    if let Some(reason) = failure {
                         failed = true;
-                        events.publish(Event::Toast(format!("rebase failed: {reason}")))
-                    }
-                    Err(_) => {
-                        failed = true;
-                        events.publish(Event::Toast("rebase failed: interrupted".into()))
+                        events.publish(Event::Toast(format!("{verb} failed: {reason}")));
                     }
                 }
+                Some(_) if moving => {
+                    let worktree = worktree.clone();
+                    let handle = crate::runtime::runtime().spawn_blocking(move || {
+                        let Some(upstream) = upstream else {
+                            return Err("this branch has no upstream to pull from".to_string());
+                        };
+                        shared?;
+                        match mode {
+                            Pull::Rebase => worktree.rebase_onto(&upstream),
+                            _ => worktree.fast_forward_onto(&upstream),
+                        }
+                        .map_err(|e| e.to_string())
+                    });
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(reason)) => {
+                            failed = true;
+                            events.publish(Event::Toast(format!("{verb} failed: {reason}")))
+                        }
+                        Err(_) => {
+                            failed = true;
+                            events.publish(Event::Toast(format!("{verb} failed: interrupted")))
+                        }
+                    }
+                }
+                _ => {}
             }
-            if rebase && !failed {
-                let (count, upstream) = behind.unwrap_or((0, None));
-                let upstream = upstream.unwrap_or_else(|| "the remote".to_string());
+            if mode != Pull::Fetch && !failed && held_back.is_none() {
                 events.publish(Event::Toast(if count == 0 {
-                    format!("Already up to date with {upstream}")
+                    format!("Already up to date with {upstream_name}")
                 } else {
                     format!(
-                        "Pulled {count} commit{} from {upstream}",
-                        if count == 1 { "" } else { "s" }
+                        "Pulled {count} commit{} from {upstream_name}",
+                        plural(count)
                     )
                 }));
             }

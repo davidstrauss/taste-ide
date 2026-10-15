@@ -34,6 +34,21 @@ use git2::{BranchType, Oid};
 
 use crate::{GitWorkspace, SyncStatus};
 
+/// What Pull would do ([`GitWorkspace::pull_plan_of`]). A click does the
+/// first two; the third is a rebase, which replays the branch's own
+/// commits, and so is held for (David, 2026-10-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullPlan {
+    /// The target has nothing the branch does not.
+    UpToDate,
+    /// The target is ahead by `theirs`, and the branch has nothing of its
+    /// own: it moves there.
+    FastForward { theirs: usize },
+    /// Both moved: the branch's `mine` commits replayed onto the target's
+    /// `theirs`.
+    Rebase { mine: usize, theirs: usize },
+}
+
 /// Where a branch's push goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushTarget {
@@ -225,6 +240,35 @@ impl GitWorkspace {
     /// [`GitWorkspace::rebase_target_of`].
     pub fn rebase_onto_command(&self, target: &str) -> (String, Vec<String>) {
         self.git_command(&["rebase", "--autostash", target])
+    }
+
+    /// `git merge --ff-only --autostash <target>`: Pull's click, which
+    /// moves the branch only where nothing of its own has to be replayed,
+    /// and refuses rather than rewrite should a commit have landed since
+    /// [`GitWorkspace::pull_plan_of`] looked.
+    pub fn fast_forward_onto_command(&self, target: &str) -> (String, Vec<String>) {
+        self.git_command(&["merge", "--ff-only", "--autostash", target])
+    }
+
+    /// What Pull would do to `branch` against its rebase target
+    /// ([`GitWorkspace::rebase_target_of`]), as the refs here stand: so
+    /// asked after the fetch. `None` with no target, or a branch or target
+    /// that does not resolve.
+    pub fn pull_plan_of(&self, branch: &str) -> Option<PullPlan> {
+        let target = self.rebase_target_of(branch)?;
+        let theirs_tip = self.repo.find_reference(&target).ok()?.target()?;
+        let mine_tip = self
+            .repo
+            .find_branch(branch, BranchType::Local)
+            .ok()?
+            .get()
+            .target()?;
+        let (mine, theirs) = self.repo.graph_ahead_behind(mine_tip, theirs_tip).ok()?;
+        Some(match (mine, theirs) {
+            (_, 0) => PullPlan::UpToDate,
+            (0, theirs) => PullPlan::FastForward { theirs },
+            (mine, theirs) => PullPlan::Rebase { mine, theirs },
+        })
     }
 
     /// Fetch every configured remote: the base and a named push remote

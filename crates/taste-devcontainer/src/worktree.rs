@@ -892,6 +892,15 @@ impl Worktree {
         Ok(())
     }
 
+    /// Move the branch forward to `onto` and only forward
+    /// (`taste_git::GitWorkspace::fast_forward_onto_command`): a branch with
+    /// a commit of its own is refused, never replayed.
+    pub fn fast_forward_onto(&self, onto: &str) -> Result<()> {
+        self.git_ok(&["merge", "--ff-only", "--autostash", onto])?;
+        self.ref_changed();
+        Ok(())
+    }
+
     pub fn rebase_abort(&self) -> Result<()> {
         self.git_ok(&["rebase", "--abort"])?;
         self.ref_changed();
