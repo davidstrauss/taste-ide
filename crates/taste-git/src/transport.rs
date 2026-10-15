@@ -6,13 +6,15 @@
 //! The user's keys answer the scheme the parent uses — that is the one
 //! they cloned with — so a submodule on the other scheme asks for
 //! credentials they may not have set up here, or for a key touch the
-//! parent never needed. So every fetch the IDE makes of a submodule,
-//! and the parent's own fetch that reaches into them, carries git's
-//! `url.<base>.insteadOf` rewrites from the parent's URL: on the parent's
-//! host, the other scheme is fetched as the parent's (David, 2026-10-14:
-//! "if the parent repo uses HTTPS to github.com, have submodules use that,
-//! too, even if they are set to use SSH. Do the same in the other
-//! direction"). A rewrite given on the command line, not written to any
+//! parent never needed. So every fetch the IDE makes of a submodule, the
+//! parent's own fetch that reaches into them, and the parent's push that
+//! takes their commits along, carries git's `url.<base>.insteadOf`
+//! rewrites from the parent's URL: on the parent's host, the other scheme
+//! is reached as the parent's (David, 2026-10-14: "if the parent repo uses
+//! HTTPS to github.com, have submodules use that, too, even if they are set
+//! to use SSH. Do the same in the other direction"; 2026-10-15: "I want
+//! pushes to use the same rewrite"). The parent's own remotes on that host
+//! follow it too. A rewrite given on the command line, not written to any
 //! config, so `.gitmodules` and the user's own settings stay as they are.
 
 /// How a URL reaches its remote.

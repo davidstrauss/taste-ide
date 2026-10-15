@@ -379,7 +379,11 @@ impl GitWorkspace {
         extra_refspecs: &[&str],
     ) -> (String, Vec<String>) {
         let target = self.push_target(branch);
-        let mut args = vec!["push".to_string()];
+        // The submodule commits the branch records go first, as
+        // [`GitWorkspace::push_command`]'s do, and on this repository's
+        // host in its scheme ([`crate::transport`]).
+        let mut args = self.align_args();
+        args.extend(["push", crate::PUSH_SUBMODULES].map(String::from));
         if self
             .config_string(&format!("branch.{branch}.merge"))
             .is_none()

@@ -766,9 +766,12 @@ impl GitWorkspace {
     /// parent pointing at a commit only this machine has (David,
     /// 2026-10-06: "add submodule push to the IDE's push"). Git does this
     /// for the submodules it knows as active; with none, the flag changes
-    /// nothing.
+    /// nothing. A submodule on this repository's host is pushed to in its
+    /// scheme, as it is fetched from ([`transport`]).
     pub fn push_command(&self) -> (String, Vec<String>) {
-        self.git_command(&["push", PUSH_SUBMODULES])
+        let mut args = self.align_args();
+        args.extend(["push", PUSH_SUBMODULES].map(String::from));
+        self.git_command_owned(args)
     }
 
     /// The user's push, carrying extra refspecs alongside the branch — e.g.
@@ -789,11 +792,12 @@ impl GitWorkspace {
         if extra_refspecs.is_empty() {
             return self.push_command();
         }
-        let mut args = vec![
+        let mut args = self.align_args();
+        args.extend([
             "push".to_string(),
             PUSH_SUBMODULES.to_string(),
             self.push_remote(),
-        ];
+        ]);
         if let Some(branch) = self.push_branch_refspec() {
             args.push(branch);
         }
@@ -1290,9 +1294,10 @@ mod tests {
 
         let (_, args) = ws.push_branch_command("devcontainer", &[]);
         assert_eq!(
-            &args[2..],
+            &args[args.len() - 5..],
             [
                 "push",
+                PUSH_SUBMODULES,
                 "--set-upstream",
                 "origin",
                 "refs/heads/devcontainer:refs/heads/devcontainer"
@@ -1408,8 +1413,13 @@ mod tests {
         // leaves the configured upstream alone.
         let (_, args) = ws.push_branch_command("topic", &[]);
         assert_eq!(
-            &args[args.len() - 3..],
-            ["push", fork, "refs/heads/topic:refs/heads/topic"]
+            &args[args.len() - 4..],
+            [
+                "push",
+                PUSH_SUBMODULES,
+                fork,
+                "refs/heads/topic:refs/heads/topic"
+            ]
         );
         // After a rebase the fork's tip is not in the branch: the push
         // replaces it, leased on that tip.
@@ -1503,8 +1513,13 @@ mod tests {
         );
         let (_, args) = ws.push_branch_command("topic", &[]);
         assert_eq!(
-            &args[args.len() - 3..],
-            ["push", "fork", "refs/heads/topic:refs/heads/topic"],
+            &args[args.len() - 4..],
+            [
+                "push",
+                PUSH_SUBMODULES,
+                "fork",
+                "refs/heads/topic:refs/heads/topic"
+            ],
             "no --set-upstream over the base"
         );
 
@@ -1598,8 +1613,11 @@ mod tests {
         }
         let ws = GitWorkspace::discover(dir.path()).unwrap();
         let (_, args) = ws.push_command_with(&["refs/taste/issues:refs/taste/issues"]);
+        // On the upstream's host, a submodule is pushed to in its scheme.
+        let align = transport::align_args(Some("https://example.invalid/repo.git"));
+        assert_eq!(args[2..2 + align.len()], align);
         assert_eq!(
-            args,
+            [&args[..2], &args[2 + align.len()..]].concat(),
             vec![
                 "-C".to_string(),
                 wd,
