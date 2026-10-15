@@ -191,6 +191,10 @@ files are the rows the hero frame shows;
 submodule banner (`submodule_bar.rs`) for those submodules (`clone`,
 `fetch`, or `behind`), since the folder a probe opens has none — with
 `TASTE_PROBE_VIEW=dirty` for the pane's geometry in the dump;
+`TASTE_PROBE_MERGED=contained` (or `equivalent`, `gone`) poses the file
+tree's banner for a branch already in the default branch
+(`merged_bar.rs`, `taste_git::merged`), with its Switch to main, since the
+folder a probe opens is on its own branch;
 `TASTE_PROBE_SYNC=running` (or `conflict`, `failed`, `done`) poses the
 title bar's cloud — the folder's sync and the Google Cloud connection,
 one badge — in that state with its popover open;

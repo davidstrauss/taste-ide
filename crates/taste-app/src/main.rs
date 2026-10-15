@@ -49,6 +49,7 @@ mod logview;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
 mod markdown_view;
+mod merged_bar;
 mod mermaid;
 mod notebook;
 mod notify;
@@ -494,6 +495,10 @@ fn main() -> glib::ExitCode {
                  .changed-bar.submodule-setup { \
                    background-color: alpha(@warning_bg_color, 0.22); \
                    padding: 6px 0; }\n\
+                 /* The file tree's merged-branch banner (merged_bar.rs): \
+                    a nudge, so the accent the bar has, with the submodule \
+                    banner's edges. */\n\
+                 .changed-bar.merged-branch { padding: 6px 0; }\n\
                  /* The environment's startup page (startup.rs): a card for \
                     the checklist over the construction stripes, the log in \
                     a card of its own below; the strip's other tabs dimmed \

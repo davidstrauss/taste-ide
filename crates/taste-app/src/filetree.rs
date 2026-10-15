@@ -500,6 +500,9 @@ pub struct FileTree {
     /// (`crate::submodule_bar`); `submodule_busy` while it runs.
     submodule_setup: RefCell<Vec<taste_git::submodule_setup::SubmoduleSetup>>,
     submodule_bar: crate::submodule_bar::SubmoduleBar,
+    /// The banner for a branch already in the default branch, with the
+    /// switch back (`crate::merged_bar`).
+    merged_bar: Rc<crate::merged_bar::MergedBar>,
     submodule_busy: Cell<bool>,
     on_open: RefCell<Option<OpenCallback>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
@@ -769,6 +772,10 @@ struct StatusSnapshot {
     /// the folder's, not the checkout's, since the folder is where they are
     /// cloned and fetched, with the user's keys.
     submodule_setup: Vec<taste_git::submodule_setup::SubmoduleSetup>,
+    /// The branch checked out, when it is already in the default branch
+    /// (`GitWorkspace::merged_into_default`), asked of the folder's refs
+    /// as the sync status is.
+    merged: Option<taste_git::merged::MergedInto>,
     /// What syncs though git ignores it (`Worktree::sync_ignored`).
     sync_ignored: taste_devcontainer::worktree::SyncIgnored,
 }
@@ -1431,6 +1438,8 @@ impl FileTree {
             sync_button_with_label("Set Up", "").0,
         );
         widget.append(&submodule_bar.widget);
+        let merged_bar = crate::merged_bar::MergedBar::new(CHROME_INSET);
+        widget.append(&merged_bar.widget);
         // The project folder itself: always the first row, never
         // collapsible; its context menu creates top-level items.
         let root_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1580,6 +1589,7 @@ impl FileTree {
             folder_syncing: Cell::new(false),
             submodule_setup: RefCell::new(Vec::new()),
             submodule_bar,
+            merged_bar,
             submodule_busy: Cell::new(false),
             on_open: RefCell::new(None),
             on_open_diff: RefCell::new(None),
@@ -1713,6 +1723,16 @@ impl FileTree {
         }
 
         let weak = Rc::downgrade(&tree);
+        {
+            let weak = Rc::downgrade(&tree);
+            tree.merged_bar.switch.connect_clicked(move |_| {
+                if let Some(tree) = weak.upgrade() {
+                    if let Some(default) = tree.merged_bar.default_branch() {
+                        tree.run_branch_op(default, false);
+                    }
+                }
+            });
+        }
         {
             let weak = Rc::downgrade(&tree);
             tree.submodule_bar.button.connect_clicked(move |_| {
@@ -4916,7 +4936,12 @@ impl FileTree {
                     Some(branch) => git.sync_status_of(branch).ok(),
                     None => git.sync_status().ok(),
                 });
+                let merged = crate::merged_bar::posed_for_probe().or_else(|| {
+                    let branch = branch.as_deref()?;
+                    folder.as_ref()?.merged_into_default(branch)
+                });
                 Ok(StatusSnapshot {
+                    merged,
                     submodules: worktree.submodule_heads(),
                     submodule_setup: crate::submodule_bar::posed_for_probe().unwrap_or_else(|| {
                         folder
@@ -5083,6 +5108,7 @@ impl FileTree {
                 self.submodule_bar
                     .show(&snapshot.submodule_setup, self.submodule_busy.get());
                 *self.submodule_setup.borrow_mut() = snapshot.submodule_setup;
+                self.merged_bar.show(snapshot.merged.as_ref());
                 self.ignore_rules.set(snapshot.ignore_rules);
                 self.sync_filter_counts();
                 *self.status_branch.borrow_mut() = snapshot.branch.clone();

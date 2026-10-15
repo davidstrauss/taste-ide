@@ -112,11 +112,11 @@ fn remote_tip(url: &str, branch: &str) -> Option<Option<Oid>> {
 }
 
 impl GitWorkspace {
-    fn config_string(&self, key: &str) -> Option<String> {
+    pub(crate) fn config_string(&self, key: &str) -> Option<String> {
         self.repo.config().ok()?.get_string(key).ok()
     }
 
-    fn is_named_remote(&self, remote: &str) -> bool {
+    pub(crate) fn is_named_remote(&self, remote: &str) -> bool {
         self.repo.find_remote(remote).is_ok()
     }
 
