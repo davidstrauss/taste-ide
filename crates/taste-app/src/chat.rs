@@ -1188,6 +1188,9 @@ struct PendingPrompt {
     /// Once the card has been moved to where the agent accepted it, the
     /// marker left behind at the point it was typed.
     origin: Option<gtk::ListBoxRow>,
+    /// Went out inside the prompt ahead of it (`SessionEvent::QueuedJoined`),
+    /// so the turn that ends that one ends this too.
+    joined: bool,
 }
 
 /// Where an unfinished prompt goes when the process holding it dies.
@@ -3895,6 +3898,7 @@ impl ChatPane {
             card,
             queued: None,
             origin: None,
+            joined: false,
         });
         *self.capture.borrow_mut() = Some((String::new(), on_done));
         let result = match self.client.borrow().as_ref() {
@@ -4160,6 +4164,7 @@ impl ChatPane {
                     card,
                     queued: badge,
                     origin: None,
+                    joined: false,
                 });
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
@@ -5302,6 +5307,7 @@ impl ChatPane {
                         card,
                         queued: Some((badge, item.written)),
                         origin: None,
+                        joined: false,
                     });
                     self.stop_button.set_visible(true);
                     self.set_busy(true);
@@ -7685,6 +7691,50 @@ impl ChatPane {
     /// between, so that is not where it joins the conversation. Reading the
     /// transcript back, the prompt appeared to come before answers it never
     /// saw. Returns the marker's row so it can be cleaned up with the card.
+    /// Take the prompt a turn was for off the queue, with every message
+    /// that went out inside it (`PendingPrompt::joined`).
+    fn pop_turn(&self) -> Vec<PendingPrompt> {
+        let mut pending = self.pending_prompts.borrow_mut();
+        let mut turn: Vec<PendingPrompt> = pending.pop_front().into_iter().collect();
+        while pending.front().is_some_and(|prompt| prompt.joined) {
+            turn.extend(pending.pop_front());
+        }
+        turn
+    }
+
+    /// The queued prompt at `index` has gone to the agent: its card moves
+    /// to where the conversation took it, and its badge says how long it
+    /// waited.
+    fn accept_queued(self: &Rc<Self>, index: usize) {
+        let accepted = {
+            let mut pending = self.pending_prompts.borrow_mut();
+            pending.get_mut(index).and_then(|prompt| {
+                let card = prompt.card.clone();
+                prompt.queued.take().map(|queued| (card, queued))
+            })
+        };
+        let Some((card, (badge, written))) = accepted else {
+            return;
+        };
+        // The card was appended where the prompt was TYPED, which is not
+        // where it joins the conversation — a whole turn's output has
+        // landed in between. Move it to the end and leave a marker behind.
+        let origin = self.reseat_accepted_prompt(&card);
+        if let Some(prompt) = self.pending_prompts.borrow_mut().get_mut(index) {
+            prompt.origin = origin;
+        }
+        // The badge is rewritten, not removed: how long a prompt sat behind
+        // the previous turn is the one place that cost is ever visible, and
+        // it is worth keeping in the transcript after the fact. With the
+        // note the agent got, roughly to the second.
+        retire_nudge(&badge);
+        badge.set_label(&format!("queued for {}", elapsed(written.at)));
+        badge.set_tooltip_text(Some(&taste_core::queued::note(
+            written.at.elapsed(),
+            &written.after,
+        )));
+    }
+
     fn reseat_accepted_prompt(self: &Rc<Self>, card: &gtk::Box) -> Option<gtk::ListBoxRow> {
         let origin = card.parent().and_downcast::<gtk::ListBoxRow>()?;
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -8190,11 +8240,21 @@ impl ChatPane {
         // A message that waited behind a turn went out after a note saying
         // so (`taste_core::queued`): drawn as the card's badge, as it was
         // when it was sent, not as words the user typed.
-        if let Some((note, rest)) = taste_core::queued::split(&text) {
-            let card = self.user_card(&rest, &pending.attachments);
-            let badge = queued_badge(&taste_core::queued::badge(&note));
-            badge.set_tooltip_text(Some(&note));
-            card.append(&badge_row(&badge));
+        // Several that went out together come back as the cards they were,
+        // the attachments on the last, which is as near as a replay says.
+        if let Some(parts) = taste_core::queued::split_all(&text) {
+            let last = parts.len().saturating_sub(1);
+            for (index, (note, rest)) in parts.into_iter().enumerate() {
+                let attachments: &[(String, ContentBlock)] = if index == last {
+                    &pending.attachments
+                } else {
+                    &[]
+                };
+                let card = self.user_card(&rest, attachments);
+                let badge = queued_badge(&taste_core::queued::badge(&note));
+                badge.set_tooltip_text(Some(&note));
+                card.append(&badge_row(&badge));
+            }
             return;
         }
         self.user_card(&text, &pending.attachments);
@@ -9272,6 +9332,7 @@ impl ChatPane {
                     card,
                     queued: badge,
                     origin: None,
+                    joined: false,
                 });
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
@@ -9546,6 +9607,16 @@ impl ChatPane {
             }
             SessionEvent::Permission { request, reply } => self.on_permission(request, reply),
             SessionEvent::Elicitation { request, reply } => self.on_questions(request, reply),
+            SessionEvent::QueuedJoined { count } => {
+                // The prompt that just went out carries the next `count`
+                // messages too: each is taken where the first was, in order.
+                for index in 1..=count {
+                    if let Some(prompt) = self.pending_prompts.borrow_mut().get_mut(index) {
+                        prompt.joined = true;
+                    }
+                    self.accept_queued(index);
+                }
+            }
             SessionEvent::PromptFailed { message } => {
                 self.end_nudge();
                 self.finalize_stream();
@@ -9562,14 +9633,15 @@ impl ChatPane {
                 // a "prompt failed: Incoming transport closed" row under
                 // the agent's own "Rebuild the container").
                 if self.closed_by_environment() {
-                    self.pending_prompts.borrow_mut().pop_front();
+                    self.pop_turn();
                     self.settle_running_steps();
                     return;
                 }
                 // A rejected prompt is not part of the conversation: take
                 // its card out of the transcript and hand the text back.
-                let rejected = self.pending_prompts.borrow_mut().pop_front();
-                if let Some(prompt) = rejected {
+                // Every message that went out in it, when several did: the
+                // last first, so each lands ahead of what followed it.
+                for prompt in self.pop_turn().into_iter().rev() {
                     self.drop_prompt_rows(&prompt);
                     // Only a typed one goes back to the box. A refusal is
                     // not a dropped connection: the agent is up and has
@@ -9604,36 +9676,9 @@ impl ChatPane {
                 // the agent just did to the checkout.
                 self.flush_stash();
                 self.snapshot_checkout();
-                self.pending_prompts.borrow_mut().pop_front();
+                self.pop_turn();
                 // The next queued prompt (if any) starts now.
-                let accepted = {
-                    let mut pending = self.pending_prompts.borrow_mut();
-                    pending.front_mut().and_then(|prompt| {
-                        let card = prompt.card.clone();
-                        prompt.queued.take().map(|queued| (card, queued))
-                    })
-                };
-                if let Some((card, (badge, written))) = accepted {
-                    // The card was appended where the prompt was TYPED, which
-                    // is not where it joins the conversation — a whole turn's
-                    // output has landed in between. Move it to the end and
-                    // leave a marker behind.
-                    let origin = self.reseat_accepted_prompt(&card);
-                    if let Some(prompt) = self.pending_prompts.borrow_mut().front_mut() {
-                        prompt.origin = origin;
-                    }
-                    // The badge is rewritten, not removed: how long a prompt
-                    // sat behind the previous turn is the one place that
-                    // cost is ever visible, and it is worth keeping in the
-                    // transcript after the fact.
-                    // With the note the agent got, roughly to the second.
-                    retire_nudge(&badge);
-                    badge.set_label(&format!("queued for {}", elapsed(written.at)));
-                    badge.set_tooltip_text(Some(&taste_core::queued::note(
-                        written.at.elapsed(),
-                        &written.after,
-                    )));
-                }
+                self.accept_queued(0);
                 // What is still queued decides everything below: either the
                 // next prompt starts now, or the turn is genuinely over and
                 // its indicators come down with it. The working row used to
@@ -9831,7 +9876,7 @@ impl ChatPane {
                 // rebuild as a repeat (David, 2026-10-08). Those queued
                 // behind it never reached the agent and go back as before.
                 if self.closed_by_environment() {
-                    self.pending_prompts.borrow_mut().pop_front();
+                    self.pop_turn();
                 }
                 let pending: Vec<PendingPrompt> =
                     self.pending_prompts.borrow_mut().drain(..).collect();
@@ -11651,6 +11696,14 @@ impl ChatPane {
         );
         user(&note);
         user("Look at the failing tests first.");
+        // A second message that waited behind the same turn, which went out
+        // in the same prompt (`taste_acp`'s `join_waiting`): one replayed
+        // message, two cards.
+        user(&taste_core::queued::note(
+            std::time::Duration::from_secs(47),
+            &taste_core::queued::Reference::Step("Read the output of task test".into()),
+        ));
+        user("And keep the old cache behind a flag until they pass.");
         say("Looking at the tests first: two fail on the cache's warm-up.");
     }
 

@@ -36,6 +36,7 @@ async fn full_session_roundtrip() {
             SessionEvent::Closed(e) => format!("Closed({e:?})"),
             SessionEvent::Update(_) => "Update".to_string(),
             SessionEvent::TurnEnded { .. } => "TurnEnded".to_string(),
+            SessionEvent::QueuedJoined { count } => format!("QueuedJoined({count})"),
             SessionEvent::Ready { .. } => unreachable!(),
             SessionEvent::Permission { .. } => "Permission".to_string(),
             SessionEvent::Elicitation { .. } => "Elicitation".to_string(),
@@ -437,18 +438,23 @@ async fn a_prompt_sent_during_a_turn_goes_after_it_with_a_note() {
     client
         .prompt_blocks_queued(text("and then the docs"), written("Moving the cache next."))
         .unwrap();
-    let said = replies(&client, 3).await;
+    // Both waited behind the slow turn, so they go out together, in one
+    // turn: each after its own note, in the order written.
+    let said = replies(&client, 2).await;
     assert_eq!(said[0], "slow done");
-    for (reply, message) in said[1..]
-        .iter()
+    let reply = &said[1];
+    let parts: Vec<&str> = reply.trim_start_matches("noted ").split(" | ").collect();
+    assert_eq!(parts.len(), 4, "{reply}");
+    for (pair, message) in parts
+        .chunks(2)
         .zip(["look at the tests first", "and then the docs"])
     {
-        assert!(reply.starts_with("noted [Queued for "), "{reply}");
+        assert!(pair[0].starts_with("[Queued for "), "{reply}");
         assert!(
-            reply.contains("s. Written after your message ending \"Moving the cache next.\";"),
+            pair[0].contains("s. Written after your message ending \"Moving the cache next.\";"),
             "{reply}"
         );
-        assert!(reply.ends_with(&format!(" | {message}")), "{reply}");
+        assert_eq!(pair[1], message, "{reply}");
     }
 
     // Idle: nothing to wait behind, so no note.

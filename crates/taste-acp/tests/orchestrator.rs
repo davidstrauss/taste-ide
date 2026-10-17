@@ -73,6 +73,7 @@ fn describe(event: &SessionEvent) -> String {
         SessionEvent::Closed(e) => format!("Closed({e:?})"),
         SessionEvent::Update(_) => "Update".into(),
         SessionEvent::TurnEnded { .. } => "TurnEnded".into(),
+        SessionEvent::QueuedJoined { count } => format!("QueuedJoined({count})"),
         SessionEvent::Permission { .. } => "Permission".into(),
         SessionEvent::Elicitation { .. } => "Elicitation".into(),
         SessionEvent::ModeChangeFailed { message, .. } => format!("ModeChangeFailed({message})"),

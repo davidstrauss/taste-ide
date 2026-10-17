@@ -198,9 +198,10 @@ while True:
 
         texts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
         # A prompt that waited behind a turn: the client's note first, the
-        # message after it (taste_core::queued).
+        # message after it (taste_core::queued) -- and, when several waited,
+        # each of the others after its own note, all in one prompt.
         if prompt.startswith("[Queued for "):
-            reply("noted " + texts[0] + " | " + texts[-1])
+            reply("noted " + " | ".join(texts))
             continue
         if prompt.startswith("/echo "):
             reply("echo " + " | ".join(texts))

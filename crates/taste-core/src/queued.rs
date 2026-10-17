@@ -107,6 +107,27 @@ pub fn split(text: &str) -> Option<(String, String)> {
     Some((first.to_string(), rest.trim_start_matches('\n').to_string()))
 }
 
+/// A replayed prompt that several queued messages went out as together
+/// (`taste_acp`'s `join_waiting`): each note and the message after it, in
+/// order. `None` when the text does not start with a note. A line is a
+/// note when it is one whole: `[Queued for …]`.
+pub fn split_all(text: &str) -> Option<Vec<(String, String)>> {
+    split(text)?;
+    let mut out: Vec<(String, Vec<&str>)> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with(OPEN) && line.ends_with(']') {
+            out.push((line.to_string(), Vec::new()));
+        } else if let Some((_, lines)) = out.last_mut() {
+            lines.push(line);
+        }
+    }
+    Some(
+        out.into_iter()
+            .map(|(note, lines)| (note, lines.join("\n").trim_matches('\n').to_string()))
+            .collect(),
+    )
+}
+
 /// What the card's badge says for a note read back from a replay: how long
 /// it waited.
 pub fn badge(note: &str) -> String {
@@ -153,5 +174,24 @@ mod tests {
         assert_eq!(split("plain"), None);
         assert_eq!(duration_text(Duration::from_secs(3725)), "1h 2m");
         assert!(super::note(Duration::ZERO, &Reference::TurnStart).contains("as your turn began"));
+    }
+
+    #[test]
+    fn messages_that_went_out_together_come_apart_again() {
+        let first = note(Duration::from_secs(90), &Reference::TurnStart);
+        let second = note(
+            Duration::from_secs(30),
+            &Reference::Step("Run tests".into()),
+        );
+        let sent = format!("{first}\nsaving should not block\n\nreally\n{second}\na bonus budget");
+        let parts = split_all(&sent).unwrap();
+        assert_eq!(
+            parts,
+            vec![
+                (first, "saving should not block\n\nreally".to_string()),
+                (second, "a bonus budget".to_string()),
+            ]
+        );
+        assert_eq!(split_all("plain"), None);
     }
 }

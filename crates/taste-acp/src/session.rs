@@ -97,6 +97,10 @@ pub enum SessionEvent {
         request: CreateElicitationRequest,
         reply: ElicitationReply,
     },
+    /// The prompt going out now carries this many more of the messages
+    /// that waited behind the last turn, after its own (`join_waiting`):
+    /// one turn for all of them, so a later turn ends after them all.
+    QueuedJoined { count: usize },
     /// A turn finished, with the agent's session-cumulative token usage
     /// when it reports one.
     TurnEnded {
@@ -1154,6 +1158,49 @@ async fn run_session(
     .await
 }
 
+/// A prompt that waited behind a turn, and every prompt that waited behind
+/// it, as one: each after its own note (`taste_core::queued`), in the order
+/// they were written, and how many joined the first. Sent one to a turn,
+/// three messages written during a long turn took three more turns, the
+/// one the user asked a turn for last (David, 2026-10-17: "At least send
+/// all messages so far as one big one"). Only prompts that waited join —
+/// a utility prompt has its own answer to collect — and the run stops at
+/// any other command, which keeps its place between them.
+fn join_waiting(
+    blocks: Vec<ContentBlock>,
+    written: &taste_core::queued::Queued,
+    queued: &mut std::collections::VecDeque<Command>,
+) -> (Vec<ContentBlock>, usize) {
+    let note = |written: &taste_core::queued::Queued| {
+        ContentBlock::Text(TextContent::new(taste_core::queued::note(
+            written.at.elapsed(),
+            &written.after,
+        )))
+    };
+    let mut out = vec![note(written)];
+    out.extend(blocks);
+    let mut count = 0;
+    while matches!(
+        queued.front(),
+        Some(Command::Prompt {
+            queued: Some(_),
+            ..
+        })
+    ) {
+        let Some(Command::Prompt {
+            blocks,
+            queued: Some(written),
+        }) = queued.pop_front()
+        else {
+            break;
+        };
+        out.push(note(&written));
+        out.extend(blocks);
+        count += 1;
+    }
+    (out, count)
+}
+
 /// The post-setup command loop, shared by fresh and restored sessions.
 /// Commands arriving while a turn is in flight are queued (Cancel excepted),
 /// never dropped, and run in the order they came: a prompt typed during a
@@ -1183,8 +1230,11 @@ async fn serve_commands(
                 queued: written,
             } => {
                 if let (true, Some(written)) = (waited, written) {
-                    let note = taste_core::queued::note(written.at.elapsed(), &written.after);
-                    blocks.insert(0, ContentBlock::Text(TextContent::new(note)));
+                    let (joined, count) = join_waiting(blocks, &written, &mut queued);
+                    blocks = joined;
+                    if count > 0 {
+                        let _ = event_tx.send(SessionEvent::QueuedJoined { count }).await;
+                    }
                 }
                 // Keep serving Cancel while the turn runs; the prompt then
                 // resolves with StopReason::Cancelled on its own.
@@ -1723,6 +1773,58 @@ pub fn login_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The messages that waited behind a turn go out as one prompt, each
+    /// after its own note and in the order written; a prompt that did not
+    /// wait, and anything after a command that is not a prompt, keep their
+    /// own turns.
+    #[test]
+    fn the_messages_that_waited_go_out_together() {
+        use taste_core::queued::{Queued, Reference};
+        let text = |t: &str| ContentBlock::Text(TextContent::new(t.to_string()));
+        let written = Queued {
+            at: std::time::Instant::now(),
+            after: Reference::TurnStart,
+        };
+        let prompt = |t: &str, waited: bool| Command::Prompt {
+            blocks: vec![text(t)],
+            queued: waited.then(|| written.clone()),
+        };
+        let mut queued: std::collections::VecDeque<Command> = [
+            prompt("second", true),
+            prompt("third", true),
+            prompt("utility", false),
+            prompt("fourth", true),
+        ]
+        .into_iter()
+        .collect();
+        let (blocks, count) = join_waiting(vec![text("first")], &written, &mut queued);
+        assert_eq!(count, 2);
+        let said: Vec<String> = blocks
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text(t) => t.text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(said.len(), 6);
+        for (i, message) in ["first", "second", "third"].iter().enumerate() {
+            assert!(said[2 * i].starts_with("[Queued for "), "{said:?}");
+            assert_eq!(said[2 * i + 1], *message);
+        }
+        assert_eq!(
+            queued.len(),
+            2,
+            "the utility prompt and what follows it wait"
+        );
+
+        let mut queued: std::collections::VecDeque<Command> =
+            [Command::Cancel, prompt("later", true)]
+                .into_iter()
+                .collect();
+        let (_, count) = join_waiting(vec![text("only")], &written, &mut queued);
+        assert_eq!(count, 0, "a command between them keeps its place");
+    }
 
     fn option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
         PermissionOption::new(id.to_string(), id.to_string(), kind)
