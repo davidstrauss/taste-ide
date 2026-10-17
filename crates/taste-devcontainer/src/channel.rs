@@ -442,15 +442,38 @@ if (name === null) {
   return;
 }
 let conn = null, child = null;
+// The run's mark, which everything the task starts inherits: the board's
+// Stop is Ctrl+C to every process carrying it and SIGKILL to what is left
+// five seconds on, because a signal to the task alone left what it started
+// running and holding its locks. Its own name, so a mark the run was
+// started under (`TASTE_RUN`, the IDE's exec) still reaches it too.
+const mark = process.pid + '-' + Date.now();
+const signalMarked = (sig) => {
+  let names = [];
+  try { names = fs.readdirSync('/proc'); } catch (e) {}
+  for (const d of names) {
+    if (!/^[0-9]+$/.test(d) || Number(d) === process.pid) continue;
+    try {
+      const vars = fs.readFileSync('/proc/' + d + '/environ', 'latin1').split('\0');
+      if (vars.includes('TASTE_TASK_RUN=' + mark)) process.kill(Number(d), sig);
+    } catch (e) {}
+  }
+};
+let stopping = false;
 try {
   conn = net.connect(sock);
   conn.on('error', () => { conn = null; });
-  conn.on('data', (d) => { if (child && d.toString().includes('stop')) child.kill('SIGTERM'); });
+  conn.on('data', (d) => {
+    if (!child || stopping || !d.toString().includes('stop')) return;
+    stopping = true;
+    signalMarked('SIGINT');
+    setTimeout(() => signalMarked('SIGKILL'), 5000).unref();
+  });
 } catch (e) { conn = null; }
 const send = (o) => { if (conn) { try { conn.write(JSON.stringify(o) + '\n'); } catch (e) {} } };
 const interactive = !!process.stdin.isTTY;
 send({ ev: 'start', name, args, origin: interactive ? 'terminal' : 'shell' });
-const env = Object.assign({}, process.env);
+const env = Object.assign({}, process.env, { TASTE_TASK_RUN: mark });
 if (process.stdout.isTTY) {
   env.FORCE_COLOR = env.FORCE_COLOR || '1';
   env.CLICOLOR_FORCE = env.CLICOLOR_FORCE || '1';

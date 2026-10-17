@@ -14,6 +14,132 @@ use std::sync::{Arc, RwLock};
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
+    /// How to stop it where it runs, for a command in a container
+    /// ([`Stopper`]); `None` for one on this machine, or one a terminal
+    /// closes, which killing the child stops.
+    pub stopper: Option<Stopper>,
+}
+
+impl CommandSpec {
+    /// A command as given, with nothing to stop it but its own child.
+    pub fn plain(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            stopper: None,
+        }
+    }
+}
+
+/// The environment variable a run in a container is marked with, which
+/// everything it starts there inherits.
+pub const RUN_MARK: &str = "TASTE_RUN";
+
+/// Signal every process in the container whose environment carries the
+/// run's mark: `$1` the mark, `$2` the signal. POSIX `sh`, `tr`, and `grep`,
+/// which every image the IDE runs has.
+const SIGNAL_MARKED: &str = r#"m="TASTE_RUN=$1"
+for d in /proc/[0-9]*; do
+  [ "$d" = "/proc/$$" ] && continue
+  if { tr '\0' '\n' < "$d/environ"; } 2>/dev/null | grep -qxF "$m"; then
+    kill -s "$2" "${d#/proc/}" 2>/dev/null
+  fi
+done
+exit 0"#;
+
+/// What stops a command that runs in a container. Killing the local
+/// `podman exec` stops only podman: the command goes on in the container
+/// — a stopped `cargo build` kept its lock on the build directory, and
+/// the next build blocked on it (David, 2026-10-17: "have Taskfiles or
+/// the IDE properly cancel things so locks get cleaned up"). So every
+/// command resolved into a container carries a mark in its environment
+/// ([`RUN_MARK`]) that its children inherit, and stopping it is Ctrl+C to
+/// every process with that mark, then SIGKILL to what is left after
+/// [`Stopper::GRACE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stopper {
+    program: String,
+    /// Everything but the signal, which goes last.
+    args: Vec<String>,
+}
+
+impl Stopper {
+    /// How long a run has to stop on Ctrl+C before it is killed.
+    pub const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn send(&self, signal: &str) {
+        let spawned = tokio::process::Command::new(&self.program)
+            .args(&self.args)
+            .arg(signal)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(mut child) => {
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+            Err(e) => tracing::warn!("could not signal a run in its container: {e}"),
+        }
+    }
+
+    /// Ctrl+C, to everything the run started in its container.
+    pub fn interrupt(&self) {
+        self.send("INT");
+    }
+
+    /// SIGKILL, to whatever of it is left.
+    pub fn kill(&self) {
+        self.send("KILL");
+    }
+
+    /// The argv it runs for `signal`.
+    pub fn argv(&self, signal: &str) -> Vec<String> {
+        let mut argv = vec![self.program.clone()];
+        argv.extend(self.args.iter().cloned());
+        argv.push(signal.to_string());
+        argv
+    }
+}
+
+/// Stop `child` as its spec says: Ctrl+C where it runs, its exit waited for
+/// [`Stopper::GRACE`], then SIGKILL there and to the child. With no stopper
+/// the child is all there is, and is killed.
+pub async fn stop_child(
+    stopper: Option<&Stopper>,
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    let Some(stopper) = stopper else {
+        let _ = child.start_kill();
+        return child.wait().await;
+    };
+    stopper.interrupt();
+    match tokio::time::timeout(Stopper::GRACE, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            stopper.kill();
+            let _ = child.start_kill();
+            child.wait().await
+        }
+    }
+}
+
+/// A mark no other run has.
+fn new_mark() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{}-{:x}-{}",
+        std::process::id(),
+        nanos,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Whose configuration a running container was built from.
@@ -378,20 +504,44 @@ impl ExecContext {
         program: &str,
         args: &[&str],
     ) -> CommandSpec {
-        let podman: Vec<String> = match &*self.target.read().unwrap() {
+        let (podman, stop) = match &*self.target.read().unwrap() {
             Target::Host => return self.host_spec(program, args),
             Target::Container { id, workdir, .. } => {
+                let mark = new_mark();
                 let mut v = vec!["exec".to_string()];
                 v.extend(exec_flags.iter().cloned());
+                v.push("--env".into());
+                v.push(format!("{RUN_MARK}={mark}"));
                 v.push("--workdir".into());
                 v.push(workdir_override.unwrap_or(workdir).to_string());
                 v.push(id.clone());
                 v.push(program.to_string());
                 v.extend(args.iter().map(|s| s.to_string()));
-                v
+                // As the same user, who may read the run's environments and
+                // signal its processes: a container has no CAP_SYS_PTRACE,
+                // so even its root could not read another user's.
+                let mut stop = vec!["exec".to_string()];
+                if let Some(at) = exec_flags.iter().position(|f| f == "--user" || f == "-u") {
+                    stop.extend(exec_flags[at..].iter().take(2).cloned());
+                }
+                stop.extend([
+                    id.clone(),
+                    "sh".into(),
+                    "-c".into(),
+                    SIGNAL_MARKED.into(),
+                    "taste-stop".into(),
+                    mark,
+                ]);
+                (v, stop)
             }
         };
-        self.podman_spec(podman)
+        let stop = self.podman_spec(stop);
+        let mut spec = self.podman_spec(podman);
+        spec.stopper = Some(Stopper {
+            program: stop.program,
+            args: stop.args,
+        });
+        spec
     }
 
     /// A host command, wrapped for the sandbox if there is one. The podman
@@ -399,7 +549,7 @@ impl ExecContext {
     fn host_spec(&self, program: &str, args: &[&str]) -> CommandSpec {
         let (program, args) =
             crate::podman::host_argv(self.sandboxed, program, args.iter().copied());
-        CommandSpec { program, args }
+        CommandSpec::plain(program, args)
     }
 
     /// A podman command, composed against the service this context points
@@ -409,7 +559,7 @@ impl ExecContext {
     /// them without any of them knowing a substrate exists.
     fn podman_spec(&self, args: Vec<String>) -> CommandSpec {
         let (program, args) = self.podman_target().argv(args);
-        CommandSpec { program, args }
+        CommandSpec::plain(program, args)
     }
 
     /// An interactive command with environment of its own inside the
@@ -468,6 +618,39 @@ impl ExecContext {
             }
         };
         self.podman_spec(podman)
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    /// A command resolved into a container is marked, and its stopper
+    /// signals that mark there, as the same user; a host command has
+    /// nothing to stop but itself.
+    #[test]
+    fn a_command_in_a_container_is_marked_and_stopped_where_it_runs() {
+        let ctx = ExecContext::host();
+        ctx.set_container("abc123", "/workspaces/p", ConfigAuthority::Project);
+        let spec = ctx.resolve_for_agent("cargo", &["build"]);
+        let mark = spec
+            .args
+            .iter()
+            .find_map(|a| a.strip_prefix("TASTE_RUN="))
+            .expect("marked")
+            .to_string();
+        let stop = spec.stopper.expect("a stopper").argv("INT");
+        assert_eq!(stop[stop.len() - 2..], [mark.clone(), "INT".to_string()]);
+        assert!(stop.contains(&"abc123".to_string()));
+        assert_ne!(
+            ctx.resolve_for_agent("cargo", &["build"]).args,
+            spec.args,
+            "each run its own mark"
+        );
+        assert!(ExecContext::host()
+            .resolve_for_agent("true", &[])
+            .stopper
+            .is_none());
     }
 }
 

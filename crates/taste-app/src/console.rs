@@ -3165,10 +3165,7 @@ impl Console {
         // execution context; resolving them into the devcontainer would
         // run them in the wrong universe.
         let spec = if wrapped {
-            taste_core::exec::CommandSpec {
-                program: program.to_string(),
-                args: args.to_vec(),
-            }
+            taste_core::exec::CommandSpec::plain(program, args.to_vec())
         } else {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             self.workspace.exec.resolve(program, &arg_refs, true)

@@ -474,6 +474,7 @@ impl TaskBoard {
         };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let stopper = spec.stopper.clone();
         let stop = Arc::new(tokio::sync::Notify::new());
         let first = format!("$ task {name}");
         self.runs.lock().unwrap().insert(
@@ -504,6 +505,8 @@ impl TaskBoard {
             // great many lines.
             let mut batch: Vec<String> = Vec::new();
             let mut flush = tokio::time::interval(std::time::Duration::from_millis(100));
+            // When a stop's Ctrl+C has had its grace and SIGKILL follows.
+            let mut killing: Option<tokio::time::Instant> = None;
             while !(out_done && err_done) {
                 tokio::select! {
                     line = out.next_line(), if !out_done => match line {
@@ -519,11 +522,34 @@ impl TaskBoard {
                             board.publish_lines(&key, std::mem::take(&mut batch));
                         }
                     }
-                    // Killing the process closes its streams, and the loop
-                    // ends on its own.
-                    _ = stop.notified() => {
-                        let _ = child.start_kill();
+                    // Stopped where it runs: Ctrl+C to the task and all it
+                    // started in the container, as a terminal's would be,
+                    // and SIGKILL after the grace (`exec::Stopper`). Killing
+                    // only the `podman exec` here left the build running
+                    // there, holding its lock. The streams close when it
+                    // ends, and the loop ends on its own.
+                    _ = stop.notified(), if killing.is_none() => {
+                        match &stopper {
+                            Some(stopper) => {
+                                stopper.interrupt();
+                                killing = Some(
+                                    tokio::time::Instant::now() + crate::exec::Stopper::GRACE,
+                                );
+                            }
+                            None => {
+                                let _ = child.start_kill();
+                            }
+                        }
                         batch.push("— stopped —".to_string());
+                    }
+                    _ = tokio::time::sleep_until(killing.unwrap_or_else(tokio::time::Instant::now)),
+                        if killing.is_some() =>
+                    {
+                        if let Some(stopper) = &stopper {
+                            stopper.kill();
+                        }
+                        let _ = child.start_kill();
+                        killing = None;
                     }
                 }
                 if batch.len() >= 200 {

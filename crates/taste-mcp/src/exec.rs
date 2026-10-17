@@ -126,6 +126,7 @@ impl Jobs {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning {}", spec.program))?;
+        let stopper = spec.stopper.clone();
 
         let state = Arc::new(Mutex::new(JobState::default()));
         let done = Arc::new(tokio::sync::Notify::new());
@@ -162,9 +163,10 @@ impl Jobs {
             tokio::spawn(async move {
                 let status = tokio::select! {
                     status = child.wait() => status,
+                    // Where it runs, not only podman here
+                    // (`taste_core::exec::Stopper`).
                     _ = kill.notified() => {
-                        let _ = child.start_kill();
-                        child.wait().await
+                        taste_core::exec::stop_child(stopper.as_ref(), &mut child).await
                     }
                 };
                 let ended = {
@@ -345,10 +347,7 @@ mod tests {
     }
 
     fn spec(program: &str, args: &[&str]) -> taste_core::CommandSpec {
-        taste_core::CommandSpec {
-            program: program.into(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-        }
+        taste_core::CommandSpec::plain(program, args.iter().map(|s| s.to_string()).collect())
     }
 
     /// The one rule this module exists to keep: no container, no run. An

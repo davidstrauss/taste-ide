@@ -206,13 +206,15 @@ impl Terminals {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            // The `podman exec` client dies with this process, and the
-            // command in the container dies with the exec. Together with
-            // `release_all` below that is what keeps a reload from leaving
-            // execs behind.
+            // The `podman exec` client dies with this process. The command
+            // in the container does NOT die with the exec (measured,
+            // 2026-10-17): a kill stops it where it runs, through the
+            // spec's stopper, and a reload's container removal takes the
+            // rest with it.
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning {}", spec.program))?;
+        let stopper = spec.stopper.clone();
 
         let kill = Arc::new(tokio::sync::Notify::new());
         let control: Arc<dyn ShellControl> = Arc::new({
@@ -255,9 +257,10 @@ impl Terminals {
             tokio::spawn(async move {
                 let status = tokio::select! {
                     status = child.wait() => status,
+                    // Where it runs, not only podman here
+                    // (`taste_core::exec::Stopper`).
                     _ = kill.notified() => {
-                        let _ = child.start_kill();
-                        child.wait().await
+                        taste_core::exec::stop_child(stopper.as_ref(), &mut child).await
                     }
                 };
                 let (exit, shell_state) = exit_status(status);
