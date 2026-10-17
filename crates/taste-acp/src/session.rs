@@ -1171,12 +1171,8 @@ fn join_waiting(
     written: &taste_core::queued::Queued,
     queued: &mut std::collections::VecDeque<Command>,
 ) -> (Vec<ContentBlock>, usize) {
-    let note = |written: &taste_core::queued::Queued| {
-        ContentBlock::Text(TextContent::new(taste_core::queued::note(
-            written.at.elapsed(),
-            &written.after,
-        )))
-    };
+    let note =
+        |written: &taste_core::queued::Queued| ContentBlock::Text(TextContent::new(written.note()));
     let mut out = vec![note(written)];
     out.extend(blocks);
     let mut count = 0;
@@ -1782,10 +1778,7 @@ mod tests {
     fn the_messages_that_waited_go_out_together() {
         use taste_core::queued::{Queued, Reference};
         let text = |t: &str| ContentBlock::Text(TextContent::new(t.to_string()));
-        let written = Queued {
-            at: std::time::Instant::now(),
-            after: Reference::TurnStart,
-        };
+        let written = Queued::new(Reference::TurnStart, &Default::default());
         let prompt = |t: &str, waited: bool| Command::Prompt {
             blocks: vec![text(t)],
             queued: waited.then(|| written.clone()),

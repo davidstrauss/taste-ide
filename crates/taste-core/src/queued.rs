@@ -14,6 +14,8 @@
 //! transcript draws it as the card's queued badge rather than as words the
 //! user typed.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The most characters of the agent's own words a note quotes.
@@ -35,11 +37,68 @@ pub enum Reference {
     TurnStart,
 }
 
-/// A message held behind a turn: when it was written, and where.
+/// How many messages and steps of the agent's a chat has shown, counted as
+/// they land, and read again when a queued message goes: the difference is
+/// how far back its [`Reference`] is. A quote alone does not place it — a
+/// turn that reads a task's output four times has four steps of the same
+/// name (David, 2026-10-17: "I like the precise location context").
+#[derive(Debug, Clone, Default)]
+pub struct Progress(Arc<AtomicU64>);
+
+impl Progress {
+    /// One more message or step of the agent's.
+    pub fn count(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl PartialEq for Progress {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Progress {}
+
+/// A message held behind a turn: when it was written, where, and how many
+/// of the agent's messages and steps there were then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Queued {
     pub at: Instant,
     pub after: Reference,
+    /// The chat's count, and what it stood at once `after` had landed —
+    /// for a message still being written, counting that message, which
+    /// lands when it is finished.
+    pub progress: Progress,
+    pub seen: u64,
+}
+
+impl Queued {
+    /// Written now, after `after`, in a chat whose count is `progress`.
+    pub fn new(after: Reference, progress: &Progress) -> Self {
+        let seen = progress.get() + u64::from(matches!(after, Reference::Writing(_)));
+        Self {
+            at: Instant::now(),
+            after,
+            progress: progress.clone(),
+            seen,
+        }
+    }
+
+    /// How many of the agent's messages and steps came after `after`, so
+    /// far.
+    pub fn since(&self) -> u64 {
+        self.progress.get().saturating_sub(self.seen)
+    }
+
+    /// The note it goes out after, now.
+    pub fn note(&self) -> String {
+        note(self.at.elapsed(), &self.after, self.since())
+    }
 }
 
 /// The end of `text`, as a quote: one line, at most [`QUOTE_CHARS`]
@@ -80,16 +139,36 @@ pub fn duration_text(duration: Duration) -> String {
     }
 }
 
-/// The line a queued message goes out after, for one that waited `waited`.
-pub fn note(waited: Duration, after: &Reference) -> String {
+/// `3 messages and steps`, `1 message or step`.
+fn items(n: u64) -> String {
+    if n == 1 {
+        "1 message or step".to_string()
+    } else {
+        format!("{n} messages and steps")
+    }
+}
+
+/// The line a queued message goes out after, for one that waited `waited`
+/// and was written `since` of the agent's messages and steps before it
+/// went: how long, after what, and how far back that is.
+pub fn note(waited: Duration, after: &Reference, since: u64) -> String {
     let place = match after {
         Reference::Writing(text) => format!("while you were writing \"{}\"", tail(text)),
         Reference::Message(text) => format!("after your message ending \"{}\"", tail(text)),
         Reference::Step(line) => format!("after your step \"{}\"", tail(line)),
         Reference::TurnStart => "as your turn began".to_string(),
     };
+    let distance = match (after, since) {
+        (Reference::TurnStart, 0) => ", before anything of yours".to_string(),
+        (_, 0) => ", the last thing you did before it was sent".to_string(),
+        (_, n) => format!(
+            ", {} of yours before it was sent; the user had not seen {}",
+            items(n),
+            if n == 1 { "that one" } else { "those" }
+        ),
+    };
     format!(
-        "{OPEN}{}. Written {place}; it does not know what you did after that.]",
+        "{OPEN}{}. Written {place}{distance}.]",
         duration_text(waited)
     )
 }
@@ -159,11 +238,13 @@ mod tests {
         let note = note(
             Duration::from_secs(192),
             &Reference::Message("I will move the cache next.".into()),
+            3,
         );
         assert_eq!(
             note,
             "[Queued for 3m 12s. Written after your message ending \"I will move the cache \
-             next.\"; it does not know what you did after that.]"
+             next.\", 3 messages and steps of yours before it was sent; the user had not seen \
+             those.]"
         );
         let sent = format!("{note}\n\nstop and look at the tests first");
         let (said, message) = split(&sent).unwrap();
@@ -173,15 +254,56 @@ mod tests {
         assert_eq!(split("[Queued for lunch] is what I typed"), None);
         assert_eq!(split("plain"), None);
         assert_eq!(duration_text(Duration::from_secs(3725)), "1h 2m");
-        assert!(super::note(Duration::ZERO, &Reference::TurnStart).contains("as your turn began"));
+        assert!(
+            super::note(Duration::ZERO, &Reference::TurnStart, 0).contains("as your turn began")
+        );
+    }
+
+    /// Where a message was written is said as how far back it is, because
+    /// a turn can show the same step many times: counted from what had
+    /// landed when it was written, the message being streamed then counted
+    /// as its own.
+    #[test]
+    fn the_note_says_how_far_back_it_was_written() {
+        let progress = Progress::default();
+        progress.count();
+        let step = Queued::new(
+            Reference::Step("Read the output of task build".into()),
+            &progress,
+        );
+        let writing = Queued::new(Reference::Writing("Bevy is compiling".into()), &progress);
+        assert_eq!((step.since(), writing.since()), (0, 0));
+        progress.count(); // the message being written lands
+        progress.count(); // another step
+        assert_eq!((step.since(), writing.since()), (2, 1));
+        assert!(
+            step.note().ends_with(
+                "Written after your step \"Read the output of task build\", 2 messages and steps \
+                 of yours before it was sent; the user had not seen those.]"
+            ),
+            "{}",
+            step.note()
+        );
+        assert!(writing.note().contains(
+            ", 1 message or step of yours before it was sent; the user had not seen that one."
+        ));
+        let last = Queued::new(Reference::Step("cargo test".into()), &progress);
+        assert!(last
+            .note()
+            .ends_with(", the last thing you did before it was sent.]"));
+        let start = Queued::new(Reference::TurnStart, &Progress::default());
+        assert!(start
+            .note()
+            .ends_with("as your turn began, before anything of yours.]"));
     }
 
     #[test]
     fn messages_that_went_out_together_come_apart_again() {
-        let first = note(Duration::from_secs(90), &Reference::TurnStart);
+        let first = note(Duration::from_secs(90), &Reference::TurnStart, 4);
         let second = note(
             Duration::from_secs(30),
             &Reference::Step("Run tests".into()),
+            1,
         );
         let sent = format!("{first}\nsaving should not block\n\nreally\n{second}\na bonus budget");
         let parts = split_all(&sent).unwrap();

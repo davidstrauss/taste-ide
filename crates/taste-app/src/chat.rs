@@ -1119,6 +1119,9 @@ pub struct ChatPane {
     /// lines and forgetful at the front — and the count of what it forgot
     /// travels with it, so a truncated view never reads as a quiet agent.
     transcript_log: RefCell<std::collections::VecDeque<taste_core::orchestration::TranscriptLine>>,
+    /// The agent's messages and steps so far, which a queued message's note
+    /// measures how far back it was written by (`taste_core::queued`).
+    progress: taste_core::queued::Progress,
     /// Lines this mirror has dropped off the front.
     transcript_dropped: Cell<u64>,
     /// When anything last happened here. `chat_status` reports the gap;
@@ -3497,6 +3500,7 @@ impl ChatPane {
             container_wait: Cell::new(ContainerWait::Idle),
             orientation_due: Cell::new(true),
             transcript_log: RefCell::new(std::collections::VecDeque::new()),
+            progress: Default::default(),
             transcript_dropped: Cell::new(0),
             last_activity: Cell::new(None),
             turns: Cell::new(0),
@@ -4625,6 +4629,10 @@ impl ChatPane {
             return;
         }
         self.touch();
+        // What `feed_reference` can point at is what is counted.
+        if matches!(speaker, "agent" | "tool") {
+            self.progress.count();
+        }
         let at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -5182,10 +5190,7 @@ impl ChatPane {
         // The card goes in now: the send was accepted, and a message that
         // vanished from the composer without appearing in the transcript
         // would read as lost.
-        let written = written.unwrap_or_else(|| taste_core::queued::Queued {
-            at: std::time::Instant::now(),
-            after: self.feed_reference(),
-        });
+        let written = written.unwrap_or_else(|| self.written_here());
         let card = self.user_card(text.trim(), &attachments);
         let badge = queued_badge(&holding_label(
             &self.environment.to_string(),
@@ -6762,12 +6767,13 @@ impl ChatPane {
     /// When and where a message sent now is written, if a turn is running
     /// for it to wait behind; `None` when it goes straight to the agent.
     fn written_now(&self) -> Option<taste_core::queued::Queued> {
-        self.stop_button
-            .get_visible()
-            .then(|| taste_core::queued::Queued {
-                at: std::time::Instant::now(),
-                after: self.feed_reference(),
-            })
+        self.stop_button.get_visible().then(|| self.written_here())
+    }
+
+    /// A message written now: after what, and how far into the agent's
+    /// messages and steps.
+    fn written_here(&self) -> taste_core::queued::Queued {
+        taste_core::queued::Queued::new(self.feed_reference(), &self.progress)
     }
 
     /// Hand a prompt to the agent, briefing and all; `written` when it may
@@ -7729,10 +7735,7 @@ impl ChatPane {
         // note the agent got, roughly to the second.
         retire_nudge(&badge);
         badge.set_label(&format!("queued for {}", elapsed(written.at)));
-        badge.set_tooltip_text(Some(&taste_core::queued::note(
-            written.at.elapsed(),
-            &written.after,
-        )));
+        badge.set_tooltip_text(Some(&written.note()));
     }
 
     fn reseat_accepted_prompt(self: &Rc<Self>, card: &gtk::Box) -> Option<gtk::ListBoxRow> {
@@ -11693,6 +11696,7 @@ impl ChatPane {
             &taste_core::queued::Reference::Message(
                 "Moving the cache next; the request path reads it in three places.".into(),
             ),
+            4,
         );
         user(&note);
         user("Look at the failing tests first.");
@@ -11702,6 +11706,7 @@ impl ChatPane {
         user(&taste_core::queued::note(
             std::time::Duration::from_secs(47),
             &taste_core::queued::Reference::Step("Read the output of task test".into()),
+            1,
         ));
         user("And keep the old cache behind a flag until they pass.");
         say("Looking at the tests first: two fail on the cache's warm-up.");

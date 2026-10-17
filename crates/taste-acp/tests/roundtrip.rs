@@ -417,9 +417,11 @@ async fn a_prompt_sent_during_a_turn_goes_after_it_with_a_note() {
         }
         said
     }
-    let written = |after: &str| taste_core::queued::Queued {
-        at: std::time::Instant::now(),
-        after: taste_core::queued::Reference::Message(after.into()),
+    let written = |after: &str| {
+        taste_core::queued::Queued::new(
+            taste_core::queued::Reference::Message(after.into()),
+            &Default::default(),
+        )
     };
     let text = |t: &str| {
         vec![ContentBlock::Text(
@@ -451,7 +453,7 @@ async fn a_prompt_sent_during_a_turn_goes_after_it_with_a_note() {
     {
         assert!(pair[0].starts_with("[Queued for "), "{reply}");
         assert!(
-            pair[0].contains("s. Written after your message ending \"Moving the cache next.\";"),
+            pair[0].contains("s. Written after your message ending \"Moving the cache next.\","),
             "{reply}"
         );
         assert_eq!(pair[1], message, "{reply}");
