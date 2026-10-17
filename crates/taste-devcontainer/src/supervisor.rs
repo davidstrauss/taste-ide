@@ -4003,17 +4003,19 @@ impl Supervisor {
             ));
             args.extend(nesting);
         }
-        // The grant, enforced: what the pool placed this environment by is
-        // what its container may use. Swap equal to memory, so the ceiling
-        // is a ceiling; the guest delegates the cpu and memory controllers
-        // to rootless podman (verified on the guest, 2026-09-21). After the
-        // config's own runArgs, because podman takes the last `--memory`
-        // and `--cpus` it is given: before them, a config's
+        // The grant's memory, enforced: what the pool placed this
+        // environment by is what its container may use. Swap equal to
+        // memory, so the ceiling is a ceiling; the guest delegates the cpu
+        // and memory controllers to rootless podman (verified on the guest,
+        // 2026-09-21). After the config's own runArgs, because podman takes
+        // the last `--memory` it is given: before them, a config's
         // `--memory=64g` raised its own ceiling past what it was placed by,
-        // on a VM its neighbours share.
+        // on a VM its neighbours share. No `--cpus`: the container may use
+        // every vCPU of its VM, and the weights below order a contended
+        // one (`config::Grant`). A container is made afresh at every start,
+        // so this reaches one made under the old two-CPU cap the next time
+        // its environment starts.
         let grant = self.grant_for(&config, authority);
-        args.push("--cpus".into());
-        args.push(grant.cpus.to_string());
         args.push("--memory".into());
         args.push(format!("{}m", grant.memory_mib));
         args.push("--memory-swap".into());

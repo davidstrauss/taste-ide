@@ -647,7 +647,7 @@ mod tests {
             host_storage_bytes: None,
         };
         let grant = |cpus: u32, memory_mib: u64| Grant { cpus, memory_mib };
-        // 10240 - 1024 reserve = 9216 MiB and 11 CPUs to grant per VM.
+        // 10240 - 1024 reserve = 9216 MiB to grant per VM.
         let candidates = vec![
             (vm("taste-a-x"), facts.clone(), grant(2, 4096)),
             (vm("taste-a-y"), facts.clone(), grant(0, 0)),
@@ -665,9 +665,15 @@ mod tests {
             Some("taste-a-y"),
             "only the empty one has room for a big grant"
         );
+        // CPUs are shared, never a reason to look elsewhere: a grant asking
+        // for more than any VM has still packs by its memory.
+        assert_eq!(
+            best_fit(grant(12, 4096), &candidates).map(|(vm, _, _)| vm.domain.as_str()),
+            Some("taste-a-x"),
+        );
         assert!(
-            best_fit(grant(12, 4096), &candidates).is_none(),
-            "more CPUs than any VM grants"
+            best_fit(grant(1, 9300), &candidates).is_none(),
+            "more memory than any VM has free"
         );
         assert_eq!(free_in(&facts, grant(2, 4096)), grant(9, 5120));
     }

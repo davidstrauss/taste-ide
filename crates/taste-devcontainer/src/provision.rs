@@ -1256,6 +1256,9 @@ impl LibvirtSession {
     }
 
     pub async fn start(&self, vm: &Vm) -> Result<()> {
+        if let Err(e) = self.grow_vcpus(vm).await {
+            self.say(&vm.domain, format!("its vCPUs could not be raised: {e:#}"));
+        }
         self.say(&vm.domain, "starting the domain");
         self.virsh(&["start", &vm.domain])
             .await
@@ -1583,6 +1586,36 @@ impl LibvirtSession {
                  limits sized for the IDE",
             );
         }
+        Ok(())
+    }
+
+    /// Raise a shut-off VM's vCPUs to what this host's sizing gives now,
+    /// for the next boot: a VM made when a VM was half the host keeps
+    /// that until it is told otherwise. Never lowered — a vCPU idle costs
+    /// nothing — and a VM on a cloud host is sized there.
+    async fn grow_vcpus(&self, vm: &Vm) -> Result<()> {
+        if vm.cloud.is_some() {
+            return Ok(());
+        }
+        let want = Sizing::for_host().vcpus;
+        let info = self.virsh(&["dominfo", &vm.domain]).await?;
+        let facts = facts_from_dominfo(&info, 0, None);
+        if facts.running || facts.cpus >= u64::from(want) {
+            return Ok(());
+        }
+        let count = want.to_string();
+        // The maximum first: the count cannot exceed it.
+        self.virsh(&["setvcpus", &vm.domain, &count, "--config", "--maximum"])
+            .await?;
+        self.virsh(&["setvcpus", &vm.domain, &count, "--config"])
+            .await?;
+        self.say(
+            &vm.domain,
+            format!(
+                "raised its vCPUs from {} to {want} for this boot",
+                facts.cpus
+            ),
+        );
         Ok(())
     }
 

@@ -3098,14 +3098,18 @@ hypervisor, and the ladder never resolves to it.
 
 There is no substrate setting, no sizing knob, and no per-project
 substrate. VM sizing is IDE-decided and derived from the host
-(`taste_devcontainer::sizing`): vCPUs are half the host's capped at 12,
-memory a third of host RAM clamped to 4–16 GiB, the disk a sparse 64 GiB
+(`taste_devcontainer::sizing`): vCPUs are every thread of the host's but
+two, which are the desktop's, memory a third of host RAM clamped to 4–16 GiB, the disk a sparse 64 GiB
 overlay on the shared base image, and a VM is refused when the disk has
 under 20 GiB free or when the running VMs plus this one would take the
-host past its reserve (`sizing::room_for`). The numbers are creation-time:
-a VM is never resized, because a VM is never updated — it is replaced,
-and its environments restored into the replacement (see "Uncommitted
-work, backups, and artifacts").
+host past its reserve (`sizing::room_for`). Memory is creation-time: a VM
+is never given more of the one commitment, because a VM is never updated
+— it is replaced, and its environments restored into the replacement (see
+"Uncommitted work, backups, and artifacts"). The other two grow in place
+when the host can give more: the disk at boot when it has room
+(`sizing::grown_disk_gib`), and the vCPUs before a boot when the sizing
+gives more than the VM has (`LibvirtSession::grow_vcpus`), since a vCPU
+idle costs the host nothing.
 
 **Never degrade silently — and there is nothing to degrade to.** A VM
 that exists for this workspace and will not come up, a connection the
@@ -3127,11 +3131,16 @@ is shouted, but nothing runs either. The rows say what is missing, and
   step with the hypervisor's. Environments are placed across the pool by
   **fit** (`Pool::place`): each environment has a **grant**
   (`config::Grant`) — its devcontainer.json's `hostRequirements` (`cpus`,
-  `memory`), or 2 CPUs and 4 GiB when it says nothing (David, 2026-09-21:
-  "a fine default grant"), or 1 CPU and 2 GiB for the baseline — and the
-  grant is real: `podman run` carries it as `--cpus`, `--memory`, and
-  `--memory-swap`, so what the pool plans by is what the container runs
-  under. A VM's capacity is its size less a reserve for the guest and its
+  `memory`), or 4 GiB when it says nothing (David, 2026-09-21: "a fine
+  default grant"), or 2 GiB for the baseline — and the grant's memory is
+  real: `podman run` carries it as `--memory` and `--memory-swap`, so what
+  the pool plans by is what the container runs under. **CPU is not
+  granted**: a container may use every vCPU of its VM, placement counts
+  memory alone, and a contended VM is ordered by the weights below,
+  because CPU pressure makes a build slower and memory pressure takes the
+  host down (David, 2026-10-17: "Unlike memory pressure, CPU pressure
+  isn't catastrophic"; the two-CPU cap had a Bevy build on two of a VM's
+  eight vCPUs). A VM's capacity is its size less a reserve for the guest and its
   keeper, and what is placed on it counts only while it RUNS — an idle
   environment is a checkout and nothing else, so nine mostly idle
   environments pack onto one VM rather than booting three; the fullest VM
@@ -3573,7 +3582,8 @@ asked about and ruled out of scope (David, same day):
   volume a bind of any path in the VM). Both were found passing on
   2026-10-10 and measured against podman 5.8.7
   (docs/spikes/sandbox-tightening.md). The pool's grant is the last
-  `--memory` and `--cpus` podman sees, so a config cannot raise its own.
+  `--memory` podman sees, so a config cannot raise its own. A config's
+  `--cpus` passes, and can only lower its own share of its VM.
 - **Nested podman is granted, and only as much of it as it needs**
   (2026-09-23). Projects that run podman themselves — a build in a
   container, a test that starts one — are ordinary, and a devcontainer
@@ -4051,7 +4061,7 @@ second file that could disagree.
 **The guest, concretely** (`taste_devcontainer::provision`). Fedora CoreOS
 from the pinned image (`guest`), as a sparse qcow2 overlay on a base image
 decompressed once per host and checked against the release's own
-uncompressed digest. Sized by `sizing`: half the host's CPUs capped at 12,
+uncompressed digest. Sized by `sizing`: every host thread but two,
 a third of its memory clamped to 4–16 GiB, a 64 GiB disk ceiling, and no
 VM created with under 20 GiB free. Podman in the guest is **rootless, as
 `core`** — the shape the spike measured and `podman machine` uses — so the

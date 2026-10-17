@@ -44,8 +44,13 @@ use anyhow::{bail, Result};
 /// The fewest vCPUs a VM is given; a build on one core is a build that
 /// never finishes.
 pub const VCPU_MIN: u32 = 2;
-/// The most. Half of a 24-core host is where this lands today.
-pub const VCPU_MAX: u32 = 12;
+/// The host's threads a VM leaves for the desktop. A vCPU is time, not a
+/// commitment — an idle one costs the host nothing, and a contended host
+/// is slower rather than down — so a VM is given every thread but these
+/// (David, 2026-10-17: "Unlike memory pressure, CPU pressure isn't
+/// catastrophic"). The two keep the IDE's own frames ahead of a build
+/// that has every vCPU busy.
+pub const VCPU_HOST_RESERVE: u32 = 2;
 /// The least memory the IDE considers usable for a VM that builds things.
 pub const MEMORY_MIN_MIB: u64 = 4096;
 /// The most it will commit to one VM.
@@ -81,11 +86,11 @@ impl Sizing {
         Self::derive(host_cpus(), host_memory_mib().unwrap_or(MEMORY_MIN_MIB * 3))
     }
 
-    /// The policy as a pure function: half the CPUs, a third of the memory,
-    /// both clamped, and the fixed disk ceiling.
+    /// The policy as a pure function: the CPUs less the desktop's, a third
+    /// of the memory clamped, and the fixed disk ceiling.
     pub fn derive(host_cpus: u32, host_memory_mib: u64) -> Self {
         Self {
-            vcpus: (host_cpus / 2).clamp(VCPU_MIN, VCPU_MAX),
+            vcpus: host_cpus.saturating_sub(VCPU_HOST_RESERVE).max(VCPU_MIN),
             memory_mib: (host_memory_mib / 3).clamp(MEMORY_MIN_MIB, MEMORY_MAX_MIB),
             disk_gib: DISK_GIB,
         }
@@ -217,11 +222,11 @@ mod tests {
     use super::*;
 
     /// The numbers David named, on the host he named them for: 24 CPUs and
-    /// 31 GiB gives 12 vCPU and about 10 GiB.
+    /// 31 GiB gives about 10 GiB, and every thread but the desktop's two.
     #[test]
     fn the_policy_on_the_host_it_was_decided_for() {
         let sizing = Sizing::derive(24, 31 * 1024);
-        assert_eq!(sizing.vcpus, 12);
+        assert_eq!(sizing.vcpus, 22);
         assert_eq!(sizing.memory_mib, 31 * 1024 / 3);
         assert_eq!(sizing.disk_gib, DISK_GIB);
     }
@@ -229,11 +234,11 @@ mod tests {
     /// Bounded both ways: a laptop gets the floor, a workstation the cap.
     #[test]
     fn sizing_is_clamped_at_both_ends() {
-        let small = Sizing::derive(4, 8 * 1024);
+        let small = Sizing::derive(3, 8 * 1024);
         assert_eq!(small.vcpus, VCPU_MIN);
         assert_eq!(small.memory_mib, MEMORY_MIN_MIB);
         let large = Sizing::derive(128, 256 * 1024);
-        assert_eq!(large.vcpus, VCPU_MAX);
+        assert_eq!(large.vcpus, 126);
         assert_eq!(large.memory_mib, MEMORY_MAX_MIB);
     }
 
@@ -252,7 +257,7 @@ mod tests {
     fn the_host_sizing_is_deterministic_and_within_bounds() {
         let a = Sizing::for_host();
         assert_eq!(a, Sizing::for_host());
-        assert!((VCPU_MIN..=VCPU_MAX).contains(&a.vcpus));
+        assert!(a.vcpus >= VCPU_MIN);
         assert!((MEMORY_MIN_MIB..=MEMORY_MAX_MIB).contains(&a.memory_mib));
     }
 

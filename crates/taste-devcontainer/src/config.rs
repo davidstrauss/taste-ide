@@ -152,11 +152,16 @@ pub struct HostRequirements {
 
 /// What an environment's container is granted, and what its placement
 /// costs a VM: the config's `hostRequirements` when it states them, and
-/// a stated default otherwise. The grant is REAL — `podman run` carries
-/// it as `--cpus`, `--memory`, and `--memory-swap` — so the plan the pool
-/// places by and the ceiling the container runs under are one number
-/// (David, 2026-09-21: "Surely we know what we plan to grant each
-/// devcontainer env").
+/// a stated default otherwise. The memory is REAL — `podman run` carries
+/// it as `--memory` and `--memory-swap` — so the plan the pool places by
+/// and the ceiling the container runs under are one number (David,
+/// 2026-09-21: "Surely we know what we plan to grant each devcontainer
+/// env"). The CPUs are not a ceiling and not a reservation: a container
+/// may use every vCPU its VM has, and on a contended VM the weights
+/// decide who goes first (`supervisor::priority_args`), because CPU
+/// pressure makes a build slower where memory pressure takes the host
+/// down (David, 2026-10-17: "Unlike memory pressure, CPU pressure isn't
+/// catastrophic"). `cpus` is kept as what the config said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grant {
     pub cpus: u32,
@@ -196,9 +201,10 @@ impl Grant {
         }
     }
 
-    /// Whether this grant fits in `free`.
+    /// Whether this grant fits in `free`: its memory, which is the one
+    /// commitment. CPUs are shared, so they never make a grant not fit.
     pub fn fits(&self, free: Grant) -> bool {
-        self.cpus <= free.cpus && self.memory_mib <= free.memory_mib
+        self.memory_mib <= free.memory_mib
     }
 
     /// What is left of `self` after `used`, floored at nothing.
@@ -216,13 +222,9 @@ impl Grant {
         }
     }
 
-    /// `2 CPU, 4.0 GiB`.
+    /// `4.0 GiB`: the memory, the part of a grant that is held.
     pub fn describe(&self) -> String {
-        format!(
-            "{} CPU, {:.1} GiB",
-            self.cpus,
-            self.memory_mib as f64 / 1024.0
-        )
+        format!("{:.1} GiB", self.memory_mib as f64 / 1024.0)
     }
 }
 
@@ -636,13 +638,19 @@ mod tests {
             Grant::DEFAULT,
             "an unreadable field falls back on its own"
         );
-        assert_eq!(Grant::DEFAULT.describe(), "2 CPU, 4.0 GiB");
+        assert_eq!(Grant::DEFAULT.describe(), "4.0 GiB");
         let free = Grant {
             cpus: 3,
             memory_mib: 5000,
         };
         assert!(Grant::DEFAULT.fits(free));
         assert!(!Grant::DEFAULT.plus(Grant::DEFAULT).fits(free));
+        // CPUs are shared: a VM with none left still takes a grant whose
+        // memory fits.
+        assert!(Grant::DEFAULT.fits(Grant {
+            cpus: 0,
+            memory_mib: 5000
+        }));
         assert_eq!(
             free.minus(Grant::DEFAULT),
             Grant {
