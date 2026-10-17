@@ -203,7 +203,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 3;
+pub const GUIDANCE_REVISION: u32 = 4;
 
 /// What every agent is told before its first tool call, and what the
 /// coordinator is told besides — the MCP instructions, and what `ide_guide`
@@ -278,6 +278,12 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              shell or ide_exec, or in the user's terminal: each is shown in the user's Tasks \
              section with its output. A task that takes arguments after `--` or asks for \
              input runs from a shell; the play button runs a task by name only.\n\n\
+             WAITING. To wait for something, call wait, never sleep: name the tasks \
+             (`tasks`) or ide_exec handles (`commands`) to wait for, and `seconds` as the \
+             longest to wait. It returns as soon as one of them finishes, when the time is \
+             up, or at once when the user sends you a message — a sleep hears none of \
+             these. To check on something every few minutes, call wait again with the \
+             same set: each return says where everything it watched stands.\n\n\
              SYNC. The user's folder on their machine and Personal's checkout mirror each \
              other: a file changed on one side is written on the other, and a path both \
              sides changed is asked about, never overwritten. Ignored files stay where \
@@ -928,6 +934,141 @@ impl McpServer {
         }
     }
 
+    /// Wait until `ready`, `timeout`, or a message from the user for `env`'s
+    /// agent, whichever is first (`taste_core::nudge`), and say which.
+    async fn wait_for(
+        &self,
+        env: &EnvironmentId,
+        timeout: std::time::Duration,
+        mut ready: impl FnMut() -> bool,
+    ) -> Woke {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if ready() {
+                return Woke::Ready;
+            }
+            if self.workspace.nudges.should_wake(env) {
+                return Woke::Message;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Woke::Time;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// What a wait a message ended tells the agent: the ask, delivered
+    /// here, so the next tool result does not repeat it.
+    fn woken_by_message(&self, env: &EnvironmentId) -> &'static str {
+        if self.workspace.nudges.take(env) {
+            self.workspace
+                .events
+                .publish(taste_core::Event::NudgeDelivered(env.clone()));
+        }
+        taste_core::nudge::WOKEN
+    }
+
+    /// `wait`: the first of the tasks finishing, the commands exiting, the
+    /// time passing, or the user's message, and where everything it
+    /// watched stands — so a wait called again every few minutes is the
+    /// whole of keeping an eye on a build.
+    async fn wait_tool(&self, env: &EnvironmentId, args: &Value) -> Result<Value> {
+        use taste_core::tasks::RunState;
+        let tasks: Vec<String> = args["tasks"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let commands: Vec<u64> = args["commands"]
+            .as_array()
+            .map(|items| items.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default();
+        let seconds = args["seconds"].as_u64().unwrap_or(120).clamp(1, 600);
+        let board = &self.workspace.tasks;
+        for name in &tasks {
+            if board.state(env, name) == RunState::Idle {
+                anyhow::bail!("{name} has not been run here; task_run starts it");
+            }
+        }
+        let services = if commands.is_empty() {
+            None
+        } else {
+            Some(self.services(env)?)
+        };
+        if let Some(services) = &services {
+            for handle in &commands {
+                services.jobs.finished(*handle)?;
+            }
+        }
+        let started = std::time::Instant::now();
+        let woke = self
+            .wait_for(env, std::time::Duration::from_secs(seconds), || {
+                tasks
+                    .iter()
+                    .any(|name| board.state(env, name) != RunState::Running)
+                    || services.as_ref().is_some_and(|services| {
+                        commands
+                            .iter()
+                            .any(|handle| services.jobs.finished(*handle).unwrap_or(true))
+                    })
+            })
+            .await;
+        let task_rows: Vec<Value> = tasks
+            .iter()
+            .map(|name| {
+                let last = board
+                    .lines(env, name)
+                    .iter()
+                    .rev()
+                    .map(|line| taste_core::tasks::plain_line(line))
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or_default();
+                json!({
+                    "task": name,
+                    "state": task_state_word(board.state(env, name)),
+                    "last_line": last,
+                })
+            })
+            .collect();
+        let command_rows: Vec<Value> = commands
+            .iter()
+            .map(|handle| {
+                let done = services
+                    .as_ref()
+                    .is_some_and(|services| services.jobs.finished(*handle).unwrap_or(true));
+                json!({ "handle": handle, "state": if done { "exited" } else { "running" } })
+            })
+            .collect();
+        let mut out = json!({
+            "woke": match woke {
+                Woke::Ready => "finished",
+                Woke::Message => "message",
+                Woke::Time => "time",
+            },
+            "waited_seconds": started.elapsed().as_secs(),
+        });
+        if !task_rows.is_empty() {
+            out["tasks"] = json!(task_rows);
+        }
+        if !command_rows.is_empty() {
+            out["commands"] = json!(command_rows);
+        }
+        out["next"] = json!(match woke {
+            Woke::Message => self.woken_by_message(env).to_string(),
+            Woke::Ready => "task_output reads a task's output; ide_exec_output collects an \
+                            exited command's"
+                .to_string(),
+            Woke::Time =>
+                "nothing finished: wait again with the same set to keep watching".to_string(),
+        });
+        Ok(out)
+    }
+
     /// A tool's result, with the ask for a turn after it when the user has
     /// made one for this environment and its agent has not been told yet
     /// (`taste_core::nudge`): once, at whichever tool it calls next.
@@ -1172,7 +1313,8 @@ impl McpServer {
             tool(
                 "ide_exec_output",
                 "Collect the output of a command ide_exec handed back a handle for. Waits \
-                 up to `wait_seconds`. Once it reports an exit_code the handle is spent.",
+                 up to `wait_seconds`, or until the user sends you a message. Once it reports \
+                 an exit_code the handle is spent.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1316,9 +1458,12 @@ impl McpServer {
                      reply as their next message. Each reply must make sense alone, read \
                      with only the question above it: name what it chooses (\"Add checks to \
                      TEST-26 only\", \"File it as a bug\"), never point at your text (\"all \
-                     of it\", \"option 2\", \"the first one\"). Call it last, after your answer \
-                     and the question are written: the buttons stand under them. The user \
-                     can still type anything instead.",
+                     of it\", \"option 2\", \"the first one\"). The question must stand on what \
+                     you have said in this chat: something asked only in a file, a commit, or \
+                     the backlog has not been asked, so ask it here, with what the user needs \
+                     to answer it (the command to run, what to look for). Call it last, after \
+                     your answer and the question are written: the buttons stand under them. \
+                     The user can still type anything instead.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -1550,8 +1695,8 @@ impl McpServer {
             "task_run",
             "Run a task in this environment's container, where the user sees it too: its \
              row lights and its output tab fills. Waits up to `wait_seconds` (default 60, at \
-             most 600) and returns the state and the output's last lines; a task still \
-             running is read on with task_output.",
+             most 600) and returns the state and the output's last lines. A message from the \
+             user ends the wait at once. A task still running is waited for with wait.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1559,6 +1704,21 @@ impl McpServer {
                     "wait_seconds": { "type": "integer", "description": "how long to wait for it to finish (0 returns at once)" }
                 },
                 "required": ["name"]
+            }),
+        ));
+        tools.push(tool(
+            "wait",
+            "Wait for the first of: a task in `tasks` finishing, an ide_exec command in \
+             `commands` exiting, `seconds` passing (default 120, at most 600), or a message \
+             from the user, which always ends a wait at once. Returns which it was and \
+             where each task and command stands. Use it instead of sleep.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tasks": { "type": "array", "items": { "type": "string" }, "description": "tasks to wait for, as task_list names them" },
+                    "commands": { "type": "array", "items": { "type": "integer" }, "description": "ide_exec handles to wait for" },
+                    "seconds": { "type": "integer", "description": "the longest to wait (default 120, at most 600)" }
+                }
             }),
         ));
         tools.push(tool(
@@ -2315,12 +2475,21 @@ impl McpServer {
                 // another's namespace — which is the point: two agents
                 // polling handle 1 collect their own builds.
                 let services = self.services(env)?;
+                services.jobs.finished(handle)?;
+                let woke = self
+                    .wait_for(env, std::time::Duration::from_secs(wait), || {
+                        services.jobs.finished(handle).unwrap_or(true)
+                    })
+                    .await;
                 let snapshot = services
                     .jobs
-                    .wait(handle, std::time::Duration::from_secs(wait))
+                    .wait(handle, std::time::Duration::ZERO)
                     .await?;
                 let finished = snapshot.exit_code.is_some();
                 let mut result = exec_result(handle, snapshot);
+                if woke == Woke::Message && !finished {
+                    result["next"] = json!(self.woken_by_message(env));
+                }
                 if finished {
                     self.note_config_change(env, &services, handle, &mut result)
                         .await;
@@ -3441,14 +3610,18 @@ impl McpServer {
                     .start(env, &name, supervisor.exec(), true)
                     .map_err(|why| anyhow::anyhow!("{name} was not run: {why}"))?;
                 let board = &self.workspace.tasks;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
-                while board.state(env, &name) == taste_core::tasks::RunState::Running
-                    && std::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let woke = self
+                    .wait_for(env, std::time::Duration::from_secs(wait), || {
+                        board.state(env, &name) != taste_core::tasks::RunState::Running
+                    })
+                    .await;
+                let mut report = task_report(board, env, &name, 100);
+                if woke == Woke::Message {
+                    report["next"] = json!(self.woken_by_message(env));
                 }
-                Ok(task_report(board, env, &name, 100))
+                Ok(report)
             }
+            "wait" => self.wait_tool(env, &args).await,
             "task_output" => {
                 let name = args["name"]
                     .as_str()
@@ -5467,6 +5640,14 @@ fn page<T>(rows: Vec<T>, offset: usize, limit: usize) -> (Vec<T>, Option<usize>)
 /// A log tail's `lines`, in its spellings, defaulting to 100.
 /// A task's run, as its tools report it: the state, the output's last
 /// `lines`, and what to do next when it is still running.
+/// What ended a wait (`McpServer::wait_for`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Woke {
+    Ready,
+    Message,
+    Time,
+}
+
 fn task_report(
     board: &taste_core::tasks::TaskBoard,
     env: &EnvironmentId,
@@ -5490,7 +5671,10 @@ fn task_report(
         "output": tail,
     });
     if state == taste_core::tasks::RunState::Running {
-        out["next"] = json!("still running: task_output reads on, task_stop stops it");
+        out["next"] = json!(format!(
+            "still running: wait with tasks [\"{name}\"] returns when it ends, or at once if \
+             the user sends you a message; task_output reads on, task_stop stops it"
+        ));
     }
     out
 }
@@ -5858,8 +6042,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "5c1475223228adec2d318c564acd9e6964f82d8df898be433db420b92c0509ba";
-        const AT_REVISION: u32 = 3;
+            "74d46473c0ad1c4060453b7bd330f6911169308fc94b08d661cc58ba42b3489d";
+        const AT_REVISION: u32 = 4;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"
@@ -7374,6 +7558,37 @@ mod tests {
         .await;
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         serde_json::from_str(text).unwrap()
+    }
+
+    /// A wait ends on the first of its set — here, its time — and always,
+    /// at once, on a message from the user, whether or not a turn was asked
+    /// for; a task never run is refused rather than waited on forever.
+    #[tokio::test]
+    async fn a_wait_ends_on_its_time_and_at_once_on_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, workspace) = start_test_server(dir.path()).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let timed = call_tool(&mut stream, "wait", json!({"seconds": 1})).await;
+        assert_eq!(timed["woke"], "time", "{timed}");
+
+        let nudges = workspace.nudges.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            nudges.message_waiting(&EnvironmentId::primary());
+        });
+        let started = std::time::Instant::now();
+        let woken = call_tool(&mut stream, "wait", json!({"seconds": 60})).await;
+        assert_eq!(woken["woke"], "message", "{woken}");
+        assert_eq!(woken["next"], taste_core::nudge::WOKEN);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        workspace.nudges.withdraw(&EnvironmentId::primary());
+
+        let refused = call_tool_raw(&mut stream, "wait", json!({"tasks": ["build"]})).await;
+        assert!(
+            refused.to_string().contains("has not been run here"),
+            "{refused}"
+        );
     }
 
     /// A tool's whole result, for the tools whose content is not JSON.

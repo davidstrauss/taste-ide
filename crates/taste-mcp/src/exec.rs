@@ -221,6 +221,15 @@ impl Jobs {
         Ok(id)
     }
 
+    /// Whether the job has exited, without collecting it; an error for a
+    /// handle that is not live.
+    pub fn finished(&self, id: u64) -> Result<bool> {
+        let jobs = self.inner.lock().unwrap();
+        let job = jobs.get(&id).with_context(|| unknown_handle(id, &jobs))?;
+        let exited = job.state.lock().unwrap().exit_code.is_some();
+        Ok(exited)
+    }
+
     /// Wait up to `timeout` for the job to finish, then snapshot it either
     /// way. A finished job is dropped from the registry on the way out —
     /// its output is in the snapshot, and nothing else will ever read it.

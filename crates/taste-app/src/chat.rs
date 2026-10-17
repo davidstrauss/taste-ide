@@ -6723,6 +6723,9 @@ impl ChatPane {
     /// the turn (`taste_core::nudge`), which sends the message without
     /// stopping anything.
     fn offer_nudge(self: &Rc<Self>, badge: &gtk::Label) {
+        // Waiting behind the turn, which every wait in the IDE's tools now
+        // ends for (`taste_core::nudge`), asked for or not.
+        self.workspace.nudges.message_waiting(&self.environment);
         let Some(row) = badge.parent().and_downcast::<gtk::Box>() else {
             return;
         };
@@ -14562,6 +14565,37 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "publish" => "Publish this work for review".into(),
         "environment_reinstantiate_request" => {
             "Ask to be reinstantiated on updated versions".into()
+        }
+        "wait" => {
+            let tasks: Vec<String> = input
+                .and_then(|v| v.get("tasks"))
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let commands = input
+                .and_then(|v| v.get("commands"))
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            let seconds = input
+                .and_then(|v| v.get("seconds"))
+                .and_then(serde_json::Value::as_u64);
+            match (tasks.as_slice(), commands, seconds) {
+                ([one], _, _) => format!("Wait for task {one}"),
+                ([_, ..], _, _) => format!("Wait for tasks {}", tasks.join(", ")),
+                ([], 1, _) => "Wait for a command".into(),
+                ([], 2.., _) => "Wait for commands".into(),
+                ([], 0, Some(secs)) if secs >= 60 && secs % 60 == 0 => {
+                    format!("Wait {} min", secs / 60)
+                }
+                ([], 0, Some(secs)) => format!("Wait {secs}s"),
+                ([], 0, None) => "Wait".into(),
+            }
         }
         "task_list" => "List the project's tasks".into(),
         "task_run" => about("Run task", "Run a task", "name"),

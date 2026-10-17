@@ -210,6 +210,8 @@ pub fn effect(tool: &str) -> Effect {
         // running one is `ide_exec` by another name — the Taskfile is the
         // agent's to write — so it asks as `ide_exec` does.
         "task_list" | "task_output" => Effect::Read,
+        // Waits, and reads where tasks and commands stand: nothing moves.
+        "wait" => Effect::Read,
         "task_stop" => Effect::Write,
         "task_run" => Effect::Destructive,
         // The two removals (i-0022). A clone can be the only copy of an

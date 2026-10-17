@@ -9,6 +9,13 @@
 //! agent to finish its step and end the turn (David, 2026-10-11: "is there
 //! any way to nudge the agent to let it know I need a turn?").
 //!
+//! Any message waiting is also what every wait in the IDE's tools wakes
+//! for — the `wait` tool, a task's run, a command's output — so an agent
+//! waiting on a build hears the user at once rather than at the end of its
+//! sleep (David, 2026-10-17: "The user sending a message should implicitly
+//! be something the agent waits on and activates for if in any wait
+//! loop").
+//!
 //! Workspace-wide and a handle, like the standing answers: the chat pane
 //! asks on the GTK thread and the MCP server delivers from tokio.
 
@@ -21,30 +28,57 @@ use crate::environment::EnvironmentId;
 pub const NOTE: &str = "[The user has a message waiting for you. Finish the step you are on, \
                         then end your turn so it can be sent.]";
 
-/// The environments whose agent has been asked for a turn and not yet
-/// told.
+/// What a wait that a message ended says, in place of what it waited for.
+pub const WOKEN: &str = "The user sent you a message while you waited. End your turn now: it \
+                         arrives as your next prompt.";
+
+#[derive(Debug, Default)]
+struct Inner {
+    /// Asked for a turn, and not yet told.
+    asked: BTreeSet<EnvironmentId>,
+    /// A message waiting behind the running turn.
+    waiting: BTreeSet<EnvironmentId>,
+}
+
+/// The environments whose agent has a message waiting, and those whose
+/// agent has been asked for a turn and not yet told.
 #[derive(Debug, Clone, Default)]
-pub struct Nudges(Arc<Mutex<BTreeSet<EnvironmentId>>>);
+pub struct Nudges(Arc<Mutex<Inner>>);
 
 impl Nudges {
     /// Ask `env`'s agent for a turn, at its next tool result.
     pub fn ask(&self, env: &EnvironmentId) {
-        self.0.lock().unwrap().insert(env.clone());
+        self.0.lock().unwrap().asked.insert(env.clone());
     }
 
-    /// Take the ask back, told or not: the turn it was for has ended.
+    /// Take the ask back, told or not, and the message with it: the turn
+    /// it was for has ended, and the message has gone.
     pub fn withdraw(&self, env: &EnvironmentId) {
-        self.0.lock().unwrap().remove(env);
+        let mut inner = self.0.lock().unwrap();
+        inner.asked.remove(env);
+        inner.waiting.remove(env);
     }
 
     /// Whether `env`'s agent is waiting to be told.
     pub fn is_asked(&self, env: &EnvironmentId) -> bool {
-        self.0.lock().unwrap().contains(env)
+        self.0.lock().unwrap().asked.contains(env)
     }
 
     /// Whether to tell `env`'s agent now; true once per ask.
     pub fn take(&self, env: &EnvironmentId) -> bool {
-        self.0.lock().unwrap().remove(env)
+        self.0.lock().unwrap().asked.remove(env)
+    }
+
+    /// A message is waiting for `env`'s agent behind its turn.
+    pub fn message_waiting(&self, env: &EnvironmentId) {
+        self.0.lock().unwrap().waiting.insert(env.clone());
+    }
+
+    /// Whether a wait of `env`'s agent should end now: a message is
+    /// waiting, or the user asked for a turn.
+    pub fn should_wake(&self, env: &EnvironmentId) -> bool {
+        let inner = self.0.lock().unwrap();
+        inner.waiting.contains(env) || inner.asked.contains(env)
     }
 }
 
@@ -66,5 +100,21 @@ mod tests {
         nudges.ask(&env);
         nudges.clone().withdraw(&env);
         assert!(!nudges.take(&env), "a clone is the same handle");
+    }
+
+    /// A waiting message wakes a wait whether or not a turn was asked for,
+    /// and goes with the turn it waited behind.
+    #[test]
+    fn a_message_waiting_wakes_any_wait_until_its_turn_ends() {
+        let nudges = Nudges::default();
+        let env = EnvironmentId::parse("i-0004").unwrap();
+        assert!(!nudges.should_wake(&env));
+        nudges.message_waiting(&env);
+        assert!(nudges.should_wake(&env));
+        assert!(!nudges.take(&env), "a message alone is not an ask");
+        nudges.withdraw(&env);
+        assert!(!nudges.should_wake(&env));
+        nudges.ask(&env);
+        assert!(nudges.should_wake(&env));
     }
 }
