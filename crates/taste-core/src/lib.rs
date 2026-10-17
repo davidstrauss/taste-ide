@@ -48,7 +48,7 @@ pub use capped::CappedOutput;
 pub use environment::{Checkout, EnvironmentId};
 pub use event::{
     ControllerButton, Event, EventBus, FolderSync, GuestImageFetch, GuestImagePhase,
-    MigrationAudience, StartupStage,
+    MigrationAudience, StartupStage, SyncFile,
 };
 pub use exec::{CommandSpec, ConfigAuthority, ExecContext};
 pub use files::Files;

@@ -4429,6 +4429,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // way, and the user picks a side (David, 2026-09-23:
                     // "Stop and ask"). Published once as a conflict
                     // appears; its clearing says nothing.
+                    // The files on their way between the folder and
+                    // Personal: the file tree's rings.
+                    Event::SyncFiles(files) => filetree.on_sync_files(files),
                     Event::FolderConflict { paths } => {
                         sync_status_for_events.set_conflicts(&paths);
                         if !paths.is_empty() {

@@ -71,6 +71,7 @@ mod startup;
 mod stripes;
 mod submodule_bar;
 mod submodule_diff;
+mod sync_mark;
 mod syncstatus;
 mod tabfamily;
 mod table;

@@ -153,6 +153,10 @@ pub enum Event {
     /// How the user's folder and the primary's checkout are keeping in
     /// step: the title bar's sync status (taste-app `syncstatus`).
     FolderSync(FolderSync),
+    /// The files on their way between the user's folder and the primary's
+    /// checkout, each by its path from the root: the file tree's progress
+    /// rings. The whole set each time, so a path not in it is not moving.
+    SyncFiles(std::sync::Arc<std::collections::BTreeMap<std::path::PathBuf, SyncFile>>),
     /// The user's folder and the primary's checkout both changed these
     /// paths, differently, since the folder last mirrored the checkout:
     /// nothing was written, and the user chooses a side. Empty: resolved.
@@ -445,6 +449,7 @@ impl Event {
             | Event::SuggestedReplies { .. }
             | Event::FolderConflict { .. }
             | Event::FolderSync(_)
+            | Event::SyncFiles(_)
             | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }
@@ -477,6 +482,24 @@ pub enum FolderSync {
     Done { summary: Option<String> },
     /// A pass failed, and why.
     Failed { reason: String },
+}
+
+/// One file on its way between the folder and the checkout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncFile {
+    /// From the folder to the checkout; down, from the checkout.
+    pub up: bool,
+    /// How far, from 0 to 1: `None` while it waits for its pass.
+    pub fraction: Option<f64>,
+    /// Bytes still to move, when they are known.
+    pub left: Option<u64>,
+    /// Bytes moved so far: this file's, or the transfer's when `shared`.
+    pub moved: u64,
+    /// Seconds still to go, once there is a rate to say it from.
+    pub seconds_left: Option<u64>,
+    /// The numbers are the whole transfer's, which carries this file among
+    /// others (git's fetch reports only its pack), not this file's alone.
+    pub shared: bool,
 }
 
 /// Flatpak packaging states, mirrored from `taste-flatpak` so the UI and

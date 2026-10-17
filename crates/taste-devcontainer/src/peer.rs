@@ -355,6 +355,32 @@ pub fn fetch_from_guest(
     Ok(())
 }
 
+/// Told each of git's progress prints as a fetch goes: called from the
+/// thread reading git's stderr.
+pub type FetchProgress = std::sync::Arc<dyn Fn(&GitProgress) + Send + Sync>;
+
+/// [`fetch_from_guest`], handing git's progress to `progress` as it comes.
+pub fn fetch_from_guest_reporting(
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    path: &Path,
+    refspecs: &[&str],
+    progress: FetchProgress,
+) -> Result<()> {
+    let mut args = vec![
+        "fetch".to_string(),
+        "--progress".into(),
+        "--update-head-ok".into(),
+        "--no-recurse-submodules".into(),
+        guest_url(vm, path),
+    ];
+    args.extend(refspecs.iter().map(|s| s.to_string()));
+    fetch_within_floor_reporting(peer, keys, &args, Some(progress))
+        .with_context(|| format!("fetching from {} in {}", path.display(), vm.domain))?;
+    Ok(())
+}
+
 /// Why `bytes` more on the disk holding `dir` would take it under the
 /// desktop's floor (`taste_core::environment::MIN_FREE_DISK_BYTES`), or
 /// `None` when they fit. A disk that will not say how full it is is let
@@ -383,6 +409,17 @@ pub fn room_for(dir: &Path, bytes: u64, doing: &str) -> Option<String> {
 /// 2026-09-23). Polled rather than capped: a pack's size is not known until
 /// it has arrived, and the floor is the quantity that actually matters.
 fn fetch_within_floor(peer: &Path, keys: &Keys, args: &[String]) -> Result<()> {
+    fetch_within_floor_reporting(peer, keys, args, None)
+}
+
+/// [`fetch_within_floor`], handing each progress print to `progress`; the
+/// rest of what git says is kept for its error, as before.
+fn fetch_within_floor_reporting(
+    peer: &Path,
+    keys: &Keys,
+    args: &[String],
+    progress: Option<FetchProgress>,
+) -> Result<()> {
     if let Some(reason) = room_for(peer, 0, "fetching from the VM") {
         bail!("{reason}");
     }
@@ -404,9 +441,43 @@ fn fetch_within_floor(peer: &Path, keys: &Keys, args: &[String]) -> Result<()> {
     // the fetch the loop below is waiting on.
     let stderr = child.stderr.take().map(|mut pipe| {
         std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = std::io::Read::read_to_string(&mut pipe, &mut text);
-            text
+            let Some(progress) = progress else {
+                let mut text = String::new();
+                let _ = std::io::Read::read_to_string(&mut pipe, &mut text);
+                return text;
+            };
+            // Git redraws its progress with `\r`: each print a segment,
+            // and every segment that is not one kept for the error.
+            let mut kept = String::new();
+            let mut pending: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            let take = |segment: &[u8], kept: &mut String| {
+                let text = String::from_utf8_lossy(segment);
+                let text = text.trim();
+                if text.is_empty() {
+                    return;
+                }
+                match GitProgress::parse(text) {
+                    Some(p) => progress(&p),
+                    None => {
+                        kept.push_str(text);
+                        kept.push('\n');
+                    }
+                }
+            };
+            loop {
+                let n = match std::io::Read::read(&mut pipe, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                pending.extend_from_slice(&buf[..n]);
+                while let Some(at) = pending.iter().position(|b| *b == b'\r' || *b == b'\n') {
+                    let segment: Vec<u8> = pending.drain(..=at).collect();
+                    take(&segment, &mut kept);
+                }
+            }
+            take(&pending, &mut kept);
+            kept
         })
     });
     let mut stopped = None;
@@ -937,6 +1008,23 @@ pub fn sync_primary_peer_with(
     on_send: OnSend,
     say: Say,
 ) -> Result<PeerSync> {
+    sync_primary_peer_tracked(peer, vm, keys, files, path, resolve, on_send, say, None)
+}
+
+/// [`sync_primary_peer_with`], telling `transfers` how each file it moves
+/// is getting on (`crate::transfers`): the file tree's progress rings.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_primary_peer_tracked(
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+    resolve: Option<&Resolve>,
+    on_send: OnSend,
+    say: Say,
+    transfers: Option<&crate::transfers::Transfers>,
+) -> Result<PeerSync> {
     use taste_git::mirror::Head;
     // The checkout observed by this pass, now — not by whatever last took
     // a snapshot of it, seconds or minutes ago: a pass that decided on an
@@ -974,7 +1062,26 @@ pub fn sync_primary_peer_with(
         }
     }
     say("fetching Personal's branches and working copy");
-    fetch_from_guest(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS)?;
+    match transfers {
+        // Its progress, for the files coming down: git says how far through
+        // the pack, and how much has crossed.
+        Some(transfers) => {
+            // What is coming down, sized in the checkout first: git says
+            // how far through its pack it is, never how big the files are.
+            transfers.size_down(|rel| files.stat(&path.join(rel)).ok().map(|stat| stat.size));
+            let transfers = transfers.clone();
+            let progress: FetchProgress = std::sync::Arc::new(move |p: &GitProgress| {
+                if !p.remote && p.phase == "Receiving objects" {
+                    transfers.fetching(
+                        p.percent,
+                        p.bytes.as_deref().and_then(crate::transfers::git_bytes),
+                    );
+                }
+            });
+            fetch_from_guest_reporting(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS, progress)?
+        }
+        None => fetch_from_guest(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS)?,
+    }
     if detached {
         fetch_from_guest(
             peer,
@@ -1269,7 +1376,9 @@ pub fn sync_primary_peer_with(
             ));
         } else {
             say("bringing Personal's working copy into this folder");
-            mirror_into_folder(&git, &head, files, path, resolve, on_send, &mut sync)?;
+            mirror_into_folder(
+                &git, &head, files, path, resolve, on_send, transfers, &mut sync,
+            )?;
         }
     }
     // Then each submodule, as a pair of its own, after the parent — in
@@ -1518,6 +1627,7 @@ fn mirror_into_folder(
     path: &Path,
     resolve: Option<&Resolve>,
     on_send: OnSend,
+    transfers: Option<&crate::transfers::Transfers>,
     sync: &mut PeerSync,
 ) -> Result<()> {
     use taste_git::mirror::Head;
@@ -1525,6 +1635,7 @@ fn mirror_into_folder(
         files,
         path,
         on_send,
+        transfers,
     };
     let folder = git.workdir().to_path_buf();
     let room = move |bytes: u64| room_for(&folder, bytes, "bringing the checkout's changes in");
@@ -1615,6 +1726,7 @@ struct FilesCheckout<'a> {
     files: &'a Files,
     path: &'a Path,
     on_send: OnSend<'a>,
+    transfers: Option<&'a crate::transfers::Transfers>,
 }
 
 impl taste_git::mirror::CheckoutWriter for FilesCheckout<'_> {
@@ -1664,7 +1776,16 @@ impl taste_git::mirror::CheckoutWriter for FilesCheckout<'_> {
             let kind = match &change.content {
                 None => "rm",
                 Some(bytes) => {
-                    self.files.write(&incoming.join(i.to_string()), bytes)?;
+                    let total = bytes.len() as u64;
+                    self.files.write_reporting(
+                        &incoming.join(i.to_string()),
+                        bytes,
+                        &mut |sent| {
+                            if let Some(transfers) = self.transfers {
+                                transfers.sending(&change.path, sent, total);
+                            }
+                        },
+                    )?;
                     if change.link {
                         "link"
                     } else if change.executable {
@@ -1703,6 +1824,9 @@ impl taste_git::mirror::CheckoutWriter for FilesCheckout<'_> {
             {
                 if let Some(slot) = landed.get_mut(i) {
                     *slot = true;
+                    if let (Some(transfers), Some(send)) = (self.transfers, sends.get(i)) {
+                        transfers.landed(&send.change.path, true);
+                    }
                 }
             }
         }

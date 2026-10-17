@@ -564,6 +564,9 @@ pub struct Supervisor {
     /// Paths the folder and the checkout both changed, differently
     /// (`sync_primary_blocking`); the primary's only.
     folder_conflicts: Mutex<Vec<std::path::PathBuf>>,
+    /// The files on their way between the folder and the checkout, for the
+    /// file tree's rings (`crate::transfers`). The primary's only.
+    transfers: crate::transfers::Transfers,
     /// The watch on the user's folder (`watch_folder`), held for its life.
     folder_watch: Mutex<Option<notify::RecommendedWatcher>>,
     /// Held for the whole of a primary sync, fetch to resnapshot: one at a
@@ -891,6 +894,7 @@ impl Supervisor {
     ) -> Arc<Self> {
         let checkout = env.checkout.clone();
         let env_is_primary = env.id.is_primary();
+        let transfers = crate::transfers::Transfers::new(events.clone());
         Arc::new(Self {
             env,
             events,
@@ -914,6 +918,7 @@ impl Supervisor {
             hook_failure: Mutex::new(None),
             capability_gaps: Mutex::new(Vec::new()),
             folder_conflicts: Mutex::new(Vec::new()),
+            transfers,
             folder_watch: Mutex::new(None),
             folder_sync: Mutex::new(()),
             last_tidy: Mutex::new(None),
@@ -1157,6 +1162,7 @@ impl Supervisor {
         let last_change = Arc::new(Mutex::new(std::time::Instant::now()));
         let primary = self.env.id.is_primary();
         let folder_events = self.events.clone();
+        let transfers = self.transfers.clone();
         if primary {
             self.watch_folder();
         }
@@ -1200,6 +1206,9 @@ impl Supervisor {
             // without being anything git would show.
             let worktree_changed =
                 primary && git_part(&name).is_none() && !name.is_empty() && !churn_path(&name);
+            if worktree_changed {
+                transfers.changed(Path::new(&name), false);
+            }
             if worktree_changed && !snapshot_pending.load(Ordering::SeqCst) {
                 folder_events.publish(Event::FolderSync(taste_core::FolderSync::Pending));
             }
@@ -1615,7 +1624,7 @@ impl Supervisor {
                 }));
             }
         };
-        let sync = crate::peer::sync_primary_peer_with(
+        let sync = crate::peer::sync_primary_peer_tracked(
             &self.env.peer,
             vm,
             keys,
@@ -1624,7 +1633,10 @@ impl Supervisor {
             resolve,
             &on_send,
             &say,
+            Some(&self.transfers),
         );
+        // Whatever the pass came to, nothing is on its way any more.
+        self.transfers.settle();
         if let Err(e) = &sync {
             events.publish(Event::FolderSync(taste_core::FolderSync::Failed {
                 reason: format!("{e:#}"),
@@ -1674,10 +1686,20 @@ impl Supervisor {
         let last = Arc::new(Mutex::new(std::time::Instant::now()));
         let root = folder.clone();
         let events = self.events.clone();
+        let transfers = self.transfers.clone();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else { return };
             if matches!(event.kind, notify::EventKind::Access(_)) {
                 return;
+            }
+            // Each working-tree file the folder changed is waiting to go up.
+            for path in &event.paths {
+                if let Ok(rel) = path.strip_prefix(&root) {
+                    let text = rel.to_string_lossy();
+                    if !text.is_empty() && git_part(&text).is_none() && !churn_path(&text) {
+                        transfers.changed(rel, true);
+                    }
+                }
             }
             let relevant = event.paths.iter().any(|path| {
                 path.strip_prefix(&root).is_ok_and(|rel| {

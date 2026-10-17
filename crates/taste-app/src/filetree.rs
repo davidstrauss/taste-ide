@@ -610,6 +610,9 @@ pub struct FileTree {
     /// ordinary git-status tick can restyle the ones that moved instead of
     /// resetting the factory. See [`FileTree::restyle_changed_rows`].
     rows: RefCell<HashMap<PathBuf, RowHandle>>,
+    /// The files on their way between the folder and Personal's checkout,
+    /// by path from the root (`taste_core::Event::SyncFiles`).
+    moving: RefCell<std::sync::Arc<std::collections::BTreeMap<PathBuf, taste_core::SyncFile>>>,
     /// The folders the user has open. A `TreeListModel` is rebuilt whole
     /// whenever the tree changes under it — a save, a git refresh, an
     /// agent's edit — and a rebuilt model starts collapsed, which closed
@@ -653,6 +656,25 @@ struct RowHandle {
     locked: bool,
     label: glib::WeakRef<gtk::Label>,
     badge: glib::WeakRef<gtk::Label>,
+    /// The sync mark in the badge's slot (`crate::sync_mark`).
+    mark: crate::sync_mark::SyncMark,
+}
+
+impl RowHandle {
+    /// The mark for what is moving now, and the status letter given its
+    /// slot back when the mark has nothing to show. A folder rests only:
+    /// its files carry their own rings.
+    fn show_mark(&self, moving: Option<&taste_core::SyncFile>) {
+        let moving = moving.filter(|_| !self.is_dir);
+        let at_rest = self.state.get() == FileState::Synced;
+        // Ignored and not synced: a change there goes nowhere, whatever a
+        // watcher made of it.
+        let moving = moving.filter(|_| self.state.get() != FileState::Ignored);
+        let marked = self.mark.show(moving, at_rest);
+        if let Some(badge) = self.badge.upgrade() {
+            badge.set_visible(!marked);
+        }
+    }
 }
 
 /// How long a refresh request waits for company.
@@ -1597,6 +1619,7 @@ impl FileTree {
             commit_suggester: RefCell::new(None),
             open_menu: RefCell::new(None),
             rows: RefCell::new(HashMap::new()),
+            moving: RefCell::new(syncing_for_probe()),
             expanded_dirs: RefCell::new(HashSet::new()),
             refresh: RefreshGate::default(),
             unreachable: Cell::new(false),
@@ -7765,8 +7788,10 @@ impl FileTree {
         }
         badge_label.set_tooltip_text(state_tooltip(state));
 
+        let mark = crate::sync_mark::SyncMark::new();
         row.append(&icon);
         row.append(&label);
+        row.append(&mark.widget);
         row.append(&badge_label);
         if let Some(head) = &submodule {
             let standing = format!("{name} is {}", head.pin.describe());
@@ -7853,16 +7878,23 @@ impl FileTree {
             if rows.len() >= 512 {
                 rows.retain(|_, handle| handle.badge.upgrade().is_some());
             }
-            rows.insert(
-                node.path.clone(),
-                RowHandle {
-                    is_dir: node.is_dir,
-                    state: std::cell::Cell::new(state),
-                    locked,
-                    label: label.downgrade(),
-                    badge: badge_label.downgrade(),
-                },
-            );
+            let handle = RowHandle {
+                is_dir: node.is_dir,
+                state: std::cell::Cell::new(state),
+                locked,
+                label: label.downgrade(),
+                badge: badge_label.downgrade(),
+                mark,
+            };
+            // A submodule's row wears no state of its own here.
+            if submodule.is_none() {
+                let moving = self.moving.borrow();
+                handle.show_mark(
+                    self.repo_relative(&node.path)
+                        .and_then(|rel| moving.get(&rel)),
+                );
+            }
+            rows.insert(node.path.clone(), handle);
         }
 
         // Right-click: file operations + stage/unstage. Kept out of the row
@@ -8305,6 +8337,33 @@ impl FileTree {
                 label.add_css_class(css);
             }
             handle.state.set(state);
+            let moving = self.moving.borrow();
+            handle.show_mark(rel.as_ref().and_then(|rel| moving.get(rel)));
+        }
+    }
+
+    /// The files on their way now: each bound row's mark follows, and
+    /// nothing else on the row is touched.
+    pub fn on_sync_files(
+        &self,
+        files: std::sync::Arc<std::collections::BTreeMap<PathBuf, taste_core::SyncFile>>,
+    ) {
+        let before = std::mem::replace(&mut *self.moving.borrow_mut(), files.clone());
+        if before.is_empty() && files.is_empty() {
+            return;
+        }
+        let rows = self.rows.borrow();
+        for (path, handle) in rows.iter() {
+            if handle.is_dir {
+                continue;
+            }
+            let Some(rel) = self.repo_relative(path) else {
+                continue;
+            };
+            let (was, now) = (before.get(&rel), files.get(&rel));
+            if was.is_some() || now.is_some() {
+                handle.show_mark(now);
+            }
         }
     }
 
@@ -8350,8 +8409,60 @@ fn state_style(state: FileState) -> (&'static str, Option<&'static str>) {
         FileState::Ignored => ("·", Some("dim-label")),
         // In the letters' place: an ignored path wears none of them, and
         // a real state of its own (staged by force, say) is shown instead.
-        FileState::Synced => ("⇅", None),
+        // The chasing arrows instead (`crate::sync_mark`): a glyph, not a
+        // letter.
+        FileState::Synced => ("", None),
     }
+}
+
+/// TASTE_PROBE_CHECK only: `TASTE_PROBE_SYNCING=README.md:up:0.4,Cargo.toml:down`
+/// poses those files on their way — up to Personal or down to the folder,
+/// that far through, or waiting when no fraction is given — since a probe's
+/// folder has no VM to sync with. Up is 24 MiB of its own; down is 30 MiB
+/// riding a shared fetch, as git's does.
+fn syncing_for_probe() -> std::sync::Arc<std::collections::BTreeMap<PathBuf, taste_core::SyncFile>>
+{
+    let mut files = std::collections::BTreeMap::new();
+    if std::env::var_os("TASTE_PROBE_CHECK").is_some() {
+        for posed in std::env::var("TASTE_PROBE_SYNCING")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|p| !p.is_empty())
+        {
+            let mut parts = posed.split(':');
+            let path = PathBuf::from(parts.next().unwrap_or_default());
+            let up = parts.next() != Some("down");
+            let fraction: Option<f64> = parts.next().and_then(|f| f.parse().ok());
+            let file = match fraction {
+                None => taste_core::SyncFile {
+                    up,
+                    fraction: None,
+                    left: None,
+                    moved: 0,
+                    seconds_left: None,
+                    shared: false,
+                },
+                Some(f) if up => taste_core::SyncFile {
+                    up,
+                    fraction: Some(f),
+                    left: Some(((1.0 - f) * f64::from(24u32 << 20)) as u64),
+                    moved: (f * f64::from(24u32 << 20)) as u64,
+                    seconds_left: Some(((1.0 - f) * 20.0).ceil() as u64),
+                    shared: false,
+                },
+                Some(f) => taste_core::SyncFile {
+                    up,
+                    fraction: Some(f),
+                    left: Some(((1.0 - f) * f64::from(30u32 << 20)) as u64),
+                    moved: (f * f64::from(30u32 << 20)) as u64,
+                    seconds_left: Some(((1.0 - f) * 12.0).ceil() as u64),
+                    shared: true,
+                },
+            };
+            files.insert(path, file);
+        }
+    }
+    std::sync::Arc::new(files)
 }
 
 /// TASTE_PROBE_CHECK only: `TASTE_PROBE_SYNCED=docs/,README.md` poses those

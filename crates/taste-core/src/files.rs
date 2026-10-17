@@ -133,6 +133,18 @@ pub trait RemoteFiles: Send + Sync + fmt::Debug {
     /// Atomic: written beside the target and renamed into place, with the
     /// parents made.
     fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+    /// [`Self::write`], telling `sent` how many bytes have gone as they
+    /// go, for a file large enough to be watched arriving.
+    fn write_reporting(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        sent: &mut dyn FnMut(u64),
+    ) -> io::Result<()> {
+        self.write(path, bytes)?;
+        sent(bytes.len() as u64);
+        Ok(())
+    }
     fn mkdir_all(&self, path: &Path) -> io::Result<()>;
     fn remove(&self, path: &Path, recursive: bool) -> io::Result<()>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
@@ -335,6 +347,23 @@ impl Files {
                 })
             }
             Files::Remote(remote) => remote.write(path, bytes),
+        }
+    }
+
+    /// [`Self::write`], telling `sent` how many bytes have gone as they go.
+    pub fn write_reporting(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        sent: &mut dyn FnMut(u64),
+    ) -> io::Result<()> {
+        match self {
+            Files::Local => {
+                self.write(path, bytes)?;
+                sent(bytes.len() as u64);
+                Ok(())
+            }
+            Files::Remote(remote) => remote.write_reporting(path, bytes, sent),
         }
     }
 

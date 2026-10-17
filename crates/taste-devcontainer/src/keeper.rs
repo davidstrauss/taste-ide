@@ -210,6 +210,11 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Payload per data frame, both ways.
 const CHUNK: usize = 64 * 1024;
+
+/// Frames queued for the writer before a sender waits: 2 MiB of chunks.
+/// Bounded so a large write's progress is the connection's, and so a big
+/// file is not held twice in memory while it drains.
+const WRITE_QUEUE: usize = 32;
 /// A frame larger than this is a corrupt or hostile stream.
 const MAX_FRAME: usize = 1024 * 1024;
 
@@ -270,7 +275,7 @@ fn decode(buf: &[u8]) -> Result<Option<FrameRef<'_>>> {
 #[derive(Debug)]
 pub struct Keeper {
     describe: String,
-    writes: Mutex<mpsc::Sender<Vec<u8>>>,
+    writes: Mutex<mpsc::SyncSender<Vec<u8>>>,
     pending: Arc<Mutex<HashMap<u32, mpsc::Sender<Reply>>>>,
     next_id: AtomicU32,
     alive: Arc<AtomicBool>,
@@ -378,7 +383,7 @@ impl Keeper {
 
         // The writer: one thread, so two requests never interleave halves
         // of a frame.
-        let (writes_tx, writes_rx) = mpsc::channel::<Vec<u8>>();
+        let (writes_tx, writes_rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE);
         std::thread::Builder::new()
             .name("taste-keeper-write".into())
             .spawn(move || {
@@ -697,9 +702,24 @@ impl RemoteFiles for Keeper {
     }
 
     fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.write_reporting(path, bytes, &mut |_| {})
+    }
+
+    /// Chunk by chunk, each counted once the writer has taken it: the
+    /// queue to it is bounded (`WRITE_QUEUE`), so what is counted is near
+    /// what has gone down the connection, not what is waiting in memory.
+    fn write_reporting(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        sent: &mut dyn FnMut(u64),
+    ) -> io::Result<()> {
         let (id, rx) = self.request(serde_json::json!({ "op": "write", "path": path }))?;
+        let mut gone = 0u64;
         for chunk in bytes.chunks(CHUNK) {
             self.send(encode(id, 1, chunk))?;
+            gone += chunk.len() as u64;
+            sent(gone);
         }
         self.send(encode(id, 2, &[]))?;
         self.collect(&rx).map(|_| ())

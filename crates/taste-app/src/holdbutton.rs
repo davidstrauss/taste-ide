@@ -40,7 +40,7 @@ pub fn early_release_note() -> String {
 
 /// The ring's diameter, matched to the icon it replaces so the button does
 /// not change size under the finger.
-const RING_SIZE: i32 = 16;
+pub(crate) const RING_SIZE: i32 = 16;
 
 pub struct HoldButton {
     pub widget: gtk::Button,
@@ -267,7 +267,11 @@ impl HoldButton {
 /// sector from twelve o'clock clockwise to `progress` of the way round, in
 /// the widget's own foreground colour so it follows the theme and the
 /// button's destructive tint.
-fn draw_ring(
+/// The ring: a faint track, and a wedge filling clockwise from twelve to
+/// `progress`. Shared with the file tree's sync mark (`crate::sync_mark`),
+/// so a progress ring is one thing in this app (David, 2026-10-17: "The
+/// progress circle should be the same as the one for click and hold").
+pub(crate) fn draw_ring(
     area: &gtk::DrawingArea,
     cr: &gtk::cairo::Context,
     width: i32,
@@ -277,7 +281,6 @@ fn draw_ring(
     let color = area.color();
     let (cx, cy) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
     let radius = (cx.min(cy) - 1.0).max(1.0);
-    let top = -std::f64::consts::FRAC_PI_2;
     cr.set_source_rgba(
         f64::from(color.red()),
         f64::from(color.green()),
@@ -296,6 +299,17 @@ fn draw_ring(
         f64::from(color.blue()),
         f64::from(color.alpha()),
     );
+    cr.new_path();
+    ring_wedge(cr, width, height, progress);
+    let _ = cr.fill();
+}
+
+/// The wedge [`draw_ring`] fills, added to the current path: for a mark
+/// drawn over the ring to be cut out of it.
+pub(crate) fn ring_wedge(cr: &gtk::cairo::Context, width: i32, height: i32, progress: f64) {
+    let (cx, cy) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
+    let radius = (cx.min(cy) - 1.0).max(1.0);
+    let top = -std::f64::consts::FRAC_PI_2;
     cr.move_to(cx, cy);
     cr.arc(
         cx,
@@ -305,7 +319,6 @@ fn draw_ring(
         top + std::f64::consts::TAU * progress.min(1.0),
     );
     cr.close_path();
-    let _ = cr.fill();
 }
 
 #[cfg(test)]

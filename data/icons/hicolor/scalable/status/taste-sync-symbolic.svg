@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Two arrows chasing each other round a circle: the title bar's folder
-     sync, in step (syncstatus.rs). Filled shapes rather than strokes, and
-     no mask, which GTK's symbolic loader does not honour. -->
+<!-- Two arrows chasing round a circle: an ignored path that syncs between
+     the folder and Personal anyway, at rest, in the file tree's status slot
+     (David, 2026-10-17: "I'd like these sync icons to be circular chasing
+     arrows"). Filled shapes only, so it recolours as any symbolic does. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
   <g fill="#241f31">
-    <path d="M1.60 6.87 A6.5 6.5 0 0 1 13.63 4.75 L11.90 5.75 A4.5 4.5 0 0 0 3.57 7.22 Z"/>
-    <path d="M14.58 4.20 L14.26 7.85 L10.94 6.30 Z"/>
-    <path d="M14.40 9.13 A6.5 6.5 0 0 1 2.37 11.25 L4.10 10.25 A4.5 4.5 0 0 0 12.43 8.78 Z"/>
-    <path d="M1.42 11.80 L1.74 8.15 L5.06 9.70 Z"/>
+    <path d="M2.01 6.40 A6.2 6.2 0 0 1 12.15 3.39 L11.08 4.58 A4.6 4.6 0 0 0 3.56 6.81 Z"/>
+    <path d="M9.94 5.84 L13.29 2.13 L13.19 6.51 Z"/>
+    <path d="M13.99 9.60 A6.2 6.2 0 0 1 3.85 12.61 L4.92 11.42 A4.6 4.6 0 0 0 12.44 9.19 Z"/>
+    <path d="M6.06 10.16 L2.71 13.87 L2.81 9.49 Z"/>
   </g>
 </svg>
