@@ -76,10 +76,61 @@ pub fn push_to_guest_with_progress(
     refspecs: &[&str],
     progress: &mut dyn FnMut(&GitProgress),
 ) -> Result<()> {
+    // git refuses a push whose patterns match nothing ("No refs in common
+    // and none specified"), which is every pattern in a repository fresh
+    // from `git init`, and the remotes' pattern in one with no remote.
+    // Nothing to send is a push that is already done.
+    if !sends_anything(peer, refspecs) {
+        return Ok(());
+    }
     let mut args = vec!["push".to_string(), "--progress".into(), guest_url(vm, path)];
     args.extend(refspecs.iter().map(|s| s.to_string()));
     git_streaming(peer, keys, &args, progress)
         .with_context(|| format!("pushing to {} in {}", path.display(), vm.domain))
+}
+
+/// Whether `refspecs` name anything the peer has. A source that is not a
+/// trailing-`*` pattern counts as something, for git to judge; the
+/// patterns are looked up, less what a `^` pattern excludes.
+fn sends_anything(peer: &Path, refspecs: &[&str]) -> bool {
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    for spec in refspecs {
+        if let Some(negative) = spec.strip_prefix('^') {
+            match negative.strip_suffix('*') {
+                Some(prefix) => exclude.push(prefix.to_string()),
+                None => exclude.push(negative.to_string()),
+            }
+            continue;
+        }
+        let source = spec.trim_start_matches('+').split(':').next().unwrap_or("");
+        match source.strip_suffix('*') {
+            Some(prefix) if !prefix.contains('*') => include.push(prefix.to_string()),
+            _ => return true,
+        }
+    }
+    if include.is_empty() {
+        return false;
+    }
+    let mut argv = taste_git::private::cli_prefix(peer);
+    argv.extend(["for-each-ref".to_string(), "--format=%(refname)".into()]);
+    argv.extend(include);
+    let (program, argv) = host_argv(taste_core::podman::sandboxed(), "git", argv);
+    let Ok(out) = std::process::Command::new(&program)
+        .args(&argv)
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return true;
+    };
+    if !out.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().any(|name| {
+        !exclude
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_str()))
+    })
 }
 
 /// One of git's progress lines — `Writing objects:  45% (1364/3031),
@@ -2119,6 +2170,41 @@ fn push_ahead_into_checkout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repository fresh from `git init` has nothing for the seed's
+    /// patterns to match, and git refuses such a push outright; it is
+    /// skipped instead, as is the remotes' pattern with no remote.
+    #[test]
+    fn a_push_of_patterns_that_match_nothing_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        assert!(!sends_anything(dir.path(), &PRIMARY_SEED_REFSPECS));
+        assert!(!sends_anything(dir.path(), &[REMOTES_REFSPEC]));
+        // A ref named outright is git's to judge.
+        assert!(sends_anything(dir.path(), &["+refs/heads/main:refs/x"]));
+        // What only an exclusion matches is still nothing.
+        git(&["commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&["update-ref", "refs/taste/vm/main", "HEAD"]);
+        assert!(!sends_anything(
+            dir.path(),
+            &["+refs/taste/*:refs/taste/*", "^refs/taste/vm/*"]
+        ));
+        assert!(sends_anything(dir.path(), &PRIMARY_SEED_REFSPECS));
+        assert!(!sends_anything(dir.path(), &[REMOTES_REFSPEC]));
+    }
 
     /// A submodule's name becomes one file name: plain names as they were
     /// (so a staging repository already made keeps its place), git's
