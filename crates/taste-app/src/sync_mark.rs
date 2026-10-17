@@ -67,6 +67,7 @@ impl SyncMark {
             let drawn = drawn.clone();
             let (row, text) = (row.clone(), text.clone());
             ring.set_draw_func(move |area, cr, width, height| {
+                let _doing = crate::stall::doing(|| "drawing a file's sync ring".into());
                 if let Some(file) = drawn.borrow().as_ref() {
                     draw(area, cr, width, height, file);
                 }

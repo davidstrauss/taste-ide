@@ -7520,6 +7520,7 @@ impl FileTree {
         });
         let tree = Rc::downgrade(self);
         factory.connect_bind(move |_, item| {
+            let _doing = crate::stall::doing(|| "binding a file tree row".into());
             let Some(tree) = tree.upgrade() else { return };
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
             let row = item.item().and_downcast::<gtk::TreeListRow>().unwrap();
@@ -8316,6 +8317,7 @@ impl FileTree {
     /// reason — a mode flip's locks, a new ignore rule — takes the full
     /// rebind instead.
     fn restyle_changed_rows(&self) {
+        let _doing = crate::stall::doing(|| "restyling the file tree's rows".into());
         let mut rows = self.rows.borrow_mut();
         rows.retain(|_, handle| handle.badge.upgrade().is_some());
         // Resolved against the repository open NOW, not the one that was
@@ -8392,6 +8394,8 @@ impl FileTree {
         &self,
         files: std::sync::Arc<std::collections::BTreeMap<PathBuf, taste_core::SyncFile>>,
     ) {
+        let _doing =
+            crate::stall::doing(|| format!("the tree's sync marks, {} files", files.len()));
         let before = std::mem::replace(&mut *self.moving.borrow_mut(), files.clone());
         if before.is_empty() && files.is_empty() {
             return;

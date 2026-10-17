@@ -9490,6 +9490,13 @@ impl ChatPane {
                 // join handle nobody holds, so the loop ended silently and
                 // every later update — the turn's answer, its end — went
                 // nowhere while the pane said "streaming" (2026-10-11).
+                let _doing = crate::stall::doing(|| {
+                    format!(
+                        "chat {}'s event {}",
+                        pane.environment,
+                        session_event_label(&event)
+                    )
+                });
                 let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     pane.handle_event(without_nul(event))
                 }));
@@ -15675,6 +15682,23 @@ fn next_doc_key(prefix: &str) -> String {
         n
     });
     format!("{prefix}-{n}")
+}
+
+/// A session event as the stall log names it (`crate::stall`): its kind,
+/// and for an update, the start of what it is.
+fn session_event_label(event: &SessionEvent) -> String {
+    match event {
+        SessionEvent::Update(update) => {
+            format!("update {}", crate::stall::short_debug(update, 80))
+        }
+        SessionEvent::TurnEnded { .. } => "the turn's end".into(),
+        SessionEvent::QueuedJoined { count } => format!("{count} queued messages joined"),
+        SessionEvent::Permission { .. } => "a permission request".into(),
+        SessionEvent::Elicitation { .. } => "questions".into(),
+        SessionEvent::PromptFailed { .. } => "a failed prompt".into(),
+        SessionEvent::Closed(_) => "the session closing".into(),
+        _ => "a session event".into(),
+    }
 }
 
 /// What the agent sent, with every NUL in its text shown as ␀. GTK takes C

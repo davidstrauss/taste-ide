@@ -67,6 +67,7 @@ mod search;
 mod semantic;
 mod sparkline;
 mod ssh_agent;
+mod stall;
 mod startup;
 mod stripes;
 mod submodule_bar;
@@ -311,6 +312,10 @@ fn main() -> glib::ExitCode {
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_activate(move |app| {
+        // Once per process, on the main thread: what a stall was doing goes
+        // in the log (`stall`).
+        static WATCHING: std::sync::Once = std::sync::Once::new();
+        WATCHING.call_once(stall::start);
         // Icon: installed into hicolor normally; in-repo data/ covers dev
         // runs — found beside the BINARY, not under the working directory,
         // since a dev run opens whatever project the shell is in and the

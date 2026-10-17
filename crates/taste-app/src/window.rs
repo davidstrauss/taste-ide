@@ -4066,6 +4066,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let window_for_pad = window.downgrade();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
+                let _doing = crate::stall::doing(|| {
+                    format!(
+                        "the window's event {}",
+                        crate::stall::short_debug(&event, 80)
+                    )
+                });
                 match event {
                     // The pad is read off evdev, which has no idea which
                     // window has the keyboard — or whether any of this
