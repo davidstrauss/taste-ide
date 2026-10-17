@@ -94,7 +94,7 @@ impl SyncStatus {
             .pixel_size(16)
             .build();
         let badge = gtk::Box::builder()
-            .css_classes(["sync-badge", "green"])
+            .css_classes(["sync-badge", "off"])
             .halign(gtk::Align::End)
             .valign(gtk::Align::End)
             .can_target(false)
@@ -190,7 +190,7 @@ impl SyncStatus {
             sync_section,
             separator,
             content,
-            cloud_light: Cell::new(CloudLight::Quiet),
+            cloud_light: Cell::new(CloudLight::Unset),
             cloud_said: RefCell::new(String::new()),
             current_title,
             current_detail,
@@ -414,13 +414,14 @@ impl SyncStatus {
         let sync = if self.syncing.get() {
             self.face.get().light()
         } else {
-            CloudLight::Quiet
+            CloudLight::Unset
         };
         let light = sync.max(self.cloud_light.get());
-        for class in ["green", "amber", "red"] {
+        for class in ["off", "green", "amber", "red"] {
             self.badge.remove_css_class(class);
         }
         self.badge.add_css_class(match light {
+            CloudLight::Unset => "off",
             CloudLight::Quiet => "green",
             CloudLight::Waiting => "amber",
             CloudLight::Failed => "red",

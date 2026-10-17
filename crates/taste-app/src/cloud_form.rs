@@ -56,7 +56,10 @@ pub const SETUP_TITLE: &str = "Google Cloud Setup";
 /// What the connection contributes to the cloud's badge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CloudLight {
-    /// Ready, or never set up: nothing for the user to look at.
+    /// Never set up: no connection to speak of, so grey rather than a
+    /// warning — a project with no cloud is not one with a problem.
+    Unset,
+    /// Ready: nothing for the user to look at.
     Quiet,
     /// Under way, or waiting on the user.
     Waiting,
@@ -320,7 +323,7 @@ impl CloudForm {
             Verdict::Fail => CloudLight::Failed,
             Verdict::Pending => CloudLight::Waiting,
             Verdict::Attention if self.project_id().is_some() => CloudLight::Waiting,
-            Verdict::Attention => CloudLight::Quiet,
+            Verdict::Attention | Verdict::Unset => CloudLight::Unset,
         };
         let hook = self.on_light.borrow().clone();
         if let Some(hook) = hook {
@@ -389,7 +392,7 @@ impl CloudForm {
             form.sync_sensitivity();
             match (choices, account) {
                 (None, _) => form.say(
-                    Verdict::Attention,
+                    Verdict::Unset,
                     "Not set up — enter the project, sign in with Google, then set it up",
                 ),
                 (Some(_), None) => form.say(
@@ -701,7 +704,7 @@ impl CloudForm {
             "unset" => {
                 self.project.set_text("");
                 self.say(
-                    Verdict::Attention,
+                    Verdict::Unset,
                     "Not set up — enter the project, sign in with Google, then set it up",
                 );
             }
@@ -924,5 +927,7 @@ mod tests {
     fn the_worst_light_wins() {
         assert!(CloudLight::Failed > CloudLight::Waiting);
         assert!(CloudLight::Waiting > CloudLight::Quiet);
+        // A sync in step outranks a cloud nobody set up: green, not grey.
+        assert!(CloudLight::Quiet > CloudLight::Unset);
     }
 }

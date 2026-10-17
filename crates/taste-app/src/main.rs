@@ -957,6 +957,8 @@ fn main() -> glib::ExitCode {
                  .sync-badge.green { background-color: @success_color; }\n\
                  .sync-badge.amber { background-color: @warning_color; }\n\
                  .sync-badge.red { background-color: @error_color; }\n\
+                 .sync-badge.off { background-color: \
+                   color-mix(in srgb, currentColor 40%, transparent); }\n\
                  /* The cloud popover's actions, as a popover menu's items \
                     are (cloud_form.rs): flat, label at the start, a menu \
                     item's weight and padding. */\n\

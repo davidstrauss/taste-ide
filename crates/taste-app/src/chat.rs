@@ -1694,6 +1694,11 @@ pub(crate) enum Verdict {
     /// Nothing is wrong yet, and nothing is set up either: amber, the hue
     /// this UI keeps for "you are the blocker".
     Attention,
+    /// Nothing set up, and nothing asked of the user: grey. An optional
+    /// connection nobody has defined is not a warning (David, 2026-10-17:
+    /// "should be gray, not yellow (warning), when it's simply
+    /// undefined").
+    Unset,
 }
 
 impl Verdict {
@@ -1703,6 +1708,7 @@ impl Verdict {
             Verdict::Pass => "green",
             Verdict::Fail => "red",
             Verdict::Attention => "amber",
+            Verdict::Unset => "off",
         }
     }
 }
