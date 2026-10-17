@@ -268,12 +268,30 @@ impl GuestImage {
                 part.display().to_string(),
             ],
         );
+        // xz says nothing as it goes, so the part file's size is the
+        // progress: read every second while it runs.
+        let unpacking = {
+            let (part, report, release) = (part.clone(), report.clone(), self.release.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let done = std::fs::metadata(&part).map_or(0, |meta| meta.len());
+                    report(GuestImageFetch {
+                        release: release.clone(),
+                        phase: GuestImagePhase::Decompressing,
+                        done,
+                        total: unpacked,
+                    });
+                }
+            })
+        };
         let output = tokio::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())
             .output()
-            .await
-            .context("running xz")?;
+            .await;
+        unpacking.abort();
+        let output = output.context("running xz")?;
         if !output.status.success() {
             let _ = std::fs::remove_file(&part);
             bail!(
@@ -282,12 +300,25 @@ impl GuestImage {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        self.report(&*report, GuestImagePhase::Verifying, 0, 0);
+        // Two gigabytes read back and hashed is most of a minute on a slow
+        // disk, so the check reports how far it has read, as the fetch does.
+        let size = std::fs::metadata(&part).map_or(unpacked, |meta| meta.len());
+        self.report(&*report, GuestImagePhase::Verifying, 0, size);
         let expected = self.uncompressed_sha256.clone();
         let hashed_part = part.clone();
-        let digest = tokio::task::spawn_blocking(move || sha256_file(&hashed_part))
-            .await
-            .context("hashing the base image")??;
+        let (release, hash_report) = (self.release.clone(), report.clone());
+        let digest = tokio::task::spawn_blocking(move || {
+            sha256_file(&hashed_part, |done| {
+                hash_report(GuestImageFetch {
+                    release: release.clone(),
+                    phase: GuestImagePhase::Verifying,
+                    done,
+                    total: size,
+                })
+            })
+        })
+        .await
+        .context("hashing the base image")??;
         if digest != expected {
             let _ = std::fs::remove_file(&part);
             bail!(
@@ -546,20 +577,30 @@ pub fn release_is_behind(release: &str, current: &str) -> bool {
 }
 
 /// Hex SHA-256 of a file, streamed: the base image is two gigabytes.
-fn sha256_file(path: &Path) -> Result<String> {
+/// A file's SHA-256, telling `progress` how many bytes it has read every
+/// 32 MiB.
+fn sha256_file(path: &Path, progress: impl Fn(u64)) -> Result<String> {
     use sha2::Digest as _;
     use std::io::Read as _;
     let mut file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = sha2::Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
+    let mut done = 0u64;
+    const STEP: u64 = 32 << 20;
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         hasher.update(&buffer[..n]);
+        let before = done;
+        done += n as u64;
+        if before / STEP != done / STEP {
+            progress(done);
+        }
     }
+    progress(done);
     Ok(hasher
         .finalize()
         .iter()

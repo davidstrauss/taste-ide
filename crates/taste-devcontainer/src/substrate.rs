@@ -642,7 +642,10 @@ pub fn report_download(fetch: taste_core::GuestImageFetch) {
             format!("decompressing the guest image {}", fetch.release)
         }
         GuestImagePhase::Decompressing => return,
-        GuestImagePhase::Verifying => format!("verifying the guest image {}", fetch.release),
+        GuestImagePhase::Verifying if fetch.done == 0 => {
+            format!("verifying the guest image {}", fetch.release)
+        }
+        GuestImagePhase::Verifying => return,
         GuestImagePhase::Ready => format!("the guest image {} is ready", fetch.release),
     };
     taste_core::app_log::push("info", "substrate", &line);

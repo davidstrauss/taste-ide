@@ -3179,7 +3179,7 @@ impl BacklogPanel {
                 fetch.release
             ),
             GuestImagePhase::Verifying => format!(
-                "Verifying Fedora CoreOS {} against its pinned digest.",
+                "Verifying Fedora CoreOS {} against its pinned digest: {progress}{pace}.",
                 fetch.release
             ),
             GuestImagePhase::Absent | GuestImagePhase::Ready => String::new(),
@@ -3198,7 +3198,17 @@ impl BacklogPanel {
                     *panel.guest_fetch_timer.borrow_mut() = None;
                     return glib::ControlFlow::Break;
                 }
-                panel.freshen_guest_image();
+                // The disk cannot tell a check from an unpack that has
+                // finished — the part file is whole in both — so while
+                // the check reports, the disk is not asked.
+                let verifying = panel
+                    .guest_fetch_last
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(_, fetch, _)| fetch.phase == GuestImagePhase::Verifying);
+                if !verifying {
+                    panel.freshen_guest_image();
+                }
                 glib::ControlFlow::Continue
             });
             *self.guest_fetch_timer.borrow_mut() = Some(timer);

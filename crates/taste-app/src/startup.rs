@@ -715,13 +715,15 @@ impl StartupPage {
             return;
         }
         let mib = |bytes: u64| bytes / (1024 * 1024);
-        let detail = match fetch.phase {
-            P::Fetching if fetch.total > 0 => {
-                format!("{} of {} MiB", mib(fetch.done), mib(fetch.total))
-            }
-            P::Fetching => "downloading".to_string(),
-            P::Decompressing => "unpacking".to_string(),
-            _ => "verifying".to_string(),
+        let doing = match fetch.phase {
+            P::Fetching => "downloading",
+            P::Decompressing => "unpacking",
+            _ => "verifying",
+        };
+        let detail = if fetch.total > 0 {
+            format!("{doing} · {} of {} MiB", mib(fetch.done), mib(fetch.total))
+        } else {
+            doing.to_string()
         };
         for later in Step::ALL.iter().filter(|s| **s > Step::GuestImage) {
             let row = self.row(*later);
@@ -897,8 +899,9 @@ impl StartupPage {
             // The guest image arriving inside the VM's bring-up, as the
             // first VM on a machine has it; `novm` is the same bring-up
             // failing once the image is in, as a host with VT-x off in its
-            // firmware does.
-            "image" | "novm" => {
+            // firmware does; `verify` is the unpacked image's digest being
+            // checked, partway.
+            "image" | "novm" | "verify" => {
                 self.activate(Step::Vm, Some("bringing up the workspace's VM"));
                 let fetch = |phase, done: u64, total: u64| taste_core::GuestImageFetch {
                     release: "44.20260829.3.1".into(),
@@ -907,6 +910,9 @@ impl StartupPage {
                     total: total * 1024 * 1024,
                 };
                 self.on_guest_image(&fetch(taste_core::GuestImagePhase::Fetching, 612, 976));
+                if kind == "verify" {
+                    self.on_guest_image(&fetch(taste_core::GuestImagePhase::Verifying, 812, 2003));
+                }
                 if kind == "novm" {
                     self.on_guest_image(&fetch(taste_core::GuestImagePhase::Ready, 0, 0));
                     self.on_state(
