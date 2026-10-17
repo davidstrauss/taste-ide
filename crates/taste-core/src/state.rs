@@ -76,6 +76,11 @@ pub struct WorkspaceState {
     pub open_files: Vec<PathBuf>,
     #[serde(default)]
     pub active_file: Option<PathBuf>,
+    /// How each open file's tab showed it. No version bump: an older file
+    /// has none, and a file with no mode saved opens as it would by
+    /// default, which is what the older file described.
+    #[serde(default)]
+    pub open_modes: std::collections::BTreeMap<PathBuf, crate::ide_state::TabMode>,
     /// The workspace's chats, at most one per environment.
     ///
     /// Private, and reachable only through [`WorkspaceState::set_chat`] and
@@ -401,6 +406,7 @@ impl Default for WorkspaceState {
             version: STATE_VERSION,
             root: PathBuf::new(),
             open_files: Vec::new(),
+            open_modes: Default::default(),
             active_file: None,
             chats: Vec::new(),
             environments: Vec::new(),
@@ -615,6 +621,9 @@ mod tests {
             root: root.to_path_buf(),
             open_files: vec![root.join("src/main.rs"), root.join("README.md")],
             active_file: Some(root.join("src/main.rs")),
+            open_modes: [(root.join("README.md"), crate::ide_state::TabMode::Preview)]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         state.set_chat(chat("claude-code", "sess-abc"));

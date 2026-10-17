@@ -4854,7 +4854,28 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // real conversation, and two clients on one session is a fork bomb
     // for its history.
     let (persisted, state_was_reset) = if probe_mode {
-        (taste_core::state::WorkspaceState::default(), false)
+        // `TASTE_PROBE_RESTORE=1`: the tabs a state file holds, reopened as
+        // a launch reopens them, its chats left out — the run's
+        // XDG_STATE_HOME is a scratch one, and a chat would attach to its
+        // session. Each tab's mode is printed once they have opened.
+        if std::env::var_os("TASTE_PROBE_RESTORE").is_some() {
+            let (mut state, _) = taste_core::state::load_reporting(&root);
+            state.set_chats(Vec::new());
+            let ide = workspace.ide.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
+                for file in ide.open_files() {
+                    println!(
+                        "restored tab: {} {:?}{}",
+                        file.path.display(),
+                        file.mode,
+                        if file.active { " (active)" } else { "" }
+                    );
+                }
+            });
+            (state, false)
+        } else {
+            (taste_core::state::WorkspaceState::default(), false)
+        }
     } else {
         taste_core::state::load_reporting(&root)
     };
@@ -4916,6 +4937,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let base = workspace.checkout_path();
         let mut wanted: Vec<PathBuf> = persisted.open_files.iter().map(|p| rehome(p)).collect();
         let active = persisted.active_file.as_ref().map(|p| rehome(p));
+        // Each in the mode it was left in, as its tab opens — a file that
+        // opens in preview and was left on its text, back on its text. One
+        // saved before modes were opens as it would by default.
+        editor.restore_modes(
+            persisted
+                .open_modes
+                .iter()
+                .map(|(p, mode)| (rehome(p), *mode))
+                .collect(),
+        );
         if let Some(active) = &active {
             wanted.push(active.clone());
         }
@@ -5134,6 +5165,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     };
                     state.open_files = open.iter().map(|f| home(&f.path)).collect();
                     state.active_file = open.iter().find(|f| f.active).map(|f| home(&f.path));
+                    // ...and how each was shown, every one of them: a file
+                    // with no mode saved opens as such a file opens.
+                    state.open_modes = open.iter().map(|f| (home(&f.path), f.mode)).collect();
                     state.set_chats(chats_now);
                     let saved = taste_core::state::save(&root, &state).map_err(|e| {
                         tracing::warn!("saving workspace state failed: {e:#}");

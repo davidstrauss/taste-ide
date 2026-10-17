@@ -7,9 +7,24 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+/// How a file's tab shows it: its text to edit, its rendering (Markdown,
+/// a notebook), or its changes since the last commit. Kept with the tab
+/// across restarts (David, 2026-10-17: "tracked not just the files I had
+/// open but the mode in which I had them viewed").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabMode {
+    #[default]
+    Edit,
+    Preview,
+    Changes,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenFile {
     pub path: PathBuf,
+    /// How its tab shows it.
+    pub mode: TabMode,
     pub dirty: bool,
     /// The focused tab.
     pub active: bool,
@@ -125,6 +140,7 @@ mod tests {
         let reader = state.clone();
         state.set_open_files(vec![OpenFile {
             path: PathBuf::from("/w/a.rs"),
+            mode: TabMode::Edit,
             dirty: true,
             active: true,
         }]);

@@ -631,6 +631,9 @@ pub struct Editor {
     /// opened after the reader chose its Markdown opens on its Markdown.
     doc_source: Cell<bool>,
     pages: RefCell<HashMap<PathBuf, Rc<EditorPage>>>,
+    /// The modes a restart's tabs were left in, taken as each one opens
+    /// (`Editor::restore_modes`).
+    restore_modes: RefCell<HashMap<PathBuf, taste_core::ide_state::TabMode>>,
     /// Tabs the last session had open that the folder does not hold —
     /// files the mirror never carries, the ignored ones, which exist only
     /// in Personal's checkout in the VM — by their path in the checkout,
@@ -836,6 +839,7 @@ impl Editor {
             mode_popover: mode_popover.clone(),
             doc_source: Cell::new(false),
             pages: RefCell::new(HashMap::new()),
+            restore_modes: RefCell::new(HashMap::new()),
             awaiting: RefCell::new((Vec::new(), None)),
             surfaces: RefCell::new(HashMap::new()),
             task_prompts: RefCell::new(HashMap::new()),
@@ -2215,6 +2219,8 @@ impl Editor {
                     _ => {}
                 }
                 editor.sync_toggle_to_selection();
+                // The mode is part of what a restart puts back.
+                editor.publish_state();
             });
             list.append(&row);
         }
@@ -3594,6 +3600,11 @@ impl Editor {
         if let Some(line) = line {
             jump_to_line(&page.view, &page.buffer, line);
         }
+        // Reopened by a restart: as it was left.
+        let restored = self.restore_modes.borrow_mut().remove(path);
+        if let Some(mode) = restored {
+            self.apply_mode(path, &page, mode);
+        }
         self.publish_state();
     }
 
@@ -3819,6 +3830,7 @@ impl Editor {
             return;
         }
         page.changes_view.set(on);
+        self.publish_state();
         if on {
             page.stack.set_visible_child_name("changes");
             self.refresh_changes(path, page);
@@ -4125,7 +4137,9 @@ impl Editor {
 }
 
 impl Editor {
-    /// Mirror open files + dirty + active into the shared IDE state.
+    /// Mirror open files + dirty + active + mode into the shared IDE
+    /// state, in the strip's order, which is the order a restart reopens
+    /// them in.
     fn publish_state(&self) {
         let active = self
             .tabs
@@ -4134,21 +4148,57 @@ impl Editor {
         // What the user has open is what is on screen: another
         // environment's stowed tabs are that environment's, and reporting
         // them here would describe an editor nobody is looking at.
-        let visible: Vec<adw::TabPage> = (0..self.tabs.n_pages())
-            .map(|index| self.tabs.nth_page(index))
-            .collect();
-        let files = self
-            .pages
-            .borrow()
-            .iter()
-            .filter(|(_, page)| visible.contains(&page.page))
+        let files = (0..self.tabs.n_pages())
+            .filter_map(|index| self.page_by_tab(&self.tabs.nth_page(index)))
             .map(|(path, page)| taste_core::ide_state::OpenFile {
-                path: path.clone(),
+                mode: self.tab_mode(&path, &page),
                 dirty: page.buffer.is_modified(),
-                active: Some(path) == active.as_ref(),
+                active: Some(&path) == active.as_ref(),
+                path,
             })
             .collect();
         self.workspace.ide.set_open_files(files);
+    }
+
+    /// How a tab shows its file now.
+    fn tab_mode(&self, path: &Path, page: &EditorPage) -> taste_core::ide_state::TabMode {
+        use taste_core::ide_state::TabMode;
+        if page.changes_view.get() {
+            TabMode::Changes
+        } else if self.wysiwyg_active(path, page) {
+            TabMode::Preview
+        } else {
+            TabMode::Edit
+        }
+    }
+
+    /// The modes the tabs a restart reopens were left in: each is put back
+    /// as its tab opens, whenever that is — at once, or once the checkout
+    /// that holds it arrives (`await_checkout`).
+    pub fn restore_modes(&self, modes: HashMap<PathBuf, taste_core::ide_state::TabMode>) {
+        *self.restore_modes.borrow_mut() = modes;
+    }
+
+    /// Show `page` in `mode`, as the mode menu would.
+    fn apply_mode(
+        self: &Rc<Self>,
+        path: &Path,
+        page: &Rc<EditorPage>,
+        mode: taste_core::ide_state::TabMode,
+    ) {
+        use taste_core::ide_state::TabMode;
+        if self.tab_mode(path, page) == mode {
+            return;
+        }
+        match mode {
+            TabMode::Changes => self.set_changes_view(path, page, true),
+            TabMode::Edit | TabMode::Preview => {
+                page.raw_source.set(mode == TabMode::Edit);
+                self.set_changes_view(path, page, false);
+                self.refresh_markdown_mode(path, page);
+            }
+        }
+        self.sync_toggle_to_selection();
     }
 
     /// A file changed on disk (agent, container build, terminal). Clean

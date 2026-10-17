@@ -188,7 +188,11 @@ the ⇅ in the status letter's place (`taste_git::sync_ignored`) — a probe
 opens a folder on this host, which never syncs; the two `taste-app/src`
 files are the rows the hero frame shows (a path's own rule wears ⇅, the
 policy, rightmost, and a synced file the chasing arrows, its status, left
-of it, `sync_mark.rs`); `TASTE_PROBE_SYNCING=crates/taste-app/src/filetree.rs:up:0.4,crates/taste-app/src/fleet.rs:down`
+of it, `sync_mark.rs`); `TASTE_PROBE_RESTORE=1` reopens the tabs a workspace state file holds, each in
+the mode it was left in (edit, preview, changes; `taste_core::ide_state::TabMode`),
+its chats left out, and prints each restored tab with its mode — write the
+file under a scratch `XDG_STATE_HOME`, never the real one;
+`TASTE_PROBE_SYNCING=crates/taste-app/src/filetree.rs:up:0.4,crates/taste-app/src/fleet.rs:down`
 poses files on their way between the folder and Personal — the progress
 ring, its arrow, and the dim words beside it — up or down, that far
 through, or waiting with no fraction (`taste_devcontainer::transfers`), in
