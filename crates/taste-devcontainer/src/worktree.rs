@@ -57,6 +57,28 @@ impl SyncIgnored {
             self.synced.contains(rel)
         }
     }
+
+    /// Whether `rel` syncs by a rule of its own — its line in the root
+    /// `.gitattributes`, or for a file one written by hand — rather than by
+    /// the rule of a folder it is in. Only its own rule is the row's policy
+    /// mark (David, 2026-10-17: "If a file is synced individually, by
+    /// policy, the rightmost icon/badge should be the [policy] arrows").
+    pub fn own_rule(&self, rel: &Path, is_dir: bool) -> bool {
+        if is_dir {
+            self.toggled.dirs.contains(rel) && self.ignored_dirs.contains(rel)
+        } else {
+            self.toggled.files.contains(rel)
+                || (self.synced.contains(rel) && self.rule_folder(rel).is_none())
+        }
+    }
+
+    /// The nearest folder above `rel` whose rule syncs it.
+    pub fn rule_folder<'a>(&self, rel: &'a Path) -> Option<&'a Path> {
+        rel.ancestors()
+            .skip(1)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .find(|dir| self.toggled.dirs.contains(*dir) && self.ignored_dirs.contains(*dir))
+    }
 }
 
 /// git ran beside the files and said no — as distinct from the files
@@ -1079,6 +1101,29 @@ fn submodule_names(out: &str) -> HashMap<PathBuf, SubmoduleHead> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A path's own rule is its policy; a file in a synced folder syncs by
+    /// the folder's, which is named rather than worn.
+    #[test]
+    fn a_path_syncs_by_its_own_rule_or_by_its_folders() {
+        let mut sync = SyncIgnored::default();
+        sync.toggled.dirs.insert(PathBuf::from("dist"));
+        sync.ignored_dirs.insert(PathBuf::from("dist"));
+        sync.toggled.files.insert(PathBuf::from("notes.local"));
+        sync.synced.insert(PathBuf::from("notes.local"));
+        sync.synced.insert(PathBuf::from("dist/emet"));
+        sync.synced.insert(PathBuf::from("by-hand.bin"));
+        assert!(sync.own_rule(Path::new("dist"), true));
+        assert!(sync.own_rule(Path::new("notes.local"), false));
+        assert!(sync.own_rule(Path::new("by-hand.bin"), false));
+        assert!(!sync.own_rule(Path::new("dist/emet"), false));
+        assert_eq!(
+            sync.rule_folder(Path::new("dist/emet")),
+            Some(Path::new("dist"))
+        );
+        assert!(!sync.own_rule(Path::new("dist/sub"), true));
+        assert_eq!(sync.rule_folder(Path::new("dist")), None);
+    }
 
     /// The standing against the pin, from git itself: past the recorded
     /// commit after a commit in the submodule, short of it once the parent

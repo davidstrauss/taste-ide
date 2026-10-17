@@ -15,6 +15,11 @@
 //!   fetch's progress against that size, marked `shared` — what is left of
 //!   it is an estimate, and the time is the fetch's.
 //!
+//! A submodule syncs as a pair of its own, with a fetch of its own: its
+//! pass sees the tracker [`Transfers::within`] it, naming paths as the
+//! submodule does while the tree's rings are keyed from the root, and its
+//! fetch's progress goes on its files alone, not on the parent's.
+//!
 //! A pass that writes a file sets the other side's watcher off over that
 //! same file. Those echoes are not changes to send back, so a path that
 //! just moved is not marked going the other way for a few seconds
@@ -49,6 +54,9 @@ struct Moving {
 
 #[derive(Debug, Default)]
 struct Inner {
+    /// The submodules seen syncing, by path from the root: a file under
+    /// one is that submodule's fetch's to report on.
+    scopes: std::collections::BTreeSet<PathBuf>,
     files: BTreeMap<PathBuf, Moving>,
     /// Paths that moved, the direction they moved in, and when.
     landed: HashMap<PathBuf, (bool, Instant)>,
@@ -62,6 +70,9 @@ struct Inner {
 pub struct Transfers {
     events: EventBus,
     inner: Arc<Mutex<Inner>>,
+    /// Where the pass using this handle is, from the root: empty for the
+    /// parent, a submodule's path for its pass (`within`).
+    scope: PathBuf,
 }
 
 impl Transfers {
@@ -69,7 +80,32 @@ impl Transfers {
         Self {
             events,
             inner: Arc::default(),
+            scope: PathBuf::new(),
         }
+    }
+
+    /// The same tracker, for the pass of the submodule at `sub` (from this
+    /// handle's scope): its paths are the submodule's, and its fetch
+    /// reports on the files inside it.
+    pub fn within(&self, sub: &Path) -> Self {
+        let scope = self.scope.join(sub);
+        self.inner.lock().unwrap().scopes.insert(scope.clone());
+        Self {
+            events: self.events.clone(),
+            inner: self.inner.clone(),
+            scope,
+        }
+    }
+
+    /// Whether `path` (from the root) is this handle's fetch's to report
+    /// on: inside its scope, and in no submodule deeper than it.
+    fn owns(&self, inner: &Inner, path: &Path) -> bool {
+        if !path.starts_with(&self.scope) {
+            return false;
+        }
+        !inner.scopes.iter().any(|scope| {
+            scope != &self.scope && scope.starts_with(&self.scope) && path.starts_with(scope)
+        })
     }
 
     /// A watcher saw `path` change: `up` when it was the folder's.
@@ -101,6 +137,7 @@ impl Transfers {
 
     /// `path` going up: `done` of its `total` bytes have gone.
     pub fn sending(&self, path: &Path, done: u64, total: u64) {
+        let path = &self.scope.join(path);
         let mut inner = self.inner.lock().unwrap();
         let joined = !inner.files.contains_key(path);
         let moving = inner
@@ -128,6 +165,7 @@ impl Transfers {
 
     /// `path` has arrived, in the direction `up`.
     pub fn landed(&self, path: &Path, up: bool) {
+        let path = &self.scope.join(path);
         let mut inner = self.inner.lock().unwrap();
         inner.files.remove(path);
         inner
@@ -140,9 +178,16 @@ impl Transfers {
     /// `size` reads one path's bytes in the checkout.
     pub fn size_down(&self, size: impl Fn(&Path) -> Option<u64>) {
         let mut inner = self.inner.lock().unwrap();
-        for (path, moving) in inner.files.iter_mut().filter(|(_, m)| !m.up) {
-            if moving.total.is_none() {
-                moving.total = size(path);
+        let mine: Vec<PathBuf> = inner
+            .files
+            .iter()
+            .filter(|(path, m)| !m.up && m.total.is_none() && self.owns(&inner, path))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in mine {
+            let bytes = path.strip_prefix(&self.scope).ok().and_then(&size);
+            if let Some(moving) = inner.files.get_mut(&path) {
+                moving.total = bytes;
             }
         }
     }
@@ -152,8 +197,18 @@ impl Transfers {
     pub fn fetching(&self, percent: Option<u8>, received: Option<u64>) {
         let mut inner = self.inner.lock().unwrap();
         let since = *inner.fetch_since.get_or_insert_with(Instant::now);
+        let mine: std::collections::HashSet<PathBuf> = inner
+            .files
+            .keys()
+            .filter(|path| self.owns(&inner, path))
+            .cloned()
+            .collect();
         let mut any = false;
-        for moving in inner.files.values_mut().filter(|m| !m.up) {
+        for (_, moving) in inner
+            .files
+            .iter_mut()
+            .filter(|(path, m)| !m.up && mine.contains(*path))
+        {
             moving.shared = true;
             moving.since = Some(since);
             if let Some(percent) = percent {
@@ -278,6 +333,33 @@ mod tests {
         // The checkout's watcher hears the write the sync just made.
         transfers.changed(path, false);
         assert!(rx.try_recv().is_err(), "an echo is not a change");
+    }
+
+    /// A submodule's pass names its paths as the submodule does, and its
+    /// fetch reports on its own files, never the parent's.
+    #[test]
+    fn a_submodules_pass_is_scoped_to_its_files() {
+        let events = EventBus::new();
+        let rx = events.subscribe();
+        let transfers = Transfers::new(events);
+        let sub = transfers.within(Path::new("ext/lib"));
+        transfers.changed(Path::new("README.md"), false);
+        transfers.changed(Path::new("ext/lib/src/x.rs"), false);
+        sub.size_down(|path| {
+            assert_eq!(path, Path::new("src/x.rs"), "named as the submodule does");
+            Some(10 << 20)
+        });
+        transfers.size_down(|path| {
+            assert_eq!(path, Path::new("README.md"), "the parent's own only");
+            Some(1 << 20)
+        });
+        std::thread::sleep(PACE);
+        sub.fetching(Some(50), None);
+        let set = last_set(&rx);
+        assert_eq!(set[Path::new("ext/lib/src/x.rs")].fraction, Some(0.5));
+        assert_eq!(set[Path::new("README.md")].fraction, None);
+        sub.sending(Path::new("src/y.rs"), 1, 2);
+        assert!(last_set(&rx).contains_key(Path::new("ext/lib/src/y.rs")));
     }
 
     /// What comes down wears the fetch's progress, said to be shared, and

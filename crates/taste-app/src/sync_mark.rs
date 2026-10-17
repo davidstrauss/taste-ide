@@ -1,17 +1,23 @@
-//! A file tree row's sync mark, in its status slot: two arrows chasing
-//! round a circle for an ignored path that syncs anyway, at rest; and for
-//! any file on its way between the folder and Personal's checkout, a ring
+//! A file tree row's sync status, left of its git letter or its policy mark
+//! (David, 2026-10-17: "The straight arrows show policy; the circle/progress
+//! ones show status"): two arrows chasing round a circle for a file that
+//! syncs by policy and is in step; and for any file on its way between the
+//! folder and Personal's checkout, a ring
 //! that fills as it moves, with an arrow in it saying which way — up to
 //! Personal, down to the folder — and beside it, dim, how much is left and
 //! how long (David, 2026-10-17: "change the circular arrows to a progress
 //! circle with an arrow in the middle that's up or down, depending on the
 //! direction of transfer … show low-contrast text … 'X MiB, Y s
-//! remaining'"). What it is told comes from `taste_devcontainer::transfers`
-//! through `taste_core::Event::SyncFiles`.
+//! remaining'"). The words show only while the whole row fits with them,
+//! name and all; otherwise they go, and the ring's tooltip has them (David:
+//! "You can drop the remaining size/time text entirely if space is tight.
+//! Just show it in the tooltip for the circle"). What it is told comes from
+//! `taste_devcontainer::transfers` through `taste_core::Event::SyncFiles`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gtk::glib;
 use gtk::prelude::*;
 use taste_core::SyncFile;
 
@@ -26,6 +32,8 @@ pub struct SyncMark {
     ring: gtk::DrawingArea,
     text: gtk::Label,
     drawn: Rc<RefCell<Option<SyncFile>>>,
+    /// The row the words must fit in beside everything else on it.
+    row: Rc<RefCell<glib::WeakRef<gtk::Widget>>>,
 }
 
 impl SyncMark {
@@ -49,17 +57,30 @@ impl SyncMark {
         let rest = gtk::Image::from_icon_name("taste-sync-symbolic");
         rest.set_pixel_size(RING);
         rest.add_css_class("dim-label");
-        rest.set_tooltip_text(Some("Ignored, and synced with Personal anyway"));
         rest.set_visible(false);
         widget.append(&text);
         widget.append(&ring);
         widget.append(&rest);
         let drawn: Rc<RefCell<Option<SyncFile>>> = Rc::default();
+        let row: Rc<RefCell<glib::WeakRef<gtk::Widget>>> = Rc::default();
         {
             let drawn = drawn.clone();
+            let (row, text) = (row.clone(), text.clone());
             ring.set_draw_func(move |area, cr, width, height| {
                 if let Some(file) = drawn.borrow().as_ref() {
                     draw(area, cr, width, height, file);
+                }
+                // A row resized since the words were placed: settled after
+                // this frame, never during it.
+                if let Some(row) = row.borrow().upgrade() {
+                    if words_fit(&row, &text) != Some(text.is_visible()) {
+                        let (row, text) = (row.downgrade(), text.clone());
+                        glib::idle_add_local_once(move || {
+                            if let Some(row) = row.upgrade() {
+                                place_words(&row, &text);
+                            }
+                        });
+                    }
                 }
             });
         }
@@ -69,13 +90,19 @@ impl SyncMark {
             ring,
             text,
             drawn,
+            row,
         }
     }
 
+    /// The row whose width decides whether the words fit.
+    pub fn set_row(&self, row: &impl IsA<gtk::Widget>) {
+        *self.row.borrow_mut() = row.upcast_ref::<gtk::Widget>().downgrade();
+    }
+
     /// Show `moving` when the file is on its way, else the chasing arrows
-    /// when `at_rest` (it syncs though ignored), else nothing. Whether the
-    /// mark is showing, so the row can give the status letter its slot.
-    pub fn show(&self, moving: Option<&SyncFile>, at_rest: bool) -> bool {
+    /// with `at_rest` as their tooltip when it is given (the file syncs by
+    /// policy, and is in step), else nothing.
+    pub fn show(&self, moving: Option<&SyncFile>, at_rest: Option<&str>) {
         match moving {
             Some(file) => {
                 let unchanged = self.drawn.borrow().as_ref() == Some(file);
@@ -84,24 +111,56 @@ impl SyncMark {
                     self.ring.queue_draw();
                     let (words, tooltip) = words(file);
                     self.text.set_label(&words);
-                    self.widget.set_tooltip_text(Some(&tooltip));
+                    // The ring says it all, whether or not the words fit.
+                    self.ring
+                        .set_tooltip_text(Some(&format!("{words}\n{tooltip}")));
                 }
-                self.text.set_visible(true);
                 self.ring.set_visible(true);
                 self.rest.set_visible(false);
+                self.widget.set_tooltip_text(None);
                 self.widget.set_visible(true);
-                true
+                match self.row.borrow().upgrade() {
+                    Some(row) => place_words(&row, &self.text),
+                    None => self.text.set_visible(true),
+                }
             }
             None => {
                 self.drawn.borrow_mut().take();
                 self.text.set_visible(false);
                 self.ring.set_visible(false);
-                self.rest.set_visible(at_rest);
-                self.widget.set_tooltip_text(None);
-                self.widget.set_visible(at_rest);
-                at_rest
+                self.rest.set_visible(at_rest.is_some());
+                self.widget.set_tooltip_text(at_rest);
+                self.widget.set_visible(at_rest.is_some());
             }
         }
+    }
+}
+
+/// Whether the row has room for the words beside everything else on it,
+/// its name whole included: its natural width with the words in, whether
+/// they are showing or not — so showing them cannot change the answer —
+/// against what it has. `None` before the row has a width.
+fn words_fit(row: &gtk::Widget, text: &gtk::Label) -> Option<bool> {
+    let width = row.width();
+    if width <= 0 {
+        return None;
+    }
+    let (_, natural, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
+    let needed = if text.is_visible() {
+        natural
+    } else {
+        // The words' own width and the gap before the ring.
+        natural + text.layout().pixel_size().0 + 4
+    };
+    Some(needed <= width)
+}
+
+/// The words shown when they fit and dropped when they do not; shown until
+/// the row has a width to say.
+fn place_words(row: &gtk::Widget, text: &gtk::Label) {
+    let fits = words_fit(row, text).unwrap_or(true);
+    if text.is_visible() != fits {
+        text.set_visible(fits);
     }
 }
 

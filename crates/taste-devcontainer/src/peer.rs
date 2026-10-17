@@ -1389,7 +1389,7 @@ pub fn sync_primary_peer_tracked(
     // pass (2026-10-06: "I shouldn't see this error while the env
     // builds").
     sync_submodules(
-        &git, peer, vm, keys, files, path, resolve, on_send, say, &mut sync,
+        &git, peer, vm, keys, files, path, resolve, on_send, say, transfers, &mut sync,
     );
     Ok(sync)
 }
@@ -1413,6 +1413,7 @@ fn sync_submodules(
     resolve: Option<&Resolve>,
     on_send: OnSend,
     say: Say,
+    transfers: Option<&crate::transfers::Transfers>,
     sync: &mut PeerSync,
 ) {
     for (_, sub) in git.submodules() {
@@ -1442,7 +1443,10 @@ fn sync_submodules(
                 .filter_map(|p| p.strip_prefix(&sub).ok().map(Path::to_path_buf))
                 .collect(),
         });
-        let inner = sync_primary_peer_with(
+        // Its files' rings, under the submodule's path as the tree names
+        // them, and its own fetch's progress on its own files.
+        let scoped = transfers.map(|transfers| transfers.within(&sub));
+        let inner = sync_primary_peer_tracked(
             &clone,
             vm,
             keys,
@@ -1451,6 +1455,7 @@ fn sync_submodules(
             inner_resolve.as_ref(),
             &prefixed,
             &within,
+            scoped.as_ref(),
         );
         match inner {
             Ok(inner) => {

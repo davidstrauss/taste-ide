@@ -186,11 +186,13 @@ not move;
 file-tree rows as ignored and synced anyway (a trailing slash for a folder),
 the ⇅ in the status letter's place (`taste_git::sync_ignored`) — a probe
 opens a folder on this host, which never syncs; the two `taste-app/src`
-files are the rows the hero frame shows (they wear the chasing arrows,
-`sync_mark.rs`); `TASTE_PROBE_SYNCING=crates/taste-app/src/filetree.rs:up:0.4,crates/taste-app/src/fleet.rs:down`
+files are the rows the hero frame shows (a path's own rule wears ⇅, the
+policy, rightmost, and a synced file the chasing arrows, its status, left
+of it, `sync_mark.rs`); `TASTE_PROBE_SYNCING=crates/taste-app/src/filetree.rs:up:0.4,crates/taste-app/src/fleet.rs:down`
 poses files on their way between the folder and Personal — the progress
 ring, its arrow, and the dim words beside it — up or down, that far
-through, or waiting with no fraction (`taste_devcontainer::transfers`);
+through, or waiting with no fraction (`taste_devcontainer::transfers`), in
+the tree and, with `TASTE_PROBE_VIEW=dirty`, in the changed files' lists;
 `TASTE_PROBE_SUBMODULES=tpl:clone,ext/lib:behind` poses the file tree's
 submodule banner (`submodule_bar.rs`) for those submodules (`clone`,
 `fetch`, or `behind`), since the folder a probe opens has none — with

@@ -656,24 +656,24 @@ struct RowHandle {
     locked: bool,
     label: glib::WeakRef<gtk::Label>,
     badge: glib::WeakRef<gtk::Label>,
-    /// The sync mark in the badge's slot (`crate::sync_mark`).
+    /// Whether the row syncs by a rule of its own, which its badge says
+    /// with ⇅ (`SyncIgnored::own_rule`).
+    own: std::cell::Cell<bool>,
+    /// The sync status, left of the badge (`crate::sync_mark`).
     mark: crate::sync_mark::SyncMark,
 }
 
 impl RowHandle {
-    /// The mark for what is moving now, and the status letter given its
-    /// slot back when the mark has nothing to show. A folder rests only:
-    /// its files carry their own rings.
-    fn show_mark(&self, moving: Option<&taste_core::SyncFile>) {
-        let moving = moving.filter(|_| !self.is_dir);
-        let at_rest = self.state.get() == FileState::Synced;
+    /// The status for what is moving now, or `at_rest` when it syncs by
+    /// policy and is in step. A folder's files carry their own.
+    fn show_mark(&self, moving: Option<&taste_core::SyncFile>, at_rest: Option<&str>) {
+        if self.is_dir {
+            return;
+        }
         // Ignored and not synced: a change there goes nowhere, whatever a
         // watcher made of it.
         let moving = moving.filter(|_| self.state.get() != FileState::Ignored);
-        let marked = self.mark.show(moving, at_rest);
-        if let Some(badge) = self.badge.upgrade() {
-            badge.set_visible(!marked);
-        }
+        self.mark.show(moving, at_rest);
     }
 }
 
@@ -5596,7 +5596,9 @@ impl FileTree {
             if self.changed_rows.borrow().contains_key(rel) {
                 continue;
             }
-            let (row, check) = self.changed_row(rel, *state, *in_stash, flags, workdir.as_deref());
+            let (row, check, mark) =
+                self.changed_row(rel, *state, *in_stash, flags, workdir.as_deref());
+            mark.show(self.moving.borrow().get(rel), None);
             if let Some(active) = carried.get(rel) {
                 check.set_active(*active);
             }
@@ -5608,6 +5610,7 @@ impl FileTree {
                     check,
                     state: *state,
                     in_stash: *in_stash,
+                    mark,
                 },
             );
         }
@@ -5655,7 +5658,7 @@ impl FileTree {
         in_stash: bool,
         flags: ChangedFlags,
         workdir: Option<&Path>,
-    ) -> (adw::ActionRow, gtk::CheckButton) {
+    ) -> (adw::ActionRow, gtk::CheckButton, crate::sync_mark::SyncMark) {
         let ChangedFlags {
             staged_on,
             conflicts_on,
@@ -5732,6 +5735,11 @@ impl FileTree {
                     .unwrap_or_default(),
             )
             .subtitle(rel.display().to_string())
+            // One line each, ellipsized: a wrapping title in a narrow
+            // column went to a letter a line once the sync's words took
+            // their place beside it.
+            .title_lines(1)
+            .subtitle_lines(1)
             .activatable(true)
             .tooltip_text(if conflicts_on {
                 "Opens the file at its first conflict marker"
@@ -5750,6 +5758,10 @@ impl FileTree {
             })
             .css_classes(["caption", "dim-label"])
             .build();
+        // Its sync, left of its letter as in the tree.
+        let mark = crate::sync_mark::SyncMark::new();
+        mark.set_row(&row);
+        row.add_suffix(&mark.widget);
         row.add_suffix(&badge);
         if in_stash {
             let stash_badge = gtk::Label::builder()
@@ -5844,7 +5856,7 @@ impl FileTree {
                 }
             });
         }
-        (row, check)
+        (row, check, mark)
     }
 
     /// One environment branch's changed files, against its merge base
@@ -7777,18 +7789,41 @@ impl FileTree {
         // something to fix — short of it, diverged, the commit not fetched,
         // not checked out, conflicted — and says which, as its tooltip says
         // where it stands either way (David, 2026-10-06).
+        let rel = self.repo_relative(&node.path);
+        let own = state == FileState::Synced
+            && rel
+                .as_deref()
+                .is_some_and(|rel| self.sync_ignored.borrow().own_rule(rel, node.is_dir));
         let (badge, css) = match &submodule {
             Some(_) => ("", None),
-            None => state_style(state),
+            None => badge_style(state, own),
         };
         let badge_label = gtk::Label::builder().label(badge).build();
         if let Some(css) = css {
             badge_label.add_css_class(css);
             label.add_css_class(css);
         }
-        badge_label.set_tooltip_text(state_tooltip(state));
+        badge_label.set_tooltip_text(own.then(|| policy_words(node.is_dir)));
+        // A folder that syncs by policy says so on its icon too, and one
+        // inside it names the folder whose rule it is.
+        if node.is_dir && state == FileState::Synced {
+            let said = match rel.as_deref().and_then(|rel| {
+                self.sync_ignored
+                    .borrow()
+                    .rule_folder(rel)
+                    .map(Path::to_path_buf)
+            }) {
+                Some(folder) if !own => format!(
+                    "Synced with Personal by the policy on {}/",
+                    folder.display()
+                ),
+                _ => policy_words(true).to_string(),
+            };
+            icon.set_tooltip_text(Some(&said));
+        }
 
         let mark = crate::sync_mark::SyncMark::new();
+        mark.set_row(&row);
         row.append(&icon);
         row.append(&label);
         row.append(&mark.widget);
@@ -7884,15 +7919,16 @@ impl FileTree {
                 locked,
                 label: label.downgrade(),
                 badge: badge_label.downgrade(),
+                own: std::cell::Cell::new(own),
                 mark,
             };
             // A submodule's row wears no state of its own here.
             if submodule.is_none() {
-                let moving = self.moving.borrow();
-                handle.show_mark(
-                    self.repo_relative(&node.path)
-                        .and_then(|rel| moving.get(&rel)),
-                );
+                if let Some(rel) = rel.as_deref() {
+                    let moving = self.moving.borrow();
+                    let rest = self.status_at_rest(rel, state, node.is_dir);
+                    handle.show_mark(moving.get(rel), rest.as_deref());
+                }
             }
             rows.insert(node.path.clone(), handle);
         }
@@ -8314,7 +8350,11 @@ impl FileTree {
                 None => state,
             };
             let painted = handle.state.get();
-            if state == painted {
+            let own = state == FileState::Synced
+                && rel
+                    .as_deref()
+                    .is_some_and(|rel| sync_ignored.own_rule(rel, handle.is_dir));
+            if state == painted && own == handle.own.get() {
                 continue;
             }
             let (Some(label), Some(badge)) = (handle.label.upgrade(), handle.badge.upgrade())
@@ -8329,16 +8369,20 @@ impl FileTree {
                     label.remove_css_class(old);
                 }
             }
-            let (text, css) = state_style(state);
+            let (text, css) = badge_style(state, own);
             badge.set_label(text);
-            badge.set_tooltip_text(state_tooltip(state));
+            badge.set_tooltip_text(own.then(|| policy_words(handle.is_dir)));
             if let Some(css) = css {
                 badge.add_css_class(css);
                 label.add_css_class(css);
             }
             handle.state.set(state);
-            let moving = self.moving.borrow();
-            handle.show_mark(rel.as_ref().and_then(|rel| moving.get(rel)));
+            handle.own.set(own);
+            if let Some(rel) = rel.as_deref() {
+                let moving = self.moving.borrow();
+                let rest = status_at_rest_in(&sync_ignored, rel, state, handle.is_dir);
+                handle.show_mark(moving.get(rel), rest.as_deref());
+            }
         }
     }
 
@@ -8362,9 +8406,23 @@ impl FileTree {
             };
             let (was, now) = (before.get(&rel), files.get(&rel));
             if was.is_some() || now.is_some() {
-                handle.show_mark(now);
+                let rest = self.status_at_rest(&rel, handle.state.get(), false);
+                handle.show_mark(now, rest.as_deref());
             }
         }
+        // ...and the changed files' lists, where the same files are rows.
+        for (rel, row) in self.changed_rows.borrow().iter() {
+            let (was, now) = (before.get(rel), files.get(rel));
+            if was.is_some() || now.is_some() {
+                row.mark.show(now, None);
+            }
+        }
+    }
+
+    /// What a file's status says when nothing is moving: in step, for one
+    /// that syncs by policy — its own, or a folder's, which is named.
+    fn status_at_rest(&self, rel: &Path, state: FileState, is_dir: bool) -> Option<String> {
+        status_at_rest_in(&self.sync_ignored.borrow(), rel, state, is_dir)
     }
 
     fn rebuild_rows_in_place(self: &Rc<Self>) {
@@ -8394,6 +8452,8 @@ struct ChangedRow {
     check: gtk::CheckButton,
     state: FileState,
     in_stash: bool,
+    /// Its sync status, as the tree's row has (`crate::sync_mark`).
+    mark: crate::sync_mark::SyncMark,
 }
 
 /// The badge glyph and CSS class a git state paints. One source of truth
@@ -8409,9 +8469,9 @@ fn state_style(state: FileState) -> (&'static str, Option<&'static str>) {
         FileState::Ignored => ("·", Some("dim-label")),
         // In the letters' place: an ignored path wears none of them, and
         // a real state of its own (staged by force, say) is shown instead.
-        // The chasing arrows instead (`crate::sync_mark`): a glyph, not a
-        // letter.
-        FileState::Synced => ("", None),
+        // The policy mark, when the path's own rule is the reason
+        // (`badge_style`).
+        FileState::Synced => ("⇅", None),
     }
 }
 
@@ -8488,8 +8548,45 @@ fn synced_for_probe() -> Option<taste_devcontainer::worktree::SyncIgnored> {
 }
 
 /// What the synced mark means, on the mark; the letters say it themselves.
-fn state_tooltip(state: FileState) -> Option<&'static str> {
-    (state == FileState::Synced).then_some("Ignored, and synced with Personal anyway")
+/// The badge a row wears: its git letter, or ⇅ for a path that syncs by a
+/// rule of its own — the policy mark, rightmost. A path that syncs by its
+/// folder's rule leaves the policy to the folder's row.
+fn badge_style(state: FileState, own: bool) -> (&'static str, Option<&'static str>) {
+    match state {
+        FileState::Synced if own => ("⇅", Some("dim-label")),
+        FileState::Synced => ("", None),
+        other => state_style(other),
+    }
+}
+
+/// What the policy mark means.
+fn policy_words(is_dir: bool) -> &'static str {
+    if is_dir {
+        "Synced by policy: git ignores this folder, and its taste-sync rule in \
+         .gitattributes syncs it with Personal anyway"
+    } else {
+        "Synced by policy: git ignores this file, and its taste-sync rule in \
+         .gitattributes syncs it with Personal anyway"
+    }
+}
+
+/// [`FileTree::status_at_rest`], against `sync_ignored`.
+fn status_at_rest_in(
+    sync_ignored: &taste_devcontainer::worktree::SyncIgnored,
+    rel: &Path,
+    state: FileState,
+    is_dir: bool,
+) -> Option<String> {
+    if is_dir || state != FileState::Synced {
+        return None;
+    }
+    Some(match sync_ignored.rule_folder(rel) {
+        Some(folder) if !sync_ignored.own_rule(rel, false) => format!(
+            "In step with Personal: synced by the policy on {}/",
+            folder.display()
+        ),
+        _ => "In step with Personal".to_string(),
+    })
 }
 
 /// A row's state, or the synced mark when git has nothing to say about it
