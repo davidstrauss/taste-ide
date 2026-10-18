@@ -4065,7 +4065,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let cloud_form_for_events = cloud_form.clone();
         let window_for_pad = window.downgrade();
         glib::spawn_future_local(async move {
+            let mut pacer = crate::stall::Pacer::new();
             while let Ok(event) = events.recv().await {
+                pacer.breathe().await;
                 let _doing = crate::stall::doing(|| {
                     format!(
                         "the window's event {}",

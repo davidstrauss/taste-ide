@@ -79,6 +79,10 @@ const LIST_MAX_LIMIT: usize = 5000;
 const FIND_DEFAULT_LIMIT: usize = 50;
 const FIND_MAX_LIMIT: usize = 200;
 
+/// How long a publish waits for a sync of Personal already under way
+/// before it goes on against the folder's copy of the branches.
+const PUBLISH_SYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How long a question put to the user waits for their answer, inside the
 /// tool watchdog with room for the work an approval starts. It went
 /// through the UI probe's ten seconds, which are a screenshot's: an
@@ -3033,7 +3037,7 @@ impl McpServer {
                 };
                 // Measured against the branch of record as it stands in
                 // Personal's checkout, which is where it lives.
-                self.sync_personal().await?;
+                let personal_synced = self.sync_personal().await?;
                 let ready = args["ready"].as_bool().unwrap_or(false);
                 let main = self.workspace.root().to_path_buf();
 
@@ -3067,9 +3071,8 @@ impl McpServer {
                              In your clone: update_from_main, then `git rebase \
                              origin/{target_name}`, resolve anything it stops on, rerun your \
                              gate, and publish again with ready: true. A pure rebase of what \
-                             you already published goes through on its own; one that also \
-                             changed content will report divergence and need force: true, \
-                             which asks the user.",
+                             you already published goes through, as does any rewrite of \
+                             your own branch.",
                             if behind == 1 { "" } else { "s" },
                         ),
                         taste_git::PublishReadiness::TargetUnseen => anyhow::bail!(
@@ -3101,7 +3104,10 @@ impl McpServer {
                     }
                     self.share_published(env).await?;
                     let review = self.flag_for_review(env, ready).await?;
-                    return Ok(publish_result(&attempt.outcome, env, review));
+                    return Ok(personal_note(
+                        publish_result(&attempt.outcome, env, review),
+                        personal_synced,
+                    ));
                 }
 
                 // The one rewrite a ready publish accepts on its own: the
@@ -3148,7 +3154,7 @@ impl McpServer {
                     let review = self.flag_for_review(env, ready).await?;
                     let mut result = publish_result(&moved.outcome, env, review);
                     result["rebased_onto_target"] = json!(true);
-                    return Ok(result);
+                    return Ok(personal_note(result, personal_synced));
                 }
 
                 // Its own branch, so it is its to rewrite: a publish that
@@ -3174,7 +3180,7 @@ impl McpServer {
                 let review = self.flag_for_review(env, ready).await?;
                 let mut result = publish_result(&forced.outcome, env, review);
                 result["replaced_commits"] = json!(attempt.dropped);
-                Ok(result)
+                Ok(personal_note(result, personal_synced))
             }
             // Mediated refresh: hub → env. Remote-tracking refs only; the
             // refspec set is checked to land outside refs/heads/, so nothing
@@ -4738,9 +4744,12 @@ impl McpServer {
     /// Personal's checkout's branches brought to the folder, so a publish
     /// is measured against the branch as it stands over there — where the
     /// coordinator may have moved it — and not a stale copy here.
-    async fn sync_personal(&self) -> Result<()> {
+    /// Within [`PUBLISH_SYNC_WAIT`], so a sync already moving a large file
+    /// cannot hold a publish past the tool watchdog; `false` when it was
+    /// still running, and the publish went on against the folder's copy.
+    async fn sync_personal(&self) -> Result<bool> {
         let primary = self.supervisor(&EnvironmentId::primary())?;
-        tokio::task::spawn_blocking(move || primary.sync_peer_blocking())
+        tokio::task::spawn_blocking(move || primary.sync_peer_for_publish(PUBLISH_SYNC_WAIT))
             .await?
             .context("bringing Personal's branches home before publishing")
     }
@@ -5733,7 +5742,9 @@ fn publish_result(outcome: &PublishOutcome, env: &EnvironmentId, review: Option<
             "already published at this commit; nothing moved".to_string()
         }
         (None, PublishStatus::Forced) => {
-            "the user approved overwriting the previously published tip".to_string()
+            "a checkpoint that replaced what you published before: your branch of record \
+             moved, and your environment is still working"
+                .to_string()
         }
         (None, _) => "a checkpoint: your branch of record moved, and your environment is \
                       still working. Publish again with ready: true when it is done and \
@@ -5751,6 +5762,18 @@ fn publish_result(outcome: &PublishOutcome, env: &EnvironmentId, review: Option<
         "flagged_for_review": review.is_some(),
         "note": note,
     })
+}
+
+/// A publish's result, saying so when Personal was mid-sync for longer than
+/// a publish waits and the folder's copy of its branches was used.
+fn personal_note(mut result: Value, personal_synced: bool) -> Value {
+    if !personal_synced {
+        result["personal_sync"] = json!(
+            "Personal was mid-sync, so this was measured against the folder's copy of \
+             its branches; it reaches Personal when that sync finishes"
+        );
+    }
+    result
 }
 
 /// Why a question put to the user came to no: their answer, or that there

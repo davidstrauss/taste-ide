@@ -22,7 +22,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -576,6 +576,9 @@ pub struct Supervisor {
     /// send an older version of a file after a newer one (review,
     /// 2026-09-23).
     folder_sync: Mutex<()>,
+    /// Primary syncs finished, for a caller that waited one out to know it
+    /// need not run another (`sync_peer_for_publish`).
+    folder_passes: AtomicU64,
     /// When the checkout's git was last tidied of what its replaced
     /// snapshots left (`taste_git::snapshot::TIDY_SCRIPT`).
     last_tidy: Mutex<Option<std::time::Instant>>,
@@ -921,6 +924,7 @@ impl Supervisor {
             transfers,
             folder_watch: Mutex::new(None),
             folder_sync: Mutex::new(()),
+            folder_passes: AtomicU64::new(0),
             last_tidy: Mutex::new(None),
             agent_node: Mutex::new(None),
             agent_task: Mutex::new(None),
@@ -1547,6 +1551,55 @@ impl Supervisor {
     /// which is its own repository. Blocking; the file tree runs it after
     /// every commit, switch, or rebase it makes over there, and the
     /// snapshot cadence after every snapshot that wrote.
+    /// Personal's branches brought home for a publish, within `wait`: a
+    /// pass of its own when none is running; when one is, that pass, waited
+    /// out, since it brings them home too; and when it is still going at
+    /// `wait`, none — `false`, and the publish is measured against the
+    /// folder's copy as the last pass left it. A publish used to take the
+    /// lock and then run a whole pass of its own behind one already moving
+    /// a large file, and ran out the tool watchdog (2026-10-17).
+    pub fn sync_peer_for_publish(&self, wait: std::time::Duration) -> Result<bool> {
+        if !self.env.id.is_primary() || self.checkout().is_local() {
+            self.sync_peer_blocking()?;
+            return Ok(true);
+        }
+        let before = self.folder_passes.load(Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + wait;
+        let started = std::time::Instant::now();
+        loop {
+            match self.folder_sync.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    if self.folder_passes.load(Ordering::SeqCst) != before {
+                        tracing::info!(
+                            "publish: waited {} s for Personal's sync in progress, which \
+                             brought the branches home",
+                            started.elapsed().as_secs()
+                        );
+                        return Ok(true);
+                    }
+                    self.sync_peer_blocking()?;
+                    return Ok(true);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.sync_peer_blocking()?;
+                    return Ok(true);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            "publish: Personal's sync was still running after {} s; \
+                             publishing against the folder's copy of its branches",
+                            wait.as_secs()
+                        );
+                        return Ok(false);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+    }
+
     pub fn sync_peer_blocking(&self) -> Result<()> {
         let Checkout::Remote { vm, path } = self.checkout() else {
             return Ok(());
@@ -1562,7 +1615,9 @@ impl Supervisor {
         // checkout's word whole.
         if self.env.id.is_primary() {
             let _one = self.folder_sync.lock().unwrap_or_else(|e| e.into_inner());
-            self.sync_primary_blocking(&vm_info, &keys, &path, None, 0)?;
+            let pass = self.sync_primary_blocking(&vm_info, &keys, &path, None, 0);
+            self.folder_passes.fetch_add(1, Ordering::SeqCst);
+            pass?;
         } else {
             crate::peer::fetch_from_guest(
                 &self.env.peer,

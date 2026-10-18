@@ -9472,7 +9472,11 @@ impl ChatPane {
 
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
+            let mut pacer = crate::stall::Pacer::new();
             while let Ok(event) = events.recv().await {
+                // A replay is thousands of updates queued at once: a frame
+                // and the keyboard get their turn between them.
+                pacer.breathe().await;
                 let Some(pane) = weak.upgrade() else { break };
                 // A replaced process is dead by construction — dropping its
                 // client killed it — and nothing it still has to say is

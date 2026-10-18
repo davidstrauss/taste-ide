@@ -144,6 +144,37 @@ pub fn short_debug(value: &impl std::fmt::Debug, max: usize) -> String {
     capped.text
 }
 
+/// Lets a loop on the main thread give GTK its turn. An event loop that
+/// finds its channel full never awaits anything that waits, so it ran a
+/// chat's whole replay — thousands of updates — without one frame drawn or
+/// one key read: 6.6 s frozen at startup, which this module's log named
+/// (2026-10-17). Once a loop has worked [`PACE`] straight, [`Pacer::breathe`]
+/// waits a turn at idle priority, behind GTK's redraw and input, which
+/// outrank ordinary work and would never run behind a default-priority
+/// yield.
+pub struct Pacer {
+    since: Instant,
+}
+
+/// How long a main-thread loop works before it lets a frame through.
+const PACE: Duration = Duration::from_millis(8);
+
+impl Pacer {
+    pub fn new() -> Self {
+        Self {
+            since: Instant::now(),
+        }
+    }
+
+    /// Give GTK a turn if this loop has had the thread for [`PACE`].
+    pub async fn breathe(&mut self) {
+        if self.since.elapsed() >= PACE {
+            glib::timeout_future_with_priority(glib::Priority::DEFAULT_IDLE, Duration::ZERO).await;
+            self.since = Instant::now();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
