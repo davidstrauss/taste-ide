@@ -201,6 +201,20 @@ impl Grant {
         }
     }
 
+    /// The CPUs its container sees: one for each GiB of its memory, and
+    /// never fewer than two. Uncapped, a container saw its VM's fourteen
+    /// vCPUs, cargo ran fourteen `rustc` at once in four GiB, and the
+    /// container spent nine tenths of its time stalled on memory — the
+    /// agent's startup checks with it, so the agent never came up
+    /// (2026-10-17). A build sizes its jobs by `nproc`, which reads this, so
+    /// the jobs it starts are ones its memory can hold; a project that wants
+    /// more of both asks for more memory in `hostRequirements`.
+    pub fn cpu_ceiling(&self) -> u32 {
+        u32::try_from(self.memory_mib / 1024)
+            .unwrap_or(u32::MAX)
+            .max(2)
+    }
+
     /// Whether this grant fits in `free`: its memory, which is the one
     /// commitment. CPUs are shared, so they never make a grant not fit.
     pub fn fits(&self, free: Grant) -> bool {
@@ -639,6 +653,17 @@ mod tests {
             "an unreadable field falls back on its own"
         );
         assert_eq!(Grant::DEFAULT.describe(), "4.0 GiB");
+        // A job per GiB: the default's four, the baseline's floor of two.
+        assert_eq!(Grant::DEFAULT.cpu_ceiling(), 4);
+        assert_eq!(Grant::BASELINE.cpu_ceiling(), 2);
+        assert_eq!(
+            Grant {
+                cpus: 2,
+                memory_mib: 12 * 1024
+            }
+            .cpu_ceiling(),
+            12
+        );
         let free = Grant {
             cpus: 3,
             memory_mib: 5000,

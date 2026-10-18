@@ -4087,12 +4087,12 @@ impl Supervisor {
         // 2026-09-21). After the config's own runArgs, because podman takes
         // the last `--memory` it is given: before them, a config's
         // `--memory=64g` raised its own ceiling past what it was placed by,
-        // on a VM its neighbours share. No `--cpus`: the container may use
-        // every vCPU of its VM, and the weights below order a contended
-        // one (`config::Grant`). A container is made afresh at every start,
-        // so this reaches one made under the old two-CPU cap the next time
-        // its environment starts.
+        // on a VM its neighbours share. The CPUs follow the memory
+        // (`Grant::cpu_ceiling`): a build sizes its jobs from the CPUs it
+        // sees, and its jobs are what take the memory.
         let grant = self.grant_for(&config, authority);
+        args.push("--cpus".into());
+        args.push(grant.cpu_ceiling().to_string());
         args.push("--memory".into());
         args.push(format!("{}m", grant.memory_mib));
         args.push("--memory-swap".into());

@@ -4949,6 +4949,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 .map(|(p, mode)| (rehome(p), *mode))
                 .collect(),
         );
+        // `TASTE_PROBE_RESTORE`: the restored active tab brought back in
+        // front of the probe's own, so the shot shows the face it came
+        // back on rather than only the mode it reports.
+        if probe_mode && std::env::var_os("TASTE_PROBE_RESTORE").is_some() {
+            if let Some(active) = active.clone() {
+                let editor = editor.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
+                    editor.open_at(&active, None);
+                });
+            }
+        }
         if let Some(active) = &active {
             wanted.push(active.clone());
         }

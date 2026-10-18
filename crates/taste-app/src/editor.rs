@@ -3666,10 +3666,14 @@ impl Editor {
     }
 
     pub fn relocate_checkout(self: &Rc<Self>, from: &Path, to: &Path) {
-        let moves: Vec<(PathBuf, PathBuf, Option<u32>, Rc<EditorPage>)> = self
-            .pages
-            .borrow()
-            .iter()
+        // In the strip's order, so they reopen as they stood, each keeping
+        // the face it was on as well as its line: a restart reopens the
+        // tabs over the folder and moves them here once the checkout in
+        // the VM is placed, and a preview reopened as text was the mode
+        // lost (2026-10-17: "They were in preview. They didn't come back in
+        // preview").
+        let moves: Vec<(PathBuf, PathBuf, Option<u32>, Rc<EditorPage>)> = (0..self.tabs.n_pages())
+            .filter_map(|index| self.page_by_tab(&self.tabs.nth_page(index)))
             .filter(|(_, page)| page.review.is_none() && page.foreign_env.is_none())
             .filter(|(_, page)| !page.buffer.is_modified())
             .filter_map(|(path, page)| {
@@ -3679,10 +3683,25 @@ impl Editor {
                     path.clone(),
                     to.join(rel),
                     u32::try_from(line + 1).ok(),
-                    page.clone(),
+                    page,
                 ))
             })
             .collect();
+        // The modes still waiting for their tabs follow them too: one kept
+        // under the folder's path would never meet a tab opened at the
+        // checkout's.
+        {
+            let mut restore = self.restore_modes.borrow_mut();
+            let waiting: Vec<(PathBuf, taste_core::ide_state::TabMode)> = restore
+                .iter()
+                .filter_map(|(path, mode)| Some((to.join(path.strip_prefix(from).ok()?), *mode)))
+                .collect();
+            restore.retain(|path, _| !path.starts_with(from));
+            restore.extend(waiting);
+            for (old, new, _, page) in &moves {
+                restore.insert(new.clone(), self.tab_mode(old, page));
+            }
+        }
         let selected = self.selected().map(|(path, _)| path);
         for (old, new, line, page) in &moves {
             self.tabs.close_page(&page.page);
@@ -5064,6 +5083,69 @@ mod tests {
             // Handed over late, after the move: opened at once.
             editor.await_checkout(&folder, vec!["notes.md".into()], None);
             assert!(wait_for(&checkout.join("notes.md")));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// A restart's tabs open over the folder and move to the checkout once
+    /// it is placed; each keeps the face it was left on through the move,
+    /// the one waiting for the checkout included.
+    #[test]
+    fn a_tab_keeps_its_mode_when_the_checkout_moves() {
+        crate::gtk_test::on_gtk_thread("relocate modes: no display — skipped", || {
+            use taste_core::ide_state::TabMode;
+            let dir = std::env::temp_dir().join(format!("taste-modes-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let folder = dir.join("folder");
+            let checkout = dir.join("checkout");
+            for root in [&folder, &checkout] {
+                std::fs::create_dir_all(root.join("dist")).unwrap();
+                std::fs::write(root.join("README.md"), "# Read me\n\nsome words\n").unwrap();
+            }
+            std::fs::write(checkout.join("dist/BACKLOG.md"), "# Backlog\n").unwrap();
+            crate::languages::register();
+            let workspace = taste_core::Workspace::open(folder.clone());
+            let editor = super::Editor::new(workspace.clone());
+            let wait_for = |path: &std::path::Path| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !editor.pages.borrow().contains_key(path)
+                    && std::time::Instant::now() < deadline
+                {
+                    gtk::glib::MainContext::default().iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                editor.pages.borrow().contains_key(path)
+            };
+            let mode_of = |path: &std::path::Path| {
+                let page = editor.pages.borrow().get(path).cloned().unwrap();
+                editor.tab_mode(path, &page)
+            };
+            editor.restore_modes(
+                [
+                    (folder.join("README.md"), TabMode::Preview),
+                    (folder.join("dist/BACKLOG.md"), TabMode::Preview),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            editor.open_at(&folder.join("README.md"), None);
+            assert!(wait_for(&folder.join("README.md")));
+            assert_eq!(mode_of(&folder.join("README.md")), TabMode::Preview);
+            editor.await_checkout(&folder, vec!["dist/BACKLOG.md".into()], None);
+
+            workspace.set_checkout(
+                taste_core::environment::Checkout::Local(checkout.clone()),
+                taste_core::files::Files::Local,
+            );
+            editor.relocate_checkout(&folder, &checkout);
+            assert!(wait_for(&checkout.join("README.md")));
+            assert!(wait_for(&checkout.join("dist/BACKLOG.md")));
+            assert_eq!(mode_of(&checkout.join("README.md")), TabMode::Preview);
+            assert_eq!(
+                mode_of(&checkout.join("dist/BACKLOG.md")),
+                TabMode::Preview,
+                "the mode that waited for the checkout"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         });
     }

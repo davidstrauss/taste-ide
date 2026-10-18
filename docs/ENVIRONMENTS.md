@@ -3134,13 +3134,17 @@ is shouted, but nothing runs either. The rows say what is missing, and
   `memory`), or 4 GiB when it says nothing (David, 2026-09-21: "a fine
   default grant"), or 2 GiB for the baseline — and the grant's memory is
   real: `podman run` carries it as `--memory` and `--memory-swap`, so what
-  the pool plans by is what the container runs under. **CPU is not
-  granted**: a container may use every vCPU of its VM, placement counts
-  memory alone, and a contended VM is ordered by the weights below,
-  because CPU pressure makes a build slower and memory pressure takes the
-  host down (David, 2026-10-17: "Unlike memory pressure, CPU pressure
-  isn't catastrophic"; the two-CPU cap had a Bevy build on two of a VM's
-  eight vCPUs). A VM's capacity is its size less a reserve for the guest and its
+  the pool plans by is what the container runs under. **CPU follows
+  memory**: placement counts memory alone, a contended VM is ordered by
+  the weights below, and a container sees one CPU for each GiB of its
+  memory, never fewer than two (`Grant::cpu_ceiling`), because a build
+  sizes its jobs by the CPUs it sees and its jobs are what take the
+  memory. A fixed two-CPU cap had a Bevy build on two of a VM's eight
+  vCPUs (David, 2026-10-17: "Unlike memory pressure, CPU pressure isn't
+  catastrophic"); no cap at all had cargo running fourteen jobs in four
+  GiB, the container stalled on memory nine tenths of the time and its
+  agent unable to start. More memory in `hostRequirements` is more of
+  both. A VM's capacity is its size less a reserve for the guest and its
   keeper, and what is placed on it counts only while it RUNS — an idle
   environment is a checkout and nothing else, so nine mostly idle
   environments pack onto one VM rather than booting three; the fullest VM
@@ -3582,8 +3586,7 @@ asked about and ruled out of scope (David, same day):
   volume a bind of any path in the VM). Both were found passing on
   2026-10-10 and measured against podman 5.8.7
   (docs/spikes/sandbox-tightening.md). The pool's grant is the last
-  `--memory` podman sees, so a config cannot raise its own. A config's
-  `--cpus` passes, and can only lower its own share of its VM.
+  `--memory` and `--cpus` podman sees, so a config cannot raise its own.
 - **Nested podman is granted, and only as much of it as it needs**
   (2026-09-23). Projects that run podman themselves — a build in a
   container, a test that starts one — are ordinary, and a devcontainer
