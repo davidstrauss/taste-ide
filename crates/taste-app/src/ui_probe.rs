@@ -124,6 +124,22 @@ fn spawn_confirm(
                 dialog.set_response_appearance("apply", adw::ResponseAppearance::Destructive);
                 dialog.set_default_response(Some("deny"));
                 dialog.set_close_response("deny");
+                // The asker stopped waiting (`CONFIRM_WAIT` in the MCP
+                // server): the dialog goes, rather than staying up to take
+                // an approval nothing will act on.
+                {
+                    let (dialog, reply) = (dialog.downgrade(), reply.clone());
+                    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                        let Some(dialog) = dialog.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        if reply.is_closed() {
+                            dialog.force_close();
+                            return glib::ControlFlow::Break;
+                        }
+                        glib::ControlFlow::Continue
+                    });
+                }
                 dialog.choose_future(Some(&window)).await == "apply"
             }
             None => false,

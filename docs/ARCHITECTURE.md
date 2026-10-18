@@ -1531,8 +1531,9 @@ it, and carries its actions.
   mode, is never skipped by an allow rule, and is offered no "don't ask
   again" — which is "configuration authority is execution authority" said
   where the client can act on it, rather than a refusal the IDE issues
-  after the fact. `publish` is deliberately not in that class: it is
-  fast-forward only, so the irreversible case does not exist in the tool.
+  after the fact. `publish` is deliberately not in that class: it writes
+  only the environment's own branch of record, which is the environment's
+  to rewrite (below).
   Neither are `environment_destroy` and `issue_delete`, destructive as
   they are: the field is static and per-tool, so it would ask on every
   call — the reclaim of an environment the user has already merged
@@ -2055,10 +2056,14 @@ Tool surface:
   environments only. Publish fetches one branch out of the caller's clone
   into the main checkout at `agents/<env>` — the environment's one branch
   of record, derived from its id, moved by every publish — host-side,
-  libgit2, no hooks; it is fast-forward only, reports divergence with the
-  commit count a force would cost, and has no force of its own:
-  `force: true` asks the *user* in a prompt naming the loss, and fails
-  closed. `ready: true` additionally flags the environment for review and
+  libgit2, no hooks. A publish that does not build on the last one
+  replaces it, asking nobody, and says in `replaced_commits` how many it
+  replaced: the branch is the environment's own, and its rewrites are not
+  the user's to approve (David, 2026-10-17: "I don't need to review these
+  pushes for approval. Just let them work"). It once refused, then asked
+  the user through a ten-second wait an approval could miss. `ready: true`
+  still needs a fast-forward of the user's branch, and additionally flags
+  the environment for review and
   stops its container. Update brings the hub's branches and every
   environment's branch of record down as remote-tracking refs, moving
   nothing local.

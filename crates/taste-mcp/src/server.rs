@@ -79,6 +79,16 @@ const LIST_MAX_LIMIT: usize = 5000;
 const FIND_DEFAULT_LIMIT: usize = 50;
 const FIND_MAX_LIMIT: usize = 200;
 
+/// How long a question put to the user waits for their answer, inside the
+/// tool watchdog with room for the work an approval starts. It went
+/// through the UI probe's ten seconds, which are a screenshot's: an
+/// approval given after them reached a dialog nothing listened to, and the
+/// agent had already been refused (2026-10-17: "I gave the approval").
+#[cfg(not(test))]
+const CONFIRM_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+#[cfg(test)]
+const CONFIRM_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The longest `devcontainer_reload` will wait before answering, inside
 /// the tool watchdog (`TOOL_WATCHDOG`) with room for the answer.
 const RELOAD_WAIT_MAX_SECS: u64 = 120;
@@ -1654,13 +1664,13 @@ impl McpServer {
                  agents/<your-environment>. Without `ready` it is a checkpoint. With \
                  `ready: true` the work is done: the branch must be a fast-forward of the \
                  user's branch (else update_from_main, rebase, publish again), and your \
-                 container stops. `force` asks the user.",
+                 container stops. A publish that does not build on your last one \
+                 replaces it.",
                 json!({
                     "type": "object",
                     "properties": {
                         "branch": { "type": "string", "description": "branch in YOUR checkout to publish (default: the one you have checked out)" },
-                        "ready": { "type": "boolean", "description": "the work is finished — flag this environment for review and stop its container" },
-                        "force": { "type": "boolean", "description": "ask the user to overwrite a diverged published branch; refused unless they approve" }
+                        "ready": { "type": "boolean", "description": "the work is finished — flag this environment for review and stop its container" }
                     }
                 }),
             ));
@@ -3006,10 +3016,6 @@ impl McpServer {
             // topology: mediated publish".
             "publish" => {
                 let clone_root = self.mediating_env(env, "publish")?;
-                // No topic, and none to invent: the destination is derived
-                // from the environment, which is what makes publishing
-                // twice move one branch instead of leaving two.
-                let dest = taste_git::env_branch_ref(env.as_str());
                 let named = args["branch"]
                     .as_str()
                     .map(str::trim)
@@ -3145,61 +3151,14 @@ impl McpServer {
                     return Ok(result);
                 }
 
-                let force = args["force"].as_bool().unwrap_or(false);
-                if !force {
-                    let why = rebased
-                        .map(|verdict| format!(" Not accepted as a rebase: {}.", verdict.reason()))
-                        .unwrap_or_default();
-                    anyhow::bail!(
-                        "refused: {dest} already holds work that {} does not descend from — \
-                         you rewrote history the user can already see, so publishing would \
-                         destroy {} commit{} in their checkout. Nothing was changed.{why} \
-                         Resolve it in your own clone: update_from_main, then rebase onto \
-                         origin/{} and publish again. Only if the rewrite is \
-                         deliberate, call publish again with force: true — that asks \
-                         the USER to approve the overwrite, and they may say no.",
-                        attempt.outcome.new,
-                        attempt.dropped,
-                        if attempt.dropped == 1 { "" } else { "s" },
-                        taste_git::env_branch(env.as_str()),
-                    );
-                }
-
-                // Force is a clobber of work the user has already been
-                // shown, so it is gated exactly like devcontainer_reload:
-                // the prompt names what is lost, and no answer is a no.
-                let (title, body) = force_confirmation(&attempt, &dest);
-                let approved = match self
-                    .probe(taste_core::ui_probe::UiRequest::Confirm {
-                        title,
-                        body,
-                        confirm_label: "Overwrite Published Branch".into(),
-                    })
-                    .await
-                {
-                    Ok(taste_core::ui_probe::UiReply::Confirm(approved)) => approved,
-                    _ => false,
-                };
-                if !approved {
-                    self.workspace.ide.record_permission(
-                        "publish",
-                        "denied",
-                        "force-publishing destroys commits already in the user's checkout — \
-                         that is the user call",
-                    );
-                    anyhow::bail!(
-                        "refused: overwriting {dest} would drop {} commit{} the user can \
-                         already see. They declined, or there was no one to ask. Nothing was \
-                         changed — rebase onto the published tip instead.",
-                        attempt.dropped,
-                        if attempt.dropped == 1 { "" } else { "s" },
-                    );
-                }
-                self.workspace.ide.record_permission(
-                    "publish",
-                    "allowed",
-                    "the user approved overwriting a diverged published branch",
-                );
+                // Its own branch, so it is its to rewrite: a publish that
+                // does not build on what it published before replaces it,
+                // with no refusal to call again past and nobody asked (David,
+                // 2026-10-17: "I don't need to review these pushes for
+                // approval. Just let them work"). It used to be refused, then
+                // asked of the user through a wait of ten seconds, and an
+                // approval given after them went nowhere. What it replaced is
+                // in the result.
                 let forced = publish_attempt(
                     &main,
                     &clone_root,
@@ -3213,7 +3172,9 @@ impl McpServer {
                 }
                 self.share_published(env).await?;
                 let review = self.flag_for_review(env, ready).await?;
-                Ok(publish_result(&forced.outcome, env, review))
+                let mut result = publish_result(&forced.outcome, env, review);
+                result["replaced_commits"] = json!(attempt.dropped);
+                Ok(result)
             }
             // Mediated refresh: hub → env. Remote-tracking refs only; the
             // refspec set is checked to land outside refs/heads/, so nothing
@@ -4414,8 +4375,8 @@ impl McpServer {
             );
         }
         if at_stake {
-            let approved = match self
-                .probe(taste_core::ui_probe::UiRequest::Confirm {
+            let answer = self
+                .confirm(taste_core::ui_probe::UiRequest::Confirm {
                     title: format!("Destroy {env}?"),
                     body: format!(
                         "An agent asked to destroy this environment.\n\n{}\nDestroying \
@@ -4425,14 +4386,8 @@ impl McpServer {
                     ),
                     confirm_label: "Destroy".into(),
                 })
-                .await
-            {
-                Ok(taste_core::ui_probe::UiReply::Confirm(approved)) => approved,
-                // No UI, a wedged one, or the wrong reply: fail closed, for
-                // the reason the reload does. An unanswerable question is
-                // not a yes, least of all this one.
-                _ => false,
-            };
+                .await;
+            let approved = answer == Ok(true);
             if !approved {
                 self.workspace.ide.record_permission(
                     "environment_destroy",
@@ -4440,9 +4395,9 @@ impl McpServer {
                     "destroying a clone that holds unreviewed work is the user call",
                 );
                 anyhow::bail!(
-                    "refused: destroying {env} would take work nobody else has with it. \
-                     The user declined, or there was no one to ask. Nothing was \
-                     destroyed."
+                    "refused: destroying {env} would take work nobody else has with it. {} \
+                     Nothing was destroyed.",
+                    unanswered(&answer),
                 );
             }
             self.workspace.ide.record_permission(
@@ -4608,8 +4563,8 @@ impl McpServer {
             );
         }
         if !carries.is_empty() {
-            let approved = match self
-                .probe(taste_core::ui_probe::UiRequest::Confirm {
+            let answer = self
+                .confirm(taste_core::ui_probe::UiRequest::Confirm {
                     title: format!("Delete {}?", issue.id),
                     body: format!(
                         "An agent asked to delete “{}” from the backlog.\n\nIt carries:\n\
@@ -4620,11 +4575,8 @@ impl McpServer {
                     ),
                     confirm_label: "Delete".into(),
                 })
-                .await
-            {
-                Ok(taste_core::ui_probe::UiReply::Confirm(approved)) => approved,
-                _ => false,
-            };
+                .await;
+            let approved = answer == Ok(true);
             if !approved {
                 self.workspace.ide.record_permission(
                     "issue_delete",
@@ -4632,10 +4584,10 @@ impl McpServer {
                     "erasing an issue that carries a record is the user call",
                 );
                 anyhow::bail!(
-                    "refused: deleting {} would erase a record nobody else has. The user \
-                     declined, or there was no one to ask. Nothing was deleted — decline \
-                     it with a reason instead, if it will not happen.",
-                    issue.id
+                    "refused: deleting {} would erase a record nobody else has. {} Nothing \
+                     was deleted — decline it with a reason instead, if it will not happen.",
+                    issue.id,
+                    unanswered(&answer),
                 );
             }
             self.workspace.ide.record_permission(
@@ -5131,6 +5083,23 @@ impl McpServer {
             );
         }
         Ok(reply)
+    }
+
+    /// Ask the user `request`, a confirmation, and wait for them up to
+    /// [`CONFIRM_WAIT`]: `Ok` with their answer, or `Err` saying why there
+    /// is none — no window, or no answer in time, in which case the window
+    /// takes its dialog down, so an answer given later goes nowhere it
+    /// could be mistaken for one that counted.
+    async fn confirm(&self, request: taste_core::ui_probe::UiRequest) -> Result<bool, String> {
+        match tokio::time::timeout(CONFIRM_WAIT, self.workspace.ui.request(request)).await {
+            Ok(Ok(taste_core::ui_probe::UiReply::Confirm(approved))) => Ok(approved),
+            Ok(Ok(_)) => Err("the window gave an answer that was not one".into()),
+            Ok(Err(e)) => Err(format!("there was no one to ask ({e})")),
+            Err(_) => Err(format!(
+                "the user did not answer within {} s, and the question was taken down",
+                CONFIRM_WAIT.as_secs()
+            )),
+        }
     }
 
     async fn probe(
@@ -5784,28 +5753,17 @@ fn publish_result(outcome: &PublishOutcome, env: &EnvironmentId, review: Option<
     })
 }
 
-/// The confirmation a force-publish needs. Approving "force" in the
-/// abstract is not consent to losing anything in particular, so the prompt
-/// names the branch, the count, and both tips.
-fn force_confirmation(attempt: &PublishAttempt, dest: &str) -> (String, String) {
-    let branch = dest.strip_prefix("refs/heads/").unwrap_or(dest);
-    let old = attempt
-        .outcome
-        .old
-        .map(|o| o.to_string())
-        .unwrap_or_default();
-    let dropped = attempt.dropped;
-    let new = attempt.outcome.new.to_string();
-    let body = format!(
-        "An agent asked to overwrite the published branch “{branch}” with work that does \
-         not build on it.\n\n{dropped} commit{} currently on {branch} would be dropped from \
-         your checkout.\n\n  {} → {}\n\nDeclining changes nothing; the agent can rebase onto \
-         the published tip and publish again.",
-        if dropped == 1 { "" } else { "s" },
-        &old[..old.len().min(12)],
-        &new[..new.len().min(12)],
-    );
-    (format!("Overwrite published branch {branch}?"), body)
+/// Why a question put to the user came to no: their answer, or that there
+/// was none — which is not a no, and is said so the agent tells them what
+/// it asked rather than taking it as a decision.
+fn unanswered(answer: &Result<bool, String>) -> String {
+    match answer {
+        Ok(_) => "The user declined.".to_string(),
+        Err(why) => format!(
+            "No answer: {why}. Tell the user what you asked and why, and call again when \
+             they are ready to answer."
+        ),
+    }
 }
 
 /// Whether `path` is part of the checkout's devcontainer config: under
@@ -6858,11 +6816,12 @@ mod tests {
         assert_eq!(merged.status, taste_git::MergeStatus::FastForward);
     }
 
-    /// The accepted rewrite is exactly one shape. A rebase that also
-    /// changed the content still asks, and a checkpoint (`ready: false`)
-    /// that rewrites history still asks, whatever it contains.
+    /// An environment's own branch is its to rewrite: a rebase that also
+    /// changed the content lands, ready or a checkpoint, asking nobody, and
+    /// says how many commits it replaced (David, 2026-10-17: "Just let them
+    /// work").
     #[tokio::test]
-    async fn only_a_pure_rebase_onto_the_target_moves_the_branch_unasked() {
+    async fn any_rewrite_of_its_own_branch_lands_and_says_what_it_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -6900,9 +6859,7 @@ mod tests {
         let moved = hub.read_ref("HEAD").unwrap().unwrap();
         call_tool(&mut stream, "update_from_main", json!({})).await;
 
-        // Rebased with an edit on the way: the content is not what the user
-        // saw, so this is an overwrite and it asks. Nobody answers, so it
-        // is refused and the branch of record stays where it was.
+        // Rebased with an edit on the way, and ready: it lands, flagged.
         reset_ref(&clone_root, "refs/heads/work", moved);
         let edited = commit_on_ref(
             &clone_root,
@@ -6910,35 +6867,35 @@ mod tests {
             "agent.rs",
             "fn agent() { changed() }\n",
         );
-        let refused = call_tool(
+        let landed = call_tool(
             &mut stream,
             "publish",
             json!({"branch": "work", "ready": true}),
         )
         .await;
-        let error = refused["error"].as_str().unwrap_or_default();
-        assert!(error.contains("not a pure rebase"), "{refused}");
-        assert_ne!(
+        assert_eq!(landed["status"], "forced", "{landed}");
+        assert_eq!(landed["replaced_commits"], 1, "{landed}");
+        assert_eq!(
             hub.read_ref("refs/heads/agents/worker").unwrap(),
             Some(edited),
-            "the branch of record did not move"
+            "the branch of record moved"
         );
-        assert!(!workspace.review.state(&env).flagged());
+        assert!(workspace.review.state(&env).flagged());
 
-        // The same pure rebase that `ready: true` would accept is still an
-        // overwrite on a checkpoint: a ready publish is the only call that
-        // carries the promise the rule was made for.
+        // A checkpoint that rewrites history lands the same way.
         reset_ref(&clone_root, "refs/heads/work", moved);
-        commit_on_ref(
+        let again = commit_on_ref(
             &clone_root,
             "refs/heads/work",
             "agent.rs",
             "fn agent() {}\n",
         );
-        let refused = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
-        let error = refused["error"].as_str().unwrap_or_default();
-        assert!(error.contains("force: true"), "{refused}");
-        assert!(!error.contains("Not accepted as a rebase"), "{refused}");
+        let checkpoint = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
+        assert!(checkpoint["error"].is_null(), "{checkpoint}");
+        assert_eq!(
+            hub.read_ref("refs/heads/agents/worker").unwrap(),
+            Some(again),
+        );
     }
 
     /// The issue queue is everyone's — the primary's agent files issues
@@ -7313,10 +7270,10 @@ mod tests {
         assert!(names.contains(&"update_from_main"), "{names:?}");
     }
 
-    /// Rewritten history the user can already see is reported, never
-    /// silently overwritten. The tool has no force of its own.
+    /// Rewritten history replaces what the environment published before,
+    /// and the result says how many commits went: nobody is asked.
     #[tokio::test]
-    async fn a_diverged_publish_reports_instead_of_forcing() {
+    async fn a_diverged_publish_replaces_its_branch() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -7345,26 +7302,24 @@ mod tests {
         reset_ref(&clone_root, "refs/heads/work", base);
         commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "rewritten\n");
 
-        let refused = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
-        let error = refused["error"].as_str().unwrap();
-        assert!(error.contains("force: true"), "{error}");
-        assert!(error.contains("update_from_main"), "{error}");
-        assert!(error.contains("1 commit"), "{error}");
-
+        let replaced = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
+        assert_eq!(replaced["status"], "forced", "{replaced}");
+        assert_eq!(replaced["replaced_commits"], 1, "{replaced}");
         let hub = GitWorkspace::discover(root).unwrap();
-        assert_eq!(
+        assert_ne!(
             hub.read_ref("refs/heads/agents/review")
                 .unwrap()
                 .unwrap()
                 .to_string(),
             published_tip,
-            "a refused publish moves nothing"
+            "replaced"
         );
     }
 
-    /// Force is the user's call. With no UI to ask, it fails closed.
+    /// An environment's own branch is its to rewrite: force overwrites it,
+    /// with no window to ask and nobody asked.
     #[tokio::test]
-    async fn force_publish_without_a_ui_fails_closed() {
+    async fn force_publish_asks_nobody() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -7390,15 +7345,14 @@ mod tests {
         reset_ref(&clone_root, "refs/heads/work", base);
         commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "rewritten\n");
 
-        let refused = call_tool(
+        let forced = call_tool(
             &mut stream,
             "publish",
             json!({"branch": "work", "force": true}),
         )
         .await;
-        let error = refused["error"].as_str().unwrap();
-        assert!(error.contains("no one to ask"), "{error}");
-        assert_eq!(
+        assert_eq!(forced["status"], "forced", "{forced}");
+        assert_ne!(
             GitWorkspace::discover(root)
                 .unwrap()
                 .read_ref("refs/heads/agents/review")
@@ -7406,13 +7360,51 @@ mod tests {
                 .unwrap()
                 .to_string(),
             published_tip,
-            "an unanswered question is not a yes"
+            "overwritten"
         );
     }
 
-    /// Approved, the force lands — and the prompt named what it cost.
+    /// A question nobody answers is not a no: the answer says nobody
+    /// answered, and the asker lets go, so the window takes its dialog
+    /// down rather than keep it up for an approval nothing will act on.
     #[tokio::test]
-    async fn force_publish_overwrites_once_the_user_approves() {
+    async fn an_unanswered_question_is_not_a_no_and_is_taken_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, _environments) = build_test_server(root);
+        // A window that shows the question and never answers it.
+        let requests = workspace.ui.requests();
+        let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let shown = shown.clone();
+            tokio::spawn(async move {
+                while let Ok(envelope) = requests.recv().await {
+                    shown.lock().unwrap().push(envelope);
+                }
+            });
+        }
+        let answer = server
+            .confirm(taste_core::ui_probe::UiRequest::Confirm {
+                title: "Destroy i-0004?".into(),
+                body: "It holds work nobody else has.".into(),
+                confirm_label: "Destroy".into(),
+            })
+            .await;
+        let why = answer.clone().unwrap_err();
+        assert!(why.contains("did not answer"), "{why}");
+        assert!(unanswered(&answer).starts_with("No answer"));
+        let (_, reply) = shown.lock().unwrap().pop().expect("the question was shown");
+        assert!(
+            reply.is_closed(),
+            "the asker let go, so the dialog comes down"
+        );
+    }
+
+    /// With a window there to ask, it still asks nothing: the branch is
+    /// the environment's own.
+    #[tokio::test]
+    async fn force_publish_shows_no_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -7460,9 +7452,10 @@ mod tests {
                 .to_string(),
             forced["new"].as_str().unwrap(),
         );
-        let body = prompts.lock().unwrap().first().cloned().unwrap();
-        assert!(body.contains("agents/review"), "{body}");
-        assert!(body.contains("1 commit"), "{body}");
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "an environment's own branch asks nobody, forced or not"
+        );
     }
 
     /// The other direction: the hub's branches — including other
