@@ -515,6 +515,31 @@ fn holder_index(holder: &gtk::Box) -> Option<usize> {
     }
 }
 
+/// To the end of the transcript: the list asked to bring its last item
+/// into view when the end is far, the value set to the very bottom once
+/// it is near. Set straight across hundreds of items the list has not
+/// measured, the value moved and the list did not — it stayed bound to the
+/// first ones, and showed nothing (2026-10-19, a 404-stretch history
+/// restored blank).
+fn pin_to_end(list: &gtk::ListView, adjustment: &gtk::Adjustment, pinning: &Rc<Cell<bool>>) {
+    let bottom = adjustment.upper() - adjustment.page_size();
+    let count = list.model().map_or(0, |model| model.n_items());
+    if count > 0 && bottom - adjustment.value() > adjustment.page_size() * 2.0 {
+        // The list goes there, and its own scrolling there is not the
+        // reader scrolling away; the change in its extent that follows
+        // pins the rest of the way.
+        pinning.set(true);
+        list.scroll_to(count - 1, gtk::ListScrollFlags::NONE, None);
+        // Not for ever: a reader who scrolls during it is heard after.
+        let pinning = pinning.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+            pinning.set(false);
+        });
+        return;
+    }
+    adjustment.set_value(bottom);
+}
+
 /// A stretch's list of rows, as every stretch's is made.
 fn stretch_list() -> gtk::ListBox {
     gtk::ListBox::builder()
@@ -1065,6 +1090,9 @@ pub struct ChatPane {
     /// A re-pin is already queued; further growth in the same frame must
     /// not queue another.
     scroll_pending: Rc<Cell<bool>>,
+    /// The list is on its way to the end at our asking (`pin_to_end`): its
+    /// own scrolling there is not the reader scrolling away.
+    pinning: Rc<Cell<bool>>,
     /// Permission outcomes still looking for their tool card, keyed by tool
     /// call id: the request can arrive before the update that creates the
     /// card, so the mark waits here until there is something to put it on.
@@ -3768,6 +3796,7 @@ impl ChatPane {
             open_jump_up: open_jump_up.clone(),
             open_jump_down: open_jump_down.clone(),
             scroll_pending: Rc::new(Cell::new(false)),
+            pinning: Rc::new(Cell::new(false)),
             mode_sync: RefCell::new(None),
             controls_signature: RefCell::new(None),
             config_options: RefCell::new(Vec::new()),
@@ -3899,8 +3928,15 @@ impl ChatPane {
             let adjustment = pane.transcript_scroller.vadjustment();
             let stick = pane.stick_to_bottom.clone();
             let banner = jump_banner.clone();
+            let pinning = pane.pinning.clone();
             adjustment.connect_value_changed(move |adjustment| {
                 let bottom = at_bottom(adjustment);
+                // On the way to the end at our asking: still following it.
+                if pinning.get() && !bottom {
+                    stick.set(true);
+                    return;
+                }
+                pinning.set(false);
                 stick.set(bottom);
                 if bottom {
                     // Arrived under their own steam: nothing left to offer.
@@ -3914,6 +3950,8 @@ impl ChatPane {
             let last_upper = Rc::new(Cell::new(0.0f64));
             let stick = pane.stick_to_bottom.clone();
             let pending = pane.scroll_pending.clone();
+            let list = pane.list.clone();
+            let pinning = pane.pinning.clone();
             let banner = jump_banner.clone();
             adjustment.connect_changed(move |adjustment| {
                 let upper = adjustment.upper();
@@ -3938,12 +3976,14 @@ impl ChatPane {
                 let adjustment = adjustment.clone();
                 let stick = stick.clone();
                 let pending = pending.clone();
+                let list = list.clone();
+                let pinning = pinning.clone();
                 glib::idle_add_local_once(move || {
                     pending.set(false);
                     // Re-checked: the user may have scrolled away while
                     // this was queued, and their scroll wins.
                     if stick.get() {
-                        adjustment.set_value(adjustment.upper() - adjustment.page_size());
+                        pin_to_end(&list, &adjustment, &pinning);
                     }
                 });
             });
@@ -3989,38 +4029,7 @@ impl ChatPane {
                 let index = *object.borrow::<usize>();
                 set_holder_index(&holder, Some(index));
                 pane.holders.borrow_mut().insert(index, holder.downgrade());
-                // Its rows if they are drawn; a placeholder of their height
-                // until they are, drawn when it comes on screen.
-                let rows = pane
-                    .stretches
-                    .borrow()
-                    .list
-                    .get(index)
-                    .and_then(|stretch| stretch.rows.clone());
-                match rows {
-                    Some(rows) => {
-                        if let Some(parent) = rows.parent().and_downcast::<gtk::Box>() {
-                            if parent != holder {
-                                parent.remove(&rows);
-                            }
-                        }
-                        if rows.parent().is_none() {
-                            holder.append(&rows);
-                        }
-                    }
-                    None => {
-                        let height = pane.estimate(index);
-                        holder.append(
-                            &gtk::Box::builder()
-                                .height_request(height)
-                                .css_classes(["stretch-placeholder"])
-                                .build(),
-                        );
-                        if holder.is_mapped() {
-                            pane.want_stretch(index);
-                        }
-                    }
-                }
+                pane.fill_holder(&holder, index);
             });
             let weak = Rc::downgrade(&pane);
             factory.connect_unbind(move |_, item| {
@@ -4061,10 +4070,12 @@ impl ChatPane {
             let adjustment = pane.transcript_scroller.vadjustment();
             let stick = pane.stick_to_bottom.clone();
             let banner = jump_banner.clone();
+            let list = pane.list.clone();
+            let pinning = pane.pinning.clone();
             jump.connect_clicked(move || {
                 stick.set(true);
                 banner.set_reveal_child(false);
-                adjustment.set_value(adjustment.upper() - adjustment.page_size());
+                pin_to_end(&list, &adjustment, &pinning);
             });
         }
         // The floats' comings and goings resize the room under the last
@@ -7934,10 +7945,65 @@ impl ChatPane {
     /// Have the transcript show stretch `index` again — its rows drawn, or
     /// let go — with a new item in its place: the list keeps an item it
     /// is told changed but is the same object bound as it was.
+    ///
+    /// In the item the list has bound for it, where it is bound, and
+    /// never by changing the store: an item replaced was the anchor the
+    /// list keeps the reader's place by, often enough, and with it gone
+    /// the list fell back to the first item while the scroll stayed at the
+    /// last — a transcript with nothing in view (2026-10-19).
     fn rebind(&self, index: usize) {
-        if (index as u32) < self.store.n_items() {
-            self.store
-                .splice(index as u32, 1, &[glib::BoxedAnyObject::new(index)]);
+        let holder = self
+            .holders
+            .borrow()
+            .get(&index)
+            .and_then(|holder| holder.upgrade())
+            .filter(|holder| holder_index(holder) == Some(index));
+        if let Some(holder) = holder {
+            self.fill_holder(&holder, index);
+        }
+    }
+
+    /// What `holder`, the item bound to stretch `index`, shows: the
+    /// stretch's rows if they are drawn, and a placeholder of their height
+    /// until they are, drawn when it comes on screen.
+    fn fill_holder(&self, holder: &gtk::Box, index: usize) {
+        let rows = self
+            .stretches
+            .borrow()
+            .list
+            .get(index)
+            .and_then(|stretch| stretch.rows.clone());
+        // What it showed before, unless it is these rows already.
+        let mut child = holder.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            if rows.as_ref().map(|rows| rows.upcast_ref::<gtk::Widget>()) != Some(&current) {
+                holder.remove(&current);
+            }
+        }
+        match rows {
+            Some(rows) => {
+                if let Some(parent) = rows.parent().and_downcast::<gtk::Box>() {
+                    if &parent != holder {
+                        parent.remove(&rows);
+                    }
+                }
+                if rows.parent().is_none() {
+                    holder.append(&rows);
+                }
+            }
+            None => {
+                let height = self.estimate(index);
+                holder.append(
+                    &gtk::Box::builder()
+                        .height_request(height)
+                        .css_classes(["stretch-placeholder"])
+                        .build(),
+                );
+                if holder.is_mapped() {
+                    self.want_stretch(index);
+                }
+            }
         }
     }
 
@@ -7949,15 +8015,14 @@ impl ChatPane {
             return;
         }
         self.stick_to_bottom.set(true);
-        self.list
-            .scroll_to(count - 1, gtk::ListScrollFlags::NONE, None);
         let adjustment = self.transcript_scroller.vadjustment();
-        for delay in [40, 160, 400] {
-            let adjustment = adjustment.clone();
-            let stick = self.stick_to_bottom.clone();
+        pin_to_end(&self.list, &adjustment, &self.pinning);
+        for delay in [40, 160, 400, 1000] {
+            let (list, adjustment) = (self.list.clone(), adjustment.clone());
+            let (stick, pinning) = (self.stick_to_bottom.clone(), self.pinning.clone());
             glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
                 if stick.get() {
-                    adjustment.set_value(adjustment.upper() - adjustment.page_size());
+                    pin_to_end(&list, &adjustment, &pinning);
                 }
             });
         }
@@ -13455,6 +13520,13 @@ impl ChatPane {
             self.probe_history();
             return;
         }
+        // `TASTE_PROBE_CHAT=kept`: a stash (`TASTE_PROBE_HISTORY_FILE`)
+        // written to this chat's archive and its last session drawn as a
+        // resume draws it (`draw_kept_history`), `Ready`'s hold included.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("kept") {
+            self.probe_kept();
+            return;
+        }
         // `TASTE_PROBE_CHAT=roundtrip` lives a conversation, lets its
         // stretches go, draws them back, and compares (`probe_roundtrip`).
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("roundtrip") {
@@ -14063,6 +14135,63 @@ impl ChatPane {
             pane.stick_to_bottom.set(true);
             glib::timeout_future(std::time::Duration::from_millis(800)).await;
             report(&pane, "back at the bottom", &held);
+        });
+    }
+
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=kept` writes a stash
+    /// (`TASTE_PROBE_HISTORY_FILE`) to this chat's archive and draws its last
+    /// session as a resume does, `Ready`'s hold included, then says every
+    /// few seconds what is drawn and where the view is — the path a 404-
+    /// stretch history once came back blank on.
+    fn probe_kept(self: &Rc<Self>) {
+        let path = std::env::var("TASTE_PROBE_HISTORY_FILE").unwrap_or_default();
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|line| line.get("update").cloned())
+            .collect();
+        let session = records
+            .iter()
+            .rev()
+            .find_map(|r| r.get(taste_core::chatarchive::SESSION_MARKER))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let archive = self.chat_archive();
+        let _ = archive.forget(&self.environment);
+        let _ = archive.append_all(&self.environment, records);
+        println!("probe kept: session {session}");
+        self.probe_timing.set(true);
+        self.clear_on_replay.set(false);
+        self.drawing_history.set(true);
+        self.draw_kept_history(&session);
+        let pane = self.clone();
+        glib::spawn_future_local(async move {
+            for second in [2, 4, 8, 12] {
+                glib::timeout_future(std::time::Duration::from_secs(2)).await;
+                let stretches = pane.stretches.borrow();
+                let drawn = stretches.list.iter().filter(|s| s.rows.is_some()).count();
+                let mapped = stretches
+                    .list
+                    .iter()
+                    .filter(|s| s.rows.as_ref().is_some_and(|r| r.is_mapped()))
+                    .count();
+                let adjustment = pane.transcript_scroller.vadjustment();
+                println!(
+                    "probe kept: {second}s: {} stretches, {drawn} drawn, {mapped} mapped, rows {}, history {}, queue {}, job {}, stack {:?}, value {:.0} of {:.0} page {:.0}, placeholders on screen {}",
+                    stretches.list.len(),
+                    pane.transcript_rows.get(),
+                    pane.drawing_history.get(),
+                    pane.build_queue.borrow().len(),
+                    pane.build_job.borrow().is_some(),
+                    pane.transcript_stack.visible_child_name(),
+                    adjustment.value(),
+                    adjustment.upper(),
+                    adjustment.page_size(),
+                    pane.placeholders_on_screen().len()
+                );
+            }
         });
     }
 

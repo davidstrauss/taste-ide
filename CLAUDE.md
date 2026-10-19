@@ -137,7 +137,9 @@ the longest a page waited for what came on screen to be drawn, at each
 step, and what each stretch drawn cost in all and in its longest slice
 (`TASTE_PROBE_HISTORY_AT=middle` jumps to the middle and stays, for the shot; `TASTE_PROBE_HISTORY_FILE=<a stash .jsonl>` draws a
 real conversation instead — copy one under `target/`, never commit it);
-give it `TASTE_PROBE_DELAY_MS=150000` —, `roundtrip` — a
+give it `TASTE_PROBE_DELAY_MS=150000` —, `kept` — the same file written to
+the chat's archive and its last session drawn as a resume draws it, the
+view's state said every two seconds —, `roundtrip` — a
 conversation lived the way the event handler and a send live it, every
 stretch but the live one let go and drawn back, and each compared with
 what it was, widget by widget (text, what shows, its classes), then the
