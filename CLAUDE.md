@@ -128,7 +128,13 @@ filed/started/completed/declined/moved/prompted cards —, `permission`,
 agent has none, which is where a workspace restored from its archive
 lands: a transcript long enough to be scrolled to the bottom, the line
 saying so where the restored part ends, seeded by writing the stash and reading it back through the
-real replay so the frame is a state the code can reach —; the three permission variants
+real replay so the frame is a state the code can reach —, `history` — a
+conversation of `TASTE_PROBE_TURNS` turns (400) drawn from its record as a
+restore draws it, then read a page at a time up to its first message, a
+jump to the middle, and back down, printing the rows and stretches drawn,
+the turn at the top of the view, and the longest the main thread was held
+at each step (`TASTE_PROBE_HISTORY_AT=middle` jumps to the middle and stays,
+for the shot); give it `TASTE_PROBE_DELAY_MS=150000` —; the three permission variants
 are the permission card asking about a command (all four answers, which
 is the widest it gets), about a file edit, and about one of the IDE's own
 reads (the one whose "don't ask again" the PROJECT keeps, so the only one
@@ -585,7 +591,9 @@ to.
   spawns, or network on it (offload via `runtime().spawn_blocking` and
   apply results with `glib::spawn_future_local`). Per-keystroke work must be
   bounded or coalesced (see the markdown restyle debounce). Widget lists are
-  virtualized (`ListView`) or hard-capped (transcript). Measure before
+  virtualized: a `ListView`, or the transcript's stretches drawn near the
+  reader and spacers for the rest (`ChatPane::reconcile`; ARCHITECTURE →
+  "A transcript is drawn from its record"). Measure before
   shipping hot paths: `cargo test -p <crate> perf_ -- --ignored --nocapture`
   runs the in-repo profiling harness; for frame-level analysis run the GUI
   under sysprof or `GDK_DEBUG=frames`. Transcript scrolling has a probe of

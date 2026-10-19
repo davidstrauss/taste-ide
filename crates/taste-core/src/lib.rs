@@ -36,6 +36,7 @@ pub mod search;
 pub mod shells;
 pub mod standing;
 pub mod state;
+pub mod stretches;
 pub mod tasks;
 pub mod templates;
 pub mod textfile;

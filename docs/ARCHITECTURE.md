@@ -479,6 +479,29 @@ keeps its history, and `session/load` reassembles them. An IDE restart
 already kills the agent outright and the chat comes back; a container
 rebuild is the same event. Covered by tests, not by hope.
 
+**A transcript is drawn from its record, and only near the reader.**
+Every row the chat pane draws comes from one stream of records, kept per
+environment on this machine (`taste_core::chatarchive`): the agent's ACP
+updates verbatim, the user's messages as the `user_message_chunk` a
+replay would bring back (recorded where the agent took them, so a message
+queued behind a turn is after that turn), and the IDE's own notes. A
+`tasteSession` marker says where a session's history begins. Live,
+restored, and drawn back for a reader up the history, it is the same
+records through the same renderer (`ChatPane::draw_record`), so nothing
+is special-cased by where it came from. On a reconnect, a session whose
+whole history is in the record is resumed (`session/resume`, which
+replays nothing) and drawn from the record; one that is not is loaded
+(`session/load`), and its replay, being complete, replaces the record.
+Either way only the last stretch is drawn: the record is cut into
+stretches (`taste_core::stretches` — at each user message, and inside a
+long turn between settled steps), and the transcript is virtual, with
+the stretches within a page or so of the view as rows and the rest as
+spacers of their measured or estimated height, drawn and let go as the
+reader scrolls (`ChatPane::reconcile`). The row budget is a performance
+limit, not a horizon: the reader can scroll to the first message the
+record holds (up to the newest 32 MiB of it), and the scroll anchor holds their
+place while what is around them is drawn.
+
 **What mediation is for.** The IDE still serves the agent files, search
 and commands, and it is worth being exact about why:
 

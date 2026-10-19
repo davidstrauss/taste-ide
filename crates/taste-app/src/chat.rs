@@ -476,6 +476,191 @@ struct StepRail {
     bottom: gtk::Box,
 }
 
+/// What a stretch of the conversation is drawn with: the renderer's state
+/// partway through it — the block streaming, the steps that may still be
+/// updated, the rail's last dot, the message being assembled. The pane's
+/// own fields are the drawing in force; a stretch drawn back from the
+/// record swaps a fresh one in ([`ChatPane::swap_drawing`]), so drawing
+/// history above the reader leaves the live turn's state exactly as it was.
+#[derive(Default)]
+struct Drawing {
+    current_agent: Option<gtk::TextBuffer>,
+    current_agent_view: Option<gtk::TextView>,
+    current_thought: Option<gtk::TextBuffer>,
+    current_thought_header: Option<(gtk::Expander, std::time::Instant)>,
+    tool_cards: HashMap<String, ToolCard>,
+    ide_edit_calls: HashMap<String, String>,
+    terminal_text: HashMap<String, String>,
+    last_rail: Option<StepRail>,
+    after_prompt: bool,
+    pending_user: Option<PendingUserMessage>,
+    plan_card: Option<gtk::Box>,
+    plan_snapshot: Option<Vec<(String, String)>>,
+    last_prompt_row: Option<gtk::ListBoxRow>,
+}
+
+/// A stretch of the conversation (`taste_core::stretches`): its records,
+/// and either the rows drawn from them or, let go, the height it stands in
+/// for.
+struct Stretch {
+    records: Vec<serde_json::Value>,
+    /// Its rows while drawn. A row taken out by something else (a card
+    /// withdrawn) stays listed, and is passed over.
+    rows: Vec<gtk::ListBoxRow>,
+    hidden: bool,
+    /// How tall it was when last let go: what its space is, when known.
+    height: Option<f64>,
+    /// How tall its records say it is, before the measured scale.
+    estimate: f64,
+    /// The row that stands in for the run of hidden stretches this one
+    /// begins.
+    spacer: Option<gtk::ListBoxRow>,
+}
+
+impl Stretch {
+    fn new(records: Vec<serde_json::Value>, hidden: bool) -> Self {
+        Self {
+            estimate: estimate_height(&records),
+            records,
+            rows: Vec::new(),
+            hidden,
+            height: None,
+            spacer: None,
+        }
+    }
+
+    fn space(&self, scale: f64) -> f64 {
+        self.height.unwrap_or(self.estimate * scale)
+    }
+}
+
+/// The conversation as the transcript holds it: every stretch in order,
+/// some drawn, the rest standing in as space (DESIGN in
+/// [`ChatPane::reconcile`]).
+struct Stretches {
+    list: Vec<Stretch>,
+    /// Where the live conversation's next stretch begins.
+    segmenter: taste_core::stretches::Segmenter,
+    /// The stretch being drawn back, whose rows land where it is rather
+    /// than at the end.
+    drawing: Option<usize>,
+    /// Measured over estimated, as stretches are let go: what an
+    /// estimate is corrected by.
+    scale: f64,
+}
+
+impl Default for Stretches {
+    fn default() -> Self {
+        Self {
+            list: Vec::new(),
+            segmenter: Default::default(),
+            drawing: None,
+            scale: 1.0,
+        }
+    }
+}
+
+impl Stretches {
+    /// A live record: into the last stretch, or one it begins.
+    fn read(&mut self, record: &serde_json::Value) {
+        if self.segmenter.begins(record) || self.list.is_empty() {
+            self.list.push(Stretch::new(Vec::new(), false));
+        }
+        if let Some(last) = self.list.last_mut() {
+            last.records.push(record.clone());
+            last.estimate = estimate_height(&last.records);
+        }
+    }
+
+    /// A row drawn: the stretch being drawn back has it, or the last.
+    fn adopt(&mut self, row: &gtk::ListBoxRow) {
+        if self.list.is_empty() {
+            self.list.push(Stretch::new(Vec::new(), false));
+        }
+        let index = self.drawing.unwrap_or(self.list.len() - 1);
+        if let Some(stretch) = self.list.get_mut(index) {
+            stretch.rows.push(row.clone());
+        }
+    }
+
+    /// Where in `list`'s rows the first row of stretch `index` goes: after
+    /// the last widget of any stretch before it.
+    fn position_after(&self, index: usize, transcript: &gtk::ListBox) -> i32 {
+        let parent: &gtk::Widget = transcript.upcast_ref();
+        for stretch in self.list[..index].iter().rev() {
+            let last = stretch
+                .rows
+                .iter()
+                .rev()
+                .find(|row| row.parent().as_ref() == Some(parent))
+                .or(stretch.spacer.as_ref());
+            if let Some(row) = last {
+                return row.index() + 1;
+            }
+        }
+        0
+    }
+}
+
+/// How tall a stretch's records will draw, roughly, in pixels: what its
+/// space is until it has been drawn and measured. Errs are corrected by
+/// [`Stretches::scale`] and absorbed by the scroll anchor.
+fn estimate_height(records: &[serde_json::Value]) -> f64 {
+    let text = |record: &serde_json::Value| {
+        record
+            .pointer("/content/text")
+            .and_then(serde_json::Value::as_str)
+            .map_or(0, str::len)
+    };
+    let (mut px, mut said, mut asked, mut thought) = (0.0, 0usize, 0usize, false);
+    for record in records {
+        match record
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("agent_message_chunk") => said += text(record),
+            Some("user_message_chunk") => asked += text(record),
+            Some("tool_call") => px += 44.0,
+            Some("agent_thought_chunk") if !thought => {
+                thought = true;
+                px += 32.0;
+            }
+            Some("plan") => {
+                let entries = record
+                    .get("entries")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                px += 24.0 + 26.0 * entries as f64;
+            }
+            None if record.get(NOTE_RECORD).is_some() => px += 22.0,
+            _ => {}
+        }
+    }
+    let lines = |chars: usize, per: f64| (chars as f64 / per).ceil();
+    if asked > 0 {
+        px += 48.0 + 22.0 * lines(asked, 48.0);
+    }
+    px + 22.0 * lines(said, 64.0)
+}
+
+/// Whether `update` draws rows, rather than setting the chat's state.
+fn draws_rows(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::UserMessageChunk(_)
+            | SessionUpdate::AgentMessageChunk(_)
+            | SessionUpdate::AgentThoughtChunk(_)
+            | SessionUpdate::ToolCall(_)
+            | SessionUpdate::ToolCallUpdate(_)
+            | SessionUpdate::Plan(_)
+    )
+}
+
+/// Whether a spacer row is what `row` is.
+fn is_spacer(row: &gtk::Widget) -> bool {
+    row.widget_name() == "stretch-spacer"
+}
+
 /// The orchestrator's glyph, beside the chat's own name in its header.
 ///
 /// It rode on the tab's indicator slot until there were tabs no longer.
@@ -1045,6 +1230,15 @@ pub struct ChatPane {
     /// Drawing a conversation from a record rather than living it: what is
     /// drawn now is already recorded, and is not recorded again.
     drawing_history: Cell<bool>,
+    /// Drawing a stretch back above or below the reader (`draw_stretch`):
+    /// rows only, none of the effects its records had on the live chat —
+    /// the mode, the usage, the replies, the working line.
+    drawing_past: Cell<bool>,
+    /// The conversation as stretches, drawn and not (`reconcile`).
+    stretches: RefCell<Stretches>,
+    /// Where `append_row` puts the next row while a stretch is drawn back.
+    insert_at: Cell<Option<i32>>,
+    reconcile_pending: Cell<bool>,
     /// The session whose whole history this machine's stash holds, read
     /// once off the main thread and kept as the stash is marked: what a
     /// reconnect may `session/resume` rather than replay.
@@ -3538,6 +3732,10 @@ impl ChatPane {
             snapshotting: Rc::new(Cell::new(false)),
             archive_buffer: RefCell::new(Vec::new()),
             drawing_history: Cell::new(false),
+            drawing_past: Cell::new(false),
+            stretches: RefCell::new(Stretches::default()),
+            insert_at: Cell::new(None),
+            reconcile_pending: Cell::new(false),
             stash_session: RefCell::new(None),
             replay_record: RefCell::new(Vec::new()),
             needs_auth: Cell::new(false),
@@ -3668,18 +3866,11 @@ impl ChatPane {
         {
             let adjustment = pane.transcript_scroller.vadjustment();
             let weak = Rc::downgrade(&pane);
-            adjustment.connect_value_changed(move |adjustment| {
+            adjustment.connect_value_changed(move |_| {
                 let Some(pane) = weak.upgrade() else { return };
                 pane.note_anchor();
-                // Back at the bottom: the rows kept while they read can go.
-                if at_bottom(adjustment) && pane.transcript_rows.get() > MAX_TRANSCRIPT_ROWS {
-                    let weak = Rc::downgrade(&pane);
-                    glib::idle_add_local_once(move || {
-                        if let Some(pane) = weak.upgrade() {
-                            pane.trim_transcript();
-                        }
-                    });
-                }
+                // What is drawn follows the reader.
+                pane.trim_transcript();
             });
             // In the same pass, not after it: the viewport places the list
             // at the adjustment's value as it stands once its extent is set,
@@ -3690,6 +3881,8 @@ impl ChatPane {
             adjustment.connect_changed(move |_| {
                 if let Some(pane) = weak.upgrade() {
                     pane.keep_anchor();
+                    // A page that grew may want more drawn.
+                    pane.trim_transcript();
                 }
             });
         }
@@ -4225,6 +4418,9 @@ impl ChatPane {
         let result = self.send_blocks(blocks, written.clone());
         match result {
             Ok(unrecorded) => {
+                if unrecorded.is_empty() {
+                    self.claim_row(&card);
+                }
                 self.mark_session_content();
                 let queued = written.is_some();
                 let badge = written.map(|written| {
@@ -4699,7 +4895,9 @@ impl ChatPane {
     /// end: what falls off the front is counted, never silently lost.
     fn record_line(&self, speaker: &'static str, text: &str) {
         let text = text.trim();
-        if text.is_empty() {
+        // A stretch drawn back for the reader is in the mirror already, or
+        // older than all of it.
+        if text.is_empty() || self.drawing_past.get() {
             return;
         }
         self.touch();
@@ -4735,6 +4933,7 @@ impl ChatPane {
             self.transcript.remove(&row);
         }
         self.transcript_rows.set(0);
+        *self.stretches.borrow_mut() = Stretches::default();
         self.last_prompt_row.borrow_mut().take();
         // A replay reports each call's output again.
         self.terminal_text.borrow_mut().clear();
@@ -5369,6 +5568,9 @@ impl ChatPane {
             let result = self.send_blocks(blocks, Some(item.written.clone()));
             match result {
                 Ok(unrecorded) => {
+                    if unrecorded.is_empty() {
+                        self.claim_row(&card);
+                    }
                     self.mark_session_content();
                     badge.set_label("queued — sends when the current turn ends");
                     if behind_a_turn {
@@ -7108,39 +7310,390 @@ impl ChatPane {
             .build();
         // When it landed, for the search listing (`row_time_text`).
         stamp_row(&row);
-        self.transcript.append(&row);
+        match self.insert_at.get() {
+            Some(at) => {
+                self.transcript.insert(&row, at);
+                self.insert_at.set(Some(at + 1));
+            }
+            None => self.transcript.append(&row),
+        }
         self.transcript_rows.set(self.transcript_rows.get() + 1);
-        self.trim_transcript();
+        self.stretches.borrow_mut().adopt(&row);
+        if self.insert_at.get().is_none() {
+            self.trim_transcript();
+        }
         // No scroll here: appending grows the adjustment, and the tail
         // policy in `new` decides whether that should move the view. This
         // used to yank the view to the bottom even mid-history.
         row
     }
 
-    /// Let the oldest rows go past the cap. GtkListBox measures every row
-    /// on every width change, so pane resizing costs O(rows × text): the
-    /// live widgets are capped, and the full conversation stays with the
-    /// agent (session/load restores it). Not while the reader is up the
-    /// transcript, though, up to twice the cap: a row let go above them
-    /// moved everything they were reading up by its height, at every new
-    /// step (David, 2026-10-11: "the IDE is moving my viewport even when
-    /// the content above and in my viewport has long settled"). They go
-    /// when the reader is back at the bottom.
+    /// Keep the drawn part of the transcript near the reader
+    /// ([`Self::reconcile`]), once the current pass is over. Ahead of the
+    /// next frame rather than after it: a reader scrolling with frames
+    /// coming one after another would otherwise outrun an idle that never
+    /// got its turn, and scroll on through space.
     fn trim_transcript(&self) {
+        if self.reconcile_pending.replace(true) {
+            return;
+        }
+        let weak = self.weak_self.borrow().clone();
+        glib::idle_add_local_full(glib::Priority::DEFAULT, move || {
+            if let Some(pane) = weak.upgrade() {
+                pane.reconcile_pending.set(false);
+                pane.reconcile();
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Draw what is near the reader and let go of what is far from it.
+    ///
+    /// GtkListBox measures every row on every width change, so a pane
+    /// resize costs O(rows × text), and a conversation of thousands of
+    /// steps cannot all be rows. It does not have to be: the conversation
+    /// is its record (`record`), cut into stretches
+    /// (`taste_core::stretches`), and a stretch is drawn from its records
+    /// whenever it is wanted. So the transcript is virtual — the reader
+    /// scrolls through all of it, and only the stretches within a page or
+    /// so of the view are rows; the rest are spacers of their height, as
+    /// measured when they were let go or estimated from their records
+    /// until then. Whatever moves under the reader as stretches come and
+    /// go and estimates become measurements, the scroll anchor holds their
+    /// place (`keep_anchor`; David, 2026-10-11: "the IDE is moving my
+    /// viewport even when the content above and in my viewport has long
+    /// settled").
+    ///
+    /// One stretch is drawn a pass, the one nearest the view; the layout
+    /// it causes starts the next pass (the adjustment's `changed`), so a
+    /// stretch is drawn a frame and the keyboard gets its turn between. Stretches are let go only past the row budget,
+    /// farthest from the view first, never the last: that one is the live
+    /// conversation, and its state is the pane's. A last stretch that
+    /// outgrows the budget on its own (a turn whose steps never all
+    /// settle) loses its oldest rows, as every stretch once did; its
+    /// records keep them, for the next time it is drawn.
+    fn reconcile(self: &Rc<Self>) {
+        if self.drawing_history.get() {
+            return;
+        }
+        let adjustment = self.transcript_scroller.vadjustment();
+        let (top, page) = (adjustment.value(), adjustment.page_size());
+        let margin = page.max(400.0);
+        let distance = |(y, h): (f64, f64)| {
+            if y + h < top {
+                top - (y + h)
+            } else if y > top + page {
+                y - (top + page)
+            } else {
+                0.0
+            }
+        };
+        // Let go: over budget, the drawn stretch farthest from the view,
+        // well clear of it. First, so a reader who keeps scrolling, with a
+        // stretch always wanted ahead of them, still leaves rows behind.
+        let mut spans = self.stretch_spans();
+        while self.transcript_rows.get() > MAX_TRANSCRIPT_ROWS {
+            let farthest = {
+                let stretches = self.stretches.borrow();
+                let last = stretches.list.len().saturating_sub(1);
+                spans
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i < last && !stretches.list[*i].hidden)
+                    .filter_map(|(i, span)| span.map(|span| (i, distance(span))))
+                    .filter(|(_, d)| *d > margin * 3.0)
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(i, _)| i)
+            };
+            let Some(index) = farthest else { break };
+            if !self.let_go(index) {
+                break;
+            }
+            spans = self.stretch_spans();
+        }
+        self.trim_last_stretch();
+        // Draw: the hidden stretch nearest the view, within a margin of it,
+        // and another pass after it.
+        let wanted = {
+            let stretches = self.stretches.borrow();
+            spans
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| stretches.list[*i].hidden)
+                .filter_map(|(i, span)| span.map(|span| (i, distance(span))))
+                .filter(|(_, d)| *d <= margin)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        };
+        if let Some(index) = wanted {
+            self.draw_stretch(index);
+        }
+    }
+
+    /// Where each stretch is in the transcript, top and height: a drawn
+    /// one from its rows, a hidden one from its run's spacer. `None` for
+    /// one not yet laid out — a row just put in reports the list's top
+    /// and no height until it is, and a stretch taken for one there would
+    /// be the farthest from a reader anywhere else, and let go at once.
+    fn stretch_spans(&self) -> Vec<Option<(f64, f64)>> {
+        let stretches = self.stretches.borrow();
+        let parent: &gtk::Widget = self.transcript.upcast_ref();
+        let mut spans = Vec::with_capacity(stretches.list.len());
+        let mut run: Option<f64> = None;
+        for stretch in &stretches.list {
+            if stretch.hidden {
+                if let Some(spacer) = &stretch.spacer {
+                    run = spacer
+                        .compute_bounds(&self.transcript)
+                        .filter(|_| spacer.height() > 0)
+                        .map(|bounds| f64::from(bounds.y()));
+                }
+                let space = stretch.space(stretches.scale);
+                spans.push(run.map(|y| (y, space)));
+                run = run.map(|y| y + space);
+                continue;
+            }
+            run = None;
+            let laid_out = |row: &&gtk::ListBoxRow| row.height() > 0;
+            if stretch
+                .rows
+                .iter()
+                .any(|row| row.parent().as_ref() == Some(parent) && !laid_out(&row))
+            {
+                spans.push(None);
+                continue;
+            }
+            let mut live = stretch
+                .rows
+                .iter()
+                .filter(|row| row.parent().as_ref() == Some(parent));
+            let first = live
+                .next()
+                .and_then(|row| row.compute_bounds(&self.transcript));
+            let last = live
+                .next_back()
+                .and_then(|row| row.compute_bounds(&self.transcript))
+                .or(first);
+            spans.push(first.zip(last).map(|(first, last)| {
+                let y = f64::from(first.y());
+                (y, f64::from(last.y() + last.height()) - y)
+            }));
+        }
+        spans
+    }
+
+    /// Draw hidden stretch `index` where it belongs, from its records, with
+    /// a drawing of its own (`swap_drawing`) and none of its records'
+    /// effects on the live chat (`drawing_past`).
+    fn draw_stretch(self: &Rc<Self>, index: usize) {
+        let records = {
+            let mut stretches = self.stretches.borrow_mut();
+            let Some(stretch) = stretches.list.get_mut(index) else {
+                return;
+            };
+            if !stretch.hidden {
+                return;
+            }
+            stretch.hidden = false;
+            let spacer = stretch.spacer.take();
+            let records = stretch.records.clone();
+            if let Some(spacer) = spacer {
+                self.transcript.remove(&spacer);
+            }
+            let at = stretches.position_after(index, &self.transcript);
+            self.insert_at.set(Some(at));
+            stretches.drawing = Some(index);
+            records
+        };
+        let mut drawing = Drawing::default();
+        self.swap_drawing(&mut drawing);
+        self.drawing_history.set(true);
+        self.drawing_past.set(true);
+        for record in records {
+            self.draw_record(record);
+        }
+        self.finalize_stream();
+        self.settle_running_steps();
+        self.drawing_past.set(false);
+        self.drawing_history.set(false);
+        self.swap_drawing(&mut drawing);
+        self.insert_at.set(None);
+        self.stretches.borrow_mut().drawing = None;
+        self.respace();
+    }
+
+    /// Let drawn stretch `index` go: its rows out, a spacer of its measured
+    /// height in. False when it has no rows laid out to measure.
+    fn let_go(&self, index: usize) -> bool {
+        let Some(Some((_, height))) = self.stretch_spans().get(index).copied() else {
+            return false;
+        };
+        let rows = {
+            let mut stretches = self.stretches.borrow_mut();
+            let Some(stretch) = stretches.list.get_mut(index) else {
+                return false;
+            };
+            stretch.hidden = true;
+            stretch.height = Some(height);
+            let estimate = stretch.estimate;
+            let rows = std::mem::take(&mut stretch.rows);
+            if estimate > 0.0 && height > 0.0 {
+                stretches.scale =
+                    (stretches.scale * 0.8 + height / estimate * 0.2).clamp(0.25, 4.0);
+            }
+            rows
+        };
+        let parent: &gtk::Widget = self.transcript.upcast_ref();
+        for row in rows {
+            if row.parent().as_ref() == Some(parent) {
+                self.transcript.remove(&row);
+                self.transcript_rows
+                    .set(self.transcript_rows.get().saturating_sub(1));
+            }
+        }
+        self.doc_rows
+            .borrow_mut()
+            .retain(|_, row| row.parent().as_ref() == Some(parent));
+        if self
+            .lit_doc_row
+            .borrow()
+            .as_ref()
+            .is_some_and(|row| row.parent().as_ref() != Some(parent))
+        {
+            self.lit_doc_row.borrow_mut().take();
+        }
+        self.respace();
+        true
+    }
+
+    /// One spacer for each run of hidden stretches, owned by its first and
+    /// as tall as the run: kept where it is when the run keeps its first,
+    /// so a reader anchored on it stays put.
+    fn respace(&self) {
+        let mut stretches = self.stretches.borrow_mut();
+        let scale = stretches.scale;
+        let count = stretches.list.len();
+        let mut index = 0;
+        while index < count {
+            if !stretches.list[index].hidden {
+                if let Some(spacer) = stretches.list[index].spacer.take() {
+                    self.transcript.remove(&spacer);
+                }
+                index += 1;
+                continue;
+            }
+            let mut end = index;
+            let mut height = 0.0;
+            while end < count && stretches.list[end].hidden {
+                height += stretches.list[end].space(scale);
+                if end > index {
+                    if let Some(spacer) = stretches.list[end].spacer.take() {
+                        self.transcript.remove(&spacer);
+                    }
+                }
+                end += 1;
+            }
+            let spacer = match stretches.list[index].spacer.clone() {
+                Some(spacer) => spacer,
+                None => {
+                    let spacer = gtk::ListBoxRow::builder()
+                        .name("stretch-spacer")
+                        .activatable(false)
+                        .selectable(false)
+                        .focusable(false)
+                        .child(&gtk::Box::new(gtk::Orientation::Vertical, 0))
+                        .build();
+                    let at = stretches.position_after(index, &self.transcript);
+                    self.transcript.insert(&spacer, at);
+                    stretches.list[index].spacer = Some(spacer.clone());
+                    spacer
+                }
+            };
+            if let Some(child) = spacer.child() {
+                child.set_height_request(height.round().min(f64::from(i32::MAX)) as i32);
+            }
+            index = end;
+        }
+    }
+
+    /// The live stretch past the row budget on its own: its oldest rows
+    /// go, as every row once did past the cap.
+    fn trim_last_stretch(&self) {
         let cap = if self.stick_to_bottom.get() {
             MAX_TRANSCRIPT_ROWS
         } else {
             MAX_TRANSCRIPT_ROWS * 2
         };
-        let mut rows = self.transcript_rows.get();
-        while rows > cap {
-            let Some(oldest) = self.transcript.first_child() else {
-                break;
+        let parent: &gtk::Widget = self.transcript.upcast_ref();
+        while self.transcript_rows.get() > cap {
+            let oldest = {
+                let mut stretches = self.stretches.borrow_mut();
+                let Some(last) = stretches.list.last_mut() else {
+                    break;
+                };
+                last.rows
+                    .retain(|row| row.parent().as_ref() == Some(parent));
+                if last.rows.is_empty() {
+                    break;
+                }
+                last.rows.remove(0)
             };
             self.transcript.remove(&oldest);
-            rows -= 1;
+            self.transcript_rows
+                .set(self.transcript_rows.get().saturating_sub(1));
         }
-        self.transcript_rows.set(rows);
+    }
+
+    /// Exchange the drawing in force with `drawing`.
+    fn swap_drawing(&self, drawing: &mut Drawing) {
+        use std::mem::swap;
+        swap(
+            &mut *self.current_agent.borrow_mut(),
+            &mut drawing.current_agent,
+        );
+        swap(
+            &mut *self.current_agent_view.borrow_mut(),
+            &mut drawing.current_agent_view,
+        );
+        swap(
+            &mut *self.current_thought.borrow_mut(),
+            &mut drawing.current_thought,
+        );
+        swap(
+            &mut *self.current_thought_header.borrow_mut(),
+            &mut drawing.current_thought_header,
+        );
+        swap(&mut *self.tool_cards.borrow_mut(), &mut drawing.tool_cards);
+        swap(
+            &mut *self.ide_edit_calls.borrow_mut(),
+            &mut drawing.ide_edit_calls,
+        );
+        swap(
+            &mut *self.terminal_text.borrow_mut(),
+            &mut drawing.terminal_text,
+        );
+        swap(&mut *self.last_rail.borrow_mut(), &mut drawing.last_rail);
+        drawing.after_prompt = self.after_prompt.replace(drawing.after_prompt);
+        swap(
+            &mut *self.pending_user.borrow_mut(),
+            &mut drawing.pending_user,
+        );
+        swap(&mut *self.plan_card.borrow_mut(), &mut drawing.plan_card);
+        swap(
+            &mut *self.plan_snapshot.borrow_mut(),
+            &mut drawing.plan_snapshot,
+        );
+        swap(
+            &mut *self.last_prompt_row.borrow_mut(),
+            &mut drawing.last_prompt_row,
+        );
+    }
+
+    /// Restoring a conversation's state from its record, as opposed to
+    /// living it or drawing a stretch of it back for the reader: what a
+    /// replay once did and a drawn history does now.
+    fn restoring(&self) -> bool {
+        (self.replaying.get() || self.drawing_history.get()) && !self.drawing_past.get()
     }
 
     /// Note the row at the top of the reader's view and where it starts in
@@ -7178,6 +7731,24 @@ impl ChatPane {
             if f64::from(bounds.y() + bounds.height()) <= value {
                 row = current.next_sibling();
                 continue;
+            }
+            // A spacer is a place the reader can be, but a row beside it in
+            // the view is the better anchor: the spacer's height changes as
+            // the stretches it stands for are drawn.
+            // Only one laid out below it: a row just put in reports the
+            // list's top until it is.
+            let page = self.transcript_scroller.vadjustment().page_size();
+            if is_spacer(&current) {
+                if let Some(next) = current.next_sibling() {
+                    if let Some(next_bounds) = next.compute_bounds(transcript) {
+                        let below = next_bounds.y() >= bounds.y() + bounds.height() - 1.0;
+                        if below && f64::from(next_bounds.y()) < value + page {
+                            *self.scroll_anchor.borrow_mut() =
+                                Some((next, f64::from(next_bounds.y()) - value));
+                            return;
+                        }
+                    }
+                }
             }
             *self.scroll_anchor.borrow_mut() = Some((current, f64::from(bounds.y()) - value));
             return;
@@ -8344,7 +8915,7 @@ impl ChatPane {
         }
         // A message later in a replay answered whatever replies came
         // before it.
-        if self.replaying.get() {
+        if self.restoring() {
             self.pending_replies.borrow_mut().clear();
             self.replayed_replies_call.borrow_mut().take();
         }
@@ -9444,6 +10015,9 @@ impl ChatPane {
         let result = self.send_blocks(blocks, written.clone());
         match result {
             Ok(unrecorded) => {
+                if unrecorded.is_empty() {
+                    self.claim_row(&card);
+                }
                 self.mark_session_content();
                 // Sending mid-turn is fine: the session layer queues it.
                 // Say so on the card until its turn starts.
@@ -9696,7 +10270,9 @@ impl ChatPane {
                 if !restored {
                     self.mark_session(&session_id);
                 } else if replayed {
-                    self.replace_record(&session_id, replay);
+                    self.replace_record(&session_id, replay.clone());
+                    self.clear_on_replay.set(false);
+                    self.restore_history(replay);
                 } else {
                     // The old rendering stays until the record replaces
                     // it, rather than a blank while the record is read.
@@ -9771,10 +10347,13 @@ impl ChatPane {
                 self.flush_revive_queue();
             }
             SessionEvent::Update(update) => {
+                // A replay is the history, drawn whole once it is all here
+                // (`Ready`), and only its last stretch at that.
                 if self.replaying.get() {
                     if let Ok(value) = serde_json::to_value(&update) {
                         self.replay_record.borrow_mut().push(value);
                     }
+                    return;
                 }
                 self.stash_update(&update);
                 self.render_update(update)
@@ -11244,7 +11823,24 @@ impl ChatPane {
         if self.replaying.get() || self.drawing_history.get() {
             return;
         }
+        self.stretches.borrow_mut().read(&value);
         self.archive_buffer.borrow_mut().push(value);
+    }
+
+    /// The row `card` is in, moved into the last stretch: a prompt's card
+    /// is drawn before its message is recorded, and the message begins the
+    /// stretch the card belongs to.
+    fn claim_row(&self, card: &gtk::Box) {
+        let Some(row) = card.parent().and_downcast::<gtk::ListBoxRow>() else {
+            return;
+        };
+        let mut stretches = self.stretches.borrow_mut();
+        for stretch in &mut stretches.list {
+            stretch.rows.retain(|kept| kept != &row);
+        }
+        if let Some(last) = stretches.list.last_mut() {
+            last.rows.push(row);
+        }
     }
 
     /// Draw one entry of a conversation's record (`record`): the IDE's
@@ -11263,9 +11859,79 @@ impl ChatPane {
         // fatal: a stash is a convenience, and half a conversation beats an
         // error where one used to be.
         if let Ok(update) = serde_json::from_value::<SessionUpdate>(value) {
+            if self.drawing_past.get() && !draws_rows(&update) {
+                return;
+            }
             // A stash written before `without_nul` may hold one.
             self.render_update(nul_free(update));
         }
+    }
+
+    /// Draw a conversation from its record: the transcript cleared, the
+    /// record cut into stretches, and only the last drawn — the rest stand
+    /// in as space, drawn as the reader comes near them (`reconcile`).
+    /// What the record says about the chat's state now — the context it
+    /// has used, its commands — is applied from wherever it last said it.
+    async fn draw_history(self: Rc<Self>, records: Vec<serde_json::Value>) {
+        self.clear_transcript();
+        let state: Vec<serde_json::Value> = ["usage_update", "available_commands_update"]
+            .iter()
+            .filter_map(|kind| {
+                records
+                    .iter()
+                    .rev()
+                    .find(|r| {
+                        r.get("sessionUpdate").and_then(serde_json::Value::as_str) == Some(kind)
+                    })
+                    .cloned()
+            })
+            .collect();
+        let (list, segmenter) = taste_core::stretches::cut(records);
+        let count = list.len();
+        let tail = {
+            let mut stretches = self.stretches.borrow_mut();
+            stretches.segmenter = segmenter;
+            stretches.list = list
+                .into_iter()
+                .enumerate()
+                .map(|(i, records)| Stretch::new(records, i + 1 < count))
+                .collect();
+            stretches
+                .list
+                .last()
+                .map(|last| last.records.clone())
+                .unwrap_or_default()
+        };
+        tracing::info!(
+            "chat {}: drawing its history's last stretch of {count}, {} record(s)",
+            self.environment,
+            tail.len()
+        );
+        self.drawing_history.set(true);
+        for record in state {
+            self.draw_record(record);
+        }
+        let mut pacer = crate::stall::Pacer::new();
+        for record in tail {
+            self.draw_record(record);
+            pacer.breathe().await;
+        }
+        self.finalize_stream();
+        self.settle_running_steps();
+        self.drawing_history.set(false);
+        self.respace();
+        self.trim_transcript();
+    }
+
+    /// [`Self::draw_history`] for a restored session, and what a replay's
+    /// end does in `Ready`, for this history's end.
+    fn restore_history(self: &Rc<Self>, records: Vec<serde_json::Value>) {
+        let pane = self.clone();
+        glib::spawn_future_local(async move {
+            pane.clone().draw_history(records).await;
+            pane.reattach_pending_cards();
+            pane.settle_replayed_replies(true);
+        });
     }
 
     /// Put this machine's stashed conversation on screen when the agent
@@ -11308,21 +11974,12 @@ impl ChatPane {
             if pane.transcript_rows.get() != 0 {
                 return;
             }
-            tracing::info!(
-                "replaying {} stashed update(s) for {}",
-                loaded.updates.len(),
-                pane.environment
-            );
-            pane.drawing_history.set(true);
-            for record in loaded.updates {
-                pane.draw_record(record.update);
-            }
-            pane.drawing_history.set(false);
-            // The last streamed block's markdown pass, for the reason the
-            // `Ready` arm does the same: nothing follows it to trigger one.
-            pane.finalize_stream();
-            // A stashed call left open is history too.
-            pane.settle_running_steps();
+            let records: Vec<serde_json::Value> = loaded
+                .updates
+                .into_iter()
+                .map(|record| record.update)
+                .collect();
+            pane.clone().draw_history(records).await;
             // Said only over a conversation there is to see. A stash can
             // hold nothing but updates that draw no row — the command
             // list, the session's options — and a banner about restored
@@ -11335,8 +11992,13 @@ impl ChatPane {
             // above it, and it scrolls away with it as the conversation
             // goes on (David, 2026-09-23: "It also should just be a message
             // in the chat history ... so it eventually scrolls off").
+            //
+            // Not recorded: the conversation it is about is not this
+            // session's, and the session's record began without it.
             if pane.transcript_rows.get() != 0 {
+                pane.drawing_history.set(true);
                 pane.meta_row("restored from this machine; the agent does not remember it");
+                pane.drawing_history.set(false);
             }
         });
     }
@@ -11462,22 +12124,7 @@ impl ChatPane {
             let (Some(pane), Ok(records)) = (weak.upgrade(), read) else {
                 return;
             };
-            tracing::info!(
-                "chat {}: drawing {} kept record(s) of its resumed session",
-                pane.environment,
-                records.len()
-            );
-            pane.clear_transcript();
-            pane.drawing_history.set(true);
-            let mut pacer = crate::stall::Pacer::new();
-            for record in records {
-                pane.draw_record(record);
-                pacer.breathe().await;
-            }
-            pane.finalize_stream();
-            pane.settle_running_steps();
-            pane.drawing_history.set(false);
-            // What a replay's end does in `Ready`, for this history's end.
+            pane.clone().draw_history(records).await;
             pane.reattach_pending_cards();
             pane.settle_replayed_replies(true);
         });
@@ -11560,7 +12207,12 @@ impl ChatPane {
             }
             SessionUpdate::AgentMessageChunk(chunk) => {
                 if let Some(text) = content_text(&chunk.content) {
-                    if let Some((captured, _)) = self.capture.borrow_mut().as_mut() {
+                    if let Some((captured, _)) = self
+                        .capture
+                        .borrow_mut()
+                        .as_mut()
+                        .filter(|_| !self.drawing_history.get())
+                    {
                         captured.push_str(&text);
                     }
                     let buffer = self.agent_buffer();
@@ -11593,7 +12245,7 @@ impl ChatPane {
                         self.meta_row(
                             "the turn was cut off before it finished — send again to continue",
                         );
-                    } else if !line.is_empty() && self.busy.get() {
+                    } else if !line.is_empty() && self.busy.get() && !self.drawing_history.get() {
                         self.set_activity(&line);
                     }
                 }
@@ -11603,8 +12255,10 @@ impl ChatPane {
                 // answer the replies, if any, will be about. Offering the
                 // replies is not work.
                 if mcp_tool_name(&call.title).as_deref() != Some("suggest_replies") {
-                    self.unclip_answer.borrow_mut().clear();
-                } else if self.replaying.get() {
+                    if !self.drawing_past.get() {
+                        self.unclip_answer.borrow_mut().clear();
+                    }
+                } else if self.restoring() {
                     self.recover_replies(
                         &call.tool_call_id.to_string(),
                         call.raw_input.as_ref(),
@@ -11644,7 +12298,7 @@ impl ChatPane {
             }
             SessionUpdate::ToolCallUpdate(mut update) => {
                 let id = update.tool_call_id.to_string();
-                if self.replaying.get()
+                if self.restoring()
                     && self.replayed_replies_call.borrow().as_deref() == Some(id.as_str())
                 {
                     self.recover_replies(
@@ -12261,6 +12915,13 @@ impl ChatPane {
             self.seed_stash_for_probe();
             return;
         }
+        // `TASTE_PROBE_CHAT=history` is a long conversation drawn from its
+        // record and read from the bottom to the top and back
+        // (`probe_history`).
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("history") {
+            self.probe_history();
+            return;
+        }
         // `TASTE_PROBE_CHAT=task` is a turn that two background subagents
         // report back into: one finished with a report, one failed.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("task") {
@@ -12513,7 +13174,24 @@ impl ChatPane {
                     "Change the title first".to_string(),
                     "Move all six into the template".to_string(),
                 ];
-                self.replaying.set(restored);
+                // `restored` goes the way a restore does: the conversation
+                // as records, drawn from them (`draw_history`).
+                let mut records: Vec<serde_json::Value> = Vec::new();
+                let mut emit = |pane: &Rc<Self>, update: SessionUpdate| {
+                    if restored {
+                        records.push(serde_json::to_value(&update).unwrap_or_default());
+                    } else {
+                        pane.render_update(update);
+                    }
+                };
+                if restored {
+                    emit(
+                        self,
+                        SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new("Which of the deck's pieces belong in the template?"),
+                        ))),
+                    );
+                }
                 // The answer, long enough to clip, with the list the
                 // replies choose from in its tail; then the call that
                 // offers them, then the question in a line of its own —
@@ -12540,9 +13218,12 @@ impl ChatPane {
                     ));
                 }
                 answer.push_str(&"Each of these is deck-agnostic.\n\n".repeat(6));
-                self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                    ContentBlock::Text(TextContent::new(answer)),
-                )));
+                emit(
+                    self,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new(answer),
+                    ))),
+                );
                 self.finalize_stream();
                 // The call that offered them, opened: its answer is a field
                 // whose value wraps, the row that once stood a page tall
@@ -12564,21 +13245,30 @@ impl ChatPane {
                         .to_string(),
                     ),
                 )))];
-                self.render_update(SessionUpdate::ToolCall(offered));
-                self.expand_tool_card_for_probe("probe-replies");
-                self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                    ContentBlock::Text(TextContent::new(
-                        "Should I make those template changes now, or put them on the backlog?",
-                    )),
-                )));
+                emit(self, SessionUpdate::ToolCall(offered));
+                if !restored {
+                    self.expand_tool_card_for_probe("probe-replies");
+                }
+                emit(
+                    self,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new(
+                            "Should I make those template changes now, or put them on the backlog?",
+                        ),
+                    ))),
+                );
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
                 self.set_busy(false);
                 // A long one among them: a reply wider than the column
                 // wraps rather than running off its edge.
                 if restored {
-                    self.replaying.set(false);
-                    self.settle_replayed_replies(true);
+                    let pane = self.clone();
+                    glib::spawn_future_local(async move {
+                        pane.clone().draw_history(records).await;
+                        pane.expand_tool_card_for_probe("probe-replies");
+                        pane.settle_replayed_replies(true);
+                    });
                 } else {
                     self.offer_replies(offers);
                 }
@@ -12656,6 +13346,134 @@ impl ChatPane {
         if std::env::var("TASTE_PROBE_ANCHOR").is_ok() {
             self.probe_anchor();
         }
+    }
+
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=history` draws a long
+    /// conversation (`TASTE_PROBE_TURNS`, 400 by default) from its record
+    /// the way a restore does, then reads it: up to the top a page at a
+    /// time, a jump to the middle, and back down to the bottom. Each step
+    /// prints the rows drawn, the stretches drawn of all of them, the
+    /// scroll extent, and the turn at the top of the view; and the longest
+    /// the main thread was held while it ran. `TASTE_PROBE_HISTORY_AT=middle`
+    /// jumps to the middle and stays, for the shot.
+    fn probe_history(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::{ContentChunk, ToolCall};
+        let turns: usize = std::env::var("TASTE_PROBE_TURNS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(400);
+        let value = |update: SessionUpdate| serde_json::to_value(update).unwrap_or_default();
+        let text = |t: String| ContentChunk::new(ContentBlock::Text(TextContent::new(t)));
+        let mut records =
+            vec![serde_json::json!({ taste_core::chatarchive::SESSION_MARKER: "probe" })];
+        for turn in 0..turns {
+            records.push(value(SessionUpdate::UserMessageChunk(text(format!(
+                "turn {turn}: what does the next step need?"
+            )))));
+            for step in 0..(3 + turn % 5) {
+                let id = format!("t{turn}-{step}");
+                let mut call = ToolCall::new(id.clone(), format!("Read crates/file-{step}.rs"));
+                call.kind = ToolKind::Read;
+                call.status = ToolCallStatus::Completed;
+                records.push(value(SessionUpdate::ToolCall(call)));
+                records.push(value(SessionUpdate::AgentMessageChunk(text(format!(
+                    "Step {step} of turn {turn} read what it needed. "
+                )))));
+            }
+            for chunk in 0..(turn % 7 + 1) {
+                records.push(value(SessionUpdate::AgentMessageChunk(text(format!(
+                    "The answer to turn {turn}, part {chunk}: a sentence or two long \
+                     enough to wrap across the column at least once.\n\n"
+                )))));
+            }
+        }
+        let held = Rc::new(Cell::new(std::time::Duration::ZERO));
+        {
+            let held = held.clone();
+            let last = Rc::new(Cell::new(std::time::Instant::now()));
+            glib::timeout_add_local(std::time::Duration::from_millis(5), move || {
+                let now = std::time::Instant::now();
+                let gap = now.duration_since(last.replace(now));
+                if gap > held.get() {
+                    held.set(gap);
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+        fn report(pane: &ChatPane, what: &str, held: &Cell<std::time::Duration>) {
+            let adjustment = pane.transcript_scroller.vadjustment();
+            let (shown, all) = {
+                let stretches = pane.stretches.borrow();
+                (
+                    stretches.list.iter().filter(|s| !s.hidden).count(),
+                    stretches.list.len(),
+                )
+            };
+            // The first row reaching into the view that says which turn.
+            let value = adjustment.value();
+            let mut at_top = String::from("-");
+            let mut child = pane.transcript.first_child();
+            while let Some(row) = child {
+                if let Some(bounds) = row.compute_bounds(&pane.transcript) {
+                    if f64::from(bounds.y() + bounds.height()) > value {
+                        let text = widget_text(&row);
+                        if let Some(at) = text.find("turn ") {
+                            at_top = text[at..].chars().take(9).collect();
+                            break;
+                        }
+                    }
+                }
+                child = row.next_sibling();
+            }
+            println!(
+                "probe history: {what}: rows {}, stretches drawn {shown}/{all}, value {:.0} of {:.0}, top {at_top:?}, held {}ms",
+                pane.transcript_rows.get(),
+                value,
+                adjustment.upper(),
+                held.replace(std::time::Duration::ZERO).as_millis()
+            );
+        }
+        let pane = self.clone();
+        glib::spawn_future_local(async move {
+            let started = std::time::Instant::now();
+            pane.clone().draw_history(records).await;
+            println!(
+                "probe history: {turns} turns drawn in {}ms",
+                started.elapsed().as_millis()
+            );
+            glib::timeout_future(std::time::Duration::from_millis(1500)).await;
+            report(&pane, "at the bottom", &held);
+            let adjustment = pane.transcript_scroller.vadjustment();
+            pane.stick_to_bottom.set(false);
+            // `TASTE_PROBE_HISTORY_AT=middle`: straight to the middle and
+            // stay, for a shot of stretches drawn back from the record.
+            if std::env::var("TASTE_PROBE_HISTORY_AT").as_deref() == Ok("middle") {
+                adjustment.set_value(adjustment.upper() / 2.0);
+                glib::timeout_future(std::time::Duration::from_millis(1500)).await;
+                report(&pane, "jumped to the middle", &held);
+                return;
+            }
+            let mut steps = 0;
+            while adjustment.value() > 0.0 && steps < 4000 {
+                let target = (adjustment.value() - adjustment.page_size() * 0.8).max(0.0);
+                adjustment.set_value(target);
+                glib::timeout_future(std::time::Duration::from_millis(60)).await;
+                steps += 1;
+                if steps % 50 == 0 {
+                    report(&pane, &format!("{steps} pages up"), &held);
+                }
+            }
+            glib::timeout_future(std::time::Duration::from_millis(800)).await;
+            report(&pane, &format!("at the top after {steps} pages"), &held);
+            adjustment.set_value(adjustment.upper() / 2.0);
+            glib::timeout_future(std::time::Duration::from_millis(800)).await;
+            report(&pane, "jumped to the middle", &held);
+            adjustment.set_value(adjustment.upper());
+            glib::timeout_future(std::time::Duration::from_millis(800)).await;
+            pane.stick_to_bottom.set(true);
+            glib::timeout_future(std::time::Duration::from_millis(800)).await;
+            report(&pane, "back at the bottom", &held);
+        });
     }
 
     /// TASTE_PROBE_CHECK only: `TASTE_PROBE_ANCHOR=1` holds the reader's
