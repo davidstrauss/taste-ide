@@ -4114,6 +4114,21 @@ restored from its peer in a VM on the current release, the old copy
 removed, the old VM destroyed once nothing of the workspace is left in it,
 and the container started again.
 
+**A move is said as it happens** (David, 2026-10-19, after one ran for
+three minutes under a safe-mode banner: "There was no indication why
+anything had failed"). From the snapshot to the start at the end, the
+environment's state is `Preparing` with the step under way —
+"moving to a VM on the current release: placing its checkout"
+(`Supervisor::begin_move`) — whatever its container's stop would have
+said. So the startup page draws the move as it draws a start, under a
+heading that names it, from "Save work and stop container" to the
+container up in the new VM; the safe-mode banner and its Start button
+stay away; the safe-mode environment, which comes up on its own over a
+checkout with nothing running, does not come up in the VM being left; and
+the chat, whose agent stops with the container, waits for the move to end
+rather than trying to start its agent anywhere else, and says what it is
+waiting for.
+
 **Packages age too, and are refreshed the same way** (David, 2026-09-22:
 "that too — and with the same notifications and constraints"), with as
 little rebuilding as starting fresh allows ("minimize the work while

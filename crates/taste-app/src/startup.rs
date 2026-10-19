@@ -49,6 +49,9 @@ pub const READY_LINGER: std::time::Duration = std::time::Duration::from_millis(2
 /// conclusion is what says whether the act was needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
+    /// A move's start: the work in progress saved, the container stopped,
+    /// and the agent's home carried out. Shown only for a move.
+    Leave,
     /// Other projects' VMs that no window owns, stopped for the room.
     Sweep,
     /// The guest image fetched, unpacked, and verified — once per machine.
@@ -70,7 +73,8 @@ pub enum Step {
 }
 
 impl Step {
-    pub const ALL: [Step; 9] = [
+    pub const ALL: [Step; 10] = [
+        Step::Leave,
         Step::Sweep,
         Step::GuestImage,
         Step::Vm,
@@ -84,6 +88,7 @@ impl Step {
 
     fn title(self) -> &'static str {
         match self {
+            Step::Leave => "Save work and stop container",
             Step::Sweep => "Stop unused VMs and verify capacity",
             Step::GuestImage => "Download guest image",
             Step::Vm => "Start workspace VM",
@@ -287,6 +292,9 @@ pub struct StartupPage {
     /// The start reached Running and is lingering on "ready"; a new
     /// transitional state clears it (`begin`).
     settled: Cell<bool>,
+    /// What is drawn is a move to another VM rather than a start
+    /// ([`StartupPage::on_move`]).
+    moving: Cell<bool>,
     area: gtk::DrawingArea,
     offset: Cell<f64>,
     tick: RefCell<Option<gtk::TickCallbackId>>,
@@ -393,6 +401,7 @@ impl StartupPage {
             build_steps: Cell::new((0, 0)),
             underway: Cell::new(false),
             settled: Cell::new(false),
+            moving: Cell::new(false),
             area,
             offset: Cell::new(0.0),
             tick: RefCell::new(None),
@@ -449,6 +458,9 @@ impl StartupPage {
         self.current.set(None);
         self.heading
             .set_label(&format!("{} starting", self.subject.borrow()));
+        // A start has nothing to leave; a move shows the step (`on_move`).
+        self.moving.set(false);
+        self.row(Step::Leave).row.set_visible(false);
         self.note.set_visible(false);
         self.since.set(None);
         self.build_steps.set((0, 0));
@@ -627,7 +639,13 @@ impl StartupPage {
     pub fn on_state(self: &Rc<Self>, state: &DevcontainerStateEvent, baseline: bool) {
         match state {
             DevcontainerStateEvent::Preparing { what } => {
-                self.activate(Step::for_preparing(what), None);
+                match what
+                    .split_once(": ")
+                    .filter(|(head, _)| head.starts_with("moving "))
+                {
+                    Some((head, step)) => self.on_move(head, step),
+                    None => self.activate(Step::for_preparing(what), None),
+                }
             }
             DevcontainerStateEvent::Building => self.activate(Step::Build, None),
             DevcontainerStateEvent::Starting => self.activate(Step::Start, None),
@@ -688,6 +706,33 @@ impl StartupPage {
             }
             DevcontainerStateEvent::ConfigDetected | DevcontainerStateEvent::Stopped => {}
         }
+    }
+
+    /// A step of a move to another VM (`Supervisor::begin_move`), said as
+    /// `head: step` — "moving to a VM on the current release: placing its
+    /// checkout". Drawn as a start is, from leaving the old VM to the
+    /// container up in the new one, under a heading that says it is a
+    /// move: stopped, it read as an environment at rest, with nothing
+    /// saying a move was minutes from done.
+    fn on_move(self: &Rc<Self>, head: &str, step: &str) {
+        if !self.underway.get() || self.settled.get() || !self.moving.get() {
+            self.begin();
+            self.moving.set(true);
+            self.row(Step::Leave).row.set_visible(true);
+        }
+        self.heading
+            .set_label(&format!("{} {head}", self.subject.borrow()));
+        let at = if step.starts_with("saving")
+            || step.starts_with("stopping")
+            || step.ends_with("home out")
+        {
+            Step::Leave
+        } else if step.contains("checkout") || step.contains("old VM") {
+            Step::Place
+        } else {
+            Step::Vm
+        };
+        self.activate(at, Some(step));
     }
 
     fn set_note(&self, text: &str) {
@@ -811,6 +856,23 @@ impl StartupPage {
     /// a shot has none of it.
     #[doc(hidden)]
     pub fn pose_for_probe(self: &Rc<Self>, kind: &str) {
+        // `move`: an environment moving to a VM on the current release,
+        // its work saved and its container stopped, the new VM booting.
+        if kind == "move" {
+            let head = "moving to a VM on the current release";
+            for step in ["saving its uncommitted work", "stopping its container"] {
+                self.on_move(head, step);
+            }
+            self.on_move(head, "bringing up the VM it moves to");
+            for line in [
+                "[taste-ide] taste-ed69211e7a0eb5f1-niw7xn: primary: moving in from VM taste-ed69211e7a0eb5f1-77rb1w",
+                "[taste-ide] starting the domain",
+                "[taste-ide] waiting for the guest's sshd on 127.0.0.1:32833 (up to 240s)",
+            ] {
+                self.on_vm_line(line);
+            }
+            return;
+        }
         self.begin();
         for line in [
             "[taste-ide] the domain is already running",

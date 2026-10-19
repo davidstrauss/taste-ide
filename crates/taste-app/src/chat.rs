@@ -5394,6 +5394,25 @@ impl ChatPane {
     /// topology decision disagrees with. A chat with no supervisor at all
     /// has nothing to report and reads as `Up`: the environment is not the
     /// subject of that chat's header.
+    /// What a move under way is doing to this chat's environment, in the
+    /// words its state says it in — "moving to a VM on the current
+    /// release" — or `None` when it is not moving
+    /// (`Supervisor::begin_move`).
+    fn moving_words(&self) -> Option<String> {
+        let supervisor = self.environments.get(&self.environment)?;
+        if !supervisor.is_moving() {
+            return None;
+        }
+        match supervisor.state() {
+            taste_devcontainer::SupervisorState::Preparing { what } => what
+                .split_once(": ")
+                .map(|(head, _)| head.to_string())
+                .filter(|head| head.starts_with("moving ")),
+            _ => None,
+        }
+        .or_else(|| Some("moving to another VM".to_string()))
+    }
+
     fn environment_reading(&self) -> EnvReading {
         let Some(supervisor) = self.environments.get(&self.environment) else {
             return EnvReading::Up;
@@ -5447,10 +5466,16 @@ impl ChatPane {
         let queued = self.revive_queue.borrow().len();
         let name = &self.environment;
         let text = if self.environment_in_transition() {
+            // A move says it is one: "starting" over an environment that
+            // was running a minute ago, and is minutes from running again,
+            // explained nothing.
+            let doing = self
+                .moving_words()
+                .unwrap_or_else(|| "starting".to_string());
             match queued {
-                0 => format!("{name} is starting…"),
-                1 => format!("{name} is starting — your message sends when it is up"),
-                n => format!("{name} is starting — {n} messages send when it is up"),
+                0 => format!("{name} is {doing}…"),
+                1 => format!("{name} is {doing} — your message sends when it is up"),
+                n => format!("{name} is {doing} — {n} messages send when it is up"),
             }
         } else if revive_wanted(&state, true) {
             match queued {
@@ -10841,7 +10866,12 @@ impl ChatPane {
                 // for. `schedule_reconnect` below waits for the same state.
                 // Error details are transcript-worthy otherwise; clean
                 // closes are not.
-                if self.environment_in_transition() {
+                if let Some(moving) = self.moving_words() {
+                    self.note(&format!(
+                        "the agent stopped with its container, which is {moving} — it comes back \
+                         when the move finishes"
+                    ));
+                } else if self.environment_in_transition() {
                     self.note("the agent stopped with its container — it comes back when the rebuild finishes");
                 } else if self.closed_by_environment() {
                     // Stopped rather than rebuilt: the supervisor gives up
@@ -10954,7 +10984,10 @@ impl ChatPane {
         // exactly once, when the environment settles. Waiting is not a
         // timer — it is the environment telling us where the agent goes.
         if self.environment_in_transition() {
-            self.set_status("waiting for its environment…");
+            self.set_status(&match self.moving_words() {
+                Some(moving) => format!("waiting for its environment, {moving}…"),
+                None => "waiting for its environment…".to_string(),
+            });
             return;
         }
         let attempt = self.reconnect_attempts.get() + 1;

@@ -4401,29 +4401,35 @@ impl EnvironmentRegistry {
         let old_substrate = self
             .substrate_of_vm(&old_domain)
             .with_context(|| format!("VM {old_domain} is not brought up"))?;
-        self.note_vm(
-            &old_domain,
-            match (self.host_of(env), host) {
-                (environment::Host::Local, environment::Host::Cloud) => {
-                    format!("{env}: moving to a host in the cloud")
-                }
-                (environment::Host::Cloud, environment::Host::Local) => {
-                    format!("{env}: moving to a VM on this machine")
-                }
-                _ => format!("{env}: moving to a VM on the current release"),
-            },
-        );
+        let moving = match (self.host_of(env), host) {
+            (environment::Host::Local, environment::Host::Cloud) => "moving to a host in the cloud",
+            (environment::Host::Cloud, environment::Host::Local) => {
+                "moving to a VM on this machine"
+            }
+            _ => "moving to a VM on the current release",
+        };
+        self.note_vm(&old_domain, format!("{env}: {moving}"));
+        // Said as its state from here to the start at the end, so the row,
+        // the startup page, and the chat all show a move under way rather
+        // than an environment at rest (`Supervisor::begin_move`).
+        supervisor.begin_move(&format!("{moving}: saving its uncommitted work"));
 
         // Nothing moves without a fresh snapshot: it is what carries the
         // uncommitted work.
         let for_snapshot = supervisor.clone();
-        tokio::task::spawn_blocking(move || {
+        let snapshot = tokio::task::spawn_blocking(move || {
             for_snapshot.snapshot_blocking()?;
             for_snapshot.sync_peer_blocking()
         })
         .await
-        .context("the snapshot did not finish")?
-        .context("snapshotting before the move")?;
+        .context("the snapshot did not finish")
+        .and_then(|done| done.context("snapshotting before the move"));
+        if let Err(e) = snapshot {
+            // Nothing stopped yet: it stands as it was.
+            supervisor.end_move(false);
+            return Err(e);
+        }
+        supervisor.move_step(&format!("{moving}: stopping its container"));
         if let Err(e) = supervisor.stop_orderly().await {
             self.note_vm(&old_domain, format!("{env}: stopping its container: {e:#}"));
         }
@@ -4432,10 +4438,11 @@ impl EnvironmentRegistry {
         // substrate the old VM's, its container started again — rather than
         // stopped and pointed at a VM it is not in.
         match self
-            .carry_and_place(env, &supervisor, &old_substrate, host)
+            .carry_and_place(env, &supervisor, &old_substrate, host, moving)
             .await
         {
             Ok(target) => {
+                supervisor.move_step(&format!("{moving}: clearing out the old VM"));
                 self.finish_move(
                     env,
                     &supervisor,
@@ -4450,6 +4457,7 @@ impl EnvironmentRegistry {
                 if env.is_primary() {
                     self.set_substrate(old_substrate.clone());
                 }
+                supervisor.end_move(was_running);
                 if was_running {
                     if let Err(again) = supervisor.reload().await {
                         tracing::warn!("{env} did not start again in VM {old_domain}: {again:#}");
@@ -4468,6 +4476,7 @@ impl EnvironmentRegistry {
         supervisor: &Arc<Supervisor>,
         old_substrate: &Arc<Substrate>,
         host: environment::Host,
+        moving: &str,
     ) -> Result<Vm> {
         let old_domain = old_substrate
             .vm_details()
@@ -4477,6 +4486,7 @@ impl EnvironmentRegistry {
         // host between the two VMs' podmans.
         let volume = environment::env_home_volume(&self.workspace_root, env);
         let tar = self.env_dir(env).join("home-volume.tar");
+        supervisor.move_step(&format!("{moving}: carrying its agent's home out"));
         let exported = {
             let (substrate, volume, tar) = (old_substrate.clone(), volume.clone(), tar.clone());
             tokio::task::spawn_blocking(move || export_volume(&substrate, &volume, &tar))
@@ -4484,6 +4494,7 @@ impl EnvironmentRegistry {
                 .context("exporting the home volume did not finish")??
         };
 
+        supervisor.move_step(&format!("{moving}: bringing up the VM it moves to"));
         let target = {
             let registry = self.clone();
             let grant = supervisor.grant();
@@ -4499,6 +4510,7 @@ impl EnvironmentRegistry {
             format!("{env}: moving in from VM {old_domain}"),
         );
         if exported {
+            supervisor.move_step(&format!("{moving}: carrying its agent's home in"));
             let (substrate, volume, from) = (target_substrate.clone(), volume.clone(), tar.clone());
             tokio::task::spawn_blocking(move || import_volume(&substrate, &volume, &from))
                 .await
@@ -4506,6 +4518,7 @@ impl EnvironmentRegistry {
         }
         let _ = std::fs::remove_file(&tar);
 
+        supervisor.move_step(&format!("{moving}: placing its checkout"));
         if env.is_primary() {
             self.set_substrate(target_substrate.clone());
             let (registry, vm) = (self.clone(), target.clone());
@@ -4575,6 +4588,7 @@ impl EnvironmentRegistry {
             }
         }
 
+        supervisor.end_move(was_running);
         if was_running {
             if let Err(e) = supervisor.reload().await {
                 tracing::warn!("{env} did not start again after its move: {e:#}");

@@ -637,6 +637,10 @@ pub struct Supervisor {
     /// What brings the VM this checkout is in back up, when a start finds
     /// it down (`EnvironmentRegistry::wake_vm_of`).
     waker: Mutex<Option<Placer>>,
+    /// While the registry moves this environment to another VM: the step
+    /// under way, in the row's words, and the state it was in before.
+    /// See [`Supervisor::begin_move`].
+    moving: Mutex<Option<(String, SupervisorState)>>,
     /// What gives the other environments Personal's branches
     /// (`EnvironmentRegistry::share_personal`): run by the primary after
     /// each sync with the folder, and by any other environment after it
@@ -941,6 +945,7 @@ impl Supervisor {
             checkout: Mutex::new(checkout),
             placer: Mutex::new(None),
             waker: Mutex::new(None),
+            moving: Mutex::new(None),
             sharer: Mutex::new(None),
             applied_grant: Mutex::new(None),
             substrate: Mutex::new(substrate),
@@ -990,6 +995,56 @@ impl Supervisor {
                 what: what.to_string(),
             });
         }
+    }
+
+    /// The registry's: this environment is moving to another VM, now at
+    /// `what`. From here until [`Supervisor::end_move`] its state is
+    /// `Preparing` with the step under way, whatever else happens to it —
+    /// the container's stop above all. Stopped, it read as an environment
+    /// at rest: the safe-mode banner and its start button, the chat trying
+    /// to start its agent anywhere it could, and nothing saying a move was
+    /// minutes from done.
+    pub fn begin_move(&self, what: &str) {
+        let before = self.state();
+        *self.moving.lock().unwrap() = Some((what.to_string(), before));
+        self.set_state(SupervisorState::Preparing {
+            what: what.to_string(),
+        });
+    }
+
+    /// The move's next step, said as its state.
+    pub fn move_step(&self, what: &str) {
+        let moving = {
+            let mut moving = self.moving.lock().unwrap();
+            match moving.as_mut() {
+                Some((step, _)) => {
+                    *step = what.to_string();
+                    true
+                }
+                None => false,
+            }
+        };
+        if moving {
+            self.set_state(SupervisorState::Preparing {
+                what: what.to_string(),
+            });
+        }
+    }
+
+    /// The move is over. With a start to follow (`restarting`), the state
+    /// is that start's to say, and stays at the move's last step until it
+    /// does — set back to stopped first, it read as at rest for a moment
+    /// again. Without one, the state it was in before.
+    pub fn end_move(&self, restarting: bool) {
+        let before = self.moving.lock().unwrap().take().map(|(_, before)| before);
+        if let Some(before) = before.filter(|_| !restarting) {
+            self.set_state(before);
+        }
+    }
+
+    /// Whether the registry is moving this environment.
+    pub fn is_moving(&self) -> bool {
+        self.moving.lock().unwrap().is_some()
     }
 
     /// See [`Supervisor::waker`]'s field: called by a start whose VM is not
@@ -2804,6 +2859,14 @@ impl Supervisor {
     }
 
     fn set_state(&self, state: SupervisorState) {
+        // Mid-move, what the move is doing is the state, whatever the
+        // steps of it would otherwise have said.
+        let state = match (self.moving.lock().unwrap().as_ref(), state) {
+            (Some((what, _)), state) if !matches!(state, SupervisorState::Preparing { .. }) => {
+                SupervisorState::Preparing { what: what.clone() }
+            }
+            (_, state) => state,
+        };
         *self.state.lock().unwrap() = state.clone();
         self.events.publish(Event::DevcontainerState {
             env: self.env.id.clone(),
@@ -6367,6 +6430,46 @@ mod tests {
         sup.recheck().unwrap();
         assert_eq!(sup.state(), SupervisorState::ConfigDetected);
         assert!(!sup.pending_changes());
+    }
+
+    /// A move is said as its state from start to end: the container's
+    /// stop and a recheck along the way do not show it at rest, each step
+    /// says itself, and the end puts back what it was — or, with a start
+    /// to follow, leaves the state to that start.
+    #[test]
+    fn a_move_is_preparing_from_start_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        let running = SupervisorState::Running {
+            container_id: "abc".into(),
+        };
+        sup.set_state_for_tests(running.clone());
+        sup.begin_move("moving: saving its uncommitted work");
+        assert!(sup.is_moving());
+        sup.set_state_for_tests(SupervisorState::Stopped);
+        let _ = sup.recheck();
+        assert_eq!(
+            sup.state(),
+            SupervisorState::Preparing {
+                what: "moving: saving its uncommitted work".into()
+            }
+        );
+        sup.move_step("moving: placing its checkout");
+        assert_eq!(
+            sup.state(),
+            SupervisorState::Preparing {
+                what: "moving: placing its checkout".into()
+            }
+        );
+        sup.end_move(false);
+        assert!(!sup.is_moving());
+        assert_eq!(sup.state(), running);
+
+        sup.begin_move("moving: placing its checkout");
+        sup.end_move(true);
+        assert!(matches!(sup.state(), SupervisorState::Preparing { .. }));
+        sup.set_state_for_tests(SupervisorState::Building);
+        assert_eq!(sup.state(), SupervisorState::Building, "the start says");
     }
 
     /// A checkout with no config, left in Preparing by the startup's

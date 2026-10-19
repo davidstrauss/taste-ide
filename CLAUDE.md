@@ -244,7 +244,9 @@ the VM's bring-up —, `verify` — the unpacked image's digest check partway,
 read and hashed as its row's detail —, `novm` — that bring-up failing once the image is in,
 as a host with VT-x off does —, `service` — the files service's image building
 in the VM, its podman step as the row's detail —, `place` — the checkout's seed partway,
-git's progress as its detail —, `build`, `failed`, `noconfig`, `ready`)
+git's progress as its detail —, `build`, `failed`, `noconfig`, `ready`, `move` —
+the page as a move to a VM on the current release draws it, its work saved,
+its container stopped, the new VM booting (`Supervisor::begin_move`) —)
 poses the environment's startup page — the checklist over the stripes,
 the log below, the safe-mode note on the fallback faces
 — pinned in front of the editor's strip as a real start puts it, which
