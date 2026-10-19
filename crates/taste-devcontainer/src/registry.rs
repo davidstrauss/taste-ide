@@ -344,6 +344,12 @@ pub struct EnvironmentRegistry {
     /// The files service for every environment on that VM; connected on
     /// first need and kept for as long as it answers.
     keepers: Mutex<BTreeMap<String, Arc<Keeper>>>,
+    /// Environments being made — cloned, placed, seeded — before they have
+    /// a supervisor, and the stage each is at (`creating`). A Start used to
+    /// say nothing for the minutes that takes: the row stayed queued and no
+    /// page came up until the environment existed (David, 2026-10-18: "It
+    /// should go to that immediately if I've requested startup").
+    creating: Mutex<BTreeMap<EnvironmentId, String>>,
     /// One substrate per VM of the pool that hosts an environment, by
     /// domain: the resolved one and every other the registry brought up
     /// for a restored or newly placed environment. An environment's
@@ -498,6 +504,7 @@ impl EnvironmentRegistry {
             image_records_lock: Mutex::new(()),
             free_disk_for_tests: Mutex::new(None),
             keepers: Mutex::new(BTreeMap::new()),
+            creating: Mutex::new(BTreeMap::new()),
             substrates: Mutex::new(BTreeMap::new()),
             placing_primary: Mutex::new(()),
             reconciling: tokio::sync::Mutex::new(()),
@@ -2478,7 +2485,21 @@ impl EnvironmentRegistry {
             ],
         )?;
         let keys = crate::keys::Keys::for_workspace(&self.workspace_root);
-        crate::peer::push_to_guest(peer, vm, &keys, &path, &crate::peer::PEER_REFSPECS)?;
+        // The whole repository crosses here: git's progress is the stage's
+        // detail while it does.
+        let mut pace = crate::peer::ProgressPace::default();
+        crate::peer::push_to_guest_with_progress(
+            peer,
+            vm,
+            &keys,
+            &path,
+            &crate::peer::PEER_REFSPECS,
+            &mut |p| {
+                if pace.due(p) && self.creating.lock().unwrap().contains_key(id) {
+                    self.creating_stage(id, &format!("placing its checkout: {}", p.words()));
+                }
+            },
+        )?;
         taste_git::strip_worktree(peer)?;
         Placement {
             vm: vm.domain.clone(),
@@ -2547,6 +2568,32 @@ impl EnvironmentRegistry {
 
     /// A new environment on `host`: a VM of this machine's pool, or a host
     /// in the project's cloud.
+    /// The environments being made, and the stage each is at: rows for
+    /// the panel and the backlog before there is a supervisor to ask.
+    pub fn creating(&self) -> Vec<(EnvironmentId, String)> {
+        self.creating
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, what)| (id.clone(), what.clone()))
+            .collect()
+    }
+
+    /// `id` is being made, now at `what`: said as its state, which its
+    /// startup page and its row already listen for.
+    fn creating_stage(&self, id: &EnvironmentId, what: &str) {
+        self.creating
+            .lock()
+            .unwrap()
+            .insert(id.clone(), what.to_string());
+        self.events.publish(Event::DevcontainerState {
+            env: id.clone(),
+            state: taste_core::event::DevcontainerStateEvent::Preparing {
+                what: what.to_string(),
+            },
+        });
+    }
+
     pub fn create_on(&self, id: EnvironmentId, host: environment::Host) -> Result<Arc<Supervisor>> {
         if id.is_primary() {
             bail!("the primary environment is the main checkout; it is never created");
@@ -2554,6 +2601,22 @@ impl EnvironmentRegistry {
         if self.get(&id).is_some() {
             bail!("environment {id} already exists");
         }
+        self.creating_stage(&id, "making its clone of your checkout");
+        let made = self.create_staged(id.clone(), host);
+        self.creating.lock().unwrap().remove(&id);
+        if let Err(e) = &made {
+            // Its page says how it ended; the row goes back to the queue.
+            self.events.publish(Event::DevcontainerState {
+                env: id.clone(),
+                state: taste_core::event::DevcontainerStateEvent::Failed {
+                    message: format!("{e:#}"),
+                },
+            });
+        }
+        made
+    }
+
+    fn create_staged(&self, id: EnvironmentId, host: environment::Host) -> Result<Arc<Supervisor>> {
         let repo = self.env_repo(&id);
         if repo.exists() {
             bail!("{} already exists", repo.display());
@@ -2584,9 +2647,18 @@ impl EnvironmentRegistry {
                 Ok(Some(config)) => config.grant(),
                 _ => Self::grant_of(&self.workspace_root),
             };
-            let placed = self
-                .place_by_capacity(grant, host)
-                .and_then(|vm| self.place_in_vm(&id, &repo, &vm));
+            self.creating_stage(
+                &id,
+                if host == environment::Host::Cloud {
+                    "finding it a cloud host, which can take a few minutes"
+                } else {
+                    "finding room for it in the workspace's VMs"
+                },
+            );
+            let placed = self.place_by_capacity(grant, host).and_then(|vm| {
+                self.creating_stage(&id, "placing its checkout in the VM");
+                self.place_in_vm(&id, &repo, &vm)
+            });
             match placed {
                 Ok(identity) => identity,
                 Err(e) => {
@@ -5236,6 +5308,45 @@ mod tests {
         assert!(registry.create(env("review")).is_err());
     }
 
+    /// Being made, an environment is announced from its first stage as
+    /// starting — a row and a startup page before there is a supervisor to
+    /// ask — and nothing of that is left once it exists or has failed.
+    #[test]
+    fn an_environment_being_made_says_so_from_its_first_stage() {
+        let fixture = Fixture::new();
+        let events = EventBus::new();
+        let rx = events.subscribe();
+        let registry = EnvironmentRegistry::new_for_tests(
+            fixture.workspace.path(),
+            events,
+            ExecContext::host_unsandboxed_for_tests(),
+            fixture.state.path(),
+        );
+        registry.create(env("review")).unwrap();
+        let first = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|event| match event {
+                Event::DevcontainerState { env: id, state } if id == env("review") => Some(state),
+                _ => None,
+            })
+            .expect("a state for the environment being made");
+        assert!(
+            matches!(
+                first,
+                taste_core::event::DevcontainerStateEvent::Preparing { .. }
+            ),
+            "{first:?}"
+        );
+        assert!(
+            registry.creating().is_empty(),
+            "made, so no longer being made"
+        );
+
+        // A failed one ends on its failure, and leaves no row behind.
+        let failed = registry.create(env("review"));
+        assert!(failed.is_err());
+        assert!(registry.creating().is_empty());
+    }
+
     /// Configuration that exists only uncommitted in Personal reaches a new
     /// environment, whose clone of the commit has none of it.
     #[test]
@@ -5288,10 +5399,13 @@ mod tests {
         let registry = fixture.registry();
         let events = registry.events.subscribe();
         registry.create(env("review")).unwrap();
-        assert!(matches!(
-            events.recv().await.unwrap(),
-            Event::EnvironmentCreated { env: ref id } if *id == env("review")
-        ));
+        let created = loop {
+            match events.recv().await.unwrap() {
+                Event::EnvironmentCreated { env: id } => break id,
+                _ => continue, // the stages of its making, on the way up
+            }
+        };
+        assert_eq!(created, env("review"));
 
         registry.destroy(&env("review")).await.unwrap();
         let removal = loop {

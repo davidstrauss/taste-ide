@@ -152,6 +152,30 @@ pub struct EnvFacts {
     pub working_on: Vec<taste_git::Claim>,
 }
 
+impl EnvFacts {
+    /// An environment still being made — cloned, placed, seeded — before
+    /// it has a supervisor: starting, at `what`, and nothing else known.
+    pub fn being_made(env: EnvironmentId, what: String) -> Self {
+        Self {
+            env,
+            cloud: false,
+            state: SupervisorState::Preparing { what },
+            authority: ConfigAuthority::Project,
+            pending_rebuild: false,
+            reinstating: None,
+            config_reason: None,
+            hook_failure: None,
+            chat: None,
+            git: None,
+            disk: None,
+            spend: Spend::default(),
+            shells: 0,
+            review: taste_core::ReviewState::Working,
+            working_on: Vec::new(),
+        }
+    }
+}
+
 /// An environment's status at traffic-light resolution.
 ///
 /// Three lights and an honest fourth, and the three are chosen by what the

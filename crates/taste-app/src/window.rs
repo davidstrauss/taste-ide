@@ -536,6 +536,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let startup_follow: Rc<
         RefCell<Option<Rc<dyn Fn(&taste_core::environment::EnvironmentId)>>>,
     > = Rc::new(RefCell::new(None));
+    // The environment the user just pressed Start on, while it is still
+    // being made: its startup page comes forward from its first stage, as
+    // the aimed environment's does, though nothing can be aimed at it until
+    // it exists (David, 2026-10-18: "It should go to that immediately if
+    // I've requested startup").
+    let startup_wanted: Rc<RefCell<Option<taste_core::environment::EnvironmentId>>> =
+        Rc::new(RefCell::new(None));
     let aim_panes: std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)> = {
         let startup_follow = startup_follow.clone();
         let filetree = filetree.clone();
@@ -981,6 +988,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let workspace = workspace.clone();
         let aim_panes = aim_panes.clone();
         let console = console.clone();
+        let startup_wanted = startup_wanted.clone();
         filetree.set_on_start_issue(move |issue| {
             start_issue(
                 &environments,
@@ -988,6 +996,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 &workspace,
                 &aim_panes,
                 &console,
+                &startup_wanted,
                 issue,
             )
         });
@@ -4284,7 +4293,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                 s.config_authority() == taste_core::ConfigAuthority::Baseline
                             });
                             page.on_state(&state, baseline);
-                            let aimed = filetree.aimed_environment() == env;
+                            let aimed = filetree.aimed_environment() == env
+                                || startup_wanted.borrow().as_ref() == Some(&env);
                             let bring_forward = || {
                                 if !aimed {
                                     return;
@@ -5669,6 +5679,9 @@ fn start_issue(
     workspace: &taste_core::Workspace,
     aim_panes: &std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)>,
     console: &std::rc::Rc<crate::console::Console>,
+    startup_wanted: &std::rc::Rc<
+        std::cell::RefCell<Option<taste_core::environment::EnvironmentId>>,
+    >,
     issue: crate::backlog::StartedIssue,
 ) {
     let env = match crate::environments::for_issue(&issue.id) {
@@ -5712,6 +5725,10 @@ fn start_issue(
     let aim_panes = aim_panes.clone();
     let console = console.clone();
     let registry = environments.clone();
+    // Its page comes forward at its first stage (`startup_wanted`), and
+    // the panes take over once it exists.
+    *startup_wanted.borrow_mut() = Some(env.clone());
+    let wanted = startup_wanted.clone();
     if issue.host == taste_core::environment::Host::Cloud {
         workspace.events.publish(taste_core::Event::Toast(format!(
             "Starting {env} in the cloud — a host is started or made there first, which can \
@@ -5723,6 +5740,7 @@ fn start_issue(
         env,
         issue.host,
         Box::new(move |outcome| {
+            wanted.borrow_mut().take();
             let env = match outcome {
                 Ok(env) => env,
                 Err(e) => {

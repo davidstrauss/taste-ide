@@ -1424,6 +1424,16 @@ impl Console {
             .map(|supervisor| self.facts_for(supervisor))
             .collect();
         facts.extend(self.probe_rows.borrow().iter().cloned());
+        // An environment still being made has no supervisor yet, and its
+        // row says it is starting from the moment Start is pressed.
+        let being_made: Vec<EnvFacts> = self
+            .environments
+            .creating()
+            .into_iter()
+            .filter(|(env, _)| facts.iter().all(|f| &f.env != env))
+            .map(|(env, what)| fleet::EnvFacts::being_made(env, what))
+            .collect();
+        facts.extend(being_made);
         let published = self.published.borrow();
         let rows = fleet::assemble(facts, &self.state.borrow(), &published);
         drop(published);
