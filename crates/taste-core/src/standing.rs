@@ -280,8 +280,7 @@ impl Book {
     /// Read-modify-write of the one field this owns, exactly as every other
     /// writer of the workspace state file does it.
     fn persist(&self) -> Result<()> {
-        let mut state = self.load();
-        state.standing = self
+        let standing = self
             .answers
             .as_ref()
             .map(|answers| {
@@ -295,10 +294,12 @@ impl Book {
                     .collect()
             })
             .unwrap_or_default();
+        let change = |state: &mut crate::state::WorkspaceState| state.standing = standing;
         match &self.base {
-            Some(base) => crate::state::save_to(base, &self.root, &state),
-            None => crate::state::save(&self.root, &state),
+            Some(base) => crate::state::update_in(base, &self.root, change),
+            None => crate::state::update(&self.root, change),
         }
+        .map(drop)
     }
 
     fn load(&self) -> crate::state::WorkspaceState {

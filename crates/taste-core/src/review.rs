@@ -311,15 +311,17 @@ impl Board {
     /// Read-modify-write of the one field this owns, exactly as every other
     /// writer of the workspace state file does it.
     fn persist(&self, env: &EnvironmentId, record: Option<&ReviewRecord>) -> Result<()> {
-        let mut state = self.load();
-        state.set_review(env, record.map(|r| r.state).unwrap_or_default());
-        if let Some(record) = record {
-            state.set_review_since(env, record.since.clone());
-        }
+        let change = |state: &mut crate::state::WorkspaceState| {
+            state.set_review(env, record.map(|r| r.state).unwrap_or_default());
+            if let Some(record) = record {
+                state.set_review_since(env, record.since.clone());
+            }
+        };
         match &self.base {
-            Some(base) => crate::state::save_to(base, &self.root, &state),
-            None => crate::state::save(&self.root, &state),
+            Some(base) => crate::state::update_in(base, &self.root, change),
+            None => crate::state::update(&self.root, change),
         }
+        .map(drop)
     }
 
     fn load(&self) -> crate::state::WorkspaceState {

@@ -1114,10 +1114,7 @@ impl Chats {
         let root = self.workspace.root().to_path_buf();
         // Never on the GTK thread: this reads and writes a file.
         crate::runtime::runtime().spawn_blocking(move || {
-            let mut state = taste_core::state::load(&root);
-            state.root = root.clone();
-            state.set_chats(chats);
-            if let Err(e) = taste_core::state::save(&root, &state) {
+            if let Err(e) = taste_core::state::update(&root, |state| state.set_chats(chats)) {
                 tracing::warn!("saving chats failed: {e:#}");
             }
         });

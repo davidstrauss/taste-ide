@@ -2888,10 +2888,9 @@ impl Console {
             glib::spawn_future_local(async move {
                 let named = env.clone();
                 let handle = crate::runtime::runtime().spawn_blocking(move || {
-                    let mut state = taste_core::state::load(&root);
-                    state.root = root.clone();
-                    state.set_environment_name(&named, Some(&name));
-                    taste_core::state::save(&root, &state).map(|()| state)
+                    taste_core::state::update(&root, |state| {
+                        state.set_environment_name(&named, Some(&name))
+                    })
                 });
                 let Ok(Ok(state)) = handle.await else { return };
                 let Some(console) = weak.upgrade() else {
@@ -4241,10 +4240,7 @@ fn forget_in_workspace_state(root: &Path, env: &EnvironmentId) {
     let root = root.to_path_buf();
     let env = env.clone();
     crate::runtime::runtime().spawn_blocking(move || {
-        let mut state = taste_core::state::load(&root);
-        state.root = root.clone();
-        state.forget_environment(&env);
-        if let Err(e) = taste_core::state::save(&root, &state) {
+        if let Err(e) = taste_core::state::update(&root, |state| state.forget_environment(&env)) {
             tracing::warn!("forgetting environment {env}: {e:#}");
         }
     });

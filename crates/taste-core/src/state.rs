@@ -543,6 +543,39 @@ pub fn save(root: &Path, state: &WorkspaceState) -> Result<()> {
     save_to(&state_base(), root, state)
 }
 
+/// One read-modify-write of the state file at a time, in this process.
+/// Every part of the IDE that keeps something here — the chats, the tabs,
+/// the standing answers, the reviews, the environments' names — reads the
+/// file, changes its own field, and writes the file back, from whichever
+/// blocking thread it was given. Two at once each wrote the other's field
+/// back as it was before, and lost it; and with one temporary name per
+/// process, the second rename found the first had taken its file ("saving
+/// chats failed: installing …json: No such file or directory").
+static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Change the workspace's state in place: read it, `change` it, and write
+/// it back, with no other change of this process's in between. What it
+/// wrote comes back.
+pub fn update(root: &Path, change: impl FnOnce(&mut WorkspaceState)) -> Result<WorkspaceState> {
+    update_in(&state_base(), root, change)
+}
+
+/// [`update`], under `base`.
+pub fn update_in(
+    base: &Path,
+    root: &Path,
+    change: impl FnOnce(&mut WorkspaceState),
+) -> Result<WorkspaceState> {
+    let _one = WRITING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = load_from(base, root);
+    state.root = root.to_path_buf();
+    change(&mut state);
+    write_to(base, root, &state)?;
+    Ok(state)
+}
+
 /// Write the state out **atomically**.
 ///
 /// `fs::write` truncates before it fills, so a reader arriving in that
@@ -559,10 +592,20 @@ pub fn save(root: &Path, state: &WorkspaceState) -> Result<()> {
 /// the winner's. Last close wins, and what lands is always one window's
 /// complete idea of the session.
 pub fn save_to(base: &Path, root: &Path, state: &WorkspaceState) -> Result<()> {
+    let _one = WRITING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    write_to(base, root, state)
+}
+
+fn write_to(base: &Path, root: &Path, state: &WorkspaceState) -> Result<()> {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::fs::create_dir_all(base).context("creating state dir")?;
     let path = file_for(base, root);
     let json = serde_json::to_string_pretty(state).context("serializing state")?;
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // The process and the write: no two writers ever share a temporary.
+    let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("{}-{write}.tmp", std::process::id()));
     std::fs::write(&temp, json).with_context(|| format!("writing {}", temp.display()))?;
     std::fs::rename(&temp, &path)
         .with_context(|| format!("installing {}", path.display()))
@@ -577,6 +620,41 @@ mod tests {
 
     fn env(slug: &str) -> EnvironmentId {
         EnvironmentId::parse(slug).unwrap()
+    }
+
+    /// Writers on several threads at once each keep what they wrote: no
+    /// update is written over by another's stale copy, and none fails for
+    /// want of its temporary file.
+    #[test]
+    fn concurrent_updates_keep_every_change() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/home/u/Projects/demo");
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let base = base.path().to_path_buf();
+                std::thread::spawn(move || {
+                    for round in 0..10 {
+                        update_in(&base, root, |state| {
+                            state.set_environment_name(
+                                &env(&format!("i-000{n}")),
+                                Some(&format!("writer {n}, round {round}")),
+                            );
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let state = load_from(base.path(), root);
+        for n in 0..8 {
+            assert_eq!(
+                state.environment_name(&env(&format!("i-000{n}"))),
+                Some(format!("writer {n}, round 9").as_str())
+            );
+        }
     }
 
     /// A chat of the user's own environment.

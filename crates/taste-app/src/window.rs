@@ -5174,8 +5174,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         });
                     // Update in place: fields owned elsewhere survive
                     // untouched.
-                    let mut state = taste_core::state::load(&root);
-                    state.root = root.clone();
                     // Tabs over the checkout are saved as paths in the
                     // folder the user opened, which is stable across
                     // launches; the checkout's own path is a VM's and the
@@ -5186,13 +5184,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             Err(_) => path.clone(),
                         }
                     };
-                    state.open_files = open.iter().map(|f| home(&f.path)).collect();
-                    state.active_file = open.iter().find(|f| f.active).map(|f| home(&f.path));
-                    // ...and how each was shown, every one of them: a file
-                    // with no mode saved opens as such a file opens.
-                    state.open_modes = open.iter().map(|f| (home(&f.path), f.mode)).collect();
-                    state.set_chats(chats_now);
-                    let saved = taste_core::state::save(&root, &state).map_err(|e| {
+                    let saved = taste_core::state::update(&root, |state| {
+                        state.open_files = open.iter().map(|f| home(&f.path)).collect();
+                        state.active_file = open.iter().find(|f| f.active).map(|f| home(&f.path));
+                        // ...and how each was shown, every one of them: a
+                        // file with no mode saved opens as such a file
+                        // opens.
+                        state.open_modes = open.iter().map(|f| (home(&f.path), f.mode)).collect();
+                        state.set_chats(chats_now);
+                    })
+                    .map(drop)
+                    .map_err(|e| {
                         tracing::warn!("saving workspace state failed: {e:#}");
                         format!("{e:#}")
                     });
