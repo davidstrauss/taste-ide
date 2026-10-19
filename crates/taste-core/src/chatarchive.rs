@@ -38,6 +38,20 @@
 //! envelope with a timestamp in it, and the caller owns what the envelope
 //! carries.
 //!
+//! **A session's history is marked where it begins** ([`ChatArchive::mark_session`]):
+//! a record whose payload is `{"tasteSession": "<id>"}` instead of an
+//! update, which no older reader takes for one. The records after the last
+//! marker for a session are that session's whole conversation — the user's
+//! messages included, which the stash once lacked because they never
+//! arrive as live updates — so a chat can reconnect with `session/resume`,
+//! which sends no history, and draw its history from here
+//! ([`Loaded::session`]). A stash with no marker for the session, written
+//! before markers were, is rewritten whole from the next `session/load`'s
+//! replay ([`ChatArchive::replace`]). The marker's id is also kept beside
+//! the stash (`<env>.session`), so whether a session can be resumed is a
+//! read of a few bytes rather than of the whole conversation
+//! ([`ChatArchive::marked_session`]).
+//!
 //! **Retention is seven days** ([`RETENTION`]), swept by mtime. "Delete old
 //! chat archives after 7 days" — so an archive restored after a fortnight
 //! finds nothing and starts fresh, which is the intended outcome and not a
@@ -69,6 +83,14 @@ pub struct ArchivedUpdate {
     pub at: u64,
     /// The ACP `SessionUpdate` exactly as it arrived.
     pub update: serde_json::Value,
+}
+
+/// The key of a session marker's payload.
+pub const SESSION_MARKER: &str = "tasteSession";
+
+/// The session a record marks the start of, when it is a marker.
+pub fn marker_of(record: &ArchivedUpdate) -> Option<&str> {
+    record.update.get(SESSION_MARKER)?.as_str()
 }
 
 /// One workspace's stashed conversations, one file per environment.
@@ -107,6 +129,62 @@ impl ChatArchive {
     /// escaping here.
     pub fn path_for(&self, env: &EnvironmentId) -> PathBuf {
         self.dir.join(format!("{env}.jsonl"))
+    }
+
+    /// Where the id of the session last marked in an environment's stash
+    /// is kept.
+    fn session_path_for(&self, env: &EnvironmentId) -> PathBuf {
+        self.dir.join(format!("{env}.session"))
+    }
+
+    /// The session whose history the stash holds from its marker on, if
+    /// any: what a reconnect may `session/resume` without a replay.
+    pub fn marked_session(&self, env: &EnvironmentId) -> Option<String> {
+        std::fs::read_to_string(self.session_path_for(env))
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            // A marker without the stash it marks is nothing to resume.
+            .filter(|_| self.has(env))
+    }
+
+    /// Mark where `session`'s history begins: everything appended after
+    /// this, until another marker, is that session's conversation.
+    pub fn mark_session(&self, env: &EnvironmentId, session: &str) -> Result<()> {
+        self.append_all(env, vec![serde_json::json!({ SESSION_MARKER: session })])?;
+        std::fs::write(self.session_path_for(env), session)
+            .with_context(|| format!("recording {env}'s session"))
+    }
+
+    /// Replace the stash with `session`'s whole history, `updates`, oldest
+    /// first: what a `session/load` replayed, which is complete where the
+    /// live stash was not. Written beside and renamed over.
+    pub fn replace(
+        &self,
+        env: &EnvironmentId,
+        session: &str,
+        updates: Vec<serde_json::Value>,
+    ) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating {}", self.dir.display()))?;
+        let at = now_secs();
+        let mut text = String::new();
+        let marker = serde_json::json!({ SESSION_MARKER: session });
+        for update in std::iter::once(marker).chain(updates) {
+            let record = ArchivedUpdate { at, update };
+            text.push_str(&serde_json::to_string(&record).context("serialising a chat update")?);
+            text.push('\n');
+        }
+        let path = self.path_for(env);
+        let staged = path.with_extension("jsonl.replace");
+        std::fs::write(&staged, &text).with_context(|| format!("writing {}", staged.display()))?;
+        std::fs::rename(&staged, &path).with_context(|| format!("replacing {}", path.display()))?;
+        std::fs::write(self.session_path_for(env), session)
+            .with_context(|| format!("recording {env}'s session"))?;
+        if text.len() as u64 > MAX_STASH_BYTES {
+            self.keep_newest(&path, MAX_STASH_BYTES / 2)?;
+        }
+        Ok(())
     }
 
     /// Whether this environment has a conversation stashed — the question
@@ -175,9 +253,20 @@ impl ChatArchive {
             .iter()
             .position(|&b| b == b'\n')
             .map_or(text.len(), |i| cut + i + 1);
+        // The last marker in what goes is the session what stays begins in:
+        // kept at the top, so the session's history is still found, its
+        // oldest part gone as a trimmed stash's always is.
+        let marker = text[..start].lines().rev().find(|line| {
+            serde_json::from_str::<ArchivedUpdate>(line)
+                .ok()
+                .is_some_and(|record| marker_of(&record).is_some())
+        });
+        let kept = match marker {
+            Some(marker) => format!("{marker}\n{}", &text[start..]),
+            None => text[start..].to_string(),
+        };
         let staged = path.with_extension("jsonl.trim");
-        std::fs::write(&staged, &text[start..])
-            .with_context(|| format!("writing {}", staged.display()))?;
+        std::fs::write(&staged, kept).with_context(|| format!("writing {}", staged.display()))?;
         std::fs::rename(&staged, path).with_context(|| format!("replacing {}", path.display()))
     }
 
@@ -207,6 +296,7 @@ impl ChatArchive {
     /// Forget one environment's conversation — its environment is gone, or
     /// the user asked.
     pub fn forget(&self, env: &EnvironmentId) -> Result<()> {
+        let _ = std::fs::remove_file(self.session_path_for(env));
         let path = self.path_for(env);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -261,6 +351,21 @@ impl Loaded {
     pub fn is_empty(&self) -> bool {
         self.updates.is_empty()
     }
+
+    /// `session`'s history: the records after its last marker, markers of
+    /// other sessions excluded — `None` when the stash never marked it.
+    pub fn session(&self, session: &str) -> Option<Vec<&ArchivedUpdate>> {
+        let start = self
+            .updates
+            .iter()
+            .rposition(|record| marker_of(record) == Some(session))?;
+        Some(
+            self.updates[start + 1..]
+                .iter()
+                .take_while(|record| marker_of(record).is_none())
+                .collect(),
+        )
+    }
 }
 
 fn now_secs() -> u64 {
@@ -273,6 +378,61 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session's history is what follows its marker, until another
+    /// session's; a replace puts a whole history under one; a trim keeps
+    /// the marker the remaining records belong to.
+    #[test]
+    fn a_session_is_found_by_its_marker_through_replace_and_trim() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = ChatArchive::at(dir.path().to_path_buf());
+        let env = EnvironmentId::primary();
+        archive
+            .append_all(&env, vec![serde_json::json!({"sessionUpdate": "old"})])
+            .unwrap();
+        assert_eq!(archive.marked_session(&env), None);
+        archive.mark_session(&env, "s1").unwrap();
+        archive
+            .append_all(
+                &env,
+                vec![serde_json::json!({"n": 1}), serde_json::json!({"n": 2})],
+            )
+            .unwrap();
+        assert_eq!(archive.marked_session(&env).as_deref(), Some("s1"));
+        let loaded = archive.load(&env);
+        assert_eq!(loaded.session("s1").unwrap().len(), 2);
+        assert!(loaded.session("s0").is_none());
+
+        archive.mark_session(&env, "s2").unwrap();
+        archive
+            .append_all(&env, vec![serde_json::json!({"n": 3})])
+            .unwrap();
+        let loaded = archive.load(&env);
+        assert_eq!(
+            loaded.session("s1").unwrap().len(),
+            2,
+            "up to the next marker"
+        );
+        assert_eq!(loaded.session("s2").unwrap().len(), 1);
+
+        archive
+            .replace(
+                &env,
+                "s3",
+                (0..5).map(|n| serde_json::json!({"n": n})).collect(),
+            )
+            .unwrap();
+        let loaded = archive.load(&env);
+        assert_eq!(loaded.session("s3").unwrap().len(), 5);
+        assert!(loaded.session("s1").is_none(), "replaced whole");
+
+        // Trimmed: the marker of the records that stay is kept.
+        let path = archive.path_for(&env);
+        archive.keep_newest(&path, 60).unwrap();
+        let loaded = archive.load(&env);
+        let kept = loaded.session("s3").expect("the marker survives the trim");
+        assert!(!kept.is_empty() && kept.len() < 5, "{}", kept.len());
+    }
     use serde_json::json;
 
     #[test]
