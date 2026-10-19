@@ -492,15 +492,22 @@ is special-cased by where it came from. On a reconnect, a session whose
 whole history is in the record is resumed (`session/resume`, which
 replays nothing) and drawn from the record; one that is not is loaded
 (`session/load`), and its replay, being complete, replaces the record.
-Either way only the last stretch is drawn: the record is cut into
+Either way only the last stretch is drawn. The record is cut into
 stretches (`taste_core::stretches` — at each user message, and inside a
-long turn between settled steps), and the transcript is virtual, with
-the stretches within a page or so of the view as rows and the rest as
-spacers of their measured or estimated height, drawn and let go as the
-reader scrolls (`ChatPane::reconcile`). The row budget is a performance
-limit, not a horizon: the reader can scroll to the first message the
-record holds (up to the newest 32 MiB of it), and the scroll anchor holds their
-place while what is around them is drawn.
+turn between settled steps, so most are a step and the words after it),
+and the transcript is GTK's own virtualized list (`gtk::ListView`) with
+one item per stretch. An item shows its stretch's rows once they are
+drawn and a placeholder of their estimated height until then; a stretch
+is drawn from its records when its item comes on screen, and the few
+either side of it with it, a slice of a frame at a time, into a list of
+its own that replaces the placeholder whole (`ChatPane::build_step`).
+The list keeps the reader's place as items change height, binds only the
+items near the view, and recycles their widgets; drawn stretches far
+from the reader are let go, a few a frame, and drawn again when they
+come back. The live stretch is simply the last item, drawn as it
+happens. The row budget is a performance limit, not a horizon: the
+reader can scroll to the first message the record holds (up to the
+newest 32 MiB of it).
 
 **What mediation is for.** The IDE still serves the agent files, search
 and commands, and it is worth being exact about why:

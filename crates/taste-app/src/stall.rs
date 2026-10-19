@@ -159,8 +159,14 @@ pub struct Pacer {
 /// How long a main-thread loop works before it lets a frame through.
 const PACE: Duration = Duration::from_millis(8);
 
-/// Just after a frame: below GDK's redraw priority (120), above idle (200).
-pub const AFTER_FRAME: i32 = 130;
+/// How long main-thread work that yields stands aside before it goes on:
+/// long enough that a frame waiting runs first, whatever its priority.
+/// Yielding at a lower priority than GDK's redraw instead (idle, or just
+/// below redraw) waited for a moment the loop never reached while a frame
+/// clock ran back to back — a spinner, frames slower than the display's,
+/// a reader scrolling — and the work stopped there: a drawn history
+/// halfway, a transcript whose stretches on screen were never drawn.
+pub const GAP: Duration = Duration::from_millis(2);
 
 impl Pacer {
     pub fn new() -> Self {
@@ -170,17 +176,19 @@ impl Pacer {
     }
 
     /// Give GTK a turn if this loop has had the thread for [`PACE`]: a
-    /// frame waiting goes first (GDK draws at priority 120), and then this
-    /// loop goes on. At idle priority it waited for the loop to be idle,
-    /// which a frame clock running back to back — a spinner, frames slower
-    /// than the display's — never is, and a drawn history stopped halfway.
+    /// frame waiting goes first, and then this loop goes on ([`GAP`]).
     pub async fn breathe(&mut self) {
         if self.since.elapsed() >= PACE {
-            glib::timeout_future_with_priority(glib::Priority::from(AFTER_FRAME), Duration::ZERO)
-                .await;
+            glib::timeout_future(GAP).await;
             self.since = Instant::now();
         }
     }
+}
+
+/// Run `work` once, after [`GAP`]: work that does a slice and comes back
+/// for the next, with every frame waiting in between.
+pub fn after_a_gap(work: impl FnOnce() + 'static) {
+    glib::timeout_add_local_once(GAP, work);
 }
 
 #[cfg(test)]

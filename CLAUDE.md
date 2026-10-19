@@ -132,10 +132,10 @@ real replay so the frame is a state the code can reach —, `history` — a
 conversation of `TASTE_PROBE_TURNS` turns (400) drawn from its record as a
 restore draws it, then read a page at a time up to its first message, a
 jump to the middle, and back down, printing the rows and stretches drawn,
-the turn at the top of the view, and the longest the main thread was held
-at each step, and what each stretch drawn back cost in all and in its
-longest slice (`TASTE_PROBE_HISTORY_AT=middle` jumps to the middle and
-stays, for the shot; `TASTE_PROBE_HISTORY_FILE=<a stash .jsonl>` draws a
+the turn at the top of the view, the longest the main thread was held and
+the longest a page waited for what came on screen to be drawn, at each
+step, and what each stretch drawn cost in all and in its longest slice
+(`TASTE_PROBE_HISTORY_AT=middle` jumps to the middle and stays, for the shot; `TASTE_PROBE_HISTORY_FILE=<a stash .jsonl>` draws a
 real conversation instead — copy one under `target/`, never commit it);
 give it `TASTE_PROBE_DELAY_MS=150000` —, `roundtrip` — a
 conversation lived the way the event handler and a send live it, every
@@ -601,23 +601,23 @@ to.
   spawns, or network on it (offload via `runtime().spawn_blocking` and
   apply results with `glib::spawn_future_local`). Per-keystroke work must be
   bounded or coalesced (see the markdown restyle debounce). Widget lists are
-  virtualized: a `ListView`, or the transcript's stretches drawn near the
-  reader and spacers for the rest (`ChatPane::reconcile`; ARCHITECTURE →
-  "A transcript is drawn from its record"). Measure before
+  virtualized `ListView`s — the transcript's included, an item per
+  stretch of the conversation, drawn when it comes on screen (ARCHITECTURE
+  → "A transcript is drawn from its record"). Measure before
   shipping hot paths: `cargo test -p <crate> perf_ -- --ignored --nocapture`
   runs the in-repo profiling harness; for frame-level analysis run the GUI
   under sysprof or `GDK_DEBUG=frames`. Transcript scrolling has a probe of
   its own: `TASTE_PROBE_CHECK=1 TASTE_PROBE_SCROLL=1
-  TASTE_PROBE_DELAY_MS=60000` fills the transcript to its row cap and
+  TASTE_PROBE_DELAY_MS=60000` fills the transcript with 200 rows and
   scrolls it down and back up, printing each frame's work and the time
   between frames (`=prose`, `=shell`, `=edit` for one kind of row,
   `TASTE_PROBE_SCROLL_ROWS=N` for fewer rows). `TASTE_PROBE_ANCHOR=1` (with
-`TASTE_PROBE_CHAT=busy`) parks the transcript mid-history, as a reader up
-it has it, and prints whether the row at the top of the view stayed put
-through what used to move it — the oldest row let go, a row put in above,
-rows added below, the row cap reached — `held` or `MOVED` for each (its
-row put in above trips one GTK allocation CRITICAL of its own, with or
-without the anchoring). `TASTE_PROBE_SELECT=1` (with
+`TASTE_PROBE_CHAT=busy`) draws sixty turns from their record, parks the
+transcript mid-history, as a reader up it has it, watches it left alone for
+six seconds, and then prints whether the row at the top of the view stayed
+put through what could move it — rows added below, a tall row put in a
+stretch above the view, the far stretches let go, hundreds more rows below
+— `held` or `MOVED` for each. `TASTE_PROBE_SELECT=1` (with
 `TASTE_PROBE_PREVIEW=<a long .md>`) grows a selection across the preview's
 longest label a step a frame, as a drag does, and prints its frames;
 `=nomap` hides the overview strip first, which tells the label's cost apart

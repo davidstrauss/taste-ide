@@ -418,8 +418,6 @@ const SEND_TOOLTIP_QUEUED: &str = "Queue — sends when the current turn ends";
 /// model is writing and there is genuinely nothing more specific to report.
 const BUSY_IDLE: &str = "Working…";
 
-const MAX_TRANSCRIPT_ROWS: u32 = 200;
-
 /// The key of a note the IDE put in a conversation, as its record holds it
 /// (`ChatPane::record`): beside the agent's updates and the user's
 /// messages, the third thing a transcript is drawn from.
@@ -499,6 +497,32 @@ fn continues_turn(records: &[serde_json::Value]) -> bool {
         == Some("tool_call")
 }
 
+/// Which stretch a transcript item's holder is showing, as its bind says.
+const HOLDER_INDEX: &str = "taste-stretch-index";
+
+fn set_holder_index(holder: &gtk::Box, index: Option<usize>) {
+    // SAFETY: the key is private to this file and is only ever set to, and
+    // read as, an `Option<usize>` — here and in `holder_index`.
+    unsafe { holder.set_data::<Option<usize>>(HOLDER_INDEX, index) };
+}
+
+fn holder_index(holder: &gtk::Box) -> Option<usize> {
+    // SAFETY: see `set_holder_index`.
+    unsafe {
+        holder
+            .data::<Option<usize>>(HOLDER_INDEX)
+            .and_then(|index| *index.as_ref())
+    }
+}
+
+/// A stretch's list of rows, as every stretch's is made.
+fn stretch_list() -> gtk::ListBox {
+    gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["background", "transcript"])
+        .build()
+}
+
 /// What a stretch of the conversation is drawn with: the renderer's state
 /// partway through it — the block streaming, the steps that may still be
 /// updated, the rail's last dot, the message being assembled. The pane's
@@ -522,115 +546,78 @@ struct Drawing {
     last_prompt_row: Option<gtk::ListBoxRow>,
 }
 
-/// A stretch of the conversation (`taste_core::stretches`): its records,
-/// and either the rows drawn from them or, let go, the height it stands in
-/// for.
+/// A stretch of the conversation (`taste_core::stretches`) as the
+/// transcript holds it: one item of its list, its records, and — once it
+/// has been drawn — its rows, in a list of their own.
 struct Stretch {
     records: Vec<serde_json::Value>,
-    /// Its rows while drawn. A row taken out by something else (a card
-    /// withdrawn) stays listed, and is passed over.
-    rows: Vec<gtk::ListBoxRow>,
-    hidden: bool,
-    /// How tall it was when last let go: what its space is, when known.
-    height: Option<f64>,
-    /// How tall its records say it is, before the measured scale.
-    estimate: f64,
-    /// The row that stands in for the run of hidden stretches this one
-    /// begins.
-    spacer: Option<gtk::ListBoxRow>,
+    /// Its rows, once drawn: live as they happened, or from its records
+    /// the first time the list showed it ([`ChatPane::stretch_rows`]).
+    /// `None` until then, and again once let go far from the reader
+    /// ([`ChatPane::let_go_far`]).
+    rows: Option<gtk::ListBox>,
 }
 
-impl Stretch {
-    fn new(records: Vec<serde_json::Value>, hidden: bool) -> Self {
-        Self {
-            estimate: estimate_height(&records),
-            records,
-            rows: Vec::new(),
-            hidden,
-            height: None,
-            spacer: None,
-        }
-    }
-
-    fn space(&self, scale: f64) -> f64 {
-        self.height.unwrap_or(self.estimate * scale)
-    }
-}
-
-/// The conversation as the transcript holds it: every stretch in order,
-/// some drawn, the rest standing in as space (DESIGN in
-/// [`ChatPane::reconcile`]).
+/// The conversation as the transcript holds it: every stretch in order.
+#[derive(Default)]
 struct Stretches {
     list: Vec<Stretch>,
     /// Where the live conversation's next stretch begins.
     segmenter: taste_core::stretches::Segmenter,
-    /// The stretch being drawn back, whose rows land where it is rather
-    /// than at the end.
-    drawing: Option<usize>,
-    /// Measured over estimated, as stretches are let go: what an
-    /// estimate is corrected by.
-    scale: f64,
-}
-
-impl Default for Stretches {
-    fn default() -> Self {
-        Self {
-            list: Vec::new(),
-            segmenter: Default::default(),
-            drawing: None,
-            scale: 1.0,
-        }
-    }
 }
 
 impl Stretches {
-    /// A live record: into the last stretch, or one it begins.
-    fn read(&mut self, record: &serde_json::Value) {
-        // A stretch with rows and no records yet (a card drawn before the
-        // message it is for was recorded) is the one this begins.
-        let open = self.list.last().is_some_and(|last| last.records.is_empty());
-        if (self.segmenter.begins(record) && !open) || self.list.is_empty() {
-            self.list.push(Stretch::new(Vec::new(), false));
-        }
-        if let Some(last) = self.list.last_mut() {
-            last.records.push(record.clone());
-            last.estimate = estimate_height(&last.records);
-        }
-    }
-
-    /// A row drawn: the stretch being drawn back has it, or the last.
-    fn adopt(&mut self, row: &gtk::ListBoxRow) {
-        if self.list.is_empty() {
-            self.list.push(Stretch::new(Vec::new(), false));
-        }
-        let index = self.drawing.unwrap_or(self.list.len() - 1);
-        if let Some(stretch) = self.list.get_mut(index) {
-            stretch.rows.push(row.clone());
-        }
-    }
-
-    /// Where in `list`'s rows the first row of stretch `index` goes: after
-    /// the last widget of any stretch before it.
-    fn position_after(&self, index: usize, transcript: &gtk::ListBox) -> i32 {
-        let parent: &gtk::Widget = transcript.upcast_ref();
-        for stretch in self.list[..index].iter().rev() {
-            let last = stretch
-                .rows
-                .iter()
-                .rev()
-                .find(|row| row.parent().as_ref() == Some(parent))
-                .or(stretch.spacer.as_ref());
-            if let Some(row) = last {
-                return row.index() + 1;
-            }
-        }
-        0
+    /// Whether a live record begins a stretch of its own. A stretch with
+    /// nothing drawn from its records yet — a card drawn before the message
+    /// it is for was recorded, or only the session's marker — is the one
+    /// it begins, as a history is cut (`taste_core::stretches::cut`).
+    fn begins(&mut self, record: &serde_json::Value) -> bool {
+        let open = self
+            .list
+            .last()
+            .is_some_and(|last| !last.records.iter().any(taste_core::stretches::draws));
+        (self.segmenter.begins(record) && !open) || self.list.is_empty()
     }
 }
 
-/// How tall a stretch's records will draw, roughly, in pixels: what its
-/// space is until it has been drawn and measured. Errs are corrected by
-/// [`Stretches::scale`] and absorbed by the scroll anchor.
+/// How many stretches keep their rows while far from the reader: the rest
+/// are drawn again from their records when the list next shows them.
+const KEEP_DRAWN: usize = 120;
+
+/// How many stretches a pass lets go of ([`ChatPane::let_go_far`]).
+const LET_GO_AT_ONCE: usize = 8;
+
+/// The most of a frame drawing stretches takes ([`ChatPane::build_step`]).
+const BUILD_SLICE: std::time::Duration = std::time::Duration::from_millis(6);
+
+/// The most of a slow frame drawing stretches takes.
+const BUILD_SLICE_MOST: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// How far from the reader a stretch wanted on screen stays wanted: past
+/// it, the reader has moved on, and it is drawn if they come back.
+const BUILD_REACH: usize = 24;
+
+/// How many stretches either side of one on screen are drawn ahead of the
+/// reader reaching them.
+const BUILD_AHEAD: usize = 3;
+
+/// A stretch being drawn from its records a slice at a time, into a list
+/// of its own that the transcript shows once it is whole.
+struct StretchJob {
+    index: usize,
+    records: std::vec::IntoIter<serde_json::Value>,
+    drawing: Drawing,
+    rows: gtk::ListBox,
+    /// The stretch after it goes on from its last step.
+    followed: bool,
+    started: std::time::Instant,
+    longest: std::time::Duration,
+}
+
+/// How tall a stretch's records will draw, roughly, in pixels: the
+/// placeholder's height until it is drawn. Errs are corrected by the
+/// measured scale ([`ChatPane::estimate`]) and absorbed by the list,
+/// which holds the reader's place as an item's height changes.
 fn estimate_height(records: &[serde_json::Value]) -> f64 {
     let text = |record: &serde_json::Value| {
         record
@@ -663,15 +650,10 @@ fn estimate_height(records: &[serde_json::Value]) -> f64 {
         }
     }
     let lines = |chars: usize, per: f64| (chars as f64 / per).ceil();
-    // Something to draw is never no space: a run of hidden stretches
-    // estimated at nothing has a spacer nothing is ever near.
-    if !records.is_empty() {
-        px = px.max(24.0);
-    }
     if asked > 0 {
         px += 48.0 + 22.0 * lines(asked, 48.0);
     }
-    px + 22.0 * lines(said, 64.0)
+    (px + 22.0 * lines(said, 64.0)).max(24.0)
 }
 
 /// The record of one block of the user's message: the update a replay
@@ -681,22 +663,6 @@ fn user_record(block: &ContentBlock) -> serde_json::Value {
         agent_client_protocol::schema::v1::ContentChunk::new(block.clone()),
     ))
     .unwrap_or_default()
-}
-
-/// The most of a frame a stretch being drawn back takes
-/// ([`ChatPane::continue_stretch`]).
-const STRETCH_SLICE: std::time::Duration = std::time::Duration::from_millis(6);
-
-/// A stretch being drawn back a slice at a time: what is left of its
-/// records, and its drawing between slices.
-struct StretchJob {
-    index: usize,
-    records: std::vec::IntoIter<serde_json::Value>,
-    drawing: Drawing,
-    /// The stretch after it goes on from its last step.
-    followed: bool,
-    started: std::time::Instant,
-    longest: std::time::Duration,
 }
 
 /// Whether `update` draws rows, rather than setting the chat's state.
@@ -710,11 +676,6 @@ fn draws_rows(update: &SessionUpdate) -> bool {
             | SessionUpdate::ToolCallUpdate(_)
             | SessionUpdate::Plan(_)
     )
-}
-
-/// Whether a spacer row is what `row` is.
-fn is_spacer(row: &gtk::Widget) -> bool {
-    row.widget_name() == "stretch-spacer"
 }
 
 /// The orchestrator's glyph, beside the chat's own name in its header.
@@ -851,7 +812,20 @@ impl ToolCard {
 pub struct ChatPane {
     pub widget: gtk::Box,
     workspace: Workspace,
-    transcript: gtk::ListBox,
+    /// The transcript: one item per stretch of the conversation, each
+    /// showing that stretch's rows (`Stretch::rows`), and the foot.
+    list: gtk::ListView,
+    store: gtk::gio::ListStore,
+    /// The room under the last row (`sync_bottom_room`): the last
+    /// stretch's rows' bottom margin. An item of its own, it was the
+    /// smallest in the list, which sizes how many items it keeps ready by
+    /// its smallest.
+    foot_room: Cell<i32>,
+    /// The empty chat's page, or the transcript.
+    transcript_stack: gtk::Stack,
+    /// Where the rows being drawn go, while a stretch is drawn from its
+    /// records: its own list. Otherwise rows go to the last stretch's.
+    sink: RefCell<Option<gtk::ListBox>>,
     transcript_scroller: gtk::ScrolledWindow,
     /// Pinned copy of the last user prompt: overlays the transcript's top
     /// edge whenever the real card is scrolled out of view above it, so
@@ -1078,7 +1052,6 @@ pub struct ChatPane {
     /// height above it — a reply drawn as Markdown, a card filling in, a
     /// row moved or let go — the view follows the row (`keep_anchor`), so
     /// nothing they are reading moves but by their hand.
-    scroll_anchor: RefCell<Option<(gtk::Widget, f64)>>,
     /// "Jump to the newest" banner, revealed when content lands while the
     /// user is reading further up.
     jump_banner: gtk::Revealer,
@@ -1292,15 +1265,25 @@ pub struct ChatPane {
     drawing_past: Cell<bool>,
     /// The conversation as stretches, drawn and not (`reconcile`).
     stretches: RefCell<Stretches>,
-    /// Where `append_row` puts the next row while a stretch is drawn back.
-    insert_at: Cell<Option<i32>>,
     reconcile_pending: Cell<bool>,
     /// TASTE_PROBE_CHECK only: say what each stretch drawn back cost.
     probe_timing: Cell<bool>,
-    /// The stretch being drawn back, between its slices.
-    stretch_job: RefCell<Option<StretchJob>>,
     /// Drawing from the record, this moment ([`ChatPane::as_recorded`]).
     from_record: Cell<bool>,
+    /// The stretches wanted on screen and not yet drawn, nearest first,
+    /// and the one being drawn ([`ChatPane::build_step`]).
+    build_queue: RefCell<std::collections::VecDeque<usize>>,
+    build_job: RefCell<Option<StretchJob>>,
+    build_scheduled: Cell<bool>,
+    /// When the last slice ended, while more were to come.
+    build_last: Cell<Option<std::time::Instant>>,
+    /// Measured over estimated, as drawn stretches are laid out.
+    est_scale: Cell<f64>,
+    /// The stretch that last came on screen: where the reader is.
+    reader_at: Cell<usize>,
+    /// The item showing each stretch the list has bound, so what is
+    /// drawn first is what is on screen ([`ChatPane::next_to_draw`]).
+    holders: RefCell<HashMap<usize, glib::WeakRef<gtk::Box>>>,
     /// A prompt's records and rows being gathered (`send_blocks`).
     holding: RefCell<Option<Unrecorded>>,
     /// The stash's reads and writes, in the order they were asked for
@@ -2850,12 +2833,17 @@ impl ChatPane {
 
         // The transcript: a list of message cards. When empty, a native
         // placeholder invites the first prompt instead of blank space.
-        let transcript = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["background", "transcript"])
-            // The resting foot, from the first frame; `sync_bottom_room`
-            // grows it while something floats over the tail.
-            .margin_bottom(TRANSCRIPT_FOOT)
+        // The transcript is GTK's own virtualized list over the
+        // conversation's stretches: only those near the view have rows, the
+        // list keeps the reader's place as they are drawn, and each is
+        // drawn from its records the first time it is shown (David,
+        // 2026-10-19: "When I scroll back and have messages loading, it's
+        // honestly a mess. Is there a robust foundation we could put these
+        // chats on?").
+        let store = gtk::gio::ListStore::new::<glib::BoxedAnyObject>();
+        let list = gtk::ListView::builder()
+            .model(&gtk::NoSelection::new(Some(store.clone())))
+            .css_classes(["background", "transcript-items"])
             .build();
         // Under the placeholder's logo when a restore fell through: the
         // fresh chat was forced, not chosen. A transcript row would hide
@@ -2905,10 +2893,9 @@ impl ChatPane {
             body.append(&restore_notice);
             body.append(&keys);
             placeholder.set_child(Some(&body));
-            transcript.set_placeholder(Some(&placeholder));
         }
         let transcript_scroller = gtk::ScrolledWindow::builder()
-            .child(&transcript)
+            .child(&list)
             .name("transcript")
             .vexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -3657,7 +3644,12 @@ impl ChatPane {
 
         let options_overlay = gtk::Overlay::new();
         options_overlay.set_vexpand(true);
-        options_overlay.set_child(Some(&transcript_scroller));
+        // The empty chat's page until there is a row, then the transcript.
+        let transcript_stack = gtk::Stack::new();
+        transcript_stack.add_named(&placeholder, Some("empty"));
+        transcript_stack.add_named(&transcript_scroller, Some("list"));
+        transcript_stack.set_visible_child_name("empty");
+        options_overlay.set_child(Some(&transcript_stack));
         options_overlay.add_overlay(&pinned_float);
         // The jumps float over the transcript and under the shades.
         options_overlay.add_overlay(&jump.widget);
@@ -3682,7 +3674,11 @@ impl ChatPane {
         let pane = Rc::new(Self {
             widget,
             workspace,
-            transcript,
+            list,
+            store,
+            foot_room: Cell::new(TRANSCRIPT_FOOT),
+            transcript_stack,
+            sink: RefCell::new(None),
             transcript_scroller,
             pinned_float: pinned_float.clone(),
             pinned_prompt_label,
@@ -3767,7 +3763,6 @@ impl ChatPane {
             quiet_tick: RefCell::new(None),
             weak_self: RefCell::new(std::rc::Weak::new()),
             stick_to_bottom: Rc::new(Cell::new(true)),
-            scroll_anchor: RefCell::new(None),
             jump_banner: jump_banner.clone(),
             pinned_plate: pinned_plate.clone(),
             open_jump_up: open_jump_up.clone(),
@@ -3817,11 +3812,16 @@ impl ChatPane {
             drawing_history: Cell::new(false),
             drawing_past: Cell::new(false),
             stretches: RefCell::new(Stretches::default()),
-            insert_at: Cell::new(None),
             reconcile_pending: Cell::new(false),
             probe_timing: Cell::new(false),
-            stretch_job: RefCell::new(None),
             from_record: Cell::new(false),
+            build_queue: RefCell::new(std::collections::VecDeque::new()),
+            build_job: RefCell::new(None),
+            build_scheduled: Cell::new(false),
+            build_last: Cell::new(None),
+            est_scale: Cell::new(1.0),
+            reader_at: Cell::new(0),
+            holders: RefCell::new(HashMap::new()),
             holding: RefCell::new(None),
             archive_io: RefCell::new(None),
             after_history: Cell::new(false),
@@ -3949,30 +3949,111 @@ impl ChatPane {
             });
         }
 
-        // The reader's place, held: noted as they scroll, kept as the
-        // transcript's layout changes under it. After the tail's handlers,
-        // so `stick_to_bottom` is already this scroll's answer.
+        // Each of the transcript's items shows its stretch's rows, drawn
+        // from its records the first time the list shows it; the last item
+        // is the foot. A list widget holds only the items near the view,
+        // so what is bound here is what the reader is near.
+        {
+            let factory = gtk::SignalListItemFactory::new();
+            let weak = Rc::downgrade(&pane);
+            factory.connect_setup(move |_, item| {
+                let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                item.set_activatable(false);
+                item.set_selectable(false);
+                item.set_focusable(false);
+                let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                // On screen: the list maps only the items in view of the
+                // ~200 it keeps bound, so this is the reader reaching one.
+                let weak = weak.clone();
+                holder.connect_map(move |holder| {
+                    if let (Some(pane), Some(index)) = (weak.upgrade(), holder_index(holder)) {
+                        pane.want_stretch(index);
+                    }
+                });
+                item.set_child(Some(&holder));
+            });
+            let weak = Rc::downgrade(&pane);
+            factory.connect_bind(move |_, item| {
+                let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let (Some(pane), Some(holder), Some(object)) = (
+                    weak.upgrade(),
+                    item.child().and_downcast::<gtk::Box>(),
+                    item.item().and_downcast::<glib::BoxedAnyObject>(),
+                ) else {
+                    return;
+                };
+                let index = *object.borrow::<usize>();
+                set_holder_index(&holder, Some(index));
+                pane.holders.borrow_mut().insert(index, holder.downgrade());
+                // Its rows if they are drawn; a placeholder of their height
+                // until they are, drawn when it comes on screen.
+                let rows = pane
+                    .stretches
+                    .borrow()
+                    .list
+                    .get(index)
+                    .and_then(|stretch| stretch.rows.clone());
+                match rows {
+                    Some(rows) => {
+                        if let Some(parent) = rows.parent().and_downcast::<gtk::Box>() {
+                            if parent != holder {
+                                parent.remove(&rows);
+                            }
+                        }
+                        if rows.parent().is_none() {
+                            holder.append(&rows);
+                        }
+                    }
+                    None => {
+                        let height = pane.estimate(index);
+                        holder.append(
+                            &gtk::Box::builder()
+                                .height_request(height)
+                                .css_classes(["stretch-placeholder"])
+                                .build(),
+                        );
+                        if holder.is_mapped() {
+                            pane.want_stretch(index);
+                        }
+                    }
+                }
+            });
+            let weak = Rc::downgrade(&pane);
+            factory.connect_unbind(move |_, item| {
+                let Some(holder) = item
+                    .downcast_ref::<gtk::ListItem>()
+                    .and_then(|item| item.child())
+                    .and_downcast::<gtk::Box>()
+                else {
+                    return;
+                };
+                if let (Some(pane), Some(index)) = (weak.upgrade(), holder_index(&holder)) {
+                    let mut holders = pane.holders.borrow_mut();
+                    if holders.get(&index).and_then(|h| h.upgrade()).as_ref() == Some(&holder) {
+                        holders.remove(&index);
+                    }
+                }
+                set_holder_index(&holder, None);
+                while let Some(child) = holder.first_child() {
+                    holder.remove(&child);
+                }
+            });
+            pane.list.set_factory(Some(&factory));
+        }
+
+        // The reader's place is the list's to keep (GtkListView anchors on
+        // the item in view); what stays drawn follows them.
         {
             let adjustment = pane.transcript_scroller.vadjustment();
             let weak = Rc::downgrade(&pane);
             adjustment.connect_value_changed(move |_| {
                 let Some(pane) = weak.upgrade() else { return };
-                pane.note_anchor();
-                // What is drawn follows the reader.
+                // What stays drawn follows the reader.
                 pane.trim_transcript();
-            });
-            // In the same pass, not after it: the viewport places the list
-            // at the adjustment's value as it stands once its extent is set,
-            // so the row lands where it was, with no frame drawn in between
-            // in which it had moved. (Deferred to an idle, the frame showed
-            // the jump and then its undoing.)
-            let weak = Rc::downgrade(&pane);
-            adjustment.connect_changed(move |_| {
-                if let Some(pane) = weak.upgrade() {
-                    pane.keep_anchor();
-                    // A page that grew may want more drawn.
-                    pane.trim_transcript();
-                }
             });
         }
 
@@ -4031,11 +4112,7 @@ impl ChatPane {
                 let Some(pane) = weak.upgrade() else { return };
                 let row = pane.last_prompt_row.borrow().clone();
                 if let Some(row) = row {
-                    if let Some(bounds) = row.compute_bounds(&pane.transcript) {
-                        pane.transcript_scroller
-                            .vadjustment()
-                            .set_value(f64::from(bounds.y()));
-                    }
+                    pane.scroll_to_row(&row, 0.0);
                 }
             });
             pinned_prompt.add_controller(click);
@@ -5015,12 +5092,12 @@ impl ChatPane {
     /// `chat_transcript_tail` would otherwise hand an orchestrator the
     /// same lines twice, with a dropped-count that counted nothing.
     fn clear_transcript(&self) {
-        while let Some(row) = self.transcript.first_child() {
-            self.transcript.remove(&row);
-        }
+        self.store.remove_all();
+        self.build_queue.borrow_mut().clear();
+        self.build_job.borrow_mut().take();
         self.transcript_rows.set(0);
         *self.stretches.borrow_mut() = Stretches::default();
-        self.stretch_job.borrow_mut().take();
+        self.sync_placeholder();
         self.last_prompt_row.borrow_mut().take();
         // A replay reports each call's output again.
         self.terminal_text.borrow_mut().clear();
@@ -5071,9 +5148,7 @@ impl ChatPane {
     ) -> (usize, Vec<TranscriptHit>) {
         let mut count = 0;
         let mut hits = Vec::new();
-        let mut index = 0;
-        let mut child = self.transcript.first_child();
-        while let Some(row) = child {
+        for (index, row) in self.drawn_rows().into_iter().enumerate() {
             let text = widget_text(&row);
             let (n, lines) = taste_core::search::search_text(&text, query, cap);
             count += n;
@@ -5081,16 +5156,37 @@ impl ChatPane {
             for (_, line) in lines {
                 if hits.len() < cap {
                     hits.push(TranscriptHit {
-                        row: index,
+                        row: i32::try_from(index).unwrap_or(i32::MAX),
                         text: line,
                         at,
                     });
                 }
             }
-            index += 1;
-            child = row.next_sibling();
         }
         (count, hits)
+    }
+
+    /// Every row drawn, in order: the stretches the transcript has drawn,
+    /// which are the ones near the reader and the live one.
+    fn drawn_rows(&self) -> Vec<gtk::Widget> {
+        let lists: Vec<gtk::ListBox> = self
+            .stretches
+            .borrow()
+            .list
+            .iter()
+            .filter_map(|stretch| stretch.rows.clone())
+            .collect();
+        let mut rows = Vec::new();
+        for list in lists {
+            let mut child = list.first_child();
+            while let Some(row) = child {
+                child = row.next_sibling();
+                if row.is::<gtk::ListBoxRow>() {
+                    rows.push(row);
+                }
+            }
+        }
+        rows
     }
 
     /// How many transcript lines match, from the text mirror the
@@ -5108,14 +5204,13 @@ impl ChatPane {
     /// scroll anchor lets go, so the next streamed line does not yank the
     /// view back to the end, and the row is lit for a moment.
     pub fn scroll_to_transcript_row(&self, row: i32) {
-        let Some(row_widget) = self.transcript.row_at_index(row) else {
+        let Some(row_widget) = usize::try_from(row)
+            .ok()
+            .and_then(|row| self.drawn_rows().into_iter().nth(row))
+        else {
             return;
         };
-        self.stick_to_bottom.set(false);
-        if let Some(bounds) = row_widget.compute_bounds(&self.transcript) {
-            let adjustment = self.transcript_scroller.vadjustment();
-            adjustment.set_value((f64::from(bounds.y()) - 24.0).max(adjustment.lower()));
-        }
+        self.scroll_to_row(&row_widget, 24.0);
         row_widget.add_css_class("search-hit");
         glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
             row_widget.remove_css_class("search-hit");
@@ -5534,7 +5629,7 @@ impl ChatPane {
             .chain(self.pending_prompts.borrow().iter().map(|p| p.card.clone()))
             .collect();
         for card in cards {
-            if card.is_ancestor(&self.transcript) {
+            if self.in_transcript(&card) {
                 continue;
             }
             // Out of the row the clear dropped, into one of its own.
@@ -5658,7 +5753,7 @@ impl ChatPane {
             // 2026-09-08: "when I sent a chat message that woke up my
             // primary env, it seemed to get the message, but it's not in
             // the chat").
-            let (card, badge) = if item.card.is_ancestor(&self.transcript) {
+            let (card, badge) = if self.in_transcript(&item.card) {
                 (item.card, item.badge)
             } else {
                 let card = self.user_card(item.text.trim(), &item.attachments);
@@ -5982,13 +6077,9 @@ impl ChatPane {
         };
         for held in withdrawn {
             if let Some(row) = held.card.parent() {
-                if row.is_ancestor(&self.transcript) {
-                    if let Ok(row) = row.downcast::<gtk::ListBoxRow>() {
-                        self.transcript.remove(&row);
-                        self.transcript_rows
-                            .set(self.transcript_rows.get().saturating_sub(1));
-                        continue;
-                    }
+                if self.in_transcript(&row) {
+                    self.remove_row(&row);
+                    continue;
                 }
             }
             held.card.unparent();
@@ -7438,280 +7529,284 @@ impl ChatPane {
             .build();
         // When it landed, for the search listing (`row_time_text`).
         stamp_row(&row);
-        match self.insert_at.get() {
-            Some(at) => {
-                self.transcript.insert(&row, at);
-                self.insert_at.set(Some(at + 1));
-            }
-            None => self.transcript.append(&row),
-        }
+        // Into the stretch being drawn from its records, or the live one.
+        let sink = self.sink.borrow().clone();
+        let rows = sink.unwrap_or_else(|| self.live_rows());
+        rows.append(&row);
         self.transcript_rows.set(self.transcript_rows.get() + 1);
-        self.stretches.borrow_mut().adopt(&row);
         if let Some(held) = self.holding.borrow_mut().as_mut() {
             held.rows.push(row.clone());
         }
-        if self.insert_at.get().is_none() {
-            self.trim_transcript();
-        }
+        self.sync_placeholder();
+        self.trim_transcript();
         // No scroll here: appending grows the adjustment, and the tail
         // policy in `new` decides whether that should move the view. This
         // used to yank the view to the bottom even mid-history.
         row
     }
 
-    /// Keep the drawn part of the transcript near the reader
-    /// ([`Self::reconcile`]), once the current pass is over. Ahead of the
-    /// next frame rather than after it: a reader scrolling with frames
-    /// coming one after another would otherwise outrun an idle that never
-    /// got its turn, and scroll on through space.
-    fn trim_transcript(&self) {
-        if self.reconcile_pending.replace(true) {
+    /// The live stretch's rows: the last stretch's, drawn as it happens —
+    /// opened here when there is none yet, or when a restore has not yet
+    /// given it a list.
+    fn live_rows(&self) -> gtk::ListBox {
+        let last = self
+            .stretches
+            .borrow()
+            .list
+            .last()
+            .map(|stretch| stretch.rows.clone());
+        match last {
+            Some(Some(rows)) => rows,
+            Some(None) => {
+                let rows = stretch_list();
+                let index = {
+                    let mut stretches = self.stretches.borrow_mut();
+                    if let Some(last) = stretches.list.last_mut() {
+                        last.rows = Some(rows.clone());
+                    }
+                    stretches.list.len() - 1
+                };
+                self.place_foot();
+                // Its item may be showing its placeholder.
+                self.rebind(index);
+                rows
+            }
+            None => self.open_stretch(),
+        }
+    }
+
+    /// A new stretch at the end of the conversation, live: its list of
+    /// rows, and its item in the transcript.
+    fn open_stretch(&self) -> gtk::ListBox {
+        let rows = stretch_list();
+        let index = {
+            let mut stretches = self.stretches.borrow_mut();
+            stretches.list.push(Stretch {
+                records: Vec::new(),
+                rows: Some(rows.clone()),
+            });
+            stretches.list.len() - 1
+        };
+        self.store.append(&glib::BoxedAnyObject::new(index));
+        self.place_foot();
+        rows
+    }
+
+    /// The room under the last row, on the last stretch's rows and on no
+    /// other's.
+    fn place_foot(&self) {
+        let room = self.foot_room.get();
+        let stretches = self.stretches.borrow();
+        let count = stretches.list.len();
+        for (index, stretch) in stretches.list.iter().enumerate().rev().take(2) {
+            if let Some(rows) = &stretch.rows {
+                let wanted = if index + 1 == count { room } else { 0 };
+                if rows.margin_bottom() != wanted {
+                    rows.set_margin_bottom(wanted);
+                }
+            }
+        }
+    }
+
+    /// Stretch `index`'s rows, drawn from its records now if they are not
+    /// drawn — whole, at once: for a probe that compares a stretch drawn
+    /// back with what it was. The transcript draws them a slice at a time
+    /// as they come on screen ([`Self::want_stretch`]).
+    fn stretch_rows(self: &Rc<Self>, index: usize) -> Option<gtk::ListBox> {
+        if let Some(rows) = self.stretches.borrow().list.get(index)?.rows.clone() {
+            return Some(rows);
+        }
+        let mut job = self.start_job(index)?;
+        while !self.draw_slice(&mut job, None) {}
+        self.finish_job(job)
+    }
+
+    /// What a stretch not yet drawn stands in as: its estimated height.
+    fn estimate(&self, index: usize) -> i32 {
+        let estimate = self
+            .stretches
+            .borrow()
+            .list
+            .get(index)
+            .map_or(24.0, |stretch| estimate_height(&stretch.records));
+        (estimate * self.est_scale.get()).round() as i32
+    }
+
+    /// Stretch `index` is on screen: draw it, if it is not drawn, and the
+    /// ones either side of it, so the reader reaches them drawn.
+    fn want_stretch(&self, index: usize) {
+        self.reader_at.set(index);
+        let count = self.stretches.borrow().list.len();
+        let undrawn = |i: usize| {
+            self.stretches
+                .borrow()
+                .list
+                .get(i)
+                .is_some_and(|stretch| stretch.rows.is_none())
+        };
+        {
+            let mut queue = self.build_queue.borrow_mut();
+            let ahead = (1..=BUILD_AHEAD)
+                .flat_map(|d| [index.checked_sub(d), Some(index + d)])
+                .flatten()
+                .filter(|i| *i < count);
+            // On screen first; the ones either side after anything else
+            // that is on screen.
+            if undrawn(index) && !queue.contains(&index) {
+                queue.push_front(index);
+            }
+            for i in ahead {
+                if undrawn(i) && !queue.contains(&i) {
+                    queue.push_back(i);
+                }
+            }
+            // What the reader has left behind is not worth their wait.
+            queue.retain(|i| i.abs_diff(index) <= BUILD_REACH);
+        }
+        self.schedule_build();
+    }
+
+    fn schedule_build(&self) {
+        if self.build_scheduled.replace(true) {
             return;
         }
         let weak = self.weak_self.borrow().clone();
-        glib::idle_add_local_full(glib::Priority::DEFAULT, move || {
+        // After a gap, so a frame waiting goes first.
+        crate::stall::after_a_gap(move || {
             if let Some(pane) = weak.upgrade() {
-                pane.reconcile_pending.set(false);
-                pane.reconcile();
+                pane.build_scheduled.set(false);
+                pane.build_step();
             }
-            glib::ControlFlow::Break
         });
     }
 
-    /// Draw what is near the reader and let go of what is far from it.
-    ///
-    /// GtkListBox measures every row on every width change, so a pane
-    /// resize costs O(rows × text), and a conversation of thousands of
-    /// steps cannot all be rows. It does not have to be: the conversation
-    /// is its record (`record`), cut into stretches
-    /// (`taste_core::stretches`), and a stretch is drawn from its records
-    /// whenever it is wanted. So the transcript is virtual — the reader
-    /// scrolls through all of it, and only the stretches within a page or
-    /// so of the view are rows; the rest are spacers of their height, as
-    /// measured when they were let go or estimated from their records
-    /// until then. Whatever moves under the reader as stretches come and
-    /// go and estimates become measurements, the scroll anchor holds their
-    /// place (`keep_anchor`; David, 2026-10-11: "the IDE is moving my
-    /// viewport even when the content above and in my viewport has long
-    /// settled").
-    ///
-    /// One stretch is drawn a pass, the one nearest the view; the layout
-    /// it causes starts the next pass (the adjustment's `changed`), so a
-    /// stretch is drawn a frame and the keyboard gets its turn between. Stretches are let go only past the row budget,
-    /// farthest from the view first, never the last: that one is the live
-    /// conversation, and its state is the pane's. A last stretch that
-    /// outgrows the budget on its own (a turn whose steps never all
-    /// settle) loses its oldest rows, as every stretch once did; its
-    /// records keep them, for the next time it is drawn.
-    fn reconcile(self: &Rc<Self>) {
-        // One stretch at a time: the next pass follows the one being drawn.
-        if self.drawing_history.get() || self.stretch_job.borrow().is_some() {
+    /// Draw wanted stretches for [`BUILD_SLICE`] of this frame, and come
+    /// back after the next while any are left. A stretch is a step and the
+    /// words after it, a few milliseconds of drawing most often, but a long
+    /// answer's markdown or a diff can be more than a frame's worth: it is
+    /// drawn across frames into a list of its own, and shown whole.
+    fn build_step(self: &Rc<Self>) {
+        // Not while a history is being drawn: what is wanted is redrawn
+        // from the new one.
+        if self.drawing_history.get() {
+            self.schedule_build();
             return;
         }
-        let adjustment = self.transcript_scroller.vadjustment();
-        let (top, page) = (adjustment.value(), adjustment.page_size());
-        let margin = page.max(400.0);
-        let distance = |(y, h): (f64, f64)| {
-            if y + h < top {
-                top - (y + h)
-            } else if y > top + page {
-                y - (top + page)
-            } else {
-                0.0
-            }
-        };
-        // Let go: over budget, the drawn stretch farthest from the view,
-        // well clear of it. First, so a reader who keeps scrolling, with a
-        // stretch always wanted ahead of them, still leaves rows behind.
-        let mut spans = self.stretch_spans();
-        while self.transcript_rows.get() > MAX_TRANSCRIPT_ROWS {
-            let farthest = {
-                let stretches = self.stretches.borrow();
-                let last = stretches.list.len().saturating_sub(1);
-                spans
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i < last && !stretches.list[*i].hidden)
-                    .filter_map(|(i, span)| span.map(|span| (i, distance(span))))
-                    .filter(|(_, d)| *d > margin * 3.0)
-                    .max_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(i, _)| i)
+        let slice = std::time::Instant::now();
+        // Half of what a frame and its gap took since the last slice, and
+        // never less than BUILD_SLICE: on a display that draws a frame in
+        // a few milliseconds that is the slice, and on one that takes a
+        // hundred (software rendering) the drawing keeps up with what
+        // comes on screen rather than falling a page behind for each one.
+        let budget = self
+            .build_last
+            .get()
+            .map(|last| slice.duration_since(last) / 2)
+            .unwrap_or(BUILD_SLICE)
+            .clamp(BUILD_SLICE, BUILD_SLICE_MOST);
+        loop {
+            let job = self.build_job.borrow_mut().take();
+            let mut job = match job {
+                Some(job) => job,
+                None => {
+                    let Some(index) = self.next_to_draw() else {
+                        break;
+                    };
+                    match self.start_job(index) {
+                        Some(job) => job,
+                        None => continue,
+                    }
+                }
             };
-            let Some(index) = farthest else { break };
-            if !self.let_go(index) {
+            let left = budget.saturating_sub(slice.elapsed());
+            if self.draw_slice(&mut job, Some(left)) {
+                self.finish_job(job);
+            } else {
+                *self.build_job.borrow_mut() = Some(job);
+            }
+            if slice.elapsed() >= budget {
                 break;
             }
-            spans = self.stretch_spans();
         }
-        self.trim_last_stretch();
-        // Draw: the hidden stretch nearest the view, within a margin of it,
-        // and another pass after it.
-        let wanted = {
-            let stretches = self.stretches.borrow();
-            spans
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| stretches.list[*i].hidden)
-                .filter_map(|(i, span)| span.map(|span| (i, distance(span))))
-                .filter(|(_, d)| *d <= margin)
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(i, _)| i)
-        };
-        if let Some(index) = wanted {
-            self.draw_stretch(index);
+        let more = self.build_job.borrow().is_some() || !self.build_queue.borrow().is_empty();
+        self.build_last.set(more.then(std::time::Instant::now));
+        if more {
+            self.schedule_build();
         }
     }
 
-    /// Where each stretch is in the transcript, top and height: a drawn
-    /// one from its rows, a hidden one from its run's spacer. `None` for
-    /// one not yet laid out — a row just put in reports the list's top
-    /// and no height until it is, and a stretch taken for one there would
-    /// be the farthest from a reader anywhere else, and let go at once.
-    fn stretch_spans(&self) -> Vec<Option<(f64, f64)>> {
+    /// The wanted stretch to draw next, taken off the queue: the one on
+    /// screen, or nearest it, by where its item is — the list maps more
+    /// items than are in view, so being mapped says less than this does.
+    fn next_to_draw(&self) -> Option<usize> {
+        let scroller: &gtk::Widget = self.transcript_scroller.upcast_ref();
+        let height = scroller.height() as f32;
+        let distance = |index: &usize| -> f32 {
+            self.holders
+                .borrow()
+                .get(index)
+                .and_then(|holder| holder.upgrade())
+                .and_then(|holder| holder.compute_bounds(scroller))
+                .map_or(f32::MAX, |b| {
+                    if b.y() + b.height() < 0.0 {
+                        -(b.y() + b.height())
+                    } else if b.y() > height {
+                        b.y() - height
+                    } else {
+                        0.0
+                    }
+                })
+        };
+        let mut queue = self.build_queue.borrow_mut();
+        let at = (0..queue.len())
+            .min_by(|a, b| distance(&queue[*a]).total_cmp(&distance(&queue[*b])))?;
+        queue.remove(at)
+    }
+
+    /// A job to draw stretch `index`, or `None` when it is drawn already.
+    fn start_job(&self, index: usize) -> Option<StretchJob> {
         let stretches = self.stretches.borrow();
-        let parent: &gtk::Widget = self.transcript.upcast_ref();
-        let mut spans = Vec::with_capacity(stretches.list.len());
-        let mut run: Option<f64> = None;
-        for stretch in &stretches.list {
-            if stretch.hidden {
-                if let Some(spacer) = &stretch.spacer {
-                    run = spacer
-                        .compute_bounds(&self.transcript)
-                        .filter(|_| spacer.height() > 0)
-                        .map(|bounds| f64::from(bounds.y()));
-                }
-                let space = stretch.space(stretches.scale);
-                spans.push(run.map(|y| (y, space)));
-                run = run.map(|y| y + space);
-                continue;
-            }
-            run = None;
-            let laid_out = |row: &&gtk::ListBoxRow| row.height() > 0;
-            if stretch
-                .rows
-                .iter()
-                .any(|row| row.parent().as_ref() == Some(parent) && !laid_out(&row))
-            {
-                spans.push(None);
-                continue;
-            }
-            let mut live = stretch
-                .rows
-                .iter()
-                .filter(|row| row.parent().as_ref() == Some(parent));
-            let first = live
-                .next()
-                .and_then(|row| row.compute_bounds(&self.transcript));
-            let last = live
-                .next_back()
-                .and_then(|row| row.compute_bounds(&self.transcript))
-                .or(first);
-            spans.push(first.zip(last).map(|(first, last)| {
-                let y = f64::from(first.y());
-                (y, f64::from(last.y() + last.height()) - y)
-            }));
+        let stretch = stretches.list.get(index)?;
+        if stretch.rows.is_some() {
+            return None;
         }
-        spans
-    }
-
-    /// Start drawing hidden stretch `index` where it belongs, from its
-    /// records, with a drawing of its own (`swap_drawing`) and none of its
-    /// records' effects on the live chat (`drawing_past`), a frame's worth
-    /// at a time ([`Self::continue_stretch`]).
-    ///
-    /// A stretch is a turn's worth of steps, and drawn whole it held the
-    /// main thread for a hundred milliseconds and more of a debug build —
-    /// each step's card, the markdown of the message before it — right as
-    /// the reader scrolled towards it. In slices the cost is the same and
-    /// no frame pays more than [`STRETCH_SLICE`] of it; the stretch comes
-    /// in above or below the view, where the margin put it, while the
-    /// reader goes on scrolling.
-    fn draw_stretch(self: &Rc<Self>, index: usize) {
-        if self.stretch_job.borrow().is_some() {
-            return;
-        }
-        let (records, followed) = {
-            let mut stretches = self.stretches.borrow_mut();
-            let Some(stretch) = stretches.list.get_mut(index) else {
-                return;
-            };
-            if !stretch.hidden {
-                return;
-            }
-            stretch.hidden = false;
-            let spacer = stretch.spacer.take();
-            let records = stretch.records.clone();
-            if let Some(spacer) = spacer {
-                self.transcript.remove(&spacer);
-            }
-            let followed = stretches
-                .list
-                .get(index + 1)
-                .is_some_and(|next| continues_turn(&next.records));
-            (records, followed)
-        };
-        // The rest of its run keeps its space while it is drawn.
-        self.respace();
+        let followed = stretches
+            .list
+            .get(index + 1)
+            .is_some_and(|next| continues_turn(&next.records));
         let mut drawing = Drawing::default();
-        // Its rail as the turn drew it: on from the step before it, and
-        // on into the step after it, when those are in the stretches on
+        // Its rail as the turn drew it: on from the step before it, and on
+        // into the step after it, when those are in the stretches on
         // either side.
-        if index > 0 && continues_turn(&records) {
+        if index > 0 && continues_turn(&stretch.records) {
             drawing.last_rail = Some(StepRail::elsewhere());
         }
-        *self.stretch_job.borrow_mut() = Some(StretchJob {
+        Some(StretchJob {
             index,
-            records: records.into_iter(),
+            records: stretch.records.clone().into_iter(),
             drawing,
+            rows: stretch_list(),
             followed,
             started: std::time::Instant::now(),
             longest: std::time::Duration::ZERO,
-        });
-        self.continue_stretch(Some(STRETCH_SLICE));
+        })
     }
 
-    /// [`Self::draw_stretch`], whole, now.
-    fn draw_stretch_now(self: &Rc<Self>, index: usize) {
-        self.draw_stretch(index);
-        while self.stretch_job.borrow().is_some() {
-            self.continue_stretch(None);
-        }
-    }
-
-    /// Draw the next slice of the stretch being drawn: as many records as
-    /// fit in `budget` (all of them, without one), then the frame. Its
-    /// drawing, and where its rows go, are put back for each slice and
-    /// taken away after, so what happens between slices — the agent's
-    /// next update, a message sent — is drawn as live.
-    fn continue_stretch(self: &Rc<Self>, budget: Option<std::time::Duration>) {
-        let Some(mut job) = self.stretch_job.borrow_mut().take() else {
-            return;
-        };
+    /// Draw `job`'s next records, `budget`'s worth (all of them, without
+    /// one), with its drawing and its list put in for the slice and taken
+    /// back after, so what happens between slices is drawn as live, and
+    /// none of its records' effects on the live chat (`drawing_past`).
+    /// Whether it is whole.
+    fn draw_slice(
+        self: &Rc<Self>,
+        job: &mut StretchJob,
+        budget: Option<std::time::Duration>,
+    ) -> bool {
         let slice = std::time::Instant::now();
-        let index = job.index;
-        {
-            let mut stretches = self.stretches.borrow_mut();
-            let parent: &gtk::Widget = self.transcript.upcast_ref();
-            // After the last of its rows drawn so far: whatever happened
-            // since moved where that is.
-            let at = stretches
-                .list
-                .get(index)
-                .and_then(|stretch| {
-                    stretch
-                        .rows
-                        .iter()
-                        .rev()
-                        .find(|row| row.parent().as_ref() == Some(parent))
-                })
-                .map(|row| row.index() + 1)
-                .unwrap_or_else(|| stretches.position_after(index, &self.transcript));
-            self.insert_at.set(Some(at));
-            stretches.drawing = Some(index);
-        }
+        let sink = self.sink.replace(Some(job.rows.clone()));
         let was = self.from_record.replace(true);
         self.swap_drawing(&mut job.drawing);
-        self.drawing_history.set(true);
+        let history = self.drawing_history.replace(true);
         self.drawing_past.set(true);
         let mut done = false;
         loop {
@@ -7732,169 +7827,332 @@ impl ChatPane {
             }
         }
         self.drawing_past.set(false);
-        self.drawing_history.set(false);
+        self.drawing_history.set(history);
         self.swap_drawing(&mut job.drawing);
         self.from_record.set(was);
-        self.insert_at.set(None);
-        self.stretches.borrow_mut().drawing = None;
+        self.sink.replace(sink);
         job.longest = job.longest.max(slice.elapsed());
-        if done {
-            if self.probe_timing.get() {
-                println!(
-                    "probe history: drew stretch {index}: {:.1}ms in all, {:.1}ms the longest slice",
-                    job.started.elapsed().as_secs_f64() * 1000.0,
-                    job.longest.as_secs_f64() * 1000.0
-                );
+        done
+    }
+
+    /// `job` is whole: its rows are the stretch's, and the transcript's
+    /// item for it shows them.
+    fn finish_job(self: &Rc<Self>, job: StretchJob) -> Option<gtk::ListBox> {
+        let index = job.index;
+        {
+            let mut stretches = self.stretches.borrow_mut();
+            let stretch = stretches.list.get_mut(index)?;
+            // Drawn meanwhile, another way: that one stands.
+            if let Some(rows) = &stretch.rows {
+                let rows = rows.clone();
+                drop(stretches);
+                self.forget_rows(&job.rows);
+                return Some(rows);
             }
-            self.respace();
-            self.trim_transcript();
-            return;
+            stretch.rows = Some(job.rows.clone());
         }
-        *self.stretch_job.borrow_mut() = Some(job);
-        if budget.is_some() {
-            let weak = self.weak_self.borrow().clone();
-            glib::timeout_add_local_full(
-                std::time::Duration::ZERO,
-                glib::Priority::from(crate::stall::AFTER_FRAME),
-                move || {
-                    if let Some(pane) = weak.upgrade() {
-                        pane.continue_stretch(Some(STRETCH_SLICE));
-                    }
-                    glib::ControlFlow::Break
-                },
+        self.place_foot();
+        if self.probe_timing.get() {
+            println!(
+                "probe history: drew stretch {index}: {:.1}ms in all, {:.1}ms the longest slice",
+                job.started.elapsed().as_secs_f64() * 1000.0,
+                job.longest.as_secs_f64() * 1000.0
             );
         }
+        // The item shows the rows in the placeholder's place.
+        self.rebind(index);
+        // What it came to, against what it was guessed at: the guesses
+        // after it are scaled by the difference.
+        let estimate = self
+            .stretches
+            .borrow()
+            .list
+            .get(index)
+            .map_or(0.0, |stretch| estimate_height(&stretch.records));
+        let weak = self.weak_self.borrow().clone();
+        job.rows.add_tick_callback(move |rows, _| {
+            let height = f64::from(rows.height());
+            if height <= 0.0 {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(pane) = weak.upgrade() {
+                if estimate > 0.0 {
+                    let scale = pane.est_scale.get() * 0.8 + height / estimate * 0.2;
+                    pane.est_scale.set(scale.clamp(0.25, 4.0));
+                }
+            }
+            glib::ControlFlow::Break
+        });
+        self.trim_transcript();
+        Some(job.rows)
     }
 
-    /// Let drawn stretch `index` go: its rows out, a spacer of its measured
-    /// height in. False when it has no rows laid out to measure.
-    fn let_go(&self, index: usize) -> bool {
-        let Some(Some((_, height))) = self.stretch_spans().get(index).copied() else {
-            return false;
-        };
-        let rows = {
-            let mut stretches = self.stretches.borrow_mut();
-            let Some(stretch) = stretches.list.get_mut(index) else {
-                return false;
-            };
-            stretch.hidden = true;
-            stretch.height = Some(height);
-            let estimate = stretch.estimate;
-            let rows = std::mem::take(&mut stretch.rows);
-            if estimate > 0.0 && height > 0.0 {
-                stretches.scale =
-                    (stretches.scale * 0.8 + height / estimate * 0.2).clamp(0.25, 4.0);
+    /// TASTE_PROBE_CHECK only: how many stretches on screen are still
+    /// standing in as their estimated height.
+    fn placeholders_on_screen(&self) -> Vec<Option<usize>> {
+        fn walk(
+            widget: &gtk::Widget,
+            depth: u32,
+            scroller: &gtk::Widget,
+            found: &mut Vec<Option<usize>>,
+        ) {
+            if widget.has_css_class("stretch-placeholder") {
+                let height = scroller.height() as f32;
+                if widget.is_mapped()
+                    && widget
+                        .compute_bounds(scroller)
+                        .is_some_and(|b| b.y() + b.height() > 0.0 && b.y() < height)
+                {
+                    found.push(
+                        widget
+                            .parent()
+                            .and_downcast::<gtk::Box>()
+                            .and_then(|holder| holder_index(&holder)),
+                    );
+                }
+                return;
             }
-            rows
-        };
-        let parent: &gtk::Widget = self.transcript.upcast_ref();
-        for row in rows {
-            if row.parent().as_ref() == Some(parent) {
-                self.transcript.remove(&row);
-                self.transcript_rows
-                    .set(self.transcript_rows.get().saturating_sub(1));
+            if depth == 0 {
+                return;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                walk(&current, depth - 1, scroller, found);
+                child = current.next_sibling();
             }
         }
-        self.doc_rows
+        let mut found = Vec::new();
+        walk(
+            self.list.upcast_ref(),
+            3,
+            self.transcript_scroller.upcast_ref(),
+            &mut found,
+        );
+        found
+    }
+
+    /// Have the transcript show stretch `index` again — its rows drawn, or
+    /// let go — with a new item in its place: the list keeps an item it
+    /// is told changed but is the same object bound as it was.
+    fn rebind(&self, index: usize) {
+        if (index as u32) < self.store.n_items() {
+            self.store
+                .splice(index as u32, 1, &[glib::BoxedAnyObject::new(index)]);
+        }
+    }
+
+    /// To the end of the conversation, as the list stands now and once it
+    /// has measured what it finds there.
+    fn scroll_to_end(&self) {
+        let count = self.store.n_items();
+        if count == 0 {
+            return;
+        }
+        self.stick_to_bottom.set(true);
+        self.list
+            .scroll_to(count - 1, gtk::ListScrollFlags::NONE, None);
+        let adjustment = self.transcript_scroller.vadjustment();
+        for delay in [40, 160, 400] {
+            let adjustment = adjustment.clone();
+            let stick = self.stick_to_bottom.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
+                if stick.get() {
+                    adjustment.set_value(adjustment.upper() - adjustment.page_size());
+                }
+            });
+        }
+    }
+
+    /// Let go of what is far from the reader, once the current pass is
+    /// over: past [`KEEP_DRAWN`] stretches with rows, those the list is not
+    /// showing, farthest first, are drawn again from their records when it
+    /// next does.
+    fn trim_transcript(&self) {
+        if self.reconcile_pending.replace(true) {
+            return;
+        }
+        let weak = self.weak_self.borrow().clone();
+        // After a gap: at idle priority it waited for an idle a frame clock
+        // running back to back never gives, and let go of a thousand
+        // stretches at once when it finally ran.
+        crate::stall::after_a_gap(move || {
+            if let Some(pane) = weak.upgrade() {
+                pane.reconcile_pending.set(false);
+                pane.let_go_far();
+            }
+        });
+    }
+
+    /// See [`Self::trim_transcript`]. Never the last two stretches — the
+    /// live one, and the one it may still be drawing into — nor one with
+    /// no records to draw it again from, nor one holding a card for a
+    /// message still on its way.
+    fn let_go_far(&self) {
+        let (drawn, near) = {
+            let stretches = self.stretches.borrow();
+            let drawn = stretches.list.iter().filter(|s| s.rows.is_some()).count();
+            if drawn <= KEEP_DRAWN {
+                return;
+            }
+            // Where the reader is: the stretch that last came on screen —
+            // not the drawn ones on screen, of which there are none while
+            // what the reader reached is still being drawn.
+            (drawn, self.reader_at.get())
+        };
+        let live_cards: Vec<gtk::Widget> = self
+            .pending_prompts
+            .borrow()
+            .iter()
+            .flat_map(|p| {
+                std::iter::once(p.card.clone().upcast::<gtk::Widget>())
+                    .chain(p.origin.clone().map(|o| o.upcast()))
+            })
+            .chain(
+                self.revive_queue
+                    .borrow()
+                    .iter()
+                    .map(|item| item.card.clone().upcast()),
+            )
+            .collect();
+        let mut candidates: Vec<(usize, usize)> = {
+            let stretches = self.stretches.borrow();
+            let keep_from = stretches.list.len().saturating_sub(2);
+            stretches
+                .list
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| *i < keep_from && !s.records.is_empty())
+                .filter_map(|(i, s)| s.rows.as_ref().map(|rows| (i, rows)))
+                // Not on screen: bound to an item the list keeps ready, or
+                // not bound at all.
+                .filter(|(_, rows)| !rows.is_mapped())
+                .filter(|(i, _)| i.abs_diff(near) > BUILD_AHEAD * 2)
+                .filter(|(_, rows)| !live_cards.iter().any(|card| card.is_ancestor(*rows)))
+                .map(|(i, _)| (i, i.abs_diff(near)))
+                .collect()
+        };
+        candidates.sort_by_key(|(_, distance)| std::cmp::Reverse(*distance));
+        // A few a pass, so letting go never costs a frame of its own.
+        let over = drawn - KEEP_DRAWN;
+        for (index, _) in candidates.into_iter().take(over.min(LET_GO_AT_ONCE)) {
+            self.let_go_of(index);
+        }
+        if over > LET_GO_AT_ONCE {
+            self.trim_transcript();
+        }
+    }
+
+    /// Let go of stretch `index`'s rows, now, whether or not the list is
+    /// showing them: it shows them again drawn from the records.
+    fn let_go_of(&self, index: usize) {
+        let rows = self
+            .stretches
             .borrow_mut()
-            .retain(|_, row| row.parent().as_ref() == Some(parent));
-        // The pin's prompt let go: the pin has nothing to jump to.
-        let stale = self
-            .last_prompt_row
-            .borrow()
-            .as_ref()
-            .filter(|row| row.parent().as_ref() != Some(parent))
-            .map(|row| row.clone().upcast::<gtk::Widget>());
-        if let Some(row) = stale {
-            self.forget_prompt_row(&row);
+            .list
+            .get_mut(index)
+            .and_then(|stretch| stretch.rows.take());
+        if let Some(rows) = rows {
+            if let Some(holder) = rows.parent().and_downcast::<gtk::Box>() {
+                holder.remove(&rows);
+            }
+            self.forget_rows(&rows);
+            self.rebind(index);
         }
-        if self
-            .lit_doc_row
-            .borrow()
-            .as_ref()
-            .is_some_and(|row| row.parent().as_ref() != Some(parent))
-        {
+    }
+
+    /// `rows`, let go: counted out, and every handle into them dropped.
+    fn forget_rows(&self, rows: &gtk::ListBox) {
+        let mut count = 0;
+        let mut child = rows.first_child();
+        while let Some(row) = child {
+            count += 1;
+            child = row.next_sibling();
+        }
+        self.transcript_rows
+            .set(self.transcript_rows.get().saturating_sub(count));
+        let within = |row: &gtk::ListBoxRow| row.is_ancestor(rows);
+        self.doc_rows.borrow_mut().retain(|_, row| !within(row));
+        if self.lit_doc_row.borrow().as_ref().is_some_and(within) {
             self.lit_doc_row.borrow_mut().take();
         }
-        self.respace();
-        true
-    }
-
-    /// One spacer for each run of hidden stretches, owned by its first and
-    /// as tall as the run: kept where it is when the run keeps its first,
-    /// so a reader anchored on it stays put.
-    fn respace(&self) {
-        let mut stretches = self.stretches.borrow_mut();
-        let scale = stretches.scale;
-        let count = stretches.list.len();
-        let mut index = 0;
-        while index < count {
-            if !stretches.list[index].hidden {
-                if let Some(spacer) = stretches.list[index].spacer.take() {
-                    self.transcript.remove(&spacer);
-                }
-                index += 1;
-                continue;
-            }
-            let mut end = index;
-            let mut height = 0.0;
-            while end < count && stretches.list[end].hidden {
-                height += stretches.list[end].space(scale);
-                if end > index {
-                    if let Some(spacer) = stretches.list[end].spacer.take() {
-                        self.transcript.remove(&spacer);
-                    }
-                }
-                end += 1;
-            }
-            let spacer = match stretches.list[index].spacer.clone() {
-                Some(spacer) => spacer,
-                None => {
-                    let spacer = gtk::ListBoxRow::builder()
-                        .name("stretch-spacer")
-                        .activatable(false)
-                        .selectable(false)
-                        .focusable(false)
-                        .child(&gtk::Box::new(gtk::Orientation::Vertical, 0))
-                        .build();
-                    let at = stretches.position_after(index, &self.transcript);
-                    self.transcript.insert(&spacer, at);
-                    stretches.list[index].spacer = Some(spacer.clone());
-                    spacer
-                }
-            };
-            if let Some(child) = spacer.child() {
-                child.set_height_request(height.round().min(f64::from(i32::MAX)) as i32);
-            }
-            index = end;
+        let prompt = self
+            .last_prompt_row
+            .borrow()
+            .clone()
+            .filter(within)
+            .map(|row| row.upcast::<gtk::Widget>());
+        if let Some(row) = prompt {
+            self.forget_prompt_row(&row);
         }
     }
 
-    /// The live stretch past the row budget on its own: its oldest rows
-    /// go, as every row once did past the cap.
-    fn trim_last_stretch(&self) {
-        let cap = if self.stick_to_bottom.get() {
-            MAX_TRANSCRIPT_ROWS
-        } else {
-            MAX_TRANSCRIPT_ROWS * 2
-        };
-        let parent: &gtk::Widget = self.transcript.upcast_ref();
-        while self.transcript_rows.get() > cap {
-            let oldest = {
-                let mut stretches = self.stretches.borrow_mut();
-                let Some(last) = stretches.list.last_mut() else {
-                    break;
-                };
-                last.rows
-                    .retain(|row| row.parent().as_ref() == Some(parent));
-                if last.rows.is_empty() {
-                    break;
-                }
-                last.rows.remove(0)
-            };
-            self.transcript.remove(&oldest);
+    /// Take `row` out of the transcript, whichever stretch it is in.
+    fn remove_row(&self, row: &impl IsA<gtk::Widget>) {
+        if let Some(rows) = row.parent().and_downcast::<gtk::ListBox>() {
+            rows.remove(row);
             self.transcript_rows
                 .set(self.transcript_rows.get().saturating_sub(1));
+            self.sync_placeholder();
+        }
+    }
+
+    /// Whether `widget` is in the transcript: in one of its stretches'
+    /// rows, shown or not — not in a list a clear has let go of and GTK
+    /// has yet to dispose of.
+    fn in_transcript(&self, widget: &impl IsA<gtk::Widget>) -> bool {
+        self.stretch_of(widget).is_some()
+    }
+
+    /// Which stretch `row` is in.
+    fn stretch_of(&self, row: &impl IsA<gtk::Widget>) -> Option<usize> {
+        let rows = row
+            .ancestor(gtk::ListBox::static_type())
+            .and_downcast::<gtk::ListBox>()?;
+        self.stretches
+            .borrow()
+            .list
+            .iter()
+            .position(|stretch| stretch.rows.as_ref() == Some(&rows))
+    }
+
+    /// Bring `row` to the top of the view, `inset` below its edge: the
+    /// list brings its stretch into view, and once that is laid out the
+    /// row is put where it was asked for.
+    fn scroll_to_row(&self, row: &impl IsA<gtk::Widget>, inset: f32) {
+        let Some(index) = self.stretch_of(row) else {
+            return;
+        };
+        self.stick_to_bottom.set(false);
+        self.list
+            .scroll_to(index as u32, gtk::ListScrollFlags::NONE, None);
+        let row = row.clone().upcast::<gtk::Widget>();
+        let scroller = self.transcript_scroller.clone();
+        // Twice: the first lands the row near enough for its neighbours to
+        // be measured, the second where it was asked for.
+        for delay in [40, 160] {
+            let (row, scroller) = (row.clone(), scroller.clone());
+            glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
+                if let Some(bounds) = row.compute_bounds(&scroller) {
+                    let adjustment = scroller.vadjustment();
+                    let by = f64::from(bounds.y() - inset);
+                    if by.abs() >= 1.0 {
+                        adjustment.set_value((adjustment.value() + by).max(adjustment.lower()));
+                    }
+                }
+            });
+        }
+    }
+
+    /// The empty chat's page while there is no row, the transcript once
+    /// there is.
+    fn sync_placeholder(&self) {
+        let name = if self.transcript_rows.get() == 0 && self.stretches.borrow().list.len() <= 1 {
+            "empty"
+        } else {
+            "list"
+        };
+        if self.transcript_stack.visible_child_name().as_deref() != Some(name) {
+            self.transcript_stack.set_visible_child_name(name);
         }
     }
 
@@ -7948,92 +8206,6 @@ impl ChatPane {
     /// replay once did and a drawn history does now.
     fn restoring(&self) -> bool {
         (self.replaying.get() || self.drawing_history.get()) && !self.drawing_past.get()
-    }
-
-    /// Note the row at the top of the reader's view and where it starts in
-    /// it — nothing while the view follows the bottom. Walked from the last
-    /// anchor, so a scroll costs the rows it passed.
-    fn note_anchor(&self) {
-        if self.stick_to_bottom.get() {
-            self.scroll_anchor.borrow_mut().take();
-            return;
-        }
-        let value = self.transcript_scroller.vadjustment().value();
-        let transcript: &gtk::Widget = self.transcript.upcast_ref();
-        let mut row = self
-            .scroll_anchor
-            .borrow()
-            .as_ref()
-            .map(|(row, _)| row.clone())
-            .filter(|row| row.parent().as_ref() == Some(transcript))
-            .or_else(|| self.transcript.first_child());
-        // Back while the row starts below the view's top...
-        while let Some(current) = row.clone() {
-            match current.compute_bounds(transcript) {
-                Some(bounds) if f64::from(bounds.y()) > value => match current.prev_sibling() {
-                    Some(previous) => row = Some(previous),
-                    None => break,
-                },
-                _ => break,
-            }
-        }
-        // ...then on to the first that reaches into it.
-        while let Some(current) = row.clone() {
-            let Some(bounds) = current.compute_bounds(transcript) else {
-                break;
-            };
-            if f64::from(bounds.y() + bounds.height()) <= value {
-                row = current.next_sibling();
-                continue;
-            }
-            // A spacer is a place the reader can be, but a row beside it in
-            // the view is the better anchor: the spacer's height changes as
-            // the stretches it stands for are drawn.
-            // Only one laid out below it: a row just put in reports the
-            // list's top until it is.
-            let page = self.transcript_scroller.vadjustment().page_size();
-            if is_spacer(&current) {
-                if let Some(next) = current.next_sibling() {
-                    if let Some(next_bounds) = next.compute_bounds(transcript) {
-                        let below = next_bounds.y() >= bounds.y() + bounds.height() - 1.0;
-                        if below && f64::from(next_bounds.y()) < value + page {
-                            *self.scroll_anchor.borrow_mut() =
-                                Some((next, f64::from(next_bounds.y()) - value));
-                            return;
-                        }
-                    }
-                }
-            }
-            *self.scroll_anchor.borrow_mut() = Some((current, f64::from(bounds.y()) - value));
-            return;
-        }
-        self.scroll_anchor.borrow_mut().take();
-    }
-
-    /// The transcript's layout changed: put the reader's row back where it
-    /// was in their view. Nothing while the view follows the bottom, whose
-    /// own policy is in `new`; and when the row has gone, the next scroll
-    /// notes another.
-    fn keep_anchor(&self) {
-        if self.stick_to_bottom.get() {
-            return;
-        }
-        let Some((row, offset)) = self.scroll_anchor.borrow().clone() else {
-            return;
-        };
-        let transcript: &gtk::Widget = self.transcript.upcast_ref();
-        if row.parent().as_ref() != Some(transcript) {
-            return;
-        }
-        let Some(bounds) = row.compute_bounds(transcript) else {
-            return;
-        };
-        let adjustment = self.transcript_scroller.vadjustment();
-        let top = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
-        let target = (f64::from(bounds.y()) - offset).clamp(adjustment.lower(), top);
-        if (target - adjustment.value()).abs() >= 0.5 {
-            adjustment.set_value(target);
-        }
     }
 
     /// Append one step of the agent's turn: `content` beside the rail — the
@@ -8128,8 +8300,15 @@ impl ChatPane {
             .build();
         slot.append(&dot);
         slot.append(&spinner);
+        // The rail never sizes its row: the line and the dot's slot are laid
+        // over the height the content decides, rather than measured with it.
+        // Measured, the line's top segment — fitted to the dot once the
+        // first line can be measured, after the row is first laid out —
+        // grew or shrank a short row a few pixels a moment after it was
+        // shown, and moved everything a reader had in view.
         let rail = gtk::Overlay::new();
-        rail.set_child(Some(&line));
+        rail.set_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+        rail.add_overlay(&line);
         rail.add_overlay(&slot);
         rail.set_size_request(RAIL_WIDTH, -1);
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
@@ -8277,8 +8456,8 @@ impl ChatPane {
         if self.open_jump_down.widget.reveals_child() {
             room += self.open_jump_down.height() + 8;
         }
-        if self.transcript.margin_bottom() != room {
-            self.transcript.set_margin_bottom(room);
+        if self.foot_room.replace(room) != room {
+            self.place_foot();
         }
     }
 
@@ -8288,17 +8467,12 @@ impl ChatPane {
         let Some(row) = self.lit_doc_row.borrow().clone() else {
             return;
         };
-        let Some(bounds) = row.compute_bounds(&self.transcript) else {
-            return;
-        };
-        self.stick_to_bottom.set(false);
         let top = if self.pinned_float.is_visible() {
             self.pinned_plate.height() as f32
         } else {
             0.0
         };
-        let adjustment = self.transcript_scroller.vadjustment();
-        adjustment.set_value(f64::from(bounds.y() - top - 8.0).max(adjustment.lower()));
+        self.scroll_to_row(&row, top + 8.0);
     }
 
     /// The way out of a clipped block: what opens `doc` in the editor,
@@ -8761,11 +8935,7 @@ impl ChatPane {
                 let (Some(pane), Some(seat)) = (weak.upgrade(), seat.upgrade()) else {
                     return;
                 };
-                if let Some(bounds) = seat.compute_bounds(&pane.transcript) {
-                    pane.transcript_scroller
-                        .vadjustment()
-                        .set_value(f64::from(bounds.y()));
-                }
+                pane.scroll_to_row(&seat, 0.0);
             });
         }
         Some(origin)
@@ -8785,9 +8955,7 @@ impl ChatPane {
         }
         for row in rows {
             self.forget_prompt_row(&row);
-            self.transcript.remove(&row);
-            self.transcript_rows
-                .set(self.transcript_rows.get().saturating_sub(1));
+            self.remove_row(&row);
         }
     }
 
@@ -12099,7 +12267,13 @@ impl ChatPane {
             held.records.push(value);
             return;
         }
-        self.stretches.borrow_mut().read(&value);
+        let begins = self.stretches.borrow_mut().begins(&value);
+        if begins {
+            self.open_stretch();
+        }
+        if let Some(last) = self.stretches.borrow_mut().list.last_mut() {
+            last.records.push(value.clone());
+        }
         self.archive_buffer.borrow_mut().push(value);
     }
 
@@ -12118,15 +12292,22 @@ impl ChatPane {
     /// drawn before its message is recorded, and the message begins the
     /// stretch they belong to.
     fn claim_rows(&self, rows: &[gtk::ListBoxRow]) {
-        let mut stretches = self.stretches.borrow_mut();
-        for stretch in &mut stretches.list {
-            stretch.rows.retain(|kept| !rows.contains(kept));
-        }
-        if let Some(last) = stretches.list.last_mut() {
-            last.rows.extend(rows.iter().cloned());
-            // In the order they stand in, which every reading of a
-            // stretch's rows assumes.
-            last.rows.sort_by_key(|row| row.index());
+        let live = self.live_rows();
+        // In the order they stood in, after any claimed before them (the
+        // prompts a turn took together, each in turn): the message was
+        // recorded just now, so nothing else has been drawn into the
+        // stretch it began.
+        let mut moving: Vec<gtk::ListBoxRow> = rows
+            .iter()
+            .filter(|row| row.parent().is_some_and(|parent| parent != live))
+            .cloned()
+            .collect();
+        moving.sort_by_key(|row| row.index());
+        for row in &moving {
+            if let Some(from) = row.parent().and_downcast::<gtk::ListBox>() {
+                from.remove(row);
+                live.append(row);
+            }
         }
     }
 
@@ -12182,15 +12363,25 @@ impl ChatPane {
             stretches.segmenter = segmenter;
             stretches.list = list
                 .into_iter()
-                .enumerate()
-                .map(|(i, records)| Stretch::new(records, i + 1 < count))
+                .map(|records| Stretch {
+                    records,
+                    rows: None,
+                })
                 .collect();
+            // The last is drawn now, live, into a list of its own; the rest
+            // when the transcript first shows them.
+            if let Some(last) = stretches.list.last_mut() {
+                last.rows = Some(stretch_list());
+            }
             stretches
                 .list
                 .last()
                 .map(|last| last.records.clone())
                 .unwrap_or_default()
         };
+        let items: Vec<glib::BoxedAnyObject> = (0..count).map(glib::BoxedAnyObject::new).collect();
+        self.store.splice(0, 0, &items);
+        self.place_foot();
         tracing::info!(
             "chat {}: drawing its history's last stretch of {count}, {} record(s)",
             self.environment,
@@ -12213,7 +12404,8 @@ impl ChatPane {
             self.settle_running_steps();
         });
         self.drawing_history.set(false);
-        self.respace();
+        self.sync_placeholder();
+        self.scroll_to_end();
         self.trim_transcript();
     }
 
@@ -13763,20 +13955,24 @@ impl ChatPane {
         }
         fn report(pane: &ChatPane, what: &str, held: &Cell<std::time::Duration>) {
             let adjustment = pane.transcript_scroller.vadjustment();
-            let (shown, all) = {
+            let (shown, mapped, all) = {
                 let stretches = pane.stretches.borrow();
                 (
-                    stretches.list.iter().filter(|s| !s.hidden).count(),
+                    stretches.list.iter().filter(|s| s.rows.is_some()).count(),
+                    stretches
+                        .list
+                        .iter()
+                        .filter(|s| s.rows.as_ref().is_some_and(|r| r.is_mapped()))
+                        .count(),
                     stretches.list.len(),
                 )
             };
             // The first row reaching into the view that says which turn.
             let value = adjustment.value();
             let mut at_top = String::from("-");
-            let mut child = pane.transcript.first_child();
-            while let Some(row) = child {
-                if let Some(bounds) = row.compute_bounds(&pane.transcript) {
-                    if f64::from(bounds.y() + bounds.height()) > value {
+            for row in pane.drawn_rows().into_iter().filter(|row| row.is_mapped()) {
+                if let Some(bounds) = row.compute_bounds(&pane.transcript_scroller) {
+                    if bounds.y() + bounds.height() > 0.0 {
                         let text = widget_text(&row);
                         if let Some(at) = text.find("turn ") {
                             at_top = text[at..].chars().take(9).collect();
@@ -13784,10 +13980,9 @@ impl ChatPane {
                         }
                     }
                 }
-                child = row.next_sibling();
             }
             println!(
-                "probe history: {what}: rows {}, stretches drawn {shown}/{all}, value {:.0} of {:.0}, top {at_top:?}, held {}ms",
+                "probe history: {what}: rows {}, stretches drawn {shown}/{all} ({mapped} mapped), value {:.0} of {:.0}, top {at_top:?}, held {}ms",
                 pane.transcript_rows.get(),
                 value,
                 adjustment.upper(),
@@ -13815,13 +14010,47 @@ impl ChatPane {
                 return;
             }
             let mut steps = 0;
+            let mut waited = std::time::Duration::ZERO;
             while adjustment.value() > 0.0 && steps < 4000 {
                 let target = (adjustment.value() - adjustment.page_size() * 0.8).max(0.0);
                 adjustment.set_value(target);
-                glib::timeout_future(std::time::Duration::from_millis(60)).await;
+                // A reader's pace: on once what came on screen is drawn.
+                let stop = std::time::Instant::now();
+                glib::timeout_future(std::time::Duration::from_millis(30)).await;
+                while !pane.placeholders_on_screen().is_empty()
+                    && stop.elapsed() < std::time::Duration::from_secs(2)
+                {
+                    glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                }
+                let left = pane.placeholders_on_screen();
+                if !left.is_empty() {
+                    let stretches = pane.stretches.borrow();
+                    let said: Vec<String> = left
+                        .iter()
+                        .map(|index| match index {
+                            None => "no index".to_string(),
+                            Some(i) => format!(
+                                "{i}: drawn {}, queued {}, drawing {}",
+                                stretches.list.get(*i).is_some_and(|s| s.rows.is_some()),
+                                pane.build_queue.borrow().contains(i),
+                                pane.build_job
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|j| j.index == *i)
+                            ),
+                        })
+                        .collect();
+                    println!("probe history: still placeholders after 2s: {said:?}");
+                }
+                waited = waited.max(stop.elapsed());
                 steps += 1;
                 if steps % 50 == 0 {
                     report(&pane, &format!("{steps} pages up"), &held);
+                    println!(
+                        "probe history: the longest a page waited to be drawn: {}ms",
+                        waited.as_millis()
+                    );
+                    waited = std::time::Duration::ZERO;
                 }
             }
             glib::timeout_future(std::time::Duration::from_millis(800)).await;
@@ -14027,7 +14256,14 @@ impl ChatPane {
                 return;
             }
             let mut line = widget.css_name().to_string();
-            for class in widget.css_classes() {
+            // Not the classes layout gives: an overlay marks its children
+            // by the edge they were allocated at, which a list not yet
+            // shown has not been.
+            for class in widget
+                .css_classes()
+                .into_iter()
+                .filter(|class| !matches!(class.as_str(), "top" | "bottom" | "left" | "right"))
+            {
                 line.push('.');
                 line.push_str(&class);
             }
@@ -14048,19 +14284,16 @@ impl ChatPane {
             }
         }
         fn snapshot(pane: &ChatPane) -> Vec<Vec<String>> {
-            let parent: &gtk::Widget = pane.transcript.upcast_ref();
             pane.stretches
                 .borrow()
                 .list
                 .iter()
                 .map(|stretch| {
                     let mut out = Vec::new();
-                    for row in stretch
-                        .rows
-                        .iter()
-                        .filter(|row| row.parent().as_ref() == Some(parent))
-                    {
-                        signature(row.upcast_ref(), &mut out);
+                    let mut child = stretch.rows.as_ref().and_then(|rows| rows.first_child());
+                    while let Some(row) = child {
+                        signature(&row, &mut out);
+                        child = row.next_sibling();
                     }
                     out
                 })
@@ -14082,16 +14315,14 @@ impl ChatPane {
                     .collect::<Vec<_>>()
             );
             for index in 0..count.saturating_sub(1) {
-                if !pane.let_go(index) {
-                    println!("probe roundtrip: stretch {index} could not be let go");
-                }
+                pane.let_go_of(index);
             }
             println!(
                 "probe roundtrip: let go, rows {}",
                 pane.transcript_rows.get()
             );
             for index in 0..count.saturating_sub(1) {
-                pane.draw_stretch_now(index);
+                pane.stretch_rows(index);
             }
             glib::timeout_future(std::time::Duration::from_millis(800)).await;
             let after = snapshot(&pane);
@@ -14139,8 +14370,8 @@ impl ChatPane {
                 .borrow()
                 .list
                 .last()
-                .and_then(|stretch| stretch.rows.last().cloned())
-                .map(|row| widget_text(row.upcast_ref()))
+                .and_then(|stretch| stretch.rows.as_ref().and_then(|rows| rows.last_child()))
+                .map(|row| widget_text(&row))
                 .unwrap_or_default();
             println!(
                 "probe roundtrip: the live turn's last row: {:?}",
@@ -14191,19 +14422,23 @@ impl ChatPane {
     }
 
     /// TASTE_PROBE_CHECK only: `TASTE_PROBE_ANCHOR=1` holds the reader's
-    /// place to account. The view is parked mid-transcript, as a reader up
-    /// the history has it; then what moved it happens — the oldest row let
-    /// go, a tall row put in above, rows added at the bottom, and the cap
-    /// reached with more rows still coming — and the row at the top of the
-    /// view is measured before and after each, in the view's own terms.
+    /// place to account. A conversation of sixty turns is drawn from its
+    /// record and the view parked in the middle of it, as a reader up the
+    /// history has it; then what could move it happens — rows added at the
+    /// bottom, a tall row put in a stretch above the view, the stretches
+    /// far from the reader let go, and hundreds more rows at the bottom —
+    /// and the row at the top of the view is measured before and after
+    /// each, in the view's own terms.
     fn probe_anchor(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::ContentChunk;
         type Step = (&'static str, Box<dyn Fn(&Rc<ChatPane>)>);
-        /// The row at the top of the view, and where it starts in it.
+        /// The first row reaching into the view, and where it starts.
         fn place(pane: &ChatPane) -> Option<(String, f64)> {
-            let (row, _) = pane.scroll_anchor.borrow().clone()?;
-            let bounds = row.compute_bounds(&pane.transcript)?;
-            let value = pane.transcript_scroller.vadjustment().value();
-            Some((format!("{:p}", row.as_ptr()), f64::from(bounds.y()) - value))
+            pane.drawn_rows().into_iter().find_map(|row| {
+                let bounds = row.compute_bounds(&pane.transcript_scroller)?;
+                (bounds.y() + bounds.height() > 0.0)
+                    .then(|| (format!("{:p}", row.as_ptr()), f64::from(bounds.y())))
+            })
         }
         fn run(pane: Rc<ChatPane>, mut steps: Vec<Step>, before: Option<(String, f64)>) {
             if steps.is_empty() {
@@ -14211,52 +14446,73 @@ impl ChatPane {
             }
             let (what, step) = steps.remove(0);
             step(&pane);
-            glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
                 let after = place(&pane);
                 let held = matches!((&before, &after),
                     (Some((a, x)), Some((b, y))) if a == b && (x - y).abs() < 1.0);
+                let adjustment = pane.transcript_scroller.vadjustment();
                 println!(
-                    "probe anchor: {what}: {} (before {before:?}, after {after:?}, rows {})",
+                    "probe anchor: {what}: {} (before {before:?}, after {after:?}, rows {}; value {:.0} of {:.0}, foot {}, banner {})",
                     if held { "held" } else { "MOVED" },
-                    pane.transcript_rows.get()
+                    pane.transcript_rows.get(),
+                    adjustment.value(),
+                    adjustment.upper(),
+                    pane.foot_room.get(),
+                    pane.jump_banner.reveals_child()
                 );
                 run(pane, steps, after);
             });
         }
+        let text = |t: String| ContentChunk::new(ContentBlock::Text(TextContent::new(t)));
+        let value = |update: SessionUpdate| serde_json::to_value(update).unwrap_or_default();
+        let mut records = Vec::new();
+        for turn in 0..60 {
+            records.push(value(SessionUpdate::UserMessageChunk(text(format!(
+                "turn {turn}: and the next part?"
+            )))));
+            records.push(value(SessionUpdate::AgentMessageChunk(text(format!(
+                "The answer to turn {turn}, long enough to wrap across the column at \
+                 least once, and a second sentence to make it two lines or three."
+            )))));
+        }
         let pane = self.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+        glib::spawn_future_local(async move {
+            pane.clone().draw_history(records).await;
+            glib::timeout_future(std::time::Duration::from_millis(1500)).await;
+            pane.stick_to_bottom.set(false);
             let adjustment = pane.transcript_scroller.vadjustment();
             adjustment.set_value((adjustment.upper() - adjustment.page_size()) / 2.0);
-            let before = place(&pane);
+            glib::timeout_future(std::time::Duration::from_millis(600)).await;
+            let mut before = place(&pane);
             println!(
                 "probe anchor: parked, stuck {}, row {before:?}",
                 pane.stick_to_bottom.get()
             );
+            // Left alone, it should stay where it was put.
+            let mut state = String::new();
+            for tick in 0..60 {
+                glib::timeout_future(std::time::Duration::from_millis(100)).await;
+                let now = place(&pane);
+                let adjustment = pane.transcript_scroller.vadjustment();
+                let now_state = format!(
+                    "foot {}, banner {}, pinned {}, page {:.0}",
+                    pane.foot_room.get(),
+                    pane.jump_banner.reveals_child(),
+                    pane.pinned_float.is_visible(),
+                    adjustment.page_size()
+                );
+                if now != before || now_state != state {
+                    println!(
+                        "probe anchor: left alone, {}ms in: {before:?} -> {now:?}; value {:.0} of {:.0}; {now_state}",
+                        (tick + 1) * 100,
+                        adjustment.value(),
+                        adjustment.upper()
+                    );
+                    before = now;
+                    state = now_state;
+                }
+            }
             let steps: Vec<Step> = vec![
-                (
-                    "the oldest row let go",
-                    Box::new(|pane: &Rc<ChatPane>| {
-                        if let Some(oldest) = pane.transcript.first_child() {
-                            pane.transcript.remove(&oldest);
-                            pane.transcript_rows.set(pane.transcript_rows.get() - 1);
-                        }
-                    }),
-                ),
-                (
-                    "a tall row put in above",
-                    Box::new(|pane: &Rc<ChatPane>| {
-                        let lines: Vec<String> = (0..12)
-                            .map(|n| format!("probe: a line above the reader ({n})"))
-                            .collect();
-                        pane.meta_row(&lines.join("\n"));
-                        if let Some(row) = pane.transcript.last_child() {
-                            pane.transcript.remove(&row);
-                            if let Ok(row) = row.downcast::<gtk::ListBoxRow>() {
-                                pane.transcript.prepend(&row);
-                            }
-                        }
-                    }),
-                ),
                 (
                     "rows added at the bottom",
                     Box::new(|pane: &Rc<ChatPane>| {
@@ -14266,10 +14522,33 @@ impl ChatPane {
                     }),
                 ),
                 (
-                    "the cap reached, more rows coming",
+                    "a tall row put in a stretch above the view",
                     Box::new(|pane: &Rc<ChatPane>| {
-                        while pane.transcript_rows.get() < MAX_TRANSCRIPT_ROWS + 5 {
-                            pane.meta_row("probe: another step at the bottom");
+                        let above = pane.stretches.borrow().list.iter().find_map(|stretch| {
+                            let rows = stretch.rows.clone()?;
+                            let bounds = rows.compute_bounds(&pane.transcript_scroller)?;
+                            (bounds.y() + bounds.height() < 0.0).then_some(rows)
+                        });
+                        if let Some(rows) = above {
+                            let lines: Vec<String> = (0..12)
+                                .map(|n| format!("probe: a line above the reader ({n})"))
+                                .collect();
+                            let label = gtk::Label::new(Some(&lines.join("\n")));
+                            rows.prepend(&gtk::ListBoxRow::builder().child(&label).build());
+                        } else {
+                            println!("probe anchor: no stretch above the view is drawn");
+                        }
+                    }),
+                ),
+                (
+                    "the stretches far from the reader let go",
+                    Box::new(|pane: &Rc<ChatPane>| pane.let_go_far()),
+                ),
+                (
+                    "hundreds of rows added at the bottom",
+                    Box::new(|pane: &Rc<ChatPane>| {
+                        for n in 0..250 {
+                            pane.meta_row(&format!("probe: another step at the bottom ({n})"));
                         }
                     }),
                 ),
@@ -14651,9 +14930,9 @@ impl ChatPane {
         let cap = std::env::var("TASTE_PROBE_SCROLL_ROWS")
             .ok()
             .and_then(|rows| rows.parse().ok())
-            .unwrap_or(MAX_TRANSCRIPT_ROWS);
+            .unwrap_or(200);
         let mut index = 0;
-        while self.transcript_rows() < cap {
+        while self.transcript_rows.get() < cap {
             if wants("prose") {
                 self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                     ContentBlock::Text(TextContent::new(prose)),
@@ -14697,19 +14976,9 @@ impl ChatPane {
         });
     }
 
-    fn transcript_rows(&self) -> u32 {
-        let mut rows = 0;
-        let mut child = self.transcript.first_child();
-        while let Some(row) = child {
-            rows += 1;
-            child = row.next_sibling();
-        }
-        rows
-    }
-
     fn run_scroll_bench(self: &Rc<Self>) {
         use std::time::Instant;
-        let Some(clock) = self.transcript.frame_clock() else {
+        let Some(clock) = self.list.frame_clock() else {
             println!("scroll bench: no frame clock");
             return;
         };
@@ -14740,23 +15009,11 @@ impl ChatPane {
         // The whole length in 240 frames, at least 40px a frame: a full
         // transcript is tens of thousands of pixels.
         let step = ((adjustment.upper() - adjustment.page_size()) / 240.0).max(40.0);
-        // The last ROW: the list's last child is its empty-state placeholder.
-        let mut last_end = 0.0f32;
-        let mut child = self.transcript.first_child();
-        while let Some(widget) = child {
-            if widget.is::<gtk::ListBoxRow>() {
-                if let Some(b) = widget.compute_bounds(&self.transcript) {
-                    last_end = last_end.max(b.y() + b.height());
-                }
-            }
-            child = widget.next_sibling();
-        }
         println!(
-            "scroll bench: {} rows, {:.0}px tall, {step:.0}px a frame; the list is {}px and \
-             its last row ends at {last_end:.0}",
-            self.transcript_rows(),
+            "scroll bench: {} rows, {:.0}px tall, {step:.0}px a frame; the list is {}px",
+            self.transcript_rows.get(),
             adjustment.upper(),
-            self.transcript.height(),
+            self.list.height(),
         );
         // Down, then back up: the first pass is every row's first time on
         // screen, the second is rows that have all been shown before.
@@ -15969,12 +16226,18 @@ impl ChatPane {
 /// segment, the break for the spinner, and its bottom segment, in that
 /// order — or `None` for a row that is not a step.
 fn step_rail_line(row: &gtk::ListBoxRow) -> Option<gtk::Box> {
-    row.child()
+    let rail = row
+        .child()
         .and_downcast::<gtk::Box>()?
         .first_child()
-        .and_downcast::<gtk::Overlay>()?
-        .child()
-        .and_downcast::<gtk::Box>()
+        .and_downcast::<gtk::Overlay>()?;
+    rail_line(&rail)
+}
+
+/// A step's rail's line: laid over its row after the empty child that
+/// keeps the rail from sizing it (`append_step`).
+fn rail_line(rail: &gtk::Overlay) -> Option<gtk::Box> {
+    rail.child()?.next_sibling().and_downcast::<gtk::Box>()
 }
 
 /// Whether a call's title is one of the IDE's edit tools.
@@ -17842,12 +18105,8 @@ fn centre_dot_on_first_line(row_box: &gtk::Box) -> bool {
     }
     // ...and the line's top segment ends where the break for a spinner
     // would start, which is measured from the same centre.
-    if let (Some(top), Some(hole)) = (
-        rail.first_child().and_then(|line| line.first_child()),
-        rail.first_child()
-            .and_then(|line| line.first_child())
-            .and_then(|top| top.next_sibling()),
-    ) {
+    let top = rail_line(&rail).and_then(|line| line.first_child());
+    if let (Some(top), Some(hole)) = (top.clone(), top.and_then(|top| top.next_sibling())) {
         if let (Ok(top), Ok(hole)) = (top.downcast::<gtk::Box>(), hole.downcast::<gtk::Box>()) {
             fit_top_segment(rail.upcast_ref(), &top, &hole);
         }

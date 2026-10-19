@@ -1,18 +1,19 @@
 //! **Where a conversation's record breaks into stretches.**
 //!
-//! The chat pane draws a conversation from its record (`chatarchive`) and
-//! keeps only the part near the reader drawn: the rest stands in as space
-//! of about its height, drawn again when the reader comes near it. The
-//! unit drawn and let go is a stretch, and a stretch has to be something a
-//! renderer can start fresh at and finish whole, so it begins only where
-//! nothing before it is still being drawn into:
+//! The chat pane's transcript is a list of stretches of the conversation's
+//! record (`chatarchive`), each an item the list draws from its records
+//! when it first shows it, and lets go of when it is far from the reader.
+//! A stretch has to be something a renderer can start fresh at and finish
+//! whole, so it begins only where nothing before it is still being drawn
+//! into:
 //!
 //! - at a user message, which is where a turn begins, and
-//! - inside a long turn, before a step, once [`STEPS`] steps have gone by
-//!   and none is still running, so a turn of hundreds of steps is not one
-//!   stretch of hundreds of rows. A step still running is updated later in
-//!   the record, and its card has to be in the same stretch as its updates.
+//! - inside a turn, before a step, once [`STEPS`] steps have gone by and
+//!   none is still running. A step still running is updated later in the
+//!   record, and its card has to be in the same stretch as its updates.
 //!
+//! Small, so the list draws a stretch in a fraction of a frame as the
+//! reader scrolls onto it: a step and the words after it, most often.
 //! Decided from the records alone, so the stretches a history is cut into
 //! are the ones the live conversation was cut into as it happened.
 
@@ -22,7 +23,7 @@ use serde_json::Value;
 
 /// How many steps a stretch inside a turn holds before the next may begin
 /// a stretch of its own.
-pub const STEPS: usize = 16;
+pub const STEPS: usize = 1;
 
 /// The record's kind of update, as ACP names it (`sessionUpdate`), or
 /// `None` for the IDE's own entries (its notes and session markers).
@@ -95,13 +96,39 @@ impl Segmenter {
     }
 }
 
+/// Whether `record` is drawn: the agent's updates that put something in
+/// the transcript, and the IDE's notes — not a session's marker, nor an
+/// update about the session's state (its usage, its commands, its mode).
+pub fn draws(record: &Value) -> bool {
+    match kind(record) {
+        Some(kind) => matches!(
+            kind,
+            "user_message_chunk"
+                | "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan"
+        ),
+        None => record.get("tasteNote").is_some(),
+    }
+}
+
 /// `records` cut into stretches, in order, and the segmenter as it stands
-/// after the last, to go on reading the live conversation with.
+/// after the last, to go on reading the live conversation with. A stretch
+/// with nothing drawn in it yet takes the next one's start rather than
+/// being left as one of its own: an empty stretch is an item of no height
+/// in the transcript's list, and the list sizes how many items it keeps
+/// ready by its smallest one.
 pub fn cut(records: Vec<Value>) -> (Vec<Vec<Value>>, Segmenter) {
     let mut segmenter = Segmenter::default();
     let mut stretches: Vec<Vec<Value>> = Vec::new();
     for record in records {
-        if segmenter.begins(&record) || stretches.is_empty() {
+        let begins = segmenter.begins(&record);
+        let open = stretches
+            .last()
+            .is_some_and(|stretch| !stretch.iter().any(draws));
+        if (begins && !open) || stretches.is_empty() {
             stretches.push(Vec::new());
         }
         if let Some(stretch) = stretches.last_mut() {
@@ -129,6 +156,20 @@ mod tests {
         json!({"sessionUpdate": "tool_call_update", "toolCallId": id, "status": "completed"})
     }
 
+    /// What draws nothing — a marker, the session's usage — is no stretch of
+    /// its own: it goes with what follows it.
+    #[test]
+    fn nothing_drawn_is_no_stretch() {
+        let (stretches, _) = cut(vec![
+            json!({"tasteSession": "s"}),
+            json!({"sessionUpdate": "usage_update", "used": 1, "size": 2}),
+            user("one"),
+            said("answer"),
+        ]);
+        let lengths: Vec<usize> = stretches.iter().map(Vec::len).collect();
+        assert_eq!(lengths, vec![4]);
+    }
+
     /// A turn begins a stretch at its message, every block of which stays
     /// together, with the notes among them.
     #[test]
@@ -148,10 +189,10 @@ mod tests {
         assert_eq!(lengths, vec![2, 5, 2]);
     }
 
-    /// A long turn breaks before a step, every [`STEPS`] steps, but never
+    /// A turn breaks before a step once [`STEPS`] have gone by, but never
     /// while a step it began is still running.
     #[test]
-    fn a_long_turn_breaks_between_settled_steps() {
+    fn a_turn_breaks_between_settled_steps() {
         let mut records = vec![user("go")];
         for n in 0..STEPS {
             records.push(step(&format!("s{n}"), "completed"));
@@ -161,10 +202,9 @@ mod tests {
         records.push(step("after", "completed"));
         records.push(settle("long"));
         records.push(said("done"));
-        records.push(step("last", "completed"));
         let (stretches, _) = cut(records);
         let lengths: Vec<usize> = stretches.iter().map(Vec::len).collect();
-        assert_eq!(lengths, vec![1 + STEPS, 5]);
+        assert_eq!(lengths, vec![1 + STEPS, 4]);
         assert_eq!(stretches[1][0]["toolCallId"], "long");
     }
 
@@ -180,8 +220,9 @@ mod tests {
                 records.push(said("…"));
             }
         }
-        let (mut live, mut segmenter) = cut(records[..40].to_vec());
-        for record in records[40..].iter().cloned() {
+        let half = records.len() / 2;
+        let (mut live, mut segmenter) = cut(records[..half].to_vec());
+        for record in records[half..].iter().cloned() {
             if segmenter.begins(&record) {
                 live.push(Vec::new());
             }
