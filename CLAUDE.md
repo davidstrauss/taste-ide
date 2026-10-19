@@ -133,8 +133,11 @@ conversation of `TASTE_PROBE_TURNS` turns (400) drawn from its record as a
 restore draws it, then read a page at a time up to its first message, a
 jump to the middle, and back down, printing the rows and stretches drawn,
 the turn at the top of the view, and the longest the main thread was held
-at each step (`TASTE_PROBE_HISTORY_AT=middle` jumps to the middle and stays,
-for the shot); give it `TASTE_PROBE_DELAY_MS=150000` —, `roundtrip` — a
+at each step, and what each stretch drawn back cost in all and in its
+longest slice (`TASTE_PROBE_HISTORY_AT=middle` jumps to the middle and
+stays, for the shot; `TASTE_PROBE_HISTORY_FILE=<a stash .jsonl>` draws a
+real conversation instead — copy one under `target/`, never commit it);
+give it `TASTE_PROBE_DELAY_MS=150000` —, `roundtrip` — a
 conversation lived the way the event handler and a send live it, every
 stretch but the live one let go and drawn back, and each compared with
 what it was, widget by widget (text, what shows, its classes), then the

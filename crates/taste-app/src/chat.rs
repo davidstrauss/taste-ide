@@ -683,6 +683,22 @@ fn user_record(block: &ContentBlock) -> serde_json::Value {
     .unwrap_or_default()
 }
 
+/// The most of a frame a stretch being drawn back takes
+/// ([`ChatPane::continue_stretch`]).
+const STRETCH_SLICE: std::time::Duration = std::time::Duration::from_millis(6);
+
+/// A stretch being drawn back a slice at a time: what is left of its
+/// records, and its drawing between slices.
+struct StretchJob {
+    index: usize,
+    records: std::vec::IntoIter<serde_json::Value>,
+    drawing: Drawing,
+    /// The stretch after it goes on from its last step.
+    followed: bool,
+    started: std::time::Instant,
+    longest: std::time::Duration,
+}
+
 /// Whether `update` draws rows, rather than setting the chat's state.
 fn draws_rows(update: &SessionUpdate) -> bool {
     matches!(
@@ -1279,6 +1295,10 @@ pub struct ChatPane {
     /// Where `append_row` puts the next row while a stretch is drawn back.
     insert_at: Cell<Option<i32>>,
     reconcile_pending: Cell<bool>,
+    /// TASTE_PROBE_CHECK only: say what each stretch drawn back cost.
+    probe_timing: Cell<bool>,
+    /// The stretch being drawn back, between its slices.
+    stretch_job: RefCell<Option<StretchJob>>,
     /// Drawing from the record, this moment ([`ChatPane::as_recorded`]).
     from_record: Cell<bool>,
     /// A prompt's records and rows being gathered (`send_blocks`).
@@ -3799,6 +3819,8 @@ impl ChatPane {
             stretches: RefCell::new(Stretches::default()),
             insert_at: Cell::new(None),
             reconcile_pending: Cell::new(false),
+            probe_timing: Cell::new(false),
+            stretch_job: RefCell::new(None),
             from_record: Cell::new(false),
             holding: RefCell::new(None),
             archive_io: RefCell::new(None),
@@ -4998,6 +5020,7 @@ impl ChatPane {
         }
         self.transcript_rows.set(0);
         *self.stretches.borrow_mut() = Stretches::default();
+        self.stretch_job.borrow_mut().take();
         self.last_prompt_row.borrow_mut().take();
         // A replay reports each call's output again.
         self.terminal_text.borrow_mut().clear();
@@ -7456,7 +7479,8 @@ impl ChatPane {
     /// settle) loses its oldest rows, as every stretch once did; its
     /// records keep them, for the next time it is drawn.
     fn reconcile(self: &Rc<Self>) {
-        if self.drawing_history.get() {
+        // One stretch at a time: the next pass follows the one being drawn.
+        if self.drawing_history.get() || self.stretch_job.borrow().is_some() {
             return;
         }
         let adjustment = self.transcript_scroller.vadjustment();
@@ -7565,11 +7589,23 @@ impl ChatPane {
         spans
     }
 
-    /// Draw hidden stretch `index` where it belongs, from its records, with
-    /// a drawing of its own (`swap_drawing`) and none of its records'
-    /// effects on the live chat (`drawing_past`).
+    /// Start drawing hidden stretch `index` where it belongs, from its
+    /// records, with a drawing of its own (`swap_drawing`) and none of its
+    /// records' effects on the live chat (`drawing_past`), a frame's worth
+    /// at a time ([`Self::continue_stretch`]).
+    ///
+    /// A stretch is a turn's worth of steps, and drawn whole it held the
+    /// main thread for a hundred milliseconds and more of a debug build —
+    /// each step's card, the markdown of the message before it — right as
+    /// the reader scrolled towards it. In slices the cost is the same and
+    /// no frame pays more than [`STRETCH_SLICE`] of it; the stretch comes
+    /// in above or below the view, where the margin put it, while the
+    /// reader goes on scrolling.
     fn draw_stretch(self: &Rc<Self>, index: usize) {
-        let records = {
+        if self.stretch_job.borrow().is_some() {
+            return;
+        }
+        let (records, followed) = {
             let mut stretches = self.stretches.borrow_mut();
             let Some(stretch) = stretches.list.get_mut(index) else {
                 return;
@@ -7583,44 +7619,126 @@ impl ChatPane {
             if let Some(spacer) = spacer {
                 self.transcript.remove(&spacer);
             }
-            let at = stretches.position_after(index, &self.transcript);
-            self.insert_at.set(Some(at));
-            stretches.drawing = Some(index);
             let followed = stretches
                 .list
                 .get(index + 1)
                 .is_some_and(|next| continues_turn(&next.records));
             (records, followed)
         };
-        let (records, followed) = records;
-        let was = self.from_record.replace(true);
+        // The rest of its run keeps its space while it is drawn.
+        self.respace();
         let mut drawing = Drawing::default();
-        self.swap_drawing(&mut drawing);
         // Its rail as the turn drew it: on from the step before it, and
         // on into the step after it, when those are in the stretches on
         // either side.
         if index > 0 && continues_turn(&records) {
-            *self.last_rail.borrow_mut() = Some(StepRail::elsewhere());
+            drawing.last_rail = Some(StepRail::elsewhere());
         }
+        *self.stretch_job.borrow_mut() = Some(StretchJob {
+            index,
+            records: records.into_iter(),
+            drawing,
+            followed,
+            started: std::time::Instant::now(),
+            longest: std::time::Duration::ZERO,
+        });
+        self.continue_stretch(Some(STRETCH_SLICE));
+    }
+
+    /// [`Self::draw_stretch`], whole, now.
+    fn draw_stretch_now(self: &Rc<Self>, index: usize) {
+        self.draw_stretch(index);
+        while self.stretch_job.borrow().is_some() {
+            self.continue_stretch(None);
+        }
+    }
+
+    /// Draw the next slice of the stretch being drawn: as many records as
+    /// fit in `budget` (all of them, without one), then the frame. Its
+    /// drawing, and where its rows go, are put back for each slice and
+    /// taken away after, so what happens between slices — the agent's
+    /// next update, a message sent — is drawn as live.
+    fn continue_stretch(self: &Rc<Self>, budget: Option<std::time::Duration>) {
+        let Some(mut job) = self.stretch_job.borrow_mut().take() else {
+            return;
+        };
+        let slice = std::time::Instant::now();
+        let index = job.index;
+        {
+            let mut stretches = self.stretches.borrow_mut();
+            let parent: &gtk::Widget = self.transcript.upcast_ref();
+            // After the last of its rows drawn so far: whatever happened
+            // since moved where that is.
+            let at = stretches
+                .list
+                .get(index)
+                .and_then(|stretch| {
+                    stretch
+                        .rows
+                        .iter()
+                        .rev()
+                        .find(|row| row.parent().as_ref() == Some(parent))
+                })
+                .map(|row| row.index() + 1)
+                .unwrap_or_else(|| stretches.position_after(index, &self.transcript));
+            self.insert_at.set(Some(at));
+            stretches.drawing = Some(index);
+        }
+        let was = self.from_record.replace(true);
+        self.swap_drawing(&mut job.drawing);
         self.drawing_history.set(true);
         self.drawing_past.set(true);
-        for record in records {
+        let mut done = false;
+        loop {
+            let Some(record) = job.records.next() else {
+                self.finalize_stream();
+                self.settle_running_steps();
+                if job.followed {
+                    if let Some(rail) = self.last_rail.borrow().as_ref() {
+                        rail.bottom.set_visible(true);
+                    }
+                }
+                done = true;
+                break;
+            };
             self.draw_record(record);
-        }
-        self.finalize_stream();
-        self.settle_running_steps();
-        if followed {
-            if let Some(rail) = self.last_rail.borrow().as_ref() {
-                rail.bottom.set_visible(true);
+            if budget.is_some_and(|budget| slice.elapsed() >= budget) {
+                break;
             }
         }
         self.drawing_past.set(false);
         self.drawing_history.set(false);
-        self.swap_drawing(&mut drawing);
+        self.swap_drawing(&mut job.drawing);
         self.from_record.set(was);
         self.insert_at.set(None);
         self.stretches.borrow_mut().drawing = None;
-        self.respace();
+        job.longest = job.longest.max(slice.elapsed());
+        if done {
+            if self.probe_timing.get() {
+                println!(
+                    "probe history: drew stretch {index}: {:.1}ms in all, {:.1}ms the longest slice",
+                    job.started.elapsed().as_secs_f64() * 1000.0,
+                    job.longest.as_secs_f64() * 1000.0
+                );
+            }
+            self.respace();
+            self.trim_transcript();
+            return;
+        }
+        *self.stretch_job.borrow_mut() = Some(job);
+        if budget.is_some() {
+            let weak = self.weak_self.borrow().clone();
+            glib::timeout_add_local_full(
+                std::time::Duration::ZERO,
+                glib::Priority::from(crate::stall::AFTER_FRAME),
+                move || {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.continue_stretch(Some(STRETCH_SLICE));
+                    }
+                    glib::ControlFlow::Break
+                },
+            );
+        }
     }
 
     /// Let drawn stretch `index` go: its rows out, a spacer of its measured
@@ -13562,7 +13680,21 @@ impl ChatPane {
         let text = |t: String| ContentChunk::new(ContentBlock::Text(TextContent::new(t)));
         let mut records =
             vec![serde_json::json!({ taste_core::chatarchive::SESSION_MARKER: "probe" })];
-        for turn in 0..turns {
+        // `TASTE_PROBE_HISTORY_FILE`: a real stash instead, its records
+        // as a restore draws them.
+        let file = std::env::var("TASTE_PROBE_HISTORY_FILE")
+            .ok()
+            .filter(|path| !path.is_empty());
+        if let Some(path) = &file {
+            records = std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter_map(|line| line.get("update").cloned())
+                .collect();
+        }
+        self.probe_timing.set(true);
+        for turn in 0..if file.is_some() { 0 } else { turns } {
             records.push(value(SessionUpdate::UserMessageChunk(text(format!(
                 "turn {turn}: what does the next step need?"
             )))));
@@ -13926,7 +14058,7 @@ impl ChatPane {
                 pane.transcript_rows.get()
             );
             for index in 0..count.saturating_sub(1) {
-                pane.draw_stretch(index);
+                pane.draw_stretch_now(index);
             }
             glib::timeout_future(std::time::Duration::from_millis(800)).await;
             let after = snapshot(&pane);
