@@ -81,7 +81,15 @@ impl DocumentBase {
             return None;
         }
         let source = percent_decode(source.split(['?', '#']).next().unwrap_or(source));
-        let joined = if source.starts_with('/') {
+        // A leading slash is the checkout's root, as a README spells it —
+        // unless what follows already names a path in the checkout, which
+        // is how an agent that has just written a file names it: its
+        // absolute path where it works. Joined onto the root again, that
+        // came out as the root twice over and an image that "could not be
+        // read" (2026-10-19).
+        let joined = if PathBuf::from(&source).starts_with(&self.root) {
+            PathBuf::from(&source)
+        } else if source.starts_with('/') {
             self.root.join(source.trim_start_matches('/'))
         } else {
             self.dir.join(&source)
@@ -1066,6 +1074,12 @@ mod tests {
         assert_eq!(
             base().resolve("/assets/logo.svg"),
             Some(PathBuf::from("/checkout/assets/logo.svg"))
+        );
+        // An absolute path in the checkout, as an agent names a file it
+        // just wrote, is that file.
+        assert_eq!(
+            base().resolve("/checkout/target/shots/start-3.png"),
+            Some(PathBuf::from("/checkout/target/shots/start-3.png"))
         );
         assert_eq!(base().resolve("../../etc/passwd"), None);
         assert_eq!(base().resolve("https://example.org/a.png"), None);
