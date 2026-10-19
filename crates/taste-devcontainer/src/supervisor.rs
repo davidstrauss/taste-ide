@@ -1303,12 +1303,19 @@ impl Supervisor {
                     }
                     snapshot_pending.store(false, Ordering::SeqCst);
                     if let Some(supervisor) = weak.upgrade() {
-                        let snapshot = supervisor.snapshot_blocking();
+                        let mut snapshot = supervisor.snapshot_blocking();
                         if let Err(e) = &snapshot {
                             tracing::warn!("snapshot after a ref moved in the VM: {e:#}");
                         }
-                        if let Err(e) = supervisor.sync_peer_blocking() {
+                        let synced = supervisor.sync_peer_blocking();
+                        if let Err(e) = &synced {
                             tracing::warn!("peer sync after a ref moved in the VM: {e:#}");
+                        }
+                        // The pass repairs a damaged object it meets
+                        // (`crate::repair`), which may be what the snapshot
+                        // failed on: tried again before it is said.
+                        if snapshot.is_err() && synced.is_ok() {
+                            snapshot = supervisor.snapshot_blocking();
                         }
                         // Said where the user looks, not only in the log:
                         // without a snapshot the folder cannot follow, and
@@ -1318,9 +1325,12 @@ impl Supervisor {
                         if let (true, Err(e)) = (primary, snapshot) {
                             folder_events.publish(Event::FolderSync(
                                 taste_core::FolderSync::Failed {
-                                    reason: format!(
-                                        "Personal's working copy could not be snapshotted, so \
-                                         your folder is not following it: {e:#}"
+                                    reason: plain_failure(
+                                        Some(
+                                            "Personal's working copy could not be snapshotted, \
+                                             so your folder is not following it",
+                                        ),
+                                        &e,
                                     ),
                                 },
                             ));
@@ -1791,7 +1801,7 @@ impl Supervisor {
         self.transfers.settle();
         if let Err(e) = &sync {
             events.publish(Event::FolderSync(taste_core::FolderSync::Failed {
-                reason: format!("{e:#}"),
+                reason: plain_failure(None, e),
             }));
         }
         let sync = sync?;
@@ -5123,10 +5133,67 @@ fn first_line(text: &str) -> &str {
 /// config has not chosen a user namespace itself; nothing otherwise.
 /// What a sync pass moved, in the words the title bar's status lists it
 /// with; `None` when nothing moved.
+/// Why the folder is not in step, in a sentence for the title bar's
+/// history, `lead` (what was being done) ahead of it when given. git's own
+/// words — a fetch's stderr, five lines of pack statistics and zlib — go to
+/// the log, where the IDE's faults go, and not in front of the person: in
+/// the title bar they said nothing they could act on, five times over
+/// (2026-10-19).
+pub fn plain_failure(lead: Option<&str>, error: &anyhow::Error) -> String {
+    tracing::warn!("the folder's sync: {error:#}");
+    let chain = format!("{error:#}");
+    // As the context the pass put on its error, or anywhere under it.
+    let lost = error
+        .downcast_ref::<crate::peer::Lost>()
+        .or_else(|| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<crate::peer::Lost>())
+        })
+        .map(|lost| lost.0.clone());
+    let why = if let Some(lost) = lost {
+        format!("{lost}. The sync stops there until they are restored")
+    } else if crate::repair::damaged(&chain) {
+        "git could not read an object, and neither Personal's repository nor your folder's \
+         had one to repair; it tries again on the next change, and the IDE log has the detail"
+            .to_string()
+    } else if [
+        "Connection refused",
+        "Connection closed",
+        "Connection reset",
+        "Could not resolve",
+        "No route to host",
+        "timed out",
+    ]
+    .iter()
+    .any(|sign| chain.contains(sign))
+    {
+        "Personal's VM did not answer; the sync tries again when it does".to_string()
+    } else if let Some(room) = error
+        .chain()
+        .map(|cause| cause.to_string())
+        .find(|cause| cause.contains("free for the desktop"))
+    {
+        room
+    } else {
+        // The IDE's own words for what it was doing, without what git
+        // printed under them.
+        format!("{error}; the IDE log has the detail")
+    };
+    match lead {
+        Some(lead) => format!("{lead}: {why}"),
+        None => why,
+    }
+}
+
 fn folder_sync_summary(sync: &crate::peer::PeerSync) -> Option<String> {
     let plural =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut parts = Vec::new();
+    // First: a repository repaired is the news of the pass.
+    if let Some(repaired) = &sync.repaired {
+        parts.push(repaired.clone());
+    }
     if sync.sent > 0 {
         parts.push(format!(
             "Sent {} to Personal",
@@ -5396,6 +5463,47 @@ fn podman_event_line(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The title bar says why in a sentence, never git's output: damage it
+    /// could not repair, a VM that did not answer, a disk too full.
+    #[test]
+    fn a_failure_is_said_plainly() {
+        use anyhow::anyhow;
+        let lost =
+            anyhow!("git fetch: error: inflate: data stream error\nfatal: unpack-objects failed")
+                .context(crate::peer::Lost(
+                    "1 damaged object could not be read in either copy and is lost: f3e3ca6ebb"
+                        .into(),
+                ));
+        let said = super::plain_failure(None, &lost);
+        assert!(
+            said.starts_with("1 damaged object could not be read"),
+            "{said}"
+        );
+        assert!(!said.contains("inflate"), "{said}");
+
+        let damaged =
+            anyhow!("git fetch: error: inflate: data stream error\nfatal: unpack-objects failed")
+                .context("fetching from /var/home/core/taste/x/primary in taste-x-vm");
+        let said = super::plain_failure(
+            Some("Personal's working copy could not be snapshotted"),
+            &damaged,
+        );
+        assert!(
+            said.starts_with(
+                "Personal's working copy could not be snapshotted: git could not read"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("unpack-objects"), "{said}");
+
+        let refused = anyhow!("ssh: connect to host 127.0.0.1 port 33053: Connection refused")
+            .context("fetching from /x in taste-x-vm");
+        assert_eq!(
+            super::plain_failure(None, &refused),
+            "Personal's VM did not answer; the sync tries again when it does"
+        );
+    }
+
     #[test]
     fn podman_events_become_lines_only_when_they_say_something() {
         let died = r#"{"ContainerExitCode":137,"Name":"x","Status":"died","Type":"container"}"#;

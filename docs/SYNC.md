@@ -429,3 +429,20 @@ than one parent, a detached HEAD, submodules, and directories (Sync.tla's
 planner test covers kinds). `build-aux/check-sync-model.sh` runs all eight
 configurations; `--quick` leaves out the long one.
 
+## A damaged repository is repaired from its other copy
+
+The folder and Personal's checkout each hold the whole history, so an
+object one of them can no longer read is almost always one the other
+still has (`taste_devcontainer::repair`). On 2026-10-19 a page of a pack
+went bad in a VM's memory — the bytes on its disk were sound — and every
+sync after it failed in `git fetch` with zlib's words, until it was
+repaired by hand. A pass that fails on a damaged object now repairs it
+and goes again, once: `git fsck` each copy; move a damaged pack aside and
+unpack what is still readable in it (git will not read past a damaged
+object in a pack to a sound copy elsewhere); copy each object still
+missing from the other copy, checked against its id on the way in; then
+repack and check again. The title bar's history says what was repaired,
+in a sentence, and an object neither copy can read is named as lost
+rather than failing every pass in git's words. git's own output goes to
+the IDE log, never the title bar, and a failure said again is one entry
+rather than one per pass.

@@ -927,6 +927,9 @@ pub struct PeerSync {
     pub host_behind: usize,
     /// Why the folder was left where it was, when it was.
     pub note: Option<String>,
+    /// Damaged objects this pass found and repaired from the other copy
+    /// (`crate::repair`), in a sentence.
+    pub repaired: Option<String>,
     /// The folder was made the checkout's mirror (`taste_git::mirror`):
     /// its branch, index, and working tree now match the checkout's.
     pub mirrored: bool,
@@ -1013,8 +1016,69 @@ pub fn sync_primary_peer_with(
 
 /// [`sync_primary_peer_with`], telling `transfers` how each file it moves
 /// is getting on (`crate::transfers`): the file tree's progress rings.
+///
+/// A pass that fails on a damaged object — one either copy can no longer
+/// read — repairs it from the other (`crate::repair`) and goes again, once:
+/// the folder and the checkout each hold the whole history, so what one
+/// has lost the other almost always has.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_primary_peer_tracked(
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+    resolve: Option<&Resolve>,
+    on_send: OnSend,
+    say: Say,
+    transfers: Option<&crate::transfers::Transfers>,
+) -> Result<PeerSync> {
+    match sync_primary_peer_pass(
+        peer, vm, keys, files, path, resolve, on_send, say, transfers,
+    ) {
+        Err(e) if crate::repair::damaged(&format!("{e:#}")) => {
+            tracing::warn!("the sync found a damaged object: {e:#}");
+            say("repairing a damaged object from the other copy");
+            let repair = crate::repair::repair_pair(peer, files, path)
+                .context("repairing the damaged objects")?;
+            tracing::info!("repair: {repair:?}");
+            // Nothing damaged on disk in either copy: what git read was
+            // bad and is gone, and the pass is simply tried again.
+            let mut sync = sync_primary_peer_pass(
+                peer, vm, keys, files, path, resolve, on_send, say, transfers,
+            )
+            .map_err(|again| {
+                if repair.lost.is_empty() {
+                    again
+                } else {
+                    again.context(Lost(repair.words()))
+                }
+            })?;
+            if repair.repaired_any() || !repair.lost.is_empty() {
+                sync.repaired = Some(repair.words());
+            }
+            Ok(sync)
+        }
+        other => other,
+    }
+}
+
+/// Objects neither copy could read, said in a sentence: the context a pass
+/// that failed after a repair carries, so the failure names them.
+#[derive(Debug)]
+pub struct Lost(pub String);
+
+impl std::fmt::Display for Lost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Lost {}
+
+/// One pass of [`sync_primary_peer_tracked`].
+#[allow(clippy::too_many_arguments)]
+fn sync_primary_peer_pass(
     peer: &Path,
     vm: &Vm,
     keys: &Keys,

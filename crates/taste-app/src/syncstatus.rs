@@ -358,6 +358,15 @@ impl SyncStatus {
 
     fn remember(&self, line: String, failed: bool) {
         let mut history = self.history.borrow_mut();
+        // The same thing said again is one entry, its time the latest: a
+        // failure every pass repeated was the whole history five times
+        // over, and the passes that came before it scrolled away.
+        if history
+            .first()
+            .is_some_and(|(_, said, was)| *said == line && *was == failed)
+        {
+            history.remove(0);
+        }
         history.insert(0, (Instant::now(), line, failed));
         history.truncate(HISTORY);
         drop(history);

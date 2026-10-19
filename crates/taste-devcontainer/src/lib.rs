@@ -30,6 +30,7 @@ pub mod ports;
 pub mod provision;
 pub mod reconcile;
 pub mod registry;
+pub mod repair;
 pub mod security;
 pub mod seed;
 pub mod sizing;
