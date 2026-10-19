@@ -217,7 +217,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 4;
+pub const GUIDANCE_REVISION: u32 = 5;
 
 /// What every agent is told before its first tool call, and what the
 /// coordinator is told besides — the MCP instructions, and what `ide_guide`
@@ -298,6 +298,19 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              up, or at once when the user sends you a message — a sleep hears none of \
              these. To check on something every few minutes, call wait again with the \
              same set: each return says where everything it watched stands.\n\n\
+             PORTS. A service the user's own programs should reach (a browser, a \
+             database client, a debugger) is a port in .devcontainer/devcontainer.json \
+             `forwardPorts`, with a `portsAttributes` entry giving its `label` and \
+             `protocol`, and its server bound to 0.0.0.0 in the container: one bound \
+             to the container's 127.0.0.1 cannot be reached from outside it. Keep the \
+             service's usual number (5432 Postgres, 6379 Redis, 9229 the Node \
+             inspector): the IDE forwards each to the same number on the user's \
+             machine when it is free, else the nearest free one above. Personal's \
+             forwarded ports are announced to the user's local programs in \
+             $XDG_RUNTIME_DIR/taste-ide/ports/<workspace>.json, which is how their \
+             tools find them; the environment tool's `ports` gives each port's address \
+             on their machine. A change to forwardPorts takes effect with \
+             devcontainer_reload.\n\n\
              SYNC. The user's folder on their machine and Personal's checkout mirror each \
              other: a file changed on one side is written on the other, and a path both \
              sides changed is asked about, never overwritten. Ignored files stay where \
@@ -464,6 +477,24 @@ impl McpServer {
                 SupervisorState::Running { container_id } => Some(container_id.as_str()),
                 _ => None,
             },
+            // Each forwarded port and where it answers on the user's
+            // machine, which differs from its own number when that was
+            // taken there; Personal's are announced to the user's local
+            // programs (`taste_core::discovery`).
+            "ports": supervisor
+                .ports()
+                .iter()
+                .map(|spec| {
+                    json!({
+                        "port": spec.port,
+                        "on_users_machine": spec.url(),
+                        "moved": spec.moved(),
+                        "label": spec.label,
+                        "protocol": spec.protocol,
+                        "announced": env.is_primary(),
+                    })
+                })
+                .collect::<Vec<_>>(),
             "pending_config_changes": supervisor.pending_changes(),
             "config_passed_over": supervisor.config_passed_over(),
             "lifecycle_failed": supervisor.hook_failure(),
@@ -6023,8 +6054,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "74d46473c0ad1c4060453b7bd330f6911169308fc94b08d661cc58ba42b3489d";
-        const AT_REVISION: u32 = 4;
+            "864c0ae05bbc2ab8355458ae7829e4962e64cdd27538855151aa41c2be1c3ef9";
+        const AT_REVISION: u32 = 5;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

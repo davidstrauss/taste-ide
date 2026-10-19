@@ -4401,7 +4401,20 @@ count bytes to and from each published port on the input and output
 hooks — TCP and UDP alike, which the kernel's per-socket counters never
 gave (the port-traffic spike's conclusion 3 is superseded by this) — and
 the registry's meter reads them every five seconds with one `nft -j list`
-over ssh. The rules accept everything; they only count. The keeper's recursive watch on the checkout drives config
+over ssh. The rules accept everything; they only count. **Personal's
+forwarded ports are announced to the user's local programs**
+(`taste_core::discovery`): each IDE writes
+`$XDG_RUNTIME_DIR/taste-ide/ports/<workspace-key>.json` — every port's
+number in the container, the address and number it answers on here, its
+label and protocol — in one directory whether the IDE runs natively or as
+the Flatpak (which is granted `xdg-run/taste-ide`), one file per
+workspace, so several IDEs at once never collide. A file is live while its
+IDE holds an exclusive `flock` on the `<workspace-key>.lock` beside it: a
+reader that can take a shared lock has found a crashed IDE's file and
+skips it, and the next IDE sweeps it. Zeroconf was rejected for this: it
+announces on the network, and these ports are this machine's alone
+(David, 2026-10-18). Agents learn it from the guidance's PORTS paragraph,
+and the `environment` tool lists each port with its address here. The keeper's recursive watch on the checkout drives config
 rechecks in place of inotify — every edit under `.devcontainer/` is one
 recheck a quarter second later. Placement is by capacity across the
 workspace's pool (`Pool::place`, "The pool, concretely" above). Not yet:

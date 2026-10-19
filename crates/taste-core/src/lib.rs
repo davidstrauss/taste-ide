@@ -11,6 +11,7 @@ pub mod capped;
 pub mod chatarchive;
 pub mod configprint;
 pub mod conventions;
+pub mod discovery;
 pub mod environment;
 pub mod event;
 pub mod exec;

@@ -667,6 +667,9 @@ pub struct Supervisor {
     /// The ssh process forwarding a remote container's published ports to
     /// this host's loopback, while the container runs.
     tunnel: Mutex<Option<std::process::Child>>,
+    /// Personal's forwarded ports, served to this machine's other programs
+    /// for as long as they are forwarded (`taste_core::discovery`).
+    advertised: Mutex<Option<taste_core::discovery::Advertised>>,
     /// True when the IDE itself runs inside a container (self-hosting
     /// bootstrap): the environment is already up, and lifecycle operations
     /// on it must happen from the host IDE instead. No container runtime is
@@ -947,6 +950,7 @@ impl Supervisor {
             recheck_pending: Arc::new(AtomicBool::new(false)),
             snapshot_pending: Arc::new(AtomicBool::new(false)),
             tunnel: Mutex::new(None),
+            advertised: Mutex::new(None),
             inside,
             disk: Mutex::new(None),
         })
@@ -1316,6 +1320,7 @@ impl Supervisor {
         }
         if !matches!(state, SupervisorState::Running { .. }) {
             self.stop_tunnel();
+            self.advertised.lock().unwrap().take();
             return;
         }
         let forwards: Vec<u16> = {
@@ -1352,6 +1357,7 @@ impl Supervisor {
                 .ok();
         }
         if forwards.is_empty() {
+            self.advertised.lock().unwrap().take();
             return;
         }
         let (program, args) = keys.ssh_tunnel_argv(vm.ssh_port, &forwards);
@@ -1364,6 +1370,7 @@ impl Supervisor {
         {
             Ok(child) => {
                 *self.tunnel.lock().unwrap() = Some(child);
+                self.advertise_ports();
                 self.log(format!(
                     "forwarding localhost:{} from VM {}",
                     forwards
@@ -1378,6 +1385,41 @@ impl Supervisor {
                 "the ports published in VM {} could not be forwarded here: {e}",
                 vm.domain
             )),
+        }
+    }
+
+    /// Personal's ports, as they now answer on this host, written where this
+    /// machine's other programs look (`taste_core::discovery`). Personal's
+    /// only: the user's own environment is the one whose services a local
+    /// tool means.
+    fn advertise_ports(&self) {
+        if !self.env.id.is_primary() {
+            return;
+        }
+        let ports: Vec<taste_core::discovery::Port> = self
+            .ports()
+            .into_iter()
+            .map(|spec| taste_core::discovery::Port {
+                url: spec.url(),
+                port: spec.port,
+                host: "127.0.0.1".into(),
+                host_port: spec.host,
+                label: spec.label.clone().filter(|l| !l.trim().is_empty()),
+                protocol: spec.protocol.clone(),
+            })
+            .collect();
+        let mut advertised = self.advertised.lock().unwrap();
+        // What a crashed IDE left, before this one's own goes beside it.
+        if advertised.is_none() {
+            taste_core::discovery::sweep();
+        }
+        if let Err(e) = taste_core::discovery::advertise(
+            &mut advertised,
+            &self.workspace_key(),
+            &self.env.workspace_root,
+            ports,
+        ) {
+            tracing::warn!("advertising Personal's ports to this machine: {e:#}");
         }
     }
 

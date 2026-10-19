@@ -18,7 +18,8 @@
         "--share=network",
         "--talk-name=org.freedesktop.Flatpak",
         "--system-talk-name=org.freedesktop.UPower",
-        "--filesystem=home"
+        "--filesystem=home",
+        "--filesystem=xdg-run/taste-ide:create"
     ],
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin",
