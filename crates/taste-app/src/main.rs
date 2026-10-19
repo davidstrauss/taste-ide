@@ -623,13 +623,14 @@ fn main() -> glib::ExitCode {
                     and shells: a typed glyph in the accent, a headline that \
                     keeps the weight a tool title gives up. */\n\
                  label.act-title { font-weight: 600; }\n\
-                 /* The transcript is a timeline (chat.rs::append_step): \
+                 /* The transcript is a timeline (chat/rows.rs::on_rail): \
                     the agent's steps on a rail of connected dots, Claude \
                     Code's shape. The rows carry no padding of their own so \
                     the rail's line runs unbroken from one step into the \
-                    next. */\n\
-                 list.transcript > row { padding: 0; margin: 0; \
-                   min-height: 0; }\n\
+                    next, and no hover or focus of their own: a row is \
+                    read, not chosen. */\n\
+                 listview.transcript > row { padding: 0; margin: 0; \
+                   min-height: 0; background: none; outline: none; }\n\
                  /* The transcript reads at a chat's scale, not a document's \
                     (David, 2026-09-07, beside Claude Code's: the scale and \
                     spacing are still much better there): body text a step down \
@@ -677,8 +678,8 @@ fn main() -> glib::ExitCode {
                  .section-list > row:selected, \
                  listview.files-tree > row:selected, \
                  .change-list > row.doc-open, \
-                 list.transcript > row.doc-open > .card, \
-                 list.transcript > row.doc-open .step-content, \
+                 .transcript-row.doc-open > .card, \
+                 .transcript-row.doc-open .step-content, \
                  tabbar.editor-strip tab:selected { background-color: \
                    color-mix(in srgb, var(--accent-bg-color) 25%, \
                    transparent); }\n\
@@ -691,7 +692,7 @@ fn main() -> glib::ExitCode {
                  /* On the item's own boundary — the prompt's card, the step's \
                     text column — never the row, whose edge with the rail is \
                     nobody's. */\n\
-                 list.transcript > row.doc-open .step-content { border-radius: 8px; }\n\
+                 .transcript-row.doc-open .step-content { border-radius: 8px; }\n\
                  /* The F1 reveal (reveal.rs): libadwaita's popover, arrow and \
                     all, in the accent so the map reads as a layer over the \
                     window rather than as more window. */\n\
@@ -1381,21 +1382,21 @@ fn whole_font_css(settings: &gtk::Settings) -> String {
         });
     let Some(px) = px else {
         return ".file-row { font-size: 0.92em; }\n\
-                list.transcript, .pinned-prompt { font-size: 0.92em; }\n\
-                list.transcript label.monospace, \
-                list.transcript textview.diff-side { font-size: 0.9em; }\n\
-                list.transcript label.step-summary.monospace { font-size: 0.82em; }\n"
+                listview.transcript, .pinned-prompt { font-size: 0.92em; }\n\
+                listview.transcript label.monospace, \
+                listview.transcript textview.diff-side { font-size: 0.9em; }\n\
+                listview.transcript label.step-summary.monospace { font-size: 0.82em; }\n"
             .to_string();
     };
     let body = tree_font_px(px);
     let (caption, code) = transcript_font_px(px);
     format!(
         ".file-row {{ font-size: {body}px; }}\n\
-         list.transcript, .pinned-prompt {{ font-size: {body}px; }}\n\
-         list.transcript .caption, .pinned-prompt .caption {{ font-size: {caption}px; }}\n\
-         list.transcript label.monospace, \
-         list.transcript textview.diff-side {{ font-size: {code}px; }}\n\
-         list.transcript label.step-summary.monospace {{ font-size: {caption}px; }}\n"
+         listview.transcript, .pinned-prompt {{ font-size: {body}px; }}\n\
+         listview.transcript .caption, .pinned-prompt .caption {{ font-size: {caption}px; }}\n\
+         listview.transcript label.monospace, \
+         listview.transcript textview.diff-side {{ font-size: {code}px; }}\n\
+         listview.transcript label.step-summary.monospace {{ font-size: {caption}px; }}\n"
     )
 }
 

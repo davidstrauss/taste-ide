@@ -479,35 +479,34 @@ keeps its history, and `session/load` reassembles them. An IDE restart
 already kills the agent outright and the chat comes back; a container
 rebuild is the same event. Covered by tests, not by hope.
 
-**A transcript is drawn from its record, and only near the reader.**
-Every row the chat pane draws comes from one stream of records, kept per
+**A transcript is a model of rows, drawn only near the reader.** Every
+row the chat pane shows comes from one stream of records, kept per
 environment on this machine (`taste_core::chatarchive`): the agent's ACP
 updates verbatim, the user's messages as the `user_message_chunk` a
 replay would bring back (recorded where the agent took them, so a message
 queued behind a turn is after that turn), and the IDE's own notes. A
-`tasteSession` marker says where a session's history begins. Live,
-restored, and drawn back for a reader up the history, it is the same
-records through the same renderer (`ChatPane::draw_record`), so nothing
-is special-cased by where it came from. On a reconnect, a session whose
-whole history is in the record is resumed (`session/resume`, which
-replays nothing) and drawn from the record; one that is not is loaded
-(`session/load`), and its replay, being complete, replaces the record.
-Either way only the last stretch is drawn. The record is cut into
-stretches (`taste_core::stretches` — at each user message, and inside a
-turn between settled steps, so most are a step and the words after it),
-and the transcript is GTK's own virtualized list (`gtk::ListView`) with
-one item per stretch. An item shows its stretch's rows once they are
-drawn and a placeholder of their estimated height until then; a stretch
-is drawn from its records when its item comes on screen, and the few
-either side of it with it, a slice of a frame at a time, into a list of
-its own that replaces the placeholder whole (`ChatPane::build_step`).
-The list keeps the reader's place as items change height, binds only the
-items near the view, and recycles their widgets; drawn stretches far
-from the reader are let go, a few a frame, and drawn again when they
-come back. The live stretch is simply the last item, drawn as it
-happens. The row budget is a performance limit, not a horizon: the
-reader can scroll to the first message the record holds (up to the
-newest 32 MiB of it).
+`tasteSession` marker says where a session's history begins. The records
+become rows as plain data — a message, an answer, a thought, a step, a
+task's report, the plan, a note, each with its piece of the timeline's
+line — in one place (`chat/model.rs`, `Model::apply`), live and restored
+alike, and a test holds a conversation lived and the same one read back
+to the same rows. On a reconnect, a session whose whole history is in the
+record is resumed (`session/resume`, which replays nothing) and drawn
+from the record; one that is not is loaded (`session/load`), and its
+replay, being complete, replaces the record. Either way the record is
+made into rows off the main thread (`Model::of_record`) and handed to the
+transcript at once. The transcript is GTK's own virtualized list
+(`gtk::ListView`) with one item per row: a row's widgets are built from
+its data when the list binds it (`chat/rows.rs`), in a millisecond or so
+— a step's content only once it is opened — and dropped when it
+unbinds. The list keeps the reader's place as items are measured, binds
+only those near the view, and recycles the rest; nothing stands in for a
+row not yet drawn. A change to a row is drawn where the list has it: its
+line, its light, and a streaming answer's words patched in place, and
+anything else built again. The prompt cards of a live send are the one
+kind of item the pane keeps whole, until the agent takes them. The reader
+can scroll to the first message the record holds (up to the newest 32 MiB
+of it).
 
 **What mediation is for.** The IDE still serves the agent files, search
 and commands, and it is worth being exact about why:

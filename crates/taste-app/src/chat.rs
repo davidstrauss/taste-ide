@@ -11,6 +11,9 @@
 //! devcontainer reloads. Conversations survive IDE restarts through ACP's
 //! own `session/load`; the IDE persists nothing but the session id.
 
+mod model;
+mod rows;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -33,7 +36,7 @@ use taste_devcontainer::EnvironmentRegistry;
 
 use crate::hover::FullTextOnHover;
 use agent_client_protocol::schema::v1::{
-    AuthMethod, ContentBlock, Diff, EmbeddedResourceResource, PermissionOptionKind, Plan,
+    AuthMethod, ContentBlock, Diff, EmbeddedResourceResource, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, SessionConfigId, SessionConfigKind,
     SessionConfigOption, SessionConfigSelectOptions, SessionModeId, SessionModeState,
     SessionUpdate, TextContent, ToolCallContent, ToolCallStatus, ToolKind, Usage,
@@ -100,9 +103,9 @@ const CARD_INSET: i32 = 10;
 /// wrong was almost being one.
 const PANE_BAR_INSET: i32 = 12;
 
-/// A `GtkListBoxRow` pads its child by default (measured at 2px in the
-/// probe's geometry dump). The transcript's rows have that padding taken
-/// away (`list.transcript > row` in main.rs), because the timeline's rail
+/// A list's row pads its child by default (measured at 2px in the probe's
+/// geometry dump). The transcript's rows have that padding taken away
+/// (`listview.transcript > row` in main.rs), because the timeline's rail
 /// has to run unbroken from one row into the next and a padded row is a
 /// gap in the line. Named, at zero, so the arithmetic below stays honest
 /// if the stylesheet ever gives it back.
@@ -465,56 +468,6 @@ pub type BusyHook = Rc<dyn Fn(bool)>;
 /// the tab again on a second click.
 pub type OpenDocumentHook = Rc<dyn Fn(&str, Document)>;
 
-/// A step's piece of the timeline's rail: its dot, the spinner that stands
-/// in for the dot while a call runs, and the line below it — shown once
-/// another step follows, so the line always ends at the latest dot.
-struct StepRail {
-    dot: gtk::Box,
-    spinner: gtk::Spinner,
-    bottom: gtk::Box,
-}
-
-impl StepRail {
-    /// A rail standing for a step drawn somewhere else: the stretch before
-    /// this one, which this one goes on from (`ChatPane::draw_stretch`).
-    fn elsewhere() -> Self {
-        Self {
-            dot: gtk::Box::new(gtk::Orientation::Vertical, 0),
-            spinner: gtk::Spinner::new(),
-            bottom: gtk::Box::new(gtk::Orientation::Vertical, 0),
-        }
-    }
-}
-
-/// Whether a stretch with these records goes on from the one before it,
-/// in the same turn — it begins at a step, not at a message — so its rail
-/// runs on from that stretch's last step.
-fn continues_turn(records: &[serde_json::Value]) -> bool {
-    records
-        .first()
-        .and_then(|record| record.get("sessionUpdate"))
-        .and_then(serde_json::Value::as_str)
-        == Some("tool_call")
-}
-
-/// Which stretch a transcript item's holder is showing, as its bind says.
-const HOLDER_INDEX: &str = "taste-stretch-index";
-
-fn set_holder_index(holder: &gtk::Box, index: Option<usize>) {
-    // SAFETY: the key is private to this file and is only ever set to, and
-    // read as, an `Option<usize>` — here and in `holder_index`.
-    unsafe { holder.set_data::<Option<usize>>(HOLDER_INDEX, index) };
-}
-
-fn holder_index(holder: &gtk::Box) -> Option<usize> {
-    // SAFETY: see `set_holder_index`.
-    unsafe {
-        holder
-            .data::<Option<usize>>(HOLDER_INDEX)
-            .and_then(|index| *index.as_ref())
-    }
-}
-
 /// To the end of the transcript: the list asked to bring its last item
 /// into view when the end is far, the value set to the very bottom once
 /// it is near. Set straight across hundreds of items the list has not
@@ -540,145 +493,104 @@ fn pin_to_end(list: &gtk::ListView, adjustment: &gtk::Adjustment, pinning: &Rc<C
     adjustment.set_value(bottom);
 }
 
-/// A stretch's list of rows, as every stretch's is made.
-fn stretch_list() -> gtk::ListBox {
-    gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["background", "transcript"])
-        .build()
+/// One item of the transcript's list: a row of the conversation's model,
+/// drawn when the list brings it on screen (`rows.rs`), or a widget the
+/// pane keeps whole — a prompt's card while the agent has yet to take it,
+/// the marker a reseated prompt leaves behind, the room under the last
+/// row.
+#[derive(Clone)]
+enum Item {
+    Row(model::RowId),
+    Widget(gtk::Widget),
 }
 
-/// What a stretch of the conversation is drawn with: the renderer's state
-/// partway through it — the block streaming, the steps that may still be
-/// updated, the rail's last dot, the message being assembled. The pane's
-/// own fields are the drawing in force; a stretch drawn back from the
-/// record swaps a fresh one in ([`ChatPane::swap_drawing`]), so drawing
-/// history above the reader leaves the live turn's state exactly as it was.
-#[derive(Default)]
-struct Drawing {
-    current_agent: Option<gtk::TextBuffer>,
-    current_agent_view: Option<gtk::TextView>,
-    current_thought: Option<gtk::TextBuffer>,
-    current_thought_header: Option<(gtk::Expander, std::time::Instant)>,
-    tool_cards: HashMap<String, ToolCard>,
-    ide_edit_calls: HashMap<String, String>,
-    terminal_text: HashMap<String, String>,
-    last_rail: Option<StepRail>,
-    after_prompt: bool,
-    pending_user: Option<PendingUserMessage>,
-    plan_card: Option<gtk::Box>,
-    plan_snapshot: Option<Vec<(String, String)>>,
-    last_prompt_row: Option<gtk::ListBoxRow>,
+/// A widget item: `child` in a row of its own, which wears the blue when
+/// its document is the tab in front.
+fn widget_item(child: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    row.add_css_class("transcript-row");
+    row.append(child);
+    stamp_widget(row.upcast_ref());
+    row
 }
 
-/// A stretch of the conversation (`taste_core::stretches`) as the
-/// transcript holds it: one item of its list, its records, and — once it
-/// has been drawn — its rows, in a list of their own.
-struct Stretch {
-    records: Vec<serde_json::Value>,
-    /// Its rows, once drawn: live as they happened, or from its records
-    /// the first time the list showed it ([`ChatPane::stretch_rows`]).
-    /// `None` until then, and again once let go far from the reader
-    /// ([`ChatPane::let_go_far`]).
-    rows: Option<gtk::ListBox>,
-}
-
-/// The conversation as the transcript holds it: every stretch in order.
-#[derive(Default)]
-struct Stretches {
-    list: Vec<Stretch>,
-    /// Where the live conversation's next stretch begins.
-    segmenter: taste_core::stretches::Segmenter,
-}
-
-impl Stretches {
-    /// Whether a live record begins a stretch of its own. A stretch with
-    /// nothing drawn from its records yet — a card drawn before the message
-    /// it is for was recorded, or only the session's marker — is the one
-    /// it begins, as a history is cut (`taste_core::stretches::cut`).
-    fn begins(&mut self, record: &serde_json::Value) -> bool {
-        let open = self
-            .list
-            .last()
-            .is_some_and(|last| !last.records.iter().any(taste_core::stretches::draws));
-        (self.segmenter.begins(record) && !open) || self.list.is_empty()
+/// Whether `a` and `b` are the same item of the transcript.
+fn same_item(a: &Item, b: &Item) -> bool {
+    match (a, b) {
+        (Item::Row(a), Item::Row(b)) => a == b,
+        (Item::Widget(a), Item::Widget(b)) => a == b,
+        _ => false,
     }
 }
 
-/// How many stretches keep their rows while far from the reader: the rest
-/// are drawn again from their records when the list next shows them.
-const KEEP_DRAWN: usize = 120;
+/// The prefix of the key a row's document opens under (`row_doc`).
+const ROW_DOC: &str = "row-";
 
-/// How many stretches a pass lets go of ([`ChatPane::let_go_far`]).
-const LET_GO_AT_ONCE: usize = 8;
-
-/// The most of a frame drawing stretches takes ([`ChatPane::build_step`]).
-const BUILD_SLICE: std::time::Duration = std::time::Duration::from_millis(6);
-
-/// The most of a slow frame drawing stretches takes.
-const BUILD_SLICE_MOST: std::time::Duration = std::time::Duration::from_millis(40);
-
-/// How far from the reader a stretch wanted on screen stays wanted: past
-/// it, the reader has moved on, and it is drawn if they come back.
-const BUILD_REACH: usize = 24;
-
-/// How many stretches either side of one on screen are drawn ahead of the
-/// reader reaching them.
-const BUILD_AHEAD: usize = 3;
-
-/// A stretch being drawn from its records a slice at a time, into a list
-/// of its own that the transcript shows once it is whole.
-struct StretchJob {
-    index: usize,
-    records: std::vec::IntoIter<serde_json::Value>,
-    drawing: Drawing,
-    rows: gtk::ListBox,
-    /// The stretch after it goes on from its last step.
-    followed: bool,
-    started: std::time::Instant,
-    longest: std::time::Duration,
+/// What the pin says of a prompt: its words on one paragraph — the
+/// label's three-line limit is Pango's, per paragraph, and a pasted log
+/// would pin ten lines of itself — or, with none, what was attached.
+fn pin_text(text: &str, attachments: &[(String, ContentBlock)]) -> String {
+    if text.is_empty() {
+        attachments
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        single_line(text, 600)
+    }
 }
 
-/// How tall a stretch's records will draw, roughly, in pixels: the
-/// placeholder's height until it is drawn. Errs are corrected by the
-/// measured scale ([`ChatPane::estimate`]) and absorbed by the list,
-/// which holds the reader's place as an item's height changes.
-fn estimate_height(records: &[serde_json::Value]) -> f64 {
-    let text = |record: &serde_json::Value| {
-        record
-            .pointer("/content/text")
-            .and_then(serde_json::Value::as_str)
-            .map_or(0, str::len)
+/// The replies a restored conversation's last question offered, read back
+/// from its `suggest_replies` call's input: they reach a live chat as the
+/// IDE's own event, which nothing replays, so a question left unanswered
+/// when the IDE closed came back with no buttons under it (David,
+/// 2026-10-08: "If I haven't chosen a reply yet, I should still see the
+/// options on restoring the IDE after closing it"). None when a message
+/// after it answered them, or the server refused them.
+fn replayed_replies(records: &[model::Record]) -> Vec<String> {
+    let mut replies = Vec::new();
+    let mut call: Option<String> = None;
+    let recover = |replies: &mut Vec<String>,
+                   input: Option<&serde_json::Value>,
+                   status: Option<ToolCallStatus>| {
+        if status == Some(ToolCallStatus::Failed) {
+            replies.clear();
+            return;
+        }
+        let offered = input.map(offered_replies).unwrap_or_default();
+        if !offered.is_empty() {
+            *replies = offered;
+        }
     };
-    let (mut px, mut said, mut asked, mut thought) = (0.0, 0usize, 0usize, false);
     for record in records {
-        match record
-            .get("sessionUpdate")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some("agent_message_chunk") => said += text(record),
-            Some("user_message_chunk") => asked += text(record),
-            Some("tool_call") => px += 44.0,
-            Some("agent_thought_chunk") if !thought => {
-                thought = true;
-                px += 32.0;
+        let model::Record::Update(update) = record else {
+            continue;
+        };
+        match update.as_ref() {
+            SessionUpdate::UserMessageChunk(_) => {
+                replies.clear();
+                call = None;
             }
-            Some("plan") => {
-                let entries = record
-                    .get("entries")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len);
-                px += 24.0 + 26.0 * entries as f64;
+            SessionUpdate::ToolCall(tool)
+                if mcp_tool_name(&tool.title).as_deref() == Some("suggest_replies") =>
+            {
+                call = Some(tool.tool_call_id.to_string());
+                recover(&mut replies, tool.raw_input.as_ref(), Some(tool.status));
             }
-            None if record.get(NOTE_RECORD).is_some() => px += 22.0,
+            SessionUpdate::ToolCallUpdate(tool)
+                if call.as_deref() == Some(tool.tool_call_id.to_string().as_str()) =>
+            {
+                recover(
+                    &mut replies,
+                    tool.fields.raw_input.as_ref(),
+                    tool.fields.status,
+                );
+            }
             _ => {}
         }
     }
-    let lines = |chars: usize, per: f64| (chars as f64 / per).ceil();
-    if asked > 0 {
-        px += 48.0 + 22.0 * lines(asked, 48.0);
-    }
-    (px + 22.0 * lines(said, 64.0)).max(24.0)
+    replies
 }
 
 /// The record of one block of the user's message: the update a replay
@@ -714,143 +626,26 @@ const ORCHESTRATOR_ICON: &str = "system-users-symbolic";
 /// that goes with it, for whoever is drawing this conversation's glyph.
 type UsageSeverityHook = Rc<dyn Fn(&str, &str)>;
 
-/// A live tool-call step in the transcript, updated in place.
-struct ToolCard {
-    /// The step's dot on the rail, coloured by how the call went, and the
-    /// spinner that takes its place while the call actually runs — a static
-    /// glyph is indistinguishable from a finished call at a glance, which
-    /// is the one thing the dot exists to answer.
-    dot: gtk::Box,
-    status_spinner: gtk::Spinner,
-    /// The tone the call's status gives the dot — `ok`, `fail`, `live` —
-    /// kept apart from `waiting`, which overrides it for as long as a
-    /// permission question about this call is open.
-    tone: Cell<&'static str>,
-    waiting: Cell<bool>,
-    /// Whether the call is still going, from the last status update that
-    /// carried one — a content-only update carries none.
-    ///
-    /// Recorded rather than read back off the spinner, which is the same
-    /// fact in widget form: `is_visible` answers for the whole ancestry,
-    /// so a card built before the transcript is on screen reads as hidden
-    /// however it was just set.
-    running: Cell<bool>,
-    title_label: gtk::Label,
-    /// What the agent called the call, whole: for a shell call the command,
-    /// which is the IN of its block once the step is opened.
-    ///
-    /// Shared with the Kill button's handler, which has only the command
-    /// to find the running shell by (`ChatPane::running_shell`).
-    title_full: Rc<RefCell<String>>,
-    /// Stops what this step is running, on the step that is running it.
-    ///
-    /// It shares ONE 22-pixel slot with the disclosure arrow, at the step's
-    /// right end, and exactly one of the two is ever in it. A slot of its
-    /// own put the arrow two pixels off the column every other step's arrow
-    /// stands in, and moved it again when the command ended — the
-    /// near-miss `near-miss.py` is for, and a jog under the reader's eye.
-    /// `kill_shown` and `has_content` are the two facts, decided in
-    /// different places, that `apply_trailing` turns into that one slot.
-    kill: gtk::Button,
-    kill_shown: Cell<bool>,
-    has_content: Cell<bool>,
-    /// One dim line under the title while the step is closed: the last line
-    /// the command printed, the size of the edit, the length of the result.
-    summary: gtk::Label,
-    /// The glyph an act carries — filed, started, completed… — hidden on
-    /// every other step.
-    act_icon: gtk::Image,
-    /// Which act this call is, if it is one (`act_kind`), with the
-    /// arguments it was called with and the answer it got, from which the
-    /// headline is written and rewritten as the call completes.
-    act: Cell<Option<ActKind>>,
-    act_input: RefCell<Option<serde_json::Value>>,
-    act_output: RefCell<Option<serde_json::Value>>,
-    /// The call's arguments, kept for every call rather than only an act's:
-    /// `ide_exec`'s `IN` line is built from these (`command_input_line`),
-    /// never from the result, which carries the wrapped `podman exec …`
-    /// string instead of what the agent asked for (i-0016, i-0017).
-    cmd_input: RefCell<Option<serde_json::Value>>,
-    /// How this call's permission was answered — hidden until it was.
-    permission: gtk::Image,
-    content: gtk::Box,
-    /// The disclosure, so the step can be opened without a synthetic click.
-    revealer: gtk::Revealer,
-    arrow: gtk::Image,
-    /// The header button. Untargetable, and showing no arrow, until the
-    /// call has produced something worth opening the step onto.
-    toggle: gtk::Button,
-    /// What `content` was last built from. An ACP content update is a
-    /// SNAPSHOT of the whole collection, so the block is rebuilt when this
-    /// changes and left alone when it does not — which is what keeps a step
-    /// from growing a second copy of its own output mid-stream, and keeps a
-    /// restated snapshot from destroying the widgets under the pointer.
-    signature: RefCell<Option<Vec<String>>>,
-    /// The tool's category, which decides how its content is rendered:
-    /// `Execute` output is a command's, and gets the IN/OUT block.
-    kind: Cell<ToolKind>,
-    /// The step's row, lit while one of its documents is the editor's tab
-    /// in front.
-    row: gtk::ListBoxRow,
-}
-
-impl ToolCard {
-    fn set_expanded(&self, open: bool) {
-        self.revealer.set_reveal_child(open);
-        self.arrow.set_icon_name(Some(if open {
-            "pan-down-symbolic"
-        } else {
-            "pan-end-symbolic"
-        }));
-        self.summary
-            .set_visible(!open && !self.summary.label().is_empty());
-    }
-
-    /// Colour the dot: the question's amber while a permission ask about
-    /// this call is open, else the status's own tone.
-    /// The step's trailing slot: the disclosure, or the Kill while a
-    /// command is running in it, never both and never neither's geometry.
-    ///
-    /// The two inputs arrive from opposite ends of the update — whether a
-    /// command is running (`ChatPane::refresh_kill`, off the status and the
-    /// shell roster) and whether there is anything to open onto (the
-    /// content pass) — so they are recorded and reconciled here rather than
-    /// each setting a widget and hoping the other ran first.
-    fn apply_trailing(&self) {
-        let kill = self.kill_shown.get();
-        self.kill.set_visible(kill);
-        self.arrow.set_visible(self.has_content.get() && !kill);
-    }
-
-    fn paint_dot(&self) {
-        for class in ["ok", "fail", "live", "wait", "cut"] {
-            self.dot.remove_css_class(class);
-        }
-        self.dot.add_css_class(if self.waiting.get() {
-            "wait"
-        } else {
-            self.tone.get()
-        });
-    }
-}
-
 pub struct ChatPane {
     pub widget: gtk::Box,
     workspace: Workspace,
-    /// The transcript: one item per stretch of the conversation, each
-    /// showing that stretch's rows (`Stretch::rows`), and the foot.
+    /// The transcript: one item per row of the conversation's model
+    /// ([`Item`]), and the foot, last.
     list: gtk::ListView,
     store: gtk::gio::ListStore,
-    /// The room under the last row (`sync_bottom_room`): the last
-    /// stretch's rows' bottom margin. An item of its own, it was the
-    /// smallest in the list, which sizes how many items it keeps ready by
-    /// its smallest.
+    /// The conversation as rows (`chat/model.rs`): every row of it, drawn
+    /// or not.
+    model: RefCell<model::Model>,
+    /// The rows the list has bound, by id: the item's box, and what it
+    /// shows ([`rows::RowView`]), for a change to the row to patch or
+    /// rebuild in place.
+    bound: RefCell<HashMap<model::RowId, (glib::WeakRef<gtk::Box>, rows::RowView)>>,
+    /// The room under the last row (`sync_bottom_room`): the foot, the
+    /// list's last item, is that tall.
     foot_room: Cell<i32>,
+    foot: gtk::Box,
     /// The empty chat's page, or the transcript.
     transcript_stack: gtk::Stack,
-    /// Where the rows being drawn go, while a stretch is drawn from its
-    /// records: its own list. Otherwise rows go to the last stretch's.
-    sink: RefCell<Option<gtk::ListBox>>,
     transcript_scroller: gtk::ScrolledWindow,
     /// Pinned copy of the last user prompt: overlays the transcript's top
     /// edge whenever the real card is scrolled out of view above it, so
@@ -860,7 +655,8 @@ pub struct ChatPane {
     /// inside it is what takes the click.
     pinned_float: gtk::Box,
     pinned_prompt_label: gtk::Label,
-    last_prompt_row: RefCell<Option<gtk::ListBoxRow>>,
+    /// The newest prompt's item: the pin mirrors it.
+    last_prompt: RefCell<Option<Item>>,
     entry: sourceview5::View,
     agent_picker: adw::ComboRow,
     /// The client-side permission policy: on = auto-approve.
@@ -884,17 +680,6 @@ pub struct ChatPane {
     /// Offered during the turn, shown when it ends: a question is answered
     /// once it has been asked, not while the agent is still writing it.
     pending_replies: RefCell<Vec<String>>,
-    /// The `suggest_replies` call a replay is going through, by id: its
-    /// input is where a restored conversation's replies come back from
-    /// (`recover_replies`), and its updates may carry that input late.
-    replayed_replies_call: RefCell<Option<String>>,
-    /// Renders the turn's answer whole — each response since its last step
-    /// of work that was clipped: the replies answer what it said, and a
-    /// question cut to "… 2 more lines" left buttons like "Yes, write all
-    /// of it" pointing at a list nobody could see (2026-10-02). Taken when
-    /// the replies are drawn; emptied by a step of work, or a prompt,
-    /// after which what came before is not the answer.
-    unclip_answer: RefCell<Vec<Box<dyn Fn()>>>,
     /// The card's answer buttons, rebuilt per request from the options the
     /// agent offered — every one of them, which is the whole of i-0025.
     permission_answers: adw::WrapBox,
@@ -962,7 +747,7 @@ pub struct ChatPane {
     /// Notes that replace themselves: the label of the last note filed
     /// under each key, so the next one with that key rewrites it in place
     /// (the proxy's wake-up count, ticking up on one line).
-    keyed_notes: RefCell<HashMap<String, gtk::Label>>,
+    keyed_notes: RefCell<HashMap<String, model::RowId>>,
     client: RefCell<Option<AgentClient>>,
     /// A probe filled the custom-model chooser; opening it asks nobody.
     probe_posed_choices: Cell<bool>,
@@ -1097,10 +882,6 @@ pub struct ChatPane {
     /// scrollbar, the keys — so the list moving its own content is told
     /// from the reader moving the view (`at_bottom`'s handler).
     reader_scrolled: Rc<Cell<Option<std::time::Instant>>>,
-    /// Permission outcomes still looking for their tool card, keyed by tool
-    /// call id: the request can arrive before the update that creates the
-    /// card, so the mark waits here until there is something to put it on.
-    pending_marks: RefCell<HashMap<String, (String, String)>>,
     /// The permissions controls, for syncing CurrentModeUpdate.
     mode_sync: RefCell<Option<ModeControls>>,
     /// Structure of the last-built controls (option ids + value sets).
@@ -1133,52 +914,19 @@ pub struct ChatPane {
     /// "which conversation does this environment have", and which pane the
     /// user sees is the environment panel's decision alone.
     environment: EnvironmentId,
-    // --- streaming state -------------------------------------------------
-    current_agent: RefCell<Option<gtk::TextBuffer>>,
-    current_agent_view: RefCell<Option<gtk::TextView>>,
-    current_thought: RefCell<Option<gtk::TextBuffer>>,
-    /// The open thought's expander and the moment it started, so closing it
-    /// can say how long it took. A thought that still says "Thinking…" after
-    /// the answer has arrived is the pane lying about what it is doing.
-    current_thought_header: RefCell<Option<(gtk::Expander, std::time::Instant)>>,
-    tool_cards: RefCell<HashMap<String, ToolCard>>,
-    /// The calls made through the IDE's own edit tools, by id, with their
-    /// titles: drawn as edits ([`ide_edit_shape`]), and their results kept
-    /// from replacing the diff.
-    ide_edit_calls: RefCell<HashMap<String, String>>,
-    /// Each document a step can open (by its key), and the step's row —
-    /// lit while that document is the editor's tab in front
-    /// (`highlight_document`).
-    doc_rows: RefCell<HashMap<String, gtk::ListBoxRow>>,
-    lit_doc_row: RefCell<Option<gtk::ListBoxRow>>,
-    /// The rail of the last step appended: its line is extended when the
-    /// next step follows it, and left ending at its dot when a prompt does.
-    last_rail: RefCell<Option<StepRail>>,
-    /// A prompt was the last row: the next step's line starts at the
-    /// prompt's box rather than at its own dot (David, 2026-09-07: "draw
-    /// the line from the prompt to the first bullet, too" — a departure
-    /// from Claude Code's, where the first bullet starts the line).
-    after_prompt: Cell<bool>,
+    /// The live prompts' documents (`prompt_card`), by key: the widget the
+    /// blue lands on while one is the tab in front. A row's own documents
+    /// are keyed by its id (`row_doc`).
+    doc_widgets: RefCell<HashMap<String, glib::WeakRef<gtk::Widget>>>,
+    /// The item whose document is the tab in front.
+    lit: RefCell<Option<Item>>,
     /// Who opens a document in the editor (chats.rs → editor.rs).
     on_open_document: RefCell<Option<OpenDocumentHook>>,
     /// Who focuses the box this chat is typed into — the universal
     /// composer, which is the window's (compose.rs), not this pane's.
     on_focus_composer: RefCell<Option<Rc<dyn Fn(Rc<ChatPane>)>>>,
-    /// A user message being assembled from its chunks (replayed history,
-    /// and any prompt the agent echoes back). One chunk per content block,
-    /// so the card can only be drawn once they have all arrived.
-    pending_user: RefCell<Option<PendingUserMessage>>,
-    /// The current turn's plan card, updated in place. An ACP plan update
-    /// is a SNAPSHOT of the whole checklist, not an addition to it.
-    plan_card: RefCell<Option<gtk::Box>>,
-    /// The checklist as last drawn (entry text + status), for the whole
-    /// session. A snapshot identical to this one is a restatement, not
-    /// news, and earns no space in the transcript.
-    plan_snapshot: RefCell<Option<Vec<(String, String)>>>,
     // --- slash commands ----------------------------------------------------
     command_provider: crate::command_completion::CommandProvider,
-    /// Live transcript row count (capped; see append_row).
-    transcript_rows: Cell<u32>,
     /// Which spawn the live client is: bumped by every `ensure_client`.
     /// The event loop that spawn started compares against it before it
     /// handles anything, so a process this chat has already replaced
@@ -1291,32 +1039,9 @@ pub struct ChatPane {
     /// Drawing a conversation from a record rather than living it: what is
     /// drawn now is already recorded, and is not recorded again.
     drawing_history: Cell<bool>,
-    /// Drawing a stretch back above or below the reader (`draw_stretch`):
-    /// rows only, none of the effects its records had on the live chat —
-    /// the mode, the usage, the replies, the working line.
-    drawing_past: Cell<bool>,
-    /// The conversation as stretches, drawn and not (`reconcile`).
-    stretches: RefCell<Stretches>,
-    reconcile_pending: Cell<bool>,
-    /// TASTE_PROBE_CHECK only: say what each stretch drawn back cost.
-    probe_timing: Cell<bool>,
     /// Drawing from the record, this moment ([`ChatPane::as_recorded`]).
     from_record: Cell<bool>,
-    /// The stretches wanted on screen and not yet drawn, nearest first,
-    /// and the one being drawn ([`ChatPane::build_step`]).
-    build_queue: RefCell<std::collections::VecDeque<usize>>,
-    build_job: RefCell<Option<StretchJob>>,
-    build_scheduled: Cell<bool>,
-    /// When the last slice ended, while more were to come.
-    build_last: Cell<Option<std::time::Instant>>,
-    /// Measured over estimated, as drawn stretches are laid out.
-    est_scale: Cell<f64>,
-    /// The stretch that last came on screen: where the reader is.
-    reader_at: Cell<usize>,
-    /// The item showing each stretch the list has bound, so what is
-    /// drawn first is what is on screen ([`ChatPane::next_to_draw`]).
-    holders: RefCell<HashMap<usize, glib::WeakRef<gtk::Box>>>,
-    /// A prompt's records and rows being gathered (`send_blocks`).
+    /// A prompt's records and notes being gathered (`send_blocks`).
     holding: RefCell<Option<Unrecorded>>,
     /// The stash's reads and writes, in the order they were asked for
     /// ([`ChatPane::archive_io`]).
@@ -1347,11 +1072,6 @@ pub struct ChatPane {
     /// (restore-text, transcript card, "queued" badge). A failed or dead
     /// prompt leaves the transcript and returns to the composer.
     pending_prompts: RefCell<std::collections::VecDeque<PendingPrompt>>,
-    /// What each of the adapter's own shell calls printed, by tool call id:
-    /// it reports a command it ran itself as a terminal in the content and
-    /// its output in `_meta.terminal_output` (`taste_acp::terminal::
-    /// AgentOwnedTerminals`), so the card's OUT is read from here.
-    terminal_text: RefCell<HashMap<String, String>>,
     /// The queued message whose Ask for a Turn was pressed, until its turn
     /// comes: its badge says when the agent has been told
     /// (`taste_core::nudge`).
@@ -1470,7 +1190,7 @@ type Capture = (String, Box<dyn FnOnce(String)>);
 /// A user message arriving as chunks: its text, and the blocks that are not
 /// text (images above all — a restored conversation used to lose them,
 /// because only text chunks were rendered).
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct PendingUserMessage {
     text: String,
     attachments: Vec<(String, ContentBlock)>,
@@ -1520,7 +1240,7 @@ struct PendingPrompt {
     queued: Option<(gtk::Label, taste_core::queued::Queued)>,
     /// Once the card has been moved to where the agent accepted it, the
     /// marker left behind at the point it was typed.
-    origin: Option<gtk::ListBoxRow>,
+    origin: Option<Item>,
     /// Went out inside the prompt ahead of it (`SessionEvent::QueuedJoined`),
     /// so the turn that ends that one ends this too.
     joined: bool,
@@ -1530,9 +1250,9 @@ struct PendingPrompt {
 }
 
 /// A prompt's records — the user's message as a replay would bring it
-/// back, then the IDE's notes about its briefing — and the rows drawn for
-/// those notes, held until the agent starts on the prompt: its first
-/// update, or its turn's end. Recorded when it is typed, a message sent
+/// back, then the IDE's notes about its briefing — held until the agent
+/// starts on the prompt: its first update, or its turn's end. The notes are
+/// drawn then, under the card. Recorded when it is typed, a message sent
 /// during a turn sat in the middle of that turn, where the agent's own
 /// history does not have it; and a prompt the agent refused, or never
 /// got, stayed in the record and came back on every redraw, twice once
@@ -1540,7 +1260,6 @@ struct PendingPrompt {
 #[derive(Default)]
 struct Unrecorded {
     records: Vec<serde_json::Value>,
-    rows: Vec<gtk::ListBoxRow>,
 }
 
 /// Where an unfinished prompt goes when the process holding it dies.
@@ -2863,20 +2582,22 @@ impl ChatPane {
         auth_box.set_margin_end(12);
         auth_box.set_visible(false);
 
-        // The transcript: a list of message cards. When empty, a native
-        // placeholder invites the first prompt instead of blank space.
-        // The transcript is GTK's own virtualized list over the
-        // conversation's stretches: only those near the view have rows, the
-        // list keeps the reader's place as they are drawn, and each is
-        // drawn from its records the first time it is shown (David,
-        // 2026-10-19: "When I scroll back and have messages loading, it's
-        // honestly a mess. Is there a robust foundation we could put these
-        // chats on?").
+        // The transcript: GTK's own virtualized list over the conversation's
+        // rows (`chat/model.rs`), each drawn from its data when the list
+        // shows it (David, 2026-10-19: "When I scroll back and have messages
+        // loading, it's honestly a mess. Is there a robust foundation we
+        // could put these chats on?"). When empty, a native placeholder
+        // invites the first prompt instead of blank space.
         let store = gtk::gio::ListStore::new::<glib::BoxedAnyObject>();
         let list = gtk::ListView::builder()
             .model(&gtk::NoSelection::new(Some(store.clone())))
-            .css_classes(["background", "transcript-items"])
+            .css_classes(["background", "transcript"])
             .build();
+        // The room under the last row: the list's last item, always.
+        let foot = gtk::Box::builder().height_request(TRANSCRIPT_FOOT).build();
+        store.append(&glib::BoxedAnyObject::new(Item::Widget(
+            foot.clone().upcast(),
+        )));
         // Under the placeholder's logo when a restore fell through: the
         // fresh chat was forced, not chosen. A transcript row would hide
         // the placeholder and strand tiny text in empty space; this keeps
@@ -3346,7 +3067,10 @@ impl ChatPane {
             .css_classes(["dim-label", "caption"])
             .build()
             .full_text_on_hover();
-        let busy_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        // The spinner stands in the rail's column and the words on the
+        // steps' own, so the working line reads as the turn's next step.
+        busy_spinner.set_size_request(RAIL_WIDTH, -1);
+        let busy_row = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
         busy_row.set_margin_start(PANE_BAR_INSET);
         busy_row.set_margin_end(PANE_BAR_INSET);
         busy_row.set_margin_top(6);
@@ -3709,12 +3433,16 @@ impl ChatPane {
             list,
             store,
             foot_room: Cell::new(TRANSCRIPT_FOOT),
+            foot,
+            model: RefCell::new(model::Model::default()),
+            bound: RefCell::new(HashMap::new()),
+            doc_widgets: RefCell::new(HashMap::new()),
+            lit: RefCell::new(None),
             transcript_stack,
-            sink: RefCell::new(None),
             transcript_scroller,
             pinned_float: pinned_float.clone(),
             pinned_prompt_label,
-            last_prompt_row: RefCell::new(None),
+            last_prompt: RefCell::new(None),
             entry: entry.clone(),
             agent_picker,
             approval_picker,
@@ -3736,8 +3464,6 @@ impl ChatPane {
             replies_bar,
             replies_box,
             pending_replies: RefCell::new(Vec::new()),
-            replayed_replies_call: RefCell::new(None),
-            unclip_answer: RefCell::new(Vec::new()),
             revive_bar,
             revive_label,
             revive_queue: RefCell::new(std::collections::VecDeque::new()),
@@ -3754,10 +3480,6 @@ impl ChatPane {
             busy_row: busy_row.clone(),
             busy_label,
             permission_detail,
-            last_rail: RefCell::new(None),
-            doc_rows: RefCell::new(HashMap::new()),
-            lit_doc_row: RefCell::new(None),
-            after_prompt: Cell::new(false),
             on_open_document: RefCell::new(None),
             on_focus_composer: RefCell::new(None),
             client: RefCell::new(None),
@@ -3766,7 +3488,6 @@ impl ChatPane {
             permission_queue: RefCell::new(std::collections::VecDeque::new()),
             pending_questions: RefCell::new(None),
             question_queue: RefCell::new(std::collections::VecDeque::new()),
-            pending_marks: RefCell::new(HashMap::new()),
             composer: composer.clone(),
             send_button: send.clone(),
             stop_button: stop_button.clone(),
@@ -3810,17 +3531,7 @@ impl ChatPane {
             environments,
             bridge_command,
             environment,
-            current_agent: RefCell::new(None),
-            current_agent_view: RefCell::new(None),
-            current_thought: RefCell::new(None),
-            current_thought_header: RefCell::new(None),
-            pending_user: RefCell::new(None),
-            plan_card: RefCell::new(None),
-            plan_snapshot: RefCell::new(None),
-            tool_cards: RefCell::new(HashMap::new()),
-            ide_edit_calls: RefCell::new(HashMap::new()),
             command_provider,
-            transcript_rows: Cell::new(0),
             client_generation: Cell::new(0),
             session_info: RefCell::new(None),
             persisted_session: RefCell::new(None),
@@ -3844,18 +3555,7 @@ impl ChatPane {
             snapshotting: Rc::new(Cell::new(false)),
             archive_buffer: RefCell::new(Vec::new()),
             drawing_history: Cell::new(false),
-            drawing_past: Cell::new(false),
-            stretches: RefCell::new(Stretches::default()),
-            reconcile_pending: Cell::new(false),
-            probe_timing: Cell::new(false),
             from_record: Cell::new(false),
-            build_queue: RefCell::new(std::collections::VecDeque::new()),
-            build_job: RefCell::new(None),
-            build_scheduled: Cell::new(false),
-            build_last: Cell::new(None),
-            est_scale: Cell::new(1.0),
-            reader_at: Cell::new(0),
-            holders: RefCell::new(HashMap::new()),
             holding: RefCell::new(None),
             archive_io: RefCell::new(None),
             after_history: Cell::new(false),
@@ -3865,7 +3565,6 @@ impl ChatPane {
             reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
             pending_prompts: RefCell::new(std::collections::VecDeque::new()),
-            terminal_text: RefCell::new(HashMap::new()),
             nudged_badge: RefCell::new(None),
             capture: RefCell::new(None),
             relocated: Cell::new(false),
@@ -4059,13 +3758,12 @@ impl ChatPane {
             });
         }
 
-        // Each of the transcript's items shows its stretch's rows, drawn
-        // from its records the first time the list shows it; the last item
-        // is the foot. A list widget holds only the items near the view,
-        // so what is bound here is what the reader is near.
+        // Each of the transcript's items is a row of the model, built from
+        // it when the list binds the item and dropped when it unbinds: the
+        // list holds widgets for the items near the view, keeps the reader's
+        // place as they are measured, and recycles the rest.
         {
             let factory = gtk::SignalListItemFactory::new();
-            let weak = Rc::downgrade(&pane);
             factory.connect_setup(move |_, item| {
                 let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
                     return;
@@ -4073,16 +3771,7 @@ impl ChatPane {
                 item.set_activatable(false);
                 item.set_selectable(false);
                 item.set_focusable(false);
-                let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                // On screen: the list maps only the items in view of the
-                // ~200 it keeps bound, so this is the reader reaching one.
-                let weak = weak.clone();
-                holder.connect_map(move |holder| {
-                    if let (Some(pane), Some(index)) = (weak.upgrade(), holder_index(holder)) {
-                        pane.want_stretch(index);
-                    }
-                });
-                item.set_child(Some(&holder));
+                item.set_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
             });
             let weak = Rc::downgrade(&pane);
             factory.connect_bind(move |_, item| {
@@ -4096,44 +3785,36 @@ impl ChatPane {
                 ) else {
                     return;
                 };
-                let index = *object.borrow::<usize>();
-                set_holder_index(&holder, Some(index));
-                pane.holders.borrow_mut().insert(index, holder.downgrade());
-                pane.fill_holder(&holder, index);
+                let entry = object.borrow::<Item>().clone();
+                pane.bind_item(&holder, &entry);
             });
             let weak = Rc::downgrade(&pane);
             factory.connect_unbind(move |_, item| {
-                let Some(holder) = item
-                    .downcast_ref::<gtk::ListItem>()
-                    .and_then(|item| item.child())
-                    .and_downcast::<gtk::Box>()
-                else {
+                let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
                     return;
                 };
-                if let (Some(pane), Some(index)) = (weak.upgrade(), holder_index(&holder)) {
-                    let mut holders = pane.holders.borrow_mut();
-                    if holders.get(&index).and_then(|h| h.upgrade()).as_ref() == Some(&holder) {
-                        holders.remove(&index);
+                let Some(holder) = item.child().and_downcast::<gtk::Box>() else {
+                    return;
+                };
+                let entry = item
+                    .item()
+                    .and_downcast::<glib::BoxedAnyObject>()
+                    .map(|object| object.borrow::<Item>().clone());
+                if let (Some(pane), Some(Item::Row(id))) = (weak.upgrade(), entry) {
+                    let mut bound = pane.bound.borrow_mut();
+                    if bound
+                        .get(&id)
+                        .and_then(|(at, _)| at.upgrade())
+                        .is_some_and(|at| at == holder)
+                    {
+                        bound.remove(&id);
                     }
                 }
-                set_holder_index(&holder, None);
                 while let Some(child) = holder.first_child() {
                     holder.remove(&child);
                 }
             });
             pane.list.set_factory(Some(&factory));
-        }
-
-        // The reader's place is the list's to keep (GtkListView anchors on
-        // the item in view); what stays drawn follows them.
-        {
-            let adjustment = pane.transcript_scroller.vadjustment();
-            let weak = Rc::downgrade(&pane);
-            adjustment.connect_value_changed(move |_| {
-                let Some(pane) = weak.upgrade() else { return };
-                // What stays drawn follows the reader.
-                pane.trim_transcript();
-            });
         }
 
         {
@@ -4191,9 +3872,9 @@ impl ChatPane {
             let weak = Rc::downgrade(&pane);
             click.connect_released(move |_, _, _, _| {
                 let Some(pane) = weak.upgrade() else { return };
-                let row = pane.last_prompt_row.borrow().clone();
-                if let Some(row) = row {
-                    pane.scroll_to_row(&row, 0.0);
+                let prompt = pane.last_prompt.borrow().clone();
+                if let Some(prompt) = prompt {
+                    pane.scroll_to_item(&prompt, 0.0);
                 }
             });
             pinned_prompt.add_controller(click);
@@ -4513,25 +4194,13 @@ impl ChatPane {
     /// note; each later one rewrites its label and the transcript keeps
     /// only the row.
     pub fn note_keyed(&self, key: &str, text: &str) {
-        let existing = self.keyed_notes.borrow().get(key).cloned();
-        match existing.filter(|label| label.parent().is_some()) {
-            Some(label) => {
-                label.set_label(text);
-                label.set_tooltip_text(Some(text));
-                // A long note wears a disclosure beside it
-                // (`meta_row_label`); rewritten short, it has nothing left
-                // to disclose.
-                if let Some(disclose) = label.next_sibling().and_downcast::<gtk::ToggleButton>() {
-                    let long = text.lines().count() > 1 || text.chars().count() > 80;
-                    if !long {
-                        disclose.set_active(false);
-                    }
-                    disclose.set_visible(long);
-                }
-            }
+        let existing = self.keyed_notes.borrow().get(key).copied();
+        match existing {
+            Some(id) => self.update_model(|model| model.rewrite_note(id, text)),
             None => {
-                let label = self.meta_row_label(text);
-                self.keyed_notes.borrow_mut().insert(key.to_string(), label);
+                if let Some(id) = self.meta_row_id(text) {
+                    self.keyed_notes.borrow_mut().insert(key.to_string(), id);
+                }
             }
         }
     }
@@ -5139,9 +4808,7 @@ impl ChatPane {
     /// end: what falls off the front is counted, never silently lost.
     fn record_line(&self, speaker: &'static str, text: &str) {
         let text = text.trim();
-        // A stretch drawn back for the reader is in the mirror already, or
-        // older than all of it.
-        if text.is_empty() || self.drawing_past.get() {
+        if text.is_empty() {
             return;
         }
         self.touch();
@@ -5173,28 +4840,27 @@ impl ChatPane {
     /// `chat_transcript_tail` would otherwise hand an orchestrator the
     /// same lines twice, with a dropped-count that counted nothing.
     fn clear_transcript(&self) {
-        self.store.remove_all();
-        self.build_queue.borrow_mut().clear();
-        self.build_job.borrow_mut().take();
-        self.transcript_rows.set(0);
-        *self.stretches.borrow_mut() = Stretches::default();
+        // Every item but the foot.
+        let count = self.store.n_items();
+        if count > 1 {
+            self.store
+                .splice(0, count - 1, &[] as &[glib::BoxedAnyObject]);
+        }
+        self.bound.borrow_mut().clear();
+        // Ids go on from where they were, so a document an editor tab still
+        // holds never names a row of the next conversation.
+        let next = self.model.borrow().next_id();
+        *self.model.borrow_mut() = model::Model::starting_at(next);
+        self.keyed_notes.borrow_mut().clear();
+        self.doc_widgets.borrow_mut().clear();
+        self.lit.borrow_mut().take();
         self.sync_placeholder();
-        self.last_prompt_row.borrow_mut().take();
-        // A replay reports each call's output again.
-        self.terminal_text.borrow_mut().clear();
+        self.last_prompt.borrow_mut().take();
         self.pinned_float.set_visible(false);
-        self.current_agent.borrow_mut().take();
-        self.current_agent_view.borrow_mut().take();
-        self.current_thought.borrow_mut().take();
-        self.current_thought_header.borrow_mut().take();
-        self.tool_cards.borrow_mut().clear();
-        self.doc_rows.borrow_mut().clear();
-        self.lit_doc_row.borrow_mut().take();
         // The pill pointed at a row that is gone (David, 2026-09-08:
         // "Overlay buttons, like 'Open item' in chat, should go away when
         // no longer relevant").
         self.sync_open_jump();
-        self.plan_card.borrow_mut().take();
         self.transcript_log.borrow_mut().clear();
         self.transcript_dropped.set(0);
         // The banner is a claim about the rows under it, so it goes with
@@ -5216,12 +4882,11 @@ impl ChatPane {
         *self.on_busy.borrow_mut() = Some(busy);
     }
 
-    /// The environment this chat's agent works in. Every chat has one; the
-    /// primary's chat is the one about the user's own checkout.
-    /// Hits in the transcript on screen (SEARCH.md: "the rows on screen,
-    /// walked for their text"): the row each is in, and the matching line.
-    /// The complete count comes back whatever `cap` is; `cap` bounds the
-    /// lines kept for a listing, and 0 asks for the count alone.
+    /// Hits in the transcript (SEARCH.md): the row each is in, by its
+    /// place in the transcript, and the matching line. Every row, drawn or
+    /// not — a row's text is its data. The complete count comes back
+    /// whatever `cap` is; `cap` bounds the lines kept for a listing, and 0
+    /// asks for the count alone.
     pub fn search_transcript(
         &self,
         query: &taste_core::search::Query,
@@ -5229,15 +4894,22 @@ impl ChatPane {
     ) -> (usize, Vec<TranscriptHit>) {
         let mut count = 0;
         let mut hits = Vec::new();
-        for (index, row) in self.drawn_rows().into_iter().enumerate() {
-            let text = widget_text(&row);
+        let items = self.items();
+        let model = self.model.borrow();
+        for (position, entry) in items.into_iter().enumerate() {
+            let (text, at) = match &entry {
+                Item::Row(id) => match model.row(*id) {
+                    Some(row) => (row.text(), Some(row.at)),
+                    None => continue,
+                },
+                Item::Widget(widget) => (widget_text(widget), widget_time(widget)),
+            };
             let (n, lines) = taste_core::search::search_text(&text, query, cap);
             count += n;
-            let at = row.downcast_ref::<gtk::ListBoxRow>().and_then(row_time);
             for (_, line) in lines {
                 if hits.len() < cap {
                     hits.push(TranscriptHit {
-                        row: i32::try_from(index).unwrap_or(i32::MAX),
+                        row: i32::try_from(position).unwrap_or(i32::MAX),
                         text: line,
                         at,
                     });
@@ -5247,27 +4919,44 @@ impl ChatPane {
         (count, hits)
     }
 
-    /// Every row drawn, in order: the stretches the transcript has drawn,
-    /// which are the ones near the reader and the live one.
-    fn drawn_rows(&self) -> Vec<gtk::Widget> {
-        let lists: Vec<gtk::ListBox> = self
-            .stretches
-            .borrow()
-            .list
-            .iter()
-            .filter_map(|stretch| stretch.rows.clone())
-            .collect();
-        let mut rows = Vec::new();
-        for list in lists {
-            let mut child = list.first_child();
-            while let Some(row) = child {
-                child = row.next_sibling();
-                if row.is::<gtk::ListBoxRow>() {
-                    rows.push(row);
-                }
-            }
+    /// Every item of the transcript, in order, the foot left out.
+    fn items(&self) -> Vec<Item> {
+        let count = self.store.n_items().saturating_sub(1);
+        (0..count)
+            .filter_map(|position| self.item_at(position))
+            .collect()
+    }
+
+    /// The transcript's item at `position`.
+    fn item_at(&self, position: u32) -> Option<Item> {
+        self.store
+            .item(position)
+            .and_downcast::<glib::BoxedAnyObject>()
+            .map(|object| object.borrow::<Item>().clone())
+    }
+
+    /// Where `item` is in the transcript.
+    fn position_of(&self, item: &Item) -> Option<u32> {
+        // From the end: what is asked about is the newest, most often.
+        (0..self.store.n_items())
+            .rev()
+            .find(|position| match (self.item_at(*position), item) {
+                (Some(Item::Row(a)), Item::Row(b)) => a == *b,
+                (Some(Item::Widget(a)), Item::Widget(b)) => a == *b,
+                _ => false,
+            })
+    }
+
+    /// The widget `item` is drawn as, while the list has it bound.
+    fn item_widget(&self, item: &Item) -> Option<gtk::Widget> {
+        match item {
+            Item::Row(id) => self
+                .bound
+                .borrow()
+                .get(id)
+                .map(|(_, view)| view.widget.clone()),
+            Item::Widget(widget) => Some(widget.clone()),
         }
-        rows
     }
 
     /// How many transcript lines match, from the text mirror the
@@ -5285,16 +4974,21 @@ impl ChatPane {
     /// scroll anchor lets go, so the next streamed line does not yank the
     /// view back to the end, and the row is lit for a moment.
     pub fn scroll_to_transcript_row(&self, row: i32) {
-        let Some(row_widget) = usize::try_from(row)
-            .ok()
-            .and_then(|row| self.drawn_rows().into_iter().nth(row))
-        else {
+        let Some(item) = u32::try_from(row).ok().and_then(|row| self.item_at(row)) else {
             return;
         };
-        self.scroll_to_row(&row_widget, 24.0);
-        row_widget.add_css_class("search-hit");
-        glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
-            row_widget.remove_css_class("search-hit");
+        self.scroll_to_item(&item, 24.0);
+        let Some(pane) = self.weak_self.borrow().upgrade() else {
+            return;
+        };
+        // Once the list has it drawn where it was asked for.
+        glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+            if let Some(widget) = pane.item_widget(&item) {
+                widget.add_css_class("search-hit");
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
+                    widget.remove_css_class("search-hit");
+                });
+            }
         });
     }
 
@@ -5710,12 +5404,9 @@ impl ChatPane {
             .chain(self.pending_prompts.borrow().iter().map(|p| p.card.clone()))
             .collect();
         for card in cards {
-            if self.in_transcript(&card) {
-                continue;
+            if !self.in_transcript(&card) {
+                self.append_widget(&card);
             }
-            // Out of the row the clear dropped, into one of its own.
-            card.unparent();
-            self.append_row(&card);
         }
     }
 
@@ -6157,13 +5848,9 @@ impl ChatPane {
             stale
         };
         for held in withdrawn {
-            if let Some(row) = held.card.parent() {
-                if self.in_transcript(&row) {
-                    self.remove_row(&row);
-                    continue;
-                }
+            if let Some(row) = self.widget_row(&held.card) {
+                self.remove_item(&Item::Widget(row.upcast()));
             }
-            held.card.unparent();
         }
         self.sync_revive_bar();
     }
@@ -7260,8 +6947,7 @@ impl ChatPane {
     /// message or step, which is the last thing the user could see.
     fn feed_reference(&self) -> taste_core::queued::Reference {
         use taste_core::queued::Reference;
-        if let Some(buffer) = self.current_agent.borrow().as_ref() {
-            let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+        if let Some(text) = self.model.borrow().writing() {
             if !text.trim().is_empty() {
                 return Reference::Writing(text.to_string());
             }
@@ -7351,13 +7037,11 @@ impl ChatPane {
         // answered; then the briefing's notes, which are the IDE's.
         let mut unrecorded = Unrecorded {
             records: blocks.iter().map(user_record).collect(),
-            rows: Vec::new(),
         };
         *self.holding.borrow_mut() = Some(Unrecorded::default());
         let blocks = self.with_briefing(blocks);
         let held = self.holding.borrow_mut().take().unwrap_or_default();
         unrecorded.records.extend(held.records);
-        unrecorded.rows.extend(held.rows);
         match (self.client.borrow().as_ref(), written) {
             (Some(client), Some(written)) => client.prompt_blocks_queued(blocks, written),
             (Some(client), None) => client.prompt_blocks(blocks),
@@ -7368,38 +7052,41 @@ impl ChatPane {
 
     /// The agent has started on the prompt at the front, and on any that
     /// went out joined to it: their records go in, ahead of the agent's,
-    /// and their rows into the stretch the message begins.
+    /// and their notes under the cards.
     fn record_taken(&self) {
-        let taken: Vec<(Unrecorded, gtk::Box)> = {
+        let taken: Vec<Unrecorded> = {
             let mut pending = self.pending_prompts.borrow_mut();
             pending
                 .iter_mut()
                 .enumerate()
                 .take_while(|(index, prompt)| *index == 0 || prompt.joined)
                 .filter(|(_, prompt)| !prompt.unrecorded.records.is_empty())
-                .map(|(_, prompt)| (std::mem::take(&mut prompt.unrecorded), prompt.card.clone()))
+                .map(|(_, prompt)| std::mem::take(&mut prompt.unrecorded))
                 .collect()
         };
         if taken.is_empty() {
             return;
         }
-        for (unrecorded, card) in taken {
-            self.commit_unrecorded(unrecorded, &card);
+        for unrecorded in taken {
+            self.commit_unrecorded(unrecorded);
         }
         // Written now rather than with the turn: a message the IDE closed
         // over is still the user's.
         self.flush_stash();
     }
 
-    /// `unrecorded` into the record, and its card's row and note rows into
-    /// the stretch its message begins.
-    fn commit_unrecorded(&self, unrecorded: Unrecorded, card: &gtk::Box) {
+    /// `unrecorded` into the record, and its notes into the transcript.
+    fn commit_unrecorded(&self, unrecorded: Unrecorded) {
         for record in unrecorded.records {
+            let note = record
+                .get(NOTE_RECORD)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
             self.record(record);
+            if let Some(note) = note {
+                self.update_model(|model| model.note(&note));
+            }
         }
-        let mut rows = unrecorded.rows;
-        rows.extend(card.parent().and_downcast::<gtk::ListBoxRow>());
-        self.claim_rows(&rows);
     }
 
     /// What the IDE puts ahead of a prompt so the agent does not have to
@@ -7581,21 +7268,9 @@ impl ChatPane {
         self.drop_questions();
         self.stop_button.set_visible(false);
         self.set_busy(false);
-        self.current_agent.borrow_mut().take();
-        self.current_thought.borrow_mut().take();
-        // The rows stay on screen after the map forgets them, so they are
-        // settled first.
-        self.settle_running_steps();
-        self.tool_cards.borrow_mut().clear();
-        self.doc_rows.borrow_mut().clear();
-        self.lit_doc_row.borrow_mut().take();
-        // The pill pointed at a row that is gone (David, 2026-09-08:
-        // "Overlay buttons, like 'Open item' in chat, should go away when
-        // no longer relevant").
-        self.sync_open_jump();
-        self.plan_card.borrow_mut().take();
-        self.plan_snapshot.borrow_mut().take();
-        self.pending_marks.borrow_mut().clear();
+        // What the session left streaming and running is over: the rows
+        // stay, settled, and the next session's start fresh under them.
+        self.update_model(|model| model.end_session());
         self.context_used.set(0);
         self.session_usage.borrow_mut().take();
         self.session_cost.borrow_mut().take();
@@ -7603,530 +7278,195 @@ impl ChatPane {
 
     // --- transcript --------------------------------------------------------
 
-    fn append_row(&self, child: &impl IsA<gtk::Widget>) -> gtk::ListBoxRow {
-        let row = gtk::ListBoxRow::builder()
-            .activatable(false)
-            .child(child)
-            .build();
-        // When it landed, for the search listing (`row_time_text`).
-        stamp_row(&row);
-        // Into the stretch being drawn from its records, or the live one.
-        let sink = self.sink.borrow().clone();
-        let rows = sink.unwrap_or_else(|| self.live_rows());
-        rows.append(&row);
-        self.transcript_rows.set(self.transcript_rows.get() + 1);
-        if let Some(held) = self.holding.borrow_mut().as_mut() {
-            held.rows.push(row.clone());
+    /// Change the conversation's model, and have the transcript follow it
+    /// ([`Self::follow_model`]).
+    fn update_model<T>(&self, change: impl FnOnce(&mut model::Model) -> T) -> T {
+        let out = change(&mut self.model.borrow_mut());
+        self.follow_model();
+        out
+    }
+
+    /// The transcript follows the model: rows added go in at its end, rows
+    /// changed are patched or drawn again where the list has them drawn,
+    /// and the text mirror gets its lines.
+    fn follow_model(&self) {
+        let (changes, lines) = {
+            let mut model = self.model.borrow_mut();
+            (model.take_changes(), model.take_lines())
+        };
+        for (speaker, text) in lines {
+            self.record_line(speaker, &text);
+        }
+        let mut added = Vec::new();
+        let mut prompt = None;
+        for change in changes {
+            match change {
+                model::Change::Added(id) => {
+                    added.push(glib::BoxedAnyObject::new(Item::Row(id)));
+                    if let Some(model::Kind::User(user)) =
+                        self.model.borrow().row(id).map(|row| &row.kind)
+                    {
+                        prompt = Some((id, pin_text(&user.text, &user.attachments)));
+                    }
+                }
+                model::Change::Changed(id) => self.refresh_row(id),
+            }
+        }
+        if !added.is_empty() {
+            self.insert_items(&added);
+        }
+        // A message drawn from the record is the newest prompt, as a card a
+        // send draws is.
+        if let Some((id, text)) = prompt {
+            *self.last_prompt.borrow_mut() = Some(Item::Row(id));
+            self.pinned_prompt_label.set_label(&text);
+            self.pinned_float.set_visible(false);
+        }
+    }
+
+    /// `items` in at the end of the transcript, above the foot.
+    fn insert_items(&self, items: &[glib::BoxedAnyObject]) {
+        let at = self.store.n_items().saturating_sub(1);
+        self.store.splice(at, 0, items);
+        self.sync_placeholder();
+    }
+
+    /// `child` at the end of the transcript, an item of its own — in the
+    /// row it already stands in, if it has one ([`widget_item`]).
+    fn append_widget(&self, child: &impl IsA<gtk::Widget>) -> Item {
+        let row = self.widget_row(child).unwrap_or_else(|| widget_item(child));
+        let item = Item::Widget(row.upcast());
+        self.insert_items(&[glib::BoxedAnyObject::new(item.clone())]);
+        item
+    }
+
+    /// The item row `child` stands in, once it has been given one.
+    fn widget_row(&self, child: &impl IsA<gtk::Widget>) -> Option<gtk::Box> {
+        child
+            .parent()
+            .and_downcast::<gtk::Box>()
+            .filter(|row| row.has_css_class("transcript-row"))
+    }
+
+    /// Whether `card` is in the transcript: an item of it, shown or not —
+    /// not in one a clear has let go of.
+    fn in_transcript(&self, card: &impl IsA<gtk::Widget>) -> bool {
+        self.widget_row(card)
+            .is_some_and(|row| self.position_of(&Item::Widget(row.upcast())).is_some())
+    }
+
+    /// Take `item` out of the transcript.
+    fn remove_item(&self, item: &Item) {
+        if let Some(position) = self.position_of(item) {
+            self.store.remove(position);
+        }
+        let lit = self
+            .lit
+            .borrow()
+            .as_ref()
+            .is_some_and(|lit| same_item(lit, item));
+        if lit {
+            self.lit.borrow_mut().take();
+            self.sync_open_jump();
         }
         self.sync_placeholder();
-        self.trim_transcript();
-        // No scroll here: appending grows the adjustment, and the tail
-        // policy in `new` decides whether that should move the view. This
-        // used to yank the view to the bottom even mid-history.
-        row
     }
 
-    /// The live stretch's rows: the last stretch's, drawn as it happens —
-    /// opened here when there is none yet, or when a restore has not yet
-    /// given it a list.
-    fn live_rows(&self) -> gtk::ListBox {
-        let last = self
-            .stretches
-            .borrow()
-            .list
-            .last()
-            .map(|stretch| stretch.rows.clone());
-        match last {
-            Some(Some(rows)) => rows,
-            Some(None) => {
-                let rows = stretch_list();
-                let index = {
-                    let mut stretches = self.stretches.borrow_mut();
-                    if let Some(last) = stretches.list.last_mut() {
-                        last.rows = Some(rows.clone());
-                    }
-                    stretches.list.len() - 1
+    /// The list has bound `item` to `holder`: its row's widgets, built from
+    /// the model now, or the widget it is.
+    fn bind_item(&self, holder: &gtk::Box, item: &Item) {
+        while let Some(child) = holder.first_child() {
+            holder.remove(&child);
+        }
+        match item {
+            Item::Row(id) => {
+                let Some(row) = self.model.borrow().row(*id).cloned() else {
+                    return;
                 };
-                self.place_foot();
-                // Its item may be showing its placeholder.
-                self.rebind(index);
-                rows
+                let view = self.build_row(&row);
+                holder.append(&view.widget);
+                self.bound
+                    .borrow_mut()
+                    .insert(*id, (holder.downgrade(), view));
             }
-            None => self.open_stretch(),
-        }
-    }
-
-    /// A new stretch at the end of the conversation, live: its list of
-    /// rows, and its item in the transcript.
-    fn open_stretch(&self) -> gtk::ListBox {
-        let rows = stretch_list();
-        let index = {
-            let mut stretches = self.stretches.borrow_mut();
-            stretches.list.push(Stretch {
-                records: Vec::new(),
-                rows: Some(rows.clone()),
-            });
-            stretches.list.len() - 1
-        };
-        self.store.append(&glib::BoxedAnyObject::new(index));
-        self.place_foot();
-        rows
-    }
-
-    /// The room under the last row, on the last stretch's rows and on no
-    /// other's.
-    fn place_foot(&self) {
-        let room = self.foot_room.get();
-        let stretches = self.stretches.borrow();
-        let count = stretches.list.len();
-        for (index, stretch) in stretches.list.iter().enumerate().rev().take(2) {
-            if let Some(rows) = &stretch.rows {
-                let wanted = if index + 1 == count { room } else { 0 };
-                if rows.margin_bottom() != wanted {
-                    rows.set_margin_bottom(wanted);
+            Item::Widget(widget) => {
+                if let Some(parent) = widget.parent().and_downcast::<gtk::Box>() {
+                    parent.remove(widget);
                 }
+                holder.append(widget);
             }
         }
     }
 
-    /// Stretch `index`'s rows, drawn from its records now if they are not
-    /// drawn — whole, at once: for a probe that compares a stretch drawn
-    /// back with what it was. The transcript draws them a slice at a time
-    /// as they come on screen ([`Self::want_stretch`]).
-    fn stretch_rows(self: &Rc<Self>, index: usize) -> Option<gtk::ListBox> {
-        if let Some(rows) = self.stretches.borrow().list.get(index)?.rows.clone() {
-            return Some(rows);
-        }
-        let mut job = self.start_job(index)?;
-        while !self.draw_slice(&mut job, None) {}
-        self.finish_job(job)
-    }
-
-    /// What a stretch not yet drawn stands in as: its estimated height.
-    fn estimate(&self, index: usize) -> i32 {
-        let estimate = self
-            .stretches
-            .borrow()
-            .list
-            .get(index)
-            .map_or(24.0, |stretch| estimate_height(&stretch.records));
-        (estimate * self.est_scale.get()).round() as i32
-    }
-
-    /// Stretch `index` is on screen: draw it, if it is not drawn, and the
-    /// ones either side of it, so the reader reaches them drawn.
-    fn want_stretch(&self, index: usize) {
-        self.reader_at.set(index);
-        let count = self.stretches.borrow().list.len();
-        let undrawn = |i: usize| {
-            self.stretches
-                .borrow()
-                .list
-                .get(i)
-                .is_some_and(|stretch| stretch.rows.is_none())
+    /// Row `id` changed: what the list shows of it follows — patched where
+    /// only its line, its light, or a streaming answer's text moved, and
+    /// built again otherwise. A row the list has not drawn is built from
+    /// its data when it is.
+    fn refresh_row(&self, id: model::RowId) {
+        let Some(row) = self.model.borrow().row(id).cloned() else {
+            return;
         };
         {
-            let mut queue = self.build_queue.borrow_mut();
-            let ahead = (1..=BUILD_AHEAD)
-                .flat_map(|d| [index.checked_sub(d), Some(index + d)])
-                .flatten()
-                .filter(|i| *i < count);
-            // On screen first; the ones either side after anything else
-            // that is on screen.
-            if undrawn(index) && !queue.contains(&index) {
-                queue.push_front(index);
-            }
-            for i in ahead {
-                if undrawn(i) && !queue.contains(&i) {
-                    queue.push_back(i);
-                }
-            }
-            // What the reader has left behind is not worth their wait —
-            // judged by whether its item is still on screen, not by how far
-            // its index is from this one: the list keeps fifty or so items
-            // mapped, and a stretch on screen dropped for being twenty-five
-            // away from the last one mapped was never asked for again, a
-            // blank band where it should have been (2026-10-19).
-            let holders = self.holders.borrow();
-            queue.retain(|i| {
-                i.abs_diff(index) <= BUILD_REACH
-                    || holders
-                        .get(i)
-                        .and_then(|holder| holder.upgrade())
-                        .is_some_and(|holder| holder.is_mapped())
-            });
-        }
-        self.schedule_build();
-    }
-
-    fn schedule_build(&self) {
-        if self.build_scheduled.replace(true) {
-            return;
-        }
-        let weak = self.weak_self.borrow().clone();
-        // After a gap, so a frame waiting goes first.
-        crate::stall::after_a_gap(move || {
-            if let Some(pane) = weak.upgrade() {
-                pane.build_scheduled.set(false);
-                pane.build_step();
-            }
-        });
-    }
-
-    /// Draw wanted stretches for [`BUILD_SLICE`] of this frame, and come
-    /// back after the next while any are left. A stretch is a step and the
-    /// words after it, a few milliseconds of drawing most often, but a long
-    /// answer's markdown or a diff can be more than a frame's worth: it is
-    /// drawn across frames into a list of its own, and shown whole.
-    fn build_step(self: &Rc<Self>) {
-        // Not while a history is being drawn: what is wanted is redrawn
-        // from the new one.
-        if self.drawing_history.get() {
-            self.schedule_build();
-            return;
-        }
-        let slice = std::time::Instant::now();
-        // Half of what a frame and its gap took since the last slice, and
-        // never less than BUILD_SLICE: on a display that draws a frame in
-        // a few milliseconds that is the slice, and on one that takes a
-        // hundred (software rendering) the drawing keeps up with what
-        // comes on screen rather than falling a page behind for each one.
-        let budget = self
-            .build_last
-            .get()
-            .map(|last| slice.duration_since(last) / 2)
-            .unwrap_or(BUILD_SLICE)
-            .clamp(BUILD_SLICE, BUILD_SLICE_MOST);
-        loop {
-            let job = self.build_job.borrow_mut().take();
-            let mut job = match job {
-                Some(job) => job,
-                None => {
-                    let Some(index) = self.next_to_draw() else {
-                        break;
-                    };
-                    match self.start_job(index) {
-                        Some(job) => job,
-                        None => continue,
-                    }
-                }
+            let mut bound = self.bound.borrow_mut();
+            let Some((_, view)) = bound.get_mut(&id) else {
+                return;
             };
-            let left = budget.saturating_sub(slice.elapsed());
-            if self.draw_slice(&mut job, Some(left)) {
-                self.finish_job(job);
-            } else {
-                *self.build_job.borrow_mut() = Some(job);
-            }
-            if slice.elapsed() >= budget {
-                break;
-            }
-        }
-        // Done with what was asked: anything still standing in on screen
-        // is asked for now, whatever was missed on the way.
-        if self.build_job.borrow().is_none() && self.build_queue.borrow().is_empty() {
-            self.want_placeholders_on_screen();
-        }
-        let more = self.build_job.borrow().is_some() || !self.build_queue.borrow().is_empty();
-        self.build_last.set(more.then(std::time::Instant::now));
-        if more {
-            self.schedule_build();
-        }
-    }
-
-    /// The wanted stretch to draw next, taken off the queue: the one on
-    /// screen, or nearest it, by where its item is — the list maps more
-    /// items than are in view, so being mapped says less than this does.
-    fn next_to_draw(&self) -> Option<usize> {
-        let scroller: &gtk::Widget = self.transcript_scroller.upcast_ref();
-        let height = scroller.height() as f32;
-        let distance = |index: &usize| -> f32 {
-            self.holders
-                .borrow()
-                .get(index)
-                .and_then(|holder| holder.upgrade())
-                .and_then(|holder| holder.compute_bounds(scroller))
-                .map_or(f32::MAX, |b| {
-                    if b.y() + b.height() < 0.0 {
-                        -(b.y() + b.height())
-                    } else if b.y() > height {
-                        b.y() - height
-                    } else {
-                        0.0
-                    }
-                })
-        };
-        let mut queue = self.build_queue.borrow_mut();
-        let at = (0..queue.len())
-            .min_by(|a, b| distance(&queue[*a]).total_cmp(&distance(&queue[*b])))?;
-        queue.remove(at)
-    }
-
-    /// Every bound item on screen still showing its placeholder, wanted.
-    fn want_placeholders_on_screen(&self) {
-        let undrawn: Vec<usize> = {
-            let holders = self.holders.borrow();
-            let stretches = self.stretches.borrow();
-            holders
-                .iter()
-                .filter(|(index, holder)| {
-                    stretches
-                        .list
-                        .get(**index)
-                        .is_some_and(|stretch| stretch.rows.is_none())
-                        && holder.upgrade().is_some_and(|holder| holder.is_mapped())
-                })
-                .map(|(index, _)| *index)
-                .collect()
-        };
-        if undrawn.is_empty() {
-            return;
-        }
-        let mut queue = self.build_queue.borrow_mut();
-        for index in undrawn {
-            if !queue.contains(&index) {
-                queue.push_back(index);
-            }
-        }
-    }
-
-    /// A job to draw stretch `index`, or `None` when it is drawn already.
-    fn start_job(&self, index: usize) -> Option<StretchJob> {
-        let stretches = self.stretches.borrow();
-        let stretch = stretches.list.get(index)?;
-        if stretch.rows.is_some() {
-            return None;
-        }
-        let followed = stretches
-            .list
-            .get(index + 1)
-            .is_some_and(|next| continues_turn(&next.records));
-        let mut drawing = Drawing::default();
-        // Its rail as the turn drew it: on from the step before it, and on
-        // into the step after it, when those are in the stretches on
-        // either side.
-        if index > 0 && continues_turn(&stretch.records) {
-            drawing.last_rail = Some(StepRail::elsewhere());
-        }
-        Some(StretchJob {
-            index,
-            records: stretch.records.clone().into_iter(),
-            drawing,
-            rows: stretch_list(),
-            followed,
-            started: std::time::Instant::now(),
-            longest: std::time::Duration::ZERO,
-        })
-    }
-
-    /// Draw `job`'s next records, `budget`'s worth (all of them, without
-    /// one), with its drawing and its list put in for the slice and taken
-    /// back after, so what happens between slices is drawn as live, and
-    /// none of its records' effects on the live chat (`drawing_past`).
-    /// Whether it is whole.
-    fn draw_slice(
-        self: &Rc<Self>,
-        job: &mut StretchJob,
-        budget: Option<std::time::Duration>,
-    ) -> bool {
-        let slice = std::time::Instant::now();
-        let sink = self.sink.replace(Some(job.rows.clone()));
-        let was = self.from_record.replace(true);
-        self.swap_drawing(&mut job.drawing);
-        let history = self.drawing_history.replace(true);
-        self.drawing_past.set(true);
-        let mut done = false;
-        loop {
-            let Some(record) = job.records.next() else {
-                self.finalize_stream();
-                self.settle_running_steps();
-                if job.followed {
-                    if let Some(rail) = self.last_rail.borrow().as_ref() {
-                        rail.bottom.set_visible(true);
-                    }
-                }
-                done = true;
-                break;
-            };
-            self.draw_record(record);
-            if budget.is_some_and(|budget| slice.elapsed() >= budget) {
-                break;
-            }
-        }
-        self.drawing_past.set(false);
-        self.drawing_history.set(history);
-        self.swap_drawing(&mut job.drawing);
-        self.from_record.set(was);
-        self.sink.replace(sink);
-        job.longest = job.longest.max(slice.elapsed());
-        done
-    }
-
-    /// `job` is whole: its rows are the stretch's, and the transcript's
-    /// item for it shows them.
-    fn finish_job(self: &Rc<Self>, job: StretchJob) -> Option<gtk::ListBox> {
-        let index = job.index;
-        {
-            let mut stretches = self.stretches.borrow_mut();
-            let stretch = stretches.list.get_mut(index)?;
-            // Drawn meanwhile, another way: that one stands.
-            if let Some(rows) = &stretch.rows {
-                let rows = rows.clone();
-                drop(stretches);
-                self.forget_rows(&job.rows);
-                return Some(rows);
-            }
-            stretch.rows = Some(job.rows.clone());
-        }
-        self.place_foot();
-        if self.probe_timing.get() {
-            println!(
-                "probe history: drew stretch {index}: {:.1}ms in all, {:.1}ms the longest slice",
-                job.started.elapsed().as_secs_f64() * 1000.0,
-                job.longest.as_secs_f64() * 1000.0
-            );
-        }
-        // The item shows the rows in the placeholder's place.
-        self.rebind(index);
-        // What it came to, against what it was guessed at: the guesses
-        // after it are scaled by the difference.
-        let estimate = self
-            .stretches
-            .borrow()
-            .list
-            .get(index)
-            .map_or(0.0, |stretch| estimate_height(&stretch.records));
-        let weak = self.weak_self.borrow().clone();
-        job.rows.add_tick_callback(move |rows, _| {
-            let height = f64::from(rows.height());
-            if height <= 0.0 {
-                return glib::ControlFlow::Continue;
-            }
-            if let Some(pane) = weak.upgrade() {
-                if estimate > 0.0 {
-                    let scale = pane.est_scale.get() * 0.8 + height / estimate * 0.2;
-                    pane.est_scale.set(scale.clamp(0.25, 4.0));
-                }
-            }
-            glib::ControlFlow::Break
-        });
-        self.trim_transcript();
-        Some(job.rows)
-    }
-
-    /// TASTE_PROBE_CHECK only: how many stretches on screen are still
-    /// standing in as their estimated height.
-    fn placeholders_on_screen(&self) -> Vec<Option<usize>> {
-        fn walk(
-            widget: &gtk::Widget,
-            depth: u32,
-            scroller: &gtk::Widget,
-            found: &mut Vec<Option<usize>>,
-        ) {
-            if widget.has_css_class("stretch-placeholder") {
-                let height = scroller.height() as f32;
-                if widget.is_mapped()
-                    && widget
-                        .compute_bounds(scroller)
-                        .is_some_and(|b| b.y() + b.height() > 0.0 && b.y() < height)
-                {
-                    found.push(
-                        widget
-                            .parent()
-                            .and_downcast::<gtk::Box>()
-                            .and_then(|holder| holder_index(&holder)),
-                    );
-                }
+            if self.patch_row(view, &row) {
                 return;
             }
-            if depth == 0 {
-                return;
-            }
-            let mut child = widget.first_child();
-            while let Some(current) = child {
-                walk(&current, depth - 1, scroller, found);
-                child = current.next_sibling();
-            }
         }
-        let mut found = Vec::new();
-        walk(
-            self.list.upcast_ref(),
-            3,
-            self.transcript_scroller.upcast_ref(),
-            &mut found,
-        );
-        found
+        self.rebuild_row(id);
     }
 
-    /// Have the transcript show stretch `index` again — its rows drawn, or
-    /// let go — with a new item in its place: the list keeps an item it
-    /// is told changed but is the same object bound as it was.
-    ///
-    /// In the item the list has bound for it, where it is bound, and
-    /// never by changing the store: an item replaced was the anchor the
-    /// list keeps the reader's place by, often enough, and with it gone
-    /// the list fell back to the first item while the scroll stayed at the
-    /// last — a transcript with nothing in view (2026-10-19).
-    fn rebind(&self, index: usize) {
+    /// Build row `id`'s widgets again, where the list has it drawn.
+    fn rebuild_row(&self, id: model::RowId) {
+        let Some(row) = self.model.borrow().row(id).cloned() else {
+            return;
+        };
         let holder = self
-            .holders
+            .bound
             .borrow()
-            .get(&index)
-            .and_then(|holder| holder.upgrade())
-            .filter(|holder| holder_index(holder) == Some(index));
-        if let Some(holder) = holder {
-            self.fill_holder(&holder, index);
+            .get(&id)
+            .and_then(|(holder, _)| holder.upgrade());
+        let Some(holder) = holder else {
+            self.bound.borrow_mut().remove(&id);
+            return;
+        };
+        let view = self.build_row(&row);
+        while let Some(child) = holder.first_child() {
+            holder.remove(&child);
         }
+        holder.append(&view.widget);
+        self.bound
+            .borrow_mut()
+            .insert(id, (holder.downgrade(), view));
     }
 
-    /// What `holder`, the item bound to stretch `index`, shows: the
-    /// stretch's rows if they are drawn, and a placeholder of their height
-    /// until they are, drawn when it comes on screen.
-    fn fill_holder(&self, holder: &gtk::Box, index: usize) {
-        let rows = self
-            .stretches
-            .borrow()
-            .list
-            .get(index)
-            .and_then(|stretch| stretch.rows.clone());
-        // What it showed before, unless it is these rows already.
-        let mut child = holder.first_child();
-        while let Some(current) = child {
-            child = current.next_sibling();
-            if rows.as_ref().map(|rows| rows.upcast_ref::<gtk::Widget>()) != Some(&current) {
-                holder.remove(&current);
-            }
-        }
-        match rows {
-            Some(rows) => {
-                if let Some(parent) = rows.parent().and_downcast::<gtk::Box>() {
-                    if &parent != holder {
-                        parent.remove(&rows);
-                    }
-                }
-                if rows.parent().is_none() {
-                    holder.append(&rows);
-                }
-            }
-            None => {
-                let height = self.estimate(index);
-                holder.append(
-                    &gtk::Box::builder()
-                        .height_request(height)
-                        .css_classes(["stretch-placeholder"])
-                        .build(),
-                );
-                if holder.is_mapped() {
-                    self.want_stretch(index);
-                }
-            }
-        }
+    /// Open or close step `id` onto its content.
+    fn set_step_expanded(&self, id: model::RowId, open: bool) {
+        self.update_model(|model| model.set_expanded(id, open));
+    }
+
+    /// Close what is streaming, and draw a message still being assembled.
+    fn finalize_stream(&self) {
+        self.update_model(|model| model.finalize());
+    }
+
+    /// Settle every step still marked running: nothing can be running once
+    /// its turn has ended, its session has, or a replayed history has
+    /// finished arriving — the agent only never said how the call ended. A
+    /// step left spinning under "stopped" or "new session" claimed work in
+    /// progress that nothing was doing (David, 2026-09-23: "This shouldn't
+    /// still be spinning"). Its dot says what is known and no more:
+    /// neither green nor red, with the reason on hover.
+    fn settle_running_steps(&self) {
+        self.update_model(|model| model.settle_running());
     }
 
     /// To the end of the conversation, as the list stands now and once it
     /// has measured what it finds there.
     fn scroll_to_end(&self) {
-        let count = self.store.n_items();
-        if count == 0 {
+        if self.store.n_items() <= 1 {
             return;
         }
         self.stick_to_bottom.set(true);
@@ -8143,177 +7483,29 @@ impl ChatPane {
         }
     }
 
-    /// Let go of what is far from the reader, once the current pass is
-    /// over: past [`KEEP_DRAWN`] stretches with rows, those the list is not
-    /// showing, farthest first, are drawn again from their records when it
-    /// next does.
-    fn trim_transcript(&self) {
-        if self.reconcile_pending.replace(true) {
-            return;
-        }
-        let weak = self.weak_self.borrow().clone();
-        // After a gap: at idle priority it waited for an idle a frame clock
-        // running back to back never gives, and let go of a thousand
-        // stretches at once when it finally ran.
-        crate::stall::after_a_gap(move || {
-            if let Some(pane) = weak.upgrade() {
-                pane.reconcile_pending.set(false);
-                pane.let_go_far();
-            }
-        });
-    }
-
-    /// See [`Self::trim_transcript`]. Never the last two stretches — the
-    /// live one, and the one it may still be drawing into — nor one with
-    /// no records to draw it again from, nor one holding a card for a
-    /// message still on its way.
-    fn let_go_far(&self) {
-        let (drawn, near) = {
-            let stretches = self.stretches.borrow();
-            let drawn = stretches.list.iter().filter(|s| s.rows.is_some()).count();
-            if drawn <= KEEP_DRAWN {
-                return;
-            }
-            // Where the reader is: the stretch that last came on screen —
-            // not the drawn ones on screen, of which there are none while
-            // what the reader reached is still being drawn.
-            (drawn, self.reader_at.get())
-        };
-        let live_cards: Vec<gtk::Widget> = self
-            .pending_prompts
-            .borrow()
-            .iter()
-            .flat_map(|p| {
-                std::iter::once(p.card.clone().upcast::<gtk::Widget>())
-                    .chain(p.origin.clone().map(|o| o.upcast()))
-            })
-            .chain(
-                self.revive_queue
-                    .borrow()
-                    .iter()
-                    .map(|item| item.card.clone().upcast()),
-            )
-            .collect();
-        let mut candidates: Vec<(usize, usize)> = {
-            let stretches = self.stretches.borrow();
-            let keep_from = stretches.list.len().saturating_sub(2);
-            stretches
-                .list
-                .iter()
-                .enumerate()
-                .filter(|(i, s)| *i < keep_from && !s.records.is_empty())
-                .filter_map(|(i, s)| s.rows.as_ref().map(|rows| (i, rows)))
-                // Not on screen: bound to an item the list keeps ready, or
-                // not bound at all.
-                .filter(|(_, rows)| !rows.is_mapped())
-                .filter(|(i, _)| i.abs_diff(near) > BUILD_AHEAD * 2)
-                .filter(|(_, rows)| !live_cards.iter().any(|card| card.is_ancestor(*rows)))
-                .map(|(i, _)| (i, i.abs_diff(near)))
-                .collect()
-        };
-        candidates.sort_by_key(|(_, distance)| std::cmp::Reverse(*distance));
-        // A few a pass, so letting go never costs a frame of its own.
-        let over = drawn - KEEP_DRAWN;
-        for (index, _) in candidates.into_iter().take(over.min(LET_GO_AT_ONCE)) {
-            self.let_go_of(index);
-        }
-        if over > LET_GO_AT_ONCE {
-            self.trim_transcript();
-        }
-    }
-
-    /// Let go of stretch `index`'s rows, now, whether or not the list is
-    /// showing them: it shows them again drawn from the records.
-    fn let_go_of(&self, index: usize) {
-        let rows = self
-            .stretches
-            .borrow_mut()
-            .list
-            .get_mut(index)
-            .and_then(|stretch| stretch.rows.take());
-        if let Some(rows) = rows {
-            if let Some(holder) = rows.parent().and_downcast::<gtk::Box>() {
-                holder.remove(&rows);
-            }
-            self.forget_rows(&rows);
-            self.rebind(index);
-        }
-    }
-
-    /// `rows`, let go: counted out, and every handle into them dropped.
-    fn forget_rows(&self, rows: &gtk::ListBox) {
-        let mut count = 0;
-        let mut child = rows.first_child();
-        while let Some(row) = child {
-            count += 1;
-            child = row.next_sibling();
-        }
-        self.transcript_rows
-            .set(self.transcript_rows.get().saturating_sub(count));
-        let within = |row: &gtk::ListBoxRow| row.is_ancestor(rows);
-        self.doc_rows.borrow_mut().retain(|_, row| !within(row));
-        if self.lit_doc_row.borrow().as_ref().is_some_and(within) {
-            self.lit_doc_row.borrow_mut().take();
-        }
-        let prompt = self
-            .last_prompt_row
-            .borrow()
-            .clone()
-            .filter(within)
-            .map(|row| row.upcast::<gtk::Widget>());
-        if let Some(row) = prompt {
-            self.forget_prompt_row(&row);
-        }
-    }
-
-    /// Take `row` out of the transcript, whichever stretch it is in.
-    fn remove_row(&self, row: &impl IsA<gtk::Widget>) {
-        if let Some(rows) = row.parent().and_downcast::<gtk::ListBox>() {
-            rows.remove(row);
-            self.transcript_rows
-                .set(self.transcript_rows.get().saturating_sub(1));
-            self.sync_placeholder();
-        }
-    }
-
-    /// Whether `widget` is in the transcript: in one of its stretches'
-    /// rows, shown or not — not in a list a clear has let go of and GTK
-    /// has yet to dispose of.
-    fn in_transcript(&self, widget: &impl IsA<gtk::Widget>) -> bool {
-        self.stretch_of(widget).is_some()
-    }
-
-    /// Which stretch `row` is in.
-    fn stretch_of(&self, row: &impl IsA<gtk::Widget>) -> Option<usize> {
-        let rows = row
-            .ancestor(gtk::ListBox::static_type())
-            .and_downcast::<gtk::ListBox>()?;
-        self.stretches
-            .borrow()
-            .list
-            .iter()
-            .position(|stretch| stretch.rows.as_ref() == Some(&rows))
-    }
-
-    /// Bring `row` to the top of the view, `inset` below its edge: the
-    /// list brings its stretch into view, and once that is laid out the
-    /// row is put where it was asked for.
-    fn scroll_to_row(&self, row: &impl IsA<gtk::Widget>, inset: f32) {
-        let Some(index) = self.stretch_of(row) else {
+    /// Bring `item` to the top of the view, `inset` below its edge: the
+    /// list brings it into view, and once that is laid out it is put where
+    /// it was asked for.
+    fn scroll_to_item(&self, item: &Item, inset: f32) {
+        let Some(position) = self.position_of(item) else {
             return;
         };
         self.stick_to_bottom.set(false);
         self.list
-            .scroll_to(index as u32, gtk::ListScrollFlags::NONE, None);
-        let row = row.clone().upcast::<gtk::Widget>();
-        let scroller = self.transcript_scroller.clone();
-        // Twice: the first lands the row near enough for its neighbours to
-        // be measured, the second where it was asked for.
+            .scroll_to(position, gtk::ListScrollFlags::NONE, None);
+        let Some(pane) = self.weak_self.borrow().upgrade() else {
+            return;
+        };
+        // Twice: the first lands it near enough for its neighbours to be
+        // measured, the second where it was asked for.
         for delay in [40, 160] {
-            let (row, scroller) = (row.clone(), scroller.clone());
+            let (pane, item) = (pane.clone(), item.clone());
             glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
-                if let Some(bounds) = row.compute_bounds(&scroller) {
-                    let adjustment = scroller.vadjustment();
+                let Some(widget) = pane.item_widget(&item) else {
+                    return;
+                };
+                if let Some(bounds) = widget.compute_bounds(&pane.transcript_scroller) {
+                    let adjustment = pane.transcript_scroller.vadjustment();
                     let by = f64::from(bounds.y() - inset);
                     if by.abs() >= 1.0 {
                         adjustment.set_value((adjustment.value() + by).max(adjustment.lower()));
@@ -8323,237 +7515,78 @@ impl ChatPane {
         }
     }
 
+    /// Where `item` stands against what the list has drawn, when it is not
+    /// drawn itself: above all of it (`Less`), below (`Greater`). Row ids
+    /// run in the transcript's order, and a widget item stands just before
+    /// the first row after it.
+    fn side_of(&self, item: &Item) -> Option<std::cmp::Ordering> {
+        let after = match item {
+            Item::Row(id) => id + 1,
+            Item::Widget(_) => {
+                let position = self.position_of(item)?;
+                (position + 1..self.store.n_items())
+                    .find_map(|at| match self.item_at(at) {
+                        Some(Item::Row(id)) => Some(id),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| self.model.borrow().next_id())
+            }
+        };
+        let bound = self.bound.borrow();
+        let first = bound.keys().min()?;
+        let last = bound.keys().max()?;
+        if *first >= after {
+            Some(std::cmp::Ordering::Less)
+        } else if *last < after {
+            Some(std::cmp::Ordering::Greater)
+        } else {
+            Some(std::cmp::Ordering::Equal)
+        }
+    }
+
+    /// Whether the transcript has a row: an item beside the foot.
+    fn has_rows(&self) -> bool {
+        self.store.n_items() > 1
+    }
+
     /// The empty chat's page while there is no row, the transcript once
     /// there is.
     fn sync_placeholder(&self) {
-        let name = if self.transcript_rows.get() == 0 && self.stretches.borrow().list.len() <= 1 {
-            "empty"
-        } else {
-            "list"
-        };
+        let name = if !self.has_rows() { "empty" } else { "list" };
         if self.transcript_stack.visible_child_name().as_deref() != Some(name) {
             self.transcript_stack.set_visible_child_name(name);
         }
     }
 
-    /// Exchange the drawing in force with `drawing`.
-    fn swap_drawing(&self, drawing: &mut Drawing) {
-        use std::mem::swap;
-        swap(
-            &mut *self.current_agent.borrow_mut(),
-            &mut drawing.current_agent,
-        );
-        swap(
-            &mut *self.current_agent_view.borrow_mut(),
-            &mut drawing.current_agent_view,
-        );
-        swap(
-            &mut *self.current_thought.borrow_mut(),
-            &mut drawing.current_thought,
-        );
-        swap(
-            &mut *self.current_thought_header.borrow_mut(),
-            &mut drawing.current_thought_header,
-        );
-        swap(&mut *self.tool_cards.borrow_mut(), &mut drawing.tool_cards);
-        swap(
-            &mut *self.ide_edit_calls.borrow_mut(),
-            &mut drawing.ide_edit_calls,
-        );
-        swap(
-            &mut *self.terminal_text.borrow_mut(),
-            &mut drawing.terminal_text,
-        );
-        swap(&mut *self.last_rail.borrow_mut(), &mut drawing.last_rail);
-        drawing.after_prompt = self.after_prompt.replace(drawing.after_prompt);
-        swap(
-            &mut *self.pending_user.borrow_mut(),
-            &mut drawing.pending_user,
-        );
-        swap(&mut *self.plan_card.borrow_mut(), &mut drawing.plan_card);
-        swap(
-            &mut *self.plan_snapshot.borrow_mut(),
-            &mut drawing.plan_snapshot,
-        );
-        swap(
-            &mut *self.last_prompt_row.borrow_mut(),
-            &mut drawing.last_prompt_row,
-        );
-    }
-
     /// Restoring a conversation's state from its record, as opposed to
-    /// living it or drawing a stretch of it back for the reader: what a
-    /// replay once did and a drawn history does now.
+    /// living it.
     fn restoring(&self) -> bool {
-        (self.replaying.get() || self.drawing_history.get()) && !self.drawing_past.get()
-    }
-
-    /// Append one step of the agent's turn: `content` beside the rail — the
-    /// connected bullets Claude Code's transcript is read by (David,
-    /// 2026-09-07: "the agent's turns/steps as a timeline below of
-    /// connected, sometimes colored, bullets"). The line runs from the
-    /// prompt's box to the first dot, from each dot to the next, and stops
-    /// at the latest until another step follows; a prompt ends it
-    /// (`end_steps`). The dot is neutral until the caller says otherwise: a
-    /// tool call paints it by status.
-    fn append_step(&self, content: &impl IsA<gtk::Widget>) -> (gtk::ListBoxRow, StepRail) {
-        // Under a prompt the step carries the gap itself, so the line can
-        // cross it: the dot slot and the content move down by the gap and
-        // the top segment grows by it.
-        let after_prompt = self.after_prompt.replace(false);
-        let gap = if after_prompt { PROMPT_GAP } else { STEP_GAP };
-        let top = gtk::Box::builder()
-            .css_classes(["rail-line"])
-            .halign(gtk::Align::Center)
-            .height_request(RAIL_LINE / 2 + gap)
-            .build();
-        let bottom = gtk::Box::builder()
-            .css_classes(["rail-line"])
-            .halign(gtk::Align::Center)
-            .vexpand(true)
-            .build();
-        // The break in the line for the spinner: a filled dot hides the
-        // line behind it, but the spinner is a ring, and the line showed
-        // through its middle. While the spinner shows, this transparent
-        // segment stands where the line would cross the ring, so the line
-        // ends at the ring's top and resumes below it (David, 2026-09-16:
-        // "The vertical timeline line should not be visible inside
-        // spinners"). Zero-height, and so no break, whenever the dot is
-        // what shows.
-        let hole = gtk::Box::builder()
-            .halign(gtk::Align::Center)
-            .height_request(0)
-            .build();
-        let line = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        line.append(&top);
-        line.append(&hole);
-        line.append(&bottom);
-        let dot = gtk::Box::builder()
-            .css_classes(["rail-dot"])
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .hexpand(true)
-            .build();
-        let spinner = gtk::Spinner::builder()
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .hexpand(true)
-            .visible(false)
-            .build();
-        spinner.set_size_request(RAIL_SPINNER, RAIL_SPINNER);
-        // The break follows the spinner's visibility — bound, rather than
-        // watched, so it holds however and whenever the spinner is shown —
-        // and the top segment shortens by half of it so the break stays
-        // centred on the dot's centre, which `centre_dot_on_first_line`
-        // moves and re-fits the top to once the first line is measured.
-        spinner
-            .bind_property("visible", &hole, "height-request")
-            .transform_to(|_, visible: bool| {
-                Some(
-                    if visible {
-                        RAIL_SPINNER + 2 * RAIL_HOLE_PAD
-                    } else {
-                        0
-                    }
-                    .to_value(),
-                )
-            })
-            .sync_create()
-            .build();
-        {
-            let top = top.clone();
-            hole.connect_height_request_notify(move |hole| {
-                if let Some(rail) = top.parent().and_then(|line| line.parent()) {
-                    fit_top_segment(&rail, &top, hole);
-                }
-            });
-        }
-        // One text line tall, at the top: the dot is centred on the step's
-        // first line, whatever the step grows to below it. `RAIL_LINE` is
-        // only the standing guess — `centre_dot_on_first_line` measures
-        // the line once there is one.
-        let slot = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .height_request(RAIL_LINE)
-            .valign(gtk::Align::Start)
-            .margin_top(gap)
-            .build();
-        slot.append(&dot);
-        slot.append(&spinner);
-        // The rail never sizes its row: the line and the dot's slot are laid
-        // over the height the content decides, rather than measured with it.
-        // Measured, the line's top segment — fitted to the dot once the
-        // first line can be measured, after the row is first laid out —
-        // grew or shrank a short row a few pixels a moment after it was
-        // shown, and moved everything a reader had in view.
-        let rail = gtk::Overlay::new();
-        rail.set_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
-        rail.add_overlay(&line);
-        rail.add_overlay(&slot);
-        rail.set_size_request(RAIL_WIDTH, -1);
-        let row_box = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
-        row_box.set_margin_start(ROW_OWN_SIDE);
-        row_box.set_margin_end(ROW_OWN_SIDE);
-        row_box.append(&rail);
-        content.set_hexpand(true);
-        content.set_margin_top(gap);
-        // THE BLUE lands on this column when the step's document is the tab
-        // in front — the step's own boundary, not the row's with the rail
-        // (David, 2026-09-08: "Blue for message highlights in chat should
-        // tint the existing boundary, not tint a bigger, not matched
-        // boundary").
-        content.add_css_class("step-content");
-        row_box.append(content);
-        row_box.connect_map(centre_dot_after_layout);
-        let row = self.append_row(&row_box);
-        match self.last_rail.borrow_mut().take() {
-            Some(previous) => previous.bottom.set_visible(true),
-            // Nothing above to run from — the transcript's first row —
-            // unless the prompt's box is.
-            None => top.set_visible(after_prompt),
-        }
-        bottom.set_visible(false);
-        *self.last_rail.borrow_mut() = Some(StepRail {
-            dot: dot.clone(),
-            spinner: spinner.clone(),
-            bottom: bottom.clone(),
-        });
-        (
-            row,
-            StepRail {
-                dot,
-                spinner,
-                bottom,
-            },
-        )
-    }
-
-    /// A step that is an aside — a note, a thought, the plan — wears a
-    /// hollow dot.
-    fn append_note(&self, content: &impl IsA<gtk::Widget>) -> gtk::ListBoxRow {
-        let (row, rail) = self.append_step(content);
-        rail.dot.add_css_class("note");
-        row
+        self.replaying.get() || self.drawing_history.get()
     }
 
     /// The turn's timeline ends here: the last step's line stops at its
     /// dot. A prompt calls this before it takes the full width below.
     fn end_steps(&self) {
-        if let Some(last) = self.last_rail.borrow_mut().take() {
-            last.bottom.set_visible(false);
-        }
-        self.after_prompt.set(true);
+        self.update_model(|model| model.prompt_shown());
     }
 
     pub fn set_on_open_document(&self, hook: OpenDocumentHook) {
         *self.on_open_document.borrow_mut() = Some(hook);
     }
 
-    /// The row a document opens from, remembered by the document's key.
-    fn note_doc_row(&self, key: &str, row: &gtk::ListBoxRow) {
-        self.doc_rows
+    /// The key a row's document opens under: the row's id, which is how
+    /// the row is lit while that document is the tab in front. A step's are
+    /// keyed by its call instead (`rows.rs`, `step_content`).
+    pub(super) fn row_doc(&self, id: model::RowId, what: &str) -> String {
+        format!("{ROW_DOC}{id}/{what}")
+    }
+
+    /// A live prompt's document opens from `widget`, which is lit while it
+    /// is the tab in front.
+    pub(super) fn doc_widget(&self, key: &str, widget: &gtk::Widget) {
+        self.doc_widgets
             .borrow_mut()
-            .insert(key.to_string(), row.clone());
+            .insert(key.to_string(), widget.downgrade());
     }
 
     /// The editor's tab in front is (or is not) one of this chat's
@@ -8562,14 +7595,35 @@ impl ChatPane {
     /// the editor panel area should highlight the item that would open it
     /// … include agent chat items"). One lit row at a time.
     pub fn highlight_document(&self, key: Option<&str>) {
-        if let Some(previous) = self.lit_doc_row.borrow_mut().take() {
-            previous.remove_css_class("doc-open");
+        let item = key.and_then(|key| {
+            if let Some(id) = key
+                .strip_prefix(ROW_DOC)
+                .and_then(|rest| rest.split('/').next())
+                .and_then(|id| id.parse::<model::RowId>().ok())
+            {
+                return self.model.borrow().row(id).map(|_| Item::Row(id));
+            }
+            // A step's documents are keyed by its call, which a restore
+            // brings back the same.
+            let call = key.split('/').next().unwrap_or(key);
+            if let Some(id) = self.model.borrow().step_row(call) {
+                return Some(Item::Row(id));
+            }
+            let card = self.doc_widgets.borrow().get(key)?.upgrade()?;
+            self.widget_row(&card).map(|row| Item::Widget(row.upcast()))
+        });
+        let previous = self.lit.replace(item.clone());
+        if let Some(Item::Widget(row)) = &previous {
+            row.remove_css_class("doc-open");
         }
-        let row = key.and_then(|key| self.doc_rows.borrow().get(key).cloned());
-        if let Some(row) = row {
+        if let Some(Item::Widget(row)) = &item {
             row.add_css_class("doc-open");
-            *self.lit_doc_row.borrow_mut() = Some(row);
         }
+        let lit = match item {
+            Some(Item::Row(id)) => Some(id),
+            _ => None,
+        };
+        self.update_model(|model| model.light(lit));
         self.sync_open_jump();
     }
 
@@ -8579,32 +7633,36 @@ impl ChatPane {
     /// both have something to say. The prompt row itself, once pinned, is
     /// on screen as its pin — no pill for that.
     fn sync_open_jump(&self) {
-        // A row the transcript's cap has trimmed is no longer anywhere to
-        // jump to, whatever the editor still shows.
-        let lit = self
-            .lit_doc_row
-            .borrow()
-            .clone()
-            .filter(|row| row.parent().is_some());
+        let lit = self.lit.borrow().clone();
         let pinned = self.pinned_float.is_visible();
         let is_pinned_prompt = pinned
-            && lit
-                .as_ref()
-                .is_some_and(|row| self.last_prompt_row.borrow().as_ref() == Some(row));
-        let (up, down) = match lit
-            .filter(|_| !is_pinned_prompt)
-            .and_then(|row| row.compute_bounds(&self.transcript_scroller))
-        {
+            && match (&lit, self.last_prompt.borrow().as_ref()) {
+                (Some(lit), Some(prompt)) => same_item(lit, prompt),
+                _ => false,
+            };
+        let top = if pinned {
+            self.pinned_plate.height() as f32
+        } else {
+            0.0
+        };
+        let (up, down) = match lit.filter(|_| !is_pinned_prompt) {
             None => (false, false),
-            Some(bounds) => {
-                let top = if pinned {
-                    self.pinned_plate.height() as f32
-                } else {
-                    0.0
-                };
-                let bottom = self.transcript_scroller.height() as f32;
-                (bounds.y() + bounds.height() <= top, bounds.y() >= bottom)
-            }
+            Some(item) => match self
+                .item_widget(&item)
+                .filter(|widget| widget.is_mapped())
+                .and_then(|widget| widget.compute_bounds(&self.transcript_scroller))
+            {
+                Some(bounds) => {
+                    let bottom = self.transcript_scroller.height() as f32;
+                    (bounds.y() + bounds.height() <= top, bounds.y() >= bottom)
+                }
+                // Not drawn: off one edge or the other, by far.
+                None => match self.side_of(&item) {
+                    Some(std::cmp::Ordering::Less) => (true, false),
+                    Some(std::cmp::Ordering::Greater) => (false, true),
+                    _ => (false, false),
+                },
+            },
         };
         self.open_jump_up.set_inset(if pinned {
             self.pinned_plate.height()
@@ -8625,9 +7683,8 @@ impl ChatPane {
     /// The transcript ends above whatever floats over its foot — the jump
     /// banner, the open-item pill — so the last row is never under one
     /// (David, 2026-09-08: "the last stuff in the agent chat cuts off").
-    /// A bottom margin on the list is scrollable room, and it grows with
-    /// whatever floats; `TRANSCRIPT_FOOT` is what is there when nothing
-    /// does.
+    /// The foot is scrollable room, and it grows with whatever floats;
+    /// `TRANSCRIPT_FOOT` is what is there when nothing does.
     fn sync_bottom_room(&self) {
         let mut room = TRANSCRIPT_FOOT;
         if self.jump_banner.reveals_child() {
@@ -8637,14 +7694,14 @@ impl ChatPane {
             room += self.open_jump_down.height() + 8;
         }
         if self.foot_room.replace(room) != room {
-            self.place_foot();
+            self.foot.set_height_request(room);
         }
     }
 
     /// Bring the lit row just under the pinned prompt (or the top), and let
     /// go of the tail so the next streamed line does not yank the view back.
     fn scroll_to_lit_row(&self) {
-        let Some(row) = self.lit_doc_row.borrow().clone() else {
+        let Some(item) = self.lit.borrow().clone() else {
             return;
         };
         let top = if self.pinned_float.is_visible() {
@@ -8652,7 +7709,7 @@ impl ChatPane {
         } else {
             0.0
         };
-        self.scroll_to_row(&row, top + 8.0);
+        self.scroll_to_item(&item, top + 8.0);
     }
 
     /// The way out of a clipped block: what opens `doc` in the editor,
@@ -8700,12 +7757,15 @@ impl ChatPane {
     /// list). Any part still visible means no pin: overlaying a duplicate
     /// on the real card would cover it and its copy button.
     fn sync_pinned_prompt(&self) {
-        let visible = match self.last_prompt_row.borrow().as_ref() {
-            Some(row) => match row.compute_bounds(&self.transcript_scroller) {
+        let visible = match self.last_prompt.borrow().clone() {
+            Some(item) => match self
+                .item_widget(&item)
+                .filter(|widget| widget.is_mapped())
+                .and_then(|widget| widget.compute_bounds(&self.transcript_scroller))
+            {
                 Some(bounds) => bounds.y() + bounds.height() < 0.0,
-                // No shared root: the row was capped out of the list, so
-                // the prompt certainly isn't visible.
-                None => true,
+                // Not drawn: pinned while the reader is below it.
+                None => self.side_of(&item) == Some(std::cmp::Ordering::Less),
             },
             None => false,
         };
@@ -8758,9 +7818,7 @@ impl ChatPane {
         // replies naming "all six" of a list nobody could see (David,
         // 2026-10-05: "Which 'all six'?").
         if !replies.is_empty() {
-            for unclip in self.unclip_answer.borrow_mut().drain(..) {
-                unclip();
-            }
+            self.update_model(|model| model.unclip_turn());
         }
         for (index, reply) in replies.iter().enumerate() {
             // A label of its own, wrapping: a button's own label never
@@ -8805,38 +7863,11 @@ impl ChatPane {
     /// keeps its replies — unless a message waiting to go answers it, or
     /// the agent kept no conversation to answer.
     fn settle_replayed_replies(self: &Rc<Self>, restored: bool) {
-        self.replayed_replies_call.borrow_mut().take();
         let answered = !self.pending_prompts.borrow().is_empty();
         if !restored || answered {
             self.clear_replies();
         } else if !self.busy.get() && !self.pending_replies.borrow().is_empty() {
             self.show_replies();
-        }
-    }
-
-    /// A `suggest_replies` call in a replayed conversation: the replies it
-    /// offered, read back from its input, are pending again — drawn when
-    /// the replay is over, unless a message later in it answered them.
-    /// They reach a live chat as the IDE's own event, which nothing
-    /// replays, so a question left unanswered when the IDE closed came
-    /// back with no buttons under it (David, 2026-10-08: "If I haven't
-    /// chosen a reply yet, I should still see the options on restoring
-    /// the IDE after closing it").
-    fn recover_replies(
-        &self,
-        id: &str,
-        input: Option<&serde_json::Value>,
-        status: Option<ToolCallStatus>,
-    ) {
-        *self.replayed_replies_call.borrow_mut() = Some(id.to_string());
-        // Refused by the server, so never shown in the first place.
-        if status == Some(ToolCallStatus::Failed) {
-            self.pending_replies.borrow_mut().clear();
-            return;
-        }
-        let replies = input.map(offered_replies).unwrap_or_default();
-        if !replies.is_empty() {
-            *self.pending_replies.borrow_mut() = replies;
         }
     }
 
@@ -8932,15 +7963,14 @@ impl ChatPane {
             .get()
             .map(|since| since.elapsed())
             .unwrap_or_default();
-        // Asked only when the line will use it, and never while a step is
-        // being written: a step starting sets the activity, which draws
-        // this line from inside `upsert_tool_card`'s borrow of the cards,
-        // and a plain borrow there panicked the IDE out of existence.
+        // Asked only when the line will use it, and never while the model is
+        // being written: a plain borrow of the step cards from inside their
+        // own update once panicked the IDE out of existence.
         let tool_running = quiet >= std::time::Duration::from_secs(20)
             && self
-                .tool_cards
+                .model
                 .try_borrow()
-                .is_ok_and(|cards| cards.values().any(|card| card.running.get()));
+                .is_ok_and(|model| model.any_running());
         let traffic =
             taste_acp::authproxy::handle().map(|proxy| proxy.traffic(self.environment.as_str()));
         let label = working_line(&activity, quiet, tool_running, traffic);
@@ -9039,8 +8069,10 @@ impl ChatPane {
         badge.set_tooltip_text(Some(&written.note()));
     }
 
-    fn reseat_accepted_prompt(self: &Rc<Self>, card: &gtk::Box) -> Option<gtk::ListBoxRow> {
-        let origin = card.parent().and_downcast::<gtk::ListBoxRow>()?;
+    fn reseat_accepted_prompt(self: &Rc<Self>, card: &gtk::Box) -> Option<Item> {
+        let row = self.widget_row(card)?;
+        let origin = Item::Widget(row.clone().upcast());
+        let position = self.position_of(&origin)?;
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         content.append(&gtk::Image::from_icon_name("go-down-symbolic"));
         content.append(
@@ -9064,19 +8096,20 @@ impl ChatPane {
         // "This shouldn't break the line between the bullets on the
         // left"). The step above gets back the line the prompt took from
         // it; the one below already runs up from the top of its row.
-        let above = origin
-            .prev_sibling()
-            .and_downcast::<gtk::ListBoxRow>()
-            .and_then(|row| step_rail_line(&row));
-        let below = origin
-            .next_sibling()
-            .and_downcast::<gtk::ListBoxRow>()
-            .and_then(|row| step_rail_line(&row));
+        let railed = |at: Option<u32>| match at.and_then(|at| self.item_at(at)) {
+            Some(Item::Row(id)) => self
+                .model
+                .borrow()
+                .row(id)
+                .and_then(|row| row.rail)
+                .map(|_| id),
+            _ => None,
+        };
+        let above = railed(position.checked_sub(1));
+        let below = railed(Some(position + 1));
         let through = above.is_some() && below.is_some();
-        if let Some(line) = above.filter(|_| through) {
-            if let Some(bottom) = line.last_child() {
-                bottom.set_visible(true);
-            }
+        if let Some(above) = above.filter(|_| through) {
+            self.update_model(|model| model.rejoin(above));
         }
         // Vertical, so the line is given the column's width to be centred
         // in, as a step's is; never expanding, or the column takes the
@@ -9099,26 +8132,38 @@ impl ChatPane {
         seat_row.set_margin_end(ROW_OWN_SIDE);
         seat_row.append(&rail);
         seat_row.append(&marker);
-        // Setting the marker as the child unparents the card, which is what
-        // frees it to be seated again at the end.
-        origin.set_child(Some(&seat_row));
+        // The marker takes the card's place, and the card a row of its own
+        // at the end.
+        let marker_item = Item::Widget(widget_item(&seat_row).upcast());
+        self.store.splice(
+            position,
+            1,
+            &[glib::BoxedAnyObject::new(marker_item.clone())],
+        );
+        row.remove(card);
+        if self
+            .lit
+            .borrow()
+            .as_ref()
+            .is_some_and(|lit| same_item(lit, &origin))
+        {
+            self.lit.borrow_mut().take();
+        }
         // Seated again as a prompt is: the timeline above ends at its last
         // dot, and the next step's line runs up from the box.
         self.end_steps();
-        let seat = self.append_row(card);
-        // The pin mirrors the newest prompt, and that is now this row.
-        *self.last_prompt_row.borrow_mut() = Some(seat.clone());
+        let seat = self.append_widget(card);
+        // The pin mirrors the newest prompt, and that is now this one.
+        *self.last_prompt.borrow_mut() = Some(seat.clone());
         {
             let weak = Rc::downgrade(self);
-            let seat = seat.downgrade();
             marker.connect_clicked(move |_| {
-                let (Some(pane), Some(seat)) = (weak.upgrade(), seat.upgrade()) else {
-                    return;
-                };
-                pane.scroll_to_row(&seat, 0.0);
+                if let Some(pane) = weak.upgrade() {
+                    pane.scroll_to_item(&seat, 0.0);
+                }
             });
         }
-        Some(origin)
+        Some(marker_item)
     }
 
     /// Take a prompt out of the transcript — its card, and the marker left
@@ -9126,1416 +8171,89 @@ impl ChatPane {
     /// and prompts orphaned by a dropped connection are not part of the
     /// conversation, and neither is a signpost to one.
     fn drop_prompt_rows(&self, prompt: &PendingPrompt) {
-        let mut rows: Vec<gtk::Widget> = Vec::new();
-        if let Some(row) = prompt.card.parent() {
-            rows.push(row);
+        let mut items: Vec<Item> = Vec::new();
+        if let Some(row) = self.widget_row(&prompt.card) {
+            items.push(Item::Widget(row.upcast()));
         }
         if let Some(origin) = &prompt.origin {
-            rows.push(origin.clone().upcast());
+            items.push(origin.clone());
         }
-        for row in rows {
-            self.forget_prompt_row(&row);
-            self.remove_row(&row);
+        for item in items {
+            self.forget_prompt_row(&item);
+            self.remove_item(&item);
         }
     }
 
     /// A prompt card leaving the transcript (rejected prompt, dropped
     /// connection) takes its pin with it — the pin must never advertise a
     /// card that no longer exists.
-    fn forget_prompt_row(&self, row: &gtk::Widget) {
+    fn forget_prompt_row(&self, item: &Item) {
         let is_last = self
-            .last_prompt_row
+            .last_prompt
             .borrow()
             .as_ref()
-            .is_some_and(|last| last.clone().upcast::<gtk::Widget>() == *row);
+            .is_some_and(|last| same_item(last, item));
         if is_last {
-            self.last_prompt_row.replace(None);
+            self.last_prompt.replace(None);
             self.pinned_float.set_visible(false);
         }
     }
 
+    /// A note from the IDE in the transcript, and in the record: its row,
+    /// unless it is part of a prompt the agent has yet to take, which
+    /// draws it then ([`Self::commit_unrecorded`]).
     fn meta_row(&self, text: &str) {
+        self.meta_row_id(text);
+    }
+
+    /// [`Self::meta_row`], handing back the note's row.
+    fn meta_row_id(&self, text: &str) -> Option<model::RowId> {
+        let held =
+            self.holding.borrow().is_some() && !self.replaying.get() && !self.from_record.get();
         self.record(serde_json::json!({ NOTE_RECORD: text }));
-        self.meta_row_label(text);
-    }
-
-    /// [`Self::meta_row`], handing back the label, for a note that will be
-    /// rewritten in place ([`Self::note_keyed`]).
-    fn meta_row_label(&self, text: &str) -> gtk::Label {
-        let label = gtk::Label::builder()
-            .label(text)
-            .xalign(0.0)
-            .hexpand(true)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(40)
-            // One line, to start. A note is an aside between two cards; at
-            // caption size, wrapped across the full width of the pane it
-            // stops reading as an aside and starts reading as a paragraph
-            // of small grey text.
-            .lines(1)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["dim-label", "caption"])
-            .margin_top(2)
-            .margin_bottom(2)
-            .build()
-            .full_text_on_hover();
-        self.record_line("note", text);
-        // ...but a note that says why something did not work is not an
-        // aside, and an ellipsis in the middle of a reason is half an
-        // error: the half that says a thing went wrong, without the half
-        // that says what. A tooltip is not an answer — it is unreachable
-        // by keyboard, invisible on touch, and nobody hovers a line of
-        // grey text to find out whether it continues. So a note too long
-        // for its line gets a disclosure, and the aside rule holds for
-        // everything that fits.
-        if text.lines().count() <= 1 && text.chars().count() <= 80 {
-            self.append_note(&label);
-            return label;
+        if held {
+            return None;
         }
-        let disclose = gtk::ToggleButton::builder()
-            .icon_name("pan-down-symbolic")
-            .css_classes(["flat", "circular", "note-disclose", "dim-label"])
-            .valign(gtk::Align::Start)
-            .tooltip_text("Read the whole note")
-            .build();
-        let row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(4)
-            .build();
-        row.append(&label);
-        row.append(&disclose);
-        let toggled = label.clone();
-        disclose.connect_toggled(move |button| {
-            let open = button.is_active();
-            let label = &toggled;
-            label.set_ellipsize(if open {
-                gtk::pango::EllipsizeMode::None
-            } else {
-                gtk::pango::EllipsizeMode::End
-            });
-            // -1 is "as many as it takes"; the wrap is already on.
-            label.set_lines(if open { -1 } else { 1 });
-            button.set_icon_name(if open {
-                "pan-up-symbolic"
-            } else {
-                "pan-down-symbolic"
-            });
-            button.set_tooltip_text(Some(if open {
-                "Fold this note back to one line"
-            } else {
-                "Read the whole note"
-            }));
-        });
-        self.append_note(&row);
-        label
+        Some(self.update_model(|model| model.note(text)))
     }
 
+    /// A prompt's card, at the end of the transcript, as a send draws it:
+    /// the turn before it ends there, and the pin mirrors it.
     fn user_card(&self, text: &str, attachments: &[(String, ContentBlock)]) -> gtk::Box {
-        // A prompt starts a turn, and a turn owns its plan: the next plan
-        // update writes a new card below this one instead of rewriting the
-        // last turn's checklist further up the transcript.
-        self.plan_card.borrow_mut().take();
-        // And its answer: the last turn's is not this one's.
-        self.unclip_answer.borrow_mut().clear();
-        self.record_line("you", text);
-        // A prompt ends the turn before it: the timeline's line stops at
-        // the last step's dot, and the prompt takes the full width below
+        // A prompt starts a turn, and a turn owns its plan and its answer;
+        // and a prompt ends the turn before it: the timeline's line stops
+        // at the last step's dot, and the prompt takes the full width below
         // (David, 2026-09-07: "My prompts show up as full-width in boxes,
         // followed by the agent's turns/steps as a timeline below").
         self.end_steps();
-        // No spacing: every row carries the inset itself, so spacing here
-        // would quietly add to it and only between some pairs of rows.
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        card.add_css_class("card");
-        card.set_margin_top(PROMPT_TOP);
-        // No margin below: the first step under the box carries the gap
-        // (`PROMPT_GAP`) so the rail's line can run from the box to its dot.
-        card.set_margin_bottom(0);
-        card.set_margin_start(ROW_OWN_SIDE);
-        card.set_margin_end(ROW_OWN_SIDE);
-        // Long prompts are clipped, not dropped — in the TEXT, not by the
-        // label's line limit: GtkLabel's `lines` is Pango's height-in-lines,
-        // which caps lines PER PARAGRAPH, so a pasted diff (one paragraph a
-        // line) sailed through it whole. The head is what the box shows;
-        // the box itself is the way to the rest (David, 2026-09-07: "I
-        // don't need to expand it in the chat, just be able to click a
-        // truncated item to open it in the editor panel").
-        let (head, hidden) = clip_prompt(text);
-        let mut prompt_doc_key: Option<String> = None;
-        if !text.is_empty() {
-            // An issue id in the prompt is drawn as the issue's pill, the
-            // same as in the agent's prose: a pasted "Copy ID" comes back
-            // as the issue it names, not as six characters.
-            let label = gtk::Label::builder()
-                .use_markup(true)
-                .label(crate::issue_pill::pillify(&head, &self.issues))
-                .attributes(&no_hyphens())
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .max_width_chars(40)
-                .xalign(0.0)
-                .hexpand(true)
-                // A clipped prompt is not selectable here: the whole of it
-                // is one click away, and a click on the box is that click.
-                .selectable(hidden == 0)
-                // Selectable labels are focusable and draw a persistent
-                // text caret once clicked. Pointer selection works without
-                // focus, and the Copy button covers keyboard use.
-                .focusable(false)
-                .margin_top(CARD_INSET)
-                .margin_bottom(if hidden > 0 { 2 } else { CARD_INSET })
-                .margin_start(CARD_INSET)
-                .margin_end(CARD_INSET)
-                .build();
-            crate::issue_pill::install_tooltips(&label, self.issues.clone());
-            {
-                let events = self.workspace.events.clone();
-                label.connect_activate_link(move |_, url| {
-                    // A pill's click selects the issue in the backlog.
-                    match url.strip_prefix(crate::issue_pill::SCHEME) {
-                        Some(id) => {
-                            events.publish(taste_core::Event::RevealIssueRequested(id.to_string()));
-                            glib::Propagation::Stop
-                        }
-                        None => glib::Propagation::Proceed,
-                    }
-                });
-            }
-            // Quick copy: reuse a prompt without hand-selecting it. At the
-            // card's right edge whatever the prompt's length, and centred
-            // on the first line of text: the label's top inset plus half a
-            // line is where that line's centre sits, and the button's top
-            // margin plus half its height lands on the same pixel, so a
-            // one-line card has it equidistant from top and bottom and a
-            // longer one keeps it on the opening line (David, 2026-09-16:
-            // "The copy button should always be right-aligned. In a
-            // single-line row, it should be equidistant between the top
-            // and bottom").
-            let copy = gtk::Button::builder()
-                .icon_name("edit-copy-symbolic")
-                .tooltip_text("Copy prompt")
-                .css_classes(["flat", "circular"])
-                .halign(gtk::Align::End)
-                .valign(gtk::Align::Start)
-                .margin_top(4)
-                .margin_end(4)
-                .build();
-            let prompt = text.to_string();
-            copy.connect_clicked(move |button| {
-                button.clipboard().set_text(&prompt);
-            });
-            let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            line.set_hexpand(true);
-            // The text takes the width the button leaves, so the button
-            // is at the edge and not at the end of the sentence.
-            let text_frame = crate::issue_pill::PillText::wrap(&label);
-            text_frame.set_hexpand(true);
-            text_frame.set_halign(gtk::Align::Fill);
-            line.append(&text_frame);
-            line.append(&copy);
-            card.append(&line);
-            if hidden > 0 {
-                let more = gtk::Label::builder()
-                    .label(format!(
-                        "… {hidden} more line{} · click to open in the editor",
-                        if hidden == 1 { "" } else { "s" }
-                    ))
-                    .xalign(0.0)
-                    .css_classes(["caption", "dim-label"])
-                    .margin_start(CARD_INSET)
-                    .margin_end(CARD_INSET)
-                    .margin_bottom(CARD_INSET - 2)
-                    .build();
-                card.append(&more);
-                let key = next_doc_key("prompt");
-                prompt_doc_key = Some(key.clone());
-                let open = self.opener(
-                    &key,
-                    Document::Text {
-                        title: stamp_now(),
-                        body: text.to_string(),
-                        markdown: false,
-                        role: crate::chatdoc::TextRole::Prompt,
-                    },
-                );
-                let click = gtk::GestureClick::new();
-                click.connect_released(move |_, _, _, _| open());
-                card.add_controller(click);
-                card.set_cursor_from_name(Some("pointer"));
-                card.set_tooltip_text(Some("Open the whole prompt in the editor"));
-                card.add_css_class("clipped-prompt");
-            }
-        }
-        // Images get an openable thumbnail; everything else stays a name on
-        // the paperclip row. Decoding is bounded (attachments are capped at
-        // 5MB) and happens once, here — the texture is what both the
-        // thumbnail and the viewer draw.
-        let mut thumbnails: Vec<(String, gtk::gdk::Texture)> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
-        for (label, block) in attachments {
-            match block {
-                ContentBlock::Image(image) => match decode_image(image) {
-                    Some(texture) => thumbnails.push((label.clone(), texture)),
-                    // Undecodable (unknown codec, truncated): it still went
-                    // to the agent, so still say it was attached.
-                    None => names.push(label.clone()),
-                },
-                _ => names.push(label.clone()),
-            }
-        }
-        if !thumbnails.is_empty() {
-            let strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            strip.set_margin_top(CARD_INSET);
-            strip.set_margin_bottom(CARD_INSET);
-            strip.set_margin_start(CARD_INSET);
-            strip.set_margin_end(CARD_INSET);
-            for (label, texture) in thumbnails {
-                let picture = image_thumbnail(&texture);
-                let button = gtk::Button::builder()
-                    .child(&picture)
-                    .tooltip_text(format!("Open {label}"))
-                    .css_classes(["flat"])
-                    .build();
-                button.connect_clicked(move |button| {
-                    present_image_dialog(button, &label, &texture);
-                });
-                strip.append(&button);
-            }
-            card.append(&strip);
-        }
-        if !names.is_empty() {
-            let attached = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            attached.set_margin_top(CARD_INSET);
-            attached.set_margin_bottom(CARD_INSET);
-            attached.set_margin_start(CARD_INSET);
-            attached.set_margin_end(CARD_INSET);
-            let clip = gtk::Image::from_icon_name("mail-attachment-symbolic");
-            clip.add_css_class("dim-label");
-            attached.append(&clip);
-            let label = gtk::Label::builder()
-                .label(names.join(", "))
-                .xalign(0.0)
-                .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                .css_classes(["dim-label", "caption"])
-                .build()
-                .full_text_on_hover();
-            attached.append(&label);
-            card.append(&attached);
-        }
-        let row = self.append_row(&card);
-        if let Some(key) = &prompt_doc_key {
-            self.note_doc_row(key, &row);
-        }
+        self.record_line("you", text);
+        let card = self.prompt_card(text, attachments, None);
+        let item = self.append_widget(&card);
         // This is now the prompt the pin mirrors; it starts visible in the
         // transcript, so the pin starts hidden.
-        let pin_text = if text.is_empty() {
-            attachments
-                .iter()
-                .map(|(label, _)| label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            // One paragraph: the label's three-line limit is Pango's, per
-            // paragraph, and a pasted log would pin ten lines of itself.
-            single_line(text, 600)
-        };
-        self.last_prompt_row.replace(Some(row));
-        // A prompt drawn back above the reader is not the newest.
-        if !self.drawing_past.get() {
-            self.pinned_prompt_label.set_label(&pin_text);
-            self.pinned_float.set_visible(false);
-        }
+        *self.last_prompt.borrow_mut() = Some(item);
+        self.pinned_prompt_label
+            .set_label(&pin_text(text, attachments));
+        self.pinned_float.set_visible(false);
         card
-    }
-
-    /// The agent's streaming buffer: created on first chunk, markdown-styled
-    /// when the stream ends (tool call, plan, or turn end).
-    fn agent_buffer(&self) -> gtk::TextBuffer {
-        if let Some(buffer) = self.current_agent.borrow().as_ref() {
-            return buffer.clone();
-        }
-        // No margins of its own: the rail and its gap are the inset, and
-        // the view's first line is what the step's dot is centred on.
-        let view = gtk::TextView::builder()
-            .editable(false)
-            .cursor_visible(false)
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .build();
-        let buffer = view.buffer();
-        self.append_step(&view);
-        *self.current_agent.borrow_mut() = Some(buffer.clone());
-        *self.current_agent_view.borrow_mut() = Some(view);
-        buffer
-    }
-
-    fn thought_buffer(&self) -> gtk::TextBuffer {
-        if let Some(buffer) = self.current_thought.borrow().as_ref() {
-            return buffer.clone();
-        }
-        let view = gtk::TextView::builder()
-            .editable(false)
-            .cursor_visible(false)
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .css_classes(["dim-label"])
-            .build();
-        // Caption-weight and dim: reasoning is an aside to the answer, and
-        // an expander wearing body text competes with the reply beneath it.
-        let header = gtk::Label::builder()
-            .label("Thinking…")
-            .css_classes(["dim-label", "caption"])
-            // The header carries the thought's first line once it is done
-            // (`thought_header`), and a line that will not ellipsize is a
-            // pane minimum in waiting — see TASTE_MEASURE_MIN.
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .max_width_chars(40)
-            .xalign(0.0)
-            .build()
-            .full_text_on_hover();
-        let expander = gtk::Expander::builder()
-            .label_widget(&header)
-            .child(&view)
-            .build();
-        self.append_note(&expander);
-        let buffer = view.buffer();
-        *self.current_thought.borrow_mut() = Some(buffer.clone());
-        *self.current_thought_header.borrow_mut() = Some((expander, std::time::Instant::now()));
-        buffer
-    }
-
-    /// Close whatever is streaming — and first, draw any user message that
-    /// was still being assembled, so it lands above what follows it.
-    fn finalize_stream(&self) {
-        self.flush_user_message();
-        self.close_stream();
-    }
-
-    /// Draw the accumulated user message, blocks and all. Idempotent.
-    fn flush_user_message(&self) {
-        let Some(mut pending) = self.pending_user.borrow_mut().take() else {
-            return;
-        };
-        let briefed = std::mem::take(&mut pending.briefed);
-        self.draw_user_message(pending);
-        for note in briefed {
-            self.meta_row(&note);
-        }
-    }
-
-    fn draw_user_message(&self, pending: PendingUserMessage) {
-        if pending.text.trim().is_empty() && pending.attachments.is_empty() {
-            return;
-        }
-        // A message later in a replay answered whatever replies came
-        // before it.
-        if self.restoring() {
-            self.pending_replies.borrow_mut().clear();
-            self.replayed_replies_call.borrow_mut().take();
-        }
-        // The agent's block, if one is open, belongs above this message.
-        self.close_stream();
-        let mut text = pending.text.trim_end().to_string();
-        // A background task's report, delivered to the agent as a user
-        // message, is not something the user said: it is a step of the
-        // agent's work, and drawn as one.
-        if let Some((notes, rest)) = task_notifications(&text) {
-            for note in &notes {
-                self.task_notification_step(note);
-            }
-            if rest.is_empty() && pending.attachments.is_empty() {
-                return;
-            }
-            text = rest;
-        }
-        // A message that waited behind a turn went out after a note saying
-        // so (`taste_core::queued`): drawn as the card's badge, as it was
-        // when it was sent, not as words the user typed.
-        // Several that went out together come back as the cards they were,
-        // the attachments on the last, which is as near as a replay says.
-        if let Some(parts) = taste_core::queued::split_all(&text) {
-            let last = parts.len().saturating_sub(1);
-            for (index, (note, rest)) in parts.into_iter().enumerate() {
-                let attachments: &[(String, ContentBlock)] = if index == last {
-                    &pending.attachments
-                } else {
-                    &[]
-                };
-                let card = self.user_card(&rest, attachments);
-                let badge = queued_badge(&taste_core::queued::badge(&note));
-                badge.set_tooltip_text(Some(&note));
-                card.append(&badge_row(&badge));
-            }
-            return;
-        }
-        self.user_card(&text, &pending.attachments);
-    }
-
-    /// A background task finishing, as a step of the turn that started
-    /// it: what it was and how it ended on the line, its dot the colour of
-    /// how it ended, and its report — which the agent goes on to read, and
-    /// usually summarize — one click away in the editor, where it opens as
-    /// a response does. The raw notification, tags and all, filled a
-    /// prompt's box and read as though the user had pasted it (David,
-    /// 2026-10-08: "fix this output for task notifs").
-    fn task_notification_step(&self, note: &TaskNotification) {
-        let title = note.title();
-        self.record_line("note", &title);
-        let label = gtk::Label::builder()
-            .label(&title)
-            .xalign(0.0)
-            .hexpand(true)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .attributes(&no_hyphens())
-            .css_classes(["tool-title"])
-            .build();
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        body.append(&label);
-        let key = note.report.as_ref().map(|report| {
-            let key = next_doc_key("task");
-            let lines = report.lines().count();
-            body.append(&self.open_line(
-                &key,
-                &format!(
-                    "report · {lines} line{} · open in the editor",
-                    if lines == 1 { "" } else { "s" }
-                ),
-                "Open the task's report in the editor",
-                Document::Text {
-                    title: stamp_now(),
-                    body: report.clone(),
-                    markdown: true,
-                    role: crate::chatdoc::TextRole::Response,
-                },
-            ));
-            key
-        });
-        let (row, rail) = self.append_step(&body);
-        if let Some(tone) = note.tone() {
-            rail.dot.add_css_class(tone);
-        }
-        if let Some(key) = key {
-            self.note_doc_row(&key, &row);
-        }
-    }
-
-    /// Close out the current streamed message: style it as markdown.
-    fn close_stream(&self) {
-        self.current_agent.borrow_mut().take();
-        if let Some(view) = self.current_agent_view.borrow_mut().take() {
-            let buffer = view.buffer();
-            let text = buffer
-                .text(&buffer.start_iter(), &buffer.end_iter(), true)
-                .to_string();
-            // The mirror takes the message once it is whole, not chunk by
-            // chunk: a tail assembled from stream fragments would show a
-            // supervisor half-sentences that no reader ever saw.
-            self.record_line("agent", &text);
-            // The stream is done: replace the plain text with the real
-            // renderer (same one the markdown preview uses).
-            // The stream's view sits beside the rail in the step's row; the
-            // rendered prose takes its place there.
-            if let Some(slot) = view.parent().and_downcast::<gtk::Box>() {
-                let events = self.workspace.events.clone();
-                let on_link: std::rc::Rc<dyn Fn(&str)> = std::rc::Rc::new(move |url: &str| {
-                    // An issue pill's click selects the issue in the
-                    // backlog; everything else is a URL for the browser.
-                    match url.strip_prefix(crate::issue_pill::SCHEME) {
-                        Some(id) => {
-                            events.publish(taste_core::Event::RevealIssueRequested(id.to_string()))
-                        }
-                        None => {
-                            events.publish(taste_core::Event::OpenUrlRequested(url.to_string()))
-                        }
-                    }
-                });
-                // A huge answer is clipped, not dropped: the head renders
-                // here, cut between paragraphs, and the whole of it is one
-                // click away in the editor.
-                let (head, hidden) =
-                    crate::chatdoc::clip_prose(&text, PROSE_CLIP_LINES, PROSE_CLIP_CHARS);
-                // The environment's checkout is where a path in the answer
-                // points, and where its images are.
-                let base = self.environments.get(&self.environment).map(|supervisor| {
-                    let root = supervisor.checkout().path().to_path_buf();
-                    let events = self.workspace.events.clone();
-                    crate::markdown_view::DocumentBase {
-                        files: supervisor.files(),
-                        dir: root.clone(),
-                        root,
-                        open_file: Rc::new(move |path, line| {
-                            events.publish(taste_core::Event::OpenFileRequested { path, line });
-                        }),
-                    }
-                });
-                let rendered = response_prose(
-                    &head,
-                    on_link.clone(),
-                    Some(self.issues.clone()),
-                    base.clone(),
-                );
-                let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
-                body.set_hexpand(true);
-                body.append(&rendered);
-                let unclip = (hidden > 0).then(|| {
-                    let body = body.downgrade();
-                    let whole = text.clone();
-                    let issues = self.issues.clone();
-                    Box::new(move || {
-                        let Some(body) = body.upgrade() else { return };
-                        while let Some(child) = body.first_child() {
-                            body.remove(&child);
-                        }
-                        body.append(&response_prose(
-                            &whole,
-                            on_link.clone(),
-                            Some(issues.clone()),
-                            base.clone(),
-                        ));
-                    }) as Box<dyn Fn()>
-                });
-                if let Some(unclip) = unclip {
-                    self.unclip_answer.borrow_mut().push(unclip);
-                }
-                if hidden > 0 {
-                    let key = next_doc_key("response");
-                    if let Some(row) = slot.parent().and_downcast::<gtk::ListBoxRow>() {
-                        self.note_doc_row(&key, &row);
-                    }
-                    body.append(&self.more_button(
-                        &key,
-                        hidden,
-                        "Open the whole response in the editor",
-                        Document::Text {
-                            title: stamp_now(),
-                            body: text.clone(),
-                            markdown: true,
-                            role: crate::chatdoc::TextRole::Response,
-                        },
-                    ));
-                }
-                // The rendered prose is the step's content now, so it
-                // takes everything the stream's view was carrying: the air
-                // above the step (without it the finished answer jumped up
-                // against the step before it, by the width of the gap the
-                // rail's line crosses), the class the open-item blue tints
-                // (a clipped response has a document to open, and its row
-                // had nothing left to colour), and the dot's measurement,
-                // which the new first line moves.
-                body.set_margin_top(view.margin_top());
-                body.add_css_class("step-content");
-                slot.remove(&view);
-                slot.append(&body);
-                centre_dot_after_layout(&slot);
-            }
-        }
-        let thought = self
-            .current_thought
-            .borrow_mut()
-            .take()
-            .map(|buffer| {
-                buffer
-                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                    .to_string()
-            })
-            .unwrap_or_default();
-        // The thought is over: say how long it took, rather than leaving
-        // "Thinking…" over a finished block for the rest of the session —
-        // and what it opened with, so a progress note is readable from the
-        // transcript afterwards without unfolding every block to find it.
-        if let Some((expander, since)) = self.current_thought_header.borrow_mut().take() {
-            if let Some(label) = expander.label_widget().and_downcast::<gtk::Label>() {
-                label.set_label(&thought_header(since.elapsed(), &thought));
-            }
-        }
-    }
-
-    /// Show the Kill on a step that is running a command, and say whether
-    /// the IDE can actually stop it.
-    ///
-    /// Only on an Execute step: a read or an edit is the IDE's own work and
-    /// finishes in milliseconds, so a stop button on one would be a control
-    /// for a state nobody can catch.
-    /// Settle every step still marked running: nothing can be running
-    /// once its turn has ended, its session has, or a replayed history has
-    /// finished arriving — the agent only never said how the call ended. A
-    /// step left spinning under "stopped" or "new session" claimed work in
-    /// progress that nothing was doing (David, 2026-09-23: "This shouldn't
-    /// still be spinning"). Its dot says what is known and no more:
-    /// neither green nor red, with the reason on hover.
-    fn settle_running_steps(&self) {
-        for card in self.tool_cards.borrow().values() {
-            if !card.running.replace(false) {
-                continue;
-            }
-            card.tone.set("cut");
-            card.paint_dot();
-            card.status_spinner.stop();
-            card.status_spinner.set_visible(false);
-            card.dot.set_visible(true);
-            card.dot
-                .set_tooltip_text(Some("Never reported finishing: its turn ended first"));
-            self.refresh_kill(card);
-        }
-    }
-
-    fn refresh_kill(&self, card: &ToolCard) {
-        let running = card.running.get() && card.kind.get() == ToolKind::Execute;
-        // Only when there is something to stop. What the pinned Claude Code
-        // adapter reports for its own shell tool runs inside the adapter's
-        // own process: no child of ours to signal, and no ACP request to
-        // ask for one — so there is no button, rather than an insensitive
-        // one standing in the disclosure's place saying no.
-        let killable = running
-            && running_shell(
-                &self.workspace.shells,
-                &self.environment,
-                &card.title_full.borrow(),
-            )
-            .is_some_and(|entry| entry.killable);
-        card.kill_shown.set(killable);
-        card.kill.set_tooltip_text(Some(
-            "Stop this command. The output stays, and the agent is told it died.",
-        ));
-        card.apply_trailing();
-    }
-
-    /// Keep what a shell call printed, when the update reports it: the
-    /// adapter's own shell tool says it in `_meta.terminal_output`, the
-    /// whole capture at the end, which a later update's content (the same
-    /// terminal) then redraws the card with.
-    fn note_terminal_output(
-        &self,
-        id: &str,
-        meta: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) {
-        let Some(data) = meta
-            .and_then(|meta| meta.get("terminal_output"))
-            .and_then(|output| output.get("data"))
-            .and_then(serde_json::Value::as_str)
-        else {
-            return;
-        };
-        self.terminal_text
-            .borrow_mut()
-            .entry(id.to_string())
-            .or_default()
-            .push_str(data);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn upsert_tool_card(
-        &self,
-        id: String,
-        title: Option<String>,
-        status: Option<ToolCallStatus>,
-        kind: Option<ToolKind>,
-        // `None` means "this update says nothing about content" — which is
-        // not the same as "this call has no content", and must leave what
-        // the card already shows exactly where it is.
-        content: Option<&[ToolCallContent]>,
-        // The call's arguments and its answer, as the agent reported them.
-        // Only an act (`act_kind`) reads them: they are what its headline
-        // is written from.
-        raw_input: Option<&serde_json::Value>,
-        raw_output: Option<&serde_json::Value>,
-    ) {
-        self.finalize_stream();
-        // What the agent DID belongs in the mirror as much as what it
-        // said: an orchestrator reading a stuck sub-agent's tail needs to
-        // see the command it is sitting in. Recorded once, when the card
-        // first appears — the updates that follow rewrite one card, and
-        // would otherwise write a line each. An act is recorded as its
-        // headline, which is the sentence a reader of the tail wants.
-        if let Some(title) = &title {
-            if !self.tool_cards.borrow().contains_key(&id) {
-                let line =
-                    step_title(title, raw_input, raw_output).unwrap_or_else(|| title.clone());
-                self.record_line("tool", &line);
-            }
-        }
-        let marked = id.clone();
-        let mut cards = self.tool_cards.borrow_mut();
-        // What the adapter's own shell call printed, when it has said.
-        let terminal_text = self.terminal_text.borrow().get(&id).cloned();
-        let card = cards.entry(id).or_insert_with(|| {
-            // One line on the timeline, Claude Code's shape: the dot on the
-            // rail says how the call went, the title says what it was, and
-            // a dim line under it says what came of it (`chatdoc::digest`).
-            // No frame — the rail is what groups the steps, and a bordered
-            // card per call is what made the transcript sparse.
-            //
-            // Normal weight, explicitly: Adwaita sets button labels bold,
-            // and the header IS a button. A shell command in bold outweighs
-            // the agent's prose around it, when what the step actually
-            // needs to signal — ran, failed, running — is on the dot.
-            let title_label = gtk::Label::builder()
-                .xalign(0.0)
-                .valign(gtk::Align::Center)
-                .hexpand(true)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["tool-title"])
-                // Markup, for the pills: "Read issue i-0010" names an issue
-                // the same way prose does, and is drawn the same way.
-                .use_markup(true)
-                .build()
-                .full_text_on_hover();
-            crate::issue_pill::install_tooltips(&title_label, self.issues.clone());
-            {
-                let events = self.workspace.events.clone();
-                title_label.connect_activate_link(move |_, url| {
-                    match url.strip_prefix(crate::issue_pill::SCHEME) {
-                        Some(id) => {
-                            events.publish(taste_core::Event::RevealIssueRequested(id.to_string()));
-                            glib::Propagation::Stop
-                        }
-                        None => glib::Propagation::Proceed,
-                    }
-                });
-            }
-            let summary = gtk::Label::builder()
-                .xalign(0.0)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["caption", "dim-label", "step-summary"])
-                .visible(false)
-                .build()
-                .full_text_on_hover();
-            // Right-hand end of the header, opposite the rail so the two
-            // never read as one signal: this one is about who said yes,
-            // not about how the call went.
-            let permission = gtk::Image::new();
-            permission.set_valign(gtk::Align::Center);
-            permission.set_visible(false);
-            permission.add_css_class("dim-label");
-            let act_icon = gtk::Image::new();
-            act_icon.set_valign(gtk::Align::Center);
-            act_icon.set_visible(false);
-            act_icon.add_css_class("act-icon");
-            // The disclosure, at the END of the line — the rail owns the
-            // start — and only once there is something to open onto.
-            let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
-            arrow.set_valign(gtk::Align::Center);
-            arrow.add_css_class("dim-label");
-            arrow.set_visible(false);
-            // What this step is running, for the Kill beside it: the
-            // roster carries no tool-call id, so the command is the join
-            // (`ChatPane::running_shell`).
-            let title_full: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-            // Stopping a command the agent is running, on the step that
-            // says what it is. This used to be a Kill button in the header
-            // of a read-only terminal tab per environment; the tab said
-            // nothing the transcript was not already saying, so it is gone
-            // and the control came here (David, 2026-09-08: "Kill can go to
-            // the transcript […] it's honestly sufficient to just have it
-            // in the chat").
-            //
-            // **No confirmation, deliberately.** It is supervision, not
-            // destruction: nothing is lost that a re-run cannot produce
-            // again, the output stays on the step afterwards, and the agent
-            // is told its command died. A dialog whose answer is always yes
-            // is the click-through training this project spends its consent
-            // prompts avoiding, so they still mean something where they
-            // guard something irreversible (`devcontainer_reload`).
-            // The same square the working line's stop wears: both say
-            // "stop what is running", and `process-stop-symbolic` is an X,
-            // which on a step reads as dismiss it.
-            //
-            // Top-aligned, not centred: the step's own line is the title,
-            // and a collapsed card carries a digest under it — centring on
-            // both would drop this below the line it belongs to.
-            let kill = gtk::Button::builder()
-                .icon_name("media-playback-stop-symbolic")
-                .css_classes(["flat", "circular", "step-kill"])
-                .valign(gtk::Align::Start)
-                .visible(false)
-                .build();
-            {
-                let shells = self.workspace.shells.clone();
-                let env = self.environment.clone();
-                let command = title_full.clone();
-                kill.connect_clicked(move |button| {
-                    // Insensitive immediately: the process takes a moment
-                    // to die, and a button that still invites clicking
-                    // reads as one that did nothing.
-                    button.set_sensitive(false);
-                    let command = command.borrow().clone();
-                    if let Some(entry) = running_shell(&shells, &env, &command) {
-                        shells.kill(entry.id);
-                    }
-                });
-            }
-            let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            header.append(&act_icon);
-            header.append(&crate::issue_pill::PillText::wrap(&title_label));
-            header.append(&permission);
-            header.append(&arrow);
-            let head = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            head.append(&header);
-            head.append(&summary);
-            // The content stands on the step's own text column: the rail
-            // and its gap are the inset, so it states none.
-            let content_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            content_box.set_margin_top(2);
-            content_box.set_margin_bottom(4);
-            let revealer = gtk::Revealer::builder().child(&content_box).build();
-            // A button, not a click gesture: this keeps the keyboard
-            // activation and the a11y role GtkExpander was giving us.
-            let toggle = gtk::Button::builder()
-                .child(&head)
-                .css_classes(["flat", "step-toggle"])
-                .build();
-            {
-                let revealer = revealer.clone();
-                let arrow = arrow.clone();
-                let summary = summary.clone();
-                toggle.connect_clicked(move |_| {
-                    let open = !revealer.reveals_child();
-                    revealer.set_reveal_child(open);
-                    arrow.set_icon_name(Some(if open {
-                        "pan-down-symbolic"
-                    } else {
-                        "pan-end-symbolic"
-                    }));
-                    // The digest stands in for the content; open, the
-                    // content is there and the digest would say it twice.
-                    summary.set_visible(!open && !summary.label().is_empty());
-                });
-            }
-            // A step with nothing in it must not offer to open onto nothing.
-            // Untargetable rather than INSENSITIVE: an insensitive button
-            // dims its label, and a failed call that produced no output is
-            // exactly the step that must not read as faded and unimportant.
-            toggle.set_can_target(false);
-            toggle.set_can_focus(false);
-            // The Kill sits BESIDE the disclosure, not inside it: a
-            // button nested in a button is a click the outer one eats
-            // half the time, and this one must never open the step by
-            // accident. No spacing, and the arrow steps out of the header
-            // while it is here — so it lands in exactly the arrow's 22
-            // pixels and every step's trailing column is the same column
-            // (`ToolCard::apply_trailing`).
-            toggle.set_hexpand(true);
-            let head_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            head_row.append(&toggle);
-            head_row.append(&kill);
-            let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            body.append(&head_row);
-            body.append(&revealer);
-            let (row, rail) = self.append_step(&body);
-            ToolCard {
-                row,
-                dot: rail.dot,
-                status_spinner: rail.spinner,
-                tone: Cell::new("live"),
-                waiting: Cell::new(false),
-                running: Cell::new(false),
-                title_label,
-                title_full,
-                kill,
-                kill_shown: Cell::new(false),
-                has_content: Cell::new(false),
-                summary,
-                act_icon,
-                act: Cell::new(None),
-                act_input: RefCell::new(None),
-                act_output: RefCell::new(None),
-                cmd_input: RefCell::new(None),
-                permission,
-                content: content_box,
-                revealer,
-                arrow,
-                toggle,
-                signature: RefCell::new(None),
-                kind: Cell::new(ToolKind::Other),
-            }
-        });
-        if let Some(title) = title {
-            // The title is whatever the agent called the call — for a shell
-            // tool, the entire script. A collapsed card summarises in one
-            // line; the whole thing stays a hover away, and the card's own
-            // content carries the detail when it is opened.
-            // A tool's name is worded in English wherever it shows, the
-            // first moment included (`step_title`); a title that is the
-            // adapter's own words — a shell command, "Read filetree.rs" —
-            // stays as it came. The raw name stays only in `title_full`,
-            // which is what the IN/OUT matcher compares a shell card's
-            // output against: not on the tooltip, and so never in front
-            // of the user (David, 2026-10-09: "I don't want to see the
-            // internal function/method names in even transitory
-            // circumstances").
-            let worded = step_title(&title, raw_input, raw_output);
-            let shown = worded.clone().unwrap_or_else(|| single_line(&title, 200));
-            card.title_label.set_markup(&self.pillify_headline(&shown));
-            card.title_label
-                .set_tooltip_text(Some(worded.as_deref().unwrap_or(&title)));
-            *card.title_full.borrow_mut() = title.clone();
-            // An act — the coordinator filing, starting, completing,
-            // declining, moving or prompting — is dressed as one from its
-            // first appearance, so the user sees the major things it does
-            // at a glance among the reads and shells (David, 2026-09-06).
-            if card.act.get().is_none() {
-                if let Some(kind) = act_kind(&title) {
-                    card.act.set(Some(kind));
-                    card.act_icon.set_visible(true);
-                    card.title_label.add_css_class("act-title");
-                }
-            }
-        }
-        if let Some(raw) = raw_input {
-            *card.cmd_input.borrow_mut() = Some(raw.clone());
-        }
-        if card.act.get().is_some() {
-            if let Some(raw) = raw_input {
-                *card.act_input.borrow_mut() = Some(raw.clone());
-            }
-            if let Some(parsed) = raw_output.and_then(act_output_json) {
-                *card.act_output.borrow_mut() = Some(parsed);
-            }
-        }
-        if let Some(status) = status {
-            // The traffic light the environment rows already speak, for a
-            // call: green finished, red failed — and the spinner while it
-            // runs, since a static glyph cannot say "still going". The dot
-            // is repainted from scratch each time: a call that fails after
-            // reporting progress must not keep the colour it wore.
-            let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
-            card.running.set(running);
-            // A rebuild the agent asked for stops the container the agent
-            // lives in, and its call to the IDE goes with it: "Connection
-            // closed" is that rebuild under way, not a failure of it (David,
-            // 2026-10-04: "This shouldn't be a red line. It's expected").
-            // How the rebuild itself ends is the startup page's and the
-            // row's to say. A refusal the IDE returned has words of its
-            // own and stays red.
-            let rebuild_took_the_agent = status == ToolCallStatus::Failed
-                && mcp_tool_name(&card.title_full.borrow()).as_deref()
-                    == Some("devcontainer_reload")
-                && (self.environment_in_transition()
-                    || raw_output.is_some_and(|out| {
-                        out.to_string()
-                            .to_ascii_lowercase()
-                            .contains("connection closed")
-                    }));
-            card.tone.set(match status {
-                ToolCallStatus::Completed => "ok",
-                ToolCallStatus::Failed if rebuild_took_the_agent => "ok",
-                ToolCallStatus::Failed => "fail",
-                _ => "live",
-            });
-            card.paint_dot();
-            // A status after all: the "never reported" hover is no longer
-            // true.
-            card.dot.set_tooltip_text(rebuild_took_the_agent.then_some(
-                "The rebuild started, and stopped this agent's container as a rebuild does — \
-                 the call's connection went with it. The agent comes back when the rebuild \
-                 finishes.",
-            ));
-            card.status_spinner.set_visible(running);
-            card.dot.set_visible(!running);
-            if running {
-                card.status_spinner.start();
-                // The working line says what is running rather than that
-                // something is.
-                self.set_activity(&card.title_label.text());
-            } else {
-                card.status_spinner.stop();
-                // This call is done; whether another is running or the model
-                // is writing, "Working…" is the most we can honestly claim.
-                // Through the activity, not the label: the line redraws
-                // from the activity every second to keep its "silent for"
-                // current, and the label alone put the finished call's name
-                // straight back — a call that had answered read as one still
-                // hanging (David, 2026-10-04: "It seems to be hanging on the
-                // issue update").
-                self.set_activity("");
-            }
-        }
-        if let Some(kind) = kind {
-            card.kind.set(kind);
-        }
-        // A command's step in the face its IN/OUT block is in, collapsed as
-        // well as open: the title where it IS the command line, and the
-        // summary, which is the output's last line (David, 2026-10-02:
-        // "Have commands and responses use a fixed-width typeface"). Not
-        // the IDE's sentences — "Collect what that command has written".
-        {
-            let title = card.title_full.borrow();
-            let command = is_command_call(card.kind.get(), &title);
-            let command_title = command
-                && match mcp_tool_name(&title).as_deref() {
-                    Some("ide_exec") => {
-                        command_input_line("ide_exec", card.cmd_input.borrow().as_ref()).is_some()
-                    }
-                    Some(_) => false,
-                    None => true,
-                };
-            for (label, on) in [(&card.title_label, command_title), (&card.summary, command)] {
-                if on {
-                    label.add_css_class("monospace");
-                } else {
-                    label.remove_css_class("monospace");
-                }
-            }
-        }
-        // The Kill, now that both the command and the kind are on the card.
-        self.refresh_kill(card);
-        // An ACP content update REPLACES the collection, it does not extend
-        // it — and agents restate the whole of a shell call's output on
-        // every update. Appending it grew the card by a full copy of itself
-        // each time, which is the transcript jumping under the reader while
-        // the turn streams. So: rebuild when the snapshot actually differs,
-        // and leave the card completely alone when it does not.
-        if let Some(content) = content {
-            let mut signature = content_signature(content);
-            // The terminal's output comes in `_meta`, beside a content that
-            // stays the same terminal: what it printed is part of what the
-            // card shows, so its arrival redraws it.
-            if let Some(text) = &terminal_text {
-                signature.push(format!("terminal-output\u{0}{}", text.len()));
-            }
-            let unchanged = card.signature.borrow().as_ref() == Some(&signature);
-            if !unchanged {
-                *card.signature.borrow_mut() = Some(signature);
-                clear_children(&card.content);
-                let mut summary: Option<String> = None;
-                let title_full = card.title_full.borrow().clone();
-                // `ToolKind::Execute` is what an ADAPTER reports for its own
-                // built-in shell tool; `ide_exec` is an MCP tool, so no
-                // adapter has a kind to give it and the card keeps its
-                // constructed default (`ToolKind::Other`). It is nonetheless
-                // the one command tool this project tells an agent to use,
-                // so the gate has to recognise the IDE's own tools by name
-                // too, the same way `act_kind` already does for the acts —
-                // asking only the adapter's kind left every `ide_exec` call
-                // rendering as an untagged result (i-0017). Do not
-                // "simplify" this back to the kind check alone.
-                if is_command_call(card.kind.get(), &title_full) {
-                    // Claude Code's IN/OUT: IN is the call's input — the
-                    // title, for the adapter's own shell tool, since that is
-                    // all it gives; the command and args actually passed,
-                    // for `ide_exec` — never the result, which carries the
-                    // wrapped `podman exec …` string rather than what was
-                    // asked (i-0016) — and OUT is everything printed, as one
-                    // block, clipped, the pair openable whole in the editor
-                    // (David, 2026-09-07).
-                    let command = mcp_tool_name(&title_full)
-                        .filter(|name| is_ide_command_tool(name))
-                        .and_then(|name| {
-                            command_input_line(&name, card.cmd_input.borrow().as_ref())
-                        })
-                        .unwrap_or(title_full);
-                    let mut output = content
-                        .iter()
-                        .filter_map(|item| match item {
-                            ToolCallContent::Content(block) => content_text(&block.content),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    // The adapter's own shell tool: a terminal in the
-                    // content, and what it printed reported beside it.
-                    if output.trim().is_empty() {
-                        if let Some(text) = &terminal_text {
-                            output = text.clone();
-                        }
-                    }
-                    // The IDE's own command tools answer in JSON, for the
-                    // agent; OUT is what the command printed, for the user.
-                    let output = mcp_tool_name(&card.title_full.borrow())
-                        .filter(|name| is_ide_command_tool(name))
-                        .and_then(|_| command_console_text(&output))
-                        .unwrap_or(output);
-                    let key = format!("{marked}/command");
-                    self.note_doc_row(&key, &card.row);
-                    let open = self.opener(
-                        &key,
-                        Document::Command {
-                            command: command.clone(),
-                            output: output.clone(),
-                        },
-                    );
-                    card.content.append(&crate::chatdoc::command_block(
-                        &command,
-                        &output,
-                        Some(OUTPUT_CLIP_LINES),
-                        Some(open),
-                    ));
-                    summary = crate::chatdoc::digest(&output);
-                } else {
-                    // `Read`, `Search`, `Fetch` and the rest stay untagged,
-                    // by decision rather than oversight: their title already
-                    // states the ask (`tool_headline` — "Read
-                    // src/main.rs", "Search the project for …"), so an `IN`
-                    // row here would repeat it rather than add to it. `OUT`
-                    // is the wrapped caption below.
-                    for (index, item) in content.iter().enumerate() {
-                        match item {
-                            ToolCallContent::Diff(diff) => {
-                                let edit = edit_from(diff);
-                                let view = crate::chatdoc::diff_view(
-                                    &edit,
-                                    Some(DIFF_CLIP_LINES),
-                                    crate::chatdoc::Layout::Auto,
-                                );
-                                let key = format!("{marked}/edit-{index}");
-                                self.note_doc_row(&key, &card.row);
-                                let open = self.opener(&key, Document::Edit(edit.clone()));
-                                card.content.append(&crate::chatdoc::diff_header(
-                                    &edit,
-                                    view.added,
-                                    view.removed,
-                                    Some(open),
-                                ));
-                                card.content.append(&view.widget);
-                                // The title already names the file.
-                                summary = Some(format!("+{} −{}", view.added, view.removed));
-                            }
-                            ToolCallContent::Content(block) => {
-                                // A tool that answers in a JSON object — the
-                                // IDE's own, mostly — reads as its fields, not
-                                // as the JSON the agent was given (David,
-                                // 2026-09-23: "This \"publish\" metadata
-                                // should be formatted nicely"). The raw text is
-                                // still the whole result, in the editor.
-                                if let Some(fields) =
-                                    content_text(&block.content).and_then(|t| json_fields(&t))
-                                {
-                                    let text = content_text(&block.content).unwrap_or_default();
-                                    card.content.append(&fields_grid(&fields));
-                                    let title = single_line(&card.title_label.text(), 60);
-                                    let key = format!("{marked}/result-{index}");
-                                    self.note_doc_row(&key, &card.row);
-                                    card.content.append(&self.more_button(
-                                        &key,
-                                        0,
-                                        "Open the whole result in the editor",
-                                        Document::Text {
-                                            title,
-                                            body: text,
-                                            markdown: false,
-                                            role: crate::chatdoc::TextRole::Result,
-                                        },
-                                    ));
-                                    summary.get_or_insert_with(|| {
-                                        fields
-                                            .iter()
-                                            .find(|(k, _)| k == "Status" || k == "State")
-                                            .map(|(_, v)| v.clone())
-                                            .unwrap_or_else(|| match fields.len() {
-                                                1 => "1 field".to_string(),
-                                                n => format!("{n} fields"),
-                                            })
-                                    });
-                                } else if let Some(text) = content_text(&block.content) {
-                                    let (head, hidden) =
-                                        crate::chatdoc::clip_lines(&text, OUTPUT_CLIP_LINES);
-                                    card.content.append(
-                                        &gtk::Label::builder()
-                                            .label(head)
-                                            .attributes(&no_hyphens())
-                                            .wrap(true)
-                                            .wrap_mode(gtk::pango::WrapMode::WordChar)
-                                            .max_width_chars(40)
-                                            .xalign(0.0)
-                                            .selectable(true)
-                                            .focusable(false)
-                                            .css_classes(["caption"])
-                                            .build(),
-                                    );
-                                    if hidden > 0 {
-                                        let title = single_line(&card.title_label.text(), 60);
-                                        let key = format!("{marked}/result-{index}");
-                                        self.note_doc_row(&key, &card.row);
-                                        card.content.append(&self.more_button(
-                                            &key,
-                                            hidden,
-                                            "Open the whole result in the editor",
-                                            Document::Text {
-                                                title,
-                                                body: text.clone(),
-                                                markdown: false,
-                                                role: crate::chatdoc::TextRole::Result,
-                                            },
-                                        ));
-                                    }
-                                    summary.get_or_insert_with(|| {
-                                        let lines = text.lines().count();
-                                        format!("{lines} line{}", if lines == 1 { "" } else { "s" })
-                                    });
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                match summary {
-                    Some(text) => {
-                        card.summary.set_label(&text);
-                        card.summary.set_visible(!card.revealer.reveals_child());
-                    }
-                    None => {
-                        card.summary.set_label("");
-                        card.summary.set_visible(false);
-                    }
-                }
-                let has_content = card.content.first_child().is_some();
-                card.has_content.set(has_content);
-                card.apply_trailing();
-                card.toggle.set_can_target(has_content);
-                card.toggle.set_can_focus(has_content);
-                // An MCP result reaches the card as content text (JSON)
-                // before — or instead of — a raw output; an act reads its
-                // answer from there too.
-                if card.act.get().is_some() && card.act_output.borrow().is_none() {
-                    let parsed = content.iter().find_map(|item| match item {
-                        ToolCallContent::Content(block) => content_text(&block.content)
-                            .and_then(|text| act_output_json(&serde_json::Value::String(text))),
-                        _ => None,
-                    });
-                    if parsed.is_some() {
-                        *card.act_output.borrow_mut() = parsed;
-                    }
-                }
-            }
-        }
-        if let Some(kind) = card.act.get() {
-            let input = card.act_input.borrow();
-            let output = card.act_output.borrow();
-            let headline = act_headline(kind, input.as_ref(), output.as_ref());
-            card.title_label
-                .set_markup(&self.pillify_headline(&headline));
-            // The working line follows the act's wording as its input
-            // arrives — "Updating an issue…" becomes "Updating i-0007…".
-            if card.running.get() {
-                self.set_activity(&headline);
-            }
-            // The whole sentence on hover, since the row ellipsizes it.
-            card.title_label.set_tooltip_text(Some(&headline));
-            let (icon, tone) = act_icon(kind, input.as_ref(), output.as_ref());
-            card.act_icon.set_icon_name(Some(icon));
-            card.act_icon.remove_css_class("success");
-            card.act_icon.remove_css_class("error");
-            if let Some(tone) = tone {
-                card.act_icon.add_css_class(tone);
-            }
-        }
-        drop(cards);
-        self.apply_permission_mark(&marked);
     }
 
     /// A permission question about this call opened or closed: its step's
     /// dot is amber for as long as one is open, whatever the status says.
     fn mark_waiting(&self, id: &str, waiting: bool) {
-        if let Some(card) = self.tool_cards.borrow().get(id) {
-            card.waiting.set(waiting);
-            card.paint_dot();
-        }
+        self.update_model(|model| model.mark_waiting(id, waiting));
     }
 
-    /// Record how a permission was answered, on the card for the call it
-    /// belongs to.
+    /// Record how a permission was answered, on the step for the call it
+    /// belongs to — kept until the step exists, since the request can
+    /// arrive before the update that creates it.
     ///
     /// This used to be a transcript row each. With auto-approve on that is
     /// one grey line per tool call, interleaved with the cards and repeating
     /// what the card directly above already said — the outcome belongs to
     /// the call, so it belongs on the call's card.
     fn note_permission(&self, id: String, icon: &str, tooltip: String) {
-        self.pending_marks
-            .borrow_mut()
-            .insert(id.clone(), (icon.to_string(), tooltip));
-        self.apply_permission_mark(&id);
-    }
-
-    /// Put a waiting mark on its card, if the card exists yet.
-    fn apply_permission_mark(&self, id: &str) {
-        let mark = self.pending_marks.borrow().get(id).cloned();
-        let Some((icon, tooltip)) = mark else { return };
-        let applied = match self.tool_cards.borrow().get(id) {
-            Some(card) => {
-                card.permission.set_icon_name(Some(&icon));
-                card.permission.set_tooltip_text(Some(&tooltip));
-                card.permission.set_visible(true);
-                true
-            }
-            None => false,
-        };
-        if applied {
-            self.pending_marks.borrow_mut().remove(id);
-        }
-    }
-
-    /// Render the agent's plan — when it actually says something new.
-    ///
-    /// An ACP plan update restates the WHOLE checklist every time, and
-    /// agents restate it freely: on every edit to it, and again when they
-    /// pick up the next prompt. Drawing each one filled the transcript with
-    /// copies of one list, and put last turn's finished checklist directly
-    /// under the prompt just sent, where it read as a stale answer to the
-    /// new question.
-    ///
-    /// So: an identical snapshot changes nothing on screen, a changed one
-    /// rewrites this turn's card in place, and the first change in a turn
-    /// starts that turn's card where the change happened.
-    fn plan_card(&self, plan: &Plan) {
-        if plan.entries.is_empty() {
-            return;
-        }
-        let snapshot: Vec<(String, String)> = plan
-            .entries
-            .iter()
-            .map(|entry| (entry.content.clone(), format!("{:?}", entry.status)))
-            .collect();
-        // Bound the borrow: the write below must not meet a live read.
-        let restated = self.plan_snapshot.borrow().as_ref() == Some(&snapshot);
-        if restated {
-            return; // the same checklist, said again
-        }
-        *self.plan_snapshot.borrow_mut() = Some(snapshot);
-        self.finalize_stream();
-        // A card capped out of the transcript (see append_row) is no longer
-        // on screen; updating it would write into nowhere.
-        let existing = self
-            .plan_card
-            .borrow()
-            .clone()
-            .filter(|card| card.parent().is_some());
-        let card = match existing {
-            Some(card) => {
-                clear_children(&card);
-                card
-            }
-            None => {
-                let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
-                card.set_widget_name("plan-card");
-                // A step, not a card: the checklist stands on the rail with
-                // the rest of the turn.
-                self.append_note(&card);
-                *self.plan_card.borrow_mut() = Some(card.clone());
-                card
-            }
-        };
-        for entry in &plan.entries {
-            use agent_client_protocol::schema::v1::PlanEntryStatus;
-            let icon = gtk::Image::from_icon_name(match entry.status {
-                PlanEntryStatus::Completed => "object-select-symbolic",
-                PlanEntryStatus::InProgress => "content-loading-symbolic",
-                _ => "radio-symbolic",
-            });
-            icon.set_valign(gtk::Align::Start);
-            icon.set_margin_top(3);
-            let label = gtk::Label::builder()
-                .label(&entry.content)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .max_width_chars(40)
-                .xalign(0.0)
-                .hexpand(true)
-                .build();
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            row.append(&icon);
-            row.append(&label);
-            card.append(&row);
-        }
+        self.update_model(|model| model.mark_permission(&id, icon, &tooltip));
     }
 
     // --- context attachments ---------------------------------------------
@@ -10761,11 +8479,7 @@ impl ChatPane {
             }
         };
         self.refused_launch.borrow_mut().take();
-        let refusal_shown = self
-            .keyed_notes
-            .borrow()
-            .get(LAUNCH_NOTE)
-            .is_some_and(|label| label.parent().is_some());
+        let refusal_shown = self.keyed_notes.borrow().contains_key(LAUNCH_NOTE);
         if refusal_shown {
             self.note_keyed(
                 LAUNCH_NOTE,
@@ -10956,8 +8670,8 @@ impl ChatPane {
                 }
             }
             SessionEvent::Update(update) => {
-                // A replay is the history, drawn whole once it is all here
-                // (`Ready`), and only its last stretch at that.
+                // A replay is the history, made into rows whole once it is
+                // all here (`Ready`).
                 if self.replaying.get() {
                     if let Ok(value) = serde_json::to_value(&update) {
                         self.replay_record.borrow_mut().push(value);
@@ -12435,10 +10149,10 @@ impl ChatPane {
 
     /// One entry of this conversation's record, buffered for the stash:
     /// an update the agent streamed, a message the user sent, or a note
-    /// the IDE put in the transcript. The record is what every row is
-    /// drawn from, live and restored alike (`draw_record`), so nothing a
-    /// replay or a reconnect draws is special-cased by where it came from.
-    /// Nothing is recorded while a record is being drawn back.
+    /// the IDE put in the transcript. The record is what a restored
+    /// conversation's rows are made from (`draw_history`), through the same
+    /// model a live one's are (`model::Model::apply`). Nothing is recorded
+    /// while a record is being drawn back.
     fn record(&self, value: serde_json::Value) {
         if self.replaying.get() || self.from_record.get() {
             return;
@@ -12446,13 +10160,6 @@ impl ChatPane {
         if let Some(held) = self.holding.borrow_mut().as_mut() {
             held.records.push(value);
             return;
-        }
-        let begins = self.stretches.borrow_mut().begins(&value);
-        if begins {
-            self.open_stretch();
-        }
-        if let Some(last) = self.stretches.borrow_mut().list.last_mut() {
-            last.records.push(value.clone());
         }
         self.archive_buffer.borrow_mut().push(value);
     }
@@ -12468,62 +10175,14 @@ impl ChatPane {
         out
     }
 
-    /// `rows`, moved into the last stretch: a prompt's card and notes are
-    /// drawn before its message is recorded, and the message begins the
-    /// stretch they belong to.
-    fn claim_rows(&self, rows: &[gtk::ListBoxRow]) {
-        let live = self.live_rows();
-        // In the order they stood in, after any claimed before them (the
-        // prompts a turn took together, each in turn): the message was
-        // recorded just now, so nothing else has been drawn into the
-        // stretch it began.
-        let mut moving: Vec<gtk::ListBoxRow> = rows
-            .iter()
-            .filter(|row| row.parent().is_some_and(|parent| parent != live))
-            .cloned()
-            .collect();
-        moving.sort_by_key(|row| row.index());
-        for row in &moving {
-            if let Some(from) = row.parent().and_downcast::<gtk::ListBox>() {
-                from.remove(row);
-                live.append(row);
-            }
-        }
-    }
-
-    /// Draw one entry of a conversation's record (`record`): the IDE's
-    /// session marker draws nothing, its note is a note, and anything else
-    /// is the agent's update.
-    fn draw_record(self: &Rc<Self>, value: serde_json::Value) {
-        if value.get(taste_core::chatarchive::SESSION_MARKER).is_some() {
-            return;
-        }
-        if let Some(note) = value.get(NOTE_RECORD).and_then(serde_json::Value::as_str) {
-            self.as_recorded(|| {
-                self.finalize_stream();
-                self.meta_row(note);
-            });
-            return;
-        }
-        // A record written by an older protocol is skipped rather than
-        // fatal: a stash is a convenience, and half a conversation beats an
-        // error where one used to be.
-        if let Ok(update) = serde_json::from_value::<SessionUpdate>(value) {
-            if self.drawing_past.get() && !draws_rows(&update) {
-                return;
-            }
-            // A stash written before `without_nul` may hold one.
-            self.as_recorded(|| self.render_update(nul_free(update)));
-        }
-    }
-
-    /// Draw a conversation from its record: the transcript cleared, the
-    /// record cut into stretches, and only the last drawn — the rest stand
-    /// in as space, drawn as the reader comes near them (`reconcile`).
-    /// What the record says about the chat's state now — the context it
-    /// has used, its commands — is applied from wherever it last said it.
+    /// Draw a conversation from its record: its rows are made off the main
+    /// thread (`model::Model::of_record`), and the transcript cleared and
+    /// given them at once — the list draws those it shows. What the record
+    /// says about the chat's state now — the context it has used, its
+    /// commands — is applied from wherever it last said it, and the
+    /// replies its last question offered are pending again.
     async fn draw_history(self: Rc<Self>, records: Vec<serde_json::Value>) {
-        self.clear_transcript();
+        self.drawing_history.set(true);
         let state: Vec<serde_json::Value> = ["usage_update", "available_commands_update"]
             .iter()
             .filter_map(|kind| {
@@ -12536,57 +10195,68 @@ impl ChatPane {
                     .cloned()
             })
             .collect();
-        let (list, segmenter) = taste_core::stretches::cut(records);
-        let count = list.len();
-        let tail = {
-            let mut stretches = self.stretches.borrow_mut();
-            stretches.segmenter = segmenter;
-            stretches.list = list
-                .into_iter()
-                .map(|records| Stretch {
-                    records,
-                    rows: None,
-                })
-                .collect();
-            // The last is drawn now, live, into a list of its own; the rest
-            // when the transcript first shows them.
-            if let Some(last) = stretches.list.last_mut() {
-                last.rows = Some(stretch_list());
-            }
-            stretches
-                .list
-                .last()
-                .map(|last| last.records.clone())
-                .unwrap_or_default()
+        let first = self.model.borrow().next_id();
+        let count = records.len();
+        let made = crate::runtime::runtime()
+            .spawn_blocking(move || {
+                // A record written by an older protocol is skipped rather
+                // than fatal: a stash is a convenience, and half a
+                // conversation beats an error where one used to be.
+                let records: Vec<model::Record> = records
+                    .into_iter()
+                    .filter_map(|value| model::Record::parse(value, NOTE_RECORD))
+                    .map(|record| match record {
+                        // A stash written before `without_nul` may hold one.
+                        model::Record::Update(update) => model::Record::update(nul_free(*update)),
+                        note => note,
+                    })
+                    .collect();
+                let replies = replayed_replies(&records);
+                (model::Model::of_record(first, records), replies)
+            })
+            .await;
+        let Ok((mut history, replies)) = made else {
+            self.drawing_history.set(false);
+            return;
         };
-        let items: Vec<glib::BoxedAnyObject> = (0..count).map(glib::BoxedAnyObject::new).collect();
-        self.store.splice(0, 0, &items);
-        self.place_foot();
-        tracing::info!(
-            "chat {}: drawing its history's last stretch of {count}, {} record(s)",
-            self.environment,
-            tail.len()
-        );
-        self.drawing_history.set(true);
+        self.clear_transcript();
         for record in state {
-            self.draw_record(record);
+            if let Ok(update) = serde_json::from_value::<SessionUpdate>(record) {
+                self.render_update(update);
+            }
         }
-        if count > 1 && continues_turn(&tail) {
-            *self.last_rail.borrow_mut() = Some(StepRail::elsewhere());
-        }
-        let mut pacer = crate::stall::Pacer::new();
-        for record in tail {
-            self.draw_record(record);
-            pacer.breathe().await;
-        }
-        self.as_recorded(|| {
-            self.finalize_stream();
-            self.settle_running_steps();
+        let lines = history.take_lines();
+        let items: Vec<glib::BoxedAnyObject> = history
+            .rows()
+            .iter()
+            .map(|row| glib::BoxedAnyObject::new(Item::Row(row.id)))
+            .collect();
+        let prompt = history.last_prompt().and_then(|id| match history.row(id) {
+            Some(model::Row {
+                kind: model::Kind::User(user),
+                ..
+            }) => Some((id, pin_text(&user.text, &user.attachments))),
+            _ => None,
         });
+        tracing::info!(
+            "chat {}: drawing its history of {count} record(s), {} row(s)",
+            self.environment,
+            items.len()
+        );
+        *self.model.borrow_mut() = history;
+        for (speaker, text) in lines {
+            self.record_line(speaker, &text);
+        }
+        self.insert_items(&items);
+        if let Some((id, text)) = prompt {
+            *self.last_prompt.borrow_mut() = Some(Item::Row(id));
+            self.pinned_prompt_label.set_label(&text);
+        }
+        *self.pending_replies.borrow_mut() = replies;
+        // A message sent while the record was being read is after it.
+        self.reattach_pending_cards();
         self.drawing_history.set(false);
-        self.sync_placeholder();
         self.scroll_to_end();
-        self.trim_transcript();
     }
 
     /// [`Self::draw_history`] for a restored session, and what a replay's
@@ -12658,11 +10328,7 @@ impl ChatPane {
             // The read took a moment, and a fast user may have prompted in
             // it. Old content must not land under new: the stash keeps, and
             // the next fresh session will offer it again.
-            //
-            // `transcript_rows`, not `first_child`: a `GtkListBox` counts
-            // its placeholder among its children, so asking the widget
-            // whether it is empty answers "no" even when there are no rows.
-            if pane.transcript_rows.get() != 0 {
+            if pane.has_rows() {
                 return;
             }
             let records: Vec<serde_json::Value> = loaded
@@ -12671,6 +10337,8 @@ impl ChatPane {
                 .map(|record| record.update)
                 .collect();
             pane.clone().draw_history(records).await;
+            // Its question is not the agent's to have asked.
+            pane.pending_replies.borrow_mut().clear();
             // Said only over a conversation there is to see. A stash can
             // hold nothing but updates that draw no row — the command
             // list, the session's options — and a banner about restored
@@ -12686,7 +10354,7 @@ impl ChatPane {
             //
             // Not recorded: the conversation it is about is not this
             // session's, and the session's record began without it.
-            if pane.transcript_rows.get() != 0 {
+            if pane.has_rows() {
                 pane.as_recorded(|| {
                     pane.meta_row("restored from this machine; the agent does not remember it")
                 });
@@ -12856,9 +10524,6 @@ impl ChatPane {
     fn mark_session(&self, session: &str) {
         *self.stash_session.borrow_mut() = Some(session.to_string());
         let updates = std::mem::take(&mut *self.archive_buffer.borrow_mut());
-        // The session's stretches start fresh, as a history read from the
-        // mark cuts them.
-        self.stretches.borrow_mut().segmenter = Default::default();
         let session = session.to_string();
         self.archive_write(move |archive, env| {
             let marked = archive
@@ -12883,188 +10548,93 @@ impl ChatPane {
         });
     }
 
+    /// An update that draws rows: into the model, which the transcript
+    /// follows; and the working line says what it is doing.
+    fn render_rows(self: &Rc<Self>, update: SessionUpdate) {
+        if let SessionUpdate::AgentMessageChunk(chunk) = &update {
+            if let Some(text) = content_text(&chunk.content) {
+                if let Some((captured, _)) = self
+                    .capture
+                    .borrow_mut()
+                    .as_mut()
+                    .filter(|_| !self.drawing_history.get())
+                {
+                    captured.push_str(&text);
+                }
+            }
+        }
+        // The call whose status this update says, for the working line.
+        let (call, status) = match &update {
+            SessionUpdate::ToolCall(call) => {
+                (Some(call.tool_call_id.to_string()), Some(call.status))
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                (Some(update.tool_call_id.to_string()), update.fields.status)
+            }
+            _ => (None, None),
+        };
+        let thought = matches!(update, SessionUpdate::AgentThoughtChunk(_));
+        let in_transition = self.environment_in_transition();
+        self.update_model(|model| model.apply(update, in_transition));
+        if self.restoring() {
+            return;
+        }
+        // Progress, while it is happening. On Claude Fable 5 and 5.1 the
+        // model's between-tool-call notes — what it just found, what it
+        // will do next — arrive as thinking blocks, and a long turn that
+        // produces nothing else looked silent for minutes: the block landed
+        // in a collapsed expander nobody was going to open mid-turn. So the
+        // working line below the transcript carries the latest line of it,
+        // the way it carries the running tool's title; whichever came last
+        // is what is happening.
+        if thought && self.busy.get() {
+            let line = self
+                .model
+                .borrow()
+                .thinking()
+                .and_then(|text| text.lines().rev().find(|line| !line.trim().is_empty()))
+                .map(|line| line.trim().to_string());
+            if let Some(line) = line {
+                self.set_activity(&line);
+            }
+        }
+        let Some(call) = call else { return };
+        let step = {
+            let model = self.model.borrow();
+            model
+                .step_row(&call)
+                .and_then(|id| model.row(id))
+                .and_then(|row| match &row.kind {
+                    model::Kind::Step(step) => Some((step.running, Self::step_shown_title(step))),
+                    _ => None,
+                })
+        };
+        let Some((running, title)) = step else { return };
+        if running {
+            // The working line says what is running rather than that
+            // something is — an act in its own words, as its input arrives:
+            // "Updating an issue…" becomes "Updating i-0007…".
+            self.set_activity(&title);
+        } else if status.is_some() {
+            // This call is done; whether another is running or the model
+            // is writing, "Working…" is the most we can honestly claim.
+            // Through the activity, not the label: the line redraws from
+            // the activity every second to keep its "silent for" current,
+            // and the label alone put the finished call's name straight
+            // back — a call that had answered read as one still hanging
+            // (David, 2026-10-04: "It seems to be hanging on the issue
+            // update").
+            self.set_activity("");
+        }
+    }
+
     fn render_update(self: &Rc<Self>, update: SessionUpdate) {
         self.note_word();
-        // Anything that is not another piece of the user's message ends it.
-        if !matches!(update, SessionUpdate::UserMessageChunk(_)) {
-            self.flush_user_message();
+        if draws_rows(&update) {
+            self.render_rows(update);
+            return;
         }
         match update {
-            SessionUpdate::UserMessageChunk(chunk) => {
-                // Replayed history (session/load) and echoed prompts arrive
-                // as chunks — ONE PER CONTENT BLOCK. Collect the whole
-                // message before drawing it: rendering each chunk on its own
-                // both split multi-part prompts across cards and dropped
-                // every non-text block, which is why restored conversations
-                // came back without the images they were sent with.
-                let mut pending = self.pending_user.borrow_mut();
-                let pending = pending.get_or_insert_with(PendingUserMessage::default);
-                match content_text(&chunk.content) {
-                    // The IDE's briefing ahead of the message, not the
-                    // user's words: its notes, as live drew them.
-                    Some(text) if text.trim_end().ends_with(BRIEFING_TAIL) => {
-                        pending.briefed.extend(briefing_notes(&text));
-                    }
-                    Some(text) => {
-                        if !pending.text.is_empty() && !pending.text.ends_with('\n') {
-                            pending.text.push('\n');
-                        }
-                        pending.text.push_str(&text);
-                    }
-                    None => {
-                        if let Some(attachment) = replayed_attachment(&chunk.content) {
-                            pending.attachments.push(attachment);
-                        }
-                    }
-                }
-            }
-            SessionUpdate::AgentMessageChunk(chunk) => {
-                if let Some(text) = content_text(&chunk.content) {
-                    if let Some((captured, _)) = self
-                        .capture
-                        .borrow_mut()
-                        .as_mut()
-                        .filter(|_| !self.drawing_history.get())
-                    {
-                        captured.push_str(&text);
-                    }
-                    let buffer = self.agent_buffer();
-                    let mut end = buffer.end_iter();
-                    buffer.insert(&mut end, &text);
-                }
-            }
-            SessionUpdate::AgentThoughtChunk(chunk) => {
-                if let Some(text) = content_text(&chunk.content) {
-                    let buffer = self.thought_buffer();
-                    let mut end = buffer.end_iter();
-                    buffer.insert(&mut end, &text);
-                    // Progress, while it is happening. On Claude Fable 5 and
-                    // 5.1 the model's between-tool-call notes — what it just
-                    // found, what it will do next — arrive as thinking
-                    // blocks, and a long turn that produces nothing else
-                    // looked silent for minutes: the block landed in a
-                    // collapsed expander nobody was going to open mid-turn.
-                    // So the working line below the transcript carries the
-                    // latest line of it, the way it carries the running
-                    // tool's title; whichever came last is what is happening.
-                    let line = buffer_last_line(&buffer);
-                    if line == INTERRUPTED_THOUGHT {
-                        // The API's own stand-in for work a turn ran out of
-                        // room to finish. Not a thought; a fact about the
-                        // turn, and one the reader can act on.
-                        let mut start = end;
-                        start.set_line_offset(0);
-                        buffer.delete(&mut start, &mut end);
-                        self.meta_row(
-                            "the turn was cut off before it finished — send again to continue",
-                        );
-                    } else if !line.is_empty() && self.busy.get() && !self.drawing_history.get() {
-                        self.set_activity(&line);
-                    }
-                }
-            }
-            SessionUpdate::ToolCall(mut call) => {
-                // A step of work: what was said before it is not the
-                // answer the replies, if any, will be about. Offering the
-                // replies is not work.
-                if mcp_tool_name(&call.title).as_deref() != Some("suggest_replies") {
-                    if !self.drawing_past.get() {
-                        self.unclip_answer.borrow_mut().clear();
-                    }
-                } else if self.restoring() {
-                    self.recover_replies(
-                        &call.tool_call_id.to_string(),
-                        call.raw_input.as_ref(),
-                        Some(call.status),
-                    );
-                }
-                // An edit through the IDE's tools reads as the edit it is.
-                if is_ide_edit_title(&call.title) {
-                    self.ide_edit_calls
-                        .borrow_mut()
-                        .insert(call.tool_call_id.to_string(), call.title.clone());
-                    call.kind = ToolKind::Edit;
-                    if let Some((content, path)) =
-                        ide_edit_shape(&call.title, call.raw_input.as_ref())
-                    {
-                        call.content = content;
-                        call.title = edit_title(&call.title, &path);
-                    }
-                }
-                // Close the streaming text block first: narration after
-                // this call must start a NEW block below the card, so the
-                // transcript reads as interleaved progress (text, tool,
-                // text…), not one pre-tool blob. Updates to an existing
-                // card deliberately don't finalize — they arrive while
-                // later text is already streaming.
-                self.finalize_stream();
-                self.note_terminal_output(&call.tool_call_id.to_string(), call.meta.as_ref());
-                self.upsert_tool_card(
-                    call.tool_call_id.to_string(),
-                    Some(call.title.clone()),
-                    Some(call.status),
-                    Some(call.kind),
-                    Some(&call.content),
-                    call.raw_input.as_ref(),
-                    call.raw_output.as_ref(),
-                );
-            }
-            SessionUpdate::ToolCallUpdate(mut update) => {
-                let id = update.tool_call_id.to_string();
-                if self.restoring()
-                    && self.replayed_replies_call.borrow().as_deref() == Some(id.as_str())
-                {
-                    self.recover_replies(
-                        &id,
-                        update.fields.raw_input.as_ref(),
-                        update.fields.status,
-                    );
-                }
-                if let Some(title) = update
-                    .fields
-                    .title
-                    .as_deref()
-                    .filter(|t| is_ide_edit_title(t))
-                {
-                    self.ide_edit_calls
-                        .borrow_mut()
-                        .insert(id.clone(), title.to_string());
-                }
-                let edit_title_seen = self.ide_edit_calls.borrow().get(&id).cloned();
-                if let Some(title) = edit_title_seen {
-                    update.fields.kind = Some(ToolKind::Edit);
-                    match ide_edit_shape(&title, update.fields.raw_input.as_ref()) {
-                        Some((content, path)) => {
-                            update.fields.content = Some(content);
-                            update.fields.title = Some(edit_title(&title, &path));
-                        }
-                        // The tool's own answer is a line of JSON: the diff
-                        // it was drawn with stays, unless the edit failed,
-                        // when what went wrong is the thing to show.
-                        None if update.fields.status != Some(ToolCallStatus::Failed) => {
-                            update.fields.content = None;
-                            if update.fields.title.is_some() {
-                                update.fields.title = None;
-                            }
-                        }
-                        None => {}
-                    }
-                }
-                self.note_terminal_output(&id, update.meta.as_ref());
-                self.upsert_tool_card(
-                    update.tool_call_id.to_string(),
-                    update.fields.title.clone(),
-                    update.fields.status,
-                    update.fields.kind,
-                    update.fields.content.as_deref(),
-                    update.fields.raw_input.as_ref(),
-                    update.fields.raw_output.as_ref(),
-                );
-            }
-            SessionUpdate::Plan(plan) => {
-                self.finalize_stream();
-                self.plan_card(&plan);
-            }
             SessionUpdate::UsageUpdate(update) => {
                 // The agent's own account of the context window. We used to
                 // sniff the size out of the model name and never knew the
@@ -13457,7 +11027,7 @@ impl ChatPane {
         )));
         // A prompt's chunks become a card when something follows them;
         // here nothing does, so the card is closed by hand.
-        self.flush_user_message();
+        self.finalize_stream();
     }
 
     /// TASTE_PROBE_CHECK only: sample text in the composer, so a headless
@@ -13586,7 +11156,7 @@ impl ChatPane {
         ));
         // What would end it is the agent's next word, which a probe has
         // not got.
-        self.flush_user_message();
+        self.finalize_stream();
     }
 
     pub fn seed_transcript_for_probe(self: &Rc<Self>) {
@@ -13642,8 +11212,9 @@ impl ChatPane {
             self.probe_kept();
             return;
         }
-        // `TASTE_PROBE_CHAT=roundtrip` lives a conversation, lets its
-        // stretches go, draws them back, and compares (`probe_roundtrip`).
+        // `TASTE_PROBE_CHAT=roundtrip` lives a conversation, makes its
+        // record into rows as a restore does, and compares
+        // (`probe_roundtrip`).
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("roundtrip") {
             self.probe_roundtrip();
             return;
@@ -14066,8 +11637,17 @@ impl ChatPane {
         // can be looked at too.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("top") {
             self.stick_to_bottom.set(false);
-            let adjustment = self.transcript_scroller.vadjustment();
-            glib::idle_add_local_once(move || adjustment.set_value(0.0));
+            // Through the list, which goes there and measures what it
+            // finds: a value set straight to the top moved the scroll and
+            // not the rows.
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+                if let Some(pane) = weak.upgrade() {
+                    if let Some(first) = pane.item_at(0) {
+                        pane.scroll_to_item(&first, 0.0);
+                    }
+                }
+            });
         }
         if std::env::var("TASTE_PROBE_ANCHOR").is_ok() {
             self.probe_anchor();
@@ -14078,9 +11658,9 @@ impl ChatPane {
     /// conversation (`TASTE_PROBE_TURNS`, 400 by default) from its record
     /// the way a restore does, then reads it: up to the top a page at a
     /// time, a jump to the middle, and back down to the bottom. Each step
-    /// prints the rows drawn, the stretches drawn of all of them, the
-    /// scroll extent, and the turn at the top of the view; and the longest
-    /// the main thread was held while it ran. `TASTE_PROBE_HISTORY_AT=middle`
+    /// prints the items and the rows drawn, the scroll extent, the row at
+    /// the top of the view, and whether the view showed nothing drawn; and
+    /// the longest the main thread was held while it ran. `TASTE_PROBE_HISTORY_AT=middle`
     /// jumps to the middle and stays, for the shot.
     fn probe_history(self: &Rc<Self>) {
         use agent_client_protocol::schema::v1::{ContentChunk, ToolCall};
@@ -14105,7 +11685,6 @@ impl ChatPane {
                 .filter_map(|line| line.get("update").cloned())
                 .collect();
         }
-        self.probe_timing.set(true);
         for turn in 0..if file.is_some() { 0 } else { turns } {
             records.push(value(SessionUpdate::UserMessageChunk(text(format!(
                 "turn {turn}: what does the next step need?"
@@ -14142,37 +11721,14 @@ impl ChatPane {
         }
         fn report(pane: &ChatPane, what: &str, held: &Cell<std::time::Duration>) {
             let adjustment = pane.transcript_scroller.vadjustment();
-            let (shown, mapped, all) = {
-                let stretches = pane.stretches.borrow();
-                (
-                    stretches.list.iter().filter(|s| s.rows.is_some()).count(),
-                    stretches
-                        .list
-                        .iter()
-                        .filter(|s| s.rows.as_ref().is_some_and(|r| r.is_mapped()))
-                        .count(),
-                    stretches.list.len(),
-                )
-            };
-            // The first row reaching into the view that says which turn.
-            let value = adjustment.value();
-            let mut at_top = String::from("-");
-            for row in pane.drawn_rows().into_iter().filter(|row| row.is_mapped()) {
-                if let Some(bounds) = row.compute_bounds(&pane.transcript_scroller) {
-                    if bounds.y() + bounds.height() > 0.0 {
-                        let text = widget_text(&row);
-                        if let Some(at) = text.find("turn ") {
-                            at_top = text[at..].chars().take(9).collect();
-                            break;
-                        }
-                    }
-                }
-            }
             println!(
-                "probe history: {what}: rows {}, stretches drawn {shown}/{all} ({mapped} mapped), value {:.0} of {:.0}, top {at_top:?}, held {}ms",
-                pane.transcript_rows.get(),
-                value,
+                "probe history: {what}: items {}, drawn {}, value {:.0} of {:.0}, top {:?}, blank {}, held {}ms",
+                pane.store.n_items(),
+                pane.bound.borrow().len(),
+                adjustment.value(),
                 adjustment.upper(),
+                pane.probe_top_text(),
+                pane.probe_blank(),
                 held.replace(std::time::Duration::ZERO).as_millis()
             );
         }
@@ -14189,7 +11745,7 @@ impl ChatPane {
             let adjustment = pane.transcript_scroller.vadjustment();
             pane.stick_to_bottom.set(false);
             // `TASTE_PROBE_HISTORY_AT=middle`: straight to the middle and
-            // stay, for a shot of stretches drawn back from the record.
+            // stay, for a shot of rows drawn as the list reaches them.
             if std::env::var("TASTE_PROBE_HISTORY_AT").as_deref() == Ok("middle") {
                 adjustment.set_value(adjustment.upper() / 2.0);
                 glib::timeout_future(std::time::Duration::from_millis(1500)).await;
@@ -14197,78 +11753,84 @@ impl ChatPane {
                 return;
             }
             let mut steps = 0;
-            let mut waited = std::time::Duration::ZERO;
+            let mut blank = 0;
             while adjustment.value() > 0.0 && steps < 4000 {
                 let target = (adjustment.value() - adjustment.page_size() * 0.8).max(0.0);
                 adjustment.set_value(target);
-                // A reader's pace: on once what came on screen is drawn.
-                let stop = std::time::Instant::now();
+                // A reader's pace: a frame or two to a page.
                 glib::timeout_future(std::time::Duration::from_millis(30)).await;
-                while !pane.placeholders_on_screen().is_empty()
-                    && stop.elapsed() < std::time::Duration::from_secs(2)
-                {
-                    glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                if pane.probe_blank() {
+                    blank += 1;
                 }
-                let left = pane.placeholders_on_screen();
-                if !left.is_empty() {
-                    let stretches = pane.stretches.borrow();
-                    let said: Vec<String> = left
-                        .iter()
-                        .map(|index| match index {
-                            None => "no index".to_string(),
-                            Some(i) => format!(
-                                "{i}: drawn {}, queued {}, drawing {}",
-                                stretches.list.get(*i).is_some_and(|s| s.rows.is_some()),
-                                pane.build_queue.borrow().contains(i),
-                                pane.build_job
-                                    .borrow()
-                                    .as_ref()
-                                    .is_some_and(|j| j.index == *i)
-                            ),
-                        })
-                        .collect();
-                    println!("probe history: still placeholders after 2s: {said:?}");
-                }
-                waited = waited.max(stop.elapsed());
                 steps += 1;
                 if steps % 50 == 0 {
                     report(&pane, &format!("{steps} pages up"), &held);
-                    println!(
-                        "probe history: the longest a page waited to be drawn: {}ms",
-                        waited.as_millis()
-                    );
-                    waited = std::time::Duration::ZERO;
                 }
             }
             glib::timeout_future(std::time::Duration::from_millis(800)).await;
-            report(&pane, &format!("at the top after {steps} pages"), &held);
-            // A fling: twenty jumps a frame apart, nothing waited for, and
-            // then whether anything on screen is still standing in.
+            report(
+                &pane,
+                &format!("at the top after {steps} pages, {blank} of them blank"),
+                &held,
+            );
+            // A fling: twenty jumps a frame apart, nothing waited for.
             for n in 1..=20 {
                 adjustment.set_value(adjustment.upper() * f64::from(n) / 40.0);
                 glib::timeout_future(std::time::Duration::from_millis(16)).await;
             }
-            glib::timeout_future(std::time::Duration::from_secs(3)).await;
-            println!(
-                "probe history: after a fling, placeholders on screen: {:?}",
-                pane.placeholders_on_screen()
-            );
+            glib::timeout_future(std::time::Duration::from_millis(300)).await;
+            report(&pane, "after a fling", &held);
             adjustment.set_value(adjustment.upper() / 2.0);
             glib::timeout_future(std::time::Duration::from_millis(800)).await;
             report(&pane, "jumped to the middle", &held);
-            adjustment.set_value(adjustment.upper());
-            glib::timeout_future(std::time::Duration::from_millis(800)).await;
-            pane.stick_to_bottom.set(true);
-            glib::timeout_future(std::time::Duration::from_millis(800)).await;
+            pane.scroll_to_end();
+            glib::timeout_future(std::time::Duration::from_millis(1600)).await;
             report(&pane, "back at the bottom", &held);
         });
+    }
+
+    /// TASTE_PROBE_CHECK only: the text of the first drawn row reaching
+    /// into the view, its first line.
+    fn probe_top_text(&self) -> String {
+        let scroller: &gtk::Widget = self.transcript_scroller.upcast_ref();
+        let mut top: Option<(f32, String)> = None;
+        for (_, view) in self.bound.borrow().values() {
+            let Some(bounds) = view.widget.compute_bounds(scroller) else {
+                continue;
+            };
+            if bounds.y() + bounds.height() > 0.0
+                && bounds.y() < scroller.height() as f32
+                && top.as_ref().is_none_or(|(y, _)| bounds.y() < *y)
+            {
+                let text = widget_text(&view.widget);
+                top = Some((
+                    bounds.y(),
+                    text.lines().next().unwrap_or_default().to_string(),
+                ));
+            }
+        }
+        top.map(|(_, text)| single_line(&text, 40))
+            .unwrap_or_default()
+    }
+
+    /// TASTE_PROBE_CHECK only: whether the view shows nothing drawn — a
+    /// transcript with rows, and none of them on screen.
+    fn probe_blank(&self) -> bool {
+        let scroller: &gtk::Widget = self.transcript_scroller.upcast_ref();
+        let height = scroller.height() as f32;
+        self.has_rows()
+            && !self.bound.borrow().values().any(|(_, view)| {
+                view.widget
+                    .compute_bounds(scroller)
+                    .is_some_and(|b| b.y() + b.height() > 0.0 && b.y() < height)
+            })
     }
 
     /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=kept` writes a stash
     /// (`TASTE_PROBE_HISTORY_FILE`) to this chat's archive and draws its last
     /// session as a resume does, `Ready`'s hold included, then says every
-    /// few seconds what is drawn and where the view is — the path a 404-
-    /// stretch history once came back blank on.
+    /// few seconds what is drawn and where the view is — the path a long
+    /// history once came back blank on.
     fn probe_kept(self: &Rc<Self>) {
         let path = std::env::var("TASTE_PROBE_HISTORY_FILE").unwrap_or_default();
         let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
@@ -14288,7 +11850,6 @@ impl ChatPane {
         let _ = archive.forget(&self.environment);
         let _ = archive.append_all(&self.environment, records);
         println!("probe kept: session {session}");
-        self.probe_timing.set(true);
         self.clear_on_replay.set(false);
         self.drawing_history.set(true);
         self.draw_kept_history(&session);
@@ -14297,66 +11858,46 @@ impl ChatPane {
             for second in [2, 4, 8, 12] {
                 glib::timeout_future(std::time::Duration::from_secs(2)).await;
                 if second == 8 {
-                    // New rows at the tail and stretches above let go and
-                    // drawn again: the list moves the view itself, and
-                    // following must hold through it.
+                    // New rows at the tail: the list moves the view itself
+                    // as it measures them, and following must hold through
+                    // it.
                     for n in 0..30 {
                         pane.meta_row(&format!("probe: a new step at the bottom ({n})"));
-                    }
-                    let drawn: Vec<usize> = pane
-                        .stretches
-                        .borrow()
-                        .list
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, s)| s.rows.is_some())
-                        .map(|(i, _)| i)
-                        .collect();
-                    for index in drawn.iter().rev().skip(3).take(4) {
-                        pane.let_go_of(*index);
                     }
                     glib::timeout_future(std::time::Duration::from_millis(1500)).await;
                     let adjustment = pane.transcript_scroller.vadjustment();
                     println!(
-                        "probe kept: after new rows and stretches redrawn: at the bottom {}, following {}",
+                        "probe kept: after new rows: at the bottom {}, following {}",
                         at_bottom(&adjustment),
                         pane.stick_to_bottom.get()
                     );
                 }
-                let stretches = pane.stretches.borrow();
-                let drawn = stretches.list.iter().filter(|s| s.rows.is_some()).count();
-                let mapped = stretches
-                    .list
-                    .iter()
-                    .filter(|s| s.rows.as_ref().is_some_and(|r| r.is_mapped()))
-                    .count();
                 let adjustment = pane.transcript_scroller.vadjustment();
                 println!(
-                    "probe kept: {second}s: {} stretches, {drawn} drawn, {mapped} mapped, rows {}, history {}, queue {}, job {}, stack {:?}, value {:.0} of {:.0} page {:.0}, placeholders on screen {}",
-                    stretches.list.len(),
-                    pane.transcript_rows.get(),
+                    "probe kept: {second}s: {} items, {} drawn, history {}, stack {:?}, value {:.0} of {:.0} page {:.0}, blank {}",
+                    pane.store.n_items(),
+                    pane.bound.borrow().len(),
                     pane.drawing_history.get(),
-                    pane.build_queue.borrow().len(),
-                    pane.build_job.borrow().is_some(),
                     pane.transcript_stack.visible_child_name(),
                     adjustment.value(),
                     adjustment.upper(),
                     adjustment.page_size(),
-                    pane.placeholders_on_screen().len()
+                    pane.probe_blank()
                 );
             }
         });
     }
 
-    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=roundtrip` holds a drawn
-    /// back stretch to the one it was live. A conversation is lived the way
-    /// the event handler and a send live it — records, then rows — with
-    /// thoughts, steps that run and settle or fail, a plan, an edit, notes,
-    /// a long turn cut between its steps, and a last turn left mid-stream
-    /// with a step running. Then every stretch but the last is let go and
-    /// drawn back, and each is compared with what it was: its text, and
-    /// which of its widgets show and with what classes. Then the live turn
-    /// goes on, and it is checked that it went on where it was.
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=roundtrip` holds the rows a
+    /// restore draws to the ones the conversation had live. A conversation
+    /// is lived the way the event handler and a send live it — records,
+    /// then rows — with thoughts, steps that run and settle or fail, a
+    /// plan, an edit, notes, a long turn, two prompts queued behind it, and
+    /// a last turn left mid-stream with a step running. Then its record is
+    /// read back and made into rows as a restore makes them, and each row
+    /// is compared with the live one: its text, and which of its widgets
+    /// show and with what classes. Then the live turn goes on, and it is
+    /// checked that it went on where it was.
     fn probe_roundtrip(self: &Rc<Self>) {
         use agent_client_protocol::schema::v1::{
             ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ToolCall,
@@ -14370,13 +11911,11 @@ impl ChatPane {
         };
         let send = |pane: &Rc<Self>, words: &str| {
             pane.finalize_stream();
-            let card = pane.user_card(words, &[]);
+            pane.user_card(words, &[]);
             let block = ContentBlock::Text(TextContent::new(words));
-            let unrecorded = Unrecorded {
+            pane.commit_unrecorded(Unrecorded {
                 records: vec![user_record(&block)],
-                rows: Vec::new(),
-            };
-            pane.commit_unrecorded(unrecorded, &card);
+            });
         };
         let step =
             |pane: &Rc<Self>, id: &str, title: &str, kind: ToolKind, status: ToolCallStatus| {
@@ -14449,11 +11988,10 @@ impl ChatPane {
             SessionUpdate::AgentMessageChunk(text("Done: both are kept across the rebuild.")),
         );
         end_turn(self);
-        // Turn 3: long enough to be cut between its steps, with a step
-        // running across where the cut would fall.
+        // Turn 3: a step running across several that settle.
         send(self, "Now run the whole suite and fix what fails.");
-        for n in 0..taste_core::stretches::STEPS + 6 {
-            if n == taste_core::stretches::STEPS - 1 {
+        for n in 0..7 {
+            if n == 0 {
                 step(
                     self,
                     "long",
@@ -14474,7 +12012,7 @@ impl ChatPane {
                 self,
                 SessionUpdate::AgentMessageChunk(text(&format!("Read file {n}."))),
             );
-            if n == taste_core::stretches::STEPS + 2 {
+            if n == 3 {
                 let mut fields = ToolCallUpdateFields::new();
                 fields.status = Some(ToolCallStatus::Completed);
                 live(
@@ -14510,7 +12048,6 @@ impl ChatPane {
                 joined: index > 0,
                 unrecorded: Unrecorded {
                     records: vec![user_record(&ContentBlock::Text(TextContent::new(*words)))],
-                    rows: Vec::new(),
                 },
             });
         }
@@ -14565,59 +12102,71 @@ impl ChatPane {
                 child = current.next_sibling();
             }
         }
-        fn snapshot(pane: &ChatPane) -> Vec<Vec<String>> {
-            pane.stretches
-                .borrow()
-                .list
-                .iter()
-                .map(|stretch| {
-                    let mut out = Vec::new();
-                    let mut child = stretch.rows.as_ref().and_then(|rows| rows.first_child());
-                    while let Some(row) = child {
-                        signature(&row, &mut out);
-                        child = row.next_sibling();
+        /// The transcript as drawn, an entry per row: every row built
+        /// from `rows`' data, and the live prompts' cards where the pane
+        /// keeps them — not the markers a reseated prompt leaves, which are
+        /// not part of the conversation.
+        fn snapshot(pane: &ChatPane, rows: &[model::Row], items: &[Item]) -> Vec<Vec<String>> {
+            let mut out = Vec::new();
+            for item in items {
+                let widget = match item {
+                    Item::Row(id) => match rows.iter().find(|row| row.id == *id) {
+                        Some(row) => pane.build_row(row).widget,
+                        None => continue,
+                    },
+                    Item::Widget(widget) => {
+                        let mut lines = Vec::new();
+                        signature(widget, &mut lines);
+                        if !lines.iter().any(|line| line.contains(".card")) {
+                            continue;
+                        }
+                        widget.clone()
                     }
-                    out
-                })
-                .collect()
+                };
+                let mut lines = Vec::new();
+                signature(&widget, &mut lines);
+                out.push(lines);
+            }
+            out
         }
         let pane = self.clone();
         glib::spawn_future_local(async move {
             glib::timeout_future(std::time::Duration::from_millis(1500)).await;
-            let before = snapshot(&pane);
-            let count = before.len();
+            let live = {
+                let rows = pane.model.borrow().rows().to_vec();
+                snapshot(&pane, &rows, &pane.items())
+            };
+            pane.flush_stash();
+            glib::timeout_future(std::time::Duration::from_millis(500)).await;
+            let archive = pane.chat_archive();
+            let env = pane.environment.clone();
+            let recorded: Vec<serde_json::Value> = crate::runtime::runtime()
+                .spawn_blocking(move || archive.load(&env))
+                .await
+                .map(|loaded| loaded.updates.into_iter().map(|r| r.update).collect())
+                .unwrap_or_default();
+            let records: Vec<model::Record> = recorded
+                .into_iter()
+                .filter_map(|value| model::Record::parse(value, NOTE_RECORD))
+                .collect();
+            let restored = model::Model::of_record(0, records);
+            let items: Vec<Item> = restored
+                .rows()
+                .iter()
+                .map(|row| Item::Row(row.id))
+                .collect();
+            let drawn = snapshot(&pane, restored.rows(), &items);
             println!(
-                "probe roundtrip: {count} stretches, rows {}, records {:?}",
-                pane.transcript_rows.get(),
-                pane.stretches
-                    .borrow()
-                    .list
-                    .iter()
-                    .map(|s| s.records.len())
-                    .collect::<Vec<_>>()
+                "probe roundtrip: {} rows live, {} drawn back from the record",
+                live.len(),
+                drawn.len()
             );
-            for index in 0..count.saturating_sub(1) {
-                pane.let_go_of(index);
-            }
-            println!(
-                "probe roundtrip: let go, rows {}",
-                pane.transcript_rows.get()
-            );
-            for index in 0..count.saturating_sub(1) {
-                pane.stretch_rows(index);
-            }
-            glib::timeout_future(std::time::Duration::from_millis(800)).await;
-            let after = snapshot(&pane);
-            for (index, (was, is)) in before.iter().zip(&after).enumerate() {
+            for (index, (was, is)) in live.iter().zip(&drawn).enumerate() {
                 if was == is {
-                    println!(
-                        "probe roundtrip: stretch {index}: same ({} widgets)",
-                        was.len()
-                    );
                     continue;
                 }
                 println!(
-                    "probe roundtrip: stretch {index}: DIFFERS ({} widgets live, {} drawn back)",
+                    "probe roundtrip: row {index}: DIFFERS ({} widgets live, {} drawn back)",
                     was.len(),
                     is.len()
                 );
@@ -14631,6 +12180,7 @@ impl ChatPane {
                     }
                 }
             }
+            println!("probe roundtrip: the same: {}", live == drawn);
             // The live turn goes on where it was.
             let mut fields = ToolCallUpdateFields::new();
             fields.status = Some(ToolCallStatus::Completed);
@@ -14647,59 +12197,24 @@ impl ChatPane {
             pane.render_update(more);
             pane.finalize_stream();
             glib::timeout_future(std::time::Duration::from_millis(500)).await;
-            let last = pane
-                .stretches
-                .borrow()
-                .list
+            let model = pane.model.borrow();
+            let last = model
+                .rows()
                 .last()
-                .and_then(|stretch| stretch.rows.as_ref().and_then(|rows| rows.last_child()))
-                .map(|row| widget_text(&row))
+                .map(model::Row::text)
                 .unwrap_or_default();
             println!(
                 "probe roundtrip: the live turn's last row: {:?}",
                 last.trim()
             );
-            let tone = pane
-                .tool_cards
-                .borrow()
-                .get("d1")
-                .map(|card| card.tone.get());
+            let tone = model
+                .step_row("d1")
+                .and_then(|id| model.row(id))
+                .and_then(|row| match &row.kind {
+                    model::Kind::Step(step) => Some(step.tone),
+                    _ => None,
+                });
             println!("probe roundtrip: the live step's tone: {tone:?}");
-            // The record, as a restore would read it, cut into the same
-            // stretches the live pane made.
-            let (live_cut, recorded) = {
-                let stretches = pane.stretches.borrow();
-                let lengths: Vec<usize> = stretches.list.iter().map(|s| s.records.len()).collect();
-                let all: Vec<serde_json::Value> = stretches
-                    .list
-                    .iter()
-                    .flat_map(|s| s.records.clone())
-                    .collect();
-                (lengths, all)
-            };
-            pane.flush_stash();
-            glib::timeout_future(std::time::Duration::from_millis(500)).await;
-            let archive = pane.chat_archive();
-            let env = pane.environment.clone();
-            let buffered: Vec<serde_json::Value> = crate::runtime::runtime()
-                .spawn_blocking(move || archive.load(&env))
-                .await
-                .map(|loaded| loaded.updates.into_iter().map(|r| r.update).collect())
-                .unwrap_or_default();
-            let cut: Vec<usize> = taste_core::stretches::cut(buffered.clone())
-                .0
-                .iter()
-                .map(Vec::len)
-                .collect();
-            println!(
-                "probe roundtrip: the record cuts as the pane did: {} (pane {live_cut:?}, record {cut:?}); the record is the stretches' records: {}",
-                live_cut == cut,
-                recorded == buffered
-            );
-            println!(
-                "probe roundtrip: the stretch the live turn is in: {}",
-                pane.stretches.borrow().list.len() - 1
-            );
         });
     }
 
@@ -14707,8 +12222,8 @@ impl ChatPane {
     /// place to account. A conversation of sixty turns is drawn from its
     /// record and the view parked in the middle of it, as a reader up the
     /// history has it; then what could move it happens — rows added at the
-    /// bottom, a tall row put in a stretch above the view, the stretches
-    /// far from the reader let go, and hundreds more rows at the bottom —
+    /// bottom, a row above the view grown taller, a row above it built
+    /// again, and hundreds more rows at the bottom —
     /// and the row at the top of the view is measured before and after
     /// each, in the view's own terms.
     fn probe_anchor(self: &Rc<Self>) {
@@ -14716,10 +12231,14 @@ impl ChatPane {
         type Step = (&'static str, Box<dyn Fn(&Rc<ChatPane>)>);
         /// The first row reaching into the view, and where it starts.
         fn place(pane: &ChatPane) -> Option<(String, f64)> {
-            pane.drawn_rows().into_iter().find_map(|row| {
-                let bounds = row.compute_bounds(&pane.transcript_scroller)?;
+            let bound = pane.bound.borrow();
+            let mut ids: Vec<&model::RowId> = bound.keys().collect();
+            ids.sort();
+            ids.into_iter().find_map(|id| {
+                let (_, view) = bound.get(id)?;
+                let bounds = view.widget.compute_bounds(&pane.transcript_scroller)?;
                 (bounds.y() + bounds.height() > 0.0)
-                    .then(|| (format!("{:p}", row.as_ptr()), f64::from(bounds.y())))
+                    .then(|| (format!("row {id}"), f64::from(bounds.y())))
             })
         }
         fn run(pane: Rc<ChatPane>, mut steps: Vec<Step>, before: Option<(String, f64)>) {
@@ -14734,9 +12253,9 @@ impl ChatPane {
                     (Some((a, x)), Some((b, y))) if a == b && (x - y).abs() < 1.0);
                 let adjustment = pane.transcript_scroller.vadjustment();
                 println!(
-                    "probe anchor: {what}: {} (before {before:?}, after {after:?}, rows {}; value {:.0} of {:.0}, foot {}, banner {})",
+                    "probe anchor: {what}: {} (before {before:?}, after {after:?}, items {}; value {:.0} of {:.0}, foot {}, banner {})",
                     if held { "held" } else { "MOVED" },
-                    pane.transcript_rows.get(),
+                    pane.store.n_items(),
                     adjustment.value(),
                     adjustment.upper(),
                     pane.foot_room.get(),
@@ -14804,27 +12323,37 @@ impl ChatPane {
                     }),
                 ),
                 (
-                    "a tall row put in a stretch above the view",
+                    "a row above the view grown taller",
                     Box::new(|pane: &Rc<ChatPane>| {
-                        let above = pane.stretches.borrow().list.iter().find_map(|stretch| {
-                            let rows = stretch.rows.clone()?;
-                            let bounds = rows.compute_bounds(&pane.transcript_scroller)?;
-                            (bounds.y() + bounds.height() < 0.0).then_some(rows)
+                        let scroller = pane.transcript_scroller.clone();
+                        let above = pane.bound.borrow().values().find_map(|(holder, view)| {
+                            let bounds = view.widget.compute_bounds(&scroller)?;
+                            (bounds.y() + bounds.height() < 0.0)
+                                .then(|| holder.upgrade())
+                                .flatten()
                         });
-                        if let Some(rows) = above {
+                        if let Some(holder) = above {
                             let lines: Vec<String> = (0..12)
                                 .map(|n| format!("probe: a line above the reader ({n})"))
                                 .collect();
-                            let label = gtk::Label::new(Some(&lines.join("\n")));
-                            rows.prepend(&gtk::ListBoxRow::builder().child(&label).build());
+                            holder.append(&gtk::Label::new(Some(&lines.join("\n"))));
                         } else {
-                            println!("probe anchor: no stretch above the view is drawn");
+                            println!("probe anchor: no row above the view is drawn");
                         }
                     }),
                 ),
                 (
-                    "the stretches far from the reader let go",
-                    Box::new(|pane: &Rc<ChatPane>| pane.let_go_far()),
+                    "a row above the view drawn again",
+                    Box::new(|pane: &Rc<ChatPane>| {
+                        let scroller = pane.transcript_scroller.clone();
+                        let above = pane.bound.borrow().iter().find_map(|(id, (_, view))| {
+                            let bounds = view.widget.compute_bounds(&scroller)?;
+                            (bounds.y() + bounds.height() < 0.0).then_some(*id)
+                        });
+                        if let Some(id) = above {
+                            pane.rebuild_row(id);
+                        }
+                    }),
                 ),
                 (
                     "hundreds of rows added at the bottom",
@@ -15214,7 +12743,7 @@ impl ChatPane {
             .and_then(|rows| rows.parse().ok())
             .unwrap_or(200);
         let mut index = 0;
-        while self.transcript_rows.get() < cap {
+        while self.model.borrow().rows().len() < cap {
             if wants("prose") {
                 self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                     ContentBlock::Text(TextContent::new(prose)),
@@ -15293,7 +12822,7 @@ impl ChatPane {
         let step = ((adjustment.upper() - adjustment.page_size()) / 240.0).max(40.0);
         println!(
             "scroll bench: {} rows, {:.0}px tall, {step:.0}px a frame; the list is {}px",
-            self.transcript_rows.get(),
+            self.model.borrow().rows().len(),
             adjustment.upper(),
             self.list.height(),
         );
@@ -15356,8 +12885,9 @@ impl ChatPane {
     }
 
     fn expand_tool_card_for_probe(&self, id: &str) {
-        if let Some(card) = self.tool_cards.borrow().get(id) {
-            card.set_expanded(true);
+        let row = self.model.borrow().step_row(id);
+        if let Some(row) = row {
+            self.set_step_expanded(row, true);
         }
     }
 
@@ -16485,39 +14015,8 @@ impl ChatPane {
     }
 }
 
-/// The tool a standing answer about this request would be about, or `None`
-/// when there is no grain the IDE can honestly key one on.
-///
-/// Only the IDE's own MCP tools qualify. A standing answer is a judgement
-/// about what a tool DOES, and `taste_mcp`'s effect table is that
-/// judgement for this server's tools alone; the IDE has no business ruling
-/// on GitHub's. An agent's own built-in tools do not qualify either, and
-/// that is not an oversight: a `Bash` call's title is the command, not a
-/// tool identity, so the only stable key it offers is the whole command
-/// line — which is the agent's own grain to keep, and it does keep it.
-///
-/// [`mcp_tool_name`] does the reading, in whichever dress the adapter gave
-/// the call, because a second parser for the same thing is how the first
-/// one drifts.
-///
-/// A call the adapter typed `Execute` is its shell, whatever its title
-/// says: a bare title is read as a tool name, so a command that happened
-/// to be called `devcontainer_reload` would otherwise take that tool's
-/// standing answer, or pass as one that asks nobody (review, 2026-09-23).
-/// The rail line of a step's row (`ChatPane::append_step`) — its top
-/// segment, the break for the spinner, and its bottom segment, in that
-/// order — or `None` for a row that is not a step.
-fn step_rail_line(row: &gtk::ListBoxRow) -> Option<gtk::Box> {
-    let rail = row
-        .child()
-        .and_downcast::<gtk::Box>()?
-        .first_child()
-        .and_downcast::<gtk::Overlay>()?;
-    rail_line(&rail)
-}
-
 /// A step's rail's line: laid over its row after the empty child that
-/// keeps the rail from sizing it (`append_step`).
+/// keeps the rail from sizing it (`rows.rs`, `on_rail`).
 fn rail_line(rail: &gtk::Overlay) -> Option<gtk::Box> {
     rail.child()?.next_sibling().and_downcast::<gtk::Box>()
 }
@@ -16585,6 +14084,25 @@ fn checkout_path(path: &str) -> String {
     }
 }
 
+/// The tool a standing answer about this request would be about, or `None`
+/// when there is no grain the IDE can honestly key one on.
+///
+/// Only the IDE's own MCP tools qualify. A standing answer is a judgement
+/// about what a tool DOES, and `taste_mcp`'s effect table is that
+/// judgement for this server's tools alone; the IDE has no business ruling
+/// on GitHub's. An agent's own built-in tools do not qualify either, and
+/// that is not an oversight: a `Bash` call's title is the command, not a
+/// tool identity, so the only stable key it offers is the whole command
+/// line — which is the agent's own grain to keep, and it does keep it.
+///
+/// [`mcp_tool_name`] does the reading, in whichever dress the adapter gave
+/// the call, because a second parser for the same thing is how the first
+/// one drifts.
+///
+/// A call the adapter typed `Execute` is its shell, whatever its title
+/// says: a bare title is read as a tool name, so a command that happened
+/// to be called `devcontainer_reload` would otherwise take that tool's
+/// standing answer, or pass as one that asks nobody (review, 2026-09-23).
 fn standing_tool(request: &RequestPermissionRequest) -> Option<String> {
     if request.tool_call.fields.kind == Some(ToolKind::Execute) {
         return None;
@@ -16641,26 +14159,6 @@ fn permission_scope_note(
 /// turn ran out of room to finish (Claude Fable 5.1's `display: "updates"`).
 /// Exact, by the documentation, so it can be recognised rather than shown.
 const INTERRUPTED_THOUGHT: &str = "This part of the response was interrupted before it finished.";
-
-/// The last non-empty line of a buffer, trimmed — the thing a thought is
-/// saying right now, for the working line.
-fn buffer_last_line(buffer: &gtk::TextBuffer) -> String {
-    let mut end = buffer.end_iter();
-    loop {
-        let mut start = end;
-        start.set_line_offset(0);
-        let line = buffer.text(&start, &end, false).trim().to_string();
-        if !line.is_empty() || start.offset() == 0 {
-            return line;
-        }
-        // An empty last line is a chunk that ended on a newline; the line
-        // before it is the one still being said.
-        end = start;
-        if !end.backward_char() {
-            return String::new();
-        }
-    }
-}
 
 /// A finished thought's header: how long it took, and what it opened with.
 ///
@@ -17537,30 +15035,6 @@ fn humanize_tool_title(raw: &str) -> String {
     }
 }
 
-/// What a card's content collection *is*, cheaply comparable. Only the
-/// facts that reach the screen: a restated snapshot has to compare equal, or
-/// the card rebuilds itself for nothing.
-fn content_signature(content: &[ToolCallContent]) -> Vec<String> {
-    content
-        .iter()
-        .map(|item| match item {
-            ToolCallContent::Diff(diff) => format!(
-                "diff\u{0}{}\u{0}{}\u{0}{}",
-                diff.path.display(),
-                diff.old_text.as_deref().unwrap_or_default(),
-                diff.new_text
-            ),
-            ToolCallContent::Content(block) => {
-                format!(
-                    "text\u{0}{}",
-                    content_text(&block.content).unwrap_or_default()
-                )
-            }
-            other => format!("{other:?}"),
-        })
-        .collect()
-}
-
 /// One run of terminal output carrying a single SGR style.
 #[derive(Debug, PartialEq)]
 pub(crate) struct AnsiSpan {
@@ -17707,24 +15181,22 @@ pub struct TranscriptHit {
     pub at: Option<u64>,
 }
 
-/// The key a transcript row's time is kept under, on the row itself: the
-/// rows are added and removed at both ends and by handle, so a parallel
-/// list would drift, and the row is the one thing a hit can name.
+/// The key a widget item's time is kept under, on the widget itself.
 const ROW_TIME_KEY: &str = "taste-row-time";
 
-fn stamp_row(row: &gtk::ListBoxRow) {
+fn stamp_widget(widget: &gtk::Widget) {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
     // SAFETY: the key is private to this file and is only ever set to,
-    // and read as, a `u64` — by `stamp_row` and `row_time`.
-    unsafe { row.set_data::<u64>(ROW_TIME_KEY, at) };
+    // and read as, a `u64` — by `stamp_widget` and `widget_time`.
+    unsafe { widget.set_data::<u64>(ROW_TIME_KEY, at) };
 }
 
-fn row_time(row: &gtk::ListBoxRow) -> Option<u64> {
-    // SAFETY: see `stamp_row` — the same key, the same type.
-    unsafe { row.data::<u64>(ROW_TIME_KEY).map(|at| *at.as_ref()) }
+fn widget_time(widget: &gtk::Widget) -> Option<u64> {
+    // SAFETY: see `stamp_widget` — the same key, the same type.
+    unsafe { widget.data::<u64>(ROW_TIME_KEY).map(|at| *at.as_ref()) }
 }
 
 /// "4 min ago · 2026-09-06T23:39:00Z": when a transcript row landed, both
@@ -18693,39 +16165,6 @@ mod tests {
             find_setup_token(&padded).as_deref(),
             Some(whole_token.as_str())
         );
-    }
-
-    /// The predicate the revive flush leans on.
-    ///
-    /// `flush_revive_queue` rebuilds a queued prompt's card when a session
-    /// replay has cleared the transcript from under it, and the whole fix
-    /// rests on `is_ancestor` answering "is this card still on screen" the
-    /// right way round — an argument order that is easy to write backwards
-    /// and that would silently rebuild every card, or none.
-    ///
-    /// Needs a display for the widgets; skips without one.
-    #[test]
-    fn a_card_whose_row_was_removed_is_no_longer_in_the_transcript() {
-        crate::gtk_test::on_gtk_thread("chat: no display — skipped", || {
-            let transcript = gtk::ListBox::new();
-            let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            let row = gtk::ListBoxRow::builder().child(&card).build();
-            transcript.append(&row);
-            assert!(
-                card.is_ancestor(&transcript),
-                "in the transcript while its row is"
-            );
-
-            // Exactly what `clear_transcript` does to it.
-            while let Some(row) = transcript.first_child() {
-                transcript.remove(&row);
-            }
-            assert!(
-                !card.is_ancestor(&transcript),
-                "and out of it once the row is gone, which is when the card has \
-             to be rebuilt"
-            );
-        });
     }
 
     /// What Claude Code advertised on 2026-09-16, read off this
@@ -19872,33 +17311,6 @@ mod tests {
         assert!(ansi_spans("").is_empty());
     }
 
-    /// An ACP content update REPLACES the card's content, and agents restate
-    /// the whole of a call's output on every update. The signature is what
-    /// tells a restatement from news — get it wrong and the card either
-    /// rebuilds under the pointer or grows a second copy of itself.
-    #[test]
-    fn a_restated_content_snapshot_compares_equal() {
-        let block = |text: &str| {
-            ToolCallContent::Content(agent_client_protocol::schema::v1::Content::new(
-                ContentBlock::Text(TextContent::new(text)),
-            ))
-        };
-        assert_eq!(
-            content_signature(&[block("running")]),
-            content_signature(&[block("running")])
-        );
-        assert_ne!(
-            content_signature(&[block("running")]),
-            content_signature(&[block("running\ndone")])
-        );
-        // Order and arity are part of it.
-        assert_ne!(
-            content_signature(&[block("a"), block("b")]),
-            content_signature(&[block("b"), block("a")])
-        );
-        assert_ne!(content_signature(&[block("a")]), content_signature(&[]));
-    }
-
     /// Profiling harness (run on demand):
     /// `cargo test -p taste-app perf_ -- --ignored --nocapture`
     ///
@@ -19918,12 +17330,14 @@ mod tests {
                     TextContent::new(log.clone()),
                 )),
             )];
+            // What a step keeps of its content (`chat/model.rs`), and the
+            // comparison a restated snapshot costs: the row is drawn again
+            // only when it differs.
             let start = std::time::Instant::now();
-            let signature = content_signature(&content);
+            let signature = content.to_vec();
             let signed = start.elapsed();
-            // The comparison a restated snapshot actually costs.
             let start = std::time::Instant::now();
-            assert_eq!(signature, content_signature(&content));
+            assert!(signature == content);
             let compared = start.elapsed();
             let start = std::time::Instant::now();
             let spans = ansi_spans(&log);

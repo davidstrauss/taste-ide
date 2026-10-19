@@ -165,7 +165,7 @@ const PACE: Duration = Duration::from_millis(8);
 /// below redraw) waited for a moment the loop never reached while a frame
 /// clock ran back to back — a spinner, frames slower than the display's,
 /// a reader scrolling — and the work stopped there: a drawn history
-/// halfway, a transcript whose stretches on screen were never drawn.
+/// halfway.
 pub const GAP: Duration = Duration::from_millis(2);
 
 impl Pacer {
@@ -183,12 +183,6 @@ impl Pacer {
             self.since = Instant::now();
         }
     }
-}
-
-/// Run `work` once, after [`GAP`]: work that does a slice and comes back
-/// for the next, with every frame waiting in between.
-pub fn after_a_gap(work: impl FnOnce() + 'static) {
-    glib::timeout_add_local_once(GAP, work);
 }
 
 #[cfg(test)]

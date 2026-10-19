@@ -873,6 +873,19 @@ pub struct DiffView {
     pub removed: usize,
 }
 
+/// How many lines `edit` adds and removes, as its diff view counts them,
+/// without building the view.
+pub fn edit_counts(edit: &Edit) -> (usize, usize) {
+    let (mut added, mut removed) = (0, 0);
+    for hunk in hunks(&edit.old, &edit.new) {
+        for row in &hunk.rows {
+            added += usize::from(row.right.0 == Mark::Added);
+            removed += usize::from(row.left.0 == Mark::Removed);
+        }
+    }
+    (added, removed)
+}
+
 /// The diff of `edit`, in `layout`. With `clip`, only the first so many
 /// rows across its hunks, then a dim line saying how many more there were.
 pub fn diff_view(edit: &Edit, clip: Option<usize>, layout: Layout) -> DiffView {
