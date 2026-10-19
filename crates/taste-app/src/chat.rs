@@ -420,6 +420,16 @@ const BUSY_IDLE: &str = "Working…";
 
 const MAX_TRANSCRIPT_ROWS: u32 = 200;
 
+/// The key of a note the IDE put in a conversation, as its record holds it
+/// (`ChatPane::record`): beside the agent's updates and the user's
+/// messages, the third thing a transcript is drawn from.
+const NOTE_RECORD: &str = "tasteNote";
+
+/// How the briefing the IDE puts ahead of a prompt ends (`with_briefing`):
+/// what tells it apart from the user's words when a replay brings the
+/// prompt back.
+const BRIEFING_TAIL: &str = "The user's message follows.";
+
 /// Lines kept in the text mirror `chat_transcript_tail` reads (see
 /// [`ChatPane::record_line`]). Matched to the widget cap on purpose: the
 /// mirror is a shadow of what the tab shows, and one outliving the other
@@ -1032,6 +1042,9 @@ pub struct ChatPane {
     /// the GTK thread does no filesystem IO. A turn lost to a kill -9 is an
     /// acceptable loss for a nicety that expires in a week anyway.
     archive_buffer: RefCell<Vec<serde_json::Value>>,
+    /// Drawing a conversation from a record rather than living it: what is
+    /// drawn now is already recorded, and is not recorded again.
+    drawing_history: Cell<bool>,
     /// Latched on AuthRequired; cleared by a completed turn. While set,
     /// Ready must NOT close the options shade over the sign-in buttons.
     needs_auth: Cell<bool>,
@@ -1174,6 +1187,36 @@ type Capture = (String, Box<dyn FnOnce(String)>);
 struct PendingUserMessage {
     text: String,
     attachments: Vec<(String, ContentBlock)>,
+    /// The notes for a briefing the IDE sent ahead of the message, as a
+    /// replay brings it back: drawn under the card, where live put them.
+    briefed: Vec<String>,
+}
+
+/// The notes a briefing came with (`ChatPane::with_briefing`), read back
+/// out of its text: what live drew beside the message, said again when a
+/// replay brings the briefing back as the message's first block.
+fn briefing_notes(text: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    if text.contains("YOU ARE THE COORDINATOR") {
+        notes.push("briefed as the coordinator with this prompt".to_string());
+    }
+    if text.contains("WHERE YOU ARE (the IDE sends this") {
+        let mode = text
+            .lines()
+            .find_map(|line| line.strip_prefix("Mode: "))
+            .and_then(|mode| mode.split(':').next())
+            .map(|mode| format!(": {} mode", mode.trim()))
+            .unwrap_or_default();
+        notes.push(format!("oriented with this prompt{mode}"));
+    }
+    if text.contains("[The IDE was updated since this conversation was briefed") {
+        notes.push(
+            "the IDE's guidance changed since this conversation was briefed; sent with this \
+             prompt"
+                .to_string(),
+        );
+    }
+    notes
 }
 
 /// A prompt the agent has not finished with yet: where it goes if the
@@ -3482,6 +3525,7 @@ impl ChatPane {
             stash_replayed: Cell::new(false),
             snapshotting: Rc::new(Cell::new(false)),
             archive_buffer: RefCell::new(Vec::new()),
+            drawing_history: Cell::new(false),
             needs_auth: Cell::new(false),
             reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
@@ -6786,7 +6830,20 @@ impl ChatPane {
         blocks: Vec<ContentBlock>,
         written: Option<taste_core::queued::Queued>,
     ) -> anyhow::Result<()> {
+        // The user's message, as a replay would bring it back — the
+        // updates `session/load` sends for it — so the record holds what
+        // the user said and not only what the agent answered. Before the
+        // briefing, which is the IDE's and is recorded as its notes.
+        for block in &blocks {
+            let chunk = SessionUpdate::UserMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new(block.clone()),
+            );
+            self.stash_update(&chunk);
+        }
         let blocks = self.with_briefing(blocks);
+        // Written now rather than with the turn: a message the IDE closed
+        // over is still the user's.
+        self.flush_stash();
         match (self.client.borrow().as_ref(), written) {
             (Some(client), Some(written)) => client.prompt_blocks_queued(blocks, written),
             (Some(client), None) => client.prompt_blocks(blocks),
@@ -6850,7 +6907,7 @@ impl ChatPane {
             return blocks;
         }
         let mut briefed = vec![ContentBlock::Text(TextContent::new(format!(
-            "{}\n\n---\n\nThe user's message follows.",
+            "{}\n\n---\n\n{BRIEFING_TAIL}",
             front.join("\n\n---\n\n")
         )))];
         briefed.extend(blocks);
@@ -7863,6 +7920,7 @@ impl ChatPane {
     }
 
     fn meta_row(&self, text: &str) {
+        self.record(serde_json::json!({ NOTE_RECORD: text }));
         self.meta_row_label(text);
     }
 
@@ -8216,9 +8274,17 @@ impl ChatPane {
 
     /// Draw the accumulated user message, blocks and all. Idempotent.
     fn flush_user_message(&self) {
-        let Some(pending) = self.pending_user.borrow_mut().take() else {
+        let Some(mut pending) = self.pending_user.borrow_mut().take() else {
             return;
         };
+        let briefed = std::mem::take(&mut pending.briefed);
+        self.draw_user_message(pending);
+        for note in briefed {
+            self.meta_row(&note);
+        }
+    }
+
+    fn draw_user_message(&self, pending: PendingUserMessage) {
         if pending.text.trim().is_empty() && pending.attachments.is_empty() {
             return;
         }
@@ -9551,6 +9617,11 @@ impl ChatPane {
                 // A live session clears the reconnect budget: the next
                 // death starts counting from zero, however many it took.
                 self.reconnect_attempts.set(0);
+                // A fresh session's history begins here, in the record:
+                // what the stash holds after this mark is all of it.
+                if !restored {
+                    self.mark_session(&session_id);
+                }
                 *self.session_info.borrow_mut() = Some((agent_id, session_id));
                 // A restored session has history on disk by definition; a
                 // fresh one earns persistence with its first prompt.
@@ -11068,15 +11139,46 @@ impl ChatPane {
     /// artifact that does not become a ref. Buffered here and written at
     /// the turn boundary by [`ChatPane::flush_stash`].
     fn stash_update(&self, update: &SessionUpdate) {
-        if self.replaying.get() {
-            return;
-        }
         match serde_json::to_value(update) {
-            Ok(value) => self.archive_buffer.borrow_mut().push(value),
+            Ok(value) => self.record(value),
             // A stashed transcript is a convenience. Failing to write one
             // is not worth a toast in front of the user, and the app log is
             // where the IDE's own faults go.
             Err(e) => tracing::warn!("a chat update could not be stashed: {e}"),
+        }
+    }
+
+    /// One entry of this conversation's record, buffered for the stash:
+    /// an update the agent streamed, a message the user sent, or a note
+    /// the IDE put in the transcript. The record is what every row is
+    /// drawn from, live and restored alike (`draw_record`), so nothing a
+    /// replay or a reconnect draws is special-cased by where it came from.
+    /// Nothing is recorded while a record is being drawn back.
+    fn record(&self, value: serde_json::Value) {
+        if self.replaying.get() || self.drawing_history.get() {
+            return;
+        }
+        self.archive_buffer.borrow_mut().push(value);
+    }
+
+    /// Draw one entry of a conversation's record (`record`): the IDE's
+    /// session marker draws nothing, its note is a note, and anything else
+    /// is the agent's update.
+    fn draw_record(self: &Rc<Self>, value: serde_json::Value) {
+        if value.get(taste_core::chatarchive::SESSION_MARKER).is_some() {
+            return;
+        }
+        if let Some(note) = value.get(NOTE_RECORD).and_then(serde_json::Value::as_str) {
+            self.finalize_stream();
+            self.meta_row(note);
+            return;
+        }
+        // A record written by an older protocol is skipped rather than
+        // fatal: a stash is a convenience, and half a conversation beats an
+        // error where one used to be.
+        if let Ok(update) = serde_json::from_value::<SessionUpdate>(value) {
+            // A stash written before `without_nul` may hold one.
+            self.render_update(nul_free(update));
         }
     }
 
@@ -11125,15 +11227,11 @@ impl ChatPane {
                 loaded.updates.len(),
                 pane.environment
             );
+            pane.drawing_history.set(true);
             for record in loaded.updates {
-                // A record written by an older protocol is skipped rather
-                // than fatal: a stash is a convenience, and half a
-                // conversation beats an error where one used to be.
-                if let Ok(update) = serde_json::from_value::<SessionUpdate>(record.update) {
-                    // A stash written before `without_nul` may hold one.
-                    pane.render_update(nul_free(update));
-                }
+                pane.draw_record(record.update);
             }
+            pane.drawing_history.set(false);
             // The last streamed block's markdown pass, for the reason the
             // `Ready` arm does the same: nothing follows it to trigger one.
             pane.finalize_stream();
@@ -11233,6 +11331,23 @@ impl ChatPane {
         }
     }
 
+    /// Mark where `session`'s history begins in the stash, after whatever
+    /// the last session still had buffered, off the main thread.
+    fn mark_session(&self, session: &str) {
+        let updates = std::mem::take(&mut *self.archive_buffer.borrow_mut());
+        let archive = self.chat_archive();
+        let env = self.environment.clone();
+        let session = session.to_string();
+        crate::runtime::runtime().spawn_blocking(move || {
+            let marked = archive
+                .append_all(&env, updates)
+                .and_then(|()| archive.mark_session(&env, &session));
+            if let Err(e) = marked {
+                tracing::warn!("marking {env}'s new conversation: {e:#}");
+            }
+        });
+    }
+
     /// Write the buffered turn to the stash, off the main thread.
     fn flush_stash(&self) {
         let updates = std::mem::take(&mut *self.archive_buffer.borrow_mut());
@@ -11272,6 +11387,11 @@ impl ChatPane {
                 let mut pending = self.pending_user.borrow_mut();
                 let pending = pending.get_or_insert_with(PendingUserMessage::default);
                 match content_text(&chunk.content) {
+                    // The IDE's briefing ahead of the message, not the
+                    // user's words: its notes, as live drew them.
+                    Some(text) if text.trim_end().ends_with(BRIEFING_TAIL) => {
+                        pending.briefed.extend(briefing_notes(&text));
+                    }
                     Some(text) => {
                         if !pending.text.is_empty() && !pending.text.ends_with('\n') {
                             pending.text.push('\n');
@@ -16955,6 +17075,26 @@ mod tests {
         assert!(matches!(&content[0], ToolCallContent::Diff(d) if d.old_text.is_none()));
         assert!(ide_edit_shape("mcp__taste-ide__ide_edit_file", None).is_none());
         assert!(!is_ide_edit_title("mcp__taste-ide__ide_read_file"));
+    }
+
+    /// A briefing a replay brings back as a message's first block is drawn
+    /// as the notes live drew, not as words in the user's card.
+    #[test]
+    fn a_replayed_briefing_comes_back_as_its_notes() {
+        let briefing = format!(
+            "{}\n\n---\n\nWHERE YOU ARE (the IDE sends this when your environment changes)\n\
+             Environment: primary\nMode: container: the project's own\n\n---\n\n{BRIEFING_TAIL}",
+            taste_core::orchestration::coordinator_brief()
+        );
+        assert!(briefing.trim_end().ends_with(BRIEFING_TAIL));
+        assert_eq!(
+            briefing_notes(&briefing),
+            vec![
+                "briefed as the coordinator with this prompt".to_string(),
+                "oriented with this prompt: container mode".to_string(),
+            ]
+        );
+        assert!(briefing_notes("just the user's words").is_empty());
     }
 
     /// No tool's internal name reaches the user, at any moment of the call
