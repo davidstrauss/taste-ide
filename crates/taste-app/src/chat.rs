@@ -476,6 +476,29 @@ struct StepRail {
     bottom: gtk::Box,
 }
 
+impl StepRail {
+    /// A rail standing for a step drawn somewhere else: the stretch before
+    /// this one, which this one goes on from (`ChatPane::draw_stretch`).
+    fn elsewhere() -> Self {
+        Self {
+            dot: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            spinner: gtk::Spinner::new(),
+            bottom: gtk::Box::new(gtk::Orientation::Vertical, 0),
+        }
+    }
+}
+
+/// Whether a stretch with these records goes on from the one before it,
+/// in the same turn — it begins at a step, not at a message — so its rail
+/// runs on from that stretch's last step.
+fn continues_turn(records: &[serde_json::Value]) -> bool {
+    records
+        .first()
+        .and_then(|record| record.get("sessionUpdate"))
+        .and_then(serde_json::Value::as_str)
+        == Some("tool_call")
+}
+
 /// What a stretch of the conversation is drawn with: the renderer's state
 /// partway through it — the block streaming, the steps that may still be
 /// updated, the rail's last dot, the message being assembled. The pane's
@@ -563,7 +586,10 @@ impl Default for Stretches {
 impl Stretches {
     /// A live record: into the last stretch, or one it begins.
     fn read(&mut self, record: &serde_json::Value) {
-        if self.segmenter.begins(record) || self.list.is_empty() {
+        // A stretch with rows and no records yet (a card drawn before the
+        // message it is for was recorded) is the one this begins.
+        let open = self.list.last().is_some_and(|last| last.records.is_empty());
+        if (self.segmenter.begins(record) && !open) || self.list.is_empty() {
             self.list.push(Stretch::new(Vec::new(), false));
         }
         if let Some(last) = self.list.last_mut() {
@@ -7503,10 +7529,21 @@ impl ChatPane {
             let at = stretches.position_after(index, &self.transcript);
             self.insert_at.set(Some(at));
             stretches.drawing = Some(index);
-            records
+            let followed = stretches
+                .list
+                .get(index + 1)
+                .is_some_and(|next| continues_turn(&next.records));
+            (records, followed)
         };
+        let (records, followed) = records;
         let mut drawing = Drawing::default();
         self.swap_drawing(&mut drawing);
+        // Its rail as the turn drew it: on from the step before it, and
+        // on into the step after it, when those are in the stretches on
+        // either side.
+        if index > 0 && continues_turn(&records) {
+            *self.last_rail.borrow_mut() = Some(StepRail::elsewhere());
+        }
         self.drawing_history.set(true);
         self.drawing_past.set(true);
         for record in records {
@@ -7514,6 +7551,11 @@ impl ChatPane {
         }
         self.finalize_stream();
         self.settle_running_steps();
+        if followed {
+            if let Some(rail) = self.last_rail.borrow().as_ref() {
+                rail.bottom.set_visible(true);
+            }
+        }
         self.drawing_past.set(false);
         self.drawing_history.set(false);
         self.swap_drawing(&mut drawing);
@@ -11911,6 +11953,9 @@ impl ChatPane {
         for record in state {
             self.draw_record(record);
         }
+        if count > 1 && continues_turn(&tail) {
+            *self.last_rail.borrow_mut() = Some(StepRail::elsewhere());
+        }
         let mut pacer = crate::stall::Pacer::new();
         for record in tail {
             self.draw_record(record);
@@ -12922,6 +12967,12 @@ impl ChatPane {
             self.probe_history();
             return;
         }
+        // `TASTE_PROBE_CHAT=roundtrip` lives a conversation, lets its
+        // stretches go, draws them back, and compares (`probe_roundtrip`).
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("roundtrip") {
+            self.probe_roundtrip();
+            return;
+        }
         // `TASTE_PROBE_CHAT=task` is a turn that two background subagents
         // report back into: one finished with a report, one failed.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("task") {
@@ -13473,6 +13524,319 @@ impl ChatPane {
             pane.stick_to_bottom.set(true);
             glib::timeout_future(std::time::Duration::from_millis(800)).await;
             report(&pane, "back at the bottom", &held);
+        });
+    }
+
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=roundtrip` holds a drawn
+    /// back stretch to the one it was live. A conversation is lived the way
+    /// the event handler and a send live it — records, then rows — with
+    /// thoughts, steps that run and settle or fail, a plan, an edit, notes,
+    /// a long turn cut between its steps, and a last turn left mid-stream
+    /// with a step running. Then every stretch but the last is let go and
+    /// drawn back, and each is compared with what it was: its text, and
+    /// which of its widgets show and with what classes. Then the live turn
+    /// goes on, and it is checked that it went on where it was.
+    fn probe_roundtrip(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::{
+            ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ToolCall,
+            ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        };
+        let text = |t: &str| ContentChunk::new(ContentBlock::Text(TextContent::new(t)));
+        let live = |pane: &Rc<Self>, update: SessionUpdate| {
+            pane.stash_update(&update);
+            pane.render_update(update);
+        };
+        let send = |pane: &Rc<Self>, words: &str| {
+            pane.finalize_stream();
+            let card = pane.user_card(words, &[]);
+            pane.record_user_blocks(&[ContentBlock::Text(TextContent::new(words))]);
+            pane.claim_row(&card);
+        };
+        let step =
+            |pane: &Rc<Self>, id: &str, title: &str, kind: ToolKind, status: ToolCallStatus| {
+                let mut call = ToolCall::new(id.to_string(), title.to_string());
+                call.kind = kind;
+                call.status = ToolCallStatus::InProgress;
+                live(pane, SessionUpdate::ToolCall(call));
+                if status != ToolCallStatus::InProgress {
+                    let mut fields = ToolCallUpdateFields::new();
+                    fields.status = Some(status);
+                    live(
+                        pane,
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.to_string(), fields)),
+                    );
+                }
+            };
+        let end_turn = |pane: &Rc<Self>| {
+            pane.finalize_stream();
+            pane.settle_running_steps();
+        };
+        // Turn 1: a thought, steps, a failure, an answer in markdown.
+        send(self, "Why does the Dirty filter lose its scroll position?");
+        live(
+            self,
+            SessionUpdate::AgentThoughtChunk(text(
+                "Probably the row rebuild resets the adjustment.",
+            )),
+        );
+        step(
+            self,
+            "a1",
+            "Read crates/taste-app/src/filetree.rs",
+            ToolKind::Read,
+            ToolCallStatus::Completed,
+        );
+        step(
+            self,
+            "a2",
+            "cargo test -p taste-app filetree",
+            ToolKind::Execute,
+            ToolCallStatus::Failed,
+        );
+        live(self, SessionUpdate::AgentMessageChunk(text("The rebuild **replaces** the model, so:\n\n- the adjustment resets\n- the selection goes\n")));
+        end_turn(self);
+        self.meta_row("a note the IDE put between turns");
+        // Turn 2: a plan, an edit with its diff, an answer.
+        send(self, "Fix it, and keep the selection too.");
+        live(
+            self,
+            SessionUpdate::Plan(Plan::new(vec![
+                PlanEntry::new(
+                    "Keep the adjustment",
+                    PlanEntryPriority::High,
+                    PlanEntryStatus::Completed,
+                ),
+                PlanEntry::new(
+                    "Keep the selection",
+                    PlanEntryPriority::Medium,
+                    PlanEntryStatus::InProgress,
+                ),
+            ])),
+        );
+        let mut edit = ToolCall::new("b1", "Edit crates/taste-app/src/filetree.rs");
+        edit.kind = ToolKind::Edit;
+        edit.status = ToolCallStatus::Completed;
+        edit.content = vec![ToolCallContent::Diff(probe_edit_diff())];
+        live(self, SessionUpdate::ToolCall(edit));
+        live(
+            self,
+            SessionUpdate::AgentMessageChunk(text("Done: both are kept across the rebuild.")),
+        );
+        end_turn(self);
+        // Turn 3: long enough to be cut between its steps, with a step
+        // running across where the cut would fall.
+        send(self, "Now run the whole suite and fix what fails.");
+        for n in 0..taste_core::stretches::STEPS + 6 {
+            if n == taste_core::stretches::STEPS - 1 {
+                step(
+                    self,
+                    "long",
+                    "cargo test --workspace",
+                    ToolKind::Execute,
+                    ToolCallStatus::InProgress,
+                );
+                continue;
+            }
+            step(
+                self,
+                &format!("c{n}"),
+                &format!("Read crates/file-{n}.rs"),
+                ToolKind::Read,
+                ToolCallStatus::Completed,
+            );
+            live(
+                self,
+                SessionUpdate::AgentMessageChunk(text(&format!("Read file {n}."))),
+            );
+            if n == taste_core::stretches::STEPS + 2 {
+                let mut fields = ToolCallUpdateFields::new();
+                fields.status = Some(ToolCallStatus::Completed);
+                live(
+                    self,
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new("long".to_string(), fields)),
+                );
+            }
+        }
+        end_turn(self);
+        // Turn 4, live: mid-answer, a step still running.
+        send(self, "And the docs?");
+        step(
+            self,
+            "d1",
+            "Read docs/ARCHITECTURE.md",
+            ToolKind::Read,
+            ToolCallStatus::InProgress,
+        );
+        live(
+            self,
+            SessionUpdate::AgentMessageChunk(text("Reading the architecture notes; ")),
+        );
+
+        fn signature(widget: &gtk::Widget, out: &mut Vec<String>) {
+            if !widget.is_visible() {
+                return;
+            }
+            let mut line = widget.css_name().to_string();
+            for class in widget.css_classes() {
+                line.push('.');
+                line.push_str(&class);
+            }
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                line.push_str(&format!(" {:?}", label.text()));
+            } else if let Some(view) = widget.downcast_ref::<gtk::TextView>() {
+                let buffer = view.buffer();
+                line.push_str(&format!(
+                    " {:?}",
+                    buffer.text(&buffer.start_iter(), &buffer.end_iter(), false)
+                ));
+            }
+            out.push(line);
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                signature(&current, out);
+                child = current.next_sibling();
+            }
+        }
+        fn snapshot(pane: &ChatPane) -> Vec<Vec<String>> {
+            let parent: &gtk::Widget = pane.transcript.upcast_ref();
+            pane.stretches
+                .borrow()
+                .list
+                .iter()
+                .map(|stretch| {
+                    let mut out = Vec::new();
+                    for row in stretch
+                        .rows
+                        .iter()
+                        .filter(|row| row.parent().as_ref() == Some(parent))
+                    {
+                        signature(row.upcast_ref(), &mut out);
+                    }
+                    out
+                })
+                .collect()
+        }
+        let pane = self.clone();
+        glib::spawn_future_local(async move {
+            glib::timeout_future(std::time::Duration::from_millis(1500)).await;
+            let before = snapshot(&pane);
+            let count = before.len();
+            println!(
+                "probe roundtrip: {count} stretches, rows {}, records {:?}",
+                pane.transcript_rows.get(),
+                pane.stretches
+                    .borrow()
+                    .list
+                    .iter()
+                    .map(|s| s.records.len())
+                    .collect::<Vec<_>>()
+            );
+            for index in 0..count.saturating_sub(1) {
+                if !pane.let_go(index) {
+                    println!("probe roundtrip: stretch {index} could not be let go");
+                }
+            }
+            println!(
+                "probe roundtrip: let go, rows {}",
+                pane.transcript_rows.get()
+            );
+            for index in 0..count.saturating_sub(1) {
+                pane.draw_stretch(index);
+            }
+            glib::timeout_future(std::time::Duration::from_millis(800)).await;
+            let after = snapshot(&pane);
+            for (index, (was, is)) in before.iter().zip(&after).enumerate() {
+                if was == is {
+                    println!(
+                        "probe roundtrip: stretch {index}: same ({} widgets)",
+                        was.len()
+                    );
+                    continue;
+                }
+                println!(
+                    "probe roundtrip: stretch {index}: DIFFERS ({} widgets live, {} drawn back)",
+                    was.len(),
+                    is.len()
+                );
+                let mut shown = 0;
+                for n in 0..was.len().max(is.len()) {
+                    let (a, b) = (was.get(n), is.get(n));
+                    if a != b && shown < 8 {
+                        println!("  [{n}] live:  {}", a.map_or("-", String::as_str));
+                        println!("  [{n}] drawn: {}", b.map_or("-", String::as_str));
+                        shown += 1;
+                    }
+                }
+            }
+            // The live turn goes on where it was.
+            let mut fields = ToolCallUpdateFields::new();
+            fields.status = Some(ToolCallStatus::Completed);
+            pane.stash_update(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "d1".to_string(),
+                fields.clone(),
+            )));
+            pane.render_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "d1".to_string(),
+                fields,
+            )));
+            let more = SessionUpdate::AgentMessageChunk(text("they agree with the code."));
+            pane.stash_update(&more);
+            pane.render_update(more);
+            pane.finalize_stream();
+            glib::timeout_future(std::time::Duration::from_millis(500)).await;
+            let last = pane
+                .stretches
+                .borrow()
+                .list
+                .last()
+                .and_then(|stretch| stretch.rows.last().cloned())
+                .map(|row| widget_text(row.upcast_ref()))
+                .unwrap_or_default();
+            println!(
+                "probe roundtrip: the live turn's last row: {:?}",
+                last.trim()
+            );
+            let tone = pane
+                .tool_cards
+                .borrow()
+                .get("d1")
+                .map(|card| card.tone.get());
+            println!("probe roundtrip: the live step's tone: {tone:?}");
+            // The record, as a restore would read it, cut into the same
+            // stretches the live pane made.
+            let (live_cut, recorded) = {
+                let stretches = pane.stretches.borrow();
+                let lengths: Vec<usize> = stretches.list.iter().map(|s| s.records.len()).collect();
+                let all: Vec<serde_json::Value> = stretches
+                    .list
+                    .iter()
+                    .flat_map(|s| s.records.clone())
+                    .collect();
+                (lengths, all)
+            };
+            pane.flush_stash();
+            glib::timeout_future(std::time::Duration::from_millis(500)).await;
+            let archive = pane.chat_archive();
+            let env = pane.environment.clone();
+            let buffered: Vec<serde_json::Value> = crate::runtime::runtime()
+                .spawn_blocking(move || archive.load(&env))
+                .await
+                .map(|loaded| loaded.updates.into_iter().map(|r| r.update).collect())
+                .unwrap_or_default();
+            let cut: Vec<usize> = taste_core::stretches::cut(buffered.clone())
+                .0
+                .iter()
+                .map(Vec::len)
+                .collect();
+            println!(
+                "probe roundtrip: the record cuts as the pane did: {} (pane {live_cut:?}, record {cut:?}); the record is the stretches' records: {}",
+                live_cut == cut,
+                recorded == buffered
+            );
+            println!(
+                "probe roundtrip: the stretch the live turn is in: {}",
+                pane.stretches.borrow().list.len() - 1
+            );
         });
     }
 
