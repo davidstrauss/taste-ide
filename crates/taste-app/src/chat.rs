@@ -7671,8 +7671,20 @@ impl ChatPane {
                     queue.push_back(i);
                 }
             }
-            // What the reader has left behind is not worth their wait.
-            queue.retain(|i| i.abs_diff(index) <= BUILD_REACH);
+            // What the reader has left behind is not worth their wait —
+            // judged by whether its item is still on screen, not by how far
+            // its index is from this one: the list keeps fifty or so items
+            // mapped, and a stretch on screen dropped for being twenty-five
+            // away from the last one mapped was never asked for again, a
+            // blank band where it should have been (2026-10-19).
+            let holders = self.holders.borrow();
+            queue.retain(|i| {
+                i.abs_diff(index) <= BUILD_REACH
+                    || holders
+                        .get(i)
+                        .and_then(|holder| holder.upgrade())
+                        .is_some_and(|holder| holder.is_mapped())
+            });
         }
         self.schedule_build();
     }
@@ -7739,6 +7751,11 @@ impl ChatPane {
                 break;
             }
         }
+        // Done with what was asked: anything still standing in on screen
+        // is asked for now, whatever was missed on the way.
+        if self.build_job.borrow().is_none() && self.build_queue.borrow().is_empty() {
+            self.want_placeholders_on_screen();
+        }
         let more = self.build_job.borrow().is_some() || !self.build_queue.borrow().is_empty();
         self.build_last.set(more.then(std::time::Instant::now));
         if more {
@@ -7772,6 +7789,34 @@ impl ChatPane {
         let at = (0..queue.len())
             .min_by(|a, b| distance(&queue[*a]).total_cmp(&distance(&queue[*b])))?;
         queue.remove(at)
+    }
+
+    /// Every bound item on screen still showing its placeholder, wanted.
+    fn want_placeholders_on_screen(&self) {
+        let undrawn: Vec<usize> = {
+            let holders = self.holders.borrow();
+            let stretches = self.stretches.borrow();
+            holders
+                .iter()
+                .filter(|(index, holder)| {
+                    stretches
+                        .list
+                        .get(**index)
+                        .is_some_and(|stretch| stretch.rows.is_none())
+                        && holder.upgrade().is_some_and(|holder| holder.is_mapped())
+                })
+                .map(|(index, _)| *index)
+                .collect()
+        };
+        if undrawn.is_empty() {
+            return;
+        }
+        let mut queue = self.build_queue.borrow_mut();
+        for index in undrawn {
+            if !queue.contains(&index) {
+                queue.push_back(index);
+            }
+        }
     }
 
     /// A job to draw stretch `index`, or `None` when it is drawn already.
@@ -14127,6 +14172,17 @@ impl ChatPane {
             }
             glib::timeout_future(std::time::Duration::from_millis(800)).await;
             report(&pane, &format!("at the top after {steps} pages"), &held);
+            // A fling: twenty jumps a frame apart, nothing waited for, and
+            // then whether anything on screen is still standing in.
+            for n in 1..=20 {
+                adjustment.set_value(adjustment.upper() * f64::from(n) / 40.0);
+                glib::timeout_future(std::time::Duration::from_millis(16)).await;
+            }
+            glib::timeout_future(std::time::Duration::from_secs(3)).await;
+            println!(
+                "probe history: after a fling, placeholders on screen: {:?}",
+                pane.placeholders_on_screen()
+            );
             adjustment.set_value(adjustment.upper() / 2.0);
             glib::timeout_future(std::time::Duration::from_millis(800)).await;
             report(&pane, "jumped to the middle", &held);
