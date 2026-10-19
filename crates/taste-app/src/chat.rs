@@ -1093,6 +1093,10 @@ pub struct ChatPane {
     /// The list is on its way to the end at our asking (`pin_to_end`): its
     /// own scrolling there is not the reader scrolling away.
     pinning: Rc<Cell<bool>>,
+    /// When the reader last scrolled — the wheel, the touchpad, the
+    /// scrollbar, the keys — so the list moving its own content is told
+    /// from the reader moving the view (`at_bottom`'s handler).
+    reader_scrolled: Rc<Cell<Option<std::time::Instant>>>,
     /// Permission outcomes still looking for their tool card, keyed by tool
     /// call id: the request can arrive before the update that creates the
     /// card, so the mark waits here until there is something to put it on.
@@ -3797,6 +3801,7 @@ impl ChatPane {
             open_jump_down: open_jump_down.clone(),
             scroll_pending: Rc::new(Cell::new(false)),
             pinning: Rc::new(Cell::new(false)),
+            reader_scrolled: Rc::new(Cell::new(None)),
             mode_sync: RefCell::new(None),
             controls_signature: RefCell::new(None),
             config_options: RefCell::new(Vec::new()),
@@ -3929,6 +3934,8 @@ impl ChatPane {
             let stick = pane.stick_to_bottom.clone();
             let banner = jump_banner.clone();
             let pinning = pane.pinning.clone();
+            let reader = pane.reader_scrolled.clone();
+            let list = pane.list.clone();
             adjustment.connect_value_changed(move |adjustment| {
                 let bottom = at_bottom(adjustment);
                 // On the way to the end at our asking: still following it.
@@ -3937,12 +3944,75 @@ impl ChatPane {
                     return;
                 }
                 pinning.set(false);
+                // Only the reader turns following off. The list moves the
+                // view itself — holding the reader's place as it measures
+                // what it had estimated — and taken for the reader that
+                // turned following off at the bottom, and the tail was
+                // left behind by the next line (David, 2026-10-19: "It's
+                // also not staying attached to the bottom of the chat even
+                // though I keep scrolling there").
+                let by_reader = reader
+                    .get()
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(700));
+                if !by_reader {
+                    if bottom {
+                        stick.set(true);
+                        banner.set_reveal_child(false);
+                    } else if stick.get() {
+                        let (list, adjustment, pinning) =
+                            (list.clone(), adjustment.clone(), pinning.clone());
+                        glib::idle_add_local_once(move || {
+                            pin_to_end(&list, &adjustment, &pinning);
+                        });
+                    }
+                    return;
+                }
                 stick.set(bottom);
                 if bottom {
                     // Arrived under their own steam: nothing left to offer.
                     banner.set_reveal_child(false);
                 }
             });
+            // The reader's own scrolling, wherever it comes from.
+            {
+                let mark = |reader: &Rc<Cell<Option<std::time::Instant>>>| {
+                    reader.set(Some(std::time::Instant::now()))
+                };
+                let wheel = gtk::EventControllerScroll::new(
+                    gtk::EventControllerScrollFlags::BOTH_AXES
+                        | gtk::EventControllerScrollFlags::KINETIC,
+                );
+                wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let reader = pane.reader_scrolled.clone();
+                wheel.connect_scroll(move |_, _, _| {
+                    mark(&reader);
+                    glib::Propagation::Proceed
+                });
+                let reader = pane.reader_scrolled.clone();
+                wheel.connect_decelerate(move |_, _, _| mark(&reader));
+                pane.transcript_scroller.add_controller(wheel);
+                let drag = gtk::GestureDrag::new();
+                drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let reader = pane.reader_scrolled.clone();
+                drag.connect_drag_begin(move |_, _, _| mark(&reader));
+                let reader = pane.reader_scrolled.clone();
+                drag.connect_drag_update(move |_, _, _| mark(&reader));
+                pane.transcript_scroller.vscrollbar().add_controller(drag);
+                let keys = gtk::EventControllerKey::new();
+                keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let reader = pane.reader_scrolled.clone();
+                keys.connect_key_pressed(move |_, key, _, _| {
+                    use gtk::gdk::Key;
+                    if matches!(
+                        key,
+                        Key::Page_Up | Key::Page_Down | Key::Home | Key::End | Key::Up | Key::Down
+                    ) {
+                        mark(&reader);
+                    }
+                    glib::Propagation::Proceed
+                });
+                pane.transcript_scroller.add_controller(keys);
+            }
             // Growth in `upper` is new content; a change in `page-size`
             // alone is the viewport resizing. Only the former is worth
             // announcing, or the banner would fire every time the composer
@@ -14226,6 +14296,33 @@ impl ChatPane {
         glib::spawn_future_local(async move {
             for second in [2, 4, 8, 12] {
                 glib::timeout_future(std::time::Duration::from_secs(2)).await;
+                if second == 8 {
+                    // New rows at the tail and stretches above let go and
+                    // drawn again: the list moves the view itself, and
+                    // following must hold through it.
+                    for n in 0..30 {
+                        pane.meta_row(&format!("probe: a new step at the bottom ({n})"));
+                    }
+                    let drawn: Vec<usize> = pane
+                        .stretches
+                        .borrow()
+                        .list
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.rows.is_some())
+                        .map(|(i, _)| i)
+                        .collect();
+                    for index in drawn.iter().rev().skip(3).take(4) {
+                        pane.let_go_of(*index);
+                    }
+                    glib::timeout_future(std::time::Duration::from_millis(1500)).await;
+                    let adjustment = pane.transcript_scroller.vadjustment();
+                    println!(
+                        "probe kept: after new rows and stretches redrawn: at the bottom {}, following {}",
+                        at_bottom(&adjustment),
+                        pane.stick_to_bottom.get()
+                    );
+                }
                 let stretches = pane.stretches.borrow();
                 let drawn = stretches.list.iter().filter(|s| s.rows.is_some()).count();
                 let mapped = stretches
