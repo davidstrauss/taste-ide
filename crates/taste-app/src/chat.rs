@@ -7515,10 +7515,13 @@ impl ChatPane {
         }
     }
 
-    /// Where `item` stands against what the list has drawn, when it is not
-    /// drawn itself: above all of it (`Less`), below (`Greater`). Row ids
+    /// Where `item` stands against the rows on screen, when it is not on
+    /// screen itself: above them all (`Less`), below (`Greater`). Row ids
     /// run in the transcript's order, and a widget item stands just before
-    /// the first row after it.
+    /// the first row after it. Against the rows ON SCREEN, not the rows the
+    /// list has bound: it keeps a hundred or so either side of the view
+    /// bound and unmapped, and an item among those is off screen all the
+    /// same.
     fn side_of(&self, item: &Item) -> Option<std::cmp::Ordering> {
         let after = match item {
             Item::Row(id) => id + 1,
@@ -7532,16 +7535,30 @@ impl ChatPane {
                     .unwrap_or_else(|| self.model.borrow().next_id())
             }
         };
-        let bound = self.bound.borrow();
-        let first = bound.keys().min()?;
-        let last = bound.keys().max()?;
-        if *first >= after {
+        let (first, last) = self.rows_on_screen()?;
+        if first >= after {
             Some(std::cmp::Ordering::Less)
-        } else if *last < after {
+        } else if last < after {
             Some(std::cmp::Ordering::Greater)
         } else {
             Some(std::cmp::Ordering::Equal)
         }
+    }
+
+    /// The first and last rows reaching into the view.
+    fn rows_on_screen(&self) -> Option<(model::RowId, model::RowId)> {
+        let scroller: &gtk::Widget = self.transcript_scroller.upcast_ref();
+        let height = scroller.height() as f32;
+        let bound = self.bound.borrow();
+        let mut on = bound.iter().filter_map(|(id, (_, view))| {
+            if !view.widget.is_mapped() {
+                return None;
+            }
+            let bounds = view.widget.compute_bounds(scroller)?;
+            (bounds.y() + bounds.height() > 0.0 && bounds.y() < height).then_some(*id)
+        });
+        let first = on.next()?;
+        Some(on.fold((first, first), |(lo, hi), id| (lo.min(id), hi.max(id))))
     }
 
     /// Whether the transcript has a row: an item beside the foot.
@@ -10197,6 +10214,7 @@ impl ChatPane {
             .collect();
         let first = self.model.borrow().next_id();
         let count = records.len();
+        let started = std::time::Instant::now();
         let made = crate::runtime::runtime()
             .spawn_blocking(move || {
                 // A record written by an older protocol is skipped rather
@@ -10219,6 +10237,8 @@ impl ChatPane {
             self.drawing_history.set(false);
             return;
         };
+        let made_in = started.elapsed();
+        let started = std::time::Instant::now();
         self.clear_transcript();
         for record in state {
             if let Ok(update) = serde_json::from_value::<SessionUpdate>(record) {
@@ -10238,16 +10258,33 @@ impl ChatPane {
             }) => Some((id, pin_text(&user.text, &user.attachments))),
             _ => None,
         });
-        tracing::info!(
-            "chat {}: drawing its history of {count} record(s), {} row(s)",
-            self.environment,
-            items.len()
-        );
+        let rows = items.len();
         *self.model.borrow_mut() = history;
-        for (speaker, text) in lines {
+        // The mirror keeps its newest lines and counts the rest: only those
+        // are written, and the rest are counted as it would have.
+        let lines: Vec<(&'static str, String)> = lines
+            .into_iter()
+            .filter(|(_, text)| !text.trim().is_empty())
+            .collect();
+        let kept = lines.len().saturating_sub(MAX_TRANSCRIPT_MIRROR_LINES);
+        for (speaker, _) in &lines[..kept] {
+            if matches!(*speaker, "agent" | "tool") {
+                self.progress.count();
+            }
+        }
+        self.transcript_dropped
+            .set(self.transcript_dropped.get() + kept as u64);
+        for (speaker, text) in lines.into_iter().skip(kept) {
             self.record_line(speaker, &text);
         }
         self.insert_items(&items);
+        tracing::info!(
+            "chat {}: its history of {count} record(s) is {rows} row(s), made in {}ms and \
+             handed to the transcript in {}ms",
+            self.environment,
+            made_in.as_millis(),
+            started.elapsed().as_millis()
+        );
         if let Some((id, text)) = prompt {
             *self.last_prompt.borrow_mut() = Some(Item::Row(id));
             self.pinned_prompt_label.set_label(&text);
@@ -11795,6 +11832,9 @@ impl ChatPane {
         let scroller: &gtk::Widget = self.transcript_scroller.upcast_ref();
         let mut top: Option<(f32, String)> = None;
         for (_, view) in self.bound.borrow().values() {
+            if !view.widget.is_mapped() {
+                continue;
+            }
             let Some(bounds) = view.widget.compute_bounds(scroller) else {
                 continue;
             };
@@ -11813,17 +11853,22 @@ impl ChatPane {
             .unwrap_or_default()
     }
 
+    /// TASTE_PROBE_CHECK only: a row the list has bound a little above the
+    /// first on screen.
+    fn row_above_view(&self) -> Option<model::RowId> {
+        let (first, _) = self.rows_on_screen()?;
+        self.bound
+            .borrow()
+            .keys()
+            .copied()
+            .filter(|id| *id + 2 < first)
+            .max()
+    }
+
     /// TASTE_PROBE_CHECK only: whether the view shows nothing drawn — a
     /// transcript with rows, and none of them on screen.
     fn probe_blank(&self) -> bool {
-        let scroller: &gtk::Widget = self.transcript_scroller.upcast_ref();
-        let height = scroller.height() as f32;
-        self.has_rows()
-            && !self.bound.borrow().values().any(|(_, view)| {
-                view.widget
-                    .compute_bounds(scroller)
-                    .is_some_and(|b| b.y() + b.height() > 0.0 && b.y() < height)
-            })
+        self.has_rows() && self.rows_on_screen().is_none()
     }
 
     /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=kept` writes a stash
@@ -12236,6 +12281,9 @@ impl ChatPane {
             ids.sort();
             ids.into_iter().find_map(|id| {
                 let (_, view) = bound.get(id)?;
+                if !view.widget.is_mapped() {
+                    return None;
+                }
                 let bounds = view.widget.compute_bounds(&pane.transcript_scroller)?;
                 (bounds.y() + bounds.height() > 0.0)
                     .then(|| (format!("row {id}"), f64::from(bounds.y())))
@@ -12324,35 +12372,28 @@ impl ChatPane {
                 ),
                 (
                     "a row above the view grown taller",
-                    Box::new(|pane: &Rc<ChatPane>| {
-                        let scroller = pane.transcript_scroller.clone();
-                        let above = pane.bound.borrow().values().find_map(|(holder, view)| {
-                            let bounds = view.widget.compute_bounds(&scroller)?;
-                            (bounds.y() + bounds.height() < 0.0)
-                                .then(|| holder.upgrade())
-                                .flatten()
-                        });
-                        if let Some(holder) = above {
+                    Box::new(|pane: &Rc<ChatPane>| match pane.row_above_view() {
+                        Some(id) => {
+                            let holder = pane
+                                .bound
+                                .borrow()
+                                .get(&id)
+                                .and_then(|(holder, _)| holder.upgrade());
                             let lines: Vec<String> = (0..12)
                                 .map(|n| format!("probe: a line above the reader ({n})"))
                                 .collect();
-                            holder.append(&gtk::Label::new(Some(&lines.join("\n"))));
-                        } else {
-                            println!("probe anchor: no row above the view is drawn");
+                            if let Some(holder) = holder {
+                                holder.append(&gtk::Label::new(Some(&lines.join("\n"))));
+                            }
                         }
+                        None => println!("probe anchor: no row above the view is bound"),
                     }),
                 ),
                 (
-                    "a row above the view drawn again",
-                    Box::new(|pane: &Rc<ChatPane>| {
-                        let scroller = pane.transcript_scroller.clone();
-                        let above = pane.bound.borrow().iter().find_map(|(id, (_, view))| {
-                            let bounds = view.widget.compute_bounds(&scroller)?;
-                            (bounds.y() + bounds.height() < 0.0).then_some(*id)
-                        });
-                        if let Some(id) = above {
-                            pane.rebuild_row(id);
-                        }
+                    "a row above the view built again",
+                    Box::new(|pane: &Rc<ChatPane>| match pane.row_above_view() {
+                        Some(id) => pane.rebuild_row(id),
+                        None => println!("probe anchor: no row above the view is bound"),
                     }),
                 ),
                 (
@@ -12830,18 +12871,25 @@ impl ChatPane {
         // screen, the second is rows that have all been shown before.
         let going_up = Cell::new(false);
         let down_frames: RefCell<Vec<(f64, f64)>> = RefCell::new(Vec::new());
+        // A list's extent is its estimate until it has measured every row,
+        // so the end it is scrolled towards moves as it goes: each way ends
+        // at the end or after as many frames as the length should take,
+        // twice over, whichever is first.
+        let ticks = Cell::new(0u32);
         self.transcript_scroller.add_tick_callback(move |_, clock| {
             let bottom = adjustment.upper() - adjustment.page_size();
+            ticks.set(ticks.get() + 1);
             if !going_up.get() {
-                if adjustment.value() < bottom {
+                if adjustment.value() < bottom && ticks.get() < 480 {
                     adjustment.set_value((adjustment.value() + step).min(bottom));
                     return glib::ControlFlow::Continue;
                 }
                 going_up.set(true);
+                ticks.set(0);
                 *down_frames.borrow_mut() = std::mem::take(&mut *frames.borrow_mut());
                 return glib::ControlFlow::Continue;
             }
-            if adjustment.value() > 0.0 {
+            if adjustment.value() > 0.0 && ticks.get() < 480 {
                 adjustment.set_value((adjustment.value() - step).max(0.0));
                 return glib::ControlFlow::Continue;
             }
