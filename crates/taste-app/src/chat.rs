@@ -663,10 +663,24 @@ fn estimate_height(records: &[serde_json::Value]) -> f64 {
         }
     }
     let lines = |chars: usize, per: f64| (chars as f64 / per).ceil();
+    // Something to draw is never no space: a run of hidden stretches
+    // estimated at nothing has a spacer nothing is ever near.
+    if !records.is_empty() {
+        px = px.max(24.0);
+    }
     if asked > 0 {
         px += 48.0 + 22.0 * lines(asked, 48.0);
     }
     px + 22.0 * lines(said, 64.0)
+}
+
+/// The record of one block of the user's message: the update a replay
+/// brings it back as.
+fn user_record(block: &ContentBlock) -> serde_json::Value {
+    serde_json::to_value(SessionUpdate::UserMessageChunk(
+        agent_client_protocol::schema::v1::ContentChunk::new(block.clone()),
+    ))
+    .unwrap_or_default()
 }
 
 /// Whether `update` draws rows, rather than setting the chat's state.
@@ -1265,6 +1279,16 @@ pub struct ChatPane {
     /// Where `append_row` puts the next row while a stretch is drawn back.
     insert_at: Cell<Option<i32>>,
     reconcile_pending: Cell<bool>,
+    /// Drawing from the record, this moment ([`ChatPane::as_recorded`]).
+    from_record: Cell<bool>,
+    /// A prompt's records and rows being gathered (`send_blocks`).
+    holding: RefCell<Option<Unrecorded>>,
+    /// The stash's reads and writes, in the order they were asked for
+    /// ([`ChatPane::archive_io`]).
+    archive_io: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// What waits for a restored history to be drawn: the actions `Ready`
+    /// runs last, which can send.
+    after_history: Cell<bool>,
     /// The session whose whole history this machine's stash holds, read
     /// once off the main thread and kept as the stash is marked: what a
     /// reconnect may `session/resume` rather than replay.
@@ -1465,10 +1489,23 @@ struct PendingPrompt {
     /// Went out inside the prompt ahead of it (`SessionEvent::QueuedJoined`),
     /// so the turn that ends that one ends this too.
     joined: bool,
-    /// The user's blocks, recorded when the agent takes them
-    /// ([`ChatPane::accept_queued`]) rather than when they were typed
-    /// behind a turn: the record is in the conversation's order.
-    unrecorded: Vec<ContentBlock>,
+    /// What this prompt puts in the record, held until the agent starts
+    /// on it ([`ChatPane::record_taken`]).
+    unrecorded: Unrecorded,
+}
+
+/// A prompt's records — the user's message as a replay would bring it
+/// back, then the IDE's notes about its briefing — and the rows drawn for
+/// those notes, held until the agent starts on the prompt: its first
+/// update, or its turn's end. Recorded when it is typed, a message sent
+/// during a turn sat in the middle of that turn, where the agent's own
+/// history does not have it; and a prompt the agent refused, or never
+/// got, stayed in the record and came back on every redraw, twice once
+/// it was sent again.
+#[derive(Default)]
+struct Unrecorded {
+    records: Vec<serde_json::Value>,
+    rows: Vec<gtk::ListBoxRow>,
 }
 
 /// Where an unfinished prompt goes when the process holding it dies.
@@ -3762,6 +3799,10 @@ impl ChatPane {
             stretches: RefCell::new(Stretches::default()),
             insert_at: Cell::new(None),
             reconcile_pending: Cell::new(false),
+            from_record: Cell::new(false),
+            holding: RefCell::new(None),
+            archive_io: RefCell::new(None),
+            after_history: Cell::new(false),
             stash_session: RefCell::new(None),
             replay_record: RefCell::new(Vec::new()),
             needs_auth: Cell::new(false),
@@ -4194,7 +4235,7 @@ impl ChatPane {
             queued: None,
             origin: None,
             joined: false,
-            unrecorded: Vec::new(),
+            unrecorded: Unrecorded::default(),
         });
         *self.capture.borrow_mut() = Some((String::new(), on_done));
         let result = match self.client.borrow().as_ref() {
@@ -4444,9 +4485,6 @@ impl ChatPane {
         let result = self.send_blocks(blocks, written.clone());
         match result {
             Ok(unrecorded) => {
-                if unrecorded.is_empty() {
-                    self.claim_row(&card);
-                }
                 self.mark_session_content();
                 let queued = written.is_some();
                 let badge = written.map(|written| {
@@ -5594,9 +5632,6 @@ impl ChatPane {
             let result = self.send_blocks(blocks, Some(item.written.clone()));
             match result {
                 Ok(unrecorded) => {
-                    if unrecorded.is_empty() {
-                        self.claim_row(&card);
-                    }
                     self.mark_session_content();
                     badge.set_label("queued — sends when the current turn ends");
                     if behind_a_turn {
@@ -7084,29 +7119,25 @@ impl ChatPane {
 
     /// Hand a prompt to the agent, briefing and all; `written` when it may
     /// wait behind a turn, for the note it then goes out after. Hands back
-    /// the user's blocks still to be recorded: none when the agent takes
-    /// them now, all of them when they wait behind a turn, for
-    /// [`Self::accept_queued`] to record when it does.
+    /// what the prompt puts in the record, for when the agent starts on it
+    /// ([`Unrecorded`]).
     fn send_blocks(
         &self,
         blocks: Vec<ContentBlock>,
         written: Option<taste_core::queued::Queued>,
-    ) -> anyhow::Result<Vec<ContentBlock>> {
-        // The user's message, as a replay would bring it back — the
-        // updates `session/load` sends for it — so the record holds what
-        // the user said and not only what the agent answered. Before the
-        // briefing, which is the IDE's and is recorded as its notes; and
-        // where the agent takes it, which for a message sent during a turn
-        // is after that turn, as the agent's own history has it.
-        // The same test `written_now` makes: a turn is running.
-        let behind_a_turn = self.stop_button.get_visible();
-        let unrecorded = if behind_a_turn {
-            blocks.clone()
-        } else {
-            self.record_user_blocks(&blocks);
-            Vec::new()
+    ) -> anyhow::Result<Unrecorded> {
+        // The user's message as the updates `session/load` sends for it, so
+        // the record holds what the user said and not only what the agent
+        // answered; then the briefing's notes, which are the IDE's.
+        let mut unrecorded = Unrecorded {
+            records: blocks.iter().map(user_record).collect(),
+            rows: Vec::new(),
         };
+        *self.holding.borrow_mut() = Some(Unrecorded::default());
         let blocks = self.with_briefing(blocks);
+        let held = self.holding.borrow_mut().take().unwrap_or_default();
+        unrecorded.records.extend(held.records);
+        unrecorded.rows.extend(held.rows);
         match (self.client.borrow().as_ref(), written) {
             (Some(client), Some(written)) => client.prompt_blocks_queued(blocks, written),
             (Some(client), None) => client.prompt_blocks(blocks),
@@ -7115,17 +7146,40 @@ impl ChatPane {
         .map(|()| unrecorded)
     }
 
-    /// Record the user's `blocks` as the user message they are, and write
-    /// it now rather than with the turn: a message the IDE closed over is
-    /// still the user's.
-    fn record_user_blocks(&self, blocks: &[ContentBlock]) {
-        for block in blocks {
-            let chunk = SessionUpdate::UserMessageChunk(
-                agent_client_protocol::schema::v1::ContentChunk::new(block.clone()),
-            );
-            self.stash_update(&chunk);
+    /// The agent has started on the prompt at the front, and on any that
+    /// went out joined to it: their records go in, ahead of the agent's,
+    /// and their rows into the stretch the message begins.
+    fn record_taken(&self) {
+        let taken: Vec<(Unrecorded, gtk::Box)> = {
+            let mut pending = self.pending_prompts.borrow_mut();
+            pending
+                .iter_mut()
+                .enumerate()
+                .take_while(|(index, prompt)| *index == 0 || prompt.joined)
+                .filter(|(_, prompt)| !prompt.unrecorded.records.is_empty())
+                .map(|(_, prompt)| (std::mem::take(&mut prompt.unrecorded), prompt.card.clone()))
+                .collect()
+        };
+        if taken.is_empty() {
+            return;
         }
+        for (unrecorded, card) in taken {
+            self.commit_unrecorded(unrecorded, &card);
+        }
+        // Written now rather than with the turn: a message the IDE closed
+        // over is still the user's.
         self.flush_stash();
+    }
+
+    /// `unrecorded` into the record, and its card's row and note rows into
+    /// the stretch its message begins.
+    fn commit_unrecorded(&self, unrecorded: Unrecorded, card: &gtk::Box) {
+        for record in unrecorded.records {
+            self.record(record);
+        }
+        let mut rows = unrecorded.rows;
+        rows.extend(card.parent().and_downcast::<gtk::ListBoxRow>());
+        self.claim_rows(&rows);
     }
 
     /// What the IDE puts ahead of a prompt so the agent does not have to
@@ -7345,6 +7399,9 @@ impl ChatPane {
         }
         self.transcript_rows.set(self.transcript_rows.get() + 1);
         self.stretches.borrow_mut().adopt(&row);
+        if let Some(held) = self.holding.borrow_mut().as_mut() {
+            held.rows.push(row.clone());
+        }
         if self.insert_at.get().is_none() {
             self.trim_transcript();
         }
@@ -7536,6 +7593,7 @@ impl ChatPane {
             (records, followed)
         };
         let (records, followed) = records;
+        let was = self.from_record.replace(true);
         let mut drawing = Drawing::default();
         self.swap_drawing(&mut drawing);
         // Its rail as the turn drew it: on from the step before it, and
@@ -7559,6 +7617,7 @@ impl ChatPane {
         self.drawing_past.set(false);
         self.drawing_history.set(false);
         self.swap_drawing(&mut drawing);
+        self.from_record.set(was);
         self.insert_at.set(None);
         self.stretches.borrow_mut().drawing = None;
         self.respace();
@@ -7596,6 +7655,16 @@ impl ChatPane {
         self.doc_rows
             .borrow_mut()
             .retain(|_, row| row.parent().as_ref() == Some(parent));
+        // The pin's prompt let go: the pin has nothing to jump to.
+        let stale = self
+            .last_prompt_row
+            .borrow()
+            .as_ref()
+            .filter(|row| row.parent().as_ref() != Some(parent))
+            .map(|row| row.clone().upcast::<gtk::Widget>());
+        if let Some(row) = stale {
+            self.forget_prompt_row(&row);
+        }
         if self
             .lit_doc_row
             .borrow()
@@ -8337,6 +8406,10 @@ impl ChatPane {
     /// actually reported as running. Everything else keeps saying "Working…",
     /// which is the truth when the model is writing.
     fn set_activity(&self, title: &str) {
+        // A step drawn from the record is not what is happening now.
+        if self.drawing_history.get() {
+            return;
+        }
         let text = single_line(title, 72);
         *self.activity.borrow_mut() = if text.is_empty() {
             BUSY_IDLE.to_string()
@@ -8438,17 +8511,21 @@ impl ChatPane {
             let mut pending = self.pending_prompts.borrow_mut();
             pending.get_mut(index).and_then(|prompt| {
                 let card = prompt.card.clone();
-                let unrecorded = std::mem::take(&mut prompt.unrecorded);
-                prompt
-                    .queued
-                    .take()
-                    .map(|queued| (card, queued, unrecorded))
+                let queued = prompt.queued.take()?;
+                // After the note it goes out after, as the agent has it, so
+                // a redraw draws it as the card it was, badge and all, and
+                // several that went out together as cards of their own
+                // (`draw_user_message`).
+                if !prompt.unrecorded.records.is_empty() {
+                    let note = ContentBlock::Text(TextContent::new(queued.1.note()));
+                    prompt.unrecorded.records.insert(0, user_record(&note));
+                }
+                Some((card, queued))
             })
         };
-        let Some((card, (badge, written), unrecorded)) = accepted else {
+        let Some((card, (badge, written))) = accepted else {
             return;
         };
-        self.record_user_blocks(&unrecorded);
         // The card was appended where the prompt was TYPED, which is not
         // where it joins the conversation — a whole turn's output has
         // landed in between. Move it to the end and leave a marker behind.
@@ -8872,9 +8949,12 @@ impl ChatPane {
             // paragraph, and a pasted log would pin ten lines of itself.
             single_line(text, 600)
         };
-        self.pinned_prompt_label.set_label(&pin_text);
         self.last_prompt_row.replace(Some(row));
-        self.pinned_float.set_visible(false);
+        // A prompt drawn back above the reader is not the newest.
+        if !self.drawing_past.get() {
+            self.pinned_prompt_label.set_label(&pin_text);
+            self.pinned_float.set_visible(false);
+        }
         card
     }
 
@@ -10057,9 +10137,6 @@ impl ChatPane {
         let result = self.send_blocks(blocks, written.clone());
         match result {
             Ok(unrecorded) => {
-                if unrecorded.is_empty() {
-                    self.claim_row(&card);
-                }
                 self.mark_session_content();
                 // Sending mid-turn is fine: the session layer queues it.
                 // Say so on the card until its turn starts.
@@ -10311,15 +10388,21 @@ impl ChatPane {
                 let replay = std::mem::take(&mut *self.replay_record.borrow_mut());
                 if !restored {
                     self.mark_session(&session_id);
-                } else if replayed {
-                    self.replace_record(&session_id, replay.clone());
-                    self.clear_on_replay.set(false);
-                    self.restore_history(replay);
                 } else {
+                    // Events wait from here until the history is drawn
+                    // (the event loop holds while it is): what the agent
+                    // says next is after it, and its rows must not be
+                    // cleared away by it.
+                    self.drawing_history.set(true);
                     // The old rendering stays until the record replaces
                     // it, rather than a blank while the record is read.
                     self.clear_on_replay.set(false);
-                    self.draw_kept_history(&session_id);
+                    if replayed {
+                        self.replace_record(&session_id, replay.clone());
+                        self.restore_history(replay);
+                    } else {
+                        self.draw_kept_history(&session_id);
+                    }
                 }
                 *self.session_info.borrow_mut() = Some((agent_id, session_id));
                 // A restored session has history on disk by definition; a
@@ -10375,18 +10458,11 @@ impl ChatPane {
                 // setting look like it evaporated between launches.
                 self.apply_preferred_mode();
                 self.touch();
-                // Whoever was waiting for this session to come up — today,
-                // an orchestrator's `chat_create` — runs now, once, after
-                // the controls have applied this chat's model.
-                if let Some(action) = self.on_ready_once.borrow_mut().take() {
-                    action(self.clone());
+                if restored {
+                    self.after_history.set(true);
+                } else {
+                    self.after_ready();
                 }
-                // ...and so does anything held for an agent to exist. This
-                // is the other end of the wait from `on_environment_state`:
-                // an agent that died on its way up (a container podman will
-                // not exec into yet) comes back through the reconnect, and
-                // no lifecycle event marks the moment (i-0011).
-                self.flush_revive_queue();
             }
             SessionEvent::Update(update) => {
                 // A replay is the history, drawn whole once it is all here
@@ -10397,6 +10473,7 @@ impl ChatPane {
                     }
                     return;
                 }
+                self.record_taken();
                 self.stash_update(&update);
                 self.render_update(update)
             }
@@ -10466,6 +10543,8 @@ impl ChatPane {
                 // A turn asked for is a turn given: whatever ask is still
                 // out was for this one.
                 self.end_nudge();
+                // A turn that said nothing still took its prompt.
+                self.record_taken();
                 // The turn is the commit boundary for both durable
                 // things this chat produces: its transcript, and the work
                 // the agent just did to the checkout.
@@ -11862,26 +11941,41 @@ impl ChatPane {
     /// replay or a reconnect draws is special-cased by where it came from.
     /// Nothing is recorded while a record is being drawn back.
     fn record(&self, value: serde_json::Value) {
-        if self.replaying.get() || self.drawing_history.get() {
+        if self.replaying.get() || self.from_record.get() {
+            return;
+        }
+        if let Some(held) = self.holding.borrow_mut().as_mut() {
+            held.records.push(value);
             return;
         }
         self.stretches.borrow_mut().read(&value);
         self.archive_buffer.borrow_mut().push(value);
     }
 
-    /// The row `card` is in, moved into the last stretch: a prompt's card
-    /// is drawn before its message is recorded, and the message begins the
-    /// stretch the card belongs to.
-    fn claim_row(&self, card: &gtk::Box) {
-        let Some(row) = card.parent().and_downcast::<gtk::ListBoxRow>() else {
-            return;
-        };
+    /// Run `draw` as drawing from the record: what it draws is recorded
+    /// already. Scoped to the synchronous drawing itself, never across an
+    /// await, so a message sent or a note written while a history is being
+    /// drawn is still recorded.
+    fn as_recorded<T>(&self, draw: impl FnOnce() -> T) -> T {
+        let was = self.from_record.replace(true);
+        let out = draw();
+        self.from_record.set(was);
+        out
+    }
+
+    /// `rows`, moved into the last stretch: a prompt's card and notes are
+    /// drawn before its message is recorded, and the message begins the
+    /// stretch they belong to.
+    fn claim_rows(&self, rows: &[gtk::ListBoxRow]) {
         let mut stretches = self.stretches.borrow_mut();
         for stretch in &mut stretches.list {
-            stretch.rows.retain(|kept| kept != &row);
+            stretch.rows.retain(|kept| !rows.contains(kept));
         }
         if let Some(last) = stretches.list.last_mut() {
-            last.rows.push(row);
+            last.rows.extend(rows.iter().cloned());
+            // In the order they stand in, which every reading of a
+            // stretch's rows assumes.
+            last.rows.sort_by_key(|row| row.index());
         }
     }
 
@@ -11893,8 +11987,10 @@ impl ChatPane {
             return;
         }
         if let Some(note) = value.get(NOTE_RECORD).and_then(serde_json::Value::as_str) {
-            self.finalize_stream();
-            self.meta_row(note);
+            self.as_recorded(|| {
+                self.finalize_stream();
+                self.meta_row(note);
+            });
             return;
         }
         // A record written by an older protocol is skipped rather than
@@ -11905,7 +12001,7 @@ impl ChatPane {
                 return;
             }
             // A stash written before `without_nul` may hold one.
-            self.render_update(nul_free(update));
+            self.as_recorded(|| self.render_update(nul_free(update)));
         }
     }
 
@@ -11961,8 +12057,10 @@ impl ChatPane {
             self.draw_record(record);
             pacer.breathe().await;
         }
-        self.finalize_stream();
-        self.settle_running_steps();
+        self.as_recorded(|| {
+            self.finalize_stream();
+            self.settle_running_steps();
+        });
         self.drawing_history.set(false);
         self.respace();
         self.trim_transcript();
@@ -11974,9 +12072,36 @@ impl ChatPane {
         let pane = self.clone();
         glib::spawn_future_local(async move {
             pane.clone().draw_history(records).await;
-            pane.reattach_pending_cards();
-            pane.settle_replayed_replies(true);
+            pane.history_drawn();
         });
+    }
+
+    /// A restored session's history is on screen: what a replay's end does
+    /// in `Ready`, for this history's end, and what `Ready` held for it.
+    fn history_drawn(self: &Rc<Self>) {
+        self.reattach_pending_cards();
+        self.settle_replayed_replies(true);
+        if self.after_history.replace(false) {
+            self.after_ready();
+        }
+    }
+
+    /// The last of `Ready`: whoever was waiting for the session, and the
+    /// messages held for an agent. After a restored history is drawn, not
+    /// before: what they send is answered after it.
+    fn after_ready(self: &Rc<Self>) {
+        // Whoever was waiting for this session to come up — today, an
+        // orchestrator's `chat_create` — runs now, once, after the
+        // controls have applied this chat's model.
+        if let Some(action) = self.on_ready_once.borrow_mut().take() {
+            action(self.clone());
+        }
+        // ...and so does anything held for an agent to exist. This is the
+        // other end of the wait from `on_environment_state`: an agent that
+        // died on its way up (a container podman will not exec into yet)
+        // comes back through the reconnect, and no lifecycle event marks
+        // the moment (i-0011).
+        self.flush_revive_queue();
     }
 
     /// Put this machine's stashed conversation on screen when the agent
@@ -11999,12 +12124,10 @@ impl ChatPane {
         if self.stash_replayed.replace(true) {
             return;
         }
-        let archive = self.chat_archive();
-        let env = self.environment.clone();
+        let read = self.archive_io(|archive, env| archive.load(env));
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let handle = crate::runtime::runtime().spawn_blocking(move || archive.load(&env));
-            let Ok(loaded) = handle.await else { return };
+            let Some(loaded) = read.await else { return };
             let Some(pane) = weak.upgrade() else { return };
             if loaded.is_empty() {
                 return;
@@ -12041,9 +12164,9 @@ impl ChatPane {
             // Not recorded: the conversation it is about is not this
             // session's, and the session's record began without it.
             if pane.transcript_rows.get() != 0 {
-                pane.drawing_history.set(true);
-                pane.meta_row("restored from this machine; the agent does not remember it");
-                pane.drawing_history.set(false);
+                pane.as_recorded(|| {
+                    pane.meta_row("restored from this machine; the agent does not remember it")
+                });
             }
         });
     }
@@ -12124,20 +12247,53 @@ impl ChatPane {
         }
     }
 
+    /// Run `work` on the stash off the main thread, after every piece of
+    /// stash work asked for before it: an append, a mark, a replace, and
+    /// the read a redraw makes land in the order they were asked for,
+    /// whichever blocking thread each gets. Unordered, a short append beat
+    /// the replace asked for ahead of it and was overwritten, and a read
+    /// missed what a flush just ahead of it was still writing.
+    fn archive_io<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&taste_core::chatarchive::ChatArchive, &EnvironmentId) -> T + Send + 'static,
+    ) -> impl std::future::Future<Output = Option<T>> {
+        let archive = self.chat_archive();
+        let env = self.environment.clone();
+        let previous = self.archive_io.borrow_mut().take();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = crate::runtime::runtime().spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            if let Ok(out) = tokio::task::spawn_blocking(move || work(&archive, &env)).await {
+                let _ = tx.send(out);
+            }
+        });
+        *self.archive_io.borrow_mut() = Some(handle);
+        async move { rx.await.ok() }
+    }
+
+    /// [`Self::archive_io`] for a write nothing waits on: its place in the
+    /// order is taken now, and the work runs whether or not anyone awaits.
+    fn archive_write(
+        &self,
+        work: impl FnOnce(&taste_core::chatarchive::ChatArchive, &EnvironmentId) + Send + 'static,
+    ) {
+        drop(self.archive_io(work));
+    }
+
     /// Replace the stash with `session`'s history as a load replayed it,
     /// off the main thread: what the live stash lacked, it now has, and the
     /// next reconnect resumes without a replay.
     fn replace_record(&self, session: &str, replay: Vec<serde_json::Value>) {
         // What streamed since the replay ended is after it.
         let since = std::mem::take(&mut *self.archive_buffer.borrow_mut());
-        let archive = self.chat_archive();
-        let env = self.environment.clone();
         let id = session.to_string();
         *self.stash_session.borrow_mut() = Some(id.clone());
-        crate::runtime::runtime().spawn_blocking(move || {
+        self.archive_write(move |archive, env| {
             let replaced = archive
-                .replace(&env, &id, replay)
-                .and_then(|()| archive.append_all(&env, since));
+                .replace(env, &id, replay)
+                .and_then(|()| archive.append_all(env, since));
             if let Err(e) = replaced {
                 tracing::warn!("recording {env}'s conversation from its replay: {e:#}");
             }
@@ -12147,31 +12303,28 @@ impl ChatPane {
     /// Draw `session`'s history from this machine's record of it: a resumed
     /// session has no replay, and its conversation is what was kept.
     fn draw_kept_history(self: &Rc<Self>, session: &str) {
-        let archive = self.chat_archive();
-        let env = self.environment.clone();
+        // What is still buffered — a turn cut off, the IDE's note that it
+        // was — is part of it, and is read back after it is written.
+        self.flush_stash();
         let id = session.to_string();
+        let read = self.archive_io(move |archive, env| {
+            archive
+                .load(env)
+                .session(&id)
+                .map(|records| {
+                    records
+                        .into_iter()
+                        .map(|r| r.update.clone())
+                        .collect::<Vec<serde_json::Value>>()
+                })
+                .unwrap_or_default()
+        });
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let read = crate::runtime::runtime()
-                .spawn_blocking(move || {
-                    let loaded = archive.load(&env);
-                    loaded
-                        .session(&id)
-                        .map(|records| {
-                            records
-                                .into_iter()
-                                .map(|r| r.update.clone())
-                                .collect::<Vec<serde_json::Value>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .await;
-            let (Some(pane), Ok(records)) = (weak.upgrade(), read) else {
-                return;
-            };
+            let Some(pane) = weak.upgrade() else { return };
+            let records = read.await.unwrap_or_default();
             pane.clone().draw_history(records).await;
-            pane.reattach_pending_cards();
-            pane.settle_replayed_replies(true);
+            pane.history_drawn();
         });
     }
 
@@ -12180,13 +12333,14 @@ impl ChatPane {
     fn mark_session(&self, session: &str) {
         *self.stash_session.borrow_mut() = Some(session.to_string());
         let updates = std::mem::take(&mut *self.archive_buffer.borrow_mut());
-        let archive = self.chat_archive();
-        let env = self.environment.clone();
+        // The session's stretches start fresh, as a history read from the
+        // mark cuts them.
+        self.stretches.borrow_mut().segmenter = Default::default();
         let session = session.to_string();
-        crate::runtime::runtime().spawn_blocking(move || {
+        self.archive_write(move |archive, env| {
             let marked = archive
-                .append_all(&env, updates)
-                .and_then(|()| archive.mark_session(&env, &session));
+                .append_all(env, updates)
+                .and_then(|()| archive.mark_session(env, &session));
             if let Err(e) = marked {
                 tracing::warn!("marking {env}'s new conversation: {e:#}");
             }
@@ -12199,23 +12353,14 @@ impl ChatPane {
         if updates.is_empty() {
             return;
         }
-        let archive = self.chat_archive();
-        let env = self.environment.clone();
-        crate::runtime::runtime().spawn_blocking(move || {
-            if let Err(e) = archive.append_all(&env, updates) {
+        self.archive_write(move |archive, env| {
+            if let Err(e) = archive.append_all(env, updates) {
                 tracing::warn!("stashing {env}'s conversation: {e:#}");
             }
         });
     }
 
     fn render_update(self: &Rc<Self>, update: SessionUpdate) {
-        // The first update of a resumed session is the head of its replay:
-        // the rendering it replaces goes now, and not a moment sooner.
-        if self.clear_on_replay.replace(false) {
-            self.clear_transcript();
-            // ...and the replies under it: the replay says which, if any.
-            self.clear_replies();
-        }
         self.note_word();
         // Anything that is not another piece of the user's message ends it.
         if !matches!(update, SessionUpdate::UserMessageChunk(_)) {
@@ -13543,14 +13688,19 @@ impl ChatPane {
         };
         let text = |t: &str| ContentChunk::new(ContentBlock::Text(TextContent::new(t)));
         let live = |pane: &Rc<Self>, update: SessionUpdate| {
+            pane.record_taken();
             pane.stash_update(&update);
             pane.render_update(update);
         };
         let send = |pane: &Rc<Self>, words: &str| {
             pane.finalize_stream();
             let card = pane.user_card(words, &[]);
-            pane.record_user_blocks(&[ContentBlock::Text(TextContent::new(words))]);
-            pane.claim_row(&card);
+            let block = ContentBlock::Text(TextContent::new(words));
+            let unrecorded = Unrecorded {
+                records: vec![user_record(&block)],
+                rows: Vec::new(),
+            };
+            pane.commit_unrecorded(unrecorded, &card);
         };
         let step =
             |pane: &Rc<Self>, id: &str, title: &str, kind: ToolKind, status: ToolCallStatus| {
@@ -13658,6 +13808,41 @@ impl ChatPane {
             }
         }
         end_turn(self);
+        // Two messages written during turn 3, gone out together after it:
+        // through the queue as a send puts them there, taken as the turn's
+        // end and `QueuedJoined` take them, recorded at the agent's first
+        // word.
+        for (index, words) in [
+            "One more thing: keep the docs in step.",
+            "And mention the probe.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let card = self.user_card(words, &[]);
+            let badge = queued_badge("queued — sends when the current turn ends");
+            card.append(&badge_row(&badge));
+            let written = taste_core::queued::Queued::new(
+                taste_core::queued::Reference::TurnStart,
+                &self.progress,
+            );
+            self.pending_prompts.borrow_mut().push_back(PendingPrompt {
+                unfinished: Unfinished::Nothing,
+                card,
+                queued: Some((badge, written)),
+                origin: None,
+                joined: index > 0,
+                unrecorded: Unrecorded {
+                    records: vec![user_record(&ContentBlock::Text(TextContent::new(*words)))],
+                    rows: Vec::new(),
+                },
+            });
+        }
+        self.accept_queued(0);
+        self.accept_queued(1);
+        live(self, SessionUpdate::AgentMessageChunk(text("Both noted.")));
+        end_turn(self);
+        self.pending_prompts.borrow_mut().clear();
         // Turn 4, live: mid-answer, a step still running.
         send(self, "And the docs?");
         step(
