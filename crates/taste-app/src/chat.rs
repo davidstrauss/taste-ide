@@ -1245,6 +1245,10 @@ struct PendingPrompt {
     /// Went out inside the prompt ahead of it (`SessionEvent::QueuedJoined`),
     /// so the turn that ends that one ends this too.
     joined: bool,
+    /// The user's blocks, recorded when the agent takes them
+    /// ([`ChatPane::accept_queued`]) rather than when they were typed
+    /// behind a turn: the record is in the conversation's order.
+    unrecorded: Vec<ContentBlock>,
 }
 
 /// Where an unfinished prompt goes when the process holding it dies.
@@ -3971,6 +3975,7 @@ impl ChatPane {
             queued: None,
             origin: None,
             joined: false,
+            unrecorded: Vec::new(),
         });
         *self.capture.borrow_mut() = Some((String::new(), on_done));
         let result = match self.client.borrow().as_ref() {
@@ -4219,7 +4224,7 @@ impl ChatPane {
         let blocks = vec![ContentBlock::Text(TextContent::new(text.clone()))];
         let result = self.send_blocks(blocks, written.clone());
         match result {
-            Ok(()) => {
+            Ok(unrecorded) => {
                 self.mark_session_content();
                 let queued = written.is_some();
                 let badge = written.map(|written| {
@@ -4237,6 +4242,7 @@ impl ChatPane {
                     queued: badge,
                     origin: None,
                     joined: false,
+                    unrecorded,
                 });
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
@@ -5362,7 +5368,7 @@ impl ChatPane {
             let behind_a_turn = self.stop_button.get_visible();
             let result = self.send_blocks(blocks, Some(item.written.clone()));
             match result {
-                Ok(()) => {
+                Ok(unrecorded) => {
                     self.mark_session_content();
                     badge.set_label("queued — sends when the current turn ends");
                     if behind_a_turn {
@@ -5381,6 +5387,7 @@ impl ChatPane {
                         queued: Some((badge, item.written)),
                         origin: None,
                         joined: false,
+                        unrecorded,
                     });
                     self.stop_button.set_visible(true);
                     self.set_busy(true);
@@ -6848,31 +6855,49 @@ impl ChatPane {
     }
 
     /// Hand a prompt to the agent, briefing and all; `written` when it may
-    /// wait behind a turn, for the note it then goes out after.
+    /// wait behind a turn, for the note it then goes out after. Hands back
+    /// the user's blocks still to be recorded: none when the agent takes
+    /// them now, all of them when they wait behind a turn, for
+    /// [`Self::accept_queued`] to record when it does.
     fn send_blocks(
         &self,
         blocks: Vec<ContentBlock>,
         written: Option<taste_core::queued::Queued>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<ContentBlock>> {
         // The user's message, as a replay would bring it back — the
         // updates `session/load` sends for it — so the record holds what
         // the user said and not only what the agent answered. Before the
-        // briefing, which is the IDE's and is recorded as its notes.
-        for block in &blocks {
-            let chunk = SessionUpdate::UserMessageChunk(
-                agent_client_protocol::schema::v1::ContentChunk::new(block.clone()),
-            );
-            self.stash_update(&chunk);
-        }
+        // briefing, which is the IDE's and is recorded as its notes; and
+        // where the agent takes it, which for a message sent during a turn
+        // is after that turn, as the agent's own history has it.
+        // The same test `written_now` makes: a turn is running.
+        let behind_a_turn = self.stop_button.get_visible();
+        let unrecorded = if behind_a_turn {
+            blocks.clone()
+        } else {
+            self.record_user_blocks(&blocks);
+            Vec::new()
+        };
         let blocks = self.with_briefing(blocks);
-        // Written now rather than with the turn: a message the IDE closed
-        // over is still the user's.
-        self.flush_stash();
         match (self.client.borrow().as_ref(), written) {
             (Some(client), Some(written)) => client.prompt_blocks_queued(blocks, written),
             (Some(client), None) => client.prompt_blocks(blocks),
             (None, _) => Ok(()),
         }
+        .map(|()| unrecorded)
+    }
+
+    /// Record the user's `blocks` as the user message they are, and write
+    /// it now rather than with the turn: a message the IDE closed over is
+    /// still the user's.
+    fn record_user_blocks(&self, blocks: &[ContentBlock]) {
+        for block in blocks {
+            let chunk = SessionUpdate::UserMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new(block.clone()),
+            );
+            self.stash_update(&chunk);
+        }
+        self.flush_stash();
     }
 
     /// What the IDE puts ahead of a prompt so the agent does not have to
@@ -7800,12 +7825,17 @@ impl ChatPane {
             let mut pending = self.pending_prompts.borrow_mut();
             pending.get_mut(index).and_then(|prompt| {
                 let card = prompt.card.clone();
-                prompt.queued.take().map(|queued| (card, queued))
+                let unrecorded = std::mem::take(&mut prompt.unrecorded);
+                prompt
+                    .queued
+                    .take()
+                    .map(|queued| (card, queued, unrecorded))
             })
         };
-        let Some((card, (badge, written))) = accepted else {
+        let Some((card, (badge, written), unrecorded)) = accepted else {
             return;
         };
+        self.record_user_blocks(&unrecorded);
         // The card was appended where the prompt was TYPED, which is not
         // where it joins the conversation — a whole turn's output has
         // landed in between. Move it to the end and leave a marker behind.
@@ -9413,7 +9443,7 @@ impl ChatPane {
         }
         let result = self.send_blocks(blocks, written.clone());
         match result {
-            Ok(()) => {
+            Ok(unrecorded) => {
                 self.mark_session_content();
                 // Sending mid-turn is fine: the session layer queues it.
                 // Say so on the card until its turn starts.
@@ -9429,6 +9459,7 @@ impl ChatPane {
                     queued: badge,
                     origin: None,
                     joined: false,
+                    unrecorded,
                 });
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
