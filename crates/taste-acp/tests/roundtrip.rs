@@ -270,10 +270,12 @@ async fn a_resumed_session_replays_its_history_and_keeps_its_id() {
             SessionEvent::Ready {
                 session_id,
                 restored,
+                replayed,
                 restore_failed,
                 ..
             } => {
                 assert!(restored, "a resumed session must report itself restored");
+                assert!(replayed, "without its history here, a session is loaded");
                 assert!(!restore_failed);
                 // Reused, not reissued: the id the IDE persisted still names
                 // this conversation, so the next restart can find it too.
@@ -287,6 +289,49 @@ async fn a_resumed_session_replays_its_history_and_keeps_its_id() {
     assert_eq!(replayed, vec!["replayed: earlier answer"]);
 
     // Restored, not merely replayed: the session takes a new prompt.
+    client.prompt("still there?").unwrap();
+    loop {
+        match next_event(&client).await {
+            SessionEvent::TurnEnded { .. } => break,
+            SessionEvent::Closed(e) => panic!("closed after resume: {e:?}"),
+            _ => {}
+        }
+    }
+}
+
+/// A session whose history the IDE holds is resumed rather than loaded:
+/// nothing replays, `Ready` says so, and the session goes on taking
+/// prompts. One it cannot resume is loaded instead, history and all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_with_its_history_here_resumes_without_a_replay() {
+    use taste_acp::Restore;
+    let workspace = tempfile::tempdir().unwrap();
+    let client = AgentClient::spawn_unconfined_resuming_for_tests(
+        fake_agent_spec(),
+        workspace.path().to_path_buf(),
+        Restore {
+            session: "sess-1".into(),
+            history_here: true,
+        },
+    );
+    loop {
+        match next_event(&client).await {
+            SessionEvent::Update(update) => panic!("a resume replays nothing: {update:?}"),
+            SessionEvent::Ready {
+                session_id,
+                restored,
+                replayed,
+                restore_failed,
+                ..
+            } => {
+                assert!(restored && !replayed && !restore_failed);
+                assert_eq!(session_id, "sess-1");
+                break;
+            }
+            SessionEvent::Closed(e) => panic!("connection closed early: {e:?}"),
+            _ => {}
+        }
+    }
     client.prompt("still there?").unwrap();
     loop {
         match next_event(&client).await {

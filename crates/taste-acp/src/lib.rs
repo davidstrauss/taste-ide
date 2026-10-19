@@ -38,6 +38,6 @@ pub use registry::{builtin_agents, AgentSpec, CLAUDE_CODE, CLAUDE_CODE_CUSTOM};
 pub use relocate::{AuthForward, Relocation};
 pub use session::{
     login_command, AgentClient, AgentHome, ElicitationReply, LoginCommand, PermissionReply,
-    SessionEvent,
+    Restore, SessionEvent,
 };
 pub use terminal::{TerminalHost, Terminals};

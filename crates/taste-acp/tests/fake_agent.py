@@ -7,7 +7,9 @@ session lifecycle the IDE drives: initialize -> session/new -> session/prompt
 
 session/load replays one history message and then answers, covering the
 restore path the IDE uses after any restart that ended the agent process;
-the id "expired-session" fails instead, for the fallback.
+the id "expired-session" fails instead, for the fallback. session/resume
+answers with no history, as the capability promises, and fails for
+"expired-session" too.
 
 A prompt of the form "/read <path>" makes the agent do what a real agent
 does with a file: ask the CLIENT for it (fs/read_text_file) and stream back
@@ -155,7 +157,7 @@ while True:
     method = msg.get("method")
     req_id = msg.get("id")
 
-    if method == "session/new" or method == "session/load":
+    if method in ("session/new", "session/load", "session/resume"):
         # Remember the bridge the client registered, so /mcp can use it the
         # way a real adapter would.
         mcp_servers[:] = msg.get("params", {}).get("mcpServers", [])
@@ -164,7 +166,10 @@ while True:
         client_capabilities.update(msg.get("params", {}).get("clientCapabilities", {}))
         respond(req_id, {
             "protocolVersion": 1,
-            "agentCapabilities": {"loadSession": True},
+            "agentCapabilities": {
+                "loadSession": True,
+                "sessionCapabilities": {"resume": {}},
+            },
             "authMethods": [],
         })
     elif method == "session/new":
@@ -401,6 +406,20 @@ while True:
                 "content": {"type": "text", "text": "replayed: earlier answer"},
             },
         })
+        respond(req_id, {
+            "modes": {
+                "currentModeId": "normal",
+                "availableModes": [
+                    {"id": "normal", "name": "Normal"},
+                    {"id": "yolo", "name": "Yolo"},
+                ],
+            },
+        })
+    elif method == "session/resume":
+        if msg["params"]["sessionId"] == "expired-session":
+            send({"jsonrpc": "2.0", "id": req_id,
+                  "error": {"code": -32602, "message": "no such session"}})
+            continue
         respond(req_id, {
             "modes": {
                 "currentModeId": "normal",

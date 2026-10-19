@@ -1045,6 +1045,14 @@ pub struct ChatPane {
     /// Drawing a conversation from a record rather than living it: what is
     /// drawn now is already recorded, and is not recorded again.
     drawing_history: Cell<bool>,
+    /// The session whose whole history this machine's stash holds, read
+    /// once off the main thread and kept as the stash is marked: what a
+    /// reconnect may `session/resume` rather than replay.
+    stash_session: RefCell<Option<String>>,
+    /// A `session/load`'s replay as it arrives, to rewrite the stash with:
+    /// complete where the live stash was not, so the next reconnect can
+    /// resume without one.
+    replay_record: RefCell<Vec<serde_json::Value>>,
     /// Latched on AuthRequired; cleared by a completed turn. While set,
     /// Ready must NOT close the options shade over the sign-in buttons.
     needs_auth: Cell<bool>,
@@ -3526,6 +3534,8 @@ impl ChatPane {
             snapshotting: Rc::new(Cell::new(false)),
             archive_buffer: RefCell::new(Vec::new()),
             drawing_history: Cell::new(false),
+            stash_session: RefCell::new(None),
+            replay_record: RefCell::new(Vec::new()),
             needs_auth: Cell::new(false),
             reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
@@ -3924,6 +3934,20 @@ impl ChatPane {
         // unsnapshotted. The turn boundary is the cadence; this covers the
         // turn that runs long.
         pane.start_snapshot_ceiling();
+        // Which session the stash holds whole, before any reconnect asks.
+        {
+            let archive = pane.chat_archive();
+            let env = pane.environment.clone();
+            let weak = Rc::downgrade(&pane);
+            glib::spawn_future_local(async move {
+                let read = crate::runtime::runtime()
+                    .spawn_blocking(move || archive.marked_session(&env))
+                    .await;
+                if let (Some(pane), Ok(Some(session))) = (weak.upgrade(), read) {
+                    pane.stash_session.borrow_mut().get_or_insert(session);
+                }
+            });
+        }
 
         pane
     }
@@ -9451,6 +9475,13 @@ impl ChatPane {
         // Whatever the agent replays next is already stashed; see
         // `replaying`.
         self.replaying.set(resume.is_some());
+        self.replay_record.borrow_mut().clear();
+        // Resumed without a replay only when this machine holds the whole
+        // of that session to draw instead; otherwise the agent replays it.
+        let restore = resume.clone().map(|session| taste_acp::Restore {
+            history_here: self.stash_session.borrow().as_deref() == Some(session.as_str()),
+            session,
+        });
         let agents = builtin_agents();
         let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
         let spec = agents[index].clone();
@@ -9493,7 +9524,7 @@ impl ChatPane {
             aim,
             relocation,
             terminals,
-            resume,
+            restore,
             // Buffer-aware reads: the agent sees unsaved editor buffers.
             Some(self.workspace.ui.clone()),
         ) {
@@ -9543,6 +9574,14 @@ impl ChatPane {
                 // A replay is thousands of updates queued at once: a frame
                 // and the keyboard get their turn between them.
                 pacer.breathe().await;
+                // A history being drawn from the record yields to frames
+                // as it goes; what the agent says meanwhile is after it.
+                while weak
+                    .upgrade()
+                    .is_some_and(|pane| pane.drawing_history.get())
+                {
+                    glib::timeout_future(std::time::Duration::from_millis(16)).await;
+                }
                 let Some(pane) = weak.upgrade() else { break };
                 // A replaced process is dead by construction — dropping its
                 // client killed it — and nothing it still has to say is
@@ -9586,6 +9625,7 @@ impl ChatPane {
             SessionEvent::Ready {
                 session_id,
                 restored,
+                replayed,
                 restore_failed,
                 modes,
                 config_options,
@@ -9618,9 +9658,19 @@ impl ChatPane {
                 // death starts counting from zero, however many it took.
                 self.reconnect_attempts.set(0);
                 // A fresh session's history begins here, in the record:
-                // what the stash holds after this mark is all of it.
+                // what the stash holds after this mark is all of it. A
+                // loaded one's replay is all of it, and becomes the record;
+                // a resumed one's history is the record, drawn from it.
+                let replay = std::mem::take(&mut *self.replay_record.borrow_mut());
                 if !restored {
                     self.mark_session(&session_id);
+                } else if replayed {
+                    self.replace_record(&session_id, replay);
+                } else {
+                    // The old rendering stays until the record replaces
+                    // it, rather than a blank while the record is read.
+                    self.clear_on_replay.set(false);
+                    self.draw_kept_history(&session_id);
                 }
                 *self.session_info.borrow_mut() = Some((agent_id, session_id));
                 // A restored session has history on disk by definition; a
@@ -9690,6 +9740,11 @@ impl ChatPane {
                 self.flush_revive_queue();
             }
             SessionEvent::Update(update) => {
+                if self.replaying.get() {
+                    if let Ok(value) = serde_json::to_value(&update) {
+                        self.replay_record.borrow_mut().push(value);
+                    }
+                }
                 self.stash_update(&update);
                 self.render_update(update)
             }
@@ -11331,9 +11386,76 @@ impl ChatPane {
         }
     }
 
+    /// Replace the stash with `session`'s history as a load replayed it,
+    /// off the main thread: what the live stash lacked, it now has, and the
+    /// next reconnect resumes without a replay.
+    fn replace_record(&self, session: &str, replay: Vec<serde_json::Value>) {
+        // What streamed since the replay ended is after it.
+        let since = std::mem::take(&mut *self.archive_buffer.borrow_mut());
+        let archive = self.chat_archive();
+        let env = self.environment.clone();
+        let id = session.to_string();
+        *self.stash_session.borrow_mut() = Some(id.clone());
+        crate::runtime::runtime().spawn_blocking(move || {
+            let replaced = archive
+                .replace(&env, &id, replay)
+                .and_then(|()| archive.append_all(&env, since));
+            if let Err(e) = replaced {
+                tracing::warn!("recording {env}'s conversation from its replay: {e:#}");
+            }
+        });
+    }
+
+    /// Draw `session`'s history from this machine's record of it: a resumed
+    /// session has no replay, and its conversation is what was kept.
+    fn draw_kept_history(self: &Rc<Self>, session: &str) {
+        let archive = self.chat_archive();
+        let env = self.environment.clone();
+        let id = session.to_string();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let read = crate::runtime::runtime()
+                .spawn_blocking(move || {
+                    let loaded = archive.load(&env);
+                    loaded
+                        .session(&id)
+                        .map(|records| {
+                            records
+                                .into_iter()
+                                .map(|r| r.update.clone())
+                                .collect::<Vec<serde_json::Value>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .await;
+            let (Some(pane), Ok(records)) = (weak.upgrade(), read) else {
+                return;
+            };
+            tracing::info!(
+                "chat {}: drawing {} kept record(s) of its resumed session",
+                pane.environment,
+                records.len()
+            );
+            pane.clear_transcript();
+            pane.drawing_history.set(true);
+            let mut pacer = crate::stall::Pacer::new();
+            for record in records {
+                pane.draw_record(record);
+                pacer.breathe().await;
+            }
+            pane.finalize_stream();
+            pane.settle_running_steps();
+            pane.drawing_history.set(false);
+            // What a replay's end does in `Ready`, for this history's end.
+            pane.reattach_pending_cards();
+            pane.settle_replayed_replies(true);
+        });
+    }
+
     /// Mark where `session`'s history begins in the stash, after whatever
     /// the last session still had buffered, off the main thread.
     fn mark_session(&self, session: &str) {
+        *self.stash_session.borrow_mut() = Some(session.to_string());
         let updates = std::mem::take(&mut *self.archive_buffer.borrow_mut());
         let archive = self.chat_archive();
         let env = self.environment.clone();

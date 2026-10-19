@@ -21,11 +21,12 @@ use agent_client_protocol::schema::v1::{
     LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest, PermissionOption,
     PermissionOptionKind, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionModeId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    StopReason, TerminalOutputRequest, TextContent, Usage, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
+    SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalOutputRequest,
+    TextContent, Usage, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo};
@@ -72,9 +73,13 @@ pub enum SessionEvent {
     /// surface: permission modes and config options (model choice included).
     Ready {
         session_id: String,
-        /// True when this is a restored conversation (history replays as
-        /// ordinary updates before this event's turn).
+        /// True when this is a restored conversation.
         restored: bool,
+        /// Whether its history came as ordinary updates before this event
+        /// (`session/load`); false when it was resumed without one
+        /// (`session/resume`), and its history is the one this machine kept
+        /// ([`Restore::history_here`]).
+        replayed: bool,
         /// True when a restore was attempted (or wanted) and this fresh
         /// session is the fallback — the UI should say the old
         /// conversation didn't come back, not silently present a blank.
@@ -157,6 +162,26 @@ pub struct AgentHome {
     pub environment: String,
     /// The podman volume mounted at `policy::AGENT_HOME_IN_DEVCONTAINER`.
     pub volume: String,
+}
+
+/// A conversation to reconnect to: the agent's session, and whether this
+/// machine kept its history whole. When it did and the agent offers
+/// `session/resume`, the reconnect asks for no history — it is drawn from
+/// what was kept — and a long conversation is no longer streamed back
+/// update by update on every launch. Otherwise `session/load` replays it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restore {
+    pub session: String,
+    pub history_here: bool,
+}
+
+impl From<String> for Restore {
+    fn from(session: String) -> Self {
+        Self {
+            session,
+            history_here: false,
+        }
+    }
 }
 
 impl AgentClient {
@@ -248,7 +273,7 @@ impl AgentClient {
         aim: crate::AgentAim,
         relocation: Option<crate::Relocation>,
         terminals: Option<crate::TerminalHost>,
-        resume_session: Option<String>,
+        resume_session: Option<Restore>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
     ) -> Result<Self> {
         Self::spawn(
@@ -304,7 +329,7 @@ impl AgentClient {
         relocation: Option<crate::Relocation>,
         terminals: Option<crate::TerminalHost>,
         safe_mode: bool,
-        resume_session: Option<String>,
+        resume_session: Option<Restore>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
     ) -> Result<Self> {
         let git_policy = crate::sandbox::ensure_git_policy_file()?;
@@ -466,7 +491,7 @@ impl AgentClient {
     pub fn spawn_unconfined_resuming_for_tests(
         spec: AgentSpec,
         cwd: PathBuf,
-        resume_session: String,
+        resume_session: impl Into<Restore>,
     ) -> Self {
         let program = spec.command.clone();
         let args = spec.args.clone();
@@ -475,7 +500,7 @@ impl AgentClient {
             cwd,
             taste_core::files::Files::Local,
             None,
-            Some(resume_session),
+            Some(resume_session.into()),
             None,
             None,
             false,
@@ -518,7 +543,7 @@ impl AgentClient {
         cwd: PathBuf,
         files: taste_core::files::Files,
         mcp_bridge: Option<(String, Vec<String>)>,
-        resume_session: Option<String>,
+        resume_session: Option<Restore>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
         terminal_host: Option<crate::TerminalHost>,
         safe_mode: bool,
@@ -976,7 +1001,7 @@ async fn run_session(
     connection: ConnectionTo<Agent>,
     cwd: PathBuf,
     mcp_bridge: Option<(String, Vec<String>)>,
-    resume_session: Option<String>,
+    resume_session: Option<Restore>,
     command_rx: async_channel::Receiver<Command>,
     event_tx: async_channel::Sender<SessionEvent>,
     serves_terminals: bool,
@@ -1058,14 +1083,58 @@ async fn run_session(
     };
     let auth_methods = init.auth_methods;
     let can_load = init.agent_capabilities.load_session;
+    let can_resume = init
+        .agent_capabilities
+        .session_capabilities
+        .resume
+        .is_some();
     // Commands that arrive before the session exists (the user's first
     // prompt racing the sign-in round-trip) are deferred, never dropped.
     let mut deferred: std::collections::VecDeque<Command> = std::collections::VecDeque::new();
 
-    // Restore first when asked and possible: `session/load` replays history
-    // as ordinary session/update notifications. Any failure (expired id,
+    // Resumed without its history when this machine kept that history and
+    // the agent offers it: the conversation is drawn from what was kept.
+    // A refusal falls through to a load.
+    if let (Some(previous), true) = (&resume_session, can_resume) {
+        if previous.history_here {
+            let mut request = ResumeSessionRequest::new(previous.session.clone(), cwd.clone());
+            if let Some((command, args)) = &mcp_bridge {
+                request.mcp_servers.push(mcp_server_entry(command, args));
+            }
+            match connection.send_request(request).block_task().await {
+                Ok(resumed) => {
+                    let _ = event_tx
+                        .send(SessionEvent::Ready {
+                            session_id: previous.session.clone(),
+                            restored: true,
+                            replayed: false,
+                            restore_failed: false,
+                            modes: resumed.modes.clone(),
+                            config_options: resumed.config_options.clone().unwrap_or_default(),
+                        })
+                        .await;
+                    return serve_commands(
+                        &connection,
+                        previous.session.clone().into(),
+                        deferred,
+                        command_rx,
+                        event_tx,
+                        auth_methods,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    tracing::info!("session/resume failed ({error}); loading instead");
+                }
+            }
+        }
+    }
+
+    // Restore when asked and possible: `session/load` replays history as
+    // ordinary session/update notifications. Any failure (expired id,
     // agent restarted) falls through to a fresh session.
     if let (Some(previous), true) = (&resume_session, can_load) {
+        let previous = &previous.session;
         let mut request = LoadSessionRequest::new(previous.clone(), cwd.clone());
         if let Some((command, args)) = &mcp_bridge {
             request.mcp_servers.push(mcp_server_entry(command, args));
@@ -1076,6 +1145,7 @@ async fn run_session(
                     .send(SessionEvent::Ready {
                         session_id: previous.clone(),
                         restored: true,
+                        replayed: true,
                         restore_failed: false,
                         modes: loaded.modes.clone(),
                         config_options: loaded.config_options.clone().unwrap_or_default(),
@@ -1138,6 +1208,7 @@ async fn run_session(
         .send(SessionEvent::Ready {
             session_id: session.session_id.to_string(),
             restored: false,
+            replayed: false,
             // A wanted restore that didn't happen (load failed, or the
             // agent can't load at all) — either way the conversation the
             // user expected is not the one on screen.
