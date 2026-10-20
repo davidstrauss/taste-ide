@@ -452,6 +452,12 @@ pub struct FileTree {
     dirty_toggle: gtk::ToggleButton,
     staged_toggle: gtk::ToggleButton,
     stashed_toggle: gtk::ToggleButton,
+    /// The counts the git filters wear beside their icons
+    /// ([`icon_and_count`]).
+    stashed_face: gtk::Label,
+    dirty_face: gtk::Label,
+    staged_face: gtk::Label,
+    conflicts_face: gtk::Label,
     conflicts_toggle: gtk::ToggleButton,
     /// The branch these views are aimed at for review, if any.
     ///
@@ -858,6 +864,17 @@ impl Showing {
             Showing::All => "All files, ignored and unsynced included",
         }
     }
+}
+
+/// A git filter's face: `icon` and its count beside it, the count the label
+/// returned. Replaces the button's own label, whose words are its tooltip.
+fn icon_and_count(button: &gtk::ToggleButton, icon: &str) -> gtk::Label {
+    let face = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    face.append(&gtk::Image::from_icon_name(icon));
+    let count = gtk::Label::new(Some("0"));
+    face.append(&count);
+    button.set_child(Some(&face));
+    count
 }
 
 /// `showing`'s icons in a row, as the menu's button and its items wear them.
@@ -1307,6 +1324,15 @@ impl FileTree {
             .css_classes(["flat", "caption", "error"])
             .visible(false)
             .build();
+        // The git filters as icons with their counts (David, 2026-10-20:
+        // "Are there icons we could use for stashed/dirty/staged?"): a box
+        // for what is put away, a pencil for what is edited, a ticked box
+        // for what is ready to commit, the warning for what is in conflict.
+        // Their tooltips say the words.
+        let stashed_face = icon_and_count(&stashed_toggle, "package-x-generic-symbolic");
+        let dirty_face = icon_and_count(&dirty_toggle, "document-edit-symbolic");
+        let staged_face = icon_and_count(&staged_toggle, "checkbox-checked-symbolic");
+        let conflicts_face = icon_and_count(&conflicts_toggle, "dialog-warning-symbolic");
         // search_delay debounces keystrokes; run_search additionally drops
         // stale results, so typing never staggers the UI.
 
@@ -1761,6 +1787,10 @@ impl FileTree {
             dirty_toggle: dirty_toggle.clone(),
             staged_toggle: staged_toggle.clone(),
             stashed_toggle: stashed_toggle.clone(),
+            stashed_face,
+            dirty_face,
+            staged_face,
+            conflicts_face,
             review: RefCell::new(None),
             on_open_review_diff: RefCell::new(None),
             on_review_ended: RefCell::new(None),
@@ -5775,8 +5805,8 @@ impl FileTree {
             .count();
         drop(status);
         let stashed = self.stashed.borrow().len();
-        self.dirty_toggle.set_label(&format!("Dirty {dirty}"));
-        self.staged_toggle.set_label(&format!("Staged {staged}"));
+        self.dirty_face.set_label(&dirty.to_string());
+        self.staged_face.set_label(&staged.to_string());
         if self.staged_count.replace(staged) != staged {
             self.announce_commit_state();
         }
@@ -5785,9 +5815,8 @@ impl FileTree {
         } else {
             self.staged_toggle.remove_css_class("accent");
         }
-        self.stashed_toggle.set_label(&format!("Stashed {stashed}"));
-        self.conflicts_toggle
-            .set_label(&format!("Conflicts {conflicts}"));
+        self.stashed_face.set_label(&stashed.to_string());
+        self.conflicts_face.set_label(&conflicts.to_string());
         // Present only while it means something — but never yanked out
         // from under its own active view.
         self.conflicts_toggle
