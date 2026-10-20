@@ -24,7 +24,7 @@ pub(super) struct RowView {
     /// The row as it was built, which a change is told apart from.
     shown: Row,
     /// Its line's segments above and below its dot, for a row on the rail.
-    lines: Option<(gtk::Box, gtk::Box)>,
+    lines: Option<super::rail::Rail>,
     /// A streaming answer's buffer: a stream is hundreds of updates, each a
     /// few words.
     stream: Option<gtk::TextBuffer>,
@@ -33,10 +33,7 @@ pub(super) struct RowView {
 /// A row's piece of the rail, as [`ChatPane::on_rail`] built it.
 struct Railed {
     row: gtk::Box,
-    dot: gtk::Box,
-    spinner: gtk::Spinner,
-    top: gtk::Box,
-    bottom: gtk::Box,
+    rail: super::rail::Rail,
 }
 
 impl ChatPane {
@@ -68,7 +65,7 @@ impl ChatPane {
         RowView {
             widget: outer.upcast(),
             shown: row.clone(),
-            lines: railed.map(|railed| (railed.top, railed.bottom)),
+            lines: railed.map(|railed| railed.rail),
             stream,
         }
     }
@@ -100,11 +97,10 @@ impl ChatPane {
         }
         if view.shown.rail != row.rail {
             match (&view.lines, row.rail) {
-                (Some((top, bottom)), Some(rail))
+                (Some(lines), Some(rail))
                     if view.shown.rail.map(|r| r.after_prompt) == Some(rail.after_prompt) =>
                 {
-                    top.set_visible(rail.top);
-                    bottom.set_visible(rail.bottom);
+                    lines.set_lines(rail.top, rail.bottom);
                 }
                 _ => return false,
             }
@@ -123,111 +119,34 @@ impl ChatPane {
     /// `content` beside its piece of the rail — the connected bullets the
     /// agent's turn is read by (David, 2026-09-07). The line runs up from
     /// the dot when `rail.top`, down from it when `rail.bottom`. Hands back
-    /// the row, and the dot and its spinner for a step to paint.
+    /// the row, and its rail for a step to paint (`rail.rs`).
     fn on_rail(&self, content: &impl IsA<gtk::Widget>, rail: Rail, dot_kind: Dot) -> Railed {
         // Under a prompt the step carries the gap itself, so the line can
-        // cross it: the dot slot and the content move down by the gap and
-        // the top segment grows by it.
+        // cross it: the content moves down by the gap, and the line runs
+        // up across it to the box.
         let gap = if rail.after_prompt {
             PROMPT_GAP
         } else {
             STEP_GAP
         };
-        let top = gtk::Box::builder()
-            .css_classes(["rail-line"])
-            .halign(gtk::Align::Center)
-            .height_request(RAIL_LINE / 2 + gap)
-            .visible(rail.top)
-            .build();
-        let bottom = gtk::Box::builder()
-            .css_classes(["rail-line"])
-            .halign(gtk::Align::Center)
-            .vexpand(true)
-            .visible(rail.bottom)
-            .build();
-        // The break in the line for the spinner: zero-height whenever the
-        // dot is what shows (David, 2026-09-16: "The vertical timeline line
-        // should not be visible inside spinners").
-        let hole = gtk::Box::builder()
-            .halign(gtk::Align::Center)
-            .height_request(0)
-            .build();
-        let line = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        line.append(&top);
-        line.append(&hole);
-        line.append(&bottom);
-        let dot = gtk::Box::builder()
-            .css_classes(["rail-dot"])
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .hexpand(true)
-            .build();
-        match dot_kind {
-            Dot::Plain => {}
-            Dot::Note => dot.add_css_class("note"),
-            Dot::Tone(tone) => dot.add_css_class(tone),
-        }
-        let spinner = gtk::Spinner::builder()
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .hexpand(true)
-            .visible(false)
-            .build();
-        spinner.set_size_request(RAIL_SPINNER, RAIL_SPINNER);
-        spinner
-            .bind_property("visible", &hole, "height-request")
-            .transform_to(|_, visible: bool| {
-                Some(
-                    if visible {
-                        RAIL_SPINNER + 2 * RAIL_HOLE_PAD
-                    } else {
-                        0
-                    }
-                    .to_value(),
-                )
-            })
-            .sync_create()
-            .build();
-        {
-            let top = top.clone();
-            hole.connect_height_request_notify(move |hole| {
-                if let Some(rail) = top.parent().and_then(|line| line.parent()) {
-                    fit_top_segment(&rail, &top, hole);
-                }
-            });
-        }
-        // One text line tall, at the top: the dot is centred on the step's
-        // first line, whatever the step grows to below it.
-        let slot = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .height_request(RAIL_LINE)
-            .valign(gtk::Align::Start)
-            .margin_top(gap)
-            .build();
-        slot.append(&dot);
-        slot.append(&spinner);
-        // The rail never sizes its row: the line and the dot's slot are laid
-        // over the height the content decides.
-        let overlay = gtk::Overlay::new();
-        overlay.set_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
-        overlay.add_overlay(&line);
-        overlay.add_overlay(&slot);
-        overlay.set_size_request(RAIL_WIDTH, -1);
+        let drawn = super::rail::Rail::new(content, gap);
+        drawn.set_lines(rail.top, rail.bottom);
+        drawn.set_mark(match dot_kind {
+            Dot::Plain => super::rail::Mark::Plain,
+            Dot::Note => super::rail::Mark::Hollow,
+            Dot::Tone(tone) => super::rail::Mark::Tone(tone),
+        });
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
         row_box.set_margin_start(ROW_OWN_SIDE);
         row_box.set_margin_end(ROW_OWN_SIDE);
-        row_box.append(&overlay);
+        row_box.append(&drawn);
         content.set_hexpand(true);
         content.set_margin_top(gap);
         content.add_css_class("step-content");
         row_box.append(content);
-        row_box.connect_map(centre_dot_after_layout);
         Railed {
             row: row_box,
-            dot,
-            spinner,
-            top,
-            bottom,
+            rail: drawn,
         }
     }
 
@@ -793,17 +712,20 @@ impl ChatPane {
                 }
             });
         }
-        let act_glyph = gtk::Image::new();
-        act_glyph.set_valign(gtk::Align::Center);
-        act_glyph.add_css_class("act-icon");
-        act_glyph.set_visible(step.act.is_some());
+        // Only what shows is built: a row is styled, measured, and laid
+        // out for every widget in it, hidden or not, each time it comes on
+        // screen.
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         if let Some(kind) = step.act {
             title_label.add_css_class("act-title");
             let (icon, tone) = act_icon(kind, step.input.as_ref(), step.act_output.as_ref());
-            act_glyph.set_icon_name(Some(icon));
+            let act_glyph = gtk::Image::from_icon_name(icon);
+            act_glyph.set_valign(gtk::Align::Center);
+            act_glyph.add_css_class("act-icon");
             if let Some(tone) = tone {
                 act_glyph.add_css_class(tone);
             }
+            header.append(&act_glyph);
         }
         // A command's step in the face its IN/OUT block is in.
         let command = is_command_call(step.kind, &step.title);
@@ -816,26 +738,14 @@ impl ChatPane {
         if command_title {
             title_label.add_css_class("monospace");
         }
-        let summary_text = self.step_summary(step);
-        let summary = gtk::Label::builder()
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["caption", "dim-label", "step-summary"])
-            .label(summary_text.as_deref().unwrap_or_default())
-            .visible(summary_text.is_some() && !step.expanded)
-            .build()
-            .full_text_on_hover();
-        if command {
-            summary.add_css_class("monospace");
-        }
+        header.append(&crate::issue_pill::PillText::wrap(&title_label));
         // Right-hand end of the header: who said yes, not how it went.
-        let permission = gtk::Image::new();
-        permission.set_valign(gtk::Align::Center);
-        permission.add_css_class("dim-label");
-        permission.set_visible(step.permission.is_some());
         if let Some((icon, tooltip)) = &step.permission {
-            permission.set_icon_name(Some(icon));
+            let permission = gtk::Image::from_icon_name(icon);
+            permission.set_valign(gtk::Align::Center);
+            permission.add_css_class("dim-label");
             permission.set_tooltip_text(Some(tooltip));
+            header.append(&permission);
         }
         let has_content = step_has_content(step);
         let killable = step.running
@@ -844,40 +754,31 @@ impl ChatPane {
                 .is_some_and(|entry| entry.killable);
         // The disclosure, at the END of the line, only once there is
         // something to open onto; it shares its slot with the Kill.
-        let arrow = gtk::Image::from_icon_name(if step.expanded {
-            "pan-down-symbolic"
-        } else {
-            "pan-end-symbolic"
-        });
-        arrow.set_valign(gtk::Align::Center);
-        arrow.add_css_class("dim-label");
-        arrow.set_visible(has_content && !killable);
-        let kill = gtk::Button::builder()
-            .icon_name("media-playback-stop-symbolic")
-            .css_classes(["flat", "circular", "step-kill"])
-            .valign(gtk::Align::Start)
-            .visible(killable)
-            .tooltip_text("Stop this command. The output stays, and the agent is told it died.")
-            .build();
-        {
-            let shells = self.workspace.shells.clone();
-            let env = self.environment.clone();
-            let command = step.title.clone();
-            kill.connect_clicked(move |button| {
-                button.set_sensitive(false);
-                if let Some(entry) = running_shell(&shells, &env, &command) {
-                    shells.kill(entry.id);
-                }
+        if has_content && !killable {
+            let arrow = gtk::Image::from_icon_name(if step.expanded {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
             });
+            arrow.set_valign(gtk::Align::Center);
+            arrow.add_css_class("dim-label");
+            header.append(&arrow);
         }
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        header.append(&act_glyph);
-        header.append(&crate::issue_pill::PillText::wrap(&title_label));
-        header.append(&permission);
-        header.append(&arrow);
         let head = gtk::Box::new(gtk::Orientation::Vertical, 0);
         head.append(&header);
-        head.append(&summary);
+        if let Some(text) = self.step_summary(step).filter(|_| !step.expanded) {
+            let summary = gtk::Label::builder()
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["caption", "dim-label", "step-summary"])
+                .label(text)
+                .build()
+                .full_text_on_hover();
+            if command {
+                summary.add_css_class("monospace");
+            }
+            head.append(&summary);
+        }
         let toggle = gtk::Button::builder()
             .child(&head)
             .css_classes(["flat", "step-toggle"])
@@ -895,11 +796,30 @@ impl ChatPane {
                 }
             });
         }
-        let head_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        head_row.append(&toggle);
-        head_row.append(&kill);
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        body.append(&head_row);
+        if killable {
+            let kill = gtk::Button::builder()
+                .icon_name("media-playback-stop-symbolic")
+                .css_classes(["flat", "circular", "step-kill"])
+                .valign(gtk::Align::Start)
+                .tooltip_text("Stop this command. The output stays, and the agent is told it died.")
+                .build();
+            let shells = self.workspace.shells.clone();
+            let env = self.environment.clone();
+            let command = step.title.clone();
+            kill.connect_clicked(move |button| {
+                button.set_sensitive(false);
+                if let Some(entry) = running_shell(&shells, &env, &command) {
+                    shells.kill(entry.id);
+                }
+            });
+            let head_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            head_row.append(&toggle);
+            head_row.append(&kill);
+            body.append(&head_row);
+        } else {
+            body.append(&toggle);
+        }
         if step.expanded && has_content {
             let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
             content.set_margin_top(2);
@@ -908,19 +828,19 @@ impl ChatPane {
             body.append(&content);
         }
         let railed = self.on_rail(&body, row.rail.unwrap_or_default(), row.dot);
-        let (dot, spinner) = (&railed.dot, &railed.spinner);
         // The traffic light: green finished, red failed, the question's
         // amber while one is open, the spinner while it runs.
-        dot.add_css_class(if step.waiting { "wait" } else { step.tone });
-        spinner.set_visible(step.running);
-        dot.set_visible(!step.running);
-        if step.running {
-            spinner.start();
-        }
+        let rail = &railed.rail;
+        rail.set_mark(match (step.waiting, step.tone) {
+            (true, _) => super::rail::Mark::Tone("wait"),
+            (false, "cut") => super::rail::Mark::Cut,
+            (false, tone) => super::rail::Mark::Tone(tone),
+        });
+        rail.set_running(step.running);
         if step.tone == "cut" {
-            dot.set_tooltip_text(Some("Never reported finishing: its turn ended first"));
+            rail.set_tooltip_text(Some("Never reported finishing: its turn ended first"));
         } else if step.rebuild_took_the_agent {
-            dot.set_tooltip_text(Some(
+            rail.set_tooltip_text(Some(
                 "The rebuild started, and stopped this agent's container as a rebuild does — \
                  the call's connection went with it. The agent comes back when the rebuild \
                  finishes.",

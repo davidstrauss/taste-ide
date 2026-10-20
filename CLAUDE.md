@@ -612,7 +612,10 @@ to.
   TASTE_PROBE_DELAY_MS=60000` fills the transcript with 200 rows and
   scrolls it down and back up, printing each frame's work and the time
   between frames (`=prose`, `=shell`, `=edit` for one kind of row,
-  `TASTE_PROBE_SCROLL_ROWS=N` for fewer rows). `TASTE_PROBE_ANCHOR=1` (with
+  `TASTE_PROBE_SCROLL_ROWS=N` for fewer rows, or more — past the ~200
+  the list binds at once, it builds rows as it scrolls, and the bench
+  says what each kind took to build; `TASTE_PROBE_SCROLL_CLOSED=1` leaves
+  the steps closed, as a conversation has them). `TASTE_PROBE_ANCHOR=1` (with
 `TASTE_PROBE_CHAT=busy`) draws sixty turns from their record, parks the
 transcript mid-history, as a reader up it has it, watches it left alone for
 six seconds, and then prints whether the row at the top of the view stayed

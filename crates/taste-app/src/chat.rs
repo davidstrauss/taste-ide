@@ -12,6 +12,7 @@
 //! own `session/load`; the IDE persists nothing but the session id.
 
 mod model;
+mod rail;
 mod rows;
 
 use std::cell::{Cell, RefCell};
@@ -370,11 +371,7 @@ const RAIL_SPINNER: i32 = 12;
 /// The air between the spinner's ring and the rail's line where the line
 /// breaks for it, above and below.
 const RAIL_HOLE_PAD: i32 = 2;
-/// How many frames a step waits for a first line to line its dot up with
-/// before settling for `RAIL_LINE`. Two or three is the real answer — the
-/// frame the content is allocated in — and this is the ceiling that keeps
-/// a step which never gets any text from watching every frame forever.
-const DOT_MEASURE_FRAMES: u32 = 20;
+
 /// The air between a prompt's box and the first step under it. Inside the
 /// step, not under the box, so the rail's line can run through it: the line
 /// starts at the box and reaches the first dot.
@@ -593,6 +590,22 @@ fn queued_or_sent(written: &Option<taste_core::queued::Queued>) -> model::Delive
     }
 }
 
+/// A row's kind, by name: what the scroll bench says a build was of.
+fn row_kind_name(kind: &model::Kind) -> &'static str {
+    match kind {
+        model::Kind::User(_) => "prompt",
+        model::Kind::Answer(answer) if answer.done => "answer",
+        model::Kind::Answer(_) => "answer (streaming)",
+        model::Kind::Thought(_) => "thought",
+        model::Kind::Step(step) if step.expanded => "step (open)",
+        model::Kind::Step(_) => "step",
+        model::Kind::Task(_) => "task",
+        model::Kind::Plan(_) => "plan",
+        model::Kind::Note(_) => "note",
+        model::Kind::Marker { .. } => "marker",
+    }
+}
+
 /// A fresh id for a prompt the IDE sends (`model::PromptId`).
 fn new_prompt_id() -> model::PromptId {
     thread_local! {
@@ -774,6 +787,9 @@ pub struct ChatPane {
     client: RefCell<Option<AgentClient>>,
     /// A probe filled the custom-model chooser; opening it asks nobody.
     probe_posed_choices: Cell<bool>,
+    /// TASTE_PROBE_SCROLL only: how long each kind of row took to build
+    /// as the list bound it, in milliseconds.
+    probe_builds: RefCell<Option<HashMap<&'static str, Vec<f64>>>>,
     pending_permission: RefCell<Option<PendingPermission>>,
     /// Requests that arrived while a card was already up, in arrival
     /// order. Each waits its turn rather than displacing the one on
@@ -3459,6 +3475,7 @@ impl ChatPane {
             on_focus_composer: RefCell::new(None),
             client: RefCell::new(None),
             probe_posed_choices: Cell::new(false),
+            probe_builds: RefCell::new(None),
             pending_permission: RefCell::new(None),
             permission_queue: RefCell::new(std::collections::VecDeque::new()),
             pending_questions: RefCell::new(None),
@@ -7492,7 +7509,14 @@ impl ChatPane {
                 let Some(row) = self.model.borrow().row(*id).cloned() else {
                     return;
                 };
+                let started = std::time::Instant::now();
                 let view = self.build_row(&row);
+                if let Some(builds) = self.probe_builds.borrow_mut().as_mut() {
+                    builds
+                        .entry(row_kind_name(&row.kind))
+                        .or_default()
+                        .push(started.elapsed().as_secs_f64() * 1000.0);
+                }
                 holder.append(&view.widget);
                 self.bound
                     .borrow_mut()
@@ -12784,6 +12808,10 @@ impl ChatPane {
             |kind: &str| !matches!(only.as_str(), "prose" | "shell" | "edit") || only == kind;
         // `TASTE_PROBE_SCROLL_ROWS` fills fewer than the cap: a cost that
         // scales with the row count is a walk over every row each frame.
+        // `TASTE_PROBE_SCROLL_CLOSED=1` leaves the steps closed, as a
+        // conversation has them until one is opened: what reading one costs,
+        // rather than the most a row can.
+        let open = std::env::var_os("TASTE_PROBE_SCROLL_CLOSED").is_none();
         let cap = std::env::var("TASTE_PROBE_SCROLL_ROWS")
             .ok()
             .and_then(|rows| rows.parse().ok())
@@ -12812,7 +12840,9 @@ impl ChatPane {
             )];
             if wants("shell") {
                 self.render_update(SessionUpdate::ToolCall(shell));
-                self.expand_tool_card_for_probe(&id);
+                if open {
+                    self.expand_tool_card_for_probe(&id);
+                }
             }
             if wants("edit") {
                 let id = format!("bench-edit-{index}");
@@ -12821,7 +12851,9 @@ impl ChatPane {
                 edit.status = ToolCallStatus::Completed;
                 edit.content = vec![ToolCallContent::Diff(probe_edit_diff())];
                 self.render_update(SessionUpdate::ToolCall(edit));
-                self.expand_tool_card_for_probe(&id);
+                if open {
+                    self.expand_tool_card_for_probe(&id);
+                }
             }
             index += 1;
         }
@@ -12835,6 +12867,8 @@ impl ChatPane {
 
     fn run_scroll_bench(self: &Rc<Self>) {
         use std::time::Instant;
+        *self.probe_builds.borrow_mut() = Some(HashMap::new());
+        let pane = Rc::downgrade(self);
         let Some(clock) = self.list.frame_clock() else {
             println!("scroll bench: no frame clock");
             return;
@@ -12927,6 +12961,30 @@ impl ChatPane {
                     gap.0,
                     gap.1,
                     gap.2,
+                );
+            }
+            // Each kind of row's build, and how much of the work the
+            // frames did it was.
+            if let Some(builds) = pane.upgrade().and_then(|pane| pane.probe_builds.take()) {
+                let mut kinds: Vec<_> = builds.into_iter().collect();
+                kinds.sort_by(|a, b| a.0.cmp(b.0));
+                let mut built = 0.0;
+                for (kind, times) in kinds {
+                    built += times.iter().sum::<f64>();
+                    let count = times.len();
+                    let (p50, p95, max) = quantiles(times);
+                    println!(
+                        "scroll bench build {kind}: {count} built; ms p50/p95/max {p50:.2}/{p95:.2}/{max:.2}"
+                    );
+                }
+                let worked: f64 = down_frames
+                    .borrow()
+                    .iter()
+                    .chain(frames.borrow().iter())
+                    .map(|f| f.0)
+                    .sum();
+                println!(
+                    "scroll bench: {built:.0}ms building rows of {worked:.0}ms of frame work"
                 );
             }
             println!(
@@ -14066,12 +14124,6 @@ impl ChatPane {
             self.standing_list.append(&row);
         }
     }
-}
-
-/// A step's rail's line: laid over its row after the empty child that
-/// keeps the rail from sizing it (`rows.rs`, `on_rail`).
-fn rail_line(rail: &gtk::Overlay) -> Option<gtk::Box> {
-    rail.child()?.next_sibling().and_downcast::<gtk::Box>()
 }
 
 /// Whether a call's title is one of the IDE's edit tools.
@@ -15835,69 +15887,6 @@ fn present_image_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, texture: &g
     dialog.present(Some(anchor));
 }
 
-/// Keep the rail's dot on the step's first line of text.
-///
-/// The dot is centred in the rail's slot, so the slot's height is what
-/// decides where it lands: at twice the first line's own centre, the dot
-/// sits ON that line. Measured (`textline`) rather than assumed, because a
-/// step's first line is a bold title on one row, a caption on the next, and
-/// rendered prose on the third, and those three sit at three different
-/// heights inside otherwise identical boxes — one constant was out by 2.5,
-/// 3.5, and 1.5 pixels respectively, against a dot 7 pixels across (David,
-/// 2026-09-08: "the first line of text is still misaligned with the dot on
-/// some rows").
-///
-/// Both ends are found from the step's row, so a step whose content is
-/// replaced — the streaming view giving way to rendered markdown — is one
-/// more call rather than a second copy of the row's shape.
-///
-/// Answers whether there was a line to measure: a step still waiting on
-/// its first word has none, and keeps the standing guess.
-fn centre_dot_on_first_line(row_box: &gtk::Box) -> bool {
-    let Some(rail) = row_box.first_child().and_downcast::<gtk::Overlay>() else {
-        return false;
-    };
-    // The overlay's child is the line; its overlay is the dot's slot.
-    let (Some(slot), Some(content)) = (
-        rail.last_child().and_downcast::<gtk::Box>(),
-        rail.next_sibling(),
-    ) else {
-        return false;
-    };
-    let Some(mid) = crate::textline::first_line_mid(&content) else {
-        return false;
-    };
-    // Only when it moves: a height request is a resize, and a resize is
-    // one frame away from being a loop.
-    if slot.height_request() != mid * 2 {
-        slot.set_height_request(mid * 2);
-    }
-    // ...and the line's top segment ends where the break for a spinner
-    // would start, which is measured from the same centre.
-    let top = rail_line(&rail).and_then(|line| line.first_child());
-    if let (Some(top), Some(hole)) = (top.clone(), top.and_then(|top| top.next_sibling())) {
-        if let (Ok(top), Ok(hole)) = (top.downcast::<gtk::Box>(), hole.downcast::<gtk::Box>()) {
-            fit_top_segment(rail.upcast_ref(), &top, &hole);
-        }
-    }
-    true
-}
-
-/// End the rail's top segment at the dot's centre, less half of the
-/// break the spinner has opened (none, when the dot shows). The centre is
-/// the slot's: its top margin plus half its height, both of which the
-/// step's geometry already states.
-fn fit_top_segment(rail: &gtk::Widget, top: &gtk::Box, hole: &gtk::Box) {
-    let Some(slot) = rail.last_child().and_downcast::<gtk::Box>() else {
-        return;
-    };
-    let centre = slot.margin_top() + slot.height_request() / 2;
-    let wanted = (centre - hole.height_request() / 2).max(0);
-    if top.height_request() != wanted {
-        top.set_height_request(wanted);
-    }
-}
-
 /// A response's prose as the transcript shows it: the markdown preview's
 /// renderer, less a document's inset — 16 on every side, which in the
 /// transcript is one more step, where the rail is the inset — and with a
@@ -15917,26 +15906,6 @@ fn response_prose(
         blocks.set_spacing(6);
     }
     rendered
-}
-
-/// The same, once there is a laid-out line to measure.
-///
-/// A widget just added has no allocation until the frame clock lays it
-/// out, and GTK4 offers no signal for that moment — the frame itself is
-/// the hook. This stops on the first frame it can measure, and gives up
-/// after a handful, so a step whose content never says a word (a stream
-/// with nothing in it yet) keeps `RAIL_LINE` rather than leaving a row
-/// ticking for the life of the transcript.
-fn centre_dot_after_layout(row_box: &gtk::Box) {
-    let frames = Cell::new(0u32);
-    row_box.add_tick_callback(move |row_box, _| {
-        frames.set(frames.get() + 1);
-        if centre_dot_on_first_line(row_box) || frames.get() >= DOT_MEASURE_FRAMES {
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
-        }
-    });
 }
 
 #[cfg(test)]

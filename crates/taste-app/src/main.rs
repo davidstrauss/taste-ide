@@ -623,7 +623,7 @@ fn main() -> glib::ExitCode {
                     and shells: a typed glyph in the accent, a headline that \
                     keeps the weight a tool title gives up. */\n\
                  label.act-title { font-weight: 600; }\n\
-                 /* The transcript is a timeline (chat/rows.rs::on_rail): \
+                 /* The transcript is a timeline (chat/rail.rs): \
                     the agent's steps on a rail of connected dots, Claude \
                     Code's shape. The rows carry no padding of their own so \
                     the rail's line runs unbroken from one step into the \
@@ -643,28 +643,17 @@ fn main() -> glib::ExitCode {
                     themselves are `whole_font_css`'s, on whole pixels. */\n\
                  .rail-line { min-width: 1px; \
                    background-color: alpha(currentColor, 0.22); }\n\
-                 .rail-dot { min-width: 7px; min-height: 7px; \
-                   border-radius: 9999px; \
-                   background-color: alpha(currentColor, 0.45); }\n\
                  /* The traffic light the environment rows already speak, \
                     for a call: finished, failed, waiting on you — and the \
                     accent while it runs (the spinner stands in for the dot \
-                    then). Prose keeps the neutral dot. */\n\
-                 .rail-dot.ok { background-color: @success_color; }\n\
-                 .rail-dot.fail { background-color: @error_color; }\n\
-                 .rail-dot.wait { background-color: @warning_color; }\n\
-                 .rail-dot.live { background-color: @accent_color; }\n\
-                 /* A call whose turn ended before it said how it went: \
-                    known only to have stopped, so neither green nor red, \
-                    and hollow like an aside. */\n\
-                 .rail-dot.cut { background-color: transparent; \
-                   border: 2px solid alpha(currentColor, 0.45); \
-                   min-width: 3px; min-height: 3px; }\n\
-                 /* An aside — a note, a thought, the plan — is a hollow \
-                    dot. */\n\
-                 .rail-dot.note { background-color: transparent; \
-                   border: 2px solid alpha(currentColor, 0.35); \
-                   min-width: 3px; min-height: 3px; }\n\
+                    then). The rail draws its dot in its own colour \
+                    (chat/rail.rs); prose keeps the text's, set back, and an \
+                    aside or a call that never said how it went is a hollow \
+                    ring. */\n\
+                 rail.ok { color: @success_color; }\n\
+                 rail.fail { color: @error_color; }\n\
+                 rail.wait { color: @warning_color; }\n\
+                 rail.live { color: @accent_color; }\n\
                  /* THE BLUE. libadwaita's own selected row is the accent at a \
                     quarter, and that is what this window means by it: the \
                     item is open in the editor's strip — or would open there \
