@@ -320,11 +320,6 @@ struct FileNode {
     create: Option<Create>,
 }
 
-/// Adwaita's horizontal padding inside a button: what a row that is not a
-/// button is inset by to stand in the same column as the button rows
-/// beside it.
-const BUTTON_INSET: i32 = 10;
-
 /// What a create row makes ([`FileNode::create`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Create {
@@ -1713,14 +1708,14 @@ impl FileTree {
         // The project folder itself: always the first row, never
         // collapsible; its context menu creates top-level items.
         let root_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-
-        // Inset by a button's padding: the branch and the filters under it
-        // are buttons, and their icons and names stood ten pixels right of
-        // the folder's (measured with TASTE_PROBE_ALIGN: icon 14 against
-        // 24, name 36 against 46; David, 2026-10-20: "These should be
-        // better aligned").
-        root_row.set_margin_start(BUTTON_INSET);
-        root_row.append(&gtk::Image::from_icon_name("folder-open-symbolic"));
+        // The folder is a button, as the branch under it is, and a click
+        // opens what can be done with it (David, 2026-10-20: "Interactions
+        // with the project folder should be a left-click pop-up, just like
+        // the branch switcher"). Being a button also stands its icon and
+        // name in the column the branch's and the filters' do: as a plain
+        // row they stood ten pixels left of them (TASTE_PROBE_ALIGN).
+        let root_face = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        root_face.append(&gtk::Image::from_icon_name("folder-open-symbolic"));
         let root_label = gtk::Label::builder()
             .label(
                 workspace
@@ -1731,11 +1726,18 @@ impl FileTree {
             )
             .css_classes(["heading"])
             .xalign(0.0)
-            .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .build()
             .full_text_on_hover();
-        root_row.append(&root_label);
+        root_face.append(&root_label);
+        let root_button = gtk::Button::builder()
+            .child(&root_face)
+            .css_classes(["flat"])
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .tooltip_text("New file, new folder, and more")
+            .build();
+        root_row.append(&root_button);
         // The pane's first row (David, 2026-10-20): the folder, and the
         // fetch that freshens everything under it — then the branch with
         // its counts, then the filters.
@@ -2082,23 +2084,28 @@ impl FileTree {
             }
         });
         {
+            // Named at click time: the primary's checkout moves into the
+            // VM after the window is up.
+            let open_menu = {
+                let weak = Rc::downgrade(&tree);
+                let anchor = root_face.clone();
+                Rc::new(move || {
+                    if let Some(tree) = weak.upgrade() {
+                        let root_node = FileNode {
+                            path: tree.view_root(),
+                            is_dir: true,
+                            ghost: false,
+                            create: None,
+                        };
+                        tree.show_context_menu(&anchor, &root_node);
+                    }
+                })
+            };
             let context = gtk::GestureClick::builder().button(3).build();
-            let weak = Rc::downgrade(&tree);
-            let row_anchor = root_row.clone();
-            context.connect_released(move |_, _, _, _| {
-                if let Some(tree) = weak.upgrade() {
-                    // Named at click time: the primary's checkout moves
-                    // into the VM after the window is up.
-                    let root_node = FileNode {
-                        path: tree.view_root(),
-                        is_dir: true,
-                        ghost: false,
-                        create: None,
-                    };
-                    tree.show_context_menu(&row_anchor, &root_node);
-                }
-            });
+            let on_right = open_menu.clone();
+            context.connect_released(move |_, _, _, _| on_right());
             root_row.add_controller(context);
+            root_button.connect_clicked(move |_| open_menu());
         }
         // A click takes what moves the branch forward and nothing else; a
         // hold rebases, replaying the branch's own commits, which a click
@@ -4795,6 +4802,19 @@ impl FileTree {
         initial: &str,
         on_done: impl Fn(&Rc<Self>, String) + 'static,
     ) {
+        self.prompt_name_or(heading, affirm, initial, on_done, |_| {});
+    }
+
+    /// [`Self::prompt_name`], with what a cancel does: the dialog closed,
+    /// or nothing usable typed.
+    fn prompt_name_or(
+        self: Rc<Self>,
+        heading: &str,
+        affirm: &str,
+        initial: &str,
+        on_done: impl Fn(&Rc<Self>, String) + 'static,
+        on_cancel: impl Fn(&Rc<Self>) + 'static,
+    ) {
         let dialog = adw::AlertDialog::new(Some(heading), None);
         let entry = gtk::Entry::builder()
             .text(initial)
@@ -4806,11 +4826,18 @@ impl FileTree {
         dialog.set_default_response(Some("ok"));
         dialog.set_close_response("cancel");
         let tree = self.clone();
-        dialog.connect_response(Some("ok"), move |_, _| {
+        dialog.connect_response(None, move |_, response| {
             let name = entry.text().to_string();
             let name = name.trim();
-            if !name.is_empty() && !name.contains('/') && name != "." && name != ".." {
+            if response == "ok"
+                && !name.is_empty()
+                && !name.contains('/')
+                && name != "."
+                && name != ".."
+            {
                 on_done(&tree, name.to_string());
+            } else {
+                on_cancel(&tree);
             }
         });
         dialog.present(Some(&self.widget));
@@ -8140,12 +8167,27 @@ impl FileTree {
                     Create::File => ("New File", false),
                     Create::Folder => ("New Folder", true),
                 };
-                tree.clone()
-                    .prompt_name(title, "Create", "", move |tree, name| {
-                        tree.create_file(&dir.join(name), folder);
-                    });
-                let tree = tree.clone();
-                glib::idle_add_local_once(move || tree.restore_tree_selection());
+                // The row stays selected while its name is asked for: a
+                // cancel gives the selection back to the file in front, and a
+                // new file takes it, as it opens (David, 2026-10-20: "it
+                // should go from 'New file...' selected to the newly created
+                // file selected"). A folder opens no tab, so the selection
+                // goes back to the file in front then too.
+                tree.clone().prompt_name_or(
+                    title,
+                    "Create",
+                    "",
+                    move |tree, name| {
+                        let path = dir.join(name);
+                        tree.create_file(&path, folder);
+                        if folder {
+                            tree.restore_tree_selection();
+                        } else {
+                            tree.select_file(path);
+                        }
+                    },
+                    |tree| tree.restore_tree_selection(),
+                );
             } else if node.is_dir || node.ghost {
                 // A ghost folder opens rather than appears: what it is for
                 // is the files in it, and creating one of them makes it.
@@ -8699,8 +8741,8 @@ impl FileTree {
             return;
         }
         // `TASTE_PROBE_ALIGN=1`: where the header rows' icons and text
-        // start, once — the folder's, the branch's, and All's, which
-        // stand in one column (`BUTTON_INSET`).
+        // start, once — the folder's, the branch's, and All's, buttons all
+        // three, which stand in one column.
         static ALIGN: std::sync::Once = std::sync::Once::new();
         if std::env::var("TASTE_PROBE_ALIGN").is_ok() && !ALIGN.is_completed() {
             ALIGN.call_once(|| {});
