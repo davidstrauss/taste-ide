@@ -102,6 +102,14 @@ pub struct Migration {
     /// again every minute.
     #[serde(default)]
     pub failed_at: Option<u64>,
+    /// When it was first started — approved, asked for by the primary,
+    /// begun with nothing running, or forced. A move once started is
+    /// retried after a failure ([`RETRY_AFTER`], or sooner when another
+    /// move frees room) rather than waiting out the two hours again
+    /// (2026-10-20: an approved move that failed for room stood until it
+    /// was forced).
+    #[serde(default)]
+    pub approved_at: Option<u64>,
     /// Whether something came due while the connection was metered and
     /// was held (`taste_core::network`). Recorded beside the environment,
     /// so a restart in between still nudges first when the stretch ends.
@@ -139,6 +147,7 @@ impl Migration {
             last_nudge: None,
             coordinator_told: false,
             failed_at: None,
+            approved_at: None,
             held_metered: false,
             force_not_before: None,
         }
@@ -216,7 +225,10 @@ impl Migration {
     /// — at the agent's request, or at the move becoming pending when the
     /// agent has not asked.
     pub fn due(&self, now: u64) -> Vec<Due> {
-        if now >= self.forced_at() {
+        // A failure says it was started, for a record from before
+        // `approved_at` was kept.
+        let started = self.approved_at.is_some() || self.failed_at.is_some();
+        if now >= self.forced_at() || started {
             let retry = self
                 .failed_at
                 .is_none_or(|at| now.saturating_sub(at) >= RETRY_AFTER.as_secs());
@@ -419,6 +431,25 @@ mod tests {
         m.failed_at = Some(due);
         assert!(m.due(due + 5 * MIN).is_empty());
         assert_eq!(m.due(due + 15 * MIN), [Due::Force]);
+    }
+
+    /// A move once started — approved, here — that failed is tried again
+    /// after the same wait as a forced one, long before it would be forced;
+    /// cleared of its failure (another move freed room), at once.
+    #[test]
+    fn a_started_move_that_failed_is_tried_again_before_it_is_forced() {
+        let mut m = pending();
+        let t = m.pending_since + 10 * MIN;
+        m.approved_at = Some(t);
+        m.failed_at = Some(t);
+        assert!(m.due(t + 5 * MIN).is_empty());
+        assert_eq!(m.due(t + 15 * MIN), [Due::Force]);
+        m.failed_at = None;
+        assert_eq!(m.due(t + 16 * MIN), [Due::Force]);
+        // A record from before approvals were kept: its failure says it.
+        let mut old = pending();
+        old.failed_at = Some(t);
+        assert_eq!(old.due(t + 15 * MIN), [Due::Force]);
     }
 
     #[test]

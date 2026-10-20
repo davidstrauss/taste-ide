@@ -799,14 +799,19 @@ mod tests {
     /// so the walk up the ancestors is not a nicety: it is the difference
     /// between an answer and a `None` on every fresh workspace. What comes
     /// back is the volume's, so the unborn path and its existing parent
-    /// agree to the byte.
+    /// agree — to within what anything else on the volume wrote between
+    /// the two reads, which on a machine building in parallel is a few
+    /// blocks (2026-10-20: 16 KiB apart).
     #[test]
     fn free_space_is_answered_for_a_directory_that_does_not_exist_yet() {
         let dir = tempfile::tempdir().unwrap();
         let here = free_bytes(dir.path()).expect("a tempdir is on a filesystem");
         let unborn = free_bytes(&dir.path().join("environments/i-0001/repo"))
             .expect("and so is the directory that will be created inside it");
-        assert_eq!(here, unborn, "both are the same volume's free space");
+        assert!(
+            here.abs_diff(unborn) < 64 << 20,
+            "both are the same volume's free space: {here} and {unborn}"
+        );
         assert!(here > 0, "the suite is running somewhere with room: {here}");
     }
 

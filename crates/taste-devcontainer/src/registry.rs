@@ -3675,6 +3675,13 @@ impl EnvironmentRegistry {
             if let Err(e) = migration.write(&dir) {
                 tracing::warn!("recording {id}'s move: {e:#}");
             }
+            // A move that failed waits as a forced one does before it is
+            // tried again, or one with no room for it was tried, and
+            // toasted, every minute (2026-10-20). Another's move finishing
+            // lets it go sooner (`relocate`).
+            let resting = migration
+                .failed_at
+                .is_some_and(|at| now.saturating_sub(at) < crate::migration::RETRY_AFTER.as_secs());
             self.migrations
                 .lock()
                 .unwrap()
@@ -3686,7 +3693,7 @@ impl EnvironmentRegistry {
                     | SupervisorState::Building
                     | SupervisorState::Preparing { .. }
             );
-            if !running && !id.is_primary() {
+            if !running && !id.is_primary() && !resting {
                 idle.push(id);
             }
         }
@@ -4063,7 +4070,11 @@ impl EnvironmentRegistry {
                     }
                     Due::Force => self.spawn_relocate(
                         id.clone(),
-                        "forced two hours after it became pending".to_string(),
+                        if now >= migration.forced_at() {
+                            "forced two hours after it became pending".to_string()
+                        } else {
+                            "tried again after it failed".to_string()
+                        },
                     ),
                 }
             }
@@ -4134,6 +4145,20 @@ impl EnvironmentRegistry {
         {
             return;
         }
+        // Started: from here a failure is retried, not waited out to the
+        // force (`Migration::due`).
+        let started = {
+            let mut migrations = self.migrations.lock().unwrap();
+            migrations.get_mut(&env).and_then(|m| {
+                m.approved_at.is_none().then(|| {
+                    m.approved_at = Some(now_secs());
+                    m.clone()
+                })
+            })
+        };
+        if let Some(m) = started {
+            let _ = m.write(&self.env_dir(&env));
+        }
         let registry = self.clone();
         tokio::spawn(async move {
             registry.relocate(&env, &why).await;
@@ -4163,6 +4188,24 @@ impl EnvironmentRegistry {
             Ok(domain) => {
                 self.migrations.lock().unwrap().remove(env);
                 crate::migration::Migration::clear(&self.env_dir(env));
+                // A move frees what it left: the moves that failed for want
+                // of room are tried again at the next tick, not a quarter of
+                // an hour on.
+                let retried: Vec<(EnvironmentId, crate::migration::Migration)> = self
+                    .migrations
+                    .lock()
+                    .unwrap()
+                    .iter_mut()
+                    .filter(|(_, m)| m.failed_at.is_some())
+                    .map(|(id, m)| {
+                        let failed = m.failed_at.take();
+                        m.approved_at = m.approved_at.or(failed);
+                        (id.clone(), m.clone())
+                    })
+                    .collect();
+                for (id, m) in retried {
+                    let _ = m.write(&self.env_dir(&id));
+                }
                 let (note, toast, told) = match migration.kind {
                     crate::migration::Kind::Guest => (
                         format!(
