@@ -166,7 +166,19 @@ impl Migration {
         }
     }
 
-    /// What reinstantiating does, as a fleet row says it.
+    /// That one is waiting, as the fleet row says it beside "running": the
+    /// waiting first, since the row's line is cut short at its end, and
+    /// never "moving", which read as a move under way while it waited on
+    /// its approval (David, 2026-10-20). A move under way says so through
+    /// the environment's state instead (`Supervisor::begin_move`).
+    pub fn pending_words(&self) -> String {
+        match self.kind {
+            Kind::Guest => format!("move pending ({})", self.to_release),
+            Kind::Packages => "package refresh pending".to_string(),
+        }
+    }
+
+    /// What reinstantiating does, as a toast or a tool's answer says it.
     pub fn row_words(&self) -> String {
         match self.kind {
             Kind::Guest => format!("moving to a VM on {}", self.to_release),
@@ -490,6 +502,11 @@ mod tests {
             "{nudge}"
         );
         assert_eq!(refresh.row_words(), "rebuilding with updated packages");
+        assert_eq!(refresh.pending_words(), "package refresh pending");
+        assert_eq!(
+            m.pending_words(),
+            format!("move pending ({})", m.to_release)
+        );
     }
 
     /// The check runs in whatever shell the image has, so it is plain sh

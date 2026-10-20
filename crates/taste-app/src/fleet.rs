@@ -116,10 +116,9 @@ pub struct EnvFacts {
     /// safe mode is a container too now.
     pub authority: ConfigAuthority,
     pub pending_rebuild: bool,
-    /// What reinstating this environment on updated versions does, while
-    /// one is pending — "moving to a VM on <release>" for a VM behind the
-    /// stream, "rebuilding with updated packages" for a day-old image
-    /// (`taste_devcontainer::migration`).
+    /// That reinstating this environment on updated versions is pending —
+    /// "move pending (<release>)" for a VM behind the stream, "package
+    /// refresh pending" for a day-old image (`Migration::pending_words`).
     pub reinstating: Option<String>,
     /// Why the project's config is passed over, when a config exists and
     /// is: the one fact that separates "safe mode because there is no

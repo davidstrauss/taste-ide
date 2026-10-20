@@ -4185,8 +4185,10 @@ move happens anyway, since what is ageing is the kernel isolation rests
 on. The primary's agent is the coordinator, so its asking is approving.
 An environment with nothing running has nobody to ask and moves at once.
 A move that fails says so to the coordinator and is tried again fifteen
-minutes later; the fleet row reads "moving to a VM on <release>" or
-"rebuilding with updated packages" while one is pending. Moving is one operation with four reasons, never a reboot the
+minutes later; the fleet row reads "move pending (<release>)" or
+"package refresh pending" while one waits — never "moving", which read as
+a move under way (David, 2026-10-20) — and the move's own steps once it
+starts. Moving is one operation with four reasons, never a reboot the
 IDE schedules.
 
 **A metered connection holds what the IDE would download by choice**

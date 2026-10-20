@@ -1661,7 +1661,7 @@ impl Console {
             reinstating: self
                 .environments
                 .migration_of(&env)
-                .map(|migration| migration.row_words()),
+                .map(|migration| migration.pending_words()),
             config_reason: supervisor.config_passed_over(),
             hook_failure: supervisor.hook_failure(),
             chat,
