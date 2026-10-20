@@ -320,6 +320,11 @@ struct FileNode {
     create: Option<Create>,
 }
 
+/// Adwaita's horizontal padding inside a button: what a row that is not a
+/// button is inset by to stand in the same column as the button rows
+/// beside it.
+const BUTTON_INSET: i32 = 10;
+
 /// What a create row makes ([`FileNode::create`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Create {
@@ -887,7 +892,9 @@ impl Showing {
 /// A git filter's face: `icon` and its count beside it, the count the label
 /// returned. Replaces the button's own label, whose words are its tooltip.
 fn icon_and_count(button: &gtk::ToggleButton, icon: &str) -> gtk::Label {
-    let face = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    // Six, as the folder's and the branch's rows part their icon and
+    // name, so the counts start where those names do.
+    let face = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     face.append(&gtk::Image::from_icon_name(icon));
     let count = gtk::Label::new(Some("0"));
     face.append(&count);
@@ -1707,6 +1714,12 @@ impl FileTree {
         // collapsible; its context menu creates top-level items.
         let root_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
 
+        // Inset by a button's padding: the branch and the filters under it
+        // are buttons, and their icons and names stood ten pixels right of
+        // the folder's (measured with TASTE_PROBE_ALIGN: icon 14 against
+        // 24, name 36 against 46; David, 2026-10-20: "These should be
+        // better aligned").
+        root_row.set_margin_start(BUTTON_INSET);
         root_row.append(&gtk::Image::from_icon_name("folder-open-symbolic"));
         let root_label = gtk::Label::builder()
             .label(
@@ -8684,6 +8697,30 @@ impl FileTree {
     fn probe_card(&self) {
         if std::env::var("TASTE_PROBE_CHECK").is_err() {
             return;
+        }
+        // `TASTE_PROBE_ALIGN=1`: where the header rows' icons and text
+        // start, once — the folder's, the branch's, and All's, which
+        // stand in one column (`BUTTON_INSET`).
+        static ALIGN: std::sync::Once = std::sync::Once::new();
+        if std::env::var("TASTE_PROBE_ALIGN").is_ok() && !ALIGN.is_completed() {
+            ALIGN.call_once(|| {});
+            let pane = self.widget.clone();
+            let (root, branch, all) = (
+                self.root_label.clone(),
+                self.branch_child.clone(),
+                self.all_face.clone(),
+            );
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                for (name, label) in [("root", root), ("branch", branch), ("all", all)] {
+                    let icon = label.prev_sibling();
+                    let x = |w: &gtk::Widget| w.compute_bounds(&pane).map(|b| b.x());
+                    println!(
+                        "align {name}: icon {:?} text {:?}",
+                        icon.as_ref().and_then(|i| x(i)),
+                        x(label.upcast_ref())
+                    );
+                }
+            });
         }
         // `TASTE_PROBE_TREE_END=1`: the listing scrolled to its end, where
         // New File… and New Folder… are, which a short pane hides.

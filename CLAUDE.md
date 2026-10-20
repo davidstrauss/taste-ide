@@ -220,6 +220,8 @@ submodule banner (`submodule_bar.rs`) for those submodules (`clone`,
 tree's banner for a branch already in the default branch
 (`merged_bar.rs`, `taste_git::merged`), with its Switch to main, since the
 folder a probe opens is on its own branch;
+`TASTE_PROBE_ALIGN=1` prints where the file tree header's folder, branch,
+and All rows start their icon and text, which stand in one column;
 `TASTE_PROBE_TREE_END=1` scrolls the file tree to the end of its listing,
 where every folder's New File… and New Folder… rows are (pair it with
 `TASTE_PROBE_VIEW=hero`: a watched environment is read-only and has none);
