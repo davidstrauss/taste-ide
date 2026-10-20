@@ -6669,19 +6669,25 @@ impl FileTree {
         create_row.append(&entry);
         create_row.append(&create);
 
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        // Real menu width: branch names and the create entry need room.
-        content.set_width_request(260);
-        content.append(&list);
-        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        content.append(&create_row);
+        // Only the branches scroll: the create row stands under them,
+        // whole, however many there are. Scrolled with them it was the
+        // bottom of a 360px window over a taller list, cut through the
+        // field and the button.
         let scroller = gtk::ScrolledWindow::builder()
-            .child(&content)
+            .child(&list)
             .propagate_natural_height(true)
             .max_content_height(360)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
-        self.branch_popover.set_child(Some(&scroller));
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        // `TASTE_PROBE_BRANCHES` shoots it by this name.
+        content.set_widget_name("branch-menu");
+        // Real menu width: branch names and the create entry need room.
+        content.set_width_request(260);
+        content.append(&scroller);
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        content.append(&create_row);
+        self.branch_popover.set_child(Some(&content));
     }
 
     /// Switch to (or create-and-switch to) a branch, off the main thread;
@@ -8933,6 +8939,17 @@ impl FileTree {
                         x(label.upcast_ref())
                     );
                 }
+            });
+        }
+        // `TASTE_PROBE_BRANCHES=1`: the branch switcher open, once, as a
+        // click on the branch leaves it — a popover, which a shot has no
+        // pointer to open.
+        static BRANCHES: std::sync::Once = std::sync::Once::new();
+        if std::env::var("TASTE_PROBE_BRANCHES").is_ok() && !BRANCHES.is_completed() {
+            BRANCHES.call_once(|| {});
+            let button = self.branch_label.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+                button.popup();
             });
         }
         // `TASTE_PROBE_TREE_END=1`: the listing scrolled to its end, where

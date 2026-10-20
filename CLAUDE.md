@@ -225,6 +225,10 @@ and All rows start their icon and text, which stand in one column;
 `TASTE_PROBE_TREE_END=1` scrolls the file tree to the end of its listing,
 where every folder's New file… and New folder… rows are (pair it with
 `TASTE_PROBE_VIEW=hero`: a watched environment is read-only and has none);
+`TASTE_PROBE_BRANCHES=1` opens the branch switcher once the branches are
+read and shoots it as `window.branch-menu` (a popover, its own surface;
+give the fixture more branches than fit, since the create row under the
+scrolling list is what a long list once cut off);
 `TASTE_PROBE_CARD=push` (or `pull`, `canon`) shows that sync count's hover
 card once the counts land (`sync_card.rs`, drawn in the window, so the
 shot has it), since a shot has no pointer to hover with;

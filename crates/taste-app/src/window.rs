@@ -3588,6 +3588,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     } else if std::env::var("TASTE_PROBE_CUSTOM").as_deref() == Ok("models") {
                         // The chooser is a popover, its own surface.
                         &["window", "window.custom-models"]
+                    } else if std::env::var("TASTE_PROBE_BRANCHES").is_ok() {
+                        // The branch switcher, opened by the file tree once
+                        // its branches are read: a popover, its own surface.
+                        &["window", "window.branch-menu"]
                     } else if std::env::var("TASTE_PROBE_SYNC").is_ok() {
                         // The popover is its own surface, so it is shot as
                         // a target of its own beside the window.
