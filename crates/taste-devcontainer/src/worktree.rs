@@ -44,6 +44,10 @@ pub struct SyncIgnored {
     pub synced: HashSet<PathBuf>,
     /// Which of `toggled`'s directories git ignores.
     pub ignored_dirs: HashSet<PathBuf>,
+    /// Every line that sets the attribute, in whichever attributes file:
+    /// what the file tree's menu finds matching a row beyond its own
+    /// checkboxes, to take out.
+    pub lines: Vec<taste_git::sync_ignored::SetLine>,
 }
 
 impl SyncIgnored {
@@ -258,9 +262,11 @@ impl Worktree {
                 .filter(|p| p.file_name().is_some_and(|n| n == ".gitattributes"))
                 .cloned(),
         );
-        let mut sources: Vec<(PathBuf, String)> = Vec::new();
+        // Each as the file it is (for taking a line out), the directory its
+        // patterns are relative to, and its text.
+        let mut sources: Vec<(PathBuf, PathBuf, String)> = Vec::new();
         if let Ok(text) = files.read_to_string(&root.join(".git/info/attributes")) {
-            sources.push((PathBuf::new(), text));
+            sources.push((PathBuf::from(".git/info/attributes"), PathBuf::new(), text));
         }
         let mut top = String::new();
         for path in found {
@@ -270,13 +276,12 @@ impl Worktree {
             if path == Path::new(".gitattributes") {
                 top = text.clone();
             }
-            sources.push((
-                path.parent().map(Path::to_path_buf).unwrap_or_default(),
-                text,
-            ));
+            let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            sources.push((path, base, text));
         }
+        let lines = taste_git::sync_ignored::set_lines(sources.iter().cloned());
         let mut rules = Rules::default();
-        rules.add_set(sources);
+        rules.add_set(sources.into_iter().map(|(_, base, text)| (base, text)));
         let toggled = Toggled::from_text(&top);
         let mut shown = SyncIgnored::default();
         if !rules.is_empty() {
@@ -302,10 +307,64 @@ impl Worktree {
                         .collect();
                 }
             }
+            // The `attr:` pathspec decides a folder git does not track by
+            // the folder's own attribute, which `*.pdf` never sets, and so
+            // never enters it: a new deck's PDF was missing from the tree
+            // (2026-10-20). The same roots listed without it — entering
+            // those folders, not the ignored ones (`--directory`) — and each
+            // file's attribute asked after, as the snapshot does
+            // (`taste_git::sync_ignored::snapshot_lines`).
+            let mut plain: Vec<String> = [
+                "ls-files",
+                "-z",
+                "-o",
+                "-i",
+                "--exclude-standard",
+                "--directory",
+                "--",
+            ]
+            .map(String::from)
+            .to_vec();
+            plain.extend(rules.roots().iter().map(|root| {
+                let root = root.display().to_string();
+                format!(":(literal){}", if root.is_empty() { "." } else { &root })
+            }));
+            let unseen: Vec<String> = self
+                .run_git_reading_attributes(&plain)
+                .ok()
+                .filter(|out| out.success())
+                .map(|out| {
+                    out.stdout_utf8()
+                        .split('\0')
+                        .filter(|p| !p.is_empty() && !p.ends_with('/'))
+                        .filter(|p| !shown.synced.contains(Path::new(p)))
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for batch in unseen.chunks(500) {
+                let mut ask: Vec<String> =
+                    ["check-attr", "-z", ATTR, "--"].map(String::from).to_vec();
+                ask.extend(batch.iter().cloned());
+                let Ok(out) = self.run_git_reading_attributes(&ask) else {
+                    break;
+                };
+                if !out.success() {
+                    break;
+                }
+                let said = out.stdout_utf8();
+                let fields: Vec<&str> = said.split('\0').collect();
+                for triple in fields.chunks(3) {
+                    if let [path, _, "set"] = triple {
+                        shown.synced.insert(PathBuf::from(*path));
+                    }
+                }
+            }
         }
         let named: Vec<PathBuf> = toggled.dirs.iter().cloned().collect();
         shown.ignored_dirs = self.ignored(&named).unwrap_or_default();
         shown.toggled = toggled;
+        shown.lines = lines;
         shown
     }
 
@@ -315,23 +374,59 @@ impl Worktree {
     /// that leaves it. The `.gitattributes` is a change like any other, to
     /// commit or not.
     pub fn set_sync_ignored(&self, rel: &Path, is_dir: bool, on: bool) -> Result<()> {
-        use taste_git::sync_ignored::{with_path, without_path};
+        self.set_sync_line(&taste_git::sync_ignored::path_line(rel, is_dir), on)
+    }
+
+    /// `line` written into the root `.gitattributes` under the IDE's
+    /// header, or taken out of it: a path's line, or a type's
+    /// (`taste_git::sync_ignored::type_line`).
+    pub fn set_sync_line(&self, line: &str, on: bool) -> Result<()> {
+        use taste_git::sync_ignored::{with_line, without_lines};
+        self.rewrite_attributes(Path::new(".gitattributes"), |text| {
+            if on {
+                with_line(text, line)
+            } else {
+                without_lines(text, &[line.to_string()])
+            }
+        })
+    }
+
+    /// Take `lines` out of the attributes files they are in — each a file
+    /// relative to the root and a line as written — leaving the rest of
+    /// each file as it was (the file tree's "Remove other matching sync
+    /// rules").
+    pub fn remove_sync_lines(&self, lines: &[(PathBuf, String)]) -> Result<()> {
+        let mut by_file: std::collections::BTreeMap<&Path, Vec<String>> = Default::default();
+        for (file, line) in lines {
+            by_file
+                .entry(file.as_path())
+                .or_default()
+                .push(line.clone());
+        }
+        for (file, gone) in by_file {
+            self.rewrite_attributes(file, |text| {
+                taste_git::sync_ignored::without_lines(text, &gone)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// `file` (relative to the root) rewritten by `edit`: made when it was
+    /// not there, and removed when the edit leaves a `.gitattributes`
+    /// empty. `.git/info/attributes` is left empty instead, being git's.
+    fn rewrite_attributes(&self, file: &Path, edit: impl FnOnce(&str) -> String) -> Result<()> {
         let files = self.files();
-        let path = self.root().join(".gitattributes");
+        let path = self.root().join(file);
         let text = match files.read_to_string(&path) {
             Ok(text) => text,
             Err(_) if !files.exists(&path) => String::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let next = if on {
-            with_path(&text, rel, is_dir)
-        } else {
-            without_path(&text, rel, is_dir)
-        };
+        let next = edit(&text);
         if next == text {
             return Ok(());
         }
-        if next.is_empty() {
+        if next.is_empty() && file.file_name().is_some_and(|n| n == ".gitattributes") {
             files.remove(&path, false)
         } else {
             files.write(&path, next.as_bytes())
@@ -1347,6 +1442,43 @@ mod tests {
             worktree.sync_ignored(&worktree.status().unwrap()),
             SyncIgnored::default()
         );
+    }
+
+    /// A type's rule (`*.pdf taste-sync`) names its files wherever they
+    /// are: in a folder git tracks, and in folders it has never seen — one
+    /// with a source file beside the PDF, one with nothing else in it —
+    /// which git's `attr:` pathspec does not enter (2026-10-20).
+    #[test]
+    fn a_types_rule_names_its_files_in_folders_git_has_not_seen() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_commit(root);
+        std::fs::write(root.join(".gitignore"), "*.pdf\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.pdf taste-sync\n").unwrap();
+        std::fs::write(root.join("old.pdf"), "p").unwrap();
+        std::fs::create_dir_all(root.join("deck")).unwrap();
+        std::fs::write(root.join("deck/main.typ"), "t").unwrap();
+        std::fs::write(root.join("deck/deck.pdf"), "p").unwrap();
+        std::fs::create_dir_all(root.join("out/deep")).unwrap();
+        std::fs::write(root.join("out/deep/only.pdf"), "p").unwrap();
+        let worktree = Worktree::Remote {
+            files: Files::Local,
+            path: root.to_path_buf(),
+            after_ref_change: None,
+        };
+        let shown = worktree.sync_ignored(&worktree.status().unwrap());
+        assert_eq!(
+            shown.synced,
+            ["old.pdf", "deck/deck.pdf", "out/deep/only.pdf"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+        );
+        assert!(shown.toggled.types.contains("pdf"));
     }
 
     #[test]

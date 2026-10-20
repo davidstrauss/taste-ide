@@ -3655,16 +3655,25 @@ asked about and ruled out of scope (David, same day):
   — except those whose `taste-sync` git attribute is set, which are part
   of both working copies and sync like any other path
   (`taste_git::sync_ignored`). The file tree's Sync Ignored Files (on a
-  folder) and Sync Though Ignored (on a file) write that line to the root
-  `.gitattributes` — `/dir/** taste-sync`, `/file taste-sync` — which is a
-  change to commit like any other, and any line setting it counts the
-  same; such a row wears ⇅ in the status letter's place, which a real
+  folder), Force Sync (Even if Ignored) (on a file), and Sync *.pdf files
+  (on a file, for its type, at any depth) write that line to the root
+  `.gitattributes` — `/dir/** taste-sync`, `/file taste-sync`, `*.pdf
+  taste-sync` — which is a change to commit like any other, and any line
+  setting it counts the same. Each is a checkbox for its own line only;
+  any other line that applies to the row, a folder's above or one written
+  by hand in whichever attributes file, is taken out by Remove other
+  matching sync rules, offered only when there is one (David,
+  2026-10-20). Such a row wears ⇅ in the status letter's place, which a real
   state of its own takes back. It is an attribute because `.gitattributes`
   is git's place for per-path facts a tool acts on (Git LFS, Linguist,
   `export-ignore`), and because a marker file inside an ignored directory
   would have to be un-ignored itself, line by line (2026-10-11). In the
   VM git decides, through `:(attr:taste-sync)` pathspecs that read the
   repository's attributes for that listing only — no filter runs on one —
+  and, since that pathspec decides a folder git does not track by the
+  folder's own attribute and so never enters one under `*.pdf`, a second
+  listing of the same roots without it, each file's attribute asked after
+  (2026-10-20: a new deck's PDF missing from the tree) —
   while the snapshot's `add` reads none, so no filter the repository
   names runs on what it takes. It replaced Copy Ignored Files to Your
   Folder, a one-way copy on request.

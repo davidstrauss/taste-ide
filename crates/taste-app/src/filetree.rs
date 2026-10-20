@@ -5132,8 +5132,12 @@ impl FileTree {
         // (`taste_git::sync_ignored`). On a folder, for the ignored files
         // under it, and on a file wherever an ignored one is listed: every
         // file, or the synced ones (the default), whose rule is taken back
-        // from the row that wears it. Checked and fixed when a
-        // folder above already syncs it, or a line the IDE did not write.
+        // from the row that wears it. Each checkbox is one line of the
+        // IDE's — the path's, and a file's type's (`*.pdf taste-sync`) —
+        // and any other line that applies, a folder's above or one written
+        // by hand, is taken out by one more item rather than shown as a
+        // box that cannot be unticked (David, 2026-10-20: "offer an option
+        // to 'Remove other matching sync rules'").
         let remote = self.watching.borrow().is_none() && !self.workspace.files().is_local();
         let rel = self.repo_relative(&node.path);
         if let (true, false, Some(rel)) = (
@@ -5141,30 +5145,71 @@ impl FileTree {
             node.ghost,
             rel,
         ) {
-            let (own, other) = {
+            use taste_git::sync_ignored::{path_line, type_line};
+            let is_dir = node.is_dir;
+            let same = |a: &str, b: &str| a.split_whitespace().eq(b.split_whitespace());
+            let path_rule = path_line(&rel, is_dir);
+            let type_rule = (!is_dir)
+                .then(|| rel.extension().and_then(|e| e.to_str()))
+                .flatten()
+                .and_then(|ext| Some((ext.to_string(), type_line(ext)?)));
+            let (own, type_on, others) = {
                 let shown = self.sync_ignored.borrow();
-                let own = shown.toggled.has(&rel, node.is_dir);
-                let other =
-                    shown.toggled.covers(&rel) || (!node.is_dir && shown.synced.contains(&rel));
-                (own, other && !own)
+                let own = shown.toggled.has(&rel, is_dir);
+                let type_on = type_rule
+                    .as_ref()
+                    .is_some_and(|(ext, _)| shown.toggled.types.contains(ext));
+                let others: Vec<(PathBuf, String)> = shown
+                    .lines
+                    .iter()
+                    .filter(|line| line.applies_to(&rel, is_dir))
+                    .filter(|line| {
+                        let boxed = line.file == Path::new(".gitattributes")
+                            && (same(&line.line, &path_rule)
+                                || type_rule.as_ref().is_some_and(|(_, t)| same(&line.line, t)));
+                        !boxed
+                    })
+                    .map(|line| (line.file.clone(), line.line.clone()))
+                    .collect();
+                (own, type_on, others)
             };
             let sync_section = gio::Menu::new();
             sync_section.append(
-                Some(if node.is_dir {
+                Some(if is_dir {
                     "Sync Ignored Files"
                 } else {
-                    "Sync Though Ignored"
+                    "Force Sync (Even if Ignored)"
                 }),
                 Some("row.sync-ignored"),
             );
-            menu.append_section(None, &sync_section);
-            let action =
-                gio::SimpleAction::new_stateful("sync-ignored", None, &(own || other).to_variant());
-            action.set_enabled(writable && !other);
-            let tree = self.clone();
-            let is_dir = node.is_dir;
-            action.connect_activate(move |_, _| tree.set_sync_ignored(&rel, is_dir, !own));
+            let action = gio::SimpleAction::new_stateful("sync-ignored", None, &own.to_variant());
+            action.set_enabled(writable);
+            {
+                let (tree, line) = (self.clone(), path_rule.clone());
+                action.connect_activate(move |_, _| tree.set_sync_line(&line, !own));
+            }
             actions.add_action(&action);
+            if let Some((ext, line)) = type_rule {
+                sync_section.append(Some(&format!("Sync *.{ext} files")), Some("row.sync-type"));
+                let action =
+                    gio::SimpleAction::new_stateful("sync-type", None, &type_on.to_variant());
+                action.set_enabled(writable);
+                let tree = self.clone();
+                action.connect_activate(move |_, _| tree.set_sync_line(&line, !type_on));
+                actions.add_action(&action);
+            }
+            if !others.is_empty() {
+                sync_section.append(
+                    Some("Remove other matching sync rules"),
+                    Some("row.sync-others"),
+                );
+                let tree = self.clone();
+                add_action(
+                    "sync-others",
+                    Box::new(move || tree.remove_sync_lines(others.clone())),
+                );
+            }
+            menu.append_section(None, &sync_section);
         }
 
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
@@ -5180,12 +5225,12 @@ impl FileTree {
         popover.popup();
     }
 
-    /// Sync `rel` though it is ignored, or stop: the root `.gitattributes`
-    /// rewritten beside the files, off the main thread, then the tree
-    /// brought current. The sync carries the files from there.
-    fn set_sync_ignored(self: &Rc<Self>, rel: &Path, is_dir: bool, on: bool) {
+    /// One sync rule written or taken out — a path's line, or a type's —
+    /// in the root `.gitattributes`, beside the files, off the main thread,
+    /// then the tree brought current. The sync carries the files from there.
+    fn set_sync_line(self: &Rc<Self>, line: &str, on: bool) {
         let worktree = self.worktree();
-        let rel = rel.to_path_buf();
+        let line = line.to_string();
         self.file_op(
             if on {
                 "Syncing ignored files failed".to_string()
@@ -5194,7 +5239,23 @@ impl FileTree {
             },
             move || {
                 worktree
-                    .set_sync_ignored(&rel, is_dir, on)
+                    .set_sync_line(&line, on)
+                    .map_err(|e| std::io::Error::other(format!("{e:#}")))
+            },
+            None,
+            |_, _| {},
+        );
+    }
+
+    /// The sync rules a row matches beyond its own checkboxes, taken out of
+    /// the attributes files they are in.
+    fn remove_sync_lines(self: &Rc<Self>, lines: Vec<(PathBuf, String)>) {
+        let worktree = self.worktree();
+        self.file_op(
+            "Removing the other sync rules failed".to_string(),
+            move || {
+                worktree
+                    .remove_sync_lines(&lines)
                     .map_err(|e| std::io::Error::other(format!("{e:#}")))
             },
             None,

@@ -1005,7 +1005,7 @@ mod tests {
         let repo = git2::Repository::init(root).unwrap();
         std::fs::write(root.join("kept.txt"), "kept\n").unwrap();
         std::fs::write(root.join("gone.txt"), "gone\n").unwrap();
-        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n*.pdf\n").unwrap();
         {
             let mut index = repo.index().unwrap();
             index
@@ -1037,7 +1037,7 @@ mod tests {
         // are not; and a filter that fails if anything runs it.
         std::fs::write(
             root.join(".gitattributes"),
-            "* text=auto eol=lf\n/target/keep/** taste-sync\n*.bin filter=boom\n",
+            "* text=auto eol=lf\n/target/keep/** taste-sync\n*.bin filter=boom\n*.pdf taste-sync\n",
         )
         .unwrap();
 
@@ -1051,6 +1051,14 @@ mod tests {
             "To: a\r\nSubject: b\r\n\r\nbody\r\n",
         )
         .unwrap();
+        // A type's rule over files in folders git has never seen: one with
+        // a source file beside it, and one holding nothing but what is
+        // ignored — which git's `attr:` pathspec does not enter, since it
+        // asks the folder's own attribute first (2026-10-20: a new deck's
+        // PDF missing from the tree).
+        std::fs::write(root.join("new/deep/deck.pdf"), "pdf").unwrap();
+        std::fs::create_dir_all(root.join("fresh/out")).unwrap();
+        std::fs::write(root.join("fresh/out/only.pdf"), "pdf").unwrap();
         std::fs::create_dir_all(root.join("sub/out")).unwrap();
         std::fs::write(root.join("sub/.gitignore"), "out/\n").unwrap();
         std::fs::write(root.join("sub/.gitattributes"), "/out/*.txt taste-sync\n").unwrap();
@@ -1105,6 +1113,8 @@ mod tests {
         for (path, there) in [
             ("target/keep/deep/w.bin", true),
             ("sub/out/a.txt", true),
+            ("new/deep/deck.pdf", true),
+            ("fresh/out/only.pdf", true),
             ("target/ignored.o", false),
             ("sub/out/b.o", false),
         ] {

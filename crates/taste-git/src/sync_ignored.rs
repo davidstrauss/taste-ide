@@ -12,11 +12,12 @@
 //! `filter=lfs`, Linguist's `linguist-generated`, `export-ignore`): it is
 //! committed, nests by directory, takes globs, and — unlike a marker file
 //! inside an ignored directory — never has to be un-ignored itself. No other
-//! tool reads `taste-sync`. The file tree's Sync Ignored Files writes one
-//! line per path to the root `.gitattributes` ([`with_path`],
-//! [`without_path`]): `/dir/** taste-sync` for a directory, `/file
-//! taste-sync` for a file; any other line setting it, written by hand or by
-//! an agent, counts the same.
+//! tool reads `taste-sync`. The file tree's menu writes one line per path
+//! to the root `.gitattributes` ([`with_path`], [`without_path`]): `/dir/**
+//! taste-sync` for a directory, `/file taste-sync` for a file, and `*.pdf
+//! taste-sync` for a file's type ([`type_line`]); any other line setting
+//! it, written by hand or by an agent, counts the same, and the menu takes
+//! out the ones matching a row ([`SetLine`]).
 //!
 //! Who decides, where: in the VM, git itself (`:(attr:taste-sync)`
 //! pathspecs in the snapshot script, [`SNAPSHOT_LINES`]); on this host,
@@ -169,15 +170,33 @@ pub fn pattern(path: &Path, is_dir: bool) -> String {
     quoted
 }
 
-fn own_line(path: &Path, is_dir: bool) -> String {
+/// The line the file tree writes for `path`: [`pattern`] and [`ATTR`].
+pub fn path_line(path: &Path, is_dir: bool) -> String {
     format!("{} {ATTR}", pattern(path, is_dir))
+}
+
+/// The line the file tree writes for every file of a type, at any depth:
+/// `*.pdf taste-sync` for `pdf` (David, 2026-10-20: "offer 'Sync *.[type]
+/// files', mapped to a rule like `*.pdf taste-sync`"). `None` for a type
+/// that would not be a plain glob — empty, or with a slash, a space, a
+/// quote, or a glob character in it.
+pub fn type_line(ext: &str) -> Option<String> {
+    let plain =
+        !ext.is_empty() && !ext.contains(['/', '\\', ' ', '\t', '"', '*', '?', '[', ']', '!', '#']);
+    plain.then(|| format!("*.{ext} {ATTR}"))
 }
 
 /// `.gitattributes` text with `path`'s line in it, under [`HEADER`]. Text
 /// that already has the line comes back as it is.
 pub fn with_path(text: &str, path: &Path, is_dir: bool) -> String {
-    let line = own_line(path, is_dir);
-    if text.lines().any(|l| l.trim() == line) {
+    with_line(text, &path_line(path, is_dir))
+}
+
+/// `.gitattributes` text with `line` in it, under [`HEADER`]. Text that
+/// already has the line comes back as it is.
+pub fn with_line(text: &str, line: &str) -> String {
+    let line = line.trim().to_string();
+    if text.lines().any(|l| same_line(l, &line)) {
         return text.to_string();
     }
     let mut out = text.to_string();
@@ -200,8 +219,22 @@ pub fn with_path(text: &str, path: &Path, is_dir: bool) -> String {
 /// (and the blank line before it) once no line mentions the attribute.
 /// Empty when nothing else was there.
 pub fn without_path(text: &str, path: &Path, is_dir: bool) -> String {
-    let line = own_line(path, is_dir);
-    let mut lines: Vec<&str> = text.lines().filter(|l| l.trim() != line).collect();
+    without_lines(text, &[path_line(path, is_dir)])
+}
+
+/// Whether two lines say the same: their words, however spaced.
+fn same_line(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
+}
+
+/// `.gitattributes` text without `gone` (each compared by its words), and
+/// without [`HEADER`] (and the blank line before it) once no line mentions
+/// the attribute. Empty when nothing else was there.
+pub fn without_lines(text: &str, gone: &[String]) -> String {
+    let mut lines: Vec<&str> = text
+        .lines()
+        .filter(|l| !gone.iter().any(|g| same_line(l, g)))
+        .collect();
     let mentioned = lines.iter().any(|l| {
         split_line(l)
             .map(|(_, attrs)| says(&attrs).is_some())
@@ -230,6 +263,8 @@ pub fn without_path(text: &str, path: &Path, is_dir: bool) -> String {
 pub struct Toggled {
     pub dirs: BTreeSet<PathBuf>,
     pub files: BTreeSet<PathBuf>,
+    /// The file types with a [`type_line`]: `pdf` for `*.pdf taste-sync`.
+    pub types: BTreeSet<String>,
 }
 
 impl Toggled {
@@ -244,6 +279,12 @@ impl Toggled {
                 continue;
             }
             let glob = unquote(raw);
+            if let Some(ext) = glob.strip_prefix("*.") {
+                if raw == glob && type_line(ext).is_some() {
+                    toggled.types.insert(ext.to_string());
+                }
+                continue;
+            }
             let Some(glob) = glob.strip_prefix('/') else {
                 continue;
             };
@@ -287,6 +328,74 @@ impl Toggled {
     pub fn covers(&self, path: &Path) -> bool {
         path.ancestors().skip(1).any(|dir| self.dirs.contains(dir))
     }
+}
+
+/// A line that sets [`ATTR`], and where it is written: what the file
+/// tree's "Remove other matching sync rules" takes out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetLine {
+    /// The file it is in, relative to the root: `.gitattributes`,
+    /// `deck/.gitattributes`, or `.git/info/attributes`.
+    pub file: PathBuf,
+    /// The directory its pattern is relative to.
+    pub base: PathBuf,
+    /// The line as written, trimmed.
+    pub line: String,
+    glob: String,
+}
+
+/// What [`SetLine::applies_to`] asks a folder's rule about: a path inside
+/// it no pattern names, so a rule matches it only by covering the folder.
+const INSIDE: &str = "\u{1}taste-inside";
+
+impl SetLine {
+    /// Whether this line syncs `path` (relative to the root) — for a
+    /// folder, what is in it — as git reads the line on its own: the
+    /// pattern against the path, not its parents, since a directory's
+    /// attributes are not its files'.
+    pub fn applies_to(&self, path: &Path, is_dir: bool) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.base) else {
+            return false;
+        };
+        let mut builder = GitignoreBuilder::new("");
+        if builder.add_line(None, &self.glob).is_err() {
+            return false;
+        }
+        let Ok(matcher) = builder.build() else {
+            return false;
+        };
+        let inside;
+        let target = if is_dir {
+            inside = rel.join(INSIDE);
+            inside.as_path()
+        } else {
+            rel
+        };
+        matcher.matched(target, false).is_ignore()
+    }
+}
+
+/// The lines that set [`ATTR`] in `files` — each as the file it is in, the
+/// directory its patterns are relative to, and its text.
+pub fn set_lines(files: impl IntoIterator<Item = (PathBuf, PathBuf, String)>) -> Vec<SetLine> {
+    let mut out = Vec::new();
+    for (file, base, text) in files {
+        for line in text.lines() {
+            let Some((raw, attrs)) = split_line(line) else {
+                continue;
+            };
+            if says(&attrs) != Some(true) {
+                continue;
+            }
+            out.push(SetLine {
+                file: file.clone(),
+                base: base.clone(),
+                line: line.trim().to_string(),
+                glob: unquote(raw),
+            });
+        }
+    }
+    out
 }
 
 /// Where a walk for a line's pattern starts, relative to the root: the
@@ -345,6 +454,11 @@ pub const ROOTS_AWK: &str = r#"/^[ \t]*(#|\[attr\])/ { next }
 }
 "#;
 
+/// gawk over `git check-attr -z` (path, attribute, value, each NUL-ended):
+/// the paths whose [`ATTR`] is set, NUL-ended, less the directories
+/// `--directory` lists — an ignored one entire, never entered.
+pub const SET_AWK: &str = r#"BEGIN { RS = "\0"; ORS = "\0" } NR % 3 == 1 { p = $0 } NR % 3 == 0 && $0 == "set" && p !~ /\/$/ { print p }"#;
+
 /// The shell lines a checkout's snapshot script runs after its `git add -A`
 /// (`crate::snapshot::script`): every ignored file whose [`ATTR`] is set,
 /// added to the scratch index. The roots come from each `.gitattributes`
@@ -353,6 +467,13 @@ pub const ROOTS_AWK: &str = r#"/^[ \t]*(#|\[attr\])/ { next }
 /// listing — the IDE's git otherwise reads none (`GIT_ATTR_SOURCE`, the
 /// keeper's), and a listing runs no filter — while the `add` keeps reading
 /// none, so no filter the repository names runs on what it adds.
+///
+/// Two listings, merged: git's `attr:` pathspec decides a folder git does
+/// not track by the folder's own attribute, which `*.pdf` never sets, and
+/// so never enters it — a new folder's PDF did not sync (2026-10-20). The
+/// second lists what is ignored in the same roots without it, entering the
+/// folders git does not track and not the ignored ones (`--directory`),
+/// and asks each file's attribute after ([`SET_AWK`]).
 ///
 /// What syncs is often a program's live data, which changes under the
 /// snapshot, and one file that did failed the whole snapshot, so the folder
@@ -387,10 +508,16 @@ roots="$GIT_INDEX_FILE.roots"
 }} | sort -u > "$roots"
 set --
 while IFS= read -r root; do set -- "$@" ":(attr:{ATTR},literal)${{root:-.}}"; done < "$roots"
-rm -f "$roots"
 if [ $# -gt 0 ]; then
   synced="$GIT_INDEX_FILE.synced"
-  ( unset GIT_ATTR_SOURCE; git ls-files -z -o -i --exclude-standard -- "$@" ) > "$synced"
+  ( unset GIT_ATTR_SOURCE
+    git ls-files -z -o -i --exclude-standard -- "$@"
+    set --
+    while IFS= read -r root; do set -- "$@" ":(literal)${{root:-.}}"; done < "$roots"
+    git ls-files -z -o -i --exclude-standard --directory -- "$@" \
+      | git check-attr -z --stdin {ATTR} \
+      | awk '{SET_AWK}'
+  ) | LC_ALL=C sort -z -u > "$synced"
   own="$GIT_INDEX_FILE.own"
   cp -p "$gitdir/taste-synced-index" "$own" 2>/dev/null || rm -f "$own"
   LC_ALL=C sort -z "$synced" > "$synced.now"
@@ -411,6 +538,7 @@ if [ $# -gt 0 ]; then
   # Nothing to write, and update-index wrote no index: there is none to keep.
   if [ -f "$own" ]; then mv -f "$own" "$gitdir/taste-synced-index"; else rm -f "$gitdir/taste-synced-index"; fi
 fi
+rm -f "$roots"
 "#,
         awk = ROOTS_AWK
     )
@@ -735,6 +863,69 @@ mod tests {
             without_path(&with_path("", Path::new("x"), false), Path::new("x"), false),
             ""
         );
+    }
+
+    /// A type's line, read back as a type; the lines that apply to a
+    /// file and to a folder, wherever they are written; and lines taken
+    /// out leaving the rest of the file.
+    #[test]
+    fn a_types_line_and_the_lines_that_apply() {
+        assert_eq!(type_line("pdf").as_deref(), Some("*.pdf taste-sync"));
+        for bad in ["", "a b", "a/b", "p*", "\"q\""] {
+            assert_eq!(type_line(bad), None, "{bad:?}");
+        }
+        let root = with_line(
+            &with_path("", Path::new("deck/out.pdf"), false),
+            "*.pdf taste-sync",
+        );
+        let toggled = Toggled::from_text(&root);
+        assert!(toggled.types.contains("pdf"));
+        assert!(toggled.has(Path::new("deck/out.pdf"), false));
+
+        let lines = set_lines([
+            (
+                PathBuf::from(".gitattributes"),
+                PathBuf::new(),
+                root.clone(),
+            ),
+            (
+                PathBuf::from("deck/.gitattributes"),
+                PathBuf::from("deck"),
+                "*.bin -taste-sync\nout.pdf taste-sync\n".to_string(),
+            ),
+            (
+                PathBuf::from(".gitattributes.other"),
+                PathBuf::new(),
+                "/build/** taste-sync\n".to_string(),
+            ),
+        ]);
+        let applying = |path: &str, is_dir: bool| -> Vec<&str> {
+            lines
+                .iter()
+                .filter(|l| l.applies_to(Path::new(path), is_dir))
+                .map(|l| l.line.as_str())
+                .collect()
+        };
+        assert_eq!(
+            applying("deck/out.pdf", false),
+            [
+                "/deck/out.pdf taste-sync",
+                "*.pdf taste-sync",
+                "out.pdf taste-sync"
+            ],
+            "every set line that names it, in whichever file; never an unset one"
+        );
+        assert_eq!(applying("deck/notes.md", false), Vec::<&str>::new());
+        assert_eq!(applying("build/x", true), ["/build/** taste-sync"]);
+        assert_eq!(
+            applying("build", true),
+            ["/build/** taste-sync"],
+            "a folder's rule covers what is in it"
+        );
+        assert!(applying("deck", true).is_empty(), "a type covers no folder");
+
+        let left = without_lines(&root, &["*.pdf   taste-sync".to_string()]);
+        assert_eq!(left, with_path("", Path::new("deck/out.pdf"), false));
     }
 
     #[test]
