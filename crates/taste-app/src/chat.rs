@@ -470,25 +470,48 @@ pub type OpenDocumentHook = Rc<dyn Fn(&str, Document)>;
 /// it is near. Set straight across hundreds of items the list has not
 /// measured, the value moved and the list did not — it stayed bound to the
 /// first ones, and showed nothing (2026-10-19, a 404-stretch history
-/// restored blank).
-fn pin_to_end(list: &gtk::ListView, adjustment: &gtk::Adjustment, pinning: &Rc<Cell<bool>>) {
+/// restored blank). What the list measures on its way there changes its
+/// extent, and that pins the rest of the way ([`repin_next_frame`]).
+fn pin_to_end(list: &gtk::ListView, adjustment: &gtk::Adjustment) {
     let bottom = adjustment.upper() - adjustment.page_size();
     let count = list.model().map_or(0, |model| model.n_items());
     if count > 0 && bottom - adjustment.value() > adjustment.page_size() * 2.0 {
-        // The list goes there, and its own scrolling there is not the
-        // reader scrolling away; the change in its extent that follows
-        // pins the rest of the way.
-        pinning.set(true);
         list.scroll_to(count - 1, gtk::ListScrollFlags::NONE, None);
-        // Not for ever: a reader who scrolls during it is heard after.
-        let pinning = pinning.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
-            pinning.set(false);
-        });
         return;
     }
     adjustment.set_value(bottom);
 }
+
+/// Pin to the end on the next frame, while following it: once, however
+/// many times this is asked before then. On the frame clock, never an
+/// idle — an idle waits for a moment a frame clock running back to back
+/// does not give it — and never mid-allocation, which is where the
+/// extent changes that ask for it come from.
+fn repin_next_frame(
+    scroller: &gtk::ScrolledWindow,
+    list: &gtk::ListView,
+    stick: &Rc<Cell<bool>>,
+    pending: &Rc<Cell<bool>>,
+) {
+    if pending.replace(true) {
+        return;
+    }
+    let (list, stick, pending) = (list.clone(), stick.clone(), pending.clone());
+    scroller.add_tick_callback(move |scroller, _| {
+        pending.set(false);
+        // Re-checked: the reader may have scrolled away meanwhile, and
+        // their scroll wins.
+        if stick.get() {
+            pin_to_end(&list, &scroller.vadjustment());
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// The most frames a jump to an item waits for it to come to rest
+/// (`ChatPane::scroll_to_item`): two seconds' worth, past which nothing
+/// the list is doing will settle it.
+const SCROLL_SETTLE_FRAMES: u32 = 120;
 
 /// One item of the transcript's list: a row of the conversation's model,
 /// drawn when the list brings it on screen (`rows.rs`), or a widget the
@@ -914,9 +937,6 @@ pub struct ChatPane {
     /// A re-pin is already queued; further growth in the same frame must
     /// not queue another.
     scroll_pending: Rc<Cell<bool>>,
-    /// The list is on its way to the end at our asking (`pin_to_end`): its
-    /// own scrolling there is not the reader scrolling away.
-    pinning: Rc<Cell<bool>>,
     /// When the reader last scrolled — the wheel, the touchpad, the
     /// scrollbar, the keys — so the list moving its own content is told
     /// from the reader moving the view (`at_bottom`'s handler).
@@ -3513,7 +3533,6 @@ impl ChatPane {
             open_jump_up: open_jump_up.clone(),
             open_jump_down: open_jump_down.clone(),
             scroll_pending: Rc::new(Cell::new(false)),
-            pinning: Rc::new(Cell::new(false)),
             reader_scrolled: Rc::new(Cell::new(None)),
             mode_sync: RefCell::new(None),
             controls_signature: RefCell::new(None),
@@ -3624,17 +3643,12 @@ impl ChatPane {
             let adjustment = pane.transcript_scroller.vadjustment();
             let stick = pane.stick_to_bottom.clone();
             let banner = jump_banner.clone();
-            let pinning = pane.pinning.clone();
             let reader = pane.reader_scrolled.clone();
             let list = pane.list.clone();
+            let scroller = pane.transcript_scroller.clone();
+            let pending = pane.scroll_pending.clone();
             adjustment.connect_value_changed(move |adjustment| {
                 let bottom = at_bottom(adjustment);
-                // On the way to the end at our asking: still following it.
-                if pinning.get() && !bottom {
-                    stick.set(true);
-                    return;
-                }
-                pinning.set(false);
                 // Only the reader turns following off. The list moves the
                 // view itself — holding the reader's place as it measures
                 // what it had estimated — and taken for the reader that
@@ -3650,11 +3664,7 @@ impl ChatPane {
                         stick.set(true);
                         banner.set_reveal_child(false);
                     } else if stick.get() {
-                        let (list, adjustment, pinning) =
-                            (list.clone(), adjustment.clone(), pinning.clone());
-                        glib::idle_add_local_once(move || {
-                            pin_to_end(&list, &adjustment, &pinning);
-                        });
+                        repin_next_frame(&scroller, &list, &stick, &pending);
                     }
                     return;
                 }
@@ -3712,7 +3722,7 @@ impl ChatPane {
             let stick = pane.stick_to_bottom.clone();
             let pending = pane.scroll_pending.clone();
             let list = pane.list.clone();
-            let pinning = pane.pinning.clone();
+            let scroller = pane.transcript_scroller.clone();
             let banner = jump_banner.clone();
             adjustment.connect_changed(move |adjustment| {
                 let upper = adjustment.upper();
@@ -3727,26 +3737,10 @@ impl ChatPane {
                     TailAction::Repin => {}
                 }
                 banner.set_reveal_child(false);
-                if pending.get() {
-                    return;
-                }
-                // Deferred, never inline: this fires from size-allocate, and
-                // moving the adjustment mid-allocation fights the layout
-                // pass that is still running.
-                pending.set(true);
-                let adjustment = adjustment.clone();
-                let stick = stick.clone();
-                let pending = pending.clone();
-                let list = list.clone();
-                let pinning = pinning.clone();
-                glib::idle_add_local_once(move || {
-                    pending.set(false);
-                    // Re-checked: the user may have scrolled away while
-                    // this was queued, and their scroll wins.
-                    if stick.get() {
-                        pin_to_end(&list, &adjustment, &pinning);
-                    }
-                });
+                // Deferred to the next frame, never inline: this fires from
+                // size-allocate, and moving the adjustment mid-allocation
+                // fights the layout pass that is still running.
+                repin_next_frame(&scroller, &list, &stick, &pending);
             });
         }
 
@@ -3814,11 +3808,10 @@ impl ChatPane {
             let stick = pane.stick_to_bottom.clone();
             let banner = jump_banner.clone();
             let list = pane.list.clone();
-            let pinning = pane.pinning.clone();
             jump.connect_clicked(move || {
                 stick.set(true);
                 banner.set_reveal_child(false);
-                pin_to_end(&list, &adjustment, &pinning);
+                pin_to_end(&list, &adjustment);
             });
         }
         // The floats' comings and goings resize the room under the last
@@ -4972,18 +4965,14 @@ impl ChatPane {
         let Some(item) = u32::try_from(row).ok().and_then(|row| self.item_at(row)) else {
             return;
         };
-        self.scroll_to_item(&item, 24.0);
-        let Some(pane) = self.weak_self.borrow().upgrade() else {
-            return;
-        };
-        // Once the list has it drawn where it was asked for.
-        glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-            if let Some(widget) = pane.item_widget(&item) {
-                widget.add_css_class("search-hit");
-                glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
-                    widget.remove_css_class("search-hit");
-                });
-            }
+        // Lit once it is where it was asked for, for as long as it takes
+        // to find it.
+        self.scroll_to_item_then(&item, 24.0, |widget| {
+            widget.add_css_class("search-hit");
+            let widget = widget.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
+                widget.remove_css_class("search-hit");
+            });
         });
     }
 
@@ -7602,50 +7591,72 @@ impl ChatPane {
         if self.store.n_items() <= 1 {
             return;
         }
+        // Following from here: every change in the list's extent as it
+        // measures what it finds at the end pins the rest of the way.
         self.stick_to_bottom.set(true);
-        let adjustment = self.transcript_scroller.vadjustment();
-        pin_to_end(&self.list, &adjustment, &self.pinning);
-        for delay in [40, 160, 400, 1000] {
-            let (list, adjustment) = (self.list.clone(), adjustment.clone());
-            let (stick, pinning) = (self.stick_to_bottom.clone(), self.pinning.clone());
-            glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
-                if stick.get() {
-                    pin_to_end(&list, &adjustment, &pinning);
-                }
-            });
-        }
+        pin_to_end(&self.list, &self.transcript_scroller.vadjustment());
     }
 
     /// Bring `item` to the top of the view, `inset` below its edge: the
-    /// list brings it into view, and once that is laid out it is put where
-    /// it was asked for.
+    /// list brings it into view, and on each frame after, once it is laid
+    /// out, it is moved the rest of the way, until it has held still two
+    /// frames running — the list measuring its neighbours moves it — and
+    /// `then` is told where it came to rest. A reader scrolling meanwhile is
+    /// where they want to be, and it stops; so does a frame count that
+    /// nothing settles in.
     fn scroll_to_item(&self, item: &Item, inset: f32) {
+        self.scroll_to_item_then(item, inset, |_| {});
+    }
+
+    fn scroll_to_item_then(
+        &self,
+        item: &Item,
+        inset: f32,
+        then: impl FnOnce(&gtk::Widget) + 'static,
+    ) {
         let Some(position) = self.position_of(item) else {
             return;
         };
         self.stick_to_bottom.set(false);
         self.list
             .scroll_to(position, gtk::ListScrollFlags::NONE, None);
-        let Some(pane) = self.weak_self.borrow().upgrade() else {
-            return;
-        };
-        // Twice: the first lands it near enough for its neighbours to be
-        // measured, the second where it was asked for.
-        for delay in [40, 160] {
-            let (pane, item) = (pane.clone(), item.clone());
-            glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
-                let Some(widget) = pane.item_widget(&item) else {
-                    return;
+        let weak = self.weak_self.borrow().clone();
+        let item = item.clone();
+        let asked = std::time::Instant::now();
+        let (frames, still) = (Cell::new(0u32), Cell::new(0u32));
+        let then = RefCell::new(Some(then));
+        self.transcript_scroller
+            .add_tick_callback(move |scroller, _| {
+                let Some(pane) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
                 };
-                if let Some(bounds) = widget.compute_bounds(&pane.transcript_scroller) {
-                    let adjustment = pane.transcript_scroller.vadjustment();
-                    let by = f64::from(bounds.y() - inset);
-                    if by.abs() >= 1.0 {
-                        adjustment.set_value((adjustment.value() + by).max(adjustment.lower()));
-                    }
+                frames.set(frames.get() + 1);
+                let reader_moved = pane.reader_scrolled.get().is_some_and(|at| at > asked);
+                if reader_moved || frames.get() > SCROLL_SETTLE_FRAMES {
+                    return glib::ControlFlow::Break;
                 }
+                let Some(widget) = pane.item_widget(&item).filter(|w| w.is_mapped()) else {
+                    return glib::ControlFlow::Continue;
+                };
+                let Some(bounds) = widget.compute_bounds(scroller) else {
+                    return glib::ControlFlow::Continue;
+                };
+                let by = f64::from(bounds.y() - inset);
+                if by.abs() >= 1.0 {
+                    let adjustment = scroller.vadjustment();
+                    adjustment.set_value((adjustment.value() + by).max(adjustment.lower()));
+                    still.set(0);
+                    return glib::ControlFlow::Continue;
+                }
+                still.set(still.get() + 1);
+                if still.get() < 2 {
+                    return glib::ControlFlow::Continue;
+                }
+                if let Some(then) = then.borrow_mut().take() {
+                    then(&widget);
+                }
+                glib::ControlFlow::Break
             });
-        }
     }
 
     /// Where `item` stands against the rows on screen, when it is not on
