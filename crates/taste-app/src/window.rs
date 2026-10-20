@@ -1161,6 +1161,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // small shortcut (David, 2026-09-07: "the size of the UI element
     // doesn't dictate its prominence in the shortcuts visible on screen").
     let reveal = crate::reveal::Reveal::new();
+    let hover_cards = crate::sync_card::Layer::install();
     {
         reveal.add(
             search.entry(),
@@ -1226,12 +1227,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             ],
             gtk::PositionType::Top,
         );
-        reveal.add(
-            &editor.tab_strip(),
-            &[("[Ctrl+W]", "close the tab")],
-            &[],
-            gtk::PositionType::Bottom,
-        );
+        // No bubble for Ctrl+W on the tab strip: it is the desktop's own
+        // close-tab key, and its bubble crowded the ones around it (David,
+        // 2026-10-19: "drop Ctrl-W from the F1 key").
     }
 
     let center_and_chat = gtk::Paned::builder()
@@ -1585,6 +1583,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // (reveal.rs), under the toasts.
     let root_overlay = gtk::Overlay::new();
     root_overlay.set_child(Some(&toolbar_view));
+    // The hover cards' layer (sync_card.rs), under the key reveal's: drawn
+    // in the window so a shared window shows them.
+    root_overlay.add_overlay(&hover_cards.layer);
     root_overlay.add_overlay(&reveal.layer);
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&root_overlay));

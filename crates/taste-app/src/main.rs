@@ -74,6 +74,7 @@ mod stripes;
 mod submodule_bar;
 mod submodule_diff;
 mod sync_arrow;
+mod sync_card;
 mod sync_mark;
 mod syncstatus;
 mod tabfamily;
@@ -639,6 +640,12 @@ fn main() -> glib::ExitCode {
                     button's ten pixels a side, so a branch name like \
                     datum-call keeps its room (filetree.rs). */\n\
                  button.sync-count { padding-left: 8px; padding-right: 8px; }\n\
+                 /* A sync count's hover card (sync_card.rs): a tooltip's \
+                    dark ground, drawn in the window so a shared window \
+                    shows it. */\n\
+                 .sync-card.osd { border-radius: 8px; padding: 8px 10px; \
+                   background-color: alpha(black, 0.9); \
+                   box-shadow: 0 2px 6px alpha(black, 0.3); }\n\
                  /* The transcript's scrollbar counts rows (chat/rowbar.rs), \
                     so it is a scrollbar of its own rather than the \
                     scrolled window's, and the fading the scrolled window \

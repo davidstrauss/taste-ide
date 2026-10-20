@@ -382,6 +382,10 @@ pub struct FileTree {
     /// Push's hold: a click pushes, and a push that replaces commits on
     /// the remote is held for ([`FileTree::push`]).
     push_hold: Rc<crate::holdbutton::HoldButton>,
+    /// What ⇊, ↓, and ↑ show on hover (`crate::sync_card`).
+    push_card: Rc<RefCell<Option<crate::sync_card::SyncCard>>>,
+    pull_card: Rc<RefCell<Option<crate::sync_card::SyncCard>>>,
+    canon_card: Rc<RefCell<Option<crate::sync_card::SyncCard>>>,
     push_button: gtk::Button,
     /// A push or sync is running. Status refreshes land constantly (the
     /// watcher, every save, the agent), and one arriving mid-operation
@@ -808,6 +812,8 @@ struct StatusSnapshot {
     /// What syncs though git ignores it (`Worktree::sync_ignored`).
     sync_ignored: taste_devcontainer::worktree::SyncIgnored,
 }
+
+use crate::sync_card::{count, SyncCard};
 
 /// What a sync does once it has fetched: Fetch (⟳) nothing more; Pull's
 /// click moves the branch forward only, and says so when that was not
@@ -1676,6 +1682,9 @@ impl FileTree {
             pull_button: pull_button.clone(),
             _pull_hold: pull_hold.clone(),
             push_hold: push_hold.clone(),
+            push_card: crate::sync_card::install(&push_button),
+            pull_card: crate::sync_card::install(&pull_button),
+            canon_card: crate::sync_card::install(&canon_button),
             push_button: push_button.clone(),
             sync_busy: std::cell::Cell::new(false),
             abort_button: abort_button.clone(),
@@ -2648,9 +2657,10 @@ impl FileTree {
             for button in [&self.push_button, &self.init_button] {
                 button.set_sensitive(false);
             }
-            self.push_button.set_tooltip_text(Some(
-                "An environment's work reaches your branch by Publish and review",
-            ));
+            *self.push_card.borrow_mut() = Some(
+                crate::sync_card::SyncCard::new("Read-only")
+                    .gesture("An environment's work reaches your branch by Publish and review"),
+            );
             self.branch_label.set_sensitive(false);
             self.branch_label
                 .set_tooltip_text(Some("Read-only: this is another environment's checkout"));
@@ -2692,7 +2702,9 @@ impl FileTree {
         self.canon_button.set_visible(false);
         for button in [&self.push_button, &self.pull_button, &self.canon_button] {
             button.set_sensitive(false);
-            button.set_tooltip_text(None);
+        }
+        for card in [&self.push_card, &self.pull_card, &self.canon_card] {
+            card.borrow_mut().take();
         }
     }
 
@@ -5333,7 +5345,6 @@ impl FileTree {
                                     // here was cut to "rewritt…" in a
                                     // 335px pane).
                                     self.set_sync_label("");
-                                    let plural = |n: usize| if n == 1 { "" } else { "s" };
                                     let hold = crate::holdbutton::HOLD.as_secs();
                                     // A fork's rebased branch, or a branch
                                     // rewritten here: what the push replaces
@@ -5371,58 +5382,76 @@ impl FileTree {
                                     let push_secs = push_hold.as_secs();
                                     let ahead = sync.ahead;
                                     let carried = ahead.saturating_sub(own);
-                                    let along = match &sync.canonical {
+                                    let sends = match &sync.canonical {
                                         Some(canonical) if carried > 0 => format!(
-                                            ", and the {carried} from {} under {}",
+                                            "{}, and {} from {} under {}",
+                                            count(own, "commit"),
+                                            carried,
                                             canonical.name,
                                             if own == 1 { "it" } else { "them" }
                                         ),
-                                        _ => String::new(),
+                                        _ => count(own, "commit"),
                                     };
-                                    self.push_button.set_tooltip_text(Some(&match replacing {
-                                        Some(replaced) if sync.rewritten.is_some() => format!(
-                                            "Hold for {push_secs} seconds to push this \
-                                             branch's {own} commit{}{along} to {upstream}{}, \
-                                             replacing what is there: {}",
-                                            plural(own),
-                                            if sync.on_canonical {
-                                                ", the default branch"
+                                    let default_branch = if sync.on_canonical {
+                                        " (the default branch)"
+                                    } else {
+                                        ""
+                                    };
+                                    let leased = format!(
+                                        "Hold {push_secs} s · refused if the remote moved since \
+                                         the last fetch"
+                                    );
+                                    *self.push_card.borrow_mut() =
+                                        Some(match replacing {
+                                            Some(replaced) => {
+                                                let card = SyncCard::new(format!(
+                                                    "Replace {upstream}{default_branch}"
+                                                ))
+                                                .fact("Sends", sends)
+                                                .fact("Replaces", count(replaced, "commit"));
+                                                match sync.rewritten {
+                                                    Some(0) => card.fact(
+                                                        "Their changes",
+                                                        "all in this branch; nothing is lost",
+                                                    ),
+                                                    Some(dropped) => card.warning(format!(
+                                                    "{} there {} changes this branch no longer \
+                                                     has; the push drops {}",
+                                                    count(dropped, "commit"),
+                                                    if dropped == 1 { "makes" } else { "make" },
+                                                    if dropped == 1 { "it" } else { "them" }
+                                                )),
+                                                    None => card.fact(
+                                                        "Their changes",
+                                                        "from before the rebase onto the base",
+                                                    ),
+                                                }
+                                                .gesture(leased)
+                                            }
+                                            None if sync.push_unknown => {
+                                                SyncCard::new(format!("Push to {upstream}"))
+                                                    .fact(
+                                                        "Sends",
+                                                        format!("up to {}", count(ahead, "commit")),
+                                                    )
+                                                    .fact("Remote tip", "not fetched yet")
+                                                    .gesture("Click to push")
+                                            }
+                                            None if sync.new_branch => {
+                                                SyncCard::new(format!("Create {upstream}"))
+                                                    .fact("Sends", sends)
+                                                    .gesture("Click to push")
+                                            }
+                                            None => SyncCard::new(format!(
+                                                "Push to {upstream}{default_branch}"
+                                            ))
+                                            .fact("Sends", sends)
+                                            .gesture(if sync.on_canonical {
+                                                format!("Hold {push_secs} s")
                                             } else {
-                                                ""
-                                            },
-                                            rewrite_verdict(
-                                                replaced,
-                                                sync.rewritten.unwrap_or(0),
-                                                upstream
-                                            )
-                                        ),
-                                        Some(replaced) => format!(
-                                            "Hold for {hold} seconds to push the rebased branch \
-                                             to {upstream}: its {own} commit{}{along}, replacing \
-                                             the {replaced} it has that this branch does not",
-                                            plural(own)
-                                        ),
-                                        None if sync.push_unknown => format!(
-                                            "Push to {upstream}. What it has is not known yet \
-                                             — the next fetch asks — so up to {ahead} \
-                                             commit{} may go",
-                                            plural(ahead)
-                                        ),
-                                        None if sync.on_canonical => format!(
-                                            "Hold for {push_secs} seconds to push {own} \
-                                             commit{} to {upstream}, the default branch",
-                                            plural(own)
-                                        ),
-                                        None if sync.new_branch => format!(
-                                            "Push {own} commit{}{along} to {upstream}, \
-                                             creating the branch there",
-                                            plural(own)
-                                        ),
-                                        None => format!(
-                                            "Push {own} commit{}{along} to {upstream}",
-                                            plural(own)
-                                        ),
-                                    }));
+                                                "Click to push".to_string()
+                                            }),
+                                        });
                                     // With the background fetch held back
                                     // for a key's touch the counts are as
                                     // old as the last Pull, so both pulls
@@ -5432,18 +5461,12 @@ impl FileTree {
                                     // checkout pulls nothing into it, as it
                                     // pushes nothing from it.
                                     let writable = !self.read_only();
-                                    let held = self
-                                        .fetch_hold
-                                        .borrow()
-                                        .as_ref()
-                                        .map(|reason| {
-                                            format!(
-                                                "\n\nNot fetched in the background: {reason}. \
-                                                 The counts are as of the last Pull, which \
-                                                 will ask for the touch."
-                                            )
-                                        })
-                                        .unwrap_or_default();
+                                    let held = self.fetch_hold.borrow().as_ref().map(|reason| {
+                                        format!(
+                                            "Not fetched in the background: {reason}. These \
+                                             counts are from the last fetch"
+                                        )
+                                    });
                                     // ↓: the branch's own copy on the remote,
                                     // which someone else may have pushed to.
                                     let behind = sync.own_behind;
@@ -5455,30 +5478,34 @@ impl FileTree {
                                             && writable,
                                     );
                                     let replaced = sync.replaces.as_ref().map_or(0, |(_, n)| *n);
-                                    self.pull_button.set_tooltip_text(Some(&if sync
-                                        .rewritten
-                                        .is_some()
-                                    {
-                                        format!(
-                                            "Nothing to pull: the {replaced} commit{} on \
-                                             {upstream} this branch lacks {} its own, from \
-                                             before it was rewritten here. Hold Push to replace \
-                                             {}{held}",
-                                            plural(replaced),
-                                            if replaced == 1 { "is" } else { "are" },
-                                            if replaced == 1 { "it" } else { "them" }
-                                        )
-                                    } else if sync.new_branch {
-                                        format!("{upstream} does not have this branch yet{held}")
-                                    } else {
-                                        format!(
-                                            "Catch up with {upstream}: {behind} commit{} there \
-                                             that this branch lacks. Click to fast-forward; hold \
-                                             for {hold} seconds to rebase onto {}{held}",
-                                            plural(behind),
-                                            if behind == 1 { "it" } else { "them" }
-                                        )
-                                    }));
+                                    *self.pull_card.borrow_mut() = Some(
+                                        if sync.rewritten.is_some() {
+                                            SyncCard::new(format!(
+                                                "Nothing to pull from {upstream}"
+                                            ))
+                                            .fact(
+                                                "There",
+                                                format!(
+                                                    "{}: this branch's own, before it was \
+                                                         rebased",
+                                                    count(replaced, "commit")
+                                                ),
+                                            )
+                                            .gesture("Hold ↑ to replace them")
+                                        } else if sync.new_branch {
+                                            SyncCard::new(format!(
+                                                "Nothing to pull from {upstream}"
+                                            ))
+                                            .fact("There", "not created yet")
+                                        } else {
+                                            SyncCard::new(format!("Catch up with {upstream}"))
+                                                .fact("New there", count(behind, "commit"))
+                                                .gesture(format!(
+                                                    "Click: fast-forward · Hold {hold} s: rebase"
+                                                ))
+                                        }
+                                        .warning_if(held.clone()),
+                                    );
                                     // ⇊: the branch a pull request's branch
                                     // is rebased onto. Not on that branch
                                     // itself, whose own copy is ↓.
@@ -5490,33 +5517,29 @@ impl FileTree {
                                             self.canon_face.set_label(&format!(" {new}"));
                                             self.canon_button
                                                 .set_sensitive((new > 0 || stale) && writable);
-                                            self.canon_button.set_tooltip_text(Some(
-                                                &if new == 0 {
-                                                    format!(
-                                                        "Up to date with {name}: this branch has \
-                                                         every change there{held}"
-                                                    )
+                                            *self.canon_card.borrow_mut() = Some(
+                                                if new == 0 {
+                                                    SyncCard::new(format!("Up to date with {name}"))
+                                                        .fact("Yours", count(mine, "commit"))
                                                 } else if mine == 0 {
-                                                    format!(
-                                                        "Catch up with {name}: {new} change{} \
-                                                         there that this branch lacks. Click to \
-                                                         fast-forward to it{held}",
-                                                        plural(new)
-                                                    )
+                                                    SyncCard::new(format!("Fast-forward to {name}"))
+                                                        .fact("New there", count(new, "change"))
+                                                        .gesture("Click to fast-forward")
                                                 } else {
-                                                    format!(
-                                                        "Rebase onto {name}: hold for {hold} \
-                                                         seconds to put this branch's {mine} \
-                                                         commit{} on top of the {new} change{} \
-                                                         there that it lacks{held}",
-                                                        plural(mine),
-                                                        plural(new)
-                                                    )
-                                                },
-                                            ));
+                                                    SyncCard::new(format!("Rebase onto {name}"))
+                                                        .fact("New there", count(new, "change"))
+                                                        .fact("Yours", count(mine, "commit"))
+                                                        .gesture(format!(
+                                                            "Hold {hold} s to rebase · a click \
+                                                             only fast-forwards"
+                                                        ))
+                                                }
+                                                .warning_if(held.clone()),
+                                            );
                                         }
                                         None => self.canon_button.set_visible(false),
                                     }
+                                    self.probe_card();
                                 }
                                 None => {
                                     self.set_sync_label("no upstream");
@@ -8481,6 +8504,37 @@ impl FileTree {
             }
         });
         Ok(())
+    }
+
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CARD=push` (or `pull`,
+    /// `canon`) shows that button's hover card once the counts have
+    /// landed, as a hover would: a shot has no pointer to hover with.
+    fn probe_card(&self) {
+        if std::env::var("TASTE_PROBE_CHECK").is_err() {
+            return;
+        }
+        let Ok(which) = std::env::var("TASTE_PROBE_CARD") else {
+            return;
+        };
+        let card = match which.as_str() {
+            "pull" => &self.pull_card,
+            "canon" => &self.canon_card,
+            _ => &self.push_card,
+        };
+        let Some(card) = card.borrow().clone() else {
+            return;
+        };
+        let button: &gtk::Button = match which.as_str() {
+            "pull" => &self.pull_button,
+            "canon" => &self.canon_button,
+            _ => &self.push_button,
+        };
+        if let Some(layer) = crate::sync_card::Layer::current() {
+            let (button, layer) = (button.clone(), layer.clone());
+            // After the frame that lays the header out, so the card is
+            // placed against where the button is.
+            glib::idle_add_local_once(move || layer.show(button.upcast_ref(), &card));
+        }
     }
 
     /// Hand the sync row to `button`'s spinner until the operation ends.

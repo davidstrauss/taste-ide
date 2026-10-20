@@ -14695,17 +14695,32 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "devcontainer_logs" => "Read the container's log".into(),
         "devcontainer_resources" => "Read what the container is using".into(),
         "devcontainer_reload" => "Rebuild the container".into(),
-        "update_from_main" => "Take the user's latest work".into(),
+        // Precise about git, which is the point of a git step's title
+        // (David, 2026-10-19: "It's okay to be precise about technical
+        // stuff. It's actually desirable"): the refs it moves and where,
+        // never the tool's own name.
+        "update_from_main" => "Update origin/* from the folder's branches".into(),
         "git_fetch" => if input
             .and_then(|input| input["ask_user"].as_bool())
             .unwrap_or(false)
         {
-            "Fetch the user's remotes, asking them if their key needs it"
+            "git fetch --all in the user's folder, asking for their key if it needs a touch"
         } else {
-            "Fetch the user's remotes"
+            "git fetch --all in the user's folder"
         }
         .into(),
-        "publish" => "Publish this work for review".into(),
+        "publish" => {
+            let ready = input
+                .and_then(|v| v.get("ready"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            match (text("branch"), ready) {
+                (Some(branch), true) => format!("Publish {branch} as ready for review"),
+                (Some(branch), false) => format!("Publish {branch}"),
+                (None, true) => "Publish this branch as ready for review".into(),
+                (None, false) => "Publish this branch".into(),
+            }
+        }
         "environment_reinstantiate_request" => {
             "Ask to be reinstantiated on updated versions".into()
         }

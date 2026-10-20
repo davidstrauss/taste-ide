@@ -733,11 +733,6 @@ const MAX_NAV_HISTORY: usize = 100;
 const PREVIEW_SWAP_WAIT: std::time::Duration = std::time::Duration::from_millis(600);
 
 impl Editor {
-    /// The tab strip, for the key reveal to point at.
-    pub fn tab_strip(&self) -> gtk::Widget {
-        self.tab_bar.clone().upcast()
-    }
-
     pub fn new(workspace: taste_core::Workspace) -> Rc<Self> {
         let tabs = adw::TabView::new();
         tabs.set_vexpand(true);
