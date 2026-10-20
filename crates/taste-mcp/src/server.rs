@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 8;
+pub const GUIDANCE_REVISION: u32 = 9;
 
 /// When the user's folder last fetched: its `FETCH_HEAD`, which every
 /// fetch writes, as a person reads an age. `None` when it never has.
@@ -429,7 +429,11 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              REPLIES. When a turn ends on a question or a choice for the user — confirm \
              this, pick one of these — call suggest_replies last, with the replies they \
              are likeliest to give, so they can answer with a click. Each reply names \
-             what it chooses, so it reads right with only the question above it.",
+             what it chooses, so it reads right with only the question above it. The \
+             user sees your messages, not your reasoning or your tool calls: before the \
+             question, say what you did this turn (edits, commits), and in the question \
+             name each thing it asks about and what each choice does. Do not ask what the \
+             user already decided or left to you: act on it and say what you did.",
     );
     if let Some(memory) = memory {
         text.push_str("\n\n");
@@ -1572,11 +1576,14 @@ impl McpServer {
                      with only the question above it: name what it chooses (\"Add checks to \
                      TEST-26 only\", \"File it as a bug\"), never point at your text (\"all \
                      of it\", \"option 2\", \"the first one\"). The question must stand on what \
-                     you have said in this chat: something asked only in a file, a commit, or \
-                     the backlog has not been asked, so ask it here, with what the user needs \
-                     to answer it (the command to run, what to look for). Call it last, after \
-                     your answer and the question are written: the buttons stand under them. \
-                     The user can still type anything instead.",
+                     you have written to the user, which is not your reasoning or your tool \
+                     calls: name each thing it asks about (\"the Roots of Trust table fix and \
+                     the design-tag removal\", never \"the two\") and what each choice does, \
+                     with what the user needs to answer it (the command to run, what to look \
+                     for). Something asked only in a file, a commit, or the backlog has not \
+                     been asked. Do not ask what the user already decided or left to you. Call \
+                     it last, after your answer and the question are written: the buttons \
+                     stand under them. The user can still type anything instead.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -6187,8 +6194,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "861ad7ad24bfac9f6c19b69f407fe5eabaeb2b6e720520e9e20c17c7fc541127";
-        const AT_REVISION: u32 = 8;
+            "77a935edaa12d245031cd2ee34924f9dd5e78dd3028cba5ec604864f57c15253";
+        const AT_REVISION: u32 = 9;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"
