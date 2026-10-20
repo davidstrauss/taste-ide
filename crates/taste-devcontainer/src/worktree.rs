@@ -63,21 +63,28 @@ impl SyncIgnored {
     /// the rule of a folder it is in. Only its own rule is the row's policy
     /// mark (David, 2026-10-17: "If a file is synced individually, by
     /// policy, the rightmost icon/badge should be the [policy] arrows").
+    ///
+    /// A folder's rule is its own whether or not git ignores the folder:
+    /// `/deck/** taste-sync` on a folder git tracks syncs the ignored files
+    /// in it, and the policy is set on the folder, not on each of them
+    /// (David, 2026-10-19: "The straight up/down should show where the
+    /// policy is set, which is the folder in this case").
     pub fn own_rule(&self, rel: &Path, is_dir: bool) -> bool {
         if is_dir {
-            self.toggled.dirs.contains(rel) && self.ignored_dirs.contains(rel)
+            self.toggled.dirs.contains(rel)
         } else {
             self.toggled.files.contains(rel)
                 || (self.synced.contains(rel) && self.rule_folder(rel).is_none())
         }
     }
 
-    /// The nearest folder above `rel` whose rule syncs it.
+    /// The nearest folder above `rel` whose rule syncs it, ignored by git
+    /// or not.
     pub fn rule_folder<'a>(&self, rel: &'a Path) -> Option<&'a Path> {
         rel.ancestors()
             .skip(1)
             .filter(|dir| !dir.as_os_str().is_empty())
-            .find(|dir| self.toggled.dirs.contains(*dir) && self.ignored_dirs.contains(*dir))
+            .find(|dir| self.toggled.dirs.contains(*dir))
     }
 }
 
@@ -1123,6 +1130,17 @@ mod tests {
         );
         assert!(!sync.own_rule(Path::new("dist/sub"), true));
         assert_eq!(sync.rule_folder(Path::new("dist")), None);
+
+        // A rule on a folder git tracks, syncing the ignored files in it:
+        // the folder's policy, and its files sync by it.
+        sync.toggled.dirs.insert(PathBuf::from("deck"));
+        sync.synced.insert(PathBuf::from("deck/main.pdf"));
+        assert!(sync.own_rule(Path::new("deck"), true));
+        assert!(!sync.own_rule(Path::new("deck/main.pdf"), false));
+        assert_eq!(
+            sync.rule_folder(Path::new("deck/main.pdf")),
+            Some(Path::new("deck"))
+        );
     }
 
     /// The standing against the pin, from git itself: past the recorded

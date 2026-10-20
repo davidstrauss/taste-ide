@@ -447,7 +447,8 @@ pub struct FileTree {
     all_toggle: gtk::ToggleButton,
     commit_box: gtk::Box,
     ignore_rules: std::cell::Cell<usize>,
-    ignored_toggle: gtk::ToggleButton,
+    /// The listing menu: which files the tree shows ([`Showing`]).
+    showing_button: gtk::MenuButton,
     dirty_toggle: gtk::ToggleButton,
     staged_toggle: gtk::ToggleButton,
     stashed_toggle: gtk::ToggleButton,
@@ -497,7 +498,7 @@ pub struct FileTree {
     /// Non-repo workspaces have nothing to diff between refreshes; this
     /// lets the unchanged-guard engage for them too.
     rendered_non_repo: std::cell::Cell<bool>,
-    show_ignored: Rc<RefCell<bool>>,
+    showing: Rc<Cell<Showing>>,
     /// Each submodule of the checkout on screen, by its path in it, and
     /// where it is: its row reads "name @ main" under a folder with git's
     /// mark (David, 2026-10-06).
@@ -823,6 +824,49 @@ enum Pull {
     Fetch,
     FastForward,
     Rebase,
+}
+
+/// Which files the tree lists (David, 2026-10-19): what git tracks; that
+/// and the ignored files that sync with Personal anyway, which are part of
+/// both working copies (the default); or everything, ignored and unsynced
+/// included. Chosen in the menu at the end of the filter row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Showing {
+    Tracked,
+    #[default]
+    TrackedAndSynced,
+    All,
+}
+
+impl Showing {
+    const EVERY: [Showing; 3] = [Showing::Tracked, Showing::TrackedAndSynced, Showing::All];
+
+    /// The icons that say it: git's glyph, git's and the sync arrows, or
+    /// infinity.
+    fn icons(self) -> &'static [&'static str] {
+        match self {
+            Showing::Tracked => &["taste-branch-symbolic"],
+            Showing::TrackedAndSynced => &["taste-branch-symbolic", "taste-sync-symbolic"],
+            Showing::All => &["taste-all-files-symbolic"],
+        }
+    }
+
+    fn words(self) -> &'static str {
+        match self {
+            Showing::Tracked => "Only files tracked in git",
+            Showing::TrackedAndSynced => "Tracked files, and ignored ones that sync",
+            Showing::All => "All files, ignored and unsynced included",
+        }
+    }
+}
+
+/// `showing`'s icons in a row, as the menu's button and its items wear them.
+fn showing_icons(showing: Showing) -> gtk::Box {
+    let icons = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    for name in showing.icons() {
+        icons.append(&gtk::Image::from_icon_name(name));
+    }
+    icons
 }
 
 /// Which branch a Pull takes from (David, 2026-10-19): the branch's own
@@ -1224,9 +1268,12 @@ impl FileTree {
                 .expect("a sync button's child is its stack"),
             "face",
         );
-        let ignored_toggle = gtk::ToggleButton::builder()
-            .icon_name("view-conceal-symbolic")
-            .tooltip_text("Show ignored files")
+        // Which files the tree lists, as a menu of three: git's, git's and
+        // what syncs, or everything (David, 2026-10-19). Its face is the
+        // chosen one's icons, and no count.
+        let showing_button = gtk::MenuButton::builder()
+            .child(&showing_icons(Showing::default()))
+            .tooltip_text(Showing::default().words())
             .css_classes(["flat"])
             .build();
         // Filters in change-flow order: Stashed ↔ Dirty ↔ Staged, with
@@ -1441,9 +1488,9 @@ impl FileTree {
         // The ignored-files eye sits at the end of the filter row: the
         // search row it shared with the tree's own entry is gone, the query
         // having moved to the title bar.
-        ignored_toggle.set_halign(gtk::Align::End);
-        ignored_toggle.set_hexpand(true);
-        branch_row.append(&ignored_toggle);
+        showing_button.set_halign(gtk::Align::End);
+        showing_button.set_hexpand(true);
+        branch_row.append(&showing_button);
         // The git row leads: the branch menu and what follows from it —
         // behind/ahead as Pull and Push, Sync, a paused rebase's Abort and
         // Continue, Initialize Repository where there is no repo. It was
@@ -1710,7 +1757,7 @@ impl FileTree {
             all_toggle: all_toggle.clone(),
             commit_box: commit_row.clone(),
             ignore_rules: std::cell::Cell::new(0),
-            ignored_toggle: ignored_toggle.clone(),
+            showing_button: showing_button.clone(),
             dirty_toggle: dirty_toggle.clone(),
             staged_toggle: staged_toggle.clone(),
             stashed_toggle: stashed_toggle.clone(),
@@ -1762,7 +1809,7 @@ impl FileTree {
             commit_blocker,
             pane: std::cell::Cell::new(PaneKind::None),
             rendered_non_repo: std::cell::Cell::new(false),
-            show_ignored: Rc::new(RefCell::new(false)),
+            showing: Rc::new(Cell::new(Showing::default())),
             submodule_heads: RefCell::new(HashMap::new()),
             folder_syncing: Cell::new(false),
             submodule_setup: RefCell::new(Vec::new()),
@@ -2085,18 +2132,60 @@ impl FileTree {
                 tree.rebuild();
             });
         }
-        let weak = Rc::downgrade(&tree);
-        ignored_toggle.connect_toggled(move |button| {
-            if let Some(tree) = weak.upgrade() {
-                *tree.show_ignored.borrow_mut() = button.is_active();
-                // Never clobber active search results — or a filter view
-                // (which never lists ignored files anyway) — with the
-                // tree; the flag applies when the tree next shows.
-                if tree.query.borrow().is_empty() && !tree.filters_active() {
-                    tree.rebuild();
-                }
+        {
+            // The menu: a row per choice — its icons, its words, and a check
+            // on the one in force.
+            let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            let checks: Rc<Vec<(Showing, gtk::Image)>> = Rc::new(
+                Showing::EVERY
+                    .iter()
+                    .map(|showing| {
+                        (
+                            *showing,
+                            gtk::Image::from_icon_name("object-select-symbolic"),
+                        )
+                    })
+                    .collect(),
+            );
+            let popover = gtk::Popover::new();
+            for (showing, check) in checks.iter() {
+                let face = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                let icons = showing_icons(*showing);
+                // The icons in a column of one width, so the words align.
+                icons.set_width_request(36);
+                face.append(&icons);
+                face.append(
+                    &gtk::Label::builder()
+                        .label(showing.words())
+                        .xalign(0.0)
+                        .hexpand(true)
+                        .build(),
+                );
+                check.set_visible(*showing == Showing::default());
+                face.append(check);
+                let item = gtk::Button::builder()
+                    .child(&face)
+                    .css_classes(["flat"])
+                    .build();
+                let (weak, checks, popover, showing) = (
+                    Rc::downgrade(&tree),
+                    checks.clone(),
+                    popover.clone(),
+                    *showing,
+                );
+                item.connect_clicked(move |_| {
+                    popover.popdown();
+                    let Some(tree) = weak.upgrade() else { return };
+                    for (each, check) in checks.iter() {
+                        check.set_visible(*each == showing);
+                    }
+                    tree.set_showing(showing);
+                });
+                list.append(&item);
             }
-        });
+            popover.set_child(Some(&list));
+            showing_button.set_popover(Some(&popover));
+        }
 
         // The panel does not aim the panes itself: the window owns that
         // transition, because it also drops the environment's watcher and
@@ -2204,6 +2293,21 @@ impl FileTree {
             self.workspace.root().to_path_buf()
         } else {
             self.view_root()
+        }
+    }
+
+    /// List `showing`'s files from now on: the menu's face says which, and
+    /// the tree is listed again — never over search results, or a filter
+    /// view, which never lists ignored files anyway; the choice applies when
+    /// the tree next shows.
+    fn set_showing(self: &Rc<Self>, showing: Showing) {
+        if self.showing.replace(showing) == showing {
+            return;
+        }
+        self.showing_button.set_child(Some(&showing_icons(showing)));
+        self.showing_button.set_tooltip_text(Some(showing.words()));
+        if self.query.borrow().is_empty() && !self.filters_active() {
+            self.rebuild();
         }
     }
 
@@ -2698,6 +2802,8 @@ impl FileTree {
         self.push_face.set_label(" 0");
         self.push_face.remove_css_class("warning");
         self.pull_face.set_label(" 0");
+        self.pull_face.remove_css_class("warning");
+        self.canon_face.remove_css_class("warning");
         self.canon_face.set_label(" 0");
         self.canon_button.set_visible(false);
         for button in [&self.push_button, &self.pull_button, &self.canon_button] {
@@ -4384,7 +4490,7 @@ impl FileTree {
             self.rebuild();
             return;
         };
-        let show_ignored = *self.show_ignored.borrow();
+        let showing = self.showing.get();
         let synced = std::sync::Arc::new(self.sync_ignored.borrow().clone());
         let worktree = self.worktree();
         let ghosts_root = (!self.read_only()).then(|| self.view_root());
@@ -4416,7 +4522,7 @@ impl FileTree {
                 let ghosts = ghosts_root
                     .map(|root| ghost_candidates(&worktree.files(), &root))
                     .unwrap_or_default();
-                scan_dir_nodes(&worktree, &dir, show_ignored, &synced, &ghosts, None)
+                scan_dir_nodes(&worktree, &dir, showing, &synced, &ghosts, None)
             });
             glib::spawn_future_local(async move {
                 let Ok(nodes) = handle.await else { return };
@@ -4954,7 +5060,7 @@ impl FileTree {
         let remote = self.watching.borrow().is_none() && !self.workspace.files().is_local();
         let rel = self.repo_relative(&node.path);
         if let (true, false, Some(rel)) = (
-            remote && (node.is_dir || *self.show_ignored.borrow()),
+            remote && (node.is_dir || self.showing.get() == Showing::All),
             node.ghost,
             rel,
         ) {
@@ -5471,6 +5577,19 @@ impl FileTree {
                                     // which someone else may have pushed to.
                                     let behind = sync.own_behind;
                                     self.pull_face.set_label(&format!(" {behind}"));
+                                    // Amber, as a push that replaces is,
+                                    // when the hold would rebase — replay
+                                    // the branch's own commits as new ones —
+                                    // rather than fast-forward (David,
+                                    // 2026-10-19: "we should probably have
+                                    // gold for a pull that isn't a fast
+                                    // forward").
+                                    let rebases = behind > 0 && sync.ahead > 0;
+                                    if rebases {
+                                        self.pull_face.add_css_class("warning");
+                                    } else {
+                                        self.pull_face.remove_css_class("warning");
+                                    }
                                     self.pull_button.set_sensitive(
                                         (behind > 0 || stale)
                                             && !sync.new_branch
@@ -5515,6 +5634,11 @@ impl FileTree {
                                                 (&canonical.name, canonical.new, canonical.own);
                                             self.canon_button.set_visible(true);
                                             self.canon_face.set_label(&format!(" {new}"));
+                                            if new > 0 && mine > 0 {
+                                                self.canon_face.add_css_class("warning");
+                                            } else {
+                                                self.canon_face.remove_css_class("warning");
+                                            }
                                             self.canon_button
                                                 .set_sensitive((new > 0 || stale) && writable);
                                             *self.canon_card.borrow_mut() = Some(
@@ -5640,9 +5764,8 @@ impl FileTree {
 
     /// Commit-building view: only changed files, each with an explicit
     /// stage checkbox — selection you can see.
-    /// Refresh the counts carried by the filter buttons and the eye.
+    /// Refresh the counts carried by the filter buttons.
     fn sync_filter_counts(&self) {
-        let ignore_rules = self.ignore_rules.get();
         let status = self.status.borrow();
         let dirty = status.values().filter(|s| s.stageable()).count();
         let staged = status.values().filter(|s| **s == FileState::Staged).count();
@@ -5673,22 +5796,6 @@ impl FileTree {
             Some(files) => self.all_toggle.set_label(&format!("All {}", files.len())),
             None => self.all_toggle.set_label("All"),
         }
-        self.ignored_toggle.set_tooltip_text(Some(&format!(
-            "Show ignored files — {ignore_rules} ignore rule{} (the RULE \
-             count; counting ignored files would walk everything)",
-            if ignore_rules == 1 { "" } else { "s" }
-        )));
-        // Plain icon + caption count (ButtonContent bolds its label,
-        // which reads as unearned emphasis next to the quiet filters).
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        content.append(&gtk::Image::from_icon_name("view-conceal-symbolic"));
-        content.append(
-            &gtk::Label::builder()
-                .label(ignore_rules.to_string())
-                .css_classes(["caption"])
-                .build(),
-        );
-        self.ignored_toggle.set_child(Some(&content));
     }
 
     /// True when the list is showing something other than the tree: a git
@@ -7762,7 +7869,7 @@ impl FileTree {
         // widgets that are about to be dropped (and, after an `aim_at`,
         // paths relative to a different repository).
         self.rows.borrow_mut().clear();
-        let show_ignored = *self.show_ignored.borrow();
+        let showing = self.showing.get();
         let synced = std::sync::Arc::new(self.sync_ignored.borrow().clone());
         // Search shapes the tree: matches-only filters to matching files
         // (autoexpanded); ghost mode keeps every file and dims the rest.
@@ -7802,7 +7909,7 @@ impl FileTree {
             &root_store,
             worktree,
             view_root,
-            show_ignored,
+            showing,
             synced,
             ghosts,
             filter.as_ref().map(|f| (**f).clone()),
@@ -7825,7 +7932,7 @@ impl FileTree {
                     &store,
                     child_worktree.clone(),
                     node.path.clone(),
-                    show_ignored,
+                    showing,
                     child_tree
                         .upgrade()
                         .map(|tree| std::sync::Arc::new(tree.sync_ignored.borrow().clone()))
@@ -8173,10 +8280,12 @@ impl FileTree {
         // not checked out, conflicted — and says which, as its tooltip says
         // where it stands either way (David, 2026-10-06).
         let rel = self.repo_relative(&node.path);
-        let own = state == FileState::Synced
-            && rel
-                .as_deref()
-                .is_some_and(|rel| self.sync_ignored.borrow().own_rule(rel, node.is_dir));
+        let own = policy_badge(
+            &self.sync_ignored.borrow(),
+            rel.as_deref(),
+            state,
+            node.is_dir,
+        );
         let (badge, css) = match &submodule {
             Some(_) => ("", None),
             None => badge_style(state, own),
@@ -8186,7 +8295,11 @@ impl FileTree {
             badge_label.add_css_class(css);
             label.add_css_class(css);
         }
-        badge_label.set_tooltip_text(own.then(|| policy_words(node.is_dir)));
+        if own && state != FileState::Synced {
+            badge_label.add_css_class("dim-label");
+        }
+        badge_label
+            .set_tooltip_text(own.then(|| policy_words(node.is_dir, state == FileState::Synced)));
         // A folder that syncs by policy says so on its icon too, and one
         // inside it names the folder whose rule it is.
         if node.is_dir && state == FileState::Synced {
@@ -8200,7 +8313,7 @@ impl FileTree {
                     "Synced with Personal by the policy on {}/",
                     folder.display()
                 ),
-                _ => policy_words(true).to_string(),
+                _ => policy_words(true, true).to_string(),
             };
             icon.set_tooltip_text(Some(&said));
         }
@@ -8519,7 +8632,8 @@ impl FileTree {
         let card = match which.as_str() {
             "pull" => &self.pull_card,
             "canon" => &self.canon_card,
-            _ => &self.push_card,
+            "push" => &self.push_card,
+            _ => return,
         };
         let Some(card) = card.borrow().clone() else {
             return;
@@ -8827,10 +8941,7 @@ impl FileTree {
                 None => state,
             };
             let painted = handle.state.get();
-            let own = state == FileState::Synced
-                && rel
-                    .as_deref()
-                    .is_some_and(|rel| sync_ignored.own_rule(rel, handle.is_dir));
+            let own = policy_badge(&sync_ignored, rel.as_deref(), state, handle.is_dir);
             if state == painted && own == handle.own.get() {
                 continue;
             }
@@ -8846,9 +8957,17 @@ impl FileTree {
                     label.remove_css_class(old);
                 }
             }
+            if handle.own.get() {
+                badge.remove_css_class("dim-label");
+            }
             let (text, css) = badge_style(state, own);
             badge.set_label(text);
-            badge.set_tooltip_text(own.then(|| policy_words(handle.is_dir)));
+            if own && state != FileState::Synced {
+                badge.add_css_class("dim-label");
+            }
+            badge.set_tooltip_text(
+                own.then(|| policy_words(handle.is_dir, state == FileState::Synced)),
+            );
             if let Some(css) = css {
                 badge.add_css_class(css);
                 label.add_css_class(css);
@@ -9034,18 +9153,48 @@ fn badge_style(state: FileState, own: bool) -> (&'static str, Option<&'static st
     match state {
         FileState::Synced if own => ("⇅", Some("dim-label")),
         FileState::Synced => ("", None),
+        // A folder git tracks whose rule syncs the ignored files in it: the
+        // policy is set here, and with no letter of its own the folder
+        // wears it — dim in the badge alone (`policy_badge`), the name
+        // being no ignored thing's.
+        FileState::Clean if own => ("⇅", None),
         other => state_style(other),
     }
 }
 
-/// What the policy mark means.
-fn policy_words(is_dir: bool) -> &'static str {
-    if is_dir {
-        "Synced by policy: git ignores this folder, and its taste-sync rule in \
-         .gitattributes syncs it with Personal anyway"
-    } else {
-        "Synced by policy: git ignores this file, and its taste-sync rule in \
-         .gitattributes syncs it with Personal anyway"
+/// Whether a row wears the policy mark ⇅: its own rule is why it syncs
+/// (`SyncIgnored::own_rule`) — an ignored file or folder, or a folder git
+/// tracks with nothing to say, whose rule syncs the ignored files in it.
+/// The rows those sync by it wear the status (`sync_mark.rs`), not this
+/// (David, 2026-10-19: "The straight up/down should show where the policy
+/// is set, which is the folder in this case").
+fn policy_badge(
+    sync_ignored: &taste_devcontainer::worktree::SyncIgnored,
+    rel: Option<&Path>,
+    state: FileState,
+    is_dir: bool,
+) -> bool {
+    let at_rest = state == FileState::Synced || (is_dir && state == FileState::Clean);
+    at_rest && rel.is_some_and(|rel| sync_ignored.own_rule(rel, is_dir))
+}
+
+/// What the policy mark means: on an ignored file or folder, that its
+/// rule syncs it anyway; on a folder git tracks, that its rule syncs the
+/// ignored files in it.
+fn policy_words(is_dir: bool, ignored: bool) -> &'static str {
+    match (is_dir, ignored) {
+        (true, true) => {
+            "Synced by policy: git ignores this folder, and its taste-sync rule in \
+             .gitattributes syncs it with Personal anyway"
+        }
+        (true, false) => {
+            "Sync policy: this folder's taste-sync rule in .gitattributes syncs the \
+             ignored files in it with Personal"
+        }
+        _ => {
+            "Synced by policy: git ignores this file, and its taste-sync rule in \
+             .gitattributes syncs it with Personal anyway"
+        }
     }
 }
 
@@ -9185,7 +9334,7 @@ fn files_reached(
 }
 
 /// List one directory as a ListStore of `FileNode`s, honoring .gitignore
-/// (unless `show_ignored`), directories first, then case-insensitive alpha.
+/// (as `showing` says), directories first, then case-insensitive alpha.
 /// `ghosts` (workspace root only) are appended last as creation suggestions.
 /// Active search results shaped for the tree: per-file hits, and the set
 /// of paths (matching files + their ancestor directories) that stay
@@ -9220,7 +9369,7 @@ struct SearchView {
 fn scan_dir_nodes(
     worktree: &Worktree,
     dir: &Path,
-    show_ignored: bool,
+    showing: Showing,
     synced: &taste_devcontainer::worktree::SyncIgnored,
     ghosts: &[Ghost],
     filter: Option<&HashSet<PathBuf>>,
@@ -9228,7 +9377,7 @@ fn scan_dir_nodes(
     let mut nodes: Vec<FileNode> = if worktree.is_local() {
         let mut walk = ignore::WalkBuilder::new(dir);
         walk.max_depth(Some(1)).hidden(false);
-        if show_ignored {
+        if showing == Showing::All {
             walk.git_ignore(false).git_exclude(false).parents(false);
         }
         walk.build()
@@ -9251,7 +9400,7 @@ fn scan_dir_nodes(
             .filter(|entry| entry.name != ".git")
             .map(|entry| dir.join(&entry.name))
             .collect();
-        let ignored = if show_ignored {
+        let ignored = if showing == Showing::All {
             HashSet::new()
         } else {
             worktree.ignored(&names).unwrap_or_default()
@@ -9270,10 +9419,11 @@ fn scan_dir_nodes(
             // see the data folder?").
             .filter(|node| {
                 !ignored.contains(&node.path)
-                    || node
-                        .path
-                        .strip_prefix(worktree.root())
-                        .is_ok_and(|rel| synced.shows(rel, node.is_dir))
+                    || (showing == Showing::TrackedAndSynced
+                        && node
+                            .path
+                            .strip_prefix(worktree.root())
+                            .is_ok_and(|rel| synced.shows(rel, node.is_dir)))
             })
             .collect()
     };
@@ -9353,7 +9503,7 @@ fn fill_dir_store_async(
     store: &gtk::gio::ListStore,
     worktree: Worktree,
     dir: PathBuf,
-    show_ignored: bool,
+    showing: Showing,
     synced: std::sync::Arc<taste_devcontainer::worktree::SyncIgnored>,
     ghosts: Ghosts,
     filter: Option<HashSet<PathBuf>>,
@@ -9361,14 +9511,7 @@ fn fill_dir_store_async(
     let weak = store.downgrade();
     let handle = crate::runtime::runtime().spawn_blocking(move || {
         let ghosts = ghosts.get(&worktree);
-        scan_dir_nodes(
-            &worktree,
-            &dir,
-            show_ignored,
-            &synced,
-            ghosts,
-            filter.as_ref(),
-        )
+        scan_dir_nodes(&worktree, &dir, showing, &synced, ghosts, filter.as_ref())
     });
     glib::spawn_future_local(async move {
         let Ok(nodes) = handle.await else { return };
@@ -9601,25 +9744,14 @@ mod tests {
         synced.toggled.dirs.insert(std::path::PathBuf::from("data"));
         synced.ignored_dirs.insert(std::path::PathBuf::from("data"));
         let names = |dir: &std::path::Path| -> Vec<String> {
-            let mut names: Vec<String> =
-                super::scan_dir_nodes(&worktree, dir, false, &synced, &[], None)
-                    .into_iter()
-                    .map(|node| {
-                        node.path
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .into_owned()
-                    })
-                    .collect();
-            names.sort();
-            names
-        };
-        assert_eq!(names(&root), [".gitignore", "README.md", "data"]);
-        assert_eq!(names(&root.join("data")), ["raw"]);
-        // Nothing syncs: the folder is hidden, as any ignored one is.
-        let none = taste_devcontainer::worktree::SyncIgnored::default();
-        let listed: Vec<String> = super::scan_dir_nodes(&worktree, &root, false, &none, &[], None)
+            let mut names: Vec<String> = super::scan_dir_nodes(
+                &worktree,
+                dir,
+                super::Showing::TrackedAndSynced,
+                &synced,
+                &[],
+                None,
+            )
             .into_iter()
             .map(|node| {
                 node.path
@@ -9629,7 +9761,47 @@ mod tests {
                     .into_owned()
             })
             .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&root), [".gitignore", "README.md", "data"]);
+        assert_eq!(names(&root.join("data")), ["raw"]);
+        // Nothing syncs: the folder is hidden, as any ignored one is.
+        let none = taste_devcontainer::worktree::SyncIgnored::default();
+        let listed: Vec<String> = super::scan_dir_nodes(
+            &worktree,
+            &root,
+            super::Showing::TrackedAndSynced,
+            &none,
+            &[],
+            None,
+        )
+        .into_iter()
+        .map(|node| {
+            node.path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
         assert!(!listed.contains(&"data".to_string()), "{listed:?}");
+        // The listing menu's other two: git's files alone leave out even
+        // what syncs; everything lists what nothing syncs too.
+        let named = |showing: super::Showing, sync: &taste_devcontainer::worktree::SyncIgnored| {
+            super::scan_dir_nodes(&worktree, &root, showing, sync, &[], None)
+                .into_iter()
+                .map(|node| {
+                    node.path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<String>>()
+        };
+        assert!(!named(super::Showing::Tracked, &synced).contains(&"data".to_string()));
+        assert!(named(super::Showing::All, &none).contains(&"data".to_string()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9642,20 +9814,27 @@ mod tests {
         let worktree = super::Worktree::Local(root.clone());
         let ghosts = super::ghost_candidates(&taste_core::files::Files::Local, &root);
         let names = |dir: &std::path::Path| -> Vec<(String, bool, bool)> {
-            super::scan_dir_nodes(&worktree, dir, false, &Default::default(), &ghosts, None)
-                .into_iter()
-                .map(|node| {
-                    (
-                        node.path
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .into_owned(),
-                        node.is_dir,
-                        node.ghost,
-                    )
-                })
-                .collect()
+            super::scan_dir_nodes(
+                &worktree,
+                dir,
+                super::Showing::TrackedAndSynced,
+                &Default::default(),
+                &ghosts,
+                None,
+            )
+            .into_iter()
+            .map(|node| {
+                (
+                    node.path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    node.is_dir,
+                    node.ghost,
+                )
+            })
+            .collect()
         };
         assert!(names(&root).contains(&(".devcontainer".into(), true, true)));
         let inside = names(&root.join(".devcontainer"));
@@ -10159,7 +10338,7 @@ mod tests {
             let nodes = scan_dir_nodes(
                 &Worktree::Local(dir.clone()),
                 &dir,
-                false,
+                Showing::TrackedAndSynced,
                 &Default::default(),
                 &[],
                 None,
@@ -10187,7 +10366,7 @@ mod tests {
                 &store,
                 Worktree::Local(dir.clone()),
                 dir.clone(),
-                false,
+                Showing::TrackedAndSynced,
                 Default::default(),
                 Ghosts::new(None),
                 None,
