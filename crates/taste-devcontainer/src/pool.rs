@@ -288,7 +288,7 @@ impl Pool {
         let sizing = Sizing::for_host();
         self.check_room(&sizing).await?;
         self.libvirt
-            .create(&self.workspace_root, &sizing, report)
+            .create(&self.workspace_root, &sizing, None, report)
             .await
             .map_err(|error| PoolError::Failed {
                 domain: None,
@@ -306,12 +306,15 @@ impl Pool {
     /// otherwise — never oversubscribed, because a VM's capacity is why a
     /// workspace has several (David, 2026-09-20: "some aspects of capacity
     /// don't scale linearly"). Brought up, with its facts, like
-    /// [`Self::ensure_one`].
+    /// [`Self::ensure_one`]. `retiring` is a VM a move is leaving, and
+    /// removes once it is done: a new VM's disk is not refused for the
+    /// room that one's could still grow into.
     pub async fn place(
         &self,
         demand: Grant,
         occupancy: &std::collections::HashMap<String, Grant>,
         host: taste_core::environment::Host,
+        retiring: Option<&str>,
         report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> std::result::Result<(Vm, VmFacts), PoolError> {
         if !Self::provisioning_allowed() {
@@ -373,7 +376,7 @@ impl Pool {
                 }
                 self.check_room(&sizing).await?;
                 self.libvirt
-                    .create(&self.workspace_root, &sizing, report)
+                    .create(&self.workspace_root, &sizing, retiring, report)
                     .await
                     .map_err(|error| PoolError::Failed {
                         domain: None,

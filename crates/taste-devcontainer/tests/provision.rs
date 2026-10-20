@@ -164,6 +164,7 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
         .create(
             root,
             &sizing,
+            None,
             Arc::new(|fetch: taste_core::GuestImageFetch| {
                 if fetch.total > 0 && fetch.done % (64 * 1024 * 1024) < 1024 * 1024 {
                     eprintln!(

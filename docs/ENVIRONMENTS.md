@@ -2329,10 +2329,15 @@ writes, and each of these is a way those bytes reach this disk:
 
 - **A VM's own disk.** A qcow2 is sparse and grows on the host as the
   guest writes, up to its virtual size, so that size is the agent's to
-  reach. A new VM's is what the disk can give: free space, less the floor,
-  less what the VMs already made could still grow into, at most 64 GiB and
-  refused under 16 (`sizing::disk_for_new_vm`, which reads each disk's
-  virtual size from its qcow2 header). The VMs together can then never
+  reach. A new VM's starts at 12 GiB, and is refused when free space, less
+  the floor, less what the VMs already made could still grow into, does not
+  cover that (`sizing::disk_for_new_vm`, which reads each disk's virtual
+  size from its qcow2 header). It grows by 8 GiB whenever its guest has
+  under 6 GiB free, into the same room, up to 64 GiB
+  (`sizing::grown_disk_gib`, checked at boot and every fifteen seconds).
+  What the VMs might want together is overcommitted; what their ceilings
+  hold is not (David, 2026-10-19: "size these smaller but leverage the
+  upsizing mechanism more readily"). The VMs together can then never
   take the disk under the floor — unless something else on the machine
   eats the reserve, which is the case a running watchdog would cover and
   nothing yet does.
@@ -3099,15 +3104,15 @@ hypervisor, and the ladder never resolves to it.
 There is no substrate setting, no sizing knob, and no per-project
 substrate. VM sizing is IDE-decided and derived from the host
 (`taste_devcontainer::sizing`): vCPUs are every thread of the host's but
-two, which are the desktop's, memory a third of host RAM clamped to 4–16 GiB, the disk a sparse 64 GiB
-overlay on the shared base image, and a VM is refused when the disk has
+two, which are the desktop's, memory a third of host RAM clamped to 4–16 GiB, the disk a sparse
+overlay on the shared base image that starts at 12 GiB and grows as it fills, and a VM is refused when the disk has
 under 20 GiB free or when the running VMs plus this one would take the
 host past its reserve (`sizing::room_for`). Memory is creation-time: a VM
 is never given more of the one commitment, because a VM is never updated
 — it is replaced, and its environments restored into the replacement (see
 "Uncommitted work, backups, and artifacts"). The other two grow in place
-when the host can give more: the disk at boot when it has room
-(`sizing::grown_disk_gib`), and the vCPUs before a boot when the sizing
+when the host can give more: the disk by a step when its guest is short
+of space and the host has room (`sizing::grown_disk_gib`), and the vCPUs before a boot when the sizing
 gives more than the VM has (`LibvirtSession::grow_vcpus`), since a vCPU
 idle costs the host nothing.
 
@@ -4065,8 +4070,9 @@ second file that could disagree.
 from the pinned image (`guest`), as a sparse qcow2 overlay on a base image
 decompressed once per host and checked against the release's own
 uncompressed digest. Sized by `sizing`: every host thread but two,
-a third of its memory clamped to 4–16 GiB, a 64 GiB disk ceiling, and no
-VM created with under 20 GiB free. Podman in the guest is **rootless, as
+a third of its memory clamped to 4–16 GiB, a disk that starts at 12 GiB
+and grows as it fills to at most 64, and no VM created with under 20 GiB
+free. Podman in the guest is **rootless, as
 `core`** — the shape the spike measured and `podman machine` uses — so the
 supervisor's `--userns=keep-id` mapping is unchanged when a checkout is
 over there; Ignition makes `core` linger and enables its user

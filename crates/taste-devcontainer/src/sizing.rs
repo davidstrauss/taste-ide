@@ -24,18 +24,30 @@
 //! guest frees space, so the floor on free space is checked before every
 //! creation rather than assumed from the last one.
 //!
-//! # Why a disk is sized to what is free
+//! # Why a disk starts small and grows as it fills
 //!
 //! A sparse disk is a ceiling, and the ceiling is the guest's to reach:
 //! everything an agent writes in its VM — a build's output, a runaway log,
-//! a clone of something huge — lands in the qcow2 on this host's disk. Two
-//! 64 GiB ceilings on a disk with 50 GiB free is a desktop an agent can
-//! fill. So a VM's virtual size is what the disk can actually give it
-//! ([`disk_for_new_vm`]): what is free, less the floor the whole IDE keeps
-//! (`taste_core::environment::MIN_FREE_DISK_BYTES`), less what the VMs
-//! already made could still grow into — at most [`DISK_GIB`], and refused
-//! below [`DISK_MIN_GIB`] (review, 2026-09-23: "focus on preventing
+//! a clone of something huge — lands in the qcow2 on this host's disk. So
+//! the ceilings together never promise more than the disk has: free space,
+//! less the floor the whole IDE keeps
+//! (`taste_core::environment::MIN_FREE_DISK_BYTES`), must cover what every
+//! disk could still grow into (review, 2026-09-23: "focus on preventing
 //! resource exhaustion on the desktop, specifically on disk").
+//!
+//! What that leaves open is how the room is handed out. A disk made at
+//! [`DISK_GIB`], or grown to it at every boot, held its whole share of the
+//! room whether or not the guest ever wrote it, and four VMs holding 175
+//! GiB they had written 68 of left a fifth nothing to start with
+//! (2026-10-19). So a VM starts at [`DISK_START_GIB`] — the guest OS, its
+//! images, and a working tree fit in eight — and grows by
+//! [`DISK_GROW_STEP_GIB`] when its filesystem has under [`DISK_LOW_GIB`]
+//! free ([`grown_disk_gib`]), checked at boot and every
+//! [`DISK_CHECK_EVERY`] while it runs (David, 2026-10-19: "size these
+//! smaller but leverage the upsizing mechanism more readily"). What the
+//! VMs might want between them is overcommitted; what they hold is not:
+//! the room is given to whichever needs it first, and a disk that cannot
+//! grow says so.
 
 use std::path::Path;
 
@@ -55,13 +67,28 @@ pub const VCPU_HOST_RESERVE: u32 = 2;
 pub const MEMORY_MIN_MIB: u64 = 4096;
 /// The most it will commit to one VM.
 pub const MEMORY_MAX_MIB: u64 = 16384;
-/// The largest virtual size a VM's disk is given. Sparse; a ceiling and
-/// not a cost — but a ceiling the guest can reach, which is why it is
-/// lowered to what the host can give ([`disk_for_new_vm`]).
+/// The largest virtual size a VM's disk grows to. Sparse; a ceiling and
+/// not a cost — but a ceiling the guest can reach, which is why a disk
+/// gets there only by filling ([`grown_disk_gib`]).
 pub const DISK_GIB: u64 = 64;
-/// The smallest disk worth making: the guest OS, an image or two, and a
-/// build.
-pub const DISK_MIN_GIB: u64 = 16;
+/// The virtual size a VM's disk is made at, and the least a new VM is
+/// made with. The base image is a 10 GiB disk, so an overlay on it is no
+/// smaller; a VM that had run a project's container for a week held 7.7
+/// GiB of it (2026-10-19), and the rest is the first growth's to cover.
+pub const DISK_START_GIB: u64 = 12;
+/// The guest's free space under which its disk grows.
+pub const DISK_LOW_GIB: u64 = 6;
+/// What a disk grows by when it is short: enough that the next growth is
+/// not the next check's.
+pub const DISK_GROW_STEP_GIB: u64 = 8;
+/// How often a running VM's disk is looked at. Mostly a stat of its qcow2
+/// on this host; the guest is asked only when that cannot rule a shortage
+/// out ([`may_be_short`]).
+pub const DISK_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+/// The most of a guest's data that may be in the base image rather than
+/// its overlay — the OS as shipped, about 2 GiB — so that an overlay's
+/// allocation, plus this, bounds what the guest's filesystem holds.
+const BASE_DATA_BOUND_GIB: u64 = 4;
 /// Memory held back for the host — the IDE, its helpers, and the desktop —
 /// when deciding whether another VM fits.
 pub const HOST_RESERVE_MIB: u64 = 8192;
@@ -87,12 +114,12 @@ impl Sizing {
     }
 
     /// The policy as a pure function: the CPUs less the desktop's, a third
-    /// of the memory clamped, and the fixed disk ceiling.
+    /// of the memory clamped, and the disk a VM starts at.
     pub fn derive(host_cpus: u32, host_memory_mib: u64) -> Self {
         Self {
             vcpus: host_cpus.saturating_sub(VCPU_HOST_RESERVE).max(VCPU_MIN),
             memory_mib: (host_memory_mib / 3).clamp(MEMORY_MIN_MIB, MEMORY_MAX_MIB),
-            disk_gib: DISK_GIB,
+            disk_gib: DISK_START_GIB,
         }
     }
 }
@@ -107,18 +134,20 @@ pub fn room_for(committed_mib: u64, next_mib: u64, host_memory_mib: u64) -> bool
         <= host_memory_mib
 }
 
-/// The virtual size, in GiB, a new VM's disk in `dir` can be given without
-/// the VMs together being able to take the disk under the floor: what is
-/// free, less `taste_core::environment::MIN_FREE_DISK_BYTES`, less the
-/// room every disk already in `dir` could still grow into, capped at
-/// [`DISK_GIB`]. Refused below [`DISK_MIN_GIB`], naming the numbers. A
-/// filesystem that will not say how full it is gets [`DISK_GIB`], as the
-/// IDE's other free-space checks allow what they cannot measure.
-pub fn disk_for_new_vm(dir: &Path) -> Result<u64> {
+/// The virtual size, in GiB, a new VM's disk in `dir` is made at:
+/// [`DISK_START_GIB`], when what is free, less
+/// `taste_core::environment::MIN_FREE_DISK_BYTES`, less the room every disk
+/// already in `dir` could still grow into, covers it, and refused, naming
+/// the numbers, when it does not. `retiring` is a VM this one replaces —
+/// a move's old VM, removed once the move is done — whose room is not
+/// counted against its replacement. A filesystem that will not say how
+/// full it is gets [`DISK_START_GIB`], as the IDE's other free-space
+/// checks allow what they cannot measure.
+pub fn disk_for_new_vm(dir: &Path, retiring: Option<&str>) -> Result<u64> {
     let Some(free) = taste_core::environment::free_bytes(dir) else {
-        return Ok(DISK_GIB);
+        return Ok(DISK_START_GIB);
     };
-    disk_for(free, unclaimed_bytes(dir))
+    disk_for(free, unclaimed_bytes(dir, retiring))
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -126,52 +155,59 @@ const GIB: u64 = 1024 * 1024 * 1024;
 fn disk_for(free: u64, unclaimed: u64) -> Result<u64> {
     let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
     let headroom = free.saturating_sub(floor).saturating_sub(unclaimed);
-    let gib = (headroom / GIB).min(DISK_GIB);
-    if gib < DISK_MIN_GIB {
+    let gib = headroom / GIB;
+    if gib < DISK_START_GIB {
         bail!(
             "this disk has {:.1} GiB free, and the VMs already made could still grow into \
              {:.1} GiB of it; with {} GiB kept free for the desktop, a new VM would get \
-             {gib} GiB, and it needs {DISK_MIN_GIB} GiB. Free some space, or remove a \
+             {gib} GiB, and it needs {DISK_START_GIB} GiB. Free some space, or remove a \
              workspace's VMs",
             free as f64 / GIB as f64,
             unclaimed as f64 / GIB as f64,
             floor / GIB,
         );
     }
-    Ok(gib)
+    Ok(DISK_START_GIB)
 }
 
-/// The least a disk is grown by: growing it a little at every launch would
-/// be a resize, and the guest's filesystem with it, for nothing much.
-pub const DISK_GROW_STEP_GIB: u64 = 4;
+/// Whether a disk of `virtual_size` with `allocated` bytes in its overlay
+/// could have a guest under [`DISK_LOW_GIB`] free. The guest's data is in
+/// the overlay or the base under it, so when the two together leave the
+/// low-water mark clear, it is clear, and nobody needs to ask the guest.
+pub fn may_be_short(virtual_size: u64, allocated: u64) -> bool {
+    virtual_size.saturating_sub(allocated) < (DISK_LOW_GIB + BASE_DATA_BOUND_GIB) * GIB
+}
 
-/// The virtual size, in GiB, an existing VM's disk of `current` bytes can
-/// grow to, when that is at least [`DISK_GROW_STEP_GIB`] more: what is free
-/// on this host, less the floor, less what every disk — this one included —
-/// could still grow into, less the [`DISK_MIN_GIB`] a workspace with no VM
-/// yet needs for its first, added to its size, capped at [`DISK_GIB`]. Taking
-/// that last share too grew finance's disk to 54 GiB and left another
-/// project's VM nothing to start with (2026-10-13). A VM
-/// made while the host was short of space got the [`DISK_MIN_GIB`] it could
-/// have, and kept it after the space came back: the finance project's, at
-/// 16 GiB, filled with a 2.3 GB data folder, its snapshots, and its
-/// backups while the host had 55 GB free (2026-10-12; David: "Grow VMs when
-/// room allows"). `None` when it cannot grow by a step.
-pub fn grown_disk_gib(current: u64, free: u64, unclaimed: u64) -> Option<u64> {
+/// The virtual size, in GiB, a disk of `current` bytes whose guest has
+/// `guest_free` bytes free grows to, when it is short: by
+/// [`DISK_GROW_STEP_GIB`], or by what is left once the floor, what every
+/// disk — this one included — could still grow into, and a new VM's
+/// [`DISK_START_GIB`] are set aside, capped at [`DISK_GIB`]. Holding a new
+/// VM's start back means a workspace with no VM yet can still have one
+/// (2026-10-13: a disk that took that last share left another project's
+/// VM nothing to start with). `None` when it is not short, or there is no
+/// room to grow by a gibibyte.
+pub fn grown_disk_gib(current: u64, guest_free: u64, free: u64, unclaimed: u64) -> Option<u64> {
+    if guest_free >= DISK_LOW_GIB * GIB {
+        return None;
+    }
     let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
     let current_gib = current / GIB;
     let room_gib = free
         .saturating_sub(floor)
         .saturating_sub(unclaimed)
-        .saturating_sub(DISK_MIN_GIB * GIB)
+        .saturating_sub(DISK_START_GIB * GIB)
         / GIB;
-    let target = current_gib.saturating_add(room_gib).min(DISK_GIB);
-    (target >= current_gib + DISK_GROW_STEP_GIB).then_some(target)
+    let target = current_gib
+        .saturating_add(DISK_GROW_STEP_GIB.min(room_gib))
+        .min(DISK_GIB);
+    (target > current_gib).then_some(target)
 }
 
 /// What the qcow2 disks in `dir` could still take from the host: each one's
-/// virtual size less what it already occupies.
-pub fn unclaimed_bytes(dir: &Path) -> u64 {
+/// virtual size less what it already occupies. `except` is a domain whose
+/// disk is left out.
+pub fn unclaimed_bytes(dir: &Path, except: Option<&str>) -> u64 {
     use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -179,6 +215,7 @@ pub fn unclaimed_bytes(dir: &Path) -> u64 {
     entries
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "qcow2"))
+        .filter(|e| except.is_none_or(|domain| e.path().file_stem() != Some(domain.as_ref())))
         .filter_map(|e| {
             let size = qcow2_virtual_size(&e.path())?;
             let taken = e.metadata().ok()?.blocks() * 512;
@@ -228,7 +265,7 @@ mod tests {
         let sizing = Sizing::derive(24, 31 * 1024);
         assert_eq!(sizing.vcpus, 22);
         assert_eq!(sizing.memory_mib, 31 * 1024 / 3);
-        assert_eq!(sizing.disk_gib, DISK_GIB);
+        assert_eq!(sizing.disk_gib, DISK_START_GIB);
     }
 
     /// Bounded both ways: a laptop gets the floor, a workstation the cap.
@@ -261,63 +298,71 @@ mod tests {
         assert!((MEMORY_MIN_MIB..=MEMORY_MAX_MIB).contains(&a.memory_mib));
     }
 
-    /// A new VM gets what the disk can give once the floor and the other
-    /// VMs' room are set aside, at most the ceiling, and is refused when
-    /// that is too little to be worth making.
-    /// A disk made small grows when the host has room again, by a step at
-    /// least, never past the ceiling, and never so far that every disk
-    /// together could take the host under its floor, or leave a new VM less
-    /// than it needs.
+    /// A disk grows only when its guest is short, by a step or by what is
+    /// left once a new VM's start is held back, never past the ceiling,
+    /// and never so far that every disk together could take the host under
+    /// its floor.
     #[test]
-    fn a_small_disk_grows_into_what_the_host_can_give() {
+    fn a_disk_grows_when_its_guest_is_short_and_the_host_has_room() {
         let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
-        // 80 GiB free, this 16 GiB disk with 2 GiB still unclaimed.
+        let short = (DISK_LOW_GIB - 1) * GIB;
         assert_eq!(
-            grown_disk_gib(16 * GIB, floor + 80 * GIB, 2 * GIB),
-            Some(DISK_GIB),
-            "16 + 78 - 16 GiB, capped"
-        );
-        assert_eq!(
-            grown_disk_gib(16 * GIB, floor + 30 * GIB, 2 * GIB),
-            Some(28),
-            "16 + 28 - 16 GiB"
-        );
-        assert_eq!(
-            grown_disk_gib(16 * GIB, floor + (DISK_MIN_GIB + 4) * GIB, 0),
-            Some(20),
-            "a step past a new VM's share"
-        );
-        assert_eq!(
-            grown_disk_gib(16 * GIB, floor + (DISK_MIN_GIB + 3) * GIB, 0),
+            grown_disk_gib(12 * GIB, DISK_LOW_GIB * GIB, floor + 500 * GIB, 0),
             None,
-            "a new VM's share is not grown into"
+            "not short"
         );
         assert_eq!(
-            grown_disk_gib(16 * GIB, floor + 5 * GIB, 2 * GIB),
+            grown_disk_gib(12 * GIB, short, floor + 500 * GIB, 2 * GIB),
+            Some(12 + DISK_GROW_STEP_GIB),
+            "a step"
+        );
+        assert_eq!(
+            grown_disk_gib(12 * GIB, short, floor + (DISK_START_GIB + 3) * GIB, 0),
+            Some(15),
+            "what is left past a new VM's start"
+        );
+        assert_eq!(
+            grown_disk_gib(12 * GIB, short, floor + DISK_START_GIB * GIB, 0),
             None,
-            "under a step"
+            "a new VM's start is not grown into"
         );
         assert_eq!(
-            grown_disk_gib(16 * GIB, floor, 0),
+            grown_disk_gib(12 * GIB, short, floor + 40 * GIB, 30 * GIB),
             None,
-            "nothing past the floor"
+            "the other disks' room is not grown into"
         );
         assert_eq!(
-            grown_disk_gib(DISK_GIB * GIB, floor + 500 * GIB, 0),
+            grown_disk_gib(DISK_GIB * GIB, 0, floor + 500 * GIB, 0),
             None,
             "at the ceiling"
         );
+        assert_eq!(
+            grown_disk_gib((DISK_GIB - 3) * GIB, 0, floor + 500 * GIB, 0),
+            Some(DISK_GIB),
+            "up to the ceiling"
+        );
+    }
+
+    /// The guest is asked only when the overlay and the base under it
+    /// could hold enough to leave it short.
+    #[test]
+    fn only_a_disk_near_full_is_looked_into() {
+        assert!(!may_be_short(64 * GIB, 8 * GIB));
+        assert!(may_be_short(12 * GIB, 3 * GIB));
+        assert!(may_be_short(12 * GIB, 13 * GIB));
     }
 
     #[test]
-    fn a_new_disk_is_sized_to_what_the_host_can_give() {
+    fn a_new_disk_starts_small_and_is_refused_without_room_for_that() {
         let floor = taste_core::environment::MIN_FREE_DISK_BYTES;
-        assert_eq!(disk_for(500 * GIB, 0).unwrap(), DISK_GIB);
-        assert_eq!(disk_for(floor + 40 * GIB, 0).unwrap(), 40);
-        assert_eq!(disk_for(floor + 100 * GIB, 64 * GIB).unwrap(), 36);
+        assert_eq!(disk_for(500 * GIB, 0).unwrap(), DISK_START_GIB);
+        assert_eq!(
+            disk_for(floor + 100 * GIB, 88 * GIB).unwrap(),
+            DISK_START_GIB
+        );
         let refused = disk_for(floor + 20 * GIB, 10 * GIB).unwrap_err();
         assert!(
-            format!("{refused:#}").contains("needs 16 GiB"),
+            format!("{refused:#}").contains("needs 12 GiB"),
             "{refused:#}"
         );
     }
@@ -331,7 +376,8 @@ mod tests {
         header[24..32].copy_from_slice(&(64 * GIB).to_be_bytes());
         std::fs::write(&disk, &header).unwrap();
         assert_eq!(qcow2_virtual_size(&disk), Some(64 * GIB));
-        assert!(unclaimed_bytes(dir.path()) > 63 * GIB);
+        assert!(unclaimed_bytes(dir.path(), None) > 63 * GIB);
+        assert_eq!(unclaimed_bytes(dir.path(), Some("vm")), 0);
         std::fs::write(dir.path().join("other.qcow2"), b"not a disk at all, no").unwrap();
         assert_eq!(qcow2_virtual_size(&dir.path().join("other.qcow2")), None);
     }

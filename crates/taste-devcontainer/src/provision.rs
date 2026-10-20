@@ -1152,16 +1152,19 @@ impl LibvirtSession {
     ///
     /// `report` hears the base image's phases and the download's progress,
     /// when this host has never had it — about a gigabyte, once.
+    /// `retiring` is the VM this one replaces, when a move makes it.
     pub async fn create(
         &self,
         workspace_root: &Path,
         sizing: &Sizing,
+        retiring: Option<&str>,
         report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> Result<Vm> {
-        // The disk's ceiling is what this host can give it, so the VMs
-        // together cannot take the desktop's disk under the floor.
+        // Made only when the host has room for its start beside what the
+        // other disks could still grow into, so the VMs together cannot
+        // take the desktop's disk under the floor.
         let sizing = &Sizing {
-            disk_gib: crate::disposable::clear_for_room(self).await?,
+            disk_gib: crate::disposable::clear_for_room(self, retiring).await?,
             ..*sizing
         };
         let image = crate::guest::image()?;
@@ -1619,13 +1622,15 @@ impl LibvirtSession {
         Ok(())
     }
 
-    /// Grow a running VM's disk into what the host can now give
-    /// ([`crate::sizing::grown_disk_gib`]) — the qcow2 by libvirt, then the
-    /// guest's root partition and filesystem — when it can grow by a step.
-    /// A disk is sized to what the host can spare when it is made, and one
-    /// made while the host was short kept that size after the space came
-    /// back. Sparse: the host gives what the guest writes, and the
-    /// capacity check counts the rest. A VM on a cloud host is sized there.
+    /// Grow a running VM's disk by a step when its guest is short of space
+    /// and the host has the room ([`crate::sizing::grown_disk_gib`]) — the
+    /// qcow2 by libvirt, then the guest's root partition and filesystem. A
+    /// disk starts small and gets its room as it fills
+    /// (`crate::sizing`'s "Why a disk starts small"), so this runs at boot
+    /// and every [`crate::sizing::DISK_CHECK_EVERY`] while the VM runs:
+    /// a stat of the qcow2 first, and the guest asked only when that cannot
+    /// rule a shortage out. A guest short with no room to grow into is said
+    /// once, until it has room again. A VM on a cloud host is sized there.
     pub async fn grow_disk(&self, vm: &Vm) -> Result<()> {
         if vm.cloud.is_some() {
             return Ok(());
@@ -1634,19 +1639,48 @@ impl LibvirtSession {
         let Some(current) = crate::sizing::qcow2_virtual_size(&disk) else {
             return Ok(());
         };
+        let Some(allocated) = allocated_bytes(&disk) else {
+            return Ok(());
+        };
+        if !crate::sizing::may_be_short(current, allocated) {
+            return Ok(());
+        }
+        let guest_free = self.guest_free_bytes(vm).await?;
         let dir = disks_dir();
         let Some(free) = taste_core::environment::free_bytes(&dir) else {
             return Ok(());
         };
-        let unclaimed = crate::sizing::unclaimed_bytes(&dir);
-        let Some(target) = crate::sizing::grown_disk_gib(current, free, unclaimed) else {
+        let unclaimed = crate::sizing::unclaimed_bytes(&dir, None);
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let Some(target) = crate::sizing::grown_disk_gib(current, guest_free, free, unclaimed)
+        else {
+            let short = guest_free < crate::sizing::DISK_LOW_GIB * GIB;
+            let mut told = SHORT_TOLD.lock().unwrap();
+            if !short {
+                told.remove(&vm.domain);
+            } else if told.insert(vm.domain.clone()) {
+                self.say(
+                    &vm.domain,
+                    format!(
+                        "its guest has {:.1} GiB free and its disk cannot grow: this host has \
+                         {:.1} GiB free, the VMs' disks could still grow into {:.1} GiB of it, \
+                         and {} GiB is kept free for the desktop",
+                        guest_free as f64 / GIB as f64,
+                        free as f64 / GIB as f64,
+                        unclaimed as f64 / GIB as f64,
+                        taste_core::environment::MIN_FREE_DISK_BYTES / GIB,
+                    ),
+                );
+            }
             return Ok(());
         };
+        SHORT_TOLD.lock().unwrap().remove(&vm.domain);
         self.say(
             &vm.domain,
             format!(
-                "growing its disk from {} GiB to {target} GiB, now that this host has room",
-                current / (1024 * 1024 * 1024)
+                "growing its disk from {} GiB to {target} GiB: its guest had {:.1} GiB free",
+                current / GIB,
+                guest_free as f64 / GIB as f64
             ),
         );
         self.virsh(&["blockresize", &vm.domain, "vda", &format!("{target}G")])
@@ -1679,6 +1713,30 @@ impl LibvirtSession {
             format!("its disk is {target} GiB, and the guest's filesystem with it"),
         );
         Ok(())
+    }
+
+    /// What the guest's root filesystem has free, in bytes — `/var`, which
+    /// is that filesystem and where everything a project writes lands.
+    async fn guest_free_bytes(&self, vm: &Vm) -> Result<u64> {
+        let keys = Keys::for_workspace(&vm.workspace_root);
+        let (program, argv) = keys.ssh_argv(vm.ssh_port, ["df", "-B1", "--output=avail", "/var"]);
+        let output = tokio::process::Command::new(&program)
+            .args(&argv)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .context("running df in the guest")?;
+        if !output.status.success() {
+            bail!(
+                "asking the guest how full its disk is: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u64>().ok())
+            .next_back()
+            .context("the guest's df said no size")
     }
 
     /// ACPI shutdown. The guest stops cleanly and keeps its disk; the next
@@ -1780,6 +1838,11 @@ fn one_line(stderr: &str) -> String {
         .collect::<Vec<_>>()
         .join(": ")
 }
+
+/// The VMs whose guest is short with no room to grow, already said so
+/// ([`LibvirtSession::grow_disk`]): said once, not at every check.
+static SHORT_TOLD: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Bytes a file actually occupies — the sparse answer, which for a qcow2
 /// overlay is the only honest one.

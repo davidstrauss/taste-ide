@@ -485,9 +485,10 @@ fn gib(bytes: u64) -> f64 {
 /// until the new one fits —
 /// and then the base images no disk is built on any more. Still short,
 /// the refusal names the VMs that were kept and what would mark them.
-pub async fn clear_for_room(libvirt: &LibvirtSession) -> Result<u64> {
+/// `retiring` is the VM a move replaces, whose room is not counted.
+pub async fn clear_for_room(libvirt: &LibvirtSession, retiring: Option<&str>) -> Result<u64> {
     let dir = disks_dir();
-    let first = match crate::sizing::disk_for_new_vm(&dir) {
+    let first = match crate::sizing::disk_for_new_vm(&dir, retiring) {
         Ok(gib) => return Ok(gib),
         Err(e) => e,
     };
@@ -511,7 +512,7 @@ pub async fn clear_for_room(libvirt: &LibvirtSession) -> Result<u64> {
             }
             Err(e) => tracing::warn!("{}: could not be removed to make room: {e:#}", vm.domain),
         }
-        if crate::sizing::disk_for_new_vm(&dir).is_ok() {
+        if crate::sizing::disk_for_new_vm(&dir, retiring).is_ok() {
             break;
         }
     }
@@ -524,7 +525,7 @@ pub async fn clear_for_room(libvirt: &LibvirtSession) -> Result<u64> {
             );
         }
     }
-    match crate::sizing::disk_for_new_vm(&dir) {
+    match crate::sizing::disk_for_new_vm(&dir, retiring) {
         Ok(gib) => Ok(gib),
         Err(still) => {
             let kept = kept_summary(&libvirt.list_all().await.unwrap_or_default());

@@ -1426,6 +1426,21 @@ impl EnvironmentRegistry {
                 }
             });
         }
+        // A running VM's disk grows as its guest fills it
+        // (`LibvirtSession::grow_disk`), on a clock of its own: a disk
+        // starts with little slack, and a build can write it in minutes.
+        {
+            let weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(crate::sizing::DISK_CHECK_EVERY).await;
+                    let Some(registry) = weak.upgrade() else {
+                        break;
+                    };
+                    registry.grow_disks().await;
+                }
+            });
+        }
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let libvirt = crate::provision::LibvirtSession::new();
@@ -2196,6 +2211,17 @@ impl EnvironmentRegistry {
     /// (`Pool::place`) for `demand`, brought up and registered. Blocking,
     /// from the runtime's blocking pool — creation runs there.
     fn place_by_capacity(&self, demand: Grant, host: environment::Host) -> Result<Vm> {
+        self.place_replacing(demand, host, None)
+    }
+
+    /// [`Self::place_by_capacity`] for a move out of `retiring`, the VM it
+    /// removes once it is done (`Pool::place`).
+    fn place_replacing(
+        &self,
+        demand: Grant,
+        host: environment::Host,
+        retiring: Option<&str>,
+    ) -> Result<Vm> {
         let pool = self.pool();
         let occupancy = self.occupancy();
         let handle = tokio::runtime::Handle::try_current()
@@ -2204,6 +2230,7 @@ impl EnvironmentRegistry {
             demand,
             &occupancy,
             host,
+            retiring,
             Arc::new(crate::substrate::report_download),
         ));
         let (vm, facts) = match placed {
@@ -4309,6 +4336,30 @@ impl EnvironmentRegistry {
         Ok(note)
     }
 
+    /// Grow the disk of each of this workspace's running VMs whose guest is
+    /// short of space, as far as the host has room
+    /// (`LibvirtSession::grow_disk`).
+    pub async fn grow_disks(self: &Arc<Self>) {
+        let pool = self.pool();
+        for domain in self.vm_domains() {
+            let Some(vm) = self
+                .substrate_of_vm(&domain)
+                .and_then(|s| s.vm_details().cloned())
+            else {
+                continue;
+            };
+            if vm.is_cloud()
+                || pool.libvirt().state(&vm).await.ok()
+                    != Some(crate::provision::DomainState::Running)
+            {
+                continue;
+            }
+            if let Err(e) = pool.libvirt().grow_disk(&vm).await {
+                tracing::debug!("{domain}: its disk was not grown: {e:#}");
+            }
+        }
+    }
+
     /// How long a cloud host may hold no running container before the IDE
     /// stops it: it bills while it runs, and starting it again is a minute.
     pub const CLOUD_IDLE_STOP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
@@ -4495,12 +4546,23 @@ impl EnvironmentRegistry {
         };
 
         supervisor.move_step(&format!("{moving}: bringing up the VM it moves to"));
+        // The old VM goes once nothing of this workspace is left in it
+        // (`finish_move`), so when this environment is the last there, the
+        // room its disk could still grow into is not held against the VM
+        // replacing it (2026-10-19: a move refused for its own VM's 55 GiB).
+        let last_in_old = !self
+            .list()
+            .iter()
+            .any(|other| other.id() != env && other.checkout().vm() == Some(old_domain.as_str()));
         let target = {
             let registry = self.clone();
             let grant = supervisor.grant();
-            tokio::task::spawn_blocking(move || registry.place_by_capacity(grant, host))
-                .await
-                .context("choosing a VM did not finish")??
+            let retiring = last_in_old.then(|| old_domain.clone());
+            tokio::task::spawn_blocking(move || {
+                registry.place_replacing(grant, host, retiring.as_deref())
+            })
+            .await
+            .context("choosing a VM did not finish")??
         };
         let target_substrate = self
             .substrate_of_vm(&target.domain)
