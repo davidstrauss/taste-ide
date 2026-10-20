@@ -313,6 +313,29 @@ struct FileNode {
     /// A suggested-but-not-yet-created file (allowlisted config the
     /// workspace could have). Activating it creates the real file.
     ghost: bool,
+    /// The New File… and New Folder… rows at the end of every folder's
+    /// listing (a ghost, never on disk): activating one asks for a name and
+    /// creates it there (David, 2026-10-20: "I think all directories should
+    /// get ghost entries for new subfolders and files for consistency").
+    create: Option<Create>,
+}
+
+/// What a create row makes ([`FileNode::create`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Create {
+    File,
+    Folder,
+}
+
+impl Create {
+    /// The name a create row stands under in its folder: never a real
+    /// file's, and never written.
+    fn placeholder(self) -> &'static str {
+        match self {
+            Create::File => ".taste-new-file",
+            Create::Folder => ".taste-new-folder",
+        }
+    }
 }
 
 /// How many of a file's matching lines a search keeps for the match panel.
@@ -445,10 +468,14 @@ pub struct FileTree {
     /// back. The backlog has its own, under its list.
     intervention: Rc<crate::intervention::Panel>,
     all_toggle: gtk::ToggleButton,
+    /// The count All wears beside its infinity sign.
+    all_face: gtk::Label,
     commit_box: gtk::Box,
     ignore_rules: std::cell::Cell<usize>,
-    /// The listing menu: which files the tree shows ([`Showing`]).
-    showing_button: gtk::MenuButton,
+    /// Which files the tree shows ([`Showing`]): ignored ones, off by
+    /// default; synced ones, on.
+    ignored_toggle: gtk::ToggleButton,
+    synced_toggle: gtk::ToggleButton,
     dirty_toggle: gtk::ToggleButton,
     staged_toggle: gtk::ToggleButton,
     stashed_toggle: gtk::ToggleButton,
@@ -832,10 +859,13 @@ enum Pull {
     Rebase,
 }
 
-/// Which files the tree lists (David, 2026-10-19): what git tracks; that
-/// and the ignored files that sync with Personal anyway, which are part of
-/// both working copies (the default); or everything, ignored and unsynced
-/// included. Chosen in the menu at the end of the filter row.
+/// Which files the tree lists: what git tracks; that and the ignored files
+/// that sync with Personal anyway, which are part of both working copies
+/// (the default); or everything, ignored and unsynced included. Two
+/// toggles at the end of the filter row choose it, Show Ignored Files (off)
+/// and Show Synced Files (on): ignored shown is everything, synced included
+/// (David, 2026-10-20: "I actually just want this to be two separate,
+/// adjacent buttons").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Showing {
     Tracked,
@@ -845,23 +875,11 @@ enum Showing {
 }
 
 impl Showing {
-    const EVERY: [Showing; 3] = [Showing::Tracked, Showing::TrackedAndSynced, Showing::All];
-
-    /// The icons that say it: git's glyph, git's and the sync arrows, or
-    /// infinity.
-    fn icons(self) -> &'static [&'static str] {
-        match self {
-            Showing::Tracked => &["taste-branch-symbolic"],
-            Showing::TrackedAndSynced => &["taste-branch-symbolic", "taste-sync-symbolic"],
-            Showing::All => &["taste-all-files-symbolic"],
-        }
-    }
-
-    fn words(self) -> &'static str {
-        match self {
-            Showing::Tracked => "Only files tracked in git",
-            Showing::TrackedAndSynced => "Tracked files, and ignored ones that sync",
-            Showing::All => "All files, ignored and unsynced included",
+    fn of(ignored: bool, synced: bool) -> Self {
+        match (ignored, synced) {
+            (true, _) => Showing::All,
+            (false, true) => Showing::TrackedAndSynced,
+            (false, false) => Showing::Tracked,
         }
     }
 }
@@ -875,15 +893,6 @@ fn icon_and_count(button: &gtk::ToggleButton, icon: &str) -> gtk::Label {
     face.append(&count);
     button.set_child(Some(&face));
     count
-}
-
-/// `showing`'s icons in a row, as the menu's button and its items wear them.
-fn showing_icons(showing: Showing) -> gtk::Box {
-    let icons = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-    for name in showing.icons() {
-        icons.append(&gtk::Image::from_icon_name(name));
-    }
-    icons
 }
 
 /// Which branch a Pull takes from (David, 2026-10-19): the branch's own
@@ -1285,19 +1294,24 @@ impl FileTree {
                 .expect("a sync button's child is its stack"),
             "face",
         );
-        // Which files the tree lists, as a menu of three: git's, git's and
-        // what syncs, or everything (David, 2026-10-19). Its face is the
-        // chosen one's icons, and no count.
-        let showing_button = gtk::MenuButton::builder()
-            .child(&showing_icons(Showing::default()))
-            .tooltip_text(Showing::default().words())
+        // Which files the tree lists: two toggles, the eye for the ignored
+        // files and the sync arrows for the synced ones (David, 2026-10-20).
+        let ignored_toggle = gtk::ToggleButton::builder()
+            .icon_name("view-conceal-symbolic")
+            .tooltip_text("Show ignored files")
             .css_classes(["flat"])
+            .build();
+        let synced_toggle = gtk::ToggleButton::builder()
+            .icon_name("taste-sync-symbolic")
+            .tooltip_text("Show ignored files that sync with Personal")
+            .css_classes(["flat"])
+            .active(true)
             .build();
         // Filters in change-flow order: Stashed ↔ Dirty ↔ Staged, with
         // All (no git filter) leading. Counts live on the buttons.
         let all_toggle = gtk::ToggleButton::builder()
             .label("All")
-            .tooltip_text("Every unignored file")
+            .tooltip_text("No git filter: every file the tree lists")
             .css_classes(["flat", "caption"])
             .active(true)
             .build();
@@ -1329,6 +1343,7 @@ impl FileTree {
         // for what is put away, a pencil for what is edited, a ticked box
         // for what is ready to commit, the warning for what is in conflict.
         // Their tooltips say the words.
+        let all_face = icon_and_count(&all_toggle, "taste-all-files-symbolic");
         let stashed_face = icon_and_count(&stashed_toggle, "package-x-generic-symbolic");
         let dirty_face = icon_and_count(&dirty_toggle, "document-edit-symbolic");
         let staged_face = icon_and_count(&staged_toggle, "checkbox-checked-symbolic");
@@ -1451,7 +1466,8 @@ impl FileTree {
         counts.append(&pull_button);
         counts.append(&push_button);
         sync_row.append(&counts);
-        sync_row.append(&sync_button);
+        // Fetch belongs to the folder, not the branch: it is on the
+        // project row above (David, 2026-10-20).
 
         // Which environment the panes are aimed at is said once, by the
         // panel at the bottom of this pane — the backlog, whose first row
@@ -1514,9 +1530,12 @@ impl FileTree {
         // The ignored-files eye sits at the end of the filter row: the
         // search row it shared with the tree's own entry is gone, the query
         // having moved to the title bar.
-        showing_button.set_halign(gtk::Align::End);
-        showing_button.set_hexpand(true);
-        branch_row.append(&showing_button);
+        let showing_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        showing_box.set_halign(gtk::Align::End);
+        showing_box.set_hexpand(true);
+        showing_box.append(&ignored_toggle);
+        showing_box.append(&synced_toggle);
+        branch_row.append(&showing_box);
         // The git row leads: the branch menu and what follows from it —
         // behind/ahead as Pull and Push, Sync, a paused rebase's Abort and
         // Continue, Initialize Repository where there is no repo. It was
@@ -1687,10 +1706,7 @@ impl FileTree {
         // The project folder itself: always the first row, never
         // collapsible; its context menu creates top-level items.
         let root_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        root_row.set_margin_top(4);
-        root_row.set_margin_bottom(4);
-        root_row.set_margin_start(CHROME_INSET);
-        root_row.set_margin_end(CHROME_INSET);
+
         root_row.append(&gtk::Image::from_icon_name("folder-open-symbolic"));
         let root_label = gtk::Label::builder()
             .label(
@@ -1707,7 +1723,11 @@ impl FileTree {
             .build()
             .full_text_on_hover();
         root_row.append(&root_label);
-        widget.append(&root_row);
+        // The pane's first row (David, 2026-10-20): the folder, and the
+        // fetch that freshens everything under it — then the branch with
+        // its counts, then the filters.
+        root_row.append(&sync_button);
+        header.prepend(&root_row);
         widget.append(&list_holder);
         widget.append(&files_results.widget);
         // The files' intervention panel opens from the bottom of the file
@@ -1781,9 +1801,11 @@ impl FileTree {
             search_cancel: RefCell::new(None),
             index_building: std::cell::Cell::new(false),
             all_toggle: all_toggle.clone(),
+            all_face,
             commit_box: commit_row.clone(),
             ignore_rules: std::cell::Cell::new(0),
-            showing_button: showing_button.clone(),
+            ignored_toggle: ignored_toggle.clone(),
+            synced_toggle: synced_toggle.clone(),
             dirty_toggle: dirty_toggle.clone(),
             staged_toggle: staged_toggle.clone(),
             stashed_toggle: stashed_toggle.clone(),
@@ -2058,6 +2080,7 @@ impl FileTree {
                         path: tree.view_root(),
                         is_dir: true,
                         ghost: false,
+                        create: None,
                     };
                     tree.show_context_menu(&row_anchor, &root_node);
                 }
@@ -2162,59 +2185,17 @@ impl FileTree {
                 tree.rebuild();
             });
         }
-        {
-            // The menu: a row per choice — its icons, its words, and a check
-            // on the one in force.
-            let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            let checks: Rc<Vec<(Showing, gtk::Image)>> = Rc::new(
-                Showing::EVERY
-                    .iter()
-                    .map(|showing| {
-                        (
-                            *showing,
-                            gtk::Image::from_icon_name("object-select-symbolic"),
-                        )
-                    })
-                    .collect(),
-            );
-            let popover = gtk::Popover::new();
-            for (showing, check) in checks.iter() {
-                let face = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-                let icons = showing_icons(*showing);
-                // The icons in a column of one width, so the words align.
-                icons.set_width_request(36);
-                face.append(&icons);
-                face.append(
-                    &gtk::Label::builder()
-                        .label(showing.words())
-                        .xalign(0.0)
-                        .hexpand(true)
-                        .build(),
-                );
-                check.set_visible(*showing == Showing::default());
-                face.append(check);
-                let item = gtk::Button::builder()
-                    .child(&face)
-                    .css_classes(["flat"])
-                    .build();
-                let (weak, checks, popover, showing) = (
-                    Rc::downgrade(&tree),
-                    checks.clone(),
-                    popover.clone(),
-                    *showing,
-                );
-                item.connect_clicked(move |_| {
-                    popover.popdown();
-                    let Some(tree) = weak.upgrade() else { return };
-                    for (each, check) in checks.iter() {
-                        check.set_visible(*each == showing);
-                    }
+        for toggle in [&ignored_toggle, &synced_toggle] {
+            let weak = Rc::downgrade(&tree);
+            toggle.connect_toggled(move |_| {
+                if let Some(tree) = weak.upgrade() {
+                    let showing = Showing::of(
+                        tree.ignored_toggle.is_active(),
+                        tree.synced_toggle.is_active(),
+                    );
                     tree.set_showing(showing);
-                });
-                list.append(&item);
-            }
-            popover.set_child(Some(&list));
-            showing_button.set_popover(Some(&popover));
+                }
+            });
         }
 
         // The panel does not aim the panes itself: the window owns that
@@ -2326,16 +2307,13 @@ impl FileTree {
         }
     }
 
-    /// List `showing`'s files from now on: the menu's face says which, and
-    /// the tree is listed again — never over search results, or a filter
-    /// view, which never lists ignored files anyway; the choice applies when
-    /// the tree next shows.
+    /// List `showing`'s files from now on: the tree is listed again —
+    /// never over search results, or a filter view, which never lists
+    /// ignored files anyway; the choice applies when the tree next shows.
     fn set_showing(self: &Rc<Self>, showing: Showing) {
         if self.showing.replace(showing) == showing {
             return;
         }
-        self.showing_button.set_child(Some(&showing_icons(showing)));
-        self.showing_button.set_tooltip_text(Some(showing.words()));
         if self.query.borrow().is_empty() && !self.filters_active() {
             self.rebuild();
         }
@@ -4549,10 +4527,11 @@ impl FileTree {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 // The ghosts' existence checks are filesystem reads too, so
                 // they come along rather than running on the main thread.
+                let creators = ghosts_root.is_some();
                 let ghosts = ghosts_root
                     .map(|root| ghost_candidates(&worktree.files(), &root))
                     .unwrap_or_default();
-                scan_dir_nodes(&worktree, &dir, showing, &synced, &ghosts, None)
+                scan_dir_nodes(&worktree, &dir, showing, &synced, &ghosts, creators, None)
             });
             glib::spawn_future_local(async move {
                 let Ok(nodes) = handle.await else { return };
@@ -4951,6 +4930,9 @@ impl FileTree {
     /// when applicable, then New File / New Folder / Rename / Delete.
     fn show_context_menu(self: &Rc<Self>, anchor: &gtk::Box, node: &FileNode) {
         use gtk::gio;
+        if node.create.is_some() {
+            return;
+        }
 
         let actions = gio::SimpleActionGroup::new();
         // Every file operation in this menu writes. In a watched
@@ -5822,8 +5804,22 @@ impl FileTree {
         self.conflicts_toggle
             .set_visible(conflicts > 0 || self.conflicts_toggle.is_active());
         match self.index_files() {
-            Some(files) => self.all_toggle.set_label(&format!("All {}", files.len())),
-            None => self.all_toggle.set_label("All"),
+            Some(files) => {
+                self.all_face.set_label(&files.len().to_string());
+                // What the number counts, which is not what the tree lists
+                // once it shows ignored files too (David, 2026-10-20:
+                // "That's false if I'm showing ignored files").
+                self.all_toggle.set_tooltip_text(Some(&format!(
+                    "No git filter: every file the tree lists. {} {} not ignored by git",
+                    files.len(),
+                    if files.len() == 1 {
+                        "file is"
+                    } else {
+                        "files are"
+                    }
+                )));
+            }
+            None => self.all_face.set_label(""),
         }
     }
 
@@ -8121,7 +8117,23 @@ impl FileTree {
                 .unwrap()
                 .borrow::<FileNode>()
                 .clone();
-            if node.is_dir || node.ghost {
+            if let Some(create) = node.create {
+                let dir = node
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let (title, folder) = match create {
+                    Create::File => ("New File", false),
+                    Create::Folder => ("New Folder", true),
+                };
+                tree.clone()
+                    .prompt_name(title, "Create", "", move |tree, name| {
+                        tree.create_file(&dir.join(name), folder);
+                    });
+                let tree = tree.clone();
+                glib::idle_add_local_once(move || tree.restore_tree_selection());
+            } else if node.is_dir || node.ghost {
                 // A ghost folder opens rather than appears: what it is for
                 // is the files in it, and creating one of them makes it.
                 if node.ghost && !node.is_dir {
@@ -8483,6 +8495,24 @@ impl FileTree {
         // panel's size stood a point taller than the files around it
         // (David, 2026-09-16: "Are these the same font size?").
         row.add_css_class("file-row");
+        if let Some(create) = node.create {
+            let (icon, words) = match create {
+                Create::File => ("document-new-symbolic", "New File…"),
+                Create::Folder => ("folder-new-symbolic", "New Folder…"),
+            };
+            let icon = gtk::Image::from_icon_name(icon);
+            icon.add_css_class("dim-label");
+            row.append(&icon);
+            row.append(
+                &gtk::Label::builder()
+                    .label(words)
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .css_classes(["dim-label", "ghost-text"])
+                    .build(),
+            );
+            return row;
+        }
         let icon = gtk::Image::from_icon_name(if node.is_dir {
             "folder-new-symbolic"
         } else {
@@ -8654,6 +8684,14 @@ impl FileTree {
     fn probe_card(&self) {
         if std::env::var("TASTE_PROBE_CHECK").is_err() {
             return;
+        }
+        // `TASTE_PROBE_TREE_END=1`: the listing scrolled to its end, where
+        // New File… and New Folder… are, which a short pane hides.
+        if std::env::var("TASTE_PROBE_TREE_END").is_ok() {
+            let adjustment = self.list_holder.vadjustment();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+                adjustment.set_value(adjustment.upper());
+            });
         }
         let Ok(which) = std::env::var("TASTE_PROBE_CARD") else {
             return;
@@ -9401,6 +9439,7 @@ fn scan_dir_nodes(
     showing: Showing,
     synced: &taste_devcontainer::worktree::SyncIgnored,
     ghosts: &[Ghost],
+    creators: bool,
     filter: Option<&HashSet<PathBuf>>,
 ) -> Vec<FileNode> {
     let mut nodes: Vec<FileNode> = if worktree.is_local() {
@@ -9417,6 +9456,7 @@ fn scan_dir_nodes(
                 is_dir: entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
                 path: entry.into_path(),
                 ghost: false,
+                create: None,
             })
             .collect()
     } else {
@@ -9441,6 +9481,7 @@ fn scan_dir_nodes(
                 is_dir: entry.kind == taste_core::files::Kind::Dir,
                 path: dir.join(&entry.name),
                 ghost: false,
+                create: None,
             })
             // Ignored and hidden — unless it syncs anyway, which makes it
             // part of both working copies: listed, wearing its mark
@@ -9476,8 +9517,20 @@ fn scan_dir_nodes(
                 path: ghost.path.clone(),
                 is_dir: ghost.is_dir,
                 ghost: true,
+                create: None,
             }),
     );
+    // Last of all, in every folder the tree can write in: a new file and a
+    // new folder, named when chosen. Not over a search or a filter, whose
+    // listings are of what is there.
+    if creators && filter.is_none() {
+        nodes.extend([Create::File, Create::Folder].map(|create| FileNode {
+            path: dir.join(create.placeholder()),
+            is_dir: false,
+            ghost: true,
+            create: Some(create),
+        }));
+    }
     nodes
 }
 
@@ -9539,8 +9592,19 @@ fn fill_dir_store_async(
 ) {
     let weak = store.downgrade();
     let handle = crate::runtime::runtime().spawn_blocking(move || {
+        // A pane that can write — the ghosts' root is set — offers the
+        // create rows too.
+        let creators = ghosts.writable();
         let ghosts = ghosts.get(&worktree);
-        scan_dir_nodes(&worktree, &dir, showing, &synced, ghosts, filter.as_ref())
+        scan_dir_nodes(
+            &worktree,
+            &dir,
+            showing,
+            &synced,
+            ghosts,
+            creators,
+            filter.as_ref(),
+        )
     });
     glib::spawn_future_local(async move {
         let Ok(nodes) = handle.await else { return };
@@ -9592,6 +9656,12 @@ struct Ghosts(std::sync::Arc<(Option<PathBuf>, std::sync::OnceLock<Vec<Ghost>>)>
 impl Ghosts {
     fn new(root: Option<PathBuf>) -> Self {
         Self(std::sync::Arc::new((root, std::sync::OnceLock::new())))
+    }
+
+    /// Whether the pane these ghosts are for can write: a read-only view
+    /// has no root for them.
+    fn writable(&self) -> bool {
+        self.0 .0.is_some()
     }
 
     fn get(&self, worktree: &Worktree) -> &[Ghost] {
@@ -9779,6 +9849,7 @@ mod tests {
                 super::Showing::TrackedAndSynced,
                 &synced,
                 &[],
+                false,
                 None,
             )
             .into_iter()
@@ -9803,6 +9874,7 @@ mod tests {
             super::Showing::TrackedAndSynced,
             &none,
             &[],
+            false,
             None,
         )
         .into_iter()
@@ -9818,7 +9890,7 @@ mod tests {
         // The listing menu's other two: git's files alone leave out even
         // what syncs; everything lists what nothing syncs too.
         let named = |showing: super::Showing, sync: &taste_devcontainer::worktree::SyncIgnored| {
-            super::scan_dir_nodes(&worktree, &root, showing, sync, &[], None)
+            super::scan_dir_nodes(&worktree, &root, showing, sync, &[], false, None)
                 .into_iter()
                 .map(|node| {
                     node.path
@@ -9831,6 +9903,39 @@ mod tests {
         };
         assert!(!named(super::Showing::Tracked, &synced).contains(&"data".to_string()));
         assert!(named(super::Showing::All, &none).contains(&"data".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every folder a writable pane lists ends with New File… and New
+    /// Folder…; a read-only pane's, and a search's, do not.
+    #[test]
+    fn every_folder_ends_with_a_new_file_and_a_new_folder() {
+        let root = std::env::temp_dir().join(format!("taste-creators-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let worktree = super::Worktree::Local(root.clone());
+        let list = |creators: bool, filter: Option<&HashSet<PathBuf>>| {
+            super::scan_dir_nodes(
+                &worktree,
+                &root,
+                super::Showing::TrackedAndSynced,
+                &Default::default(),
+                &[],
+                creators,
+                filter,
+            )
+        };
+        let nodes = list(true, None);
+        let tail: Vec<_> = nodes.iter().rev().take(2).map(|n| n.create).collect();
+        assert_eq!(
+            tail,
+            [Some(super::Create::Folder), Some(super::Create::File)]
+        );
+        assert!(nodes.iter().rev().take(2).all(|n| n.ghost && !n.is_dir));
+        assert!(list(false, None).iter().all(|n| n.create.is_none()));
+        let only = HashSet::from([root.join("a.txt")]);
+        assert!(list(true, Some(&only)).iter().all(|n| n.create.is_none()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9849,6 +9954,7 @@ mod tests {
                 super::Showing::TrackedAndSynced,
                 &Default::default(),
                 &ghosts,
+                false,
                 None,
             )
             .into_iter()
@@ -9938,6 +10044,7 @@ mod tests {
     #[test]
     fn reconcile_keeps_rows_that_are_still_there() {
         let node = |name: &str, is_dir: bool, ghost: bool| FileNode {
+            create: None,
             path: PathBuf::from("/w").join(name),
             is_dir,
             ghost,
@@ -10370,6 +10477,7 @@ mod tests {
                 Showing::TrackedAndSynced,
                 &Default::default(),
                 &[],
+                false,
                 None,
             );
             let synchronous_walk = start.elapsed();

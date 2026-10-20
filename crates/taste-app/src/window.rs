@@ -1315,14 +1315,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     app_icon.set_pixel_size(20);
     app_icon.set_margin_start(6);
     header.pack_start(&app_icon);
-    // Another folder, in a window of its own (`open_folder_in_new_window`).
+    // Another window, which asks for its folder (`open_new_window`): the
+    // square with a plus, a new thing rather than a folder (David,
+    // 2026-10-20).
     // On the START side because the end is out of room (docs/spikes/
     // header-budget-glyphs-and-port-traffic.md § 1), and first there
     // because it is about the window rather than the file in front.
     let open_folder_button = gtk::Button::builder()
-        .icon_name("folder-open-symbolic")
+        .icon_name("tab-new-symbolic")
         .action_name("win.open-folder")
-        .tooltip_text("Open Folder in New Window (Ctrl+O)")
+        .tooltip_text("New Window (Ctrl+O)")
         .build();
     header.pack_start(&open_folder_button);
     // File navigation lives with the window chrome, right of the carrot.
@@ -1330,7 +1332,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     header.pack_start(&editor.forward_button);
     // Primary menu — the HIG staple every GNOME window carries.
     let menu = gtk::gio::Menu::new();
-    menu.append(Some("Open Folder…"), Some("win.open-folder"));
+    menu.append(Some("New Window"), Some("win.open-folder"));
     menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
     menu.append(Some("About Taste"), Some("win.about"));
     let menu_button = gtk::MenuButton::builder()
@@ -3955,13 +3957,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         window.add_action(&shortcuts_action);
 
         let open_folder = gtk::gio::SimpleAction::new("open-folder", None);
-        let window_ref = window.downgrade();
-        let root = workspace.root().to_path_buf();
         let toasts = toast_overlay.clone();
         open_folder.connect_activate(move |_, _| {
-            if let Some(window) = window_ref.upgrade() {
-                crate::open_folder_in_new_window(&window, &root, &toasts);
-            }
+            crate::open_new_window(&toasts);
         });
         window.add_action(&open_folder);
     }
@@ -5524,7 +5522,7 @@ fn present_shortcuts_dialog(parent: &adw::ApplicationWindow) {
         ("Ctrl+Shift+M", "Start or stop talking into Dispatch"),
         ("Ctrl+S", "Save the current file"),
         ("Ctrl+W", "Close the current tab"),
-        ("Ctrl+O", "Open a folder in a new window"),
+        ("Ctrl+O", "A new window, which asks for its folder"),
         ("Ctrl+Shift+E", "The backlog"),
         ("Ctrl+Q", "Quit (state is saved)"),
         ("Ctrl+Shift+C / V", "Copy / paste in terminals"),
