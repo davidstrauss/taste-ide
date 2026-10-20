@@ -1070,13 +1070,37 @@ fn replacing_push(sync: &taste_git::SyncStatus) -> Option<(String, usize)> {
         .flatten()
 }
 
-/// How a rewrite's replaced commits are described when some of them make a
-/// change the branch no longer has: said, since the push drops it there.
-fn dropped_clause(dropped: usize) -> String {
+/// What a push replacing a branch rewritten here replaces, as the IDE
+/// found it (`SyncStatus::rewritten`): the `replaced` commits on the
+/// remote are the branch's own old copies, and either every change in them
+/// is in the branch — compared change by change, so the push loses nothing
+/// — or `dropped` of them make a change it no longer has, which the push
+/// drops (David, 2026-10-19: "make this tooltip more clear if we've been
+/// able to verify that our local commits include the same work, just
+/// rebased").
+fn rewrite_verdict(replaced: usize, dropped: usize, upstream: &str) -> String {
+    let (commits, are) = if replaced == 1 {
+        ("commit", "is")
+    } else {
+        ("commits", "are")
+    };
     match dropped {
-        0 => String::new(),
-        1 => ", one of which makes a change this branch no longer has".to_string(),
-        n => format!(", {n} of which make changes this branch no longer has"),
+        0 => format!(
+            "the {replaced} {commits} on {upstream} {are} this branch's own from before it \
+             was rebased or reworded here, and every change in {} is in this branch, so \
+             nothing is lost",
+            if replaced == 1 { "it" } else { "them" }
+        ),
+        1 => format!(
+            "the {replaced} {commits} on {upstream} {are} this branch's own from before it \
+             was rewritten here, and 1 of them makes a change this branch no longer has, \
+             which the push drops"
+        ),
+        n => format!(
+            "the {replaced} {commits} on {upstream} {are} this branch's own from before it \
+             was rewritten here, and {n} of them make changes this branch no longer has, \
+             which the push drops"
+        ),
     }
 }
 
@@ -5357,17 +5381,20 @@ impl FileTree {
                                     };
                                     self.push_button.set_tooltip_text(Some(&match replacing {
                                         Some(replaced) if sync.rewritten.is_some() => format!(
-                                            "Hold for {push_secs} seconds to push the branch \
-                                             rewritten here to {upstream}{}: its {own} \
-                                             commit{}{along}, replacing the {replaced} there \
-                                             from before it was rewritten{}",
+                                            "Hold for {push_secs} seconds to push this \
+                                             branch's {own} commit{}{along} to {upstream}{}, \
+                                             replacing what is there: {}",
+                                            plural(own),
                                             if sync.on_canonical {
                                                 ", the default branch"
                                             } else {
                                                 ""
                                             },
-                                            plural(own),
-                                            dropped_clause(sync.rewritten.unwrap_or(0))
+                                            rewrite_verdict(
+                                                replaced,
+                                                sync.rewritten.unwrap_or(0),
+                                                upstream
+                                            )
                                         ),
                                         Some(replaced) => format!(
                                             "Hold for {hold} seconds to push the rebased branch \
@@ -7226,12 +7253,11 @@ impl FileTree {
         let worktree = self.worktree();
         let share_remotes = self.share_remotes.borrow().clone();
         let note_agent = self.note_agent.borrow().clone();
+        // The button pressed shows a spinner; nothing is written beside the
+        // branch name, where "fetching…" had no room, came out as a bare
+        // "…", and moved every button as it came and went (David,
+        // 2026-10-19: "It jostles things around").
         self.sync_button.set_sensitive(false);
-        self.set_sync_label(if mode == Pull::Fetch {
-            "fetching…"
-        } else {
-            "syncing…"
-        });
         self.last_fetch.set(Some(std::time::Instant::now()));
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
@@ -8541,18 +8567,17 @@ impl FileTree {
                     .as_ref()
                     .and_then(|s| s.upstream.clone())
                     .unwrap_or_else(|| "the remote".to_string());
-                let when = if sync.as_ref().is_some_and(|s| s.rewritten.is_some()) {
-                    "it was rewritten here"
-                } else {
-                    "the rebase"
+                let what = match sync.as_ref().and_then(|s| s.rewritten) {
+                    Some(dropped) => rewrite_verdict(replaced, dropped, &target),
+                    None => format!(
+                        "{target} has {replaced} commit{} this branch does not, from before \
+                         the rebase",
+                        if replaced == 1 { "" } else { "s" }
+                    ),
                 };
-                let dropped = sync.as_ref().and_then(|s| s.rewritten).unwrap_or(0);
                 self.workspace.events.publish(Event::Toast(format!(
-                    "Not pushed: {target} has {replaced} commit{} this branch does not, from \
-                     before {when}{}. Hold Push for {} seconds to replace {}; it is refused \
-                     if {target} has changed since it was last fetched",
-                    if replaced == 1 { "" } else { "s" },
-                    dropped_clause(dropped),
+                    "Not pushed: {what}. Hold Push for {} seconds to replace {}; it is \
+                     refused if {target} has changed since it was last fetched",
                     self.push_hold.hold().as_secs(),
                     if replaced == 1 { "it" } else { "them" },
                 )));
@@ -9440,6 +9465,21 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// A rewrite whose every change is in the branch says nothing is
+    /// lost; one that drops changes says how many.
+    #[test]
+    fn a_rewrite_says_whether_anything_is_lost() {
+        let kept = super::rewrite_verdict(2, 0, "origin/datum-call");
+        assert!(kept.contains("nothing is lost"), "{kept}");
+        assert!(
+            kept.contains("the 2 commits on origin/datum-call are"),
+            "{kept}"
+        );
+        let lost = super::rewrite_verdict(2, 1, "origin/topic");
+        assert!(lost.contains("1 of them makes a change"), "{lost}");
+        assert!(!lost.contains("nothing is lost"), "{lost}");
+    }
 
     /// Ten seconds only to replace the default branch's history; a pull
     /// request's own branch is replaced with the ordinary hold.
