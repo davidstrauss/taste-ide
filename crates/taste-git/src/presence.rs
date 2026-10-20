@@ -103,6 +103,13 @@ pub fn identity_files_need_presence(files: &[PathBuf]) -> bool {
 /// it would not (or `url` is not reached over SSH). Runs `ssh-add -L` and
 /// `ssh -G`, both local and quick; blocking, so a caller on the GTK thread
 /// runs it on the blocking pool.
+/// [`fetch_needs_presence`] for every URL a fetch reaches — a `fetch
+/// --all` reaches every remote, and each submodule's fetch its own — held
+/// back when any one of them would ask: the first such reason.
+pub fn any_needs_presence<'a>(urls: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    urls.into_iter().find_map(fetch_needs_presence)
+}
+
 pub fn fetch_needs_presence(url: &str) -> Option<String> {
     let target = ssh_target(url)?;
     let agent_listing = Command::new("ssh-add")

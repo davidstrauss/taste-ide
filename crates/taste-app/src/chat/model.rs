@@ -419,6 +419,34 @@ impl Model {
                 }
             }
             self.changed(last);
+            // A prompt still waiting inside the turn — refused, lost, never
+            // taken — is a card of its own once the turn is over: the line
+            // that ran past it ends at the dot above (review, 2026-10-20).
+            if let Some(&at) = self.index.get(&last) {
+                let waiting: Vec<RowId> = self.rows[at + 1..]
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            &row.kind,
+                            Kind::User(User {
+                                within_turn: true,
+                                ..
+                            })
+                        )
+                    })
+                    .map(|row| row.id)
+                    .collect();
+                for id in waiting {
+                    if let Some(Row {
+                        kind: Kind::User(user),
+                        ..
+                    }) = self.row_mut(id)
+                    {
+                        user.within_turn = false;
+                    }
+                    self.changed(id);
+                }
+            }
         }
         self.after_prompt = true;
     }
@@ -952,6 +980,20 @@ impl Model {
                 self.after_prompt = true;
             }
         }
+        // The rows after it — its notes — are under a prompt now: they run
+        // up from its box, across a prompt's gap.
+        let first_after = self
+            .index
+            .get(&id)
+            .and_then(|&at| self.rows[at + 1..].iter().find(|row| row.rail.is_some()))
+            .map(|row| row.id);
+        if let Some(first) = first_after {
+            if let Some(rail) = self.row_mut(first).and_then(|row| row.rail.as_mut()) {
+                rail.top = true;
+                rail.after_prompt = true;
+            }
+            self.changed(first);
+        }
         self.plan = None;
         self.turn_answers.clear();
     }
@@ -1047,12 +1089,48 @@ impl Model {
             })
             .map(|row| row.id)
             .collect();
+        // The step the prompt stood under, which may have run its line down
+        // to it — a prompt waiting inside a turn — or to its notes.
+        let above = ids
+            .iter()
+            .filter_map(|id| self.index.get(id).copied())
+            .min()
+            .and_then(|at| self.rows[..at].iter().rev().find(|row| row.rail.is_some()))
+            .map(|row| row.id);
+        let had_last = self.last_step.is_some();
         for id in ids {
             self.remove(id);
         }
         self.prompts.remove(prompt);
         if self.last_prompt.is_some_and(|id| self.row(id).is_none()) {
             self.last_prompt = None;
+        }
+        // Mended where it went: the step above runs on only to a row that
+        // runs up to it, and the turn's next step joins it when the
+        // prompt's notes were the last of it (review, 2026-10-20).
+        if let Some(above) = above {
+            let Some(&at) = self.index.get(&above) else {
+                return;
+            };
+            let runs_on = self.rows.get(at + 1).is_some_and(|row| {
+                row.rail.is_some_and(|rail| rail.top && !rail.after_prompt)
+                    || matches!(
+                        &row.kind,
+                        Kind::User(User {
+                            within_turn: true,
+                            ..
+                        })
+                    )
+            });
+            if !runs_on {
+                if let Some(rail) = self.row_mut(above).and_then(|row| row.rail.as_mut()) {
+                    rail.bottom = false;
+                }
+                self.changed(above);
+            }
+            if had_last && self.last_step.is_none() && at + 1 == self.rows.len() {
+                self.last_step = Some(above);
+            }
         }
     }
 
@@ -1704,6 +1782,56 @@ mod tests {
             assert!(*top, "row {index} runs up: {rails:?}");
             assert_eq!(*bottom, index != last, "row {index} runs down: {rails:?}");
         }
+    }
+
+    /// A prompt waiting inside a turn leaves no line behind it: withdrawn,
+    /// the step above it ends where it did; never taken by the time the
+    /// turn is over, it is a card of its own; and seated in place with its
+    /// notes, the first note runs up from its box.
+    #[test]
+    fn a_waiting_prompt_leaves_no_line_behind() {
+        let first = format!("{PROMPT_PREFIX}1");
+        let second = format!("{PROMPT_PREFIX}2");
+        let third = format!("{PROMPT_PREFIX}3");
+        let base = || {
+            let mut model = Model::default();
+            model.prompt_sent(&first, "Fix it.".into(), Vec::new(), Delivery::Sent);
+            model.prompt_taken(&first, None);
+            model.read(step("a"));
+            model.prompt_sent(
+                &second,
+                "And the docs.".into(),
+                Vec::new(),
+                Delivery::Queued,
+            );
+            model
+        };
+        // Withdrawn.
+        let mut model = base();
+        model.remove_prompt(&second);
+        assert!(model.rows()[1].rail.is_some_and(|rail| !rail.bottom));
+        model.read(step("b"));
+        let b = model.rows()[2].rail.expect("a step");
+        assert!(b.top && !b.after_prompt, "b runs on from a: {b:?}");
+        assert!(model.rows()[1].rail.is_some_and(|rail| rail.bottom));
+        // Never taken, and the next prompt ends the turn.
+        let mut model = base();
+        model.set_delivery(&second, Delivery::Lost);
+        model.prompt_sent(&third, "Next.".into(), Vec::new(), Delivery::Sent);
+        assert!(matches!(
+            &model.rows()[2].kind,
+            Kind::User(User {
+                within_turn: false,
+                ..
+            })
+        ));
+        assert!(model.rows()[1].rail.is_some_and(|rail| !rail.bottom));
+        // Seated in place, with a note.
+        let mut model = base();
+        model.prompt_note(&second, "oriented with this prompt");
+        model.prompt_taken(&second, None);
+        let note = model.rows()[3].rail.expect("a note");
+        assert!(note.top && note.after_prompt, "{note:?}");
     }
 
     /// A message sent during a turn waits inside it: the line runs on from

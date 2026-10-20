@@ -366,6 +366,15 @@ impl GitWorkspace {
     }
 
     /// Configured remote names (read-only; nothing here creates remotes).
+    /// Every configured remote's fetch URL: what a `fetch --all` reaches.
+    pub fn remote_urls(&self) -> Vec<String> {
+        self.remotes()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| self.repo.find_remote(name).ok()?.url().map(str::to_string))
+            .collect()
+    }
+
     pub fn remotes(&self) -> Result<Vec<String>> {
         Ok(self
             .repo

@@ -127,14 +127,32 @@ impl SyncCard {
 /// tooltip's pause, so the cards come and go as tooltips do.
 const PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How often a card that is up looks again at what it shows: the counts
+/// under it can change while the pointer rests there (a fetch landing), and
+/// its button can go.
+const RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Air between a card and its button.
 const GAP: f64 = 4.0;
+
+/// What one button's card shows, written by whoever knows the numbers;
+/// `None` shows nothing.
+pub type CardSlot = Rc<RefCell<Option<SyncCard>>>;
+
+/// The card up now: whose, from which slot, and what it showed.
+struct Shown {
+    target: glib::WeakRef<gtk::Widget>,
+    slot: CardSlot,
+    card: SyncCard,
+    recheck: glib::SourceId,
+}
 
 /// The layer the cards are drawn on: over everything in the window, taking
 /// no clicks. The window makes it and lays it over its content
 /// ([`Layer::install`]).
 pub struct Layer {
     pub layer: gtk::Fixed,
+    shown: RefCell<Option<Shown>>,
 }
 
 thread_local! {
@@ -151,7 +169,10 @@ impl Layer {
             .hexpand(true)
             .vexpand(true)
             .build();
-        let this = Rc::new(Self { layer });
+        let this = Rc::new(Self {
+            layer,
+            shown: RefCell::new(None),
+        });
         LAYER.with(|cell| *cell.borrow_mut() = Some(this.clone()));
         this
     }
@@ -160,13 +181,16 @@ impl Layer {
         LAYER.with(|cell| cell.borrow().clone())
     }
 
-    /// `card` under `target`, kept inside the window: right-aligned to the
-    /// target's right edge when there is room, as a tooltip under a button
-    /// near a pane's edge would sit.
+    /// `card` under `target`, centred on it and kept inside the window; above
+    /// it when there is no room below.
     pub fn show(&self, target: &gtk::Widget, card: &SyncCard) {
-        self.hide();
+        self.clear();
+        self.place(target, card);
+    }
+
+    fn place(&self, target: &gtk::Widget, card: &SyncCard) -> bool {
         let Some(bounds) = target.compute_bounds(&self.layer) else {
-            return;
+            return false;
         };
         let widget = card.widget();
         let (_, natural_w, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
@@ -185,56 +209,163 @@ impl Layer {
             (f64::from(bounds.y()) - GAP - h).max(0.0)
         };
         self.layer.put(&widget, x, y);
+        true
+    }
+
+    /// `target`'s card from `slot`, kept as the slot changes until it is
+    /// hidden: drawn again when what it says changes, gone when it says
+    /// nothing or its button is no longer on screen (review, 2026-10-20: a
+    /// card stayed up with the numbers of before a fetch).
+    fn show_slot(self: &Rc<Self>, target: &gtk::Widget, slot: &CardSlot) {
+        self.hide();
+        let Some(card) = slot.borrow().clone() else {
+            return;
+        };
+        if !self.place(target, &card) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let recheck = glib::timeout_add_local(RECHECK, move || {
+            let Some(layer) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let mut shown = layer.shown.borrow_mut();
+            let Some(now) = shown.as_mut() else {
+                return glib::ControlFlow::Break;
+            };
+            let target = now.target.upgrade().filter(|target| target.is_mapped());
+            let card = now.slot.borrow().clone();
+            match (target, card) {
+                (Some(target), Some(card)) => {
+                    if card != now.card {
+                        layer.clear();
+                        layer.place(&target, &card);
+                        now.card = card;
+                    }
+                    glib::ControlFlow::Continue
+                }
+                _ => {
+                    // The source ends by returning Break; it must not also
+                    // be removed by `hide`.
+                    shown.take();
+                    drop(shown);
+                    layer.clear();
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+        *self.shown.borrow_mut() = Some(Shown {
+            target: target.downgrade(),
+            slot: slot.clone(),
+            card,
+            recheck,
+        });
+    }
+
+    fn clear(&self) {
+        while let Some(child) = self.layer.first_child() {
+            self.layer.remove(&child);
+        }
     }
 
     pub fn hide(&self) {
-        while let Some(child) = self.layer.first_child() {
-            self.layer.remove(&child);
+        if let Some(shown) = self.shown.borrow_mut().take() {
+            shown.recheck.remove();
+        }
+        self.clear();
+    }
+
+    /// Hide the card if it is `target`'s, and only then: one button's
+    /// pointer leaving must not take down the next one's card.
+    fn hide_for(&self, target: &gtk::Widget) {
+        let ours = self
+            .shown
+            .borrow()
+            .as_ref()
+            .is_some_and(|shown| shown.target.upgrade().as_ref() == Some(target));
+        if ours {
+            self.hide();
         }
     }
 }
 
 /// Give `button` a card on hover, and return where to put what it shows:
 /// `None` shows nothing.
-pub fn install(button: &gtk::Button) -> Rc<RefCell<Option<SyncCard>>> {
+///
+/// The pointer is watched from the button's parent, not the button: GTK
+/// runs no controller of an insensitive widget, and several cards are for
+/// buttons insensitive when they matter — "Nothing to pull", "Up to date",
+/// "Read-only" (review, 2026-10-20). The button must have its parent when
+/// this is called.
+pub fn install(button: &gtk::Button) -> CardSlot {
     button.set_tooltip_text(None);
-    let card: Rc<RefCell<Option<SyncCard>>> = Rc::new(RefCell::new(None));
+    let card: CardSlot = Rc::new(RefCell::new(None));
     let pending: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    let inside = Rc::new(Cell::new(false));
+    let target: gtk::Widget = button.clone().upcast();
     let cancel = {
-        let pending = pending.clone();
+        let (pending, target) = (pending.clone(), target.downgrade());
         move || {
             if let Some(id) = pending.take() {
                 id.remove();
             }
-            if let Some(layer) = Layer::current() {
-                layer.hide();
+            if let (Some(layer), Some(target)) = (Layer::current(), target.upgrade()) {
+                layer.hide_for(&target);
             }
         }
     };
+    let host = button.parent().unwrap_or_else(|| target.clone());
     let motion = gtk::EventControllerMotion::new();
-    {
-        let (card, pending, button) = (card.clone(), pending.clone(), button.downgrade());
-        motion.connect_enter(move |_, _, _| {
-            let (card, button, slot) = (card.clone(), button.clone(), pending.clone());
+    let over = {
+        let (card, pending, inside, cancel) = (
+            card.clone(),
+            pending.clone(),
+            inside.clone(),
+            cancel.clone(),
+        );
+        let (host, target) = (host.downgrade(), target.downgrade());
+        move |x: f64, y: f64| {
+            let (Some(host), Some(target)) = (host.upgrade(), target.upgrade()) else {
+                return;
+            };
+            let now = target.is_mapped()
+                && target.compute_bounds(&host).is_some_and(|b| {
+                    b.contains_point(&gtk::graphene::Point::new(x as f32, y as f32))
+                });
+            if now == inside.replace(now) {
+                return;
+            }
+            if !now {
+                cancel();
+                return;
+            }
+            let (card, target, slot) = (card.clone(), target.downgrade(), pending.clone());
             let id = glib::timeout_add_local_once(PAUSE, move || {
                 slot.take();
-                let (Some(button), Some(layer)) = (button.upgrade(), Layer::current()) else {
+                let (Some(target), Some(layer)) = (target.upgrade(), Layer::current()) else {
                     return;
                 };
-                if let Some(card) = card.borrow().as_ref() {
-                    layer.show(button.upcast_ref(), card);
-                }
+                layer.show_slot(&target, &card);
             });
             if let Some(old) = pending.replace(Some(id)) {
                 old.remove();
             }
+        }
+    };
+    {
+        let over = over.clone();
+        motion.connect_enter(move |_, x, y| over(x, y));
+    }
+    motion.connect_motion(move |_, x, y| over(x, y));
+    {
+        let (inside, cancel) = (inside.clone(), cancel.clone());
+        motion.connect_leave(move |_| {
+            if inside.replace(false) {
+                cancel();
+            }
         });
     }
-    {
-        let cancel = cancel.clone();
-        motion.connect_leave(move |_| cancel());
-    }
-    button.add_controller(motion);
+    host.add_controller(motion);
     // A press is an answer to the card, which goes, as a tooltip does.
     let press = gtk::GestureClick::new();
     press.set_propagation_phase(gtk::PropagationPhase::Capture);

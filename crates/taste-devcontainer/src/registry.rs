@@ -2758,6 +2758,11 @@ impl EnvironmentRegistry {
     /// syncs. Blocking. The first failure is returned once every
     /// environment has been tried.
     pub fn share_personal(&self, only: Option<&EnvironmentId>) -> Result<()> {
+        // One share at a time: a fetch's share runs on a thread of its own
+        // now, and two at once would push the same refs twice and race on
+        // each checkout's config.
+        static SHARING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
         let folder = self.workspace_root.clone();
         let Some(git) = taste_git::GitWorkspace::discover(&folder) else {
             return Ok(());
@@ -4557,6 +4562,9 @@ impl EnvironmentRegistry {
         // (`finish_move`), so when this environment is the last there, the
         // room its disk could still grow into is not held against the VM
         // replacing it (2026-10-19: a move refused for its own VM's 55 GiB).
+        // A one-time admission: should the move fail after the new VM is
+        // made, both stay, and the next growth of either counts both disks
+        // again (`grown_disk_gib`), so nothing grows into the excluded room.
         let last_in_old = !self
             .list()
             .iter()

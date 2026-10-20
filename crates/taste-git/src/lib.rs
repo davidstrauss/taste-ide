@@ -1026,6 +1026,10 @@ pub struct SyncStatus {
     /// default branch's checkout — so every push of it is held for, and one
     /// that replaces history there for longer.
     pub on_canonical: bool,
+    /// The branch pushes to a URL, not a named remote (`gh pr checkout`
+    /// writes one): its tip there is asked for and counted, but no ref here
+    /// keeps it, so ↓ has nothing to move the branch onto.
+    pub push_by_url: bool,
 }
 
 impl SyncStatus {
@@ -1043,6 +1047,7 @@ impl SyncStatus {
             own_ahead: 0,
             canonical: None,
             on_canonical: false,
+            push_by_url: false,
         }
     }
 }
@@ -1723,6 +1728,106 @@ mod tests {
         );
     }
 
+    /// An empty commit is matched across a rebase by its message and
+    /// author, having no patch to compare; and a merge someone else made on
+    /// the branch's push target is not taken for the branch's own rewrite
+    /// (review, 2026-10-20: a host's "Update branch" read as "nothing is
+    /// lost", and a hold of Push would have replaced it).
+    #[test]
+    fn empty_commits_match_and_a_merge_there_is_someone_elses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let write = |cwd: &Path, name: &str, text: &str| {
+            std::fs::write(cwd.join(name), text).unwrap();
+            git(cwd, &["add", name]);
+        };
+        git(root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(root, &["clone", "-q", "remote.git", "mine"]);
+        let mine = root.join("mine");
+        git(&mine, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&mine, &["push", "-q", "origin", "HEAD:main"]);
+        git(&mine, &["switch", "-q", "-c", "topic"]);
+        write(&mine, "deck.typ", "the deck\n");
+        git(&mine, &["commit", "-q", "-m", "deck"]);
+        git(&mine, &["commit", "-q", "--allow-empty", "-m", "ci: rerun"]);
+        git(&mine, &["push", "-q", "-u", "origin", "topic"]);
+
+        // Replayed, the empty commit with it, and a commit more.
+        git(&mine, &["reset", "-q", "--hard", "main"]);
+        write(&mine, "deck.typ", "the deck\n");
+        git(&mine, &["commit", "-q", "-m", "deck, reworded"]);
+        git(&mine, &["commit", "-q", "--allow-empty", "-m", "ci: rerun"]);
+        write(&mine, "title.typ", "a title\n");
+        git(&mine, &["commit", "-q", "-m", "title"]);
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        assert_eq!(
+            ws.pull_plan_of("topic"),
+            Some(PullPlan::Rewritten {
+                mine: 3,
+                theirs: 2,
+                dropped: 0
+            })
+        );
+
+        // A second branch, pushed and then merged with main on both sides:
+        // here by hand, there by someone else.
+        git(&mine, &["switch", "-q", "-c", "other", "main"]);
+        write(&mine, "other.md", "other\n");
+        git(&mine, &["commit", "-q", "-m", "other"]);
+        git(&mine, &["push", "-q", "-u", "origin", "other"]);
+        git(&mine, &["switch", "-q", "main"]);
+        write(&mine, "main.md", "main moves\n");
+        git(&mine, &["commit", "-q", "-m", "main moves"]);
+        git(&mine, &["push", "-q", "origin", "main"]);
+        git(
+            root,
+            &["clone", "-q", "-b", "other", "remote.git", "theirs"],
+        );
+        let theirs = root.join("theirs");
+        git(
+            &theirs,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "update branch",
+                "origin/main",
+            ],
+        );
+        git(&theirs, &["push", "-q", "origin", "other"]);
+        git(&mine, &["switch", "-q", "other"]);
+        git(
+            &mine,
+            &["merge", "-q", "--no-ff", "-m", "merge main", "main"],
+        );
+        write(&mine, "more.md", "more\n");
+        git(&mine, &["commit", "-q", "-m", "more"]);
+        git(&mine, &["fetch", "-q"]);
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        assert!(
+            matches!(ws.pull_plan_of("other"), Some(PullPlan::Rebase { .. })),
+            "{:?}",
+            ws.pull_plan_of("other")
+        );
+    }
+
     /// A branch pushed, then rewritten here — its first commit reworded,
     /// the rest replayed, as the agent did to `datum-call` (2026-10-19) —
     /// diverges from its push target only by its own old copies. Nothing
@@ -1928,7 +2033,18 @@ mod tests {
             .set_str("remote.origin.pushurl", "https://x:y@github.com/o/r.git")
             .unwrap();
         config.set_str("user.name", "Someone").unwrap();
+        // A branch whose push remote is a URL, as `gh pr checkout` writes.
+        config
+            .set_str(
+                "branch.pr.pushremote",
+                "https://tok:ghp_secret@github.com/f/r.git",
+            )
+            .unwrap();
         let got = ws.tracking_config();
+        assert!(got.contains(&(
+            "branch.pr.pushremote".into(),
+            "https://github.com/f/r.git".into()
+        )));
         assert!(got.contains(&(
             "remote.origin.url".into(),
             "https://github.com/o/r.git".into()

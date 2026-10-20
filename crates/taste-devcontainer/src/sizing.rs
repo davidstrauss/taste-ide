@@ -86,9 +86,12 @@ pub const DISK_GROW_STEP_GIB: u64 = 8;
 /// out ([`may_be_short`]).
 pub const DISK_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 /// The most of a guest's data that may be in the base image rather than
-/// its overlay — the OS as shipped, about 2 GiB — so that an overlay's
-/// allocation, plus this, bounds what the guest's filesystem holds.
-const BASE_DATA_BOUND_GIB: u64 = 4;
+/// its overlay — the OS as shipped, about 2 GiB — and of its disk that is
+/// not its root filesystem's free space (the boot and EFI partitions, the
+/// filesystem's own reserve), so that an overlay's allocation, plus this,
+/// bounds how full the guest's filesystem can be. Four left about a
+/// gibibyte unaccounted for (review, 2026-10-20).
+const BASE_DATA_BOUND_GIB: u64 = 5;
 /// Memory held back for the host — the IDE, its helpers, and the desktop —
 /// when deciding whether another VM fits.
 pub const HOST_RESERVE_MIB: u64 = 8192;

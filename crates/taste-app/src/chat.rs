@@ -7108,17 +7108,30 @@ impl ChatPane {
             prompt: prompt.to_string(),
             records: Vec::new(),
         });
-        let blocks = self.with_briefing(blocks);
+        let (blocks, notes) = self.with_briefing(blocks);
         if let Some(held) = self.holding.borrow_mut().take() {
             records.extend(held.records);
         }
         for record in records {
             self.record(record);
         }
-        match (self.client.borrow().as_ref(), written) {
+        let sent = match (self.client.borrow().as_ref(), written) {
             (Some(client), Some(written)) => client.prompt_blocks_queued(blocks, written),
             (Some(client), None) => client.prompt_blocks(blocks),
-            (None, _) => Ok(()),
+            (None, _) => Err(anyhow::anyhow!("no agent to send to")),
+        };
+        // The git notes went nowhere: they wait for the next prompt, rather
+        // than being said to an agent that never heard them.
+        if sent.is_err() && !notes.is_empty() {
+            if let Some(supervisor) = self.environments.get(&self.environment) {
+                for note in notes {
+                    supervisor.note_for_agent(note);
+                }
+            }
+        }
+        match self.client.borrow().as_ref() {
+            Some(_) => sent,
+            None => Ok(()),
         }
     }
 
@@ -7240,7 +7253,8 @@ impl ChatPane {
     /// environment settled into a new state (`orientation_due`). The
     /// transcript shows the user's words and a note that each went with
     /// them.
-    fn with_briefing(&self, blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    fn with_briefing(&self, blocks: Vec<ContentBlock>) -> (Vec<ContentBlock>, Vec<String>) {
+        let mut taken: Vec<String> = Vec::new();
         let mut front: Vec<String> = Vec::new();
         if self.environment.is_primary() && !self.session_has_content.get() {
             self.meta_row("briefed as the coordinator with this prompt");
@@ -7260,6 +7274,7 @@ impl ChatPane {
         // user to push it plainly (2026-10-19).
         if let Some(supervisor) = self.environments.get(&self.environment) {
             let notes = supervisor.take_agent_notes();
+            taken.clone_from(&notes);
             if !notes.is_empty() {
                 self.meta_row(&format!(
                     "told what happened to its git outside this conversation: {}",
@@ -7296,14 +7311,14 @@ impl ChatPane {
             self.notify_persist();
         }
         if front.is_empty() {
-            return blocks;
+            return (blocks, taken);
         }
         let mut briefed = vec![ContentBlock::Text(TextContent::new(format!(
             "{}\n\n---\n\n{BRIEFING_TAIL}",
             front.join("\n\n---\n\n")
         )))];
         briefed.extend(blocks);
-        briefed
+        (briefed, taken)
     }
 
     /// Where the agent is, said to it: the facts it cannot see from inside

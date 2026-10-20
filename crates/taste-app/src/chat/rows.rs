@@ -238,9 +238,6 @@ impl ChatPane {
         card
     }
 
-    /// Where a prompt was typed, which the agent took further down: a
-    /// marker that jumps to it. Between two steps the line runs on through
-    /// it, beside the rail as a step's content stands.
     /// `content` in the timeline's column with the line running past it
     /// beside the content: a prompt waiting inside a turn, which goes on
     /// below it (`User::within_turn`).
@@ -273,6 +270,9 @@ impl ChatPane {
         row.upcast()
     }
 
+    /// Where a prompt was typed, which the agent took further down: a
+    /// marker that jumps to it. Between two steps the line runs on through
+    /// it, beside the rail as a step's content stands.
     fn marker_widget(&self, prompt: &str, through: bool) -> gtk::Widget {
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         content.append(&gtk::Image::from_icon_name("go-down-symbolic"));

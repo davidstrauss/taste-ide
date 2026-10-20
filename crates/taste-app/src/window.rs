@@ -170,11 +170,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let share_fetched: std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync> = {
         let (primary, registry) = (supervisor.clone(), environments.clone());
         std::sync::Arc::new(move || {
-            let personal = registry.share_personal(None);
-            primary
+            // Only Personal's own refs are what the caller waits on: a
+            // Pull's move reads them. The other environments are given
+            // theirs after, off this thread, and one whose VM is down or
+            // slow to answer fails or holds up nothing but its own share
+            // (review, 2026-10-20: a stopped environment failed every Pull
+            // of Personal).
+            let shared = primary
                 .share_remotes_blocking()
-                .map_err(|e| format!("{e:#}"))?;
-            personal.map_err(|e| format!("{e:#}"))
+                .map_err(|e| format!("{e:#}"));
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = registry.share_personal(None) {
+                    tracing::warn!("sharing the fetched refs with the environments: {e:#}");
+                }
+            });
+            shared
         })
     };
     server.set_git_fetcher(crate::agent_fetch::fetcher(

@@ -646,6 +646,12 @@ echo changed
 /// folder (David, 2026-10-20: "I don't even want the agent to be able to
 /// set it; I just want it to be correct").
 pub fn share_tracking(folder: &Path, files: &Files, path: &Path) -> Result<()> {
+    // One at a time: the peer's sync runs this under its folder lock and a
+    // fetch's share without it, and two at once collide on the checkout's
+    // `.git/config.lock`, or interleave their unsets and adds (review,
+    // 2026-10-20).
+    static SHARING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(git) = taste_git::GitWorkspace::discover(folder) else {
         return Ok(());
     };

@@ -1160,15 +1160,20 @@ impl LibvirtSession {
         retiring: Option<&str>,
         report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> Result<Vm> {
+        // The base first: a first launch downloads it, and the room the
+        // new disk is judged against is what is left after it.
+        let image = crate::guest::image()?;
+        let base = image.ensure_base(self.sandboxed, report).await?;
         // Made only when the host has room for its start beside what the
         // other disks could still grow into, so the VMs together cannot
-        // take the desktop's disk under the floor.
+        // take the desktop's disk under the floor — decided and the disk
+        // made under the host's disk budget lock, so no other window's
+        // growth or creation spends the same room meanwhile.
+        let _budget = disk_budget().await;
         let sizing = &Sizing {
             disk_gib: crate::disposable::clear_for_room(self, retiring).await?,
             ..*sizing
         };
-        let image = crate::guest::image()?;
-        let base = image.ensure_base(self.sandboxed, report).await?;
 
         let keys = Keys::for_workspace(workspace_root);
         keys.ensure().await?;
@@ -1647,6 +1652,11 @@ impl LibvirtSession {
         }
         let guest_free = self.guest_free_bytes(vm).await?;
         let dir = disks_dir();
+        // Decided and set under the host's disk budget lock: two windows
+        // growing disks at once each counted the same room (review,
+        // 2026-10-20). Held to the resize, which is what moves a disk's
+        // claim; the guest's own growing of its filesystem comes after.
+        let budget = disk_budget().await;
         let Some(free) = taste_core::environment::free_bytes(&dir) else {
             return Ok(());
         };
@@ -1686,6 +1696,7 @@ impl LibvirtSession {
         self.virsh(&["blockresize", &vm.domain, "vda", &format!("{target}G")])
             .await
             .context("resizing the disk")?;
+        drop(budget);
         let want = (target * 1024 * 1024 * 1024).to_string();
         let keys = Keys::for_workspace(&vm.workspace_root);
         let (program, argv) =
@@ -1837,6 +1848,37 @@ fn one_line(stderr: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join(": ")
+}
+
+/// Held while a VM disk's size is decided and set — a new disk made, or one
+/// grown — by any window on this host: an advisory `flock` on a file beside
+/// the disks, which the kernel drops with the process however it ends.
+/// Every window's VMs share the one disk, and two deciding at once each
+/// counted the same room. `None` when the lock cannot be had at all, which
+/// is no reason to refuse the work.
+struct DiskBudget {
+    _file: std::fs::File,
+}
+
+async fn disk_budget() -> Option<DiskBudget> {
+    let path = disks_dir().join(".budget.lock");
+    tokio::task::spawn_blocking(move || {
+        use std::os::fd::AsRawFd;
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .ok()?;
+        // SAFETY: flock on a descriptor this function owns, held open by
+        // the returned value for as long as the lock is.
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0;
+        locked.then_some(DiskBudget { _file: file })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// The VMs whose guest is short with no room to grow, already said so

@@ -43,11 +43,18 @@ async fn fetch(
         tokio::task::spawn_blocking(move || {
             let git = taste_git::GitWorkspace::discover(&root)?;
             let remote = git.upstream_remote_url();
+            // Every URL the fetch reaches, not only the branch's upstream:
+            // `fetch --all` goes to each remote, and each submodule's fetch
+            // to its own, any of which could ask for a touch.
             let held = (!ask_user)
                 .then(|| {
-                    remote
-                        .as_deref()
-                        .and_then(taste_git::presence::fetch_needs_presence)
+                    let mut urls = git.remote_urls();
+                    for (_, sub) in git.submodules() {
+                        if let Some(sub) = taste_git::GitWorkspace::discover(&root.join(&sub)) {
+                            urls.extend(sub.remote_urls());
+                        }
+                    }
+                    taste_git::presence::any_needs_presence(urls.iter().map(String::as_str))
                 })
                 .flatten();
             Some((

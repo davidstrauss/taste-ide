@@ -327,12 +327,11 @@ impl GitWorkspace {
             if !is_tracking_key(name) {
                 continue;
             }
-            let value = if name.ends_with(".url") {
-                without_secret(value)
-            } else {
-                value.to_string()
-            };
-            out.push((name.to_string(), value));
+            // Every value, not only a remote's url: a branch's `remote`
+            // and `pushremote` can be URLs too (`gh pr checkout` writes
+            // them), and a token in one is as much a secret (review,
+            // 2026-10-20). A name is left as it is.
+            out.push((name.to_string(), without_secret(value)));
         }
         out
     }
@@ -471,19 +470,24 @@ impl GitWorkspace {
     /// How many of `commits` make a change none of `against` does: merges
     /// passed over, having no change of their own to compare.
     fn unmatched(&self, commits: &[Oid], against: &[Oid]) -> usize {
-        let theirs: std::collections::HashSet<Oid> = against
+        let theirs: std::collections::HashSet<Change> = against
             .iter()
-            .filter_map(|oid| self.patch_id(*oid))
+            .filter_map(|oid| self.change_of(*oid))
             .collect();
         commits
             .iter()
+            .filter(|oid| !self.is_merge(**oid))
             .filter(|oid| {
-                self.repo
-                    .find_commit(**oid)
-                    .is_ok_and(|commit| commit.parent_count() <= 1)
+                self.change_of(**oid)
+                    .is_none_or(|key| !theirs.contains(&key))
             })
-            .filter(|oid| self.patch_id(**oid).is_none_or(|id| !theirs.contains(&id)))
             .count()
+    }
+
+    fn is_merge(&self, oid: Oid) -> bool {
+        self.repo
+            .find_commit(oid)
+            .is_ok_and(|commit| commit.parent_count() > 1)
     }
 
     /// Whether the commits `there` has that `tip` lacks are `branch`'s own
@@ -508,13 +512,55 @@ impl GitWorkspace {
         if theirs.is_empty() || mine.is_empty() {
             return None;
         }
-        let dropped = self.unmatched(&theirs, &mine);
         let held = self
             .repo
             .reflog(&format!("refs/heads/{branch}"))
             .ok()
             .is_some_and(|log| log.iter().any(|entry| entry.id_new() == there));
+        // A merge there is someone's — a host's "Update branch", a
+        // maintainer's — and has no change of its own to find here, so
+        // only the branch having pointed at it makes it this branch's
+        // (review, 2026-10-20: a merge alone read as "nothing is lost").
+        if !held && theirs.iter().any(|oid| self.is_merge(*oid)) {
+            return None;
+        }
+        let dropped = self.unmatched(&theirs, &mine);
         (dropped == 0 || held).then_some(dropped)
+    }
+
+    /// The change a commit makes, to be found again after a rebase: its
+    /// [`Self::patch_id`], or for a commit that changes nothing its message
+    /// and author, which a rebase keeps (`--allow-empty`'s markers). `None`
+    /// for a merge. Kept by oid, which fixes a commit's content: a branch
+    /// far behind its base compares the same thousand commits at every
+    /// refresh.
+    fn change_of(&self, oid: Oid) -> Option<Change> {
+        thread_local! {
+            static CHANGES: std::cell::RefCell<std::collections::HashMap<Oid, Option<Change>>> =
+                std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        if let Some(known) = CHANGES.with(|cache| cache.borrow().get(&oid).cloned()) {
+            return known;
+        }
+        let change = match self.patch_id(oid) {
+            Some(id) => Some(Change::Patch(id)),
+            None => self.repo.find_commit(oid).ok().and_then(|commit| {
+                (commit.parent_count() <= 1).then(|| {
+                    Change::Empty(
+                        commit.message_bytes().to_vec(),
+                        commit.author().email_bytes().to_vec(),
+                    )
+                })
+            }),
+        };
+        CHANGES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= 50_000 {
+                cache.clear();
+            }
+            cache.insert(oid, change.clone());
+        });
+        change
     }
 
     /// The change a commit makes, as git's patch-id names it: the same for
@@ -629,6 +675,7 @@ impl GitWorkspace {
         let mut status = SyncStatus {
             upstream: Some(target.display()),
             base: base.as_deref().map(short_ref),
+            push_by_url: !target.named,
             ..SyncStatus::no_upstream()
         };
         match there {
@@ -789,6 +836,15 @@ pub fn without_secret(url: &str) -> String {
         Some((_, host)) => format!("{scheme}://{host}{path}"),
         None => url.to_string(),
     }
+}
+
+/// What a commit changes, for matching it across a rewrite
+/// ([`GitWorkspace::change_of`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Change {
+    Patch(Oid),
+    /// A commit that changes nothing: its message and author's email.
+    Empty(Vec<u8>, Vec<u8>),
 }
 
 /// `refs/remotes/origin/main` → `origin/main`.

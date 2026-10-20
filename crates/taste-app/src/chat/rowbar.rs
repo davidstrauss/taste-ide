@@ -179,6 +179,12 @@ impl RowBar {
                 this.bar.remove_css_class("dragging");
                 this.sync_hover();
                 this.show();
+                // A press at the bottom that moved nothing let go of the end
+                // all the same (`on_reader`), and the next line would have
+                // been announced rather than followed (review, 2026-10-20).
+                if this.target.get().is_none() && super::at_bottom(&this.scroller.vadjustment()) {
+                    (this.to_end)();
+                }
             }
         });
         this.bar.add_controller(drag);

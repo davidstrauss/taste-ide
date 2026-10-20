@@ -2104,7 +2104,9 @@ impl FileTree {
             let context = gtk::GestureClick::builder().button(3).build();
             let on_right = open_menu.clone();
             context.connect_released(move |_, _, _, _| on_right());
-            root_row.add_controller(context);
+            // On the folder's button, not its row: the row holds the fetch
+            // too, whose right-click is not the folder's.
+            root_button.add_controller(context);
             root_button.connect_clicked(move |_| open_menu());
         }
         // A click takes what moves the branch forward and nothing else; a
@@ -2209,10 +2211,13 @@ impl FileTree {
             let weak = Rc::downgrade(&tree);
             toggle.connect_toggled(move |_| {
                 if let Some(tree) = weak.upgrade() {
-                    let showing = Showing::of(
-                        tree.ignored_toggle.is_active(),
-                        tree.synced_toggle.is_active(),
-                    );
+                    let ignored = tree.ignored_toggle.is_active();
+                    // Every file is every synced one too: the synced toggle
+                    // decides nothing while ignored files are shown, and
+                    // says so rather than reading "off" over synced rows
+                    // (review, 2026-10-20).
+                    tree.synced_toggle.set_sensitive(!ignored);
+                    let showing = Showing::of(ignored, tree.synced_toggle.is_active());
                     tree.set_showing(showing);
                 }
             });
@@ -4872,8 +4877,20 @@ impl FileTree {
     }
 
     fn create_file(self: &Rc<Self>, path: &Path, is_dir: bool) {
+        self.create_file_then(path, is_dir, |_, _| {});
+    }
+
+    /// [`Self::create_file`], with `done` told whether it was made — after
+    /// the file exists and is open, or once it is refused or fails.
+    fn create_file_then(
+        self: &Rc<Self>,
+        path: &Path,
+        is_dir: bool,
+        done: impl FnOnce(&Rc<Self>, bool) + 'static,
+    ) {
         if !self.file_op_allowed(path) {
             self.op_denied_dialog();
+            done(self, false);
             return;
         }
         let target = path.to_path_buf();
@@ -4895,6 +4912,7 @@ impl FileTree {
                 }
             },
             (!is_dir).then(|| path.to_path_buf()),
+            done,
         );
     }
 
@@ -4913,6 +4931,7 @@ impl FileTree {
             "Rename failed".to_string(),
             move || files.rename(&from, &to),
             None,
+            |_, _| {},
         );
     }
 
@@ -4927,6 +4946,7 @@ impl FileTree {
             "Delete failed".to_string(),
             move || files.remove(&target, is_dir),
             None,
+            |_, _| {},
         );
     }
 
@@ -4938,12 +4958,14 @@ impl FileTree {
     /// as long as `remove_dir_all` takes on a build directory. The policy
     /// check stays with the caller, synchronous and BEFORE anything moves;
     /// what crosses to the blocking pool is only the syscalls. `open_after`
-    /// is the file to put in the editor once it exists.
+    /// is the file to put in the editor once it exists, and `done` is told
+    /// whether the operation went through, last.
     fn file_op(
         self: &Rc<Self>,
         failure: String,
         op: impl FnOnce() -> std::io::Result<()> + Send + 'static,
         open_after: Option<PathBuf>,
+        done: impl FnOnce(&Rc<Self>, bool) + 'static,
     ) {
         let tree = self.clone();
         glib::spawn_future_local(async move {
@@ -4955,6 +4977,7 @@ impl FileTree {
                 tree.workspace
                     .events
                     .publish(Event::Toast(format!("{failure}: {e}")));
+                done(&tree, false);
                 return;
             }
             tree.workspace.events.publish(Event::GitStatusChanged);
@@ -4963,6 +4986,7 @@ impl FileTree {
             if let Some(path) = open_after {
                 tree.open(path, None);
             }
+            done(&tree, true);
         });
     }
 
@@ -5106,13 +5130,14 @@ impl FileTree {
         // Ignored paths sync between the folder and Personal when asked
         // to: a line in the root `.gitattributes`
         // (`taste_git::sync_ignored`). On a folder, for the ignored files
-        // under it, and on a file whenever ignored files are shown, which is
-        // the only time one can be right-clicked. Checked and fixed when a
+        // under it, and on a file wherever an ignored one is listed: every
+        // file, or the synced ones (the default), whose rule is taken back
+        // from the row that wears it. Checked and fixed when a
         // folder above already syncs it, or a line the IDE did not write.
         let remote = self.watching.borrow().is_none() && !self.workspace.files().is_local();
         let rel = self.repo_relative(&node.path);
         if let (true, false, Some(rel)) = (
-            remote && (node.is_dir || self.showing.get() == Showing::All),
+            remote && (node.is_dir || self.showing.get() != Showing::Tracked),
             node.ghost,
             rel,
         ) {
@@ -5173,6 +5198,7 @@ impl FileTree {
                     .map_err(|e| std::io::Error::other(format!("{e:#}")))
             },
             None,
+            |_, _| {},
         );
     }
 
@@ -5579,10 +5605,19 @@ impl FileTree {
                                                     if dropped == 1 { "makes" } else { "make" },
                                                     if dropped == 1 { "it" } else { "them" }
                                                 )),
-                                                    None => card.fact(
-                                                        "Their changes",
-                                                        "from before the rebase onto the base",
-                                                    ),
+                                                    // A fork's branch rebased onto
+                                                    // its base, as the IDE has no
+                                                    // way to check: what is there
+                                                    // matched nothing here, so it
+                                                    // may be anyone's (review,
+                                                    // 2026-10-20).
+                                                    None => card.warning(format!(
+                                                        "{} there {} no match in this \
+                                                         branch: from before a rebase onto \
+                                                         the base, or someone else's",
+                                                        count(replaced, "commit"),
+                                                        if replaced == 1 { "has" } else { "have" },
+                                                    )),
                                                 }
                                                 .gesture(leased)
                                             }
@@ -5646,6 +5681,7 @@ impl FileTree {
                                         (behind > 0 || stale)
                                             && !sync.new_branch
                                             && !sync.push_unknown
+                                            && !sync.push_by_url
                                             && writable,
                                     );
                                     let replaced = sync.replaces.as_ref().map_or(0, |(_, n)| *n);
@@ -5668,6 +5704,17 @@ impl FileTree {
                                                 "Nothing to pull from {upstream}"
                                             ))
                                             .fact("There", "not created yet")
+                                        } else if sync.push_by_url {
+                                            // No ref here keeps a URL's tip,
+                                            // so there is nothing to move the
+                                            // branch onto (review, 2026-10-20).
+                                            SyncCard::new(format!("Can't pull from {upstream}"))
+                                                .fact("New there", count(behind, "commit"))
+                                                .fact(
+                                                    "Why",
+                                                    "it is a URL, not a remote; add it as a \
+                                                     remote to pull from it",
+                                                )
                                         } else {
                                             SyncCard::new(format!("Catch up with {upstream}"))
                                                 .fact("New there", count(behind, "commit"))
@@ -5859,7 +5906,11 @@ impl FileTree {
                     }
                 )));
             }
-            None => self.all_face.set_label(""),
+            None => {
+                self.all_face.set_label("");
+                self.all_toggle
+                    .set_tooltip_text(Some("No git filter: every file the tree lists"));
+            }
         }
     }
 
@@ -7470,6 +7521,9 @@ impl FileTree {
             let mut behind: Option<(usize, Option<String>)> = None;
             // What the click can do, which only the fetch can say.
             let mut plan: Option<taste_git::PullPlan> = None;
+            // Whether the branch is the default one, whose replacing push
+            // is the long hold.
+            let mut on_canonical = false;
             {
                 let (program, args) = fetch;
                 let handle =
@@ -7510,12 +7564,13 @@ impl FileTree {
                                 }
                                 _ => (sync.own_behind, sync.upstream),
                             };
-                            Some((counted, plan))
+                            Some((counted, plan, sync.on_canonical))
                         })
                         .await;
-                    if let Ok(Some((measured, measured_plan))) = measured {
+                    if let Ok(Some((measured, measured_plan, canonical))) = measured {
                         behind = Some(measured);
                         plan = measured_plan;
+                        on_canonical = canonical;
                     }
                 }
             }
@@ -7588,7 +7643,7 @@ impl FileTree {
                      seconds to replace {}",
                     plural(theirs),
                     if theirs == 1 { "is" } else { "are" },
-                    crate::holdbutton::HOLD.as_secs(),
+                    push_hold_for(on_canonical, true).as_secs(),
                     if theirs == 1 { "it" } else { "them" }
                 )),
                 (Pull::FastForward, Some(taste_git::PullPlan::Rebase { mine, theirs })) => {
@@ -7796,10 +7851,14 @@ impl FileTree {
         // rather than once, because the key comes and goes with the agent
         // (David, 2026-09-16: "I don't want background polling to pop open
         // modals telling me to tap the key").
+        // Every remote `fetch --all` reaches, not only the branch's
+        // upstream, which a detached HEAD does not even have.
+        let check_root = self.refs_root();
         let check = crate::runtime::runtime().spawn_blocking(move || {
-            remote
-                .as_deref()
-                .and_then(taste_git::presence::fetch_needs_presence)
+            let urls = taste_git::GitWorkspace::discover(&check_root)
+                .map(|git| git.remote_urls())
+                .unwrap_or_else(|| remote.into_iter().collect());
+            taste_git::presence::any_needs_presence(urls.iter().map(String::as_str))
         });
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -8172,19 +8231,23 @@ impl FileTree {
                 // new file takes it, as it opens (David, 2026-10-20: "it
                 // should go from 'New file...' selected to the newly created
                 // file selected"). A folder opens no tab, so the selection
-                // goes back to the file in front then too.
+                // goes back to the file in front then too, as it does when
+                // the create is refused or fails — and only once it exists
+                // does the new file take it, or the row stayed lit over a
+                // failure (review, 2026-10-20).
                 tree.clone().prompt_name_or(
                     title,
                     "Create",
                     "",
                     move |tree, name| {
                         let path = dir.join(name);
-                        tree.create_file(&path, folder);
-                        if folder {
-                            tree.restore_tree_selection();
-                        } else {
-                            tree.select_file(path);
-                        }
+                        tree.create_file_then(&path.clone(), folder, move |tree, made| {
+                            if made && !folder {
+                                tree.select_file(path);
+                            } else {
+                                tree.restore_tree_selection();
+                            }
+                        });
                     },
                     |tree| tree.restore_tree_selection(),
                 );
@@ -8838,10 +8901,32 @@ impl FileTree {
         // pushed instead — pushed by name, to its upstream or, when it has
         // none, to the same name on the remote.
         let branch = self.status_branch.borrow().clone();
-        let sync = self.git.borrow().as_ref().and_then(|git| match &branch {
-            Some(branch) => git.sync_status_of(branch).ok(),
-            None => git.sync_status().ok(),
+        // Read off the main thread: matching a rewrite compares the
+        // commits on both sides change by change (review, 2026-10-20).
+        let root = self.refs_root();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let read_branch = branch.clone();
+            let sync = crate::runtime::runtime()
+                .spawn_blocking(move || {
+                    let git = taste_git::GitWorkspace::discover(&root)?;
+                    match &read_branch {
+                        Some(branch) => git.sync_status_of(branch).ok(),
+                        None => git.sync_status().ok(),
+                    }
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some(tree) = weak.upgrade() {
+                tree.push_as(held, sync);
+            }
         });
+    }
+
+    /// [`Self::push`] once the branch's standing is read: held for, refused
+    /// with the hold that would do it, or pushed.
+    fn push_as(self: &Rc<Self>, held: bool, sync: Option<taste_git::SyncStatus>) {
         // A branch rebased onto a base its push target is not — a fork's
         // pull request after Sync — replaces what the push target has.
         // That is the push the workflow wants, and it overwrites commits on
@@ -8884,8 +8969,8 @@ impl FileTree {
                 let what = match sync.as_ref().and_then(|s| s.rewritten) {
                     Some(dropped) => rewrite_verdict(replaced, dropped, &target),
                     None => format!(
-                        "{target} has {replaced} commit{} this branch does not, from before \
-                         the rebase",
+                        "{target} has {replaced} commit{} with no match in this branch: from \
+                         before a rebase onto the base, or someone else's",
                         if replaced == 1 { "" } else { "s" }
                     ),
                 };
@@ -8898,35 +8983,31 @@ impl FileTree {
             }
             Some((expected, _)) => {
                 self.begin_sync_op(&self.push_button);
-                self.push_now(Some(expected));
+                self.push_now(Some(expected), sync);
             }
             None => {
                 self.begin_sync_op(&self.push_button);
-                self.push_now(None);
+                self.push_now(None, sync);
             }
         }
     }
 
     /// The push itself, replacing what the push target has when `expected`
     /// is its tip (the lease), an ordinary push otherwise.
-    fn push_now(self: &Rc<Self>, expected: Option<String>) {
+    fn push_now(self: &Rc<Self>, expected: Option<String>, sync: Option<taste_git::SyncStatus>) {
         let branch = self.status_branch.borrow().clone();
-        let Some((program, args, remote, sync)) = self.git.borrow().as_ref().map(|git| {
+        let Some((program, args, remote)) = self.git.borrow().as_ref().map(|git| {
             let (program, args) = match &branch {
                 Some(branch) => {
                     git.push_branch_command_including_issues(branch, expected.as_deref())
                 }
                 None => git.push_command_including_issues(),
             };
-            let sync = match &branch {
-                Some(branch) => git.sync_status_of(branch).ok(),
-                None => git.sync_status().ok(),
-            };
             let remote = match &branch {
                 Some(branch) => git.push_url_of(branch),
                 None => git.upstream_remote_url(),
             };
-            (program, args, remote, sync)
+            (program, args, remote)
         }) else {
             return;
         };
@@ -9095,7 +9176,10 @@ impl FileTree {
             else {
                 continue;
             };
-            if let (_, Some(old)) = state_style(painted) {
+            // Undone as it was painted: an ignored row synced by its own
+            // rule was dimmed by `badge_style`, which `state_style` knows
+            // nothing of, and its name stayed dim after (review, 2026-10-20).
+            if let (_, Some(old)) = badge_style(painted, handle.own.get()) {
                 badge.remove_css_class(old);
                 // The lock painted dim-label for its own reason; leaving
                 // Ignored must not un-dim a locked row.
