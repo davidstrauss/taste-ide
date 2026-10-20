@@ -5178,7 +5178,7 @@ impl FileTree {
                 Some(if is_dir {
                     "Sync Ignored Files"
                 } else {
-                    "Force Sync (Even if Ignored)"
+                    "Force sync this file"
                 }),
                 Some("row.sync-ignored"),
             );

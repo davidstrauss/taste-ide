@@ -3655,7 +3655,7 @@ asked about and ruled out of scope (David, same day):
   — except those whose `taste-sync` git attribute is set, which are part
   of both working copies and sync like any other path
   (`taste_git::sync_ignored`). The file tree's Sync Ignored Files (on a
-  folder), Force Sync (Even if Ignored) (on a file), and Sync *.pdf files
+  folder), Force sync this file (on a file), and Sync *.pdf files
   (on a file, for its type, at any depth) write that line to the root
   `.gitattributes` — `/dir/** taste-sync`, `/file taste-sync`, `*.pdf
   taste-sync` — which is a change to commit like any other, and any line
