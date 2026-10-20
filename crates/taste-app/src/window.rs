@@ -38,9 +38,11 @@ const PROBE_IMAGE: &str = concat!(
 );
 
 /// The file-tree flank's width when a window opens, in pixels. Above the
-/// flank's minimum, so it is what the user gets rather than a clamp; the
-/// width every frame in docs/screenshots was taken at.
-const FLANK_OPENING_WIDTH: i32 = 335;
+/// flank's minimum, so it is what the user gets rather than a clamp. It was
+/// 335, the width the frames in docs/screenshots were taken at, until the
+/// header's sync counts became four (⇊ ↓ ↑ ⇈, 2026-10-19) and a branch name
+/// like `datum-call` no longer fitted beside them at it.
+const FLANK_OPENING_WIDTH: i32 = 350;
 
 /// The chat's opening width. The paned between the center and the chat
 /// keeps the chat at this width as the window grows (resize goes to the

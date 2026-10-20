@@ -33,9 +33,22 @@ use gtk::glib;
 /// number, so it is one a person can count.
 pub const HOLD: Duration = Duration::from_secs(2);
 
+/// The hold for what is worst to get wrong: replacing the default branch's
+/// history on the remote, which everyone else's work stands on (David,
+/// 2026-10-19: "A force push, if necessary, for the default branch requires
+/// holding 10 seconds"). A button holds this long by [`HoldButton::set_hold`].
+pub const LONG_HOLD: Duration = Duration::from_secs(10);
+
+/// The hold for replacing the default branch from another branch entirely
+/// — the header's ⇈ when the branch is not on top of it — which should
+/// almost never be what anyone means (David, 2026-10-19: "it should be 20
+/// seconds to force-push to the default branch from another branch
+/// entirely. That should be extremely rare").
+pub const LONGEST_HOLD: Duration = Duration::from_secs(20);
+
 /// What the toast says when a press ends early.
-pub fn early_release_note() -> String {
-    format!("Hold for {} seconds to confirm", HOLD.as_secs())
+pub fn early_release_note(hold: Duration) -> String {
+    format!("Hold for {} seconds to confirm", hold.as_secs())
 }
 
 /// The ring's diameter, matched to the icon it replaces so the button does
@@ -59,6 +72,8 @@ pub struct HoldButton {
     /// What a click does, when the button does something on one
     /// ([`Self::set_on_click`]); otherwise a click is an early release.
     on_click: RefCell<Option<Rc<dyn Fn()>>>,
+    /// How long this button is held for: [`HOLD`] unless set otherwise.
+    hold: Cell<Duration>,
 }
 
 impl HoldButton {
@@ -107,6 +122,7 @@ impl HoldButton {
             on_confirm: RefCell::new(None),
             on_early: RefCell::new(None),
             on_click: RefCell::new(None),
+            hold: Cell::new(HOLD),
         });
         {
             let weak = Rc::downgrade(&this);
@@ -158,6 +174,19 @@ impl HoldButton {
         this
     }
 
+    /// How long a hold of this button takes from now on: what it confirms
+    /// can change with the state it is in — a push that replaces the
+    /// default branch's history holds for [`LONG_HOLD`]. A hold already
+    /// under way keeps the length it began with.
+    pub fn set_hold(&self, hold: Duration) {
+        self.hold.set(hold);
+    }
+
+    /// How long a hold of this button takes.
+    pub fn hold(&self) -> Duration {
+        self.hold.get()
+    }
+
     /// What a completed hold does.
     pub fn set_on_confirm(&self, hook: impl Fn() + 'static) {
         *self.on_confirm.borrow_mut() = Some(Rc::new(hook));
@@ -185,6 +214,7 @@ impl HoldButton {
         }
         self.started.set(Some(Instant::now()));
         self.progress.set(0.0);
+        let hold = self.hold.get();
         self.faces.set_visible_child_name("ring");
         self.ring.queue_draw();
         let weak = Rc::downgrade(self);
@@ -195,7 +225,7 @@ impl HoldButton {
             let Some(started) = this.started.get() else {
                 return glib::ControlFlow::Break;
             };
-            let progress = (started.elapsed().as_secs_f64() / HOLD.as_secs_f64()).min(1.0);
+            let progress = (started.elapsed().as_secs_f64() / hold.as_secs_f64()).min(1.0);
             this.progress.set(progress);
             this.ring.queue_draw();
             if progress >= 1.0 {
@@ -249,7 +279,7 @@ impl HoldButton {
 
     fn say_early(&self) {
         if let Some(hook) = self.on_early.borrow().clone() {
-            hook(early_release_note());
+            hook(early_release_note(self.hold.get()));
         }
     }
 
@@ -325,6 +355,17 @@ pub(crate) fn ring_wedge(cr: &gtk::cairo::Context, width: i32, height: i32, prog
 mod tests {
     #[test]
     fn the_note_names_the_seconds() {
-        assert_eq!(super::early_release_note(), "Hold for 2 seconds to confirm");
+        assert_eq!(
+            super::early_release_note(super::HOLD),
+            "Hold for 2 seconds to confirm"
+        );
+        assert_eq!(
+            super::early_release_note(super::LONG_HOLD),
+            "Hold for 10 seconds to confirm"
+        );
+        assert_eq!(
+            super::early_release_note(super::LONGEST_HOLD),
+            "Hold for 20 seconds to confirm"
+        );
     }
 }

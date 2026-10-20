@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 6;
+pub const GUIDANCE_REVISION: u32 = 7;
 
 /// When the user's folder last fetched: its `FETCH_HEAD`, which every
 /// fetch writes, as a person reads an age. `None` when it never has.
@@ -383,7 +383,10 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              fetches or pulls, and gives your checkout the result: Personal's checkout gets \
              the remote's branches as origin/*; any other environment gets them as \
              upstream/*, beside origin/* (the user's own branches) and personal/*. To fetch \
-             now, call git_fetch. Before you rewrite a branch (rebase, amend, reword, \
+             now, call git_fetch. A pull request's branch is brought up to date by \
+             rebasing it onto the remote's default branch (origin/main in Personal's \
+             checkout, upstream/main elsewhere), never onto its own pushed copy. Before you \
+             rewrite a branch (rebase, amend, reword, \
              reset), run `git status -sb`: if its upstream has the commits, the branch is \
              published, and only the user's hold-to-replace Push can replace them. Say so \
              before rewriting, and never tell the user to run a plain `git push` for it. \
@@ -6182,8 +6185,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "d0096dc4c3a9e77b5ad93af5a9f85ba0771899acd290325b4b37ea3ca6d63f15";
-        const AT_REVISION: u32 = 6;
+            "d5d4c603847df2ed6169ef7a2943f4e1425acc01f3e8d9c10aa7084a7d7477bc";
+        const AT_REVISION: u32 = 7;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

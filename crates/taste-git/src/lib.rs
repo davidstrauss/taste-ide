@@ -25,7 +25,7 @@ pub mod presence;
 pub mod private;
 pub mod refs;
 mod relation;
-pub use relation::{record_remote_tip, PullPlan, PushTarget};
+pub use relation::{record_remote_tip, Canonical, PullPlan, PushTarget};
 pub mod review;
 pub mod snapshot;
 pub mod submodule_setup;
@@ -1008,6 +1008,22 @@ pub struct SyncStatus {
     /// replacing them drops (`GitWorkspace::rewrite_dropping`). Only for a
     /// branch with no base.
     pub rewritten: Option<usize>,
+    /// Commits the push target has that this branch lacks — 0 when they
+    /// are its own rewritten ([`SyncStatus::rewritten`]): the header's ↓,
+    /// which is always about the branch's own remote copy, where `behind`
+    /// is about the base when there is one.
+    pub own_behind: usize,
+    /// Of [`SyncStatus::ahead`], the commits the canonical branch does not
+    /// already have: the branch's own, the header's ↑. `ahead` itself when
+    /// there is no canonical branch.
+    pub own_ahead: usize,
+    /// The branch a pull request's branch is rebased onto, and how it
+    /// stands against it: the header's ⇊. `None` on that branch itself.
+    pub canonical: Option<crate::relation::Canonical>,
+    /// The branch pushes to the canonical branch itself — it is the
+    /// default branch's checkout — so every push of it is held for, and one
+    /// that replaces history there for longer.
+    pub on_canonical: bool,
 }
 
 impl SyncStatus {
@@ -1021,6 +1037,10 @@ impl SyncStatus {
             replaces: None,
             push_unknown: false,
             rewritten: None,
+            own_behind: 0,
+            own_ahead: 0,
+            canonical: None,
+            on_canonical: false,
         }
     }
 }
@@ -1808,6 +1828,100 @@ mod tests {
         );
         let sync = ws.sync_status_of("topic").unwrap();
         assert_eq!((sync.behind, sync.rewritten), (3, None), "{sync:?}");
+    }
+
+    /// A pull request's branch against the branch it goes into: ⇊ counts
+    /// the changes there it does not have, by change, so a branch rebased
+    /// onto it reads nothing new; ↑ counts its own commits, not the ones a
+    /// rebase brought along from there; and the default branch itself has
+    /// no ⇊, its own copy being Pull's.
+    #[test]
+    fn a_pull_requests_branch_counts_against_the_default_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let write = |cwd: &Path, name: &str, text: &str| {
+            std::fs::write(cwd.join(name), text).unwrap();
+            git(cwd, &["add", name]);
+        };
+        git(root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(root, &["clone", "-q", "remote.git", "mine"]);
+        let mine = root.join("mine");
+        write(&mine, "README.md", "base\n");
+        git(&mine, &["commit", "-q", "-m", "base"]);
+        git(&mine, &["push", "-q", "origin", "HEAD:main"]);
+        git(&mine, &["switch", "-q", "-c", "topic"]);
+        write(&mine, "deck.typ", "the deck\n");
+        git(&mine, &["commit", "-q", "-m", "deck"]);
+        git(&mine, &["push", "-q", "-u", "origin", "topic"]);
+
+        // Someone merges two changes into main.
+        git(root, &["clone", "-q", "remote.git", "theirs"]);
+        let theirs = root.join("theirs");
+        write(&theirs, "a.md", "a\n");
+        git(&theirs, &["commit", "-q", "-m", "a"]);
+        write(&theirs, "b.md", "b\n");
+        git(&theirs, &["commit", "-q", "-m", "b"]);
+        git(&theirs, &["push", "-q", "origin", "main"]);
+        git(&mine, &["fetch", "-q"]);
+
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        let canonical = ws.canonical_of("topic").unwrap();
+        assert_eq!(
+            (canonical.name.as_str(), canonical.new, canonical.own),
+            ("origin/main", 2, 1)
+        );
+        assert_eq!(
+            ws.pull_plan_onto("topic", &canonical.full, false),
+            Some(PullPlan::Rebase { mine: 1, theirs: 2 })
+        );
+        assert_eq!(ws.canonical_of("main"), None, "main's own copy is Pull's");
+        assert!(ws.sync_status_of("main").unwrap().on_canonical);
+        assert!(!ws.sync_status_of("topic").unwrap().on_canonical);
+        assert_eq!(
+            canonical.lands, None,
+            "not on top of main: no merge by push"
+        );
+
+        git(&mine, &["rebase", "-q", "origin/main"]);
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        let sync = ws.sync_status_of("topic").unwrap();
+        let canonical = sync.canonical.clone().unwrap();
+        assert_eq!(
+            (canonical.new, canonical.own, canonical.lands),
+            (0, 1, Some(1)),
+            "{sync:?}"
+        );
+        // ⇈: the branch pushed onto main, a fast-forward, and main moves.
+        let (_, args) = ws.push_onto_canonical_command("topic", None).unwrap();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(
+            &args[args.len() - 2..],
+            ["origin", "refs/heads/topic:refs/heads/main"]
+        );
+        assert!(!args.iter().any(|a| a.starts_with("--force")), "{args:?}");
+        assert_eq!(
+            (sync.ahead, sync.own_ahead, sync.own_behind, sync.rewritten),
+            (3, 1, 0, Some(0)),
+            "the push sends main's two and the branch's one, which is all a \
+             pull request shows; the old copy on origin/topic is its own: {sync:?}"
+        );
     }
 
     #[test]

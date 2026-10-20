@@ -34,6 +34,10 @@ use git2::{BranchType, Oid};
 
 use crate::{GitWorkspace, SyncStatus};
 
+/// The most commits either side of a divergence is walked for to compare
+/// them change by change ([`GitWorkspace::diverged`]).
+const DIVERGENCE_LIMIT: usize = 1000;
+
 /// What Pull would do ([`GitWorkspace::pull_plan_of`]). A click does the
 /// first two; the third is a rebase, which replays the branch's own
 /// commits, and so is held for (David, 2026-10-15).
@@ -60,6 +64,33 @@ pub enum PullPlan {
     },
 }
 
+/// The branch a branch is rebased onto to bring a pull request up to date
+/// ([`GitWorkspace::canonical_of`]): the header's ⇊.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Canonical {
+    /// The full ref, `refs/remotes/origin/main`.
+    pub full: String,
+    /// As a person reads it, `origin/main`.
+    pub name: String,
+    /// Commits there whose change the branch does not have yet: what a
+    /// rebase onto it brings in. Merges, and commits the branch already has
+    /// a copy of, are not counted.
+    pub new: usize,
+    /// The branch's own commits: those whose change is not there. What a
+    /// pull request from it shows.
+    pub own: usize,
+    /// The commits a push of the branch onto it would land, when that push
+    /// is a fast-forward — the branch is on top of it — and lands any: the
+    /// header's ⇈, which merges by pushing and never by rewriting it.
+    pub lands: Option<usize>,
+    /// The commits there the branch does not have, by commit: what a push
+    /// of the branch onto it would have to replace when it is not a
+    /// fast-forward — the forced ⇈, held for longest of all.
+    pub behind: usize,
+    /// Its tip as last fetched: what a forced push onto it is leased on.
+    pub tip: String,
+}
+
 /// Where a branch's push goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushTarget {
@@ -83,7 +114,9 @@ impl PushTarget {
         }
     }
 
-    fn tracking_ref(&self) -> Option<String> {
+    /// Where the push target's tip is kept here, for a named remote:
+    /// `refs/remotes/<remote>/<branch>`.
+    pub fn tracking_ref(&self) -> Option<String> {
         self.named
             .then(|| format!("refs/remotes/{}/{}", self.remote, self.branch))
     }
@@ -267,7 +300,106 @@ impl GitWorkspace {
     /// that does not resolve.
     pub fn pull_plan_of(&self, branch: &str) -> Option<PullPlan> {
         let target = self.rebase_target_of(branch)?;
-        let theirs_tip = self.repo.find_reference(&target).ok()?.target()?;
+        // Against its own push target, a branch that diverged may only
+        // have been rewritten here; against a base — a fork's `origin/main`
+        // — divergence is what Sync is for.
+        let own = self.base_ref_of(branch).is_none();
+        self.pull_plan_onto(branch, &target, own)
+    }
+
+    /// What the header's ↓ pulls `branch` from: its push target's tip as
+    /// it is kept here (`refs/remotes/<remote>/<branch>`), when the push
+    /// target is a named remote that has the branch. A full ref name.
+    pub fn own_target_of(&self, branch: &str) -> Option<String> {
+        let tracking = self.push_target(branch).tracking_ref()?;
+        self.repo.find_reference(&tracking).ok()?;
+        Some(tracking)
+    }
+
+    /// What a pull request's branch is rebased onto: the branch's base when
+    /// it has one (a fork's `upstream/main`), otherwise the default remote's
+    /// default branch — `refs/remotes/<remote>/HEAD`, which `git clone`
+    /// sets, else its `main` or `master`. Never a local branch, which is
+    /// only as fresh as its last pull. `None` when that is where `branch`
+    /// itself pushes — the default branch has nothing to rebase onto but
+    /// its own copy, which is Pull's — or when there is no such ref. A full
+    /// ref name, resolved past `HEAD`.
+    pub fn canonical_ref_of(&self, branch: &str) -> Option<String> {
+        let candidate = self.canonical_candidate(branch)?;
+        let own = self.push_target(branch).tracking_ref();
+        (own.as_deref() != Some(candidate.as_str())).then_some(candidate)
+    }
+
+    /// Whether `branch` pushes to the canonical branch itself — it is the
+    /// default branch's checkout — so a push of it moves what every other
+    /// branch is rebased onto, and is held for even as a fast-forward
+    /// (David, 2026-10-19).
+    pub fn pushes_to_canonical(&self, branch: &str) -> bool {
+        let own = self.push_target(branch).tracking_ref();
+        own.is_some() && self.canonical_candidate(branch) == own
+    }
+
+    /// [`GitWorkspace::canonical_ref_of`] before the branch's own push
+    /// target is ruled out.
+    fn canonical_candidate(&self, branch: &str) -> Option<String> {
+        let candidate = self.base_ref_of(branch).or_else(|| {
+            let remote = self.default_remote();
+            self.repo
+                .find_reference(&format!("refs/remotes/{remote}/HEAD"))
+                .ok()
+                .and_then(|head| head.symbolic_target().map(str::to_string))
+                .or_else(|| {
+                    ["main", "master"]
+                        .iter()
+                        .map(|name| format!("refs/remotes/{remote}/{name}"))
+                        .find(|name| self.repo.find_reference(name).is_ok())
+                })
+        })?;
+        self.repo.find_reference(&candidate).ok()?;
+        Some(candidate)
+    }
+
+    /// `branch` against [`GitWorkspace::canonical_ref_of`], counted by
+    /// change rather than by commit, as `git cherry` counts: a branch
+    /// already rebased onto it reads nothing new, whatever the hashes.
+    pub fn canonical_of(&self, branch: &str) -> Option<Canonical> {
+        let full = self.canonical_ref_of(branch)?;
+        let there = self.repo.find_reference(&full).ok()?.target()?;
+        let tip = self
+            .repo
+            .find_branch(branch, BranchType::Local)
+            .ok()?
+            .get()
+            .target()?;
+        let (new, own) = match self.diverged(tip, there) {
+            Some((theirs, mine)) => (
+                self.unmatched(&theirs, &mine),
+                self.unmatched(&mine, &theirs),
+            ),
+            // Too far apart to compare change by change: by commit.
+            None => {
+                let (own, new) = self.repo.graph_ahead_behind(tip, there).ok()?;
+                (new, own)
+            }
+        };
+        let (ahead, behind) = self.repo.graph_ahead_behind(tip, there).ok()?;
+        Some(Canonical {
+            name: short_ref(&full),
+            full,
+            new,
+            own,
+            lands: (behind == 0 && ahead > 0).then_some(ahead),
+            behind,
+            tip: there.to_string(),
+        })
+    }
+
+    /// What a pull of `branch` from `target` (a full ref) would do, as the
+    /// refs here stand. `own` says `target` is where the branch pushes, so
+    /// a divergence may be its own rewrite ([`PullPlan::Rewritten`]).
+    /// `None` for a branch or target that does not resolve.
+    pub fn pull_plan_onto(&self, branch: &str, target: &str, own: bool) -> Option<PullPlan> {
+        let theirs_tip = self.repo.find_reference(target).ok()?.target()?;
         let mine_tip = self
             .repo
             .find_branch(branch, BranchType::Local)
@@ -275,10 +407,6 @@ impl GitWorkspace {
             .get()
             .target()?;
         let (mine, theirs) = self.repo.graph_ahead_behind(mine_tip, theirs_tip).ok()?;
-        // Against its own push target, a branch that diverged may only
-        // have been rewritten here; against a base — a fork's `origin/main`
-        // — divergence is what Sync is for.
-        let own = self.base_ref_of(branch).is_none();
         Some(match (mine, theirs) {
             (_, 0) => PullPlan::UpToDate,
             (0, theirs) => PullPlan::FastForward { theirs },
@@ -294,6 +422,42 @@ impl GitWorkspace {
                 None => PullPlan::Rebase { mine, theirs },
             },
         })
+    }
+
+    /// The commits each of `a` and `b` has that the other lacks: `(only
+    /// b's, only a's)`, newest first. `None` when either side is past
+    /// [`DIVERGENCE_LIMIT`], which is no comparison anyone should be told
+    /// the answer to by change.
+    fn diverged(&self, a: Oid, b: Oid) -> Option<(Vec<Oid>, Vec<Oid>)> {
+        let only = |from: Oid, hide: Oid| -> Option<Vec<Oid>> {
+            let mut walk = self.repo.revwalk().ok()?;
+            walk.push(from).ok()?;
+            walk.hide(hide).ok()?;
+            let commits: Vec<Oid> = walk
+                .take(DIVERGENCE_LIMIT + 1)
+                .filter_map(Result::ok)
+                .collect();
+            (commits.len() <= DIVERGENCE_LIMIT).then_some(commits)
+        };
+        Some((only(b, a)?, only(a, b)?))
+    }
+
+    /// How many of `commits` make a change none of `against` does: merges
+    /// passed over, having no change of their own to compare.
+    fn unmatched(&self, commits: &[Oid], against: &[Oid]) -> usize {
+        let theirs: std::collections::HashSet<Oid> = against
+            .iter()
+            .filter_map(|oid| self.patch_id(*oid))
+            .collect();
+        commits
+            .iter()
+            .filter(|oid| {
+                self.repo
+                    .find_commit(**oid)
+                    .is_ok_and(|commit| commit.parent_count() <= 1)
+            })
+            .filter(|oid| self.patch_id(**oid).is_none_or(|id| !theirs.contains(&id)))
+            .count()
     }
 
     /// Whether the commits `there` has that `tip` lacks are `branch`'s own
@@ -314,33 +478,11 @@ impl GitWorkspace {
     /// reaches the folder's reflog as the IDE moving the branch, so it
     /// reads the same here.
     pub fn rewrite_dropping(&self, branch: &str, tip: Oid, there: Oid) -> Option<usize> {
-        /// The most commits either side is walked for: a branch further
-        /// apart than this from its push target is not a rewrite anyone
-        /// should be told is safe to replace.
-        const LIMIT: usize = 1000;
-        let only = |from: Oid, hide: Oid| -> Option<Vec<Oid>> {
-            let mut walk = self.repo.revwalk().ok()?;
-            walk.push(from).ok()?;
-            walk.hide(hide).ok()?;
-            let commits: Vec<Oid> = walk.take(LIMIT + 1).filter_map(Result::ok).collect();
-            (commits.len() <= LIMIT).then_some(commits)
-        };
-        let theirs = only(there, tip)?;
-        let mine = only(tip, there)?;
+        let (theirs, mine) = self.diverged(tip, there)?;
         if theirs.is_empty() || mine.is_empty() {
             return None;
         }
-        let ours: std::collections::HashSet<Oid> =
-            mine.iter().filter_map(|oid| self.patch_id(*oid)).collect();
-        let dropped = theirs
-            .iter()
-            .filter(|oid| {
-                self.repo
-                    .find_commit(**oid)
-                    .is_ok_and(|commit| commit.parent_count() <= 1)
-            })
-            .filter(|oid| self.patch_id(**oid).is_none_or(|id| !ours.contains(&id)))
-            .count();
+        let dropped = self.unmatched(&theirs, &mine);
         let held = self
             .repo
             .reflog(&format!("refs/heads/{branch}"))
@@ -468,15 +610,19 @@ impl GitWorkspace {
                 let (ahead, behind_target) = self.repo.graph_ahead_behind(tip, there)?;
                 status.ahead = ahead;
                 status.behind = behind_target;
+                status.own_behind = behind_target;
                 if behind_target > 0 {
                     status.replaces = Some((there.to_string(), behind_target));
                     // The push target's commits are this branch's own,
                     // rewritten here: nothing to catch up with, and the
                     // push is what replaces them.
-                    if ahead > 0 && base.is_none() {
+                    if ahead > 0 {
                         status.rewritten = self.rewrite_dropping(branch, tip, there);
                         if status.rewritten.is_some() {
-                            status.behind = 0;
+                            status.own_behind = 0;
+                            if base.is_none() {
+                                status.behind = 0;
+                            }
                         }
                     }
                 }
@@ -503,7 +649,62 @@ impl GitWorkspace {
         if let Some(base_tip) = base_tip {
             status.behind = self.repo.graph_ahead_behind(tip, base_tip)?.1;
         }
+        // The pull request's own count: what the push sends that the
+        // canonical branch does not already have — a branch just rebased
+        // onto main sends main's new commits too, and they are not its own.
+        status.canonical = self.canonical_of(branch);
+        status.on_canonical = self.pushes_to_canonical(branch);
+        status.own_ahead = status.ahead;
+        if let Some(canonical) = &status.canonical {
+            let canonical_tip = self
+                .repo
+                .find_reference(&canonical.full)
+                .ok()
+                .and_then(|r| r.target());
+            let mut walk = self.repo.revwalk()?;
+            walk.push(tip)?;
+            if let Some(there) = there {
+                walk.hide(there)?;
+            } else {
+                let _ = walk.hide_glob("refs/remotes/*");
+            }
+            if let Some(canonical_tip) = canonical_tip {
+                walk.hide(canonical_tip)?;
+            }
+            status.own_ahead = walk.filter(Result::is_ok).count();
+        }
         Ok(status)
+    }
+
+    /// The ⇈: `branch` pushed onto the canonical branch on its remote —
+    /// `<remote> refs/heads/<branch>:refs/heads/<name>`. Unforced, git
+    /// refuses it unless it is a fast-forward there, which is how a merge by
+    /// push leaves the history everyone else's work stands on alone. With
+    /// `replacing`, the tip last fetched there, it replaces that history,
+    /// leased on it: the forced ⇈, held for longest of all. `None` without
+    /// a canonical branch, or one this cannot name a remote for.
+    pub fn push_onto_canonical_command(
+        &self,
+        branch: &str,
+        replacing: Option<&str>,
+    ) -> Option<(String, Vec<String>)> {
+        let full = self.canonical_ref_of(branch)?;
+        let rest = full.strip_prefix("refs/remotes/")?;
+        let remote = self
+            .remotes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|remote| rest.starts_with(&format!("{remote}/")))
+            .max_by_key(String::len)?;
+        let name = &rest[remote.len() + 1..];
+        let mut args = self.align_args();
+        args.extend(["push", crate::PUSH_SUBMODULES].map(String::from));
+        if let Some(expected) = replacing {
+            args.push(format!("--force-with-lease=refs/heads/{name}:{expected}"));
+        }
+        args.push(remote);
+        args.push(format!("refs/heads/{branch}:refs/heads/{name}"));
+        Some(self.git_command_owned(args))
     }
 
     /// The push of `branch` by name, as [`GitWorkspace::push_target`]
