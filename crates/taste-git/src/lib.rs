@@ -822,7 +822,7 @@ impl GitWorkspace {
     }
 
     /// `origin`, else the only configured remote.
-    fn default_remote(&self) -> String {
+    pub fn default_remote(&self) -> String {
         let remotes = self.remotes().unwrap_or_default();
         if remotes.iter().any(|r| r == "origin") || remotes.len() != 1 {
             "origin".to_string()
@@ -1001,6 +1001,13 @@ pub struct SyncStatus {
     /// The push target's tip is not known yet (a URL not yet asked), so
     /// `ahead` is a ceiling: what no remote's refs reach.
     pub push_unknown: bool,
+    /// The push target's commits this branch lacks ([`SyncStatus::replaces`])
+    /// are its own from before it was rewritten here — rebased, reworded,
+    /// amended — and `behind` is 0, there being nothing to catch up with:
+    /// how many of them make a change this branch does not, which the push
+    /// replacing them drops (`GitWorkspace::rewrite_dropping`). Only for a
+    /// branch with no base.
+    pub rewritten: Option<usize>,
 }
 
 impl SyncStatus {
@@ -1013,6 +1020,7 @@ impl SyncStatus {
             base: None,
             replaces: None,
             push_unknown: false,
+            rewritten: None,
         }
     }
 }
@@ -1691,6 +1699,115 @@ mod tests {
             !success,
             "a fast-forward never replays a commit of the branch's own"
         );
+    }
+
+    /// A branch pushed, then rewritten here — its first commit reworded,
+    /// the rest replayed, as the agent did to `datum-call` (2026-10-19) —
+    /// diverges from its push target only by its own old copies. Nothing
+    /// to pull, and the push replaces them; a rebase onto them would
+    /// replay the branch onto itself. Someone else's commit on top of the
+    /// old copies is not a rewrite: that one is for a rebase to take.
+    #[test]
+    fn a_branch_rewritten_here_is_pushed_over_not_pulled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let write = |cwd: &Path, name: &str, text: &str| {
+            std::fs::write(cwd.join(name), text).unwrap();
+            git(cwd, &["add", name]);
+        };
+        git(root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(root, &["clone", "-q", "remote.git", "mine"]);
+        let mine = root.join("mine");
+        git(&mine, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&mine, &["push", "-q", "origin", "HEAD:main"]);
+        git(&mine, &["switch", "-q", "-c", "topic"]);
+        write(&mine, "deck.typ", "the deck\n");
+        git(&mine, &["commit", "-q", "-m", "deck for the 21st"]);
+        write(&mine, "STYLE.md", "names\n");
+        git(&mine, &["commit", "-q", "-m", "style"]);
+        git(&mine, &["push", "-q", "-u", "origin", "topic"]);
+        let pushed = git(&mine, &["rev-parse", "HEAD"]);
+
+        // Reworded and replayed, and a commit more on top.
+        git(&mine, &["reset", "-q", "--hard", "main"]);
+        write(&mine, "deck.typ", "the deck\n");
+        git(&mine, &["commit", "-q", "-m", "deck for the 20th"]);
+        write(&mine, "STYLE.md", "names\n");
+        git(&mine, &["commit", "-q", "-m", "style"]);
+        write(&mine, "title.typ", "a title\n");
+        git(&mine, &["commit", "-q", "-m", "title"]);
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        assert_eq!(
+            ws.pull_plan_of("topic"),
+            Some(PullPlan::Rewritten {
+                mine: 3,
+                theirs: 2,
+                dropped: 0
+            })
+        );
+        let sync = ws.sync_status_of("topic").unwrap();
+        assert_eq!(
+            (
+                sync.ahead,
+                sync.behind,
+                sync.rewritten,
+                sync.replaces.clone()
+            ),
+            (3, 0, Some(0), Some((pushed.clone(), 2))),
+            "{sync:?}"
+        );
+
+        // A commit dropped as well: its change is gone, but the remote's
+        // tip is one this branch held, so it is still this branch's own,
+        // and the push says it drops one.
+        git(&mine, &["reset", "-q", "--hard", "HEAD~2"]);
+        write(&mine, "title.typ", "a title\n");
+        git(&mine, &["commit", "-q", "-m", "title"]);
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        assert_eq!(
+            ws.pull_plan_of("topic"),
+            Some(PullPlan::Rewritten {
+                mine: 2,
+                theirs: 2,
+                dropped: 1
+            })
+        );
+
+        // Someone else pushes on top of the old copies: their commit is
+        // nothing this branch has, and the tip is not one it held.
+        git(
+            root,
+            &["clone", "-q", "-b", "topic", "remote.git", "theirs"],
+        );
+        let theirs = root.join("theirs");
+        write(&theirs, "notes.md", "theirs\n");
+        git(&theirs, &["commit", "-q", "-m", "their note"]);
+        git(&theirs, &["push", "-q", "origin", "topic"]);
+        git(&mine, &["fetch", "-q"]);
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        assert_eq!(
+            ws.pull_plan_of("topic"),
+            Some(PullPlan::Rebase { mine: 2, theirs: 3 })
+        );
+        let sync = ws.sync_status_of("topic").unwrap();
+        assert_eq!((sync.behind, sync.rewritten), (3, None), "{sync:?}");
     }
 
     #[test]

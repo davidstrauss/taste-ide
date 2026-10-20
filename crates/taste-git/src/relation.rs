@@ -47,6 +47,17 @@ pub enum PullPlan {
     /// Both moved: the branch's `mine` commits replayed onto the target's
     /// `theirs`.
     Rebase { mine: usize, theirs: usize },
+    /// Both moved, but the target's `theirs` are this branch's own from
+    /// before it was rewritten here — rebased, reworded, amended
+    /// ([`GitWorkspace::rewrite_dropping`]). Nothing to pull: a rebase onto
+    /// them replays the branch onto its own old copy, which is how a
+    /// rebase the agent had done was undone (2026-10-19). The push
+    /// replaces them; `dropped` of them make a change the branch does not.
+    Rewritten {
+        mine: usize,
+        theirs: usize,
+        dropped: usize,
+    },
 }
 
 /// Where a branch's push goes.
@@ -264,11 +275,99 @@ impl GitWorkspace {
             .get()
             .target()?;
         let (mine, theirs) = self.repo.graph_ahead_behind(mine_tip, theirs_tip).ok()?;
+        // Against its own push target, a branch that diverged may only
+        // have been rewritten here; against a base — a fork's `origin/main`
+        // — divergence is what Sync is for.
+        let own = self.base_ref_of(branch).is_none();
         Some(match (mine, theirs) {
             (_, 0) => PullPlan::UpToDate,
             (0, theirs) => PullPlan::FastForward { theirs },
-            (mine, theirs) => PullPlan::Rebase { mine, theirs },
+            (mine, theirs) => match own
+                .then(|| self.rewrite_dropping(branch, mine_tip, theirs_tip))
+                .flatten()
+            {
+                Some(dropped) => PullPlan::Rewritten {
+                    mine,
+                    theirs,
+                    dropped,
+                },
+                None => PullPlan::Rebase { mine, theirs },
+            },
         })
+    }
+
+    /// Whether the commits `there` has that `tip` lacks are `branch`'s own
+    /// from before it was rewritten here, and if so how many of them make
+    /// a change `tip`'s own commits do not — the ones a push replacing
+    /// them drops. Its own when either holds:
+    ///
+    /// - every one of them makes the same change as a commit `tip` has
+    ///   that `there` lacks (git's patch-id, as `git cherry` compares) —
+    ///   a rebase, a reword, an amend that kept the change; merges are
+    ///   passed over, having no change of their own to compare;
+    /// - `there` is a commit `branch` itself has pointed at (its reflog):
+    ///   everything there came through this branch, whatever was done to
+    ///   it since.
+    ///
+    /// `None` when neither holds: someone else's commits, which are for a
+    /// rebase to take. A rewrite the agent made in a checkout in a VM
+    /// reaches the folder's reflog as the IDE moving the branch, so it
+    /// reads the same here.
+    pub fn rewrite_dropping(&self, branch: &str, tip: Oid, there: Oid) -> Option<usize> {
+        /// The most commits either side is walked for: a branch further
+        /// apart than this from its push target is not a rewrite anyone
+        /// should be told is safe to replace.
+        const LIMIT: usize = 1000;
+        let only = |from: Oid, hide: Oid| -> Option<Vec<Oid>> {
+            let mut walk = self.repo.revwalk().ok()?;
+            walk.push(from).ok()?;
+            walk.hide(hide).ok()?;
+            let commits: Vec<Oid> = walk.take(LIMIT + 1).filter_map(Result::ok).collect();
+            (commits.len() <= LIMIT).then_some(commits)
+        };
+        let theirs = only(there, tip)?;
+        let mine = only(tip, there)?;
+        if theirs.is_empty() || mine.is_empty() {
+            return None;
+        }
+        let ours: std::collections::HashSet<Oid> =
+            mine.iter().filter_map(|oid| self.patch_id(*oid)).collect();
+        let dropped = theirs
+            .iter()
+            .filter(|oid| {
+                self.repo
+                    .find_commit(**oid)
+                    .is_ok_and(|commit| commit.parent_count() <= 1)
+            })
+            .filter(|oid| self.patch_id(**oid).is_none_or(|id| !ours.contains(&id)))
+            .count();
+        let held = self
+            .repo
+            .reflog(&format!("refs/heads/{branch}"))
+            .ok()
+            .is_some_and(|log| log.iter().any(|entry| entry.id_new() == there));
+        (dropped == 0 || held).then_some(dropped)
+    }
+
+    /// The change a commit makes, as git's patch-id names it: the same for
+    /// two commits whose diffs are the same, whatever their parents,
+    /// messages, or dates. `None` for a merge, and for a commit that changes
+    /// nothing, which has no change to be the same as another's.
+    fn patch_id(&self, oid: Oid) -> Option<Oid> {
+        let commit = self.repo.find_commit(oid).ok()?;
+        let parent = match commit.parent_count() {
+            0 => None,
+            1 => Some(commit.parent(0).ok()?.tree().ok()?),
+            _ => return None,
+        };
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent.as_ref(), Some(&commit.tree().ok()?), None)
+            .ok()?;
+        if diff.deltas().len() == 0 {
+            return None;
+        }
+        diff.patchid(None).ok()
     }
 
     /// Fetch every configured remote: the base and a named push remote
@@ -371,6 +470,15 @@ impl GitWorkspace {
                 status.behind = behind_target;
                 if behind_target > 0 {
                     status.replaces = Some((there.to_string(), behind_target));
+                    // The push target's commits are this branch's own,
+                    // rewritten here: nothing to catch up with, and the
+                    // push is what replaces them.
+                    if ahead > 0 && base.is_none() {
+                        status.rewritten = self.rewrite_dropping(branch, tip, there);
+                        if status.rewritten.is_some() {
+                            status.behind = 0;
+                        }
+                    }
                 }
             }
             None => {

@@ -176,6 +176,9 @@ pub fn effect(tool: &str) -> Effect {
         // `update_from_main` fetches into the clone's remote-tracking
         // refs and moves nothing in the working tree.
         "publish" | "update_from_main" => Effect::Write,
+        // The user's remotes fetched and the checkouts' remote-tracking
+        // refs moved: nothing checked out moves, as with update_from_main.
+        "git_fetch" => Effect::Write,
         // Makes an environment: a clone and, later, a container. Heavy,
         // but additive, and `environment_destroy` is how it is undone.
         "issue_start" => Effect::Write,

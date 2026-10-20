@@ -579,14 +579,40 @@ pub const PERSONAL_REMOTE: &str = "personal";
 /// destination: a push writes a source ref to one of them only.
 pub const PERSONAL_SHARE_REFSPECS: [&str; 1] = ["+refs/taste/vm/*:refs/remotes/personal/*"];
 
+/// The remote an environment's checkout holds the folder's fetched
+/// branches under: what the user's remote had when the IDE last fetched
+/// it, beside `origin/*` — the folder's own branches, which move only when
+/// the user's do (`update_from_main`) — and `personal/*`. Given with
+/// Personal's branches ([`share_personal`]), whenever either moves: a fetch
+/// is not the folder's branches moving, and an environment rebasing onto
+/// `origin/main` was rebasing onto the user's local main, however long ago
+/// that was pulled.
+pub const UPSTREAM_REMOTE: &str = "upstream";
+
+/// What [`share_personal`] pushes of the folder's remote-tracking branches:
+/// its default remote's, as [`UPSTREAM_REMOTE`]'s. `None` when the folder
+/// has fetched nothing from it.
+pub fn upstream_share_refspec(folder: &taste_git::GitWorkspace) -> Option<String> {
+    let remote = folder.default_remote();
+    let fetched = folder.refs_under(&format!("refs/remotes/{remote}/")).ok()?;
+    (!fetched.is_empty())
+        .then(|| format!("+refs/remotes/{remote}/*:refs/remotes/{UPSTREAM_REMOTE}/*"))
+}
+
 /// Run in an environment's checkout after [`PERSONAL_SHARE_REFSPECS`] have
-/// been pushed: the `personal` remote, and — when the branch checked out
+/// been pushed: the `personal` remote, the [`UPSTREAM_REMOTE`] — unless the
+/// checkout has one of that name pointing elsewhere — and — when the branch checked out
 /// has no upstream of its own and Personal has a branch of that name, which
 /// is how an environment starts (`EnvironmentRegistry::create_on`) — that
 /// branch as its upstream. An upstream the user or the agent set is kept.
 pub const PERSONAL_REMOTE_SCRIPT: &str = r#"set -e
 git config remote.personal.url .
 git config remote.personal.fetch '+refs/remotes/personal/*:refs/remotes/personal/*'
+url=$(git config remote.upstream.url || true)
+if [ -z "$url" ] || [ "$url" = . ]; then
+  git config remote.upstream.url .
+  git config remote.upstream.fetch '+refs/remotes/upstream/*:refs/remotes/upstream/*'
+fi
 branch=$(git symbolic-ref --short -q HEAD) || exit 0
 git config "branch.$branch.remote" >/dev/null && exit 0
 git rev-parse -q --verify "refs/remotes/personal/$branch" >/dev/null || exit 0
@@ -606,6 +632,9 @@ pub fn share_personal(
 ) -> Result<()> {
     let mut args = vec!["push".to_string(), "--prune".into(), guest_url(vm, path)];
     args.extend(PERSONAL_SHARE_REFSPECS.iter().map(|s| s.to_string()));
+    args.extend(
+        taste_git::GitWorkspace::discover(folder).and_then(|git| upstream_share_refspec(&git)),
+    );
     git_streaming(folder, keys, &args, &mut |_| {})
         .with_context(|| format!("giving {} Personal's branches", path.display()))?;
     let out = files.exec(
@@ -2949,6 +2978,9 @@ mod tests {
             pair.git("folder", &["update-ref", "refs/taste/vm/main", &tip]);
             let mut args = vec!["push", "-q", "--prune", &env];
             args.extend(PERSONAL_SHARE_REFSPECS);
+            let folder = taste_git::GitWorkspace::discover(&pair.dir.join("folder")).unwrap();
+            let upstream = upstream_share_refspec(&folder);
+            args.extend(upstream.as_deref());
             pair.git("folder", &args);
             let out = std::process::Command::new("sh")
                 .current_dir(pair.dir.join("env"))
@@ -2962,11 +2994,23 @@ mod tests {
             );
         };
         pair.git("folder", &["update-ref", "refs/taste/vm/gone", "HEAD"]);
+        // What the user last fetched from their remote, as the folder
+        // keeps it.
+        pair.git(
+            "folder",
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
         share();
         assert_eq!(
             pair.git("env", &["rev-parse", "--abbrev-ref", "main@{upstream}"]),
             "personal/main"
         );
+        assert_eq!(
+            pair.git("env", &["rev-parse", "upstream/main"]),
+            pair.git("folder", &["rev-parse", "refs/remotes/origin/main"]),
+            "the folder's fetched branches are the environment's upstream/*"
+        );
+        assert_eq!(pair.git("env", &["config", "remote.upstream.url"]), ".");
 
         // Personal commits; the IDE shares; the environment pulls.
         pair.write("folder", "b.txt", "personal's\n");

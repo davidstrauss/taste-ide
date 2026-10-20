@@ -354,6 +354,9 @@ pub struct FileTree {
     /// How the checkout in the VM is given the peer's freshly fetched
     /// remote-tracking refs before it rebases onto one.
     share_remotes: RefCell<Option<std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>>>,
+    /// How the primary's agent is told, with its next prompt, what the
+    /// user's Push and Pull did to its branch (`Supervisor::note_for_agent`).
+    note_agent: RefCell<Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>>,
     status: Rc<RefCell<HashMap<PathBuf, FileState>>>,
     list_holder: gtk::ScrolledWindow,
     branch_label: gtk::MenuButton,
@@ -819,7 +822,7 @@ const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// The fetch of each submodule cloned in the folder at `root`, by its
 /// path: every remote, as the parent's own fetch is, and on the parent's
 /// host in the parent's scheme (`taste_git::transport`).
-fn submodule_fetch_commands(root: &Path) -> Vec<(String, (String, Vec<String>))> {
+pub(crate) fn submodule_fetch_commands(root: &Path) -> Vec<(String, (String, Vec<String>))> {
     let Some(git) = taste_git::GitWorkspace::discover(root) else {
         return Vec::new();
     };
@@ -839,7 +842,7 @@ fn submodule_fetch_commands(root: &Path) -> Vec<(String, (String, Vec<String>))>
 
 /// Run one git step, bounded. `Err` carries something worth putting in a
 /// toast.
-async fn run_git_step(
+pub(crate) async fn run_git_step(
     program: String,
     args: Vec<String>,
     envs: Vec<(String, String)>,
@@ -990,10 +993,38 @@ fn button_busy(button: &gtk::Button) {
     button.set_sensitive(false);
 }
 
-/// Show a button's face again.
+/// What a push of `sync`'s branch replaces on its push target, when it
+/// replaces anything: the tip there it is leased on and how many commits
+/// there it drops from the branch's history. A fork's branch rebased onto
+/// its base, or a branch rewritten here (`SyncStatus::rewritten`); any
+/// other divergence is the push target having moved, which is Pull's.
+fn replacing_push(sync: &taste_git::SyncStatus) -> Option<(String, usize)> {
+    (sync.base.is_some() || sync.rewritten.is_some())
+        .then(|| sync.replaces.clone())
+        .flatten()
+}
+
+/// How a rewrite's replaced commits are described when some of them make a
+/// change the branch no longer has: said, since the push drops it there.
+fn dropped_clause(dropped: usize) -> String {
+    match dropped {
+        0 => String::new(),
+        1 => ", one of which makes a change this branch no longer has".to_string(),
+        n => format!(", {n} of which make changes this branch no longer has"),
+    }
+}
+
+/// Show a button's face again, in place of its spinner. Only the spinner:
+/// every status refresh calls this, and those land several times a second
+/// on a checkout in a VM, so a hold's ring (`holdbutton`) swapped back to
+/// the face as soon as it was up — the hold still ran to its end, with
+/// nothing on screen to say so (David, 2026-10-19: "when I held to pull,
+/// it didn't show the animating circle").
 fn button_idle(button: &gtk::Button) {
     if let Some(stack) = button.child().and_downcast::<gtk::Stack>() {
-        stack.set_visible_child_name("face");
+        if stack.visible_child_name().as_deref() == Some("busy") {
+            stack.set_visible_child_name("face");
+        }
         if let Some(spinner) = stack.child_by_name("busy").and_downcast::<gtk::Spinner>() {
             spinner.stop();
         }
@@ -1515,6 +1546,7 @@ impl FileTree {
             after_ref_change: RefCell::new(None),
             status_branch: RefCell::new(None),
             share_remotes: RefCell::new(None),
+            note_agent: RefCell::new(None),
             status: Rc::new(RefCell::new(HashMap::new())),
             list_holder,
             intervention: intervention.clone(),
@@ -2049,9 +2081,11 @@ impl FileTree {
         &self,
         after_ref_change: std::sync::Arc<dyn Fn() + Send + Sync>,
         share_remotes: std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+        note_agent: std::sync::Arc<dyn Fn(String) + Send + Sync>,
     ) {
         *self.after_ref_change.borrow_mut() = Some(after_ref_change);
         *self.share_remotes.borrow_mut() = Some(share_remotes);
+        *self.note_agent.borrow_mut() = Some(note_agent);
     }
 
     /// The primary's checkout moved (`Event::CheckoutMoved`): re-aim at the
@@ -5155,18 +5189,23 @@ impl FileTree {
                     } else {
                         match snapshot.sync {
                             Some(sync) => match sync.upstream {
-                                Some(upstream) => {
+                                Some(ref upstream) => {
                                     // The upstream name lives in the button
                                     // tooltips; the label is for exceptions.
+                                    // A branch rewritten here is not one:
+                                    // its ↓ is 0, the commits it lacks being
+                                    // its own old copies, and Push's
+                                    // tooltip and click say the hold (a note
+                                    // here was cut to "rewritt…" in a
+                                    // 335px pane).
                                     self.set_sync_label("");
                                     let plural = |n: usize| if n == 1 { "" } else { "s" };
-                                    // A fork's rebased branch: what the push
-                                    // replaces there is the point of it.
-                                    let replacing = sync
-                                        .base
-                                        .as_ref()
-                                        .and(sync.replaces.as_ref())
-                                        .map(|(_, dropped)| *dropped);
+                                    let hold = crate::holdbutton::HOLD.as_secs();
+                                    // A fork's rebased branch, or a branch
+                                    // rewritten here: what the push replaces
+                                    // there is the point of it.
+                                    let replacing =
+                                        replacing_push(&sync).map(|(_, replaced)| replaced);
                                     self.push_face.set_label(&if sync.push_unknown {
                                         "↑ ?".to_string()
                                     } else {
@@ -5183,10 +5222,18 @@ impl FileTree {
                                     );
                                     let ahead = sync.ahead;
                                     self.push_button.set_tooltip_text(Some(&match replacing {
-                                        Some(dropped) => format!(
-                                            "Push the rebased branch to {upstream}: {ahead} \
-                                             commit{} it lacks, replacing the {dropped} it has \
-                                             that this branch does not",
+                                        Some(replaced) if sync.rewritten.is_some() => format!(
+                                            "Hold for {hold} seconds to push the branch \
+                                             rewritten here to {upstream}: {ahead} commit{}, \
+                                             replacing the {replaced} there from before it was \
+                                             rewritten{}",
+                                            plural(ahead),
+                                            dropped_clause(sync.rewritten.unwrap_or(0))
+                                        ),
+                                        Some(replaced) => format!(
+                                            "Hold for {hold} seconds to push the rebased branch \
+                                             to {upstream}: {ahead} commit{} it lacks, replacing \
+                                             the {replaced} it has that this branch does not",
                                             plural(ahead)
                                         ),
                                         None if sync.push_unknown => format!(
@@ -5230,8 +5277,17 @@ impl FileTree {
                                             )
                                         })
                                         .unwrap_or_default();
-                                    let hold = crate::holdbutton::HOLD.as_secs();
+                                    let replaced = sync.replaces.as_ref().map_or(0, |(_, n)| *n);
                                     self.pull_button.set_tooltip_text(Some(&match &sync.base {
+                                        None if sync.rewritten.is_some() => format!(
+                                            "Nothing to pull: the {replaced} commit{} on \
+                                             {upstream} this branch lacks {} its own, from \
+                                             before it was rewritten here. Hold Push to replace \
+                                             {}{held}",
+                                            plural(replaced),
+                                            if replaced == 1 { "is" } else { "are" },
+                                            if replaced == 1 { "it" } else { "them" }
+                                        ),
                                         Some(base) => format!(
                                             "Catch up with {base}: {} commit{} there that this \
                                              branch lacks. Click to fetch and fast-forward; \
@@ -6976,6 +7032,7 @@ impl FileTree {
         // first, and syncing the peer after.
         let worktree = self.worktree();
         let share_remotes = self.share_remotes.borrow().clone();
+        let note_agent = self.note_agent.borrow().clone();
         self.sync_button.set_sensitive(false);
         self.set_sync_label(if mode == Pull::Fetch {
             "fetching…"
@@ -7093,6 +7150,23 @@ impl FileTree {
             // A click with commits of the branch's own to replay moves
             // nothing, and says the hold that would.
             let held_back = match (mode, plan) {
+                // The branch's own old copies, not anyone's new commits: a
+                // click has nothing to pull, and a hold rebasing onto them
+                // replays the branch onto itself — how a rebase the agent
+                // had done was undone (2026-10-19). Push is what replaces
+                // them.
+                (
+                    Pull::FastForward | Pull::Rebase,
+                    Some(taste_git::PullPlan::Rewritten { theirs, .. }),
+                ) => Some(format!(
+                    "Nothing to pull: the {theirs} commit{} on {upstream_name} this branch \
+                     lacks {} its own, from before it was rewritten here. Hold Push for {} \
+                     seconds to replace {}",
+                    plural(theirs),
+                    if theirs == 1 { "is" } else { "are" },
+                    crate::holdbutton::HOLD.as_secs(),
+                    if theirs == 1 { "it" } else { "them" }
+                )),
                 (Pull::FastForward, Some(taste_git::PullPlan::Rebase { mine, theirs })) => {
                     Some(format!(
                         "Not pulled: this branch has {mine} commit{} of its own. Hold Pull for \
@@ -7167,6 +7241,27 @@ impl FileTree {
                         plural(count)
                     )
                 }));
+                // The branch moved under the agent: said with its next
+                // prompt, so it reads the branch again rather than its
+                // memory of it (2026-10-19: an agent that found its rebase
+                // undone spent a turn working out why).
+                if let (true, Some(branch), Some(note_agent)) =
+                    (moving && count > 0, branch.as_deref(), note_agent.as_ref())
+                {
+                    note_agent(match mode {
+                        Pull::Rebase => format!(
+                            "The user's Pull rebased {branch} onto {upstream_name}, taking \
+                             {count} commit{} from there: the branch's own commits were \
+                             replayed on top, so their hashes changed.",
+                            plural(count)
+                        ),
+                        _ => format!(
+                            "The user's Pull fast-forwarded {branch} to {upstream_name}: \
+                             {count} new commit{}.",
+                            plural(count)
+                        ),
+                    });
+                }
             }
             // The issues ref, second and quietly. A remote that has never
             // seen an issue makes this fail, which is the normal case
@@ -7297,7 +7392,24 @@ impl FileTree {
                 return;
             }
             let events = tree.workspace.events.clone();
+            let share = tree.share_remotes.borrow().clone();
             crate::runtime::runtime().spawn(async move {
+                // What the fetch moves, the agents' checkouts are given too
+                // — Personal's as its remote-tracking refs, every other
+                // environment's as `upstream/*` — so a fetch nobody pressed
+                // still keeps what the agents compare against current. Only
+                // when something moved: most of these fetch nothing.
+                let fetched_refs = {
+                    let root = observe_root.clone();
+                    move || {
+                        taste_git::GitWorkspace::discover(&root)
+                            .and_then(|git| git.refs_under("refs/remotes/").ok())
+                            .unwrap_or_default()
+                    }
+                };
+                let before = tokio::task::spawn_blocking(fetched_refs.clone())
+                    .await
+                    .unwrap_or_default();
                 observe_push_tip(
                     observe_root,
                     observe_branch,
@@ -7312,7 +7424,21 @@ impl FileTree {
                 {
                     // The refresh this triggers is throttled by last_fetch,
                     // so fetch → refresh → fetch can't loop.
-                    Ok(out) if out.status.success() => events.publish(Event::GitStatusChanged),
+                    Ok(out) if out.status.success() => {
+                        events.publish(Event::GitStatusChanged);
+                        let after = tokio::task::spawn_blocking(fetched_refs)
+                            .await
+                            .unwrap_or_default();
+                        if let (true, Some(share)) = (after != before, share) {
+                            if let Ok(Err(reason)) =
+                                tokio::task::spawn_blocking(move || share()).await
+                            {
+                                tracing::info!(
+                                    "the fetched refs did not reach the checkouts: {reason}"
+                                );
+                            }
+                        }
+                    }
                     Ok(out) => tracing::debug!(
                         "background fetch: {}",
                         String::from_utf8_lossy(&out.stderr).trim()
@@ -8173,23 +8299,31 @@ impl FileTree {
         // there so commits someone pushed since are refused rather than
         // lost. Without a base the same divergence means the push target
         // moved: Pull first, and git's own refusal says so.
-        let replacing = sync.as_ref().and_then(|sync| {
-            sync.base.as_ref()?;
-            sync.replaces.clone()
-        });
+        // A branch rewritten here — rebased, reworded, amended — whose
+        // push target still has the old copies is the same push without a
+        // base (`SyncStatus::rewritten`): its divergence is its own, and
+        // Pull would only replay it onto itself (2026-10-19).
+        let replacing = sync.as_ref().and_then(replacing_push);
         match replacing {
-            Some((_, dropped)) if !held => {
+            Some((_, replaced)) if !held => {
                 let target = sync
                     .as_ref()
                     .and_then(|s| s.upstream.clone())
                     .unwrap_or_else(|| "the remote".to_string());
+                let when = if sync.as_ref().is_some_and(|s| s.rewritten.is_some()) {
+                    "it was rewritten here"
+                } else {
+                    "the rebase"
+                };
+                let dropped = sync.as_ref().and_then(|s| s.rewritten).unwrap_or(0);
                 self.workspace.events.publish(Event::Toast(format!(
-                    "Not pushed: {target} has {dropped} commit{} this branch does not, from \
-                     before the rebase. Hold Push for {} seconds to replace {}; it is \
-                     refused if {target} has changed since it was last fetched",
-                    if dropped == 1 { "" } else { "s" },
+                    "Not pushed: {target} has {replaced} commit{} this branch does not, from \
+                     before {when}{}. Hold Push for {} seconds to replace {}; it is refused \
+                     if {target} has changed since it was last fetched",
+                    if replaced == 1 { "" } else { "s" },
+                    dropped_clause(dropped),
                     crate::holdbutton::HOLD.as_secs(),
-                    if dropped == 1 { "it" } else { "them" },
+                    if replaced == 1 { "it" } else { "them" },
                 )));
             }
             Some((expected, _)) => {
@@ -8241,6 +8375,24 @@ impl FileTree {
             )
         };
         let events = self.workspace.events.clone();
+        // The agent is told its branch is published, and its checkout given
+        // the remote-tracking ref the push moved: an agent that did not know
+        // rewrote the branch and told the user to push it plainly, which
+        // the remote refuses (2026-10-19).
+        let published = branch.clone().map(|branch| {
+            let upstream = sync
+                .as_ref()
+                .and_then(|s| s.upstream.clone())
+                .unwrap_or_else(|| "the remote".to_string());
+            format!(
+                "The user pushed {branch} to {upstream}. It is published: rewriting its \
+                 commits now (rebase, amend, reword, reset) means replacing them on \
+                 {upstream}, which only the user's hold-to-replace Push does. Say so before \
+                 rewriting it, and never tell them to run a plain git push."
+            )
+        });
+        let note_agent = self.note_agent.borrow().clone();
+        let share_remotes = self.share_remotes.borrow().clone();
         // Push runs on the host with the user's own credential helpers.
         let spec = {
             let exec = taste_core::ExecContext::host();
@@ -8254,7 +8406,20 @@ impl FileTree {
             let handle =
                 crate::runtime::runtime().spawn(run_git_step(spec.program, spec.args, envs));
             match handle.await {
-                Ok(Ok(_)) => events.publish(Event::Toast(pushed)),
+                Ok(Ok(_)) => {
+                    events.publish(Event::Toast(pushed));
+                    if let (Some(note), Some(note_agent)) = (published, note_agent) {
+                        note_agent(note);
+                    }
+                    if let Some(share) = share_remotes {
+                        let shared = crate::runtime::runtime()
+                            .spawn_blocking(move || share())
+                            .await;
+                        if let Ok(Err(reason)) = shared {
+                            tracing::info!("the pushed ref did not reach the checkouts: {reason}");
+                        }
+                    }
+                }
                 Ok(Err(reason)) => {
                     events.publish(Event::Toast(format!("Push failed: {reason}")));
                 }

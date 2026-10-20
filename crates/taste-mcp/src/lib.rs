@@ -17,7 +17,8 @@ mod protocol;
 mod server;
 
 pub use server::{
-    guidance, guidance_without_memory, socket_path, stdio_bridge, McpServer, GUIDANCE_REVISION,
+    guidance, guidance_without_memory, socket_path, stdio_bridge, GitFetchOutcome, GitFetcher,
+    McpServer, GUIDANCE_REVISION,
 };
 
 /// What the chat pane needs from the tool table to decide whether a

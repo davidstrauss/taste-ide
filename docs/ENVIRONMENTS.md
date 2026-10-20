@@ -4480,7 +4480,50 @@ person. Pull spans both: the fetch is the peer's with the user's keys,
 the peer's remote-tracking refs are pushed into the checkout, the rebase
 runs where the working tree is, and the peer is synced after. The primary
 is snapshotted on the same cadence as every other environment now, and
-the two early returns that kept it out are gone. The supervising window's
+the two early returns that kept it out are gone.
+
+**A branch rewritten here is pushed over, never pulled** (2026-10-19).
+An agent rebased a pushed branch onto `main`, and the user's held Pull
+then rebased it back onto its own pushed copy: the branch was "1 behind"
+its upstream, and that one commit was the same change as one of its own.
+So a branch that has diverged from its push target is checked for being
+its own rewrite (`GitWorkspace::rewrite_dropping`): every commit the push
+target has that it lacks makes the same change as one of its own (git's
+patch-id), or the push target's tip is one the branch itself has held
+(its reflog, where the mirror's moves land too). Such a branch reads
+`↓ 0` (`SyncStatus::rewritten`), Pull — click or hold — moves nothing and
+says why (`PullPlan::Rewritten`), and Push's hold replaces the old copies
+with `--force-with-lease` on the tip last seen there, as it does for a
+fork's rebased branch; a click says what the push replaces, and how many
+of those commits make a change the branch no longer has. Someone else's
+commit among them is not a rewrite, and Pull's rebase is still the answer.
+
+**What a fetch brings reaches every checkout.** The fetch is the folder's,
+with the user's keys; no checkout in a VM can make one. After the file
+tree's Fetch and Pull, after a background fetch that moved anything, after
+a Push, and after an agent's `git_fetch`, Personal's checkout is given the
+folder's remote-tracking refs as its own, and every other environment the
+folder's default remote's as `upstream/*`, beside `origin/*` (the folder's
+branches, `update_from_main`) and `personal/*` — given with Personal's
+branches, whenever either moves (`peer::UPSTREAM_REMOTE`). An environment
+rebasing a pull request's branch onto `origin/main` was rebasing onto the
+user's local `main`, however long ago that was pulled.
+
+**An agent fetches through the IDE** (`git_fetch`): the folder's fetch,
+then the share above, answering with the refs that moved and how long ago
+the folder last fetched (its `FETCH_HEAD`). A remote whose key would ask
+the user for a touch, a PIN, or a passphrase is fetched only when the
+call says `ask_user: true`, and then through the strip and agent the
+file tree's Pull uses; otherwise nothing runs, and the answer says why
+(David, 2026-10-19: "it's allowed, but it shouldn't be accidental").
+
+**An agent is told what happened to its git** (`Supervisor::note_for_agent`).
+The user's Push publishing its branch, the user's Pull moving it, and the
+folder sending the user's own commits into its checkout each leave a note,
+which the chat puts ahead of the agent's next prompt, once, with a meta row
+saying it went: an agent that did not know its branch had been pushed
+reworded it and told the user to push it plainly, which the remote
+refuses. The supervising window's
 first check of the primary runs from reconcile, after placement, because
 a container started before the move would bind the folder. A folder that
 is not a git repository has nothing to move: the primary stays on this

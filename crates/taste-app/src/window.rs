@@ -160,6 +160,26 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Kept before the server is handed to the channel services: the chat
     // strip tells it which environment's socket serves the orchestration
     // tools, and the server is the only thing that can act on that.
+    // What a fetch brought, given to every checkout: Personal's as its
+    // remote-tracking refs, each other environment's as `upstream/*` with
+    // Personal's branches (`EnvironmentRegistry::share_personal`). The file
+    // tree's Fetch and Pull, its background fetch when it moved something,
+    // its Push, and an agent's `git_fetch` all end here.
+    let share_fetched: std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync> = {
+        let (primary, registry) = (supervisor.clone(), environments.clone());
+        std::sync::Arc::new(move || {
+            let personal = registry.share_personal(None);
+            primary
+                .share_remotes_blocking()
+                .map_err(|e| format!("{e:#}"))?;
+            personal.map_err(|e| format!("{e:#}"))
+        })
+    };
+    server.set_git_fetcher(crate::agent_fetch::fetcher(
+        workspace.root().to_path_buf(),
+        share_fetched.clone(),
+        workspace.events.clone(),
+    ));
     environments.set_channel_services(crate::env_channel::IdeChannelServices::new(
         server,
         workspace.tasks.clone(),
@@ -181,7 +201,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // run on the worktree's blocking thread.
     {
         let sync = supervisor.clone();
-        let share = supervisor.clone();
+        let noter = supervisor.clone();
+        let share = share_fetched.clone();
         filetree.set_peer_hooks(
             std::sync::Arc::new(move || {
                 // The snapshot first, so the ref that restores the working
@@ -195,9 +216,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     tracing::warn!("syncing the folder with the checkout in the VM: {e:#}");
                 }
             }),
-            std::sync::Arc::new(move || {
-                share.share_remotes_blocking().map_err(|e| format!("{e:#}"))
-            }),
+            share,
+            std::sync::Arc::new(move |note| noter.note_for_agent(note)),
         );
     }
     {

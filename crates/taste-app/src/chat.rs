@@ -7252,6 +7252,25 @@ impl ChatPane {
                 front.push(text);
             }
         }
+        // What happened to this environment's git from outside the
+        // conversation — the user's Push publishing its branch, their Pull
+        // moving it, the folder sending their own commits in — said once,
+        // ahead of the next prompt (`Supervisor::note_for_agent`). An agent
+        // that did not know its branch was pushed rewrote it and told the
+        // user to push it plainly (2026-10-19).
+        if let Some(supervisor) = self.environments.get(&self.environment) {
+            let notes = supervisor.take_agent_notes();
+            if !notes.is_empty() {
+                self.meta_row(&format!(
+                    "told what happened to its git outside this conversation: {}",
+                    notes.join(" ")
+                ));
+                front.push(format!(
+                    "Since your last message, outside this conversation:\n\n- {}",
+                    notes.join("\n- ")
+                ));
+            }
+        }
         // The IDE's guidance, when it has changed since this conversation
         // was given it: an agent reads its instructions when its session
         // starts, and a conversation outlives the IDE that briefed it
@@ -14677,6 +14696,15 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "devcontainer_resources" => "Read what the container is using".into(),
         "devcontainer_reload" => "Rebuild the container".into(),
         "update_from_main" => "Take the user's latest work".into(),
+        "git_fetch" => if input
+            .and_then(|input| input["ask_user"].as_bool())
+            .unwrap_or(false)
+        {
+            "Fetch the user's remotes, asking them if their key needs it"
+        } else {
+            "Fetch the user's remotes"
+        }
+        .into(),
         "publish" => "Publish this work for review".into(),
         "environment_reinstantiate_request" => {
             "Ask to be reinstantiated on updated versions".into()

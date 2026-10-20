@@ -579,6 +579,13 @@ pub struct Supervisor {
     /// Primary syncs finished, for a caller that waited one out to know it
     /// need not run another (`sync_peer_for_publish`).
     folder_passes: AtomicU64,
+    /// What happened to this environment's git from outside its agent's
+    /// conversation — the user's Push publishing its branch, the user's
+    /// Pull moving it, the folder sending the user's own commits in —
+    /// for the agent's next prompt to carry (`take_agent_notes`). An agent
+    /// that rewrote a branch it did not know was pushed told the user to
+    /// run a push that would be refused (2026-10-19).
+    agent_notes: Mutex<Vec<String>>,
     /// When the checkout's git was last tidied of what its replaced
     /// snapshots left (`taste_git::snapshot::TIDY_SCRIPT`).
     last_tidy: Mutex<Option<std::time::Instant>>,
@@ -932,6 +939,7 @@ impl Supervisor {
             folder_watch: Mutex::new(None),
             folder_sync: Mutex::new(()),
             folder_passes: AtomicU64::new(0),
+            agent_notes: Mutex::new(Vec::new()),
             last_tidy: Mutex::new(None),
             agent_node: Mutex::new(None),
             agent_task: Mutex::new(None),
@@ -1707,6 +1715,25 @@ impl Supervisor {
         }
     }
 
+    /// Tell this environment's agent, with its next prompt, something that
+    /// happened to its git from outside its conversation. The newest few
+    /// are kept: a note is about the branch as it stands, and a pile of
+    /// them is noise.
+    pub fn note_for_agent(&self, note: impl Into<String>) {
+        const KEPT: usize = 4;
+        let note = note.into();
+        let mut notes = self.agent_notes.lock().unwrap();
+        notes.retain(|kept| *kept != note);
+        notes.push(note);
+        let excess = notes.len().saturating_sub(KEPT);
+        notes.drain(..excess);
+    }
+
+    /// The notes for the agent's next prompt, taken: each is said once.
+    pub fn take_agent_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.agent_notes.lock().unwrap())
+    }
+
     pub fn sync_peer_blocking(&self) -> Result<()> {
         let Checkout::Remote { vm, path } = self.checkout() else {
             return Ok(());
@@ -1819,6 +1846,17 @@ impl Supervisor {
             self.log(format!(
                 "sent {} change(s) from your folder to the checkout in the VM",
                 sync.sent
+            ));
+        }
+        // Commits the user made — or a rewrite they did — in the folder,
+        // outside this conversation, went into the checkout: its agent is
+        // told, rather than finding its branch moved.
+        if sync.pushed {
+            let branch = sync.branch.as_deref().unwrap_or("the branch");
+            self.note_for_agent(format!(
+                "The user's folder sent {branch} to your checkout: commits they made, or a \
+                 rewrite they did, outside this conversation. Read `git log` before relying \
+                 on what you last saw of it."
             ));
         }
         if (sync.missed > 0 || sync.pushed) && depth < 2 {

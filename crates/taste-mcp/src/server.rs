@@ -163,7 +163,34 @@ pub struct McpServer {
     /// environment lookup, which is the honest answer once the environment
     /// is gone.
     listeners: Mutex<BTreeMap<EnvironmentId, tokio::task::JoinHandle<()>>>,
+    /// How `git_fetch` fetches: the app's, which holds the user's keys and
+    /// the strip their questions are asked on ([`McpServer::set_git_fetcher`]).
+    /// Unset, the tool says the IDE cannot fetch for it.
+    git_fetcher: Mutex<Option<GitFetcher>>,
 }
+
+/// What a `git_fetch` came to, as the app's fetcher reports it.
+#[derive(Debug, Clone, Default)]
+pub struct GitFetchOutcome {
+    /// The fetch ran and succeeded.
+    pub fetched: bool,
+    /// The remote-tracking refs it moved, created, or removed, by name.
+    pub moved: Vec<String>,
+    /// Why it was not run: it would ask the user for a key's touch or PIN,
+    /// and the call did not say it may.
+    pub needs_user: Option<String>,
+    /// Why it failed, in git's words.
+    pub error: Option<String>,
+}
+
+/// The app's fetch of the user's remotes, in their folder, with their
+/// keys, and the checkouts given the result; `true` lets it ask the user
+/// for a key's touch, PIN, or passphrase.
+pub type GitFetcher = Arc<
+    dyn Fn(bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = GitFetchOutcome> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl McpServer {
     pub fn new(
@@ -179,7 +206,13 @@ impl McpServer {
             services: Mutex::new(BTreeMap::new()),
             semantic: Mutex::new(None),
             listeners: Mutex::new(BTreeMap::new()),
+            git_fetcher: Mutex::new(None),
         })
+    }
+
+    /// How `git_fetch` fetches ([`GitFetcher`]).
+    pub fn set_git_fetcher(&self, fetcher: GitFetcher) {
+        *self.git_fetcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(fetcher);
     }
 
     /// The semantic index this server answers `ide_semantic_search` from.
@@ -217,7 +250,25 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 5;
+pub const GUIDANCE_REVISION: u32 = 6;
+
+/// When the user's folder last fetched: its `FETCH_HEAD`, which every
+/// fetch writes, as a person reads an age. `None` when it never has.
+fn last_fetched(root: &std::path::Path) -> Option<String> {
+    let git = taste_git::GitWorkspace::discover(root)?;
+    let at = std::fs::metadata(git.git_dir().join("FETCH_HEAD"))
+        .ok()?
+        .modified()
+        .ok()?;
+    let minutes = at.elapsed().ok()?.as_secs() / 60;
+    Some(match minutes {
+        0 => "just now".to_string(),
+        1 => "a minute ago".to_string(),
+        m if m < 120 => format!("{m} minutes ago"),
+        m if m < 48 * 60 => format!("{} hours ago", m / 60),
+        m => format!("{} days ago", m / (24 * 60)),
+    })
+}
 
 /// What every agent is told before its first tool call, and what the
 /// coordinator is told besides — the MCP instructions, and what `ide_guide`
@@ -326,6 +377,18 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              message says what the change does and nothing else. Add no Co-Authored-By \
              or other trailer, no \"Generated with\" line, and no attribution or \
              signature of any kind, whatever your own defaults are.\n\n\
+             GIT REMOTES. Your checkout cannot reach a remote: `git fetch`, `git pull`, \
+             and `git push` there fail by design, because the user's keys stay on their \
+             machine. The IDE fetches with them, in the background and when the user \
+             fetches or pulls, and gives your checkout the result: Personal's checkout gets \
+             the remote's branches as origin/*; any other environment gets them as \
+             upstream/*, beside origin/* (the user's own branches) and personal/*. To fetch \
+             now, call git_fetch. Before you rewrite a branch (rebase, amend, reword, \
+             reset), run `git status -sb`: if its upstream has the commits, the branch is \
+             published, and only the user's hold-to-replace Push can replace them. Say so \
+             before rewriting, and never tell the user to run a plain `git push` for it. \
+             The IDE's notes at the top of a prompt say when the user pushed or pulled your \
+             branch; trust them over your memory of the conversation.\n\n\
              SERVICES. ",
         );
     text.push_str(taste_core::conventions::SERVICES);
@@ -1718,6 +1781,24 @@ impl McpServer {
             ));
         }
         tools.push(tool(
+            "git_fetch",
+            "Fetch the user's remotes now, on their machine with their keys, and give your \
+             checkout the result: origin/* in Personal's checkout, upstream/* in any other \
+             environment's. `git fetch`, `pull`, and `push` in your checkout fail by design. \
+             Returns the refs that moved and when the remotes were last fetched. A remote \
+             whose key needs the user's touch, PIN, or passphrase is fetched only with \
+             ask_user: true; without it the result says so and nothing runs.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ask_user": {
+                        "type": "boolean",
+                        "description": "let the fetch ask the user to touch their key or enter a PIN or passphrase. Only when the user is there and asked for something that needs fresh refs (default false)"
+                    }
+                }
+            }),
+        ));
+        tools.push(tool(
             "environment_reinstantiate_request",
             "Ask to be reinstantiated on updated versions, when the environment tool reports \
              migration.pending: a move to a VM on the current guest release, or an image \
@@ -2247,7 +2328,8 @@ impl McpServer {
                         mode, writes are limited to the devcontainer setup (.devcontainer/) and \
                         workspace dotfiles (.editorconfig, .gitignore, .gitattributes); the rest \
                         of the workspace is readable context. The home directory is never \
-                        writable, and remote git is fetch-only, in every mode.",
+                        writable, and remote git is the IDE's to reach (git_fetch), never \
+                        yours, in every mode.",
                     "conventions": "Devcontainer house style: base the image on a \
                         Containerfile in .devcontainer/; no --userns argument is needed, \
                         the IDE maps the user onto the image's user itself; \
@@ -3212,6 +3294,52 @@ impl McpServer {
                 let mut result = publish_result(&forced.outcome, env, review);
                 result["replaced_commits"] = json!(attempt.dropped);
                 Ok(personal_note(result, personal_synced))
+            }
+            // The user's remotes fetched by the app, which has their keys,
+            // and the checkouts given the result. Never a question to the
+            // user the agent did not ask for (David, 2026-10-19: "it's
+            // allowed, but it shouldn't be accidental").
+            "git_fetch" => {
+                let ask_user = args["ask_user"].as_bool().unwrap_or(false);
+                let fetcher = self
+                    .git_fetcher
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let Some(fetcher) = fetcher else {
+                    return Ok(json!({
+                        "fetched": false,
+                        "error": "this IDE cannot fetch for its agents",
+                    }));
+                };
+                let outcome = fetcher(ask_user).await;
+                let root = self.workspace.root().to_path_buf();
+                let last = tokio::task::spawn_blocking(move || last_fetched(&root))
+                    .await
+                    .ok()
+                    .flatten();
+                let mut result = json!({
+                    "fetched": outcome.fetched,
+                    "moved": outcome.moved,
+                    "last_fetched": last.unwrap_or_else(|| "never".to_string()),
+                });
+                if let Some(reason) = outcome.needs_user {
+                    result["needs_user"] = json!(format!(
+                        "{reason}. Not fetched. Call again with ask_user: true only if the \
+                         user is there and wants it."
+                    ));
+                }
+                if let Some(error) = outcome.error {
+                    result["error"] = json!(if ask_user {
+                        error
+                    } else {
+                        format!(
+                            "{error}. If the user's key wants a passphrase, PIN, or touch, \
+                             ask_user: true lets the fetch ask them."
+                        )
+                    });
+                }
+                Ok(result)
             }
             // Mediated refresh: hub → env. Remote-tracking refs only; the
             // refspec set is checked to land outside refs/heads/, so nothing
@@ -6054,8 +6182,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "864c0ae05bbc2ab8355458ae7829e4962e64cdd27538855151aa41c2be1c3ef9";
-        const AT_REVISION: u32 = 5;
+            "d0096dc4c3a9e77b5ad93af5a9f85ba0771899acd290325b4b37ea3ca6d63f15";
+        const AT_REVISION: u32 = 6;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

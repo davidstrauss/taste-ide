@@ -2766,8 +2766,15 @@ impl EnvironmentRegistry {
         if branches.is_empty() {
             return Ok(());
         }
+        // The folder's fetched branches go with Personal's, as `upstream/*`
+        // (`crate::peer::UPSTREAM_REMOTE`): a fetch that moved them is a
+        // share as much as a commit in Personal is.
+        let fetched = git
+            .refs_under(&format!("refs/remotes/{}/", git.default_remote()))
+            .unwrap_or_default();
         let fingerprint = branches
             .iter()
+            .chain(fetched.iter())
             .map(|(name, oid)| format!("{name} {oid}\n"))
             .collect::<String>();
         let keys = crate::keys::Keys::for_workspace(&folder);
