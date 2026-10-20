@@ -13,6 +13,7 @@
 
 mod model;
 mod rail;
+mod rowbar;
 mod rows;
 
 use std::cell::{Cell, RefCell};
@@ -706,6 +707,8 @@ pub struct ChatPane {
     /// The empty chat's page, or the transcript.
     transcript_stack: gtk::Stack,
     transcript_scroller: gtk::ScrolledWindow,
+    /// The transcript's scrollbar, counted in rows (`chat/rowbar.rs`).
+    row_bar: Rc<rowbar::RowBar>,
     /// Pinned copy of the last user prompt: overlays the transcript's top
     /// edge whenever the real card is scrolled out of view above it, so
     /// the question stays readable while the answer scrolls.
@@ -919,11 +922,6 @@ pub struct ChatPane {
     /// Tail latch: true while the transcript is parked at the bottom.
     /// Shared with the adjustment handlers, which is why it is an `Rc`.
     stick_to_bottom: Rc<Cell<bool>>,
-    /// While the reader is up the transcript: the row at the top of their
-    /// view, and how far below the view's top it starts. Whatever changes
-    /// height above it — a reply drawn as Markdown, a card filling in, a
-    /// row moved or let go — the view follows the row (`keep_anchor`), so
-    /// nothing they are reading moves but by their hand.
     /// "Jump to the newest" banner, revealed when content lands while the
     /// user is reading further up.
     jump_banner: gtk::Revealer,
@@ -1407,10 +1405,11 @@ enum TailAction {
 /// The whole scroll-anchoring rule, in one place.
 ///
 /// `sticking` is the latch — true exactly while the view is parked at the
-/// bottom, which a `value-changed` handler keeps current. `grew` says the
-/// content got taller, as opposed to the viewport getting shorter; only the
-/// former is news, or the banner would fire every time the composer grew a
-/// line under it.
+/// bottom, which a `value-changed` handler keeps current. `grew` says items
+/// were added, as opposed to the list measuring rows it had estimated or
+/// the viewport getting shorter; only the former is news, or the banner
+/// would fire on every scroll into rows not yet built, and every time the
+/// composer grew a line under it.
 fn tail_action(sticking: bool, grew: bool) -> TailAction {
     match (sticking, grew) {
         (true, _) => TailAction::Repin,
@@ -3415,7 +3414,26 @@ impl ChatPane {
         // The empty chat's page until there is a row, then the transcript.
         let transcript_stack = gtk::Stack::new();
         transcript_stack.add_named(&placeholder, Some("empty"));
-        transcript_stack.add_named(&transcript_scroller, Some("list"));
+        let stick_to_bottom = Rc::new(Cell::new(true));
+        let reader_scrolled: Rc<Cell<Option<std::time::Instant>>> = Rc::new(Cell::new(None));
+        let row_bar = {
+            let (stick, reader) = (stick_to_bottom.clone(), reader_scrolled.clone());
+            let on_reader: Rc<dyn Fn()> = Rc::new(move || {
+                reader.set(Some(std::time::Instant::now()));
+                stick.set(false);
+            });
+            let (stick, end_list, scroller) = (
+                stick_to_bottom.clone(),
+                list.clone(),
+                transcript_scroller.clone(),
+            );
+            let to_end: Rc<dyn Fn()> = Rc::new(move || {
+                stick.set(true);
+                pin_to_end(&end_list, &scroller.vadjustment());
+            });
+            rowbar::RowBar::new(&transcript_scroller, &list, on_reader, to_end)
+        };
+        transcript_stack.add_named(&row_bar.widget, Some("list"));
         transcript_stack.set_visible_child_name("empty");
         options_overlay.set_child(Some(&transcript_stack));
         options_overlay.add_overlay(&pinned_float);
@@ -3450,6 +3468,7 @@ impl ChatPane {
             bound: RefCell::new(HashMap::new()),
             lit: RefCell::new(None),
             transcript_stack,
+            row_bar,
             transcript_scroller,
             pinned_float: pinned_float.clone(),
             pinned_prompt_label,
@@ -3527,13 +3546,13 @@ impl ChatPane {
             last_word: Cell::new(None),
             quiet_tick: RefCell::new(None),
             weak_self: RefCell::new(std::rc::Weak::new()),
-            stick_to_bottom: Rc::new(Cell::new(true)),
+            stick_to_bottom,
             jump_banner: jump_banner.clone(),
             pinned_plate: pinned_plate.clone(),
             open_jump_up: open_jump_up.clone(),
             open_jump_down: open_jump_down.clone(),
             scroll_pending: Rc::new(Cell::new(false)),
-            reader_scrolled: Rc::new(Cell::new(None)),
+            reader_scrolled,
             mode_sync: RefCell::new(None),
             controls_signature: RefCell::new(None),
             config_options: RefCell::new(Vec::new()),
@@ -3692,13 +3711,7 @@ impl ChatPane {
                 let reader = pane.reader_scrolled.clone();
                 wheel.connect_decelerate(move |_, _, _| mark(&reader));
                 pane.transcript_scroller.add_controller(wheel);
-                let drag = gtk::GestureDrag::new();
-                drag.set_propagation_phase(gtk::PropagationPhase::Capture);
-                let reader = pane.reader_scrolled.clone();
-                drag.connect_drag_begin(move |_, _, _| mark(&reader));
-                let reader = pane.reader_scrolled.clone();
-                drag.connect_drag_update(move |_, _, _| mark(&reader));
-                pane.transcript_scroller.vscrollbar().add_controller(drag);
+                // The scrollbar's drag marks itself (`RowBar`).
                 let keys = gtk::EventControllerKey::new();
                 keys.set_propagation_phase(gtk::PropagationPhase::Capture);
                 let reader = pane.reader_scrolled.clone();
@@ -3714,20 +3727,24 @@ impl ChatPane {
                 });
                 pane.transcript_scroller.add_controller(keys);
             }
-            // Growth in `upper` is new content; a change in `page-size`
-            // alone is the viewport resizing. Only the former is worth
-            // announcing, or the banner would fire every time the composer
-            // grew a line.
-            let last_upper = Rc::new(Cell::new(0.0f64));
+            // New items are new content. Growth in `upper` is not: the
+            // list's extent is an estimate from the rows it has built, and
+            // it grows whenever a row it reaches is taller than the
+            // estimate — the banner came up mid-drag, over nothing new. A
+            // change in `page-size` alone is the viewport resizing, which
+            // is no news either, or the banner would fire every time the
+            // composer grew a line.
+            let last_items = Rc::new(Cell::new(pane.store.n_items()));
+            let store = pane.store.clone();
             let stick = pane.stick_to_bottom.clone();
             let pending = pane.scroll_pending.clone();
             let list = pane.list.clone();
             let scroller = pane.transcript_scroller.clone();
             let banner = jump_banner.clone();
-            adjustment.connect_changed(move |adjustment| {
-                let upper = adjustment.upper();
-                let grew = upper > last_upper.get() + 1.0;
-                last_upper.set(upper);
+            adjustment.connect_changed(move |_| {
+                let items = store.n_items();
+                let grew = items > last_items.get();
+                last_items.set(items);
                 match tail_action(stick.get(), grew) {
                     TailAction::Announce => {
                         banner.set_reveal_child(true);
@@ -3773,6 +3790,7 @@ impl ChatPane {
                 };
                 let entry = object.borrow::<Item>().clone();
                 pane.bind_item(&holder, &entry);
+                pane.row_bar.bound(item);
             });
             let weak = Rc::downgrade(&pane);
             factory.connect_unbind(move |_, item| {
@@ -3782,6 +3800,9 @@ impl ChatPane {
                 let Some(holder) = item.child().and_downcast::<gtk::Box>() else {
                     return;
                 };
+                if let Some(pane) = weak.upgrade() {
+                    pane.row_bar.unbound(item);
+                }
                 let entry = item
                     .item()
                     .and_downcast::<glib::BoxedAnyObject>()
@@ -11819,6 +11840,10 @@ impl ChatPane {
                 report(&pane, "jumped to the middle", &held);
                 return;
             }
+            if std::env::var("TASTE_PROBE_HISTORY_AT").as_deref() == Ok("drag") {
+                pane.probe_drag().await;
+                return;
+            }
             let mut steps = 0;
             let mut blank = 0;
             while adjustment.value() > 0.0 && steps < 4000 {
@@ -11854,6 +11879,127 @@ impl ChatPane {
             glib::timeout_future(std::time::Duration::from_millis(1600)).await;
             report(&pane, "back at the bottom", &held);
         });
+    }
+
+    /// `TASTE_PROBE_HISTORY_AT=drag`: the scrollbar's slider dragged from
+    /// the bottom to halfway, held still, nudged a pixel either way, and
+    /// dragged on to the top, a motion a frame — as GtkRange moves it: each
+    /// motion sets the bar's value to the pointer's place in the trough
+    /// times the bar's range as it stands at that moment, and nothing sets
+    /// it between motions. Prints where the slider is drawn against where
+    /// the pointer holds it, in pixels; how often the extent changed; and
+    /// how often the view moved against the pointer — the row at its top
+    /// going down while the slider went up (`chat/rowbar.rs`).
+    async fn probe_drag(self: &Rc<Self>) {
+        let rows = self.row_bar.rows().clone();
+        let pixels = self.transcript_scroller.vadjustment();
+        let trough = f64::from(self.transcript_scroller.height());
+        // The slider's travel: the trough less the slider's own length.
+        let travel = |rows: &gtk::Adjustment| {
+            let upper = rows.upper().max(1.0);
+            (trough * (1.0 - rows.page_size() / upper)).max(1.0)
+        };
+        let slider = |rows: &gtk::Adjustment| {
+            let span = (rows.upper() - rows.page_size()).max(1.0);
+            rows.value() / span * travel(rows)
+        };
+        let frames = 180;
+        enum Motion {
+            To(f64),
+            Still,
+        }
+        let mut path: Vec<(&str, Motion)> = Vec::new();
+        for i in 0..=frames {
+            path.push((
+                "down to half",
+                Motion::To(1.0 - 0.5 * f64::from(i) / f64::from(frames)),
+            ));
+        }
+        for _ in 0..60 {
+            path.push(("held", Motion::Still));
+        }
+        for i in 0..40 {
+            let nudge = if i % 2 == 0 {
+                0.5
+            } else {
+                0.5 + 1.0 / travel(&rows)
+            };
+            path.push(("nudged", Motion::To(nudge)));
+        }
+        for i in 0..=frames {
+            path.push((
+                "on to the top",
+                Motion::To(0.5 - 0.5 * f64::from(i) / f64::from(frames)),
+            ));
+        }
+        self.row_bar.probe_drag(true);
+        let mut pointer = slider(&rows);
+        let (mut worst, mut moves, mut extent, mut against) = (0.0f64, 0, 0, 0);
+        let mut phase = path[0].0;
+        let mut upper = pixels.upper();
+        let mut top = self.rows_on_screen().map(|(first, _)| first);
+        let say = |phase: &str, worst: f64, moves: i32, extent: i32, against: i32| {
+            println!(
+                "probe drag: {phase}: slider off the pointer by up to {worst:.0}px, moved under a \
+                 still pointer {moves} times, extent changed {extent} times, view moved against \
+                 the pointer {against} times"
+            );
+        };
+        for (n, (name, motion)) in path.iter().enumerate() {
+            if *name != phase {
+                say(phase, worst, moves, extent, against);
+                (worst, moves, extent, against) = (0.0, 0, 0, 0);
+                phase = name;
+            }
+            let before = slider(&rows);
+            if let Motion::To(fraction) = motion {
+                pointer = fraction * travel(&rows);
+                rows.set_value(fraction * (rows.upper() - rows.page_size()).max(0.0));
+            }
+            glib::timeout_future(std::time::Duration::from_millis(16)).await;
+            let shown = slider(&rows);
+            let off = (shown - pointer).abs();
+            worst = worst.max(off);
+            if matches!(motion, Motion::Still) && (shown - before).abs() >= 1.0 {
+                moves += 1;
+            }
+            if (pixels.upper() - upper).abs() >= 1.0 {
+                extent += 1;
+                upper = pixels.upper();
+            }
+            let now = self.rows_on_screen().map(|(first, _)| first);
+            if let (Some(was), Some(now)) = (top, now) {
+                if now > was {
+                    against += 1;
+                }
+            }
+            top = now.or(top);
+            if n % 60 == 0 {
+                println!("probe drag: frame {n}: {}", self.row_bar.probe_state());
+            }
+            if off >= 4.0 || n % 30 == 0 {
+                println!(
+                    "probe drag: frame {n} {name}: pointer {pointer:.0}px, slider {shown:.0}px \
+                     (off {off:.0}), row {:?}, value {:.0} of {:.0}, banner {}, top {:?}",
+                    now,
+                    pixels.value(),
+                    pixels.upper(),
+                    self.jump_banner.reveals_child(),
+                    self.probe_top_text()
+                );
+            }
+        }
+        say(phase, worst, moves, extent, against);
+        self.row_bar.probe_drag(false);
+        glib::timeout_future(std::time::Duration::from_millis(600)).await;
+        println!(
+            "probe drag: let go: row {:?}, slider {:.0}px, value {:.0} of {:.0}, top {:?}",
+            self.rows_on_screen().map(|(first, _)| first),
+            slider(&rows),
+            pixels.value(),
+            pixels.upper(),
+            self.probe_top_text()
+        );
     }
 
     /// TASTE_PROBE_CHECK only: the text of the first drawn row reaching

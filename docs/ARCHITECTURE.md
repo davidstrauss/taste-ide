@@ -506,6 +506,19 @@ line, its light, and a streaming answer's words patched in place, and
 anything else built again. The reader can scroll to the first message the
 record holds (up to the newest 32 MiB of it).
 
+**The transcript's scrollbar counts rows, not pixels** (`chat/rowbar.rs`).
+The list knows the height of only the rows it has built and estimates the
+rest from them, so its extent swings with whichever rows are built — by
+thousands of pixels in a conversation of one-line steps and screen-tall
+answers — and a scrollbar drawn from it jittered under a dragging pointer
+until it was unusable (David, 2026-10-19). Its slider is the item at the
+top of the view and the items on screen, which no measuring moves; a drag
+takes the view to the item the slider names, and between drags the bar
+follows the view. The wheel, the touchpad, and the keys scroll in pixels
+as before. It is drawn and faded as the native overlay indicator is. For
+the same reason, the jump banner's "new below" is new items, never the
+extent growing.
+
 **A prompt is a row from the moment it is sent.** The IDE gives each
 prompt it sends an id, carried as the `messageId` of its records, and the
 record gets the prompt as it is sent — its message, and the notes it was

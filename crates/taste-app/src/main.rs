@@ -631,6 +631,18 @@ fn main() -> glib::ExitCode {
                     read, not chosen. */\n\
                  listview.transcript > row { padding: 0; margin: 0; \
                    min-height: 0; background: none; outline: none; }\n\
+                 /* The transcript's scrollbar counts rows (chat/rowbar.rs), \
+                    so it is a scrollbar of its own rather than the \
+                    scrolled window's, and the fading the scrolled window \
+                    does for its indicator is done here: up while the view \
+                    moves, the pointer is over it, or it is held, and \
+                    faded out after. */\n\
+                 scrollbar.row-scrollbar.overlay-indicator { opacity: 0; \
+                   transition: opacity 400ms ease-out; }\n\
+                 scrollbar.row-scrollbar.overlay-indicator.shown, \
+                 scrollbar.row-scrollbar.overlay-indicator.hovering, \
+                 scrollbar.row-scrollbar.overlay-indicator.dragging { \
+                   opacity: 1; transition-duration: 100ms; }\n\
                  /* A prompt the agent refused stays where it was sent, \
                     its words set back and the refusal in the error colour \
                     under them (chat/rows.rs::user_widget). */\n\
