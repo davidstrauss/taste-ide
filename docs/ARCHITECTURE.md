@@ -503,10 +503,25 @@ unbinds. The list keeps the reader's place as items are measured, binds
 only those near the view, and recycles the rest; nothing stands in for a
 row not yet drawn. A change to a row is drawn where the list has it: its
 line, its light, and a streaming answer's words patched in place, and
-anything else built again. The prompt cards of a live send are the one
-kind of item the pane keeps whole, until the agent takes them. The reader
-can scroll to the first message the record holds (up to the newest 32 MiB
-of it).
+anything else built again. The reader can scroll to the first message the
+record holds (up to the newest 32 MiB of it).
+
+**A prompt is a row from the moment it is sent.** The IDE gives each
+prompt it sends an id, carried as the `messageId` of its records, and the
+record gets the prompt as it is sent — its message, and the notes it was
+briefed with — then where it got to, as it gets there: taken (with the note
+it went out after, if it waited behind a turn), refused (with what the
+agent said), not sent, lost with the agent, or withdrawn. That delivery is
+data on the prompt's row, and its card is drawn from it: the badge, Ask for
+a Turn, the refusal. A prompt taken after a turn it was typed during moves
+to where the agent took it, its notes with it, and leaves a marker where it
+was typed; because the move is the model's, a restore makes it too. A
+refused prompt stays where it was sent, marked (David, 2026-10-20: "For a
+prompt the agent refuses, keep it and mark it refused"). A session's mark,
+or a replay put in the record's place, is followed by the prompts still on
+their way, which the agent's history does not have yet; and a restore that
+finds a prompt never taken, which nothing in this process is holding, says
+it was not delivered.
 
 **What mediation is for.** The IDE still serves the agent files, search
 and commands, and it is worth being exact about why:

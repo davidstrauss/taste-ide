@@ -37,6 +37,50 @@ use super::{
 
 pub(super) type RowId = u64;
 
+/// A prompt the IDE sent, by the `messageId` its records carry: ids of
+/// the IDE's own begin with [`PROMPT_PREFIX`], so an agent's own message
+/// ids, on a replay, are never taken for one.
+pub(super) type PromptId = String;
+
+pub(super) const PROMPT_PREFIX: &str = "taste-prompt-";
+
+/// Where a prompt the IDE sent has got to: data on its row, which its card
+/// is drawn from — the badge, Ask for a Turn, and the refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Delivery {
+    /// In the agent's history, as everything a replay brings back is.
+    Delivered,
+    /// Gone to the agent, which has not started on it yet.
+    Sent,
+    /// Waiting behind the turn under way: Ask for a Turn is offered.
+    Queued,
+    /// Ask for a Turn pressed; `told` once the agent has been told.
+    Asking { told: bool },
+    /// Held for the agent or its environment to come up: what it is
+    /// waiting for, in words.
+    Held(String),
+    /// Taken after waiting behind a turn: the note it went out after.
+    Waited(String),
+    /// The agent refused it: what it said.
+    Refused(String),
+    /// Never sent: what went wrong.
+    NotSent(String),
+    /// The agent stopped before it took it.
+    Lost,
+    /// Read back from the record never taken: the IDE closed first.
+    Undelivered,
+}
+
+impl Delivery {
+    /// Still on its way: neither taken nor given up on.
+    pub fn in_flight(&self) -> bool {
+        matches!(
+            self,
+            Delivery::Sent | Delivery::Queued | Delivery::Asking { .. } | Delivery::Held(_)
+        )
+    }
+}
+
 /// A row's piece of the timeline's line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Rail {
@@ -64,9 +108,9 @@ pub(super) enum Dot {
 pub(super) struct User {
     pub text: String,
     pub attachments: Vec<(String, ContentBlock)>,
-    /// The badge a message that waited behind a turn wears, and the note it
-    /// went out after.
-    pub badge: Option<(String, String)>,
+    /// The IDE's id for it, for a prompt it sent and is following.
+    pub prompt: Option<PromptId>,
+    pub delivery: Delivery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +186,12 @@ pub(super) enum Kind {
     Task(Task),
     Plan(PlanCard),
     Note(String),
+    /// Where a prompt was typed, which the agent took further down: the
+    /// line runs through it when there are steps either side.
+    Marker {
+        prompt: PromptId,
+        through: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +206,8 @@ pub(super) struct Row {
     /// When it was added, unix seconds: what a search hit says instead of
     /// a row number.
     pub at: u64,
+    /// The prompt a note is about — its briefing — which it moves with.
+    pub of_prompt: Option<PromptId>,
 }
 
 impl Row {
@@ -175,6 +227,7 @@ impl Row {
                 .collect::<Vec<_>>()
                 .join("\n"),
             Kind::Note(text) => text.clone(),
+            Kind::Marker { .. } => String::new(),
         }
     }
 }
@@ -184,6 +237,7 @@ impl Row {
 pub(super) enum Change {
     Added(RowId),
     Changed(RowId),
+    Removed(RowId),
 }
 
 /// The transcript's rows, and the state of the drawing of the turn under
@@ -212,6 +266,11 @@ pub(super) struct Model {
     /// The answers since the turn's last step of work: what its suggested
     /// replies choose between, shown whole when they are offered.
     turn_answers: Vec<RowId>,
+    /// The prompts the IDE sent, by id, and the notes each was briefed
+    /// with: a prompt's records said twice — once more after a session's
+    /// mark — make it once.
+    prompts: HashMap<PromptId, RowId>,
+    prompt_notes: HashMap<PromptId, Vec<String>>,
 }
 
 impl Model {
@@ -294,9 +353,30 @@ impl Model {
             dot,
             lit: false,
             at,
+            of_prompt: None,
         });
         self.changes.push(Change::Added(id));
         id
+    }
+
+    /// Take row `id` out.
+    fn remove(&mut self, id: RowId) {
+        let Some(at) = self.index.remove(&id) else {
+            return;
+        };
+        self.rows.remove(at);
+        for (index, row) in self.rows.iter().enumerate().skip(at) {
+            self.index.insert(row.id, index);
+        }
+        let unseen = self.changes.contains(&Change::Added(id));
+        self.changes
+            .retain(|change| !matches!(change, Change::Added(x) | Change::Changed(x) if *x == id));
+        if !unseen {
+            self.changes.push(Change::Removed(id));
+        }
+        if self.last_step == Some(id) {
+            self.last_step = None;
+        }
     }
 
     /// A row on the timeline: its line runs up from the step before, or
@@ -335,15 +415,6 @@ impl Model {
             self.changed(last);
         }
         self.after_prompt = true;
-    }
-
-    /// A prompt drawn by the pane rather than from the record — the card a
-    /// live send shows — ends the turn before it, as one drawn here does:
-    /// its plan, its answers, and the timeline above at its last dot.
-    pub fn prompt_shown(&mut self) {
-        self.plan = None;
-        self.turn_answers.clear();
-        self.end_steps();
     }
 
     /// The line runs on down from step `id` again: a prompt that ended it
@@ -396,9 +467,27 @@ impl Model {
         }
         match update {
             SessionUpdate::UserMessageChunk(chunk) => {
+                // A prompt the IDE sent says so in its `messageId`, and a
+                // change of id is a new message.
+                let prompt = chunk
+                    .message_id
+                    .as_ref()
+                    .map(|id| id.0.to_string())
+                    .filter(|id| id.starts_with(PROMPT_PREFIX));
+                if prompt.is_some()
+                    && self
+                        .pending_user
+                        .as_ref()
+                        .is_some_and(|pending| pending.prompt != prompt)
+                {
+                    self.flush_user();
+                }
                 let pending = self
                     .pending_user
                     .get_or_insert_with(PendingUserMessage::default);
+                if prompt.is_some() {
+                    pending.prompt = prompt;
+                }
                 match content_text(&chunk.content) {
                     Some(text) if text.trim_end().ends_with(BRIEFING_TAIL) => {
                         pending.briefed.extend(briefing_notes(&text));
@@ -739,6 +828,197 @@ impl Model {
         self.push_step(Kind::Note(text.to_string()), Dot::Note)
     }
 
+    /// A note about prompt `prompt` — what it was briefed with — which goes
+    /// where it goes. Said again for the same prompt, it is not drawn
+    /// again.
+    pub fn prompt_note(&mut self, prompt: &str, text: &str) -> Option<RowId> {
+        let said = self.prompt_notes.entry(prompt.to_string()).or_default();
+        if said.iter().any(|note| note == text) {
+            return None;
+        }
+        said.push(text.to_string());
+        let id = self.note(text);
+        if let Some(row) = self.row_mut(id) {
+            row.of_prompt = Some(prompt.to_string());
+        }
+        Some(id)
+    }
+
+    /// A prompt the IDE is sending, as its card, from the moment it is
+    /// sent: it ends the turn before it, as any prompt does.
+    pub fn prompt_sent(
+        &mut self,
+        prompt: &str,
+        text: String,
+        attachments: Vec<(String, ContentBlock)>,
+        delivery: Delivery,
+    ) -> RowId {
+        if let Some(id) = self.prompts.get(prompt) {
+            return *id;
+        }
+        self.close_stream();
+        self.user_row(text, attachments, Some(prompt.to_string()), delivery)
+    }
+
+    /// The row prompt `prompt` is.
+    pub fn prompt_row(&self, prompt: &str) -> Option<RowId> {
+        self.prompts.get(prompt).copied()
+    }
+
+    /// The prompt row `id` is about: a prompt's own card, or its marker.
+    pub fn prompt_of(&self, id: RowId) -> Option<&str> {
+        match &self.row(id)?.kind {
+            Kind::User(user) => user.prompt.as_deref(),
+            Kind::Marker { prompt, .. } => Some(prompt),
+            _ => None,
+        }
+    }
+
+    /// Where prompt `prompt` has got to.
+    pub fn delivery(&self, prompt: &str) -> Option<&Delivery> {
+        match &self.row(*self.prompts.get(prompt)?)?.kind {
+            Kind::User(user) => Some(&user.delivery),
+            _ => None,
+        }
+    }
+
+    /// The prompts still on their way.
+    pub fn in_flight(&self) -> Vec<PromptId> {
+        self.prompts
+            .iter()
+            .filter(|(prompt, _)| self.delivery(prompt).is_some_and(Delivery::in_flight))
+            .map(|(prompt, _)| prompt.clone())
+            .collect()
+    }
+
+    /// Prompt `prompt` has got to `delivery`.
+    pub fn set_delivery(&mut self, prompt: &str, delivery: Delivery) {
+        let Some(id) = self.prompts.get(prompt).copied() else {
+            return;
+        };
+        if let Some(Row {
+            kind: Kind::User(user),
+            ..
+        }) = self.row_mut(id)
+        {
+            if user.delivery == delivery {
+                return;
+            }
+            user.delivery = delivery;
+        }
+        self.changed(id);
+    }
+
+    /// The agent has taken prompt `prompt` — after waiting behind a turn,
+    /// with the note it went out after. Where anything has been drawn since
+    /// it was typed, it moves to the end, where the conversation took it,
+    /// with its notes, and a marker stays where it was typed: a whole turn
+    /// between a prompt and its answer read as the prompt coming before
+    /// answers it never saw.
+    pub fn prompt_taken(&mut self, prompt: &str, waited: Option<String>) {
+        let Some(old) = self.prompts.get(prompt).copied() else {
+            return;
+        };
+        self.set_delivery(
+            prompt,
+            match waited {
+                Some(note) => Delivery::Waited(note),
+                None => Delivery::Delivered,
+            },
+        );
+        let Some(at) = self.index.get(&old).copied() else {
+            return;
+        };
+        let ours = |row: &Row| row.of_prompt.as_deref() == Some(prompt);
+        if self.rows[at + 1..].iter().all(ours) {
+            return;
+        }
+        self.finalize();
+        let notes: Vec<(RowId, String)> = self.rows[at + 1..]
+            .iter()
+            .filter(|row| ours(row))
+            .filter_map(|row| match &row.kind {
+                Kind::Note(text) => Some((row.id, text.clone())),
+                _ => None,
+            })
+            .collect();
+        // The line runs on through the marker between two steps (David,
+        // 2026-10-05: "This shouldn't break the line between the bullets
+        // on the left").
+        let above = at
+            .checked_sub(1)
+            .and_then(|before| self.rows.get(before))
+            .filter(|row| row.rail.is_some())
+            .map(|row| row.id);
+        let below = self.rows[at + 1..]
+            .iter()
+            .find(|row| !ours(row))
+            .is_some_and(|row| row.rail.is_some());
+        let through = above.is_some() && below;
+        let Some(Kind::User(user)) = self.row(old).map(|row| row.kind.clone()) else {
+            return;
+        };
+        if let Some(row) = self.row_mut(old) {
+            row.kind = Kind::Marker {
+                prompt: prompt.to_string(),
+                through,
+            };
+        }
+        self.changed(old);
+        for (id, _) in &notes {
+            self.remove(*id);
+        }
+        if let Some(above) = above.filter(|_| through) {
+            self.rejoin(above);
+        }
+        // Seated again as a prompt is: the timeline above ends at its last
+        // dot, and the next step's line runs up from the box.
+        self.plan = None;
+        self.turn_answers.clear();
+        self.end_steps();
+        let id = self.push(Kind::User(user), None, Dot::Plain);
+        self.prompts.insert(prompt.to_string(), id);
+        self.last_prompt = Some(id);
+        for (_, text) in notes {
+            let id = self.push_step(Kind::Note(text), Dot::Note);
+            if let Some(row) = self.row_mut(id) {
+                row.of_prompt = Some(prompt.to_string());
+            }
+        }
+    }
+
+    /// Take prompt `prompt` out, with its notes and its marker: withdrawn
+    /// before it went, it is no part of the conversation.
+    pub fn remove_prompt(&mut self, prompt: &str) {
+        let ids: Vec<RowId> = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.of_prompt.as_deref() == Some(prompt) || self.prompt_of(row.id) == Some(prompt)
+            })
+            .map(|row| row.id)
+            .collect();
+        for id in ids {
+            self.remove(id);
+        }
+        self.prompts.remove(prompt);
+        if self.last_prompt.is_some_and(|id| self.row(id).is_none()) {
+            self.last_prompt = None;
+        }
+    }
+
+    /// One of the IDE's records of where a prompt got to, read back.
+    fn delivery_record(&mut self, prompt: &str, state: &str, detail: Option<String>) {
+        match state {
+            "taken" => self.prompt_taken(prompt, detail),
+            "refused" => self.set_delivery(prompt, Delivery::Refused(detail.unwrap_or_default())),
+            "notSent" => self.set_delivery(prompt, Delivery::NotSent(detail.unwrap_or_default())),
+            "lost" => self.set_delivery(prompt, Delivery::Lost),
+            "withdrawn" => self.remove_prompt(prompt),
+            _ => {}
+        }
+    }
+
     /// Rewrite a note in place.
     pub fn rewrite_note(&mut self, id: RowId, text: &str) {
         if let Some(row) = self.row_mut(id) {
@@ -761,14 +1041,33 @@ impl Model {
             return;
         };
         let briefed = std::mem::take(&mut pending.briefed);
+        let prompt = pending.prompt.clone();
         self.user_message(pending);
         for note in briefed {
-            self.note(&note);
+            match &prompt {
+                Some(prompt) => {
+                    self.prompt_note(prompt, &note);
+                }
+                None => {
+                    self.note(&note);
+                }
+            }
         }
     }
 
     fn user_message(&mut self, pending: PendingUserMessage) {
         if pending.text.trim().is_empty() && pending.attachments.is_empty() {
+            return;
+        }
+        // A prompt the IDE sent, as it recorded it: once, whatever said it
+        // again, and on its way until a record says where it got to.
+        if let Some(prompt) = pending.prompt {
+            self.prompt_sent(
+                &prompt,
+                pending.text.trim_end().to_string(),
+                pending.attachments,
+                Delivery::Sent,
+            );
             return;
         }
         // The agent's block, if one is open, belongs above this message.
@@ -804,23 +1103,20 @@ impl Model {
                 } else {
                     Vec::new()
                 };
-                self.user_row(
-                    rest,
-                    attachments,
-                    Some((taste_core::queued::badge(&note), note)),
-                );
+                self.user_row(rest, attachments, None, Delivery::Waited(note));
             }
             return;
         }
-        self.user_row(text, pending.attachments, None);
+        self.user_row(text, pending.attachments, None, Delivery::Delivered);
     }
 
     fn user_row(
         &mut self,
         text: String,
         attachments: Vec<(String, ContentBlock)>,
-        badge: Option<(String, String)>,
-    ) {
+        prompt: Option<PromptId>,
+        delivery: Delivery,
+    ) -> RowId {
         // A prompt starts a turn: the turn owns its plan and its answer, and
         // the timeline above ends at its last dot.
         self.plan = None;
@@ -831,12 +1127,17 @@ impl Model {
             Kind::User(User {
                 text,
                 attachments,
-                badge,
+                prompt: prompt.clone(),
+                delivery,
             }),
             None,
             Dot::Plain,
         );
+        if let Some(prompt) = prompt {
+            self.prompts.insert(prompt, id);
+        }
         self.last_prompt = Some(id);
+        id
     }
 
     fn close_stream(&mut self) {
@@ -977,6 +1278,29 @@ impl Model {
         }
     }
 
+    /// One entry of the record, read.
+    pub fn read(&mut self, record: Record) {
+        match record {
+            Record::Update(update) => self.apply(*update, false),
+            Record::Note { text, prompt } => match prompt {
+                Some(prompt) => {
+                    self.prompt_note(&prompt, &text);
+                }
+                None => {
+                    self.note(&text);
+                }
+            },
+            Record::Delivery {
+                prompt,
+                state,
+                detail,
+            } => {
+                self.finalize();
+                self.delivery_record(&prompt, &state, detail);
+            }
+        }
+    }
+
     /// The model of `updates`, read as a record is read back, its first
     /// row `first`: what a restore draws, built off the main thread. Its
     /// mirror lines are left to take; its changes are not, since every row
@@ -984,12 +1308,7 @@ impl Model {
     pub fn of_record(first: RowId, updates: Vec<Record>) -> Model {
         let mut model = Model::starting_at(first);
         for record in updates {
-            match record {
-                Record::Update(update) => model.apply(*update, false),
-                Record::Note(text) => {
-                    model.note(&text);
-                }
-            }
+            model.read(record);
         }
         model.finalize();
         model.settle_running();
@@ -1002,19 +1321,61 @@ impl Model {
 #[derive(Debug, Clone)]
 pub(super) enum Record {
     Update(Box<SessionUpdate>),
-    Note(String),
+    /// The IDE's note, and the prompt it is about, if it is a briefing's.
+    Note {
+        text: String,
+        prompt: Option<PromptId>,
+    },
+    /// Where a prompt the IDE sent got to: `taken` (with the note it went
+    /// out after, if it waited), `refused` or `notSent` (with why),
+    /// `lost`, or `withdrawn`.
+    Delivery {
+        prompt: PromptId,
+        state: String,
+        detail: Option<String>,
+    },
 }
+
+/// The key a record of a prompt's delivery is kept under, its id the value.
+pub(super) const DELIVERY_RECORD: &str = "tasteDelivery";
+/// The key the prompt a note is about is kept under, beside the note.
+pub(super) const NOTE_PROMPT: &str = "tastePrompt";
 
 impl Record {
     pub fn update(update: SessionUpdate) -> Record {
         Record::Update(Box::new(update))
     }
 
-    /// A record's JSON as an entry: an update, the IDE's note, or `None`
-    /// for what draws nothing (a session's marker) or does not parse.
+    #[cfg(test)]
+    pub fn note(text: &str) -> Record {
+        Record::Note {
+            text: text.to_string(),
+            prompt: None,
+        }
+    }
+
+    /// A record's JSON as an entry: an update, the IDE's note, where a
+    /// prompt got to, or `None` for what draws nothing (a session's marker)
+    /// or does not parse.
     pub fn parse(value: serde_json::Value, note_key: &str) -> Option<Record> {
-        if let Some(note) = value.get(note_key).and_then(serde_json::Value::as_str) {
-            return Some(Record::Note(note.to_string()));
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        if let Some(note) = text(note_key) {
+            return Some(Record::Note {
+                text: note,
+                prompt: text(NOTE_PROMPT),
+            });
+        }
+        if let Some(prompt) = text(DELIVERY_RECORD) {
+            return Some(Record::Delivery {
+                prompt,
+                state: text("state").unwrap_or_default(),
+                detail: text("detail"),
+            });
         }
         serde_json::from_value::<SessionUpdate>(value)
             .ok()
@@ -1062,7 +1423,7 @@ mod tests {
         records.push(Record::update(SessionUpdate::AgentMessageChunk(text(
             "every time.",
         ))));
-        records.push(Record::Note("a note between turns".into()));
+        records.push(Record::note("a note between turns"));
         records.push(Record::update(SessionUpdate::UserMessageChunk(text(
             "Fix it.",
         ))));
@@ -1080,9 +1441,8 @@ mod tests {
         for record in conversation() {
             match record {
                 Record::Update(update) => live.apply(*update, false),
-                Record::Note(note) => {
-                    live.note(&note);
-                }
+                note @ Record::Note { .. } => live.read(note),
+                delivery @ Record::Delivery { .. } => live.read(delivery),
             }
         }
         live.finalize();
@@ -1121,6 +1481,7 @@ mod tests {
                     Kind::Plan(_) => "plan",
                     Kind::Answer(_) => "answer",
                     Kind::Note(_) => "note",
+                    Kind::Marker { .. } => "marker",
                     Kind::Task(_) => "task",
                 };
                 (what.to_string(), row.rail)
@@ -1152,5 +1513,142 @@ mod tests {
         };
         assert!(!last.running);
         assert_eq!(last.tone, "cut");
+    }
+
+    fn said(prompt: &str, words: &str) -> Record {
+        Record::update(SessionUpdate::UserMessageChunk(
+            text(words).message_id(agent_client_protocol::schema::v1::MessageId::new(prompt)),
+        ))
+    }
+
+    fn step(id: &str) -> Record {
+        let mut call = ToolCall::new(id.to_string(), format!("Read {id}.rs"));
+        call.status = ToolCallStatus::Completed;
+        Record::update(SessionUpdate::ToolCall(call))
+    }
+
+    fn taken(prompt: &str, waited: Option<&str>) -> Record {
+        Record::Delivery {
+            prompt: prompt.into(),
+            state: "taken".into(),
+            detail: waited.map(str::to_string),
+        }
+    }
+
+    /// What a row is, for comparing two models: its kind and words, its
+    /// line, and where its prompt got to.
+    fn shape(model: &Model) -> Vec<String> {
+        model
+            .rows()
+            .iter()
+            .map(|row| match &row.kind {
+                Kind::User(user) => format!("user {:?} {:?}", user.text, user.delivery),
+                Kind::Marker { through, .. } => format!("marker through={through}"),
+                Kind::Note(text) => format!("note {text:?} {:?}", row.rail),
+                Kind::Step(step) => format!("step {} {:?}", step.call, row.rail),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A message typed during a turn and taken after it is drawn where it
+    /// was taken, its briefing with it, and a marker where it was typed
+    /// with the line running through it — lived, and read back from the
+    /// record, the same.
+    #[test]
+    fn a_prompt_taken_after_a_turn_moves_and_leaves_its_marker() {
+        let first = format!("{PROMPT_PREFIX}1");
+        let second = format!("{PROMPT_PREFIX}2");
+        let mut live = Model::default();
+        live.prompt_sent(&first, "Fix it.".into(), Vec::new(), Delivery::Sent);
+        live.prompt_taken(&first, None);
+        live.read(step("a"));
+        live.prompt_sent(
+            &second,
+            "And the docs.".into(),
+            Vec::new(),
+            Delivery::Queued,
+        );
+        live.prompt_note(&second, "oriented with this prompt");
+        live.read(step("b"));
+        live.prompt_taken(&second, Some("[queued note]".into()));
+        live.read(step("c"));
+        let rows = shape(&live);
+        assert!(
+            rows[0].starts_with("user \"Fix it.\" Delivered"),
+            "{rows:#?}"
+        );
+        assert!(rows[1].starts_with("step a"), "{rows:#?}");
+        assert_eq!(rows[2], "marker through=true", "{rows:#?}");
+        assert!(rows[3].starts_with("step b"), "{rows:#?}");
+        assert!(rows[4].contains("Waited"), "{rows:#?}");
+        assert!(rows[5].starts_with("note \"oriented"), "{rows:#?}");
+        assert!(rows[6].starts_with("step c"), "{rows:#?}");
+        assert_eq!(rows.len(), 7);
+        // The step above the marker runs on down through it.
+        let Some(Rail { bottom, .. }) = live.rows()[1].rail else {
+            panic!("a step")
+        };
+        assert!(bottom);
+
+        // As recorded: each prompt as it was sent, where it got to as it
+        // got there — and the second prompt's message said twice, as a
+        // session's mark says it again.
+        let record = vec![
+            said(&first, "Fix it."),
+            taken(&first, None),
+            step("a"),
+            said(&second, "And the docs."),
+            Record::Note {
+                text: "oriented with this prompt".into(),
+                prompt: Some(second.clone()),
+            },
+            said(&second, "And the docs."),
+            step("b"),
+            taken(&second, Some("[queued note]")),
+            step("c"),
+        ];
+        let restored = Model::of_record(0, record);
+        assert_eq!(shape(&restored), rows);
+    }
+
+    /// A prompt the agent refused stays, marked; one withdrawn before it
+    /// went goes, with its notes.
+    #[test]
+    fn a_refused_prompt_stays_and_a_withdrawn_one_goes() {
+        let refused = format!("{PROMPT_PREFIX}r");
+        let withdrawn = format!("{PROMPT_PREFIX}w");
+        let model = Model::of_record(
+            0,
+            vec![
+                said(&refused, "Delete everything."),
+                Record::Delivery {
+                    prompt: refused.clone(),
+                    state: "refused".into(),
+                    detail: Some("no".into()),
+                },
+                said(&withdrawn, "REBUILD RESULT"),
+                Record::Note {
+                    text: "briefed".into(),
+                    prompt: Some(withdrawn.clone()),
+                },
+                Record::Delivery {
+                    prompt: withdrawn.clone(),
+                    state: "withdrawn".into(),
+                    detail: None,
+                },
+            ],
+        );
+        assert_eq!(
+            shape(&model),
+            vec![format!(
+                "user \"Delete everything.\" {:?}",
+                Delivery::Refused("no".into())
+            )]
+        );
+        // Never taken, and in nobody's hands: on its way, for the pane to
+        // call undelivered.
+        let stranded = Model::of_record(0, vec![said(&withdrawn, "Hello?")]);
+        assert_eq!(stranded.in_flight(), vec![withdrawn]);
     }
 }

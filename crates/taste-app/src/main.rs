@@ -631,6 +631,10 @@ fn main() -> glib::ExitCode {
                     read, not chosen. */\n\
                  listview.transcript > row { padding: 0; margin: 0; \
                    min-height: 0; background: none; outline: none; }\n\
+                 /* A prompt the agent refused stays where it was sent, \
+                    its words set back and the refusal in the error colour \
+                    under them (chat/rows.rs::user_widget). */\n\
+                 .card.refused label:not(.error) { opacity: 0.55; }\n\
                  /* The transcript reads at a chat's scale, not a document's \
                     (David, 2026-09-07, beside Claude Code's: the scale and \
                     spacing are still much better there): body text a step down \

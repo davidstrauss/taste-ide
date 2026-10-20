@@ -504,16 +504,6 @@ enum Item {
     Widget(gtk::Widget),
 }
 
-/// A widget item: `child` in a row of its own, which wears the blue when
-/// its document is the tab in front.
-fn widget_item(child: &impl IsA<gtk::Widget>) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    row.add_css_class("transcript-row");
-    row.append(child);
-    stamp_widget(row.upcast_ref());
-    row
-}
-
 /// Whether `a` and `b` are the same item of the transcript.
 fn same_item(a: &Item, b: &Item) -> bool {
     match (a, b) {
@@ -593,13 +583,46 @@ fn replayed_replies(records: &[model::Record]) -> Vec<String> {
     replies
 }
 
-/// The record of one block of the user's message: the update a replay
-/// brings it back as.
-fn user_record(block: &ContentBlock) -> serde_json::Value {
-    serde_json::to_value(SessionUpdate::UserMessageChunk(
-        agent_client_protocol::schema::v1::ContentChunk::new(block.clone()),
-    ))
-    .unwrap_or_default()
+/// Where a prompt sent now starts: queued behind the turn under way, when
+/// it was written during one.
+fn queued_or_sent(written: &Option<taste_core::queued::Queued>) -> model::Delivery {
+    if written.is_some() {
+        model::Delivery::Queued
+    } else {
+        model::Delivery::Sent
+    }
+}
+
+/// A fresh id for a prompt the IDE sends (`model::PromptId`).
+fn new_prompt_id() -> model::PromptId {
+    thread_local! {
+        static NEXT: Cell<u64> = const { Cell::new(0) };
+    }
+    let n = NEXT.with(|next| {
+        let n = next.get() + 1;
+        next.set(n);
+        n
+    });
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or_default();
+    format!("{}{at:x}-{n}", model::PROMPT_PREFIX)
+}
+
+/// A prompt's blocks as the user's message, as its records: chunks of one
+/// message, its `messageId` the prompt's id.
+fn prompt_records(prompt: &str, blocks: &[ContentBlock]) -> Vec<serde_json::Value> {
+    blocks
+        .iter()
+        .map(|block| {
+            serde_json::to_value(SessionUpdate::UserMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new(block.clone())
+                    .message_id(agent_client_protocol::schema::v1::MessageId::new(prompt)),
+            ))
+            .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// Whether `update` draws rows, rather than setting the chat's state.
@@ -914,10 +937,6 @@ pub struct ChatPane {
     /// "which conversation does this environment have", and which pane the
     /// user sees is the environment panel's decision alone.
     environment: EnvironmentId,
-    /// The live prompts' documents (`prompt_card`), by key: the widget the
-    /// blue lands on while one is the tab in front. A row's own documents
-    /// are keyed by its id (`row_doc`).
-    doc_widgets: RefCell<HashMap<String, glib::WeakRef<gtk::Widget>>>,
     /// The item whose document is the tab in front.
     lit: RefCell<Option<Item>>,
     /// Who opens a document in the editor (chats.rs → editor.rs).
@@ -1042,7 +1061,7 @@ pub struct ChatPane {
     /// Drawing from the record, this moment ([`ChatPane::as_recorded`]).
     from_record: Cell<bool>,
     /// A prompt's records and notes being gathered (`send_blocks`).
-    holding: RefCell<Option<Unrecorded>>,
+    holding: RefCell<Option<Holding>>,
     /// The stash's reads and writes, in the order they were asked for
     /// ([`ChatPane::archive_io`]).
     archive_io: RefCell<Option<tokio::task::JoinHandle<()>>>,
@@ -1075,7 +1094,7 @@ pub struct ChatPane {
     /// The queued message whose Ask for a Turn was pressed, until its turn
     /// comes: its badge says when the agent has been told
     /// (`taste_core::nudge`).
-    nudged_badge: RefCell<Option<gtk::Label>>,
+    nudged_prompt: RefCell<Option<model::PromptId>>,
     /// One-shot capture of the next agent reply (commit-message suggestions
     /// and similar utility prompts). The exchange still renders in the
     /// transcript — the IDE never talks to the agent behind the user's back.
@@ -1197,6 +1216,8 @@ struct PendingUserMessage {
     /// The notes for a briefing the IDE sent ahead of the message, as a
     /// replay brings it back: drawn under the card, where live put them.
     briefed: Vec<String>,
+    /// The IDE's id for it, when the IDE sent it and recorded it so.
+    prompt: Option<String>,
 }
 
 /// The notes a briefing came with (`ChatPane::with_briefing`), read back
@@ -1233,32 +1254,26 @@ fn briefing_notes(text: &str) -> Vec<String> {
 struct PendingPrompt {
     /// Where this goes if the agent dies before it is finished with.
     unfinished: Unfinished,
-    card: gtk::Box,
-    /// The "queued" badge, and when and where in the conversation it was
-    /// written (`taste_core::queued`) — absent when nothing was running to
-    /// wait behind.
-    queued: Option<(gtk::Label, taste_core::queued::Queued)>,
-    /// Once the card has been moved to where the agent accepted it, the
-    /// marker left behind at the point it was typed.
-    origin: Option<Item>,
+    /// Its id: its row, its records, and where it has got to.
+    prompt: model::PromptId,
+    text: String,
+    attachments: Vec<(String, ContentBlock)>,
+    /// When and where in the conversation it was written
+    /// (`taste_core::queued`) — absent when nothing was running to wait
+    /// behind.
+    queued: Option<taste_core::queued::Queued>,
     /// Went out inside the prompt ahead of it (`SessionEvent::QueuedJoined`),
     /// so the turn that ends that one ends this too.
     joined: bool,
-    /// What this prompt puts in the record, held until the agent starts
-    /// on it ([`ChatPane::record_taken`]).
-    unrecorded: Unrecorded,
+    /// The agent has taken it ([`ChatPane::record_taken`]).
+    taken: bool,
 }
 
-/// A prompt's records — the user's message as a replay would bring it
-/// back, then the IDE's notes about its briefing — held until the agent
-/// starts on the prompt: its first update, or its turn's end. The notes are
-/// drawn then, under the card. Recorded when it is typed, a message sent
-/// during a turn sat in the middle of that turn, where the agent's own
-/// history does not have it; and a prompt the agent refused, or never
-/// got, stayed in the record and came back on every redraw, twice once
-/// it was sent again.
-#[derive(Default)]
-struct Unrecorded {
+/// A prompt being sent, while its briefing is written
+/// ([`ChatPane::send_blocks`]): the notes it is briefed with are its, in
+/// the transcript and the record.
+struct Holding {
+    prompt: model::PromptId,
     records: Vec<serde_json::Value>,
 }
 
@@ -1302,51 +1317,12 @@ fn guidance_update(seen: u32, current: u32, guidance: &str) -> String {
     )
 }
 
-/// The dim line under a queued prompt's card saying why it has not gone
-/// yet. Built in two places — when the send is accepted, and again if a
-/// session replay clears the transcript before it goes (see
-/// `flush_revive_queue`) — so it is one function.
-fn queued_badge(label: &str) -> gtk::Label {
-    gtk::Label::builder()
-        .label(label)
-        .xalign(0.0)
-        .hexpand(true)
-        .wrap(true)
-        .css_classes(["dim-label", "caption"])
-        .margin_top(CARD_INSET)
-        .margin_bottom(CARD_INSET)
-        .margin_start(CARD_INSET)
-        .margin_end(CARD_INSET)
-        .build()
-}
-
-/// The line a queued badge sits on, with room at its end for Ask for a Turn
-/// (`ChatPane::offer_nudge`).
-fn badge_row(badge: &gtk::Label) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    row.append(badge);
-    row
-}
-
-/// Take Ask for a Turn off a badge's line: the turn it was for is over.
-fn retire_nudge(badge: &gtk::Label) {
-    let Some(row) = badge.parent().and_downcast::<gtk::Box>() else {
-        return;
-    };
-    let mut child = row.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        if widget.is::<gtk::Button>() {
-            row.remove(&widget);
-        }
-    }
-}
-
 struct QueuedSend {
+    prompt: model::PromptId,
     text: String,
     attachments: Vec<(String, ContentBlock)>,
-    card: gtk::Box,
-    badge: gtk::Label,
+    /// What it is waiting for, as its badge says.
+    label: String,
     /// When and where in the conversation it was written, for the note it
     /// goes out after if it ends up waiting behind a turn.
     written: taste_core::queued::Queued,
@@ -3436,7 +3412,6 @@ impl ChatPane {
             foot,
             model: RefCell::new(model::Model::default()),
             bound: RefCell::new(HashMap::new()),
-            doc_widgets: RefCell::new(HashMap::new()),
             lit: RefCell::new(None),
             transcript_stack,
             transcript_scroller,
@@ -3565,7 +3540,7 @@ impl ChatPane {
             reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
             pending_prompts: RefCell::new(std::collections::VecDeque::new()),
-            nudged_badge: RefCell::new(None),
+            nudged_prompt: RefCell::new(None),
             capture: RefCell::new(None),
             relocated: Cell::new(false),
             hosting_refusal: RefCell::new(None),
@@ -4089,14 +4064,18 @@ impl ChatPane {
             return;
         }
         self.finalize_stream();
-        let card = self.user_card(&prompt, &[]);
+        // Shown, and not recorded: a utility prompt is the IDE's, and the
+        // agent's own history is where it is kept.
+        let id = new_prompt_id();
+        self.show_prompt(&id, &prompt, &[], model::Delivery::Sent);
         self.pending_prompts.borrow_mut().push_back(PendingPrompt {
             unfinished: Unfinished::Nothing,
-            card,
+            prompt: id,
+            text: prompt.clone(),
+            attachments: Vec::new(),
             queued: None,
-            origin: None,
             joined: false,
-            unrecorded: Unrecorded::default(),
+            taken: false,
         });
         *self.capture.borrow_mut() = Some((String::new(), on_done));
         let result = match self.client.borrow().as_ref() {
@@ -4329,29 +4308,28 @@ impl ChatPane {
         // of the chat, don't move my viewport").
         self.finalize_stream();
         let written = self.written_now();
-        let card = self.user_card(text.trim(), &[]);
+        let id = new_prompt_id();
+        self.show_prompt(&id, &text, &[], queued_or_sent(&written));
         let blocks = vec![ContentBlock::Text(TextContent::new(text.clone()))];
-        let result = self.send_blocks(blocks, written.clone());
+        let result = self.send_blocks(&id, blocks, written.clone());
         match result {
-            Ok(unrecorded) => {
+            Ok(()) => {
                 self.mark_session_content();
                 let queued = written.is_some();
-                let badge = written.map(|written| {
-                    let badge = queued_badge("queued — sends when the current turn ends");
-                    card.append(&badge_row(&badge));
-                    self.offer_nudge(&badge);
-                    (badge, written)
-                });
+                if queued {
+                    self.offer_nudge();
+                }
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
                     // No composer to hand it back to, so a death under it
                     // puts it back on the hold queue instead of dropping
                     // it.
                     unfinished: Unfinished::Requeue(text.trim().to_string()),
-                    card,
-                    queued: badge,
-                    origin: None,
+                    prompt: id,
+                    text: text.trim().to_string(),
+                    attachments: Vec::new(),
+                    queued: written,
                     joined: false,
-                    unrecorded,
+                    taken: false,
                 });
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
@@ -4363,7 +4341,7 @@ impl ChatPane {
                 })
             }
             Err(e) => {
-                self.meta_row(&format!("error: {e}"));
+                self.deliver(&id, model::Delivery::NotSent(e.to_string()));
                 Err(format!("the agent refused the prompt: {e}"))
             }
         }
@@ -4852,7 +4830,6 @@ impl ChatPane {
         let next = self.model.borrow().next_id();
         *self.model.borrow_mut() = model::Model::starting_at(next);
         self.keyed_notes.borrow_mut().clear();
-        self.doc_widgets.borrow_mut().clear();
         self.lit.borrow_mut().take();
         self.sync_placeholder();
         self.last_prompt.borrow_mut().take();
@@ -4902,7 +4879,8 @@ impl ChatPane {
                     Some(row) => (row.text(), Some(row.at)),
                     None => continue,
                 },
-                Item::Widget(widget) => (widget_text(widget), widget_time(widget)),
+                // The foot: no words of its own.
+                Item::Widget(_) => continue,
             };
             let (n, lines) = taste_core::search::search_text(&text, query, cap);
             count += n;
@@ -5396,17 +5374,55 @@ impl ChatPane {
     /// or sent and waiting its turn — back at the bottom of the transcript
     /// if a clear took it. In the order they were written.
     fn reattach_pending_cards(&self) {
-        let cards: Vec<gtk::Box> = self
+        let held: Vec<(
+            model::PromptId,
+            String,
+            Vec<(String, ContentBlock)>,
+            model::Delivery,
+        )> = self
             .revive_queue
             .borrow()
             .iter()
-            .map(|item| item.card.clone())
-            .chain(self.pending_prompts.borrow().iter().map(|p| p.card.clone()))
+            .map(|item| {
+                (
+                    item.prompt.clone(),
+                    item.text.clone(),
+                    item.attachments.clone(),
+                    model::Delivery::Held(item.label.clone()),
+                )
+            })
+            .chain(
+                self.pending_prompts
+                    .borrow()
+                    .iter()
+                    .filter(|prompt| !prompt.taken)
+                    .map(|prompt| {
+                        (
+                            prompt.prompt.clone(),
+                            prompt.text.clone(),
+                            prompt.attachments.clone(),
+                            queued_or_sent(&prompt.queued),
+                        )
+                    }),
+            )
             .collect();
-        for card in cards {
-            if !self.in_transcript(&card) {
-                self.append_widget(&card);
+        let ours: Vec<model::PromptId> = held.iter().map(|(id, ..)| id.clone()).collect();
+        for (id, text, attachments, delivery) in held {
+            if self.model.borrow().prompt_row(&id).is_none() {
+                self.show_prompt(&id, &text, &attachments, delivery);
             }
+        }
+        // On their way in the record, and in nobody's hands here: the IDE
+        // closed before the agent took them.
+        let stranded: Vec<model::PromptId> = self
+            .model
+            .borrow()
+            .in_flight()
+            .into_iter()
+            .filter(|id| !ours.contains(id))
+            .collect();
+        for id in stranded {
+            self.update_model(|model| model.set_delivery(&id, model::Delivery::Undelivered));
         }
     }
 
@@ -5417,11 +5433,20 @@ impl ChatPane {
         for_the_environment: bool,
         typed: bool,
     ) {
-        self.hold_send_at(text, attachments, for_the_environment, typed, None, false);
+        self.hold_send_at(
+            text,
+            attachments,
+            for_the_environment,
+            typed,
+            None,
+            false,
+            None,
+        );
     }
 
     /// [`Self::hold_send`], for a message written earlier (`written`, when
     /// it was) and, with `first`, held ahead of everything already held.
+    #[allow(clippy::too_many_arguments)]
     fn hold_send_at(
         self: &Rc<Self>,
         text: &str,
@@ -5430,6 +5455,7 @@ impl ChatPane {
         typed: bool,
         written: Option<taste_core::queued::Queued>,
         first: bool,
+        prompt: Option<model::PromptId>,
     ) {
         // To the bottom for the user's own send, which is their act; an
         // orchestrator's, or one put back after the agent died, leaves a
@@ -5443,17 +5469,40 @@ impl ChatPane {
         // vanished from the composer without appearing in the transcript
         // would read as lost.
         let written = written.unwrap_or_else(|| self.written_here());
-        let card = self.user_card(text.trim(), &attachments);
-        let badge = queued_badge(&holding_label(
-            &self.environment.to_string(),
-            for_the_environment,
-        ));
-        card.append(&badge_row(&badge));
+        let label = holding_label(&self.environment.to_string(), for_the_environment);
+        // The prompt it was, when it is one coming back from an agent that
+        // died under it: the same card, waiting again.
+        let id = match prompt {
+            Some(id) => {
+                self.update_model(|model| {
+                    model.set_delivery(&id, model::Delivery::Held(label.clone()))
+                });
+                id
+            }
+            None => {
+                let id = new_prompt_id();
+                self.show_prompt(
+                    &id,
+                    text,
+                    &attachments,
+                    model::Delivery::Held(label.clone()),
+                );
+                let mut blocks: Vec<ContentBlock> =
+                    attachments.iter().map(|(_, block)| block.clone()).collect();
+                if !text.trim().is_empty() {
+                    blocks.push(ContentBlock::Text(TextContent::new(text.to_string())));
+                }
+                for record in prompt_records(&id, &blocks) {
+                    self.record(record);
+                }
+                id
+            }
+        };
         let item = QueuedSend {
+            prompt: id,
             text: text.to_string(),
             attachments,
-            card,
-            badge,
+            label,
             written,
             typed,
         };
@@ -5510,33 +5559,26 @@ impl ChatPane {
         let queued: Vec<QueuedSend> = self.revive_queue.borrow_mut().drain(..).collect();
         for item in queued {
             // `activate` above may have cleared the transcript out from
-            // under this card. A resumed session replays its history and
-            // the replay is the record, so `ensure_client` clears what is
-            // on screen before re-rendering it — and a prompt that has NOT
-            // been sent yet cannot be in that history. The card was put in
-            // when the send was accepted, precisely so the message would
-            // not read as lost, and the revive path is the one where those
-            // two orders collide: every other send calls `activate` first
-            // and builds its card afterwards.
-            //
-            // So it is rebuilt, at the bottom, which is where the thing
+            // under this card: a resumed session's history replaces what
+            // is on screen, and a prompt not sent yet is in no history.
+            // So it comes back at the bottom, which is where the thing
             // about to be sent belongs. This is what left the user's own
             // message off screen while the agent answered it (David,
             // 2026-09-08: "when I sent a chat message that woke up my
             // primary env, it seemed to get the message, but it's not in
             // the chat").
-            let (card, badge) = if self.in_transcript(&item.card) {
-                (item.card, item.badge)
-            } else {
-                let card = self.user_card(item.text.trim(), &item.attachments);
-                let badge = queued_badge("queued — sends when the current turn ends");
-                card.append(&badge_row(&badge));
-                (card, badge)
-            };
+            if self.model.borrow().prompt_row(&item.prompt).is_none() {
+                self.show_prompt(
+                    &item.prompt,
+                    &item.text,
+                    &item.attachments,
+                    model::Delivery::Held(item.label.clone()),
+                );
+            }
             let mut blocks: Vec<ContentBlock> = item
                 .attachments
-                .into_iter()
-                .map(|(_, block)| block)
+                .iter()
+                .map(|(_, block)| block.clone())
                 .collect();
             if !item.text.trim().is_empty() {
                 blocks.push(ContentBlock::Text(TextContent::new(item.text.clone())));
@@ -5544,36 +5586,44 @@ impl ChatPane {
             // Written a while ago, maybe: if it waits behind a turn now, the
             // note says how long, from when it was written.
             let behind_a_turn = self.stop_button.get_visible();
-            let result = self.send_blocks(blocks, Some(item.written.clone()));
+            let result = self.send_blocks(&item.prompt, blocks, Some(item.written.clone()));
             match result {
-                Ok(unrecorded) => {
+                Ok(()) => {
                     self.mark_session_content();
-                    badge.set_label("queued — sends when the current turn ends");
                     if behind_a_turn {
-                        self.offer_nudge(&badge);
+                        self.offer_nudge();
                     }
+                    self.update_model(|model| {
+                        model.set_delivery(
+                            &item.prompt,
+                            if behind_a_turn {
+                                model::Delivery::Queued
+                            } else {
+                                model::Delivery::Sent
+                            },
+                        )
+                    });
                     let text = item.text.trim().to_string();
                     self.pending_prompts.borrow_mut().push_back(PendingPrompt {
                         // Back where it came from if it is orphaned again,
                         // rather than changing owners on the way through.
                         unfinished: if item.typed {
-                            Unfinished::Composer(text)
+                            Unfinished::Composer(text.clone())
                         } else {
-                            Unfinished::Requeue(text)
+                            Unfinished::Requeue(text.clone())
                         },
-                        card,
-                        queued: Some((badge, item.written)),
-                        origin: None,
+                        prompt: item.prompt,
+                        text,
+                        attachments: item.attachments,
+                        queued: Some(item.written),
                         joined: false,
-                        unrecorded,
+                        taken: false,
                     });
                     self.stop_button.set_visible(true);
                     self.set_busy(true);
                     self.set_status("working…");
                 }
-                Err(e) => {
-                    badge.set_label(&format!("not sent: {e}"));
-                }
+                Err(e) => self.deliver(&item.prompt, model::Delivery::NotSent(e.to_string())),
             }
         }
         self.sync_revive_bar();
@@ -5848,9 +5898,8 @@ impl ChatPane {
             stale
         };
         for held in withdrawn {
-            if let Some(row) = self.widget_row(&held.card) {
-                self.remove_item(&Item::Widget(row.upcast()));
-            }
+            self.record_delivery(&held.prompt, "withdrawn", None);
+            self.update_model(|model| model.remove_prompt(&held.prompt));
         }
         self.sync_revive_bar();
     }
@@ -6962,45 +7011,37 @@ impl ChatPane {
         Reference::TurnStart
     }
 
-    /// Ask for a Turn at the end of a queued message's badge: the agent is
-    /// asked, at its next use of the IDE's tools, to finish its step and end
-    /// the turn (`taste_core::nudge`), which sends the message without
+    /// A queued message's card offers Ask for a Turn (`rows.rs`): the agent
+    /// is asked, at its next use of the IDE's tools, to finish its step and
+    /// end the turn (`taste_core::nudge`), which sends the message without
     /// stopping anything.
-    fn offer_nudge(self: &Rc<Self>, badge: &gtk::Label) {
+    fn offer_nudge(&self) {
         // Waiting behind the turn, which every wait in the IDE's tools now
         // ends for (`taste_core::nudge`), asked for or not.
         self.workspace.nudges.message_waiting(&self.environment);
-        let Some(row) = badge.parent().and_downcast::<gtk::Box>() else {
-            return;
-        };
-        let button = gtk::Button::builder()
-            .label("Ask for a Turn")
-            .css_classes(["flat", "caption"])
-            .valign(gtk::Align::Center)
-            .margin_end(CARD_INSET)
-            .tooltip_text(
-                "Ask the agent to finish the step it is on and end its turn, so this \
-                 message goes",
-            )
-            .build();
-        let weak = Rc::downgrade(self);
-        let badge = badge.clone();
-        button.connect_clicked(move |button| {
-            let Some(pane) = weak.upgrade() else {
-                return;
-            };
-            pane.workspace.nudges.ask(&pane.environment);
-            button.set_visible(false);
-            badge.set_label("queued — asking the agent to end its turn after its current step");
-            *pane.nudged_badge.borrow_mut() = Some(badge.clone());
+    }
+
+    /// Ask for a Turn, pressed on `prompt`'s card.
+    pub(super) fn ask_for_turn(&self, prompt: &str) {
+        self.workspace.nudges.ask(&self.environment);
+        *self.nudged_prompt.borrow_mut() = Some(prompt.to_string());
+        self.update_model(|model| {
+            model.set_delivery(prompt, model::Delivery::Asking { told: false })
         });
-        row.append(&button);
     }
 
     /// The agent has been told (`taste_core::Event::NudgeDelivered`).
     pub fn nudge_delivered(&self) {
-        if let Some(badge) = self.nudged_badge.borrow().as_ref() {
-            badge.set_label("queued — the agent has been asked to end its turn");
+        let prompt = self.nudged_prompt.borrow().clone();
+        if let Some(prompt) = prompt {
+            self.update_model(|model| {
+                if model
+                    .delivery(&prompt)
+                    .is_some_and(model::Delivery::in_flight)
+                {
+                    model.set_delivery(&prompt, model::Delivery::Asking { told: true });
+                }
+            });
         }
     }
 
@@ -7008,7 +7049,7 @@ impl ChatPane {
     /// taken back, told or not, so it cannot reach the next turn.
     fn end_nudge(&self) {
         self.workspace.nudges.withdraw(&self.environment);
-        self.nudged_badge.borrow_mut().take();
+        self.nudged_prompt.borrow_mut().take();
     }
 
     /// When and where a message sent now is written, if a turn is running
@@ -7023,70 +7064,137 @@ impl ChatPane {
         taste_core::queued::Queued::new(self.feed_reference(), &self.progress)
     }
 
-    /// Hand a prompt to the agent, briefing and all; `written` when it may
-    /// wait behind a turn, for the note it then goes out after. Hands back
-    /// what the prompt puts in the record, for when the agent starts on it
-    /// ([`Unrecorded`]).
+    /// Hand prompt `prompt` to the agent, briefing and all; `written` when
+    /// it may wait behind a turn, for the note it then goes out after. Its
+    /// message and the notes it is briefed with go in the record now, as
+    /// it is sent, under its id: where it got to is recorded as it gets
+    /// there ([`Self::record_delivery`]), which is how a restore puts it
+    /// where the agent took it.
     fn send_blocks(
         &self,
+        prompt: &str,
         blocks: Vec<ContentBlock>,
         written: Option<taste_core::queued::Queued>,
-    ) -> anyhow::Result<Unrecorded> {
-        // The user's message as the updates `session/load` sends for it, so
-        // the record holds what the user said and not only what the agent
-        // answered; then the briefing's notes, which are the IDE's.
-        let mut unrecorded = Unrecorded {
-            records: blocks.iter().map(user_record).collect(),
-        };
-        *self.holding.borrow_mut() = Some(Unrecorded::default());
+    ) -> anyhow::Result<()> {
+        let mut records = prompt_records(prompt, &blocks);
+        *self.holding.borrow_mut() = Some(Holding {
+            prompt: prompt.to_string(),
+            records: Vec::new(),
+        });
         let blocks = self.with_briefing(blocks);
-        let held = self.holding.borrow_mut().take().unwrap_or_default();
-        unrecorded.records.extend(held.records);
+        if let Some(held) = self.holding.borrow_mut().take() {
+            records.extend(held.records);
+        }
+        for record in records {
+            self.record(record);
+        }
         match (self.client.borrow().as_ref(), written) {
             (Some(client), Some(written)) => client.prompt_blocks_queued(blocks, written),
             (Some(client), None) => client.prompt_blocks(blocks),
             (None, _) => Ok(()),
         }
-        .map(|()| unrecorded)
+    }
+
+    /// Where prompt `prompt` got to, in the record: `taken` (with the note
+    /// it went out after, if it waited), `refused` or `notSent` (with why),
+    /// `lost`, or `withdrawn` (`model::Record::Delivery`).
+    fn record_delivery(&self, prompt: &str, state: &str, detail: Option<&str>) {
+        self.record(serde_json::json!({
+            model::DELIVERY_RECORD: prompt,
+            "state": state,
+            "detail": detail,
+        }));
+    }
+
+    /// Prompt `prompt` has got to `delivery`, in the transcript and the
+    /// record.
+    fn deliver(&self, prompt: &str, delivery: model::Delivery) {
+        match &delivery {
+            model::Delivery::Refused(why) => self.record_delivery(prompt, "refused", Some(why)),
+            model::Delivery::NotSent(why) => self.record_delivery(prompt, "notSent", Some(why)),
+            model::Delivery::Lost => self.record_delivery(prompt, "lost", None),
+            _ => {}
+        }
+        self.update_model(|model| model.set_delivery(prompt, delivery));
+    }
+
+    /// A prompt's card at the end of the transcript, from the moment it is
+    /// sent: the card is the prompt, whatever happens to it next.
+    fn show_prompt(
+        &self,
+        prompt: &str,
+        text: &str,
+        attachments: &[(String, ContentBlock)],
+        delivery: model::Delivery,
+    ) {
+        self.update_model(|model| {
+            model.prompt_sent(
+                prompt,
+                text.trim().to_string(),
+                attachments.to_vec(),
+                delivery,
+            )
+        });
+    }
+
+    /// The agent has taken prompt `prompt` — after waiting behind a turn,
+    /// with `waited` the note it went out after: recorded where it was
+    /// taken, and its card moved there.
+    fn take_prompt(&self, prompt: &str, waited: Option<String>) {
+        self.record_delivery(prompt, "taken", waited.as_deref());
+        self.update_model(|model| model.prompt_taken(prompt, waited));
     }
 
     /// The agent has started on the prompt at the front, and on any that
-    /// went out joined to it: their records go in, ahead of the agent's,
-    /// and their notes under the cards.
+    /// went out joined to it.
     fn record_taken(&self) {
-        let taken: Vec<Unrecorded> = {
+        let taken: Vec<model::PromptId> = {
             let mut pending = self.pending_prompts.borrow_mut();
             pending
                 .iter_mut()
                 .enumerate()
                 .take_while(|(index, prompt)| *index == 0 || prompt.joined)
-                .filter(|(_, prompt)| !prompt.unrecorded.records.is_empty())
-                .map(|(_, prompt)| std::mem::take(&mut prompt.unrecorded))
+                .filter_map(|(_, prompt)| {
+                    (!std::mem::replace(&mut prompt.taken, true)).then(|| prompt.prompt.clone())
+                })
                 .collect()
         };
-        if taken.is_empty() {
-            return;
-        }
-        for unrecorded in taken {
-            self.commit_unrecorded(unrecorded);
+        for prompt in taken {
+            self.take_prompt(&prompt, None);
         }
         // Written now rather than with the turn: a message the IDE closed
         // over is still the user's.
         self.flush_stash();
     }
 
-    /// `unrecorded` into the record, and its notes into the transcript.
-    fn commit_unrecorded(&self, unrecorded: Unrecorded) {
-        for record in unrecorded.records {
-            let note = record
-                .get(NOTE_RECORD)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            self.record(record);
-            if let Some(note) = note {
-                self.update_model(|model| model.note(&note));
+    /// The records of every prompt still on its way, for a record that has
+    /// started again without them: a session's mark, a replay put in its
+    /// place.
+    fn pending_prompt_records(&self) -> Vec<serde_json::Value> {
+        let blocks = |text: &str, attachments: &[(String, ContentBlock)]| {
+            let mut blocks: Vec<ContentBlock> =
+                attachments.iter().map(|(_, block)| block.clone()).collect();
+            if !text.trim().is_empty() {
+                blocks.push(ContentBlock::Text(TextContent::new(text.to_string())));
             }
-        }
+            blocks
+        };
+        let held = self
+            .revive_queue
+            .borrow()
+            .iter()
+            .flat_map(|item| prompt_records(&item.prompt, &blocks(&item.text, &item.attachments)))
+            .collect::<Vec<_>>();
+        let sent = self
+            .pending_prompts
+            .borrow()
+            .iter()
+            .filter(|prompt| !prompt.taken)
+            .flat_map(|prompt| {
+                prompt_records(&prompt.prompt, &blocks(&prompt.text, &prompt.attachments))
+            })
+            .collect::<Vec<_>>();
+        held.into_iter().chain(sent).collect()
     }
 
     /// What the IDE puts ahead of a prompt so the agent does not have to
@@ -7310,6 +7418,23 @@ impl ChatPane {
                     }
                 }
                 model::Change::Changed(id) => self.refresh_row(id),
+                model::Change::Removed(id) => {
+                    // What was added since is not in the list yet.
+                    if !added.is_empty() {
+                        self.insert_items(&std::mem::take(&mut added));
+                    }
+                    self.remove_item(&Item::Row(id));
+                    self.bound.borrow_mut().remove(&id);
+                    let pinned = self
+                        .last_prompt
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|item| same_item(item, &Item::Row(id)));
+                    if pinned {
+                        self.last_prompt.borrow_mut().take();
+                        self.pinned_float.set_visible(false);
+                    }
+                }
             }
         }
         if !added.is_empty() {
@@ -7331,30 +7456,6 @@ impl ChatPane {
         self.sync_placeholder();
     }
 
-    /// `child` at the end of the transcript, an item of its own — in the
-    /// row it already stands in, if it has one ([`widget_item`]).
-    fn append_widget(&self, child: &impl IsA<gtk::Widget>) -> Item {
-        let row = self.widget_row(child).unwrap_or_else(|| widget_item(child));
-        let item = Item::Widget(row.upcast());
-        self.insert_items(&[glib::BoxedAnyObject::new(item.clone())]);
-        item
-    }
-
-    /// The item row `child` stands in, once it has been given one.
-    fn widget_row(&self, child: &impl IsA<gtk::Widget>) -> Option<gtk::Box> {
-        child
-            .parent()
-            .and_downcast::<gtk::Box>()
-            .filter(|row| row.has_css_class("transcript-row"))
-    }
-
-    /// Whether `card` is in the transcript: an item of it, shown or not —
-    /// not in one a clear has let go of.
-    fn in_transcript(&self, card: &impl IsA<gtk::Widget>) -> bool {
-        self.widget_row(card)
-            .is_some_and(|row| self.position_of(&Item::Widget(row.upcast())).is_some())
-    }
-
     /// Take `item` out of the transcript.
     fn remove_item(&self, item: &Item) {
         if let Some(position) = self.position_of(item) {
@@ -7370,6 +7471,14 @@ impl ChatPane {
             self.sync_open_jump();
         }
         self.sync_placeholder();
+    }
+
+    /// Bring prompt `prompt` to the top of the view: a marker's jump.
+    pub(super) fn scroll_to_prompt(&self, prompt: &str) {
+        let row = self.model.borrow().prompt_row(prompt);
+        if let Some(row) = row {
+            self.scroll_to_item(&Item::Row(row), 0.0);
+        }
     }
 
     /// The list has bound `item` to `holder`: its row's widgets, built from
@@ -7581,12 +7690,6 @@ impl ChatPane {
         self.replaying.get() || self.drawing_history.get()
     }
 
-    /// The turn's timeline ends here: the last step's line stops at its
-    /// dot. A prompt calls this before it takes the full width below.
-    fn end_steps(&self) {
-        self.update_model(|model| model.prompt_shown());
-    }
-
     pub fn set_on_open_document(&self, hook: OpenDocumentHook) {
         *self.on_open_document.borrow_mut() = Some(hook);
     }
@@ -7596,14 +7699,6 @@ impl ChatPane {
     /// keyed by its call instead (`rows.rs`, `step_content`).
     pub(super) fn row_doc(&self, id: model::RowId, what: &str) -> String {
         format!("{ROW_DOC}{id}/{what}")
-    }
-
-    /// A live prompt's document opens from `widget`, which is lit while it
-    /// is the tab in front.
-    pub(super) fn doc_widget(&self, key: &str, widget: &gtk::Widget) {
-        self.doc_widgets
-            .borrow_mut()
-            .insert(key.to_string(), widget.downgrade());
     }
 
     /// The editor's tab in front is (or is not) one of this chat's
@@ -7623,11 +7718,7 @@ impl ChatPane {
             // A step's documents are keyed by its call, which a restore
             // brings back the same.
             let call = key.split('/').next().unwrap_or(key);
-            if let Some(id) = self.model.borrow().step_row(call) {
-                return Some(Item::Row(id));
-            }
-            let card = self.doc_widgets.borrow().get(key)?.upgrade()?;
-            self.widget_row(&card).map(|row| Item::Widget(row.upcast()))
+            self.model.borrow().step_row(call).map(Item::Row)
         });
         let previous = self.lit.replace(item.clone());
         if let Some(Item::Widget(row)) = &previous {
@@ -8047,6 +8138,16 @@ impl ChatPane {
         turn
     }
 
+    /// The turn at the front was delivered and worked on, whatever ended
+    /// it: off the queue, and taken, if its first word never came.
+    fn turn_delivered(&self) {
+        for prompt in self.pop_turn() {
+            if !prompt.taken {
+                self.take_prompt(&prompt.prompt, None);
+            }
+        }
+    }
+
     /// The queued prompt at `index` has gone to the agent: its card moves
     /// to where the conversation took it, and its badge says how long it
     /// waited.
@@ -8054,205 +8155,43 @@ impl ChatPane {
         let accepted = {
             let mut pending = self.pending_prompts.borrow_mut();
             pending.get_mut(index).and_then(|prompt| {
-                let card = prompt.card.clone();
                 let queued = prompt.queued.take()?;
-                // After the note it goes out after, as the agent has it, so
-                // a redraw draws it as the card it was, badge and all, and
-                // several that went out together as cards of their own
-                // (`draw_user_message`).
-                if !prompt.unrecorded.records.is_empty() {
-                    let note = ContentBlock::Text(TextContent::new(queued.1.note()));
-                    prompt.unrecorded.records.insert(0, user_record(&note));
-                }
-                Some((card, queued))
+                prompt.taken = true;
+                Some((prompt.prompt.clone(), queued.note()))
             })
         };
-        let Some((card, (badge, written))) = accepted else {
-            return;
-        };
-        // The card was appended where the prompt was TYPED, which is not
-        // where it joins the conversation — a whole turn's output has
-        // landed in between. Move it to the end and leave a marker behind.
-        let origin = self.reseat_accepted_prompt(&card);
-        if let Some(prompt) = self.pending_prompts.borrow_mut().get_mut(index) {
-            prompt.origin = origin;
-        }
-        // The badge is rewritten, not removed: how long a prompt sat behind
-        // the previous turn is the one place that cost is ever visible, and
-        // it is worth keeping in the transcript after the fact. With the
-        // note the agent got, roughly to the second.
-        retire_nudge(&badge);
-        badge.set_label(&format!("queued for {}", elapsed(written.at)));
-        badge.set_tooltip_text(Some(&written.note()));
-    }
-
-    fn reseat_accepted_prompt(self: &Rc<Self>, card: &gtk::Box) -> Option<Item> {
-        let row = self.widget_row(card)?;
-        let origin = Item::Widget(row.clone().upcast());
-        let position = self.position_of(&origin)?;
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        content.append(&gtk::Image::from_icon_name("go-down-symbolic"));
-        content.append(
-            &gtk::Label::builder()
-                .label("sent here — jump to where it was taken")
-                .css_classes(["dim-label", "caption"])
-                .build(),
-        );
-        let marker = gtk::Button::builder()
-            .child(&content)
-            .css_classes(["flat"])
-            .tooltip_text("Jump to this prompt, further down")
-            .halign(gtk::Align::Center)
-            .hexpand(true)
-            .margin_top(4)
-            .margin_bottom(4)
-            .build();
-        // The prompt ended the timeline here, and it has moved on: between
-        // two steps the line runs on through the marker, which stands
-        // beside the rail as a step's content does (David, 2026-10-05:
-        // "This shouldn't break the line between the bullets on the
-        // left"). The step above gets back the line the prompt took from
-        // it; the one below already runs up from the top of its row.
-        let railed = |at: Option<u32>| match at.and_then(|at| self.item_at(at)) {
-            Some(Item::Row(id)) => self
-                .model
-                .borrow()
-                .row(id)
-                .and_then(|row| row.rail)
-                .map(|_| id),
-            _ => None,
-        };
-        let above = railed(position.checked_sub(1));
-        let below = railed(Some(position + 1));
-        let through = above.is_some() && below.is_some();
-        if let Some(above) = above.filter(|_| through) {
-            self.update_model(|model| model.rejoin(above));
-        }
-        // Vertical, so the line is given the column's width to be centred
-        // in, as a step's is; never expanding, or the column takes the
-        // row's spare width and the line leaves the rail.
-        let rail = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .width_request(RAIL_WIDTH)
-            .hexpand(false)
-            .build();
-        rail.append(
-            &gtk::Box::builder()
-                .css_classes(["rail-line"])
-                .halign(gtk::Align::Center)
-                .vexpand(true)
-                .visible(through)
-                .build(),
-        );
-        let seat_row = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
-        seat_row.set_margin_start(ROW_OWN_SIDE);
-        seat_row.set_margin_end(ROW_OWN_SIDE);
-        seat_row.append(&rail);
-        seat_row.append(&marker);
-        // The marker takes the card's place, and the card a row of its own
-        // at the end.
-        let marker_item = Item::Widget(widget_item(&seat_row).upcast());
-        self.store.splice(
-            position,
-            1,
-            &[glib::BoxedAnyObject::new(marker_item.clone())],
-        );
-        row.remove(card);
-        if self
-            .lit
-            .borrow()
-            .as_ref()
-            .is_some_and(|lit| same_item(lit, &origin))
-        {
-            self.lit.borrow_mut().take();
-        }
-        // Seated again as a prompt is: the timeline above ends at its last
-        // dot, and the next step's line runs up from the box.
-        self.end_steps();
-        let seat = self.append_widget(card);
-        // The pin mirrors the newest prompt, and that is now this one.
-        *self.last_prompt.borrow_mut() = Some(seat.clone());
-        {
-            let weak = Rc::downgrade(self);
-            marker.connect_clicked(move |_| {
-                if let Some(pane) = weak.upgrade() {
-                    pane.scroll_to_item(&seat, 0.0);
-                }
-            });
-        }
-        Some(marker_item)
-    }
-
-    /// Take a prompt out of the transcript — its card, and the marker left
-    /// where it was typed if it had already been reseated. Rejected prompts
-    /// and prompts orphaned by a dropped connection are not part of the
-    /// conversation, and neither is a signpost to one.
-    fn drop_prompt_rows(&self, prompt: &PendingPrompt) {
-        let mut items: Vec<Item> = Vec::new();
-        if let Some(row) = self.widget_row(&prompt.card) {
-            items.push(Item::Widget(row.upcast()));
-        }
-        if let Some(origin) = &prompt.origin {
-            items.push(origin.clone());
-        }
-        for item in items {
-            self.forget_prompt_row(&item);
-            self.remove_item(&item);
+        if let Some((prompt, note)) = accepted {
+            self.take_prompt(&prompt, Some(note));
         }
     }
 
-    /// A prompt card leaving the transcript (rejected prompt, dropped
-    /// connection) takes its pin with it — the pin must never advertise a
-    /// card that no longer exists.
-    fn forget_prompt_row(&self, item: &Item) {
-        let is_last = self
-            .last_prompt
-            .borrow()
-            .as_ref()
-            .is_some_and(|last| same_item(last, item));
-        if is_last {
-            self.last_prompt.replace(None);
-            self.pinned_float.set_visible(false);
-        }
-    }
-
-    /// A note from the IDE in the transcript, and in the record: its row,
-    /// unless it is part of a prompt the agent has yet to take, which
-    /// draws it then ([`Self::commit_unrecorded`]).
     fn meta_row(&self, text: &str) {
         self.meta_row_id(text);
     }
 
-    /// [`Self::meta_row`], handing back the note's row.
+    /// A note from the IDE in the transcript, and in the record: its row.
+    /// Written while a prompt is being briefed, it is that prompt's, and
+    /// goes where it goes ([`Holding`]).
     fn meta_row_id(&self, text: &str) -> Option<model::RowId> {
-        let held =
-            self.holding.borrow().is_some() && !self.replaying.get() && !self.from_record.get();
-        self.record(serde_json::json!({ NOTE_RECORD: text }));
-        if held {
-            return None;
+        let briefing = self
+            .holding
+            .borrow()
+            .as_ref()
+            .map(|held| held.prompt.clone())
+            .filter(|_| !self.replaying.get() && !self.from_record.get());
+        match briefing {
+            Some(prompt) => {
+                self.record(serde_json::json!({
+                    NOTE_RECORD: text,
+                    model::NOTE_PROMPT: prompt,
+                }));
+                self.update_model(|model| model.prompt_note(&prompt, text))
+            }
+            None => {
+                self.record(serde_json::json!({ NOTE_RECORD: text }));
+                Some(self.update_model(|model| model.note(text)))
+            }
         }
-        Some(self.update_model(|model| model.note(text)))
-    }
-
-    /// A prompt's card, at the end of the transcript, as a send draws it:
-    /// the turn before it ends there, and the pin mirrors it.
-    fn user_card(&self, text: &str, attachments: &[(String, ContentBlock)]) -> gtk::Box {
-        // A prompt starts a turn, and a turn owns its plan and its answer;
-        // and a prompt ends the turn before it: the timeline's line stops
-        // at the last step's dot, and the prompt takes the full width below
-        // (David, 2026-09-07: "My prompts show up as full-width in boxes,
-        // followed by the agent's turns/steps as a timeline below").
-        self.end_steps();
-        self.record_line("you", text);
-        let card = self.prompt_card(text, attachments, None);
-        let item = self.append_widget(&card);
-        // This is now the prompt the pin mirrors; it starts visible in the
-        // transcript, so the pin starts hidden.
-        *self.last_prompt.borrow_mut() = Some(item);
-        self.pinned_prompt_label
-            .set_label(&pin_text(text, attachments));
-        self.pinned_float.set_visible(false);
-        card
     }
 
     /// A permission question about this call opened or closed: its step's
@@ -8354,31 +8293,30 @@ impl ChatPane {
         self.finalize_stream();
 
         let written = self.written_now();
-        let card = self.user_card(text.trim(), &attachments);
+        let id = new_prompt_id();
+        // Sending mid-turn is fine: the session layer queues it, and the
+        // card says so until its turn starts.
+        self.show_prompt(&id, &text, &attachments, queued_or_sent(&written));
         let mut blocks: Vec<ContentBlock> =
-            attachments.into_iter().map(|(_, block)| block).collect();
+            attachments.iter().map(|(_, block)| block.clone()).collect();
         if !text.trim().is_empty() {
             blocks.push(ContentBlock::Text(TextContent::new(text.clone())));
         }
-        let result = self.send_blocks(blocks, written.clone());
+        let result = self.send_blocks(&id, blocks, written.clone());
         match result {
-            Ok(unrecorded) => {
+            Ok(()) => {
                 self.mark_session_content();
-                // Sending mid-turn is fine: the session layer queues it.
-                // Say so on the card until its turn starts.
-                let badge = written.map(|written| {
-                    let badge = queued_badge("queued — sends when the current turn ends");
-                    card.append(&badge_row(&badge));
-                    self.offer_nudge(&badge);
-                    (badge, written)
-                });
+                if written.is_some() {
+                    self.offer_nudge();
+                }
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
                     unfinished: Unfinished::Composer(text.trim().to_string()),
-                    card,
-                    queued: badge,
-                    origin: None,
+                    prompt: id,
+                    text: text.trim().to_string(),
+                    attachments,
+                    queued: written,
                     joined: false,
-                    unrecorded,
+                    taken: false,
                 });
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
@@ -8386,7 +8324,7 @@ impl ChatPane {
                 Ok(())
             }
             Err(e) => {
-                self.meta_row(&format!("error: {e}"));
+                self.deliver(&id, model::Delivery::NotSent(e.to_string()));
                 Err(e.to_string())
             }
         }
@@ -8727,16 +8665,19 @@ impl ChatPane {
                 // a "prompt failed: Incoming transport closed" row under
                 // the agent's own "Rebuild the container").
                 if self.closed_by_environment() {
-                    self.pop_turn();
+                    self.turn_delivered();
                     self.settle_running_steps();
                     return;
                 }
-                // A rejected prompt is not part of the conversation: take
-                // its card out of the transcript and hand the text back.
-                // Every message that went out in it, when several did: the
-                // last first, so each lands ahead of what followed it.
+                // A rejected prompt stays where it was sent, marked refused
+                // with what the agent said (David, 2026-10-20: "For a
+                // prompt the agent refuses, keep it and mark it refused"),
+                // and a typed one's text goes back to the box to be sent
+                // again. Every message that went out in it, when several
+                // did: the last first, so each lands ahead of what followed
+                // it.
                 for prompt in self.pop_turn().into_iter().rev() {
-                    self.drop_prompt_rows(&prompt);
+                    self.deliver(&prompt.prompt, model::Delivery::Refused(message.clone()));
                     // Only a typed one goes back to the box. A refusal is
                     // not a dropped connection: the agent is up and has
                     // said no, so putting an orchestrator's prompt back on
@@ -8754,7 +8695,8 @@ impl ChatPane {
                     }
                 }
                 self.set_status("prompt rejected");
-                self.meta_row(&format!("prompt failed: {message}"));
+                // The mirror an orchestrator reads says so in words.
+                self.record_line("note", &format!("prompt failed: {message}"));
             }
             SessionEvent::TurnEnded { reason, usage } => {
                 use agent_client_protocol::schema::v1::StopReason;
@@ -8977,12 +8919,16 @@ impl ChatPane {
                 // rebuild as a repeat (David, 2026-10-08). Those queued
                 // behind it never reached the agent and go back as before.
                 if self.closed_by_environment() {
-                    self.pop_turn();
+                    self.turn_delivered();
                 }
                 let pending: Vec<PendingPrompt> =
                     self.pending_prompts.borrow_mut().drain(..).collect();
                 let mut restored: Vec<String> = Vec::new();
-                let mut requeued: Vec<(String, Option<taste_core::queued::Queued>)> = Vec::new();
+                let mut requeued: Vec<(
+                    String,
+                    Option<taste_core::queued::Queued>,
+                    model::PromptId,
+                )> = Vec::new();
                 // In the order they were written, whoever wrote them: once one
                 // goes back to the composer, each written after it goes there
                 // too, to be sent again after it rather than ahead of it
@@ -8990,16 +8936,22 @@ impl ChatPane {
                 // dispatch").
                 let mut to_composer = false;
                 for prompt in pending {
-                    self.drop_prompt_rows(&prompt);
-                    let written = prompt.queued.map(|(_, written)| written);
+                    let written = prompt.queued;
                     match prompt.unfinished {
                         Unfinished::Composer(text) => {
                             to_composer = true;
                             restored.push(text);
+                            self.deliver(&prompt.prompt, model::Delivery::Lost);
                         }
-                        Unfinished::Requeue(text) if to_composer => restored.push(text),
-                        Unfinished::Requeue(text) => requeued.push((text, written)),
-                        Unfinished::Nothing => {}
+                        Unfinished::Requeue(text) if to_composer => {
+                            restored.push(text);
+                            self.deliver(&prompt.prompt, model::Delivery::Lost);
+                        }
+                        // The same card, waiting again.
+                        Unfinished::Requeue(text) => {
+                            requeued.push((text, written, prompt.prompt));
+                        }
+                        Unfinished::Nothing => self.deliver(&prompt.prompt, model::Delivery::Lost),
                     }
                 }
                 if !restored.is_empty() {
@@ -9012,8 +8964,8 @@ impl ChatPane {
                 // Not for the environment: these wait on the process, which
                 // the reconnect below is bringing back. Ahead of anything
                 // held since, which was written after them.
-                for (text, written) in requeued.into_iter().rev() {
-                    self.hold_send_at(&text, Vec::new(), false, false, written, true);
+                for (text, written, prompt) in requeued.into_iter().rev() {
+                    self.hold_send_at(&text, Vec::new(), false, false, written, true, Some(prompt));
                 }
                 // Captured before reset_session, which clears it.
                 let resume = self
@@ -10514,8 +10466,10 @@ impl ChatPane {
     /// off the main thread: what the live stash lacked, it now has, and the
     /// next reconnect resumes without a replay.
     fn replace_record(&self, session: &str, replay: Vec<serde_json::Value>) {
-        // What streamed since the replay ended is after it.
-        let since = std::mem::take(&mut *self.archive_buffer.borrow_mut());
+        // What streamed since the replay ended is after it, and the prompts
+        // still on their way, which no replay has.
+        let mut since = std::mem::take(&mut *self.archive_buffer.borrow_mut());
+        since.extend(self.pending_prompt_records());
         let id = session.to_string();
         *self.stash_session.borrow_mut() = Some(id.clone());
         self.archive_write(move |archive, env| {
@@ -10561,11 +10515,15 @@ impl ChatPane {
     fn mark_session(&self, session: &str) {
         *self.stash_session.borrow_mut() = Some(session.to_string());
         let updates = std::mem::take(&mut *self.archive_buffer.borrow_mut());
+        // The prompts still on their way are this session's to take: said
+        // again after its mark, which is where its history begins.
+        let pending = self.pending_prompt_records();
         let session = session.to_string();
         self.archive_write(move |archive, env| {
             let marked = archive
                 .append_all(env, updates)
-                .and_then(|()| archive.mark_session(env, &session));
+                .and_then(|()| archive.mark_session(env, &session))
+                .and_then(|()| archive.append_all(env, pending));
             if let Err(e) = marked {
                 tracing::warn!("marking {env}'s new conversation: {e:#}");
             }
@@ -10919,21 +10877,38 @@ impl ChatPane {
             call.status = ToolCallStatus::Completed;
             self.render_update(SessionUpdate::ToolCall(call));
         };
-        self.user_card("Sync the template submodule and check what changed.", &[]);
+        let first = new_prompt_id();
+        self.show_prompt(
+            &first,
+            "Sync the template submodule and check what changed.",
+            &[],
+            model::Delivery::Sent,
+        );
+        self.take_prompt(&first, None);
         say("Looking at the submodule first.");
         call(
             "probe-status",
             "git status --short --untracked-files=all; find amutable-typst-template",
             ToolKind::Execute,
         );
-        let card = self.user_card("And keep the old file names as aliases.", &[]);
+        let second = new_prompt_id();
+        self.show_prompt(
+            &second,
+            "And keep the old file names as aliases.",
+            &[],
+            model::Delivery::Queued,
+        );
         call(
             "probe-read",
             "Read amutable-typst-template/lib.typ",
             ToolKind::Read,
         );
         say("The template has one modified file and nothing untracked.");
-        self.reseat_accepted_prompt(&card);
+        let waited = taste_core::queued::Queued::new(
+            taste_core::queued::Reference::TurnStart,
+            &self.progress,
+        );
+        self.take_prompt(&second, Some(waited.note()));
         say("Kept the old names as aliases in lib.typ.");
     }
 
@@ -11468,10 +11443,30 @@ impl ChatPane {
             // (`taste_core::nudge`).
             Ok("queued") => {
                 self.set_activity("cargo test -p taste-app filetree");
-                let card = self.user_card("Look at the failing tests before the docs.", &[]);
-                let badge = queued_badge("queued — sends when the current turn ends");
-                card.append(&badge_row(&badge));
-                self.offer_nudge(&badge);
+                self.show_prompt(
+                    &new_prompt_id(),
+                    "Look at the failing tests before the docs.",
+                    &[],
+                    model::Delivery::Queued,
+                );
+                self.offer_nudge();
+            }
+            // `refused`: a message the agent would not take, kept where it
+            // was sent with what the agent said under it.
+            Ok("refused") => {
+                let id = new_prompt_id();
+                self.show_prompt(
+                    &id,
+                    "Force-push the cleaned history over main.",
+                    &[],
+                    model::Delivery::Sent,
+                );
+                self.deliver(
+                    &id,
+                    model::Delivery::Refused(
+                        "Invalid request: the prompt is longer than the context window".into(),
+                    ),
+                );
             }
             // `quiet`: the same turn, silent for over a minute — the line
             // the user reads while a model's machine is asleep, before
@@ -11948,6 +11943,9 @@ impl ChatPane {
             ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ToolCall,
             ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
         };
+        // Its own record and nobody else's: a probe run before it in the
+        // same place may have left one.
+        let _ = self.chat_archive().forget(&self.environment);
         let text = |t: &str| ContentChunk::new(ContentBlock::Text(TextContent::new(t)));
         let live = |pane: &Rc<Self>, update: SessionUpdate| {
             pane.record_taken();
@@ -11956,11 +11954,13 @@ impl ChatPane {
         };
         let send = |pane: &Rc<Self>, words: &str| {
             pane.finalize_stream();
-            pane.user_card(words, &[]);
+            let id = new_prompt_id();
+            pane.show_prompt(&id, words, &[], model::Delivery::Sent);
             let block = ContentBlock::Text(TextContent::new(words));
-            pane.commit_unrecorded(Unrecorded {
-                records: vec![user_record(&block)],
-            });
+            for record in prompt_records(&id, &[block]) {
+                pane.record(record);
+            }
+            pane.take_prompt(&id, None);
         };
         let step =
             |pane: &Rc<Self>, id: &str, title: &str, kind: ToolKind, status: ToolCallStatus| {
@@ -12065,37 +12065,42 @@ impl ChatPane {
                     SessionUpdate::ToolCallUpdate(ToolCallUpdate::new("long".to_string(), fields)),
                 );
             }
+            if n == 4 {
+                // Two messages written during turn 3, gone out together
+                // after it: through the queue as a send puts them there,
+                // taken as the turn's end and `QueuedJoined` take them — and
+                // moved there, leaving their markers where they were typed.
+                for (index, words) in [
+                    "One more thing: keep the docs in step.",
+                    "And mention the probe.",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let id = new_prompt_id();
+                    self.show_prompt(&id, words, &[], model::Delivery::Queued);
+                    for record in
+                        prompt_records(&id, &[ContentBlock::Text(TextContent::new(*words))])
+                    {
+                        self.record(record);
+                    }
+                    let written = taste_core::queued::Queued::new(
+                        taste_core::queued::Reference::TurnStart,
+                        &self.progress,
+                    );
+                    self.pending_prompts.borrow_mut().push_back(PendingPrompt {
+                        unfinished: Unfinished::Nothing,
+                        prompt: id,
+                        text: words.to_string(),
+                        attachments: Vec::new(),
+                        queued: Some(written),
+                        joined: index > 0,
+                        taken: false,
+                    });
+                }
+            }
         }
         end_turn(self);
-        // Two messages written during turn 3, gone out together after it:
-        // through the queue as a send puts them there, taken as the turn's
-        // end and `QueuedJoined` take them, recorded at the agent's first
-        // word.
-        for (index, words) in [
-            "One more thing: keep the docs in step.",
-            "And mention the probe.",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let card = self.user_card(words, &[]);
-            let badge = queued_badge("queued — sends when the current turn ends");
-            card.append(&badge_row(&badge));
-            let written = taste_core::queued::Queued::new(
-                taste_core::queued::Reference::TurnStart,
-                &self.progress,
-            );
-            self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-                unfinished: Unfinished::Nothing,
-                card,
-                queued: Some((badge, written)),
-                origin: None,
-                joined: index > 0,
-                unrecorded: Unrecorded {
-                    records: vec![user_record(&ContentBlock::Text(TextContent::new(*words)))],
-                },
-            });
-        }
         self.accept_queued(0);
         self.accept_queued(1);
         live(self, SessionUpdate::AgentMessageChunk(text("Both noted.")));
@@ -14236,12 +14241,6 @@ fn thought_duration(elapsed: std::time::Duration) -> String {
     }
 }
 
-/// A wait, for a badge: "8s", "1m 4s". Whole seconds — this measures a
-/// queue behind a model turn, so there is nothing finer worth showing.
-fn elapsed(since: std::time::Instant) -> String {
-    duration_text(since.elapsed())
-}
-
 /// A duration as the transcript writes one: seconds under a minute,
 /// minutes and seconds past it.
 fn duration_text(duration: std::time::Duration) -> String {
@@ -15229,24 +15228,6 @@ pub struct TranscriptHit {
     pub at: Option<u64>,
 }
 
-/// The key a widget item's time is kept under, on the widget itself.
-const ROW_TIME_KEY: &str = "taste-row-time";
-
-fn stamp_widget(widget: &gtk::Widget) {
-    let at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
-    // SAFETY: the key is private to this file and is only ever set to,
-    // and read as, a `u64` — by `stamp_widget` and `widget_time`.
-    unsafe { widget.set_data::<u64>(ROW_TIME_KEY, at) };
-}
-
-fn widget_time(widget: &gtk::Widget) -> Option<u64> {
-    // SAFETY: see `stamp_widget` — the same key, the same type.
-    unsafe { widget.data::<u64>(ROW_TIME_KEY).map(|at| *at.as_ref()) }
-}
-
 /// "4 min ago · 2026-09-06T23:39:00Z": when a transcript row landed, both
 /// ways a reader wants it — how long ago, and exactly when.
 pub fn row_time_text(at: u64) -> String {
@@ -15542,20 +15523,6 @@ fn task_notification(block: &str) -> TaskNotification {
         summary: field("summary"),
         report: report.filter(|report| !report.is_empty()),
     }
-}
-
-/// A fresh key for a document that has no id of its own — a prompt, a
-/// response — so its opener finds the same tab twice.
-fn next_doc_key(prefix: &str) -> String {
-    thread_local! {
-        static NEXT: Cell<u64> = const { Cell::new(0) };
-    }
-    let n = NEXT.with(|next| {
-        let n = next.get() + 1;
-        next.set(n);
-        n
-    });
-    format!("{prefix}-{n}")
 }
 
 /// A session event as the stall log names it (`crate::stall`): its kind,

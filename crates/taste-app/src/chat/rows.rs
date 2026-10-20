@@ -12,7 +12,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 use agent_client_protocol::schema::v1::{ContentBlock, PlanEntryStatus, ToolCallContent};
 
-use super::model::{Answer, Dot, Kind, PlanCard, Rail, Row, RowId, Step, Task, Thought, User};
+use super::model::{
+    Answer, Delivery, Dot, Kind, PlanCard, Rail, Row, RowId, Step, Task, Thought, User,
+};
 use super::*;
 
 /// A row's widgets, and what a change to its row can patch in place
@@ -53,6 +55,7 @@ impl ChatPane {
             Kind::Task(task) => self.railed(self.task_widget(row, task)),
             Kind::Plan(plan) => self.railed(self.plan_widget(row, plan)),
             Kind::Note(text) => self.railed(self.note_widget(row, text)),
+            Kind::Marker { prompt, through } => (self.marker_widget(prompt, *through), None),
         };
         // The row's own box, which wears the blue while its document is
         // the tab in front, and a search hit's light.
@@ -232,23 +235,148 @@ impl ChatPane {
     /// began (David, 2026-09-07: "My prompts show up as full-width in
     /// boxes").
     fn user_widget(&self, id: RowId, user: &User) -> gtk::Box {
-        let card = self.prompt_card(&user.text, &user.attachments, Some(id));
-        if let Some((label, note)) = &user.badge {
-            let badge = queued_badge(label);
-            badge.set_tooltip_text(Some(note));
-            card.append(&badge_row(&badge));
+        let card = self.prompt_card(&user.text, &user.attachments, id);
+        // Where it has got to, under the words: why it has not gone yet,
+        // how long it waited, or that it never went.
+        let (label, tooltip): (String, Option<String>) = match &user.delivery {
+            Delivery::Delivered | Delivery::Sent => return card,
+            Delivery::Queued => ("queued — sends when the current turn ends".into(), None),
+            Delivery::Asking { told: false } => (
+                "queued — asking the agent to end its turn after its current step".into(),
+                None,
+            ),
+            Delivery::Asking { told: true } => (
+                "queued — the agent has been asked to end its turn".into(),
+                None,
+            ),
+            Delivery::Held(label) => (label.clone(), None),
+            Delivery::Waited(note) => (taste_core::queued::badge(note), Some(note.clone())),
+            Delivery::Refused(why) => (
+                format!("refused — {}", single_line(why, 200)),
+                Some(why.clone()),
+            ),
+            Delivery::NotSent(why) => (
+                format!("not sent — {}", single_line(why, 200)),
+                Some(why.clone()),
+            ),
+            Delivery::Lost => (
+                "not delivered — the agent stopped before it took this".into(),
+                None,
+            ),
+            Delivery::Undelivered => (
+                "not delivered — the IDE closed before the agent took this".into(),
+                None,
+            ),
+        };
+        let badge = gtk::Label::builder()
+            .label(&label)
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .css_classes(["dim-label", "caption"])
+            .margin_top(CARD_INSET)
+            .margin_bottom(CARD_INSET)
+            .margin_start(CARD_INSET)
+            .margin_end(CARD_INSET)
+            .build();
+        badge.set_tooltip_text(tooltip.as_deref());
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        line.append(&badge);
+        if matches!(user.delivery, Delivery::Refused(_)) {
+            card.add_css_class("refused");
+            badge.remove_css_class("dim-label");
+            badge.add_css_class("error");
         }
+        // Ask for a Turn at the end of a queued message's badge: the agent
+        // is asked, at its next use of the IDE's tools, to finish its step
+        // and end the turn (`taste_core::nudge`), which sends the message
+        // without stopping anything.
+        if let (Delivery::Queued, Some(prompt)) = (&user.delivery, &user.prompt) {
+            let button = gtk::Button::builder()
+                .label("Ask for a Turn")
+                .css_classes(["flat", "caption"])
+                .valign(gtk::Align::Center)
+                .margin_end(CARD_INSET)
+                .tooltip_text(
+                    "Ask the agent to finish the step it is on and end its turn, so this \
+                     message goes",
+                )
+                .build();
+            let weak = self.weak_self.borrow().clone();
+            let prompt = prompt.clone();
+            button.connect_clicked(move |button| {
+                button.set_sensitive(false);
+                if let Some(pane) = weak.upgrade() {
+                    pane.ask_for_turn(&prompt);
+                }
+            });
+            line.append(&button);
+        }
+        card.append(&line);
         card
     }
 
-    /// The card a prompt is drawn as, from a row (`row`) or as a live
-    /// send's: the words, clipped long and opened whole in the editor on a
-    /// click, a copy button, and the attachments.
+    /// Where a prompt was typed, which the agent took further down: a
+    /// marker that jumps to it. Between two steps the line runs on through
+    /// it, beside the rail as a step's content stands.
+    fn marker_widget(&self, prompt: &str, through: bool) -> gtk::Widget {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.append(&gtk::Image::from_icon_name("go-down-symbolic"));
+        content.append(
+            &gtk::Label::builder()
+                .label("sent here — jump to where it was taken")
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+        let marker = gtk::Button::builder()
+            .child(&content)
+            .css_classes(["flat"])
+            .tooltip_text("Jump to this prompt, further down")
+            .halign(gtk::Align::Center)
+            .hexpand(true)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        {
+            let weak = self.weak_self.borrow().clone();
+            let prompt = prompt.to_string();
+            marker.connect_clicked(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.scroll_to_prompt(&prompt);
+                }
+            });
+        }
+        // Vertical, so the line is given the column's width to be centred
+        // in, as a step's is; never expanding, or the column takes the
+        // row's spare width and the line leaves the rail.
+        let rail = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .width_request(RAIL_WIDTH)
+            .hexpand(false)
+            .build();
+        rail.append(
+            &gtk::Box::builder()
+                .css_classes(["rail-line"])
+                .halign(gtk::Align::Center)
+                .vexpand(true)
+                .visible(through)
+                .build(),
+        );
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
+        row.set_margin_start(ROW_OWN_SIDE);
+        row.set_margin_end(ROW_OWN_SIDE);
+        row.append(&rail);
+        row.append(&marker);
+        row.upcast()
+    }
+
+    /// The card a prompt is drawn as: the words, clipped long and opened
+    /// whole in the editor on a click, a copy button, and the attachments.
     pub(super) fn prompt_card(
         &self,
         text: &str,
         attachments: &[(String, ContentBlock)],
-        row: Option<RowId>,
+        row: RowId,
     ) -> gtk::Box {
         // No spacing: every row carries the inset itself.
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -329,13 +457,7 @@ impl ChatPane {
                     .margin_bottom(CARD_INSET - 2)
                     .build();
                 card.append(&more);
-                let key = match row {
-                    Some(id) => self.row_doc(id, "prompt"),
-                    None => next_doc_key("prompt"),
-                };
-                if row.is_none() {
-                    self.doc_widget(&key, card.upcast_ref());
-                }
+                let key = self.row_doc(row, "prompt");
                 let open = self.opener(
                     &key,
                     Document::Text {
