@@ -223,7 +223,7 @@ folder a probe opens is on its own branch;
 `TASTE_PROBE_ALIGN=1` prints where the file tree header's folder, branch,
 and All rows start their icon and text, which stand in one column;
 `TASTE_PROBE_TREE_END=1` scrolls the file tree to the end of its listing,
-where every folder's New File… and New Folder… rows are (pair it with
+where every folder's New file… and New folder… rows are (pair it with
 `TASTE_PROBE_VIEW=hero`: a watched environment is read-only and has none);
 `TASTE_PROBE_CARD=push` (or `pull`, `canon`) shows that sync count's hover
 card once the counts land (`sync_card.rs`, drawn in the window, so the

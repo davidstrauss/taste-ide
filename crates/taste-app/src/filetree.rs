@@ -313,7 +313,7 @@ struct FileNode {
     /// A suggested-but-not-yet-created file (allowlisted config the
     /// workspace could have). Activating it creates the real file.
     ghost: bool,
-    /// The New File… and New Folder… rows at the end of every folder's
+    /// The New file… and New folder… rows at the end of every folder's
     /// listing (a ghost, never on disk): activating one asks for a name and
     /// creates it there (David, 2026-10-20: "I think all directories should
     /// get ghost entries for new subfolders and files for consistency").
@@ -4991,8 +4991,8 @@ impl FileTree {
         };
 
         let create_section = gio::Menu::new();
-        create_section.append(Some("New File…"), Some("row.new-file"));
-        create_section.append(Some("New Folder…"), Some("row.new-folder"));
+        create_section.append(Some("New file…"), Some("row.new-file"));
+        create_section.append(Some("New folder…"), Some("row.new-folder"));
         menu.append_section(None, &create_section);
         {
             let tree = self.clone();
@@ -8510,8 +8510,8 @@ impl FileTree {
         row.add_css_class("file-row");
         if let Some(create) = node.create {
             let (icon, words) = match create {
-                Create::File => ("document-new-symbolic", "New File…"),
-                Create::Folder => ("folder-new-symbolic", "New Folder…"),
+                Create::File => ("document-new-symbolic", "New file…"),
+                Create::Folder => ("folder-new-symbolic", "New folder…"),
             };
             let icon = gtk::Image::from_icon_name(icon);
             icon.add_css_class("dim-label");
@@ -8723,7 +8723,7 @@ impl FileTree {
             });
         }
         // `TASTE_PROBE_TREE_END=1`: the listing scrolled to its end, where
-        // New File… and New Folder… are, which a short pane hides.
+        // New file… and New folder… are, which a short pane hides.
         if std::env::var("TASTE_PROBE_TREE_END").is_ok() {
             let adjustment = self.list_holder.vadjustment();
             glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
@@ -9943,8 +9943,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Every folder a writable pane lists ends with New File… and New
-    /// Folder…; a read-only pane's, and a search's, do not.
+    /// Every folder a writable pane lists ends with New file… and New
+    /// folder…; a read-only pane's, and a search's, do not.
     #[test]
     fn every_folder_ends_with_a_new_file_and_a_new_folder() {
         let root = std::env::temp_dir().join(format!("taste-creators-{}", std::process::id()));

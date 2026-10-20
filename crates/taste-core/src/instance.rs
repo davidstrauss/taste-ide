@@ -260,8 +260,21 @@ mod tests {
         assert!(!claim_in(base.path(), root.path()).is_granted());
 
         drop(first);
-        let next = claim_in(base.path(), root.path());
-        assert!(next.is_granted(), "a closed window releases its folder");
+        // Released, but not always at this instant: a subprocess another
+        // test forks in the same moment shares the lock's open file until
+        // it execs, which closes it (close-on-exec), so the lock outlives
+        // the drop by that long. The gate failed on it now and then
+        // (2026-10-20). A window's next claim comes long after.
+        let next = (0..100)
+            .map(|_| {
+                let claim = claim_in(base.path(), root.path());
+                if !claim.is_granted() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                claim
+            })
+            .find(|claim| claim.is_granted())
+            .expect("a closed window releases its folder");
         assert!(next.notice().is_none());
     }
 
