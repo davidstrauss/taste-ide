@@ -1761,6 +1761,33 @@ impl LibvirtSession {
         }
     }
 
+    /// Shut `vm` down and wait until it is off: an ACPI shutdown, and a
+    /// hard stop when the guest has not gone in `grace`. For a VM whose
+    /// memory is wanted now — a move's old VM, its last environment's work
+    /// already carried out of it (`Pool::place`).
+    pub async fn power_off(&self, vm: &Vm, grace: Duration) -> Result<()> {
+        self.stop(vm).await?;
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if self.state(vm).await? == DomainState::ShutOff {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        self.say(
+            &vm.domain,
+            format!(
+                "still up {}s after the shutdown; stopped hard",
+                grace.as_secs()
+            ),
+        );
+        match self.virsh(&["destroy", &vm.domain]).await {
+            Ok(_) => Ok(()),
+            Err(e) if format!("{e:#}").contains("not running") => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("stopping {}", vm.domain)),
+        }
+    }
+
     /// Remove a VM entirely: the domain, its disk, its Ignition, its log,
     /// its connection, and its `known_hosts` line. The base image stays.
     pub async fn destroy(&self, vm: &Vm) -> Result<()> {

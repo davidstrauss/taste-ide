@@ -4517,6 +4517,15 @@ impl EnvironmentRegistry {
                 .await
             }
             Err(e) => {
+                // Shut down to make room for its replacement, the old VM
+                // comes back up before anything runs in it again
+                // (`Pool::free_retiring`).
+                if let Err(again) = self.pool().bring_back(&old_domain).await {
+                    self.note_vm(
+                        &old_domain,
+                        format!("{env}: starting this VM again after the failed move: {again:#}"),
+                    );
+                }
                 if env.is_primary() {
                     self.set_substrate(old_substrate.clone());
                 }

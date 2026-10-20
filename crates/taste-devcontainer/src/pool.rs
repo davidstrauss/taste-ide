@@ -104,6 +104,12 @@ pub fn best_fit(
         })
 }
 
+/// How long a move's old VM is given to shut down when its memory is
+/// wanted before it is stopped hard: its container is stopped and its work
+/// carried out already, so a guest that dawdles holds nothing worth the
+/// wait.
+const POWER_OFF_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// One workspace's VMs: the ones under libvirt on this host, and its
 /// cloud hosts ([`crate::cloud`]).
 #[derive(Debug, Clone)]
@@ -374,7 +380,10 @@ impl Pool {
                         ),
                     });
                 }
-                self.check_room(&sizing).await?;
+                if let Err(short) = self.check_room(&sizing).await {
+                    self.free_retiring(retiring, short).await?;
+                    self.check_room(&sizing).await?;
+                }
                 self.libvirt
                     .create(&self.workspace_root, &sizing, retiring, report)
                     .await
@@ -478,6 +487,61 @@ impl Pool {
     /// Refuse a new VM the host cannot hold beside the ones already running
     /// — every workspace's, not only this one's, because the memory is the
     /// host's.
+    /// Make room for a move's new VM by shutting down the VM it leaves —
+    /// `retiring`, which holds nothing of this workspace but the moving
+    /// environment, whose work is carried out of it already (its snapshot
+    /// in the folder, its agent's home on this host) — or give back `short`
+    /// when there is no such VM.
+    ///
+    /// A move made its new VM before giving up the old, so a host that
+    /// holds two VMs and has no room for a third could move nothing: every
+    /// environment waited for another's move to free a VM, retried each
+    /// minute, and failed each time (2026-10-20: three environments on two
+    /// VMs of a 31 GiB host, after a release). The old VM is shut down, not
+    /// removed: a move that fails after this starts it again
+    /// ([`Pool::bring_back`]), and one that succeeds removes it.
+    async fn free_retiring(
+        &self,
+        retiring: Option<&str>,
+        short: PoolError,
+    ) -> std::result::Result<(), PoolError> {
+        let Some(domain) = retiring else {
+            return Err(short);
+        };
+        let vms = self.vms().await.map_err(PoolError::Unavailable)?;
+        let Some(old) = vms.iter().find(|vm| vm.domain == domain) else {
+            return Err(short);
+        };
+        if self.libvirt.state(old).await.ok() != Some(DomainState::Running) {
+            return Err(short);
+        }
+        self.libvirt.say(
+            domain,
+            "shutting down to make room for the VM replacing it; its environment's work is \
+             carried out already",
+        );
+        self.libvirt
+            .power_off(old, POWER_OFF_GRACE)
+            .await
+            .map_err(|error| PoolError::Failed {
+                domain: Some(domain.to_string()),
+                error,
+            })
+    }
+
+    /// Start `domain` again if it is down: a move's old VM, shut down to
+    /// make room ([`Pool::free_retiring`]), when the move fails.
+    pub async fn bring_back(&self, domain: &str) -> Result<()> {
+        let vms = self.vms().await?;
+        let Some(vm) = vms.iter().find(|vm| vm.domain == domain) else {
+            return Ok(());
+        };
+        if self.libvirt.state(vm).await? == DomainState::Running {
+            return Ok(());
+        }
+        self.libvirt.ensure_running(vm).await.map(|_| ())
+    }
+
     async fn check_room(&self, sizing: &Sizing) -> std::result::Result<(), PoolError> {
         let host_mib = sizing::host_memory_mib().unwrap_or(u64::MAX);
         let all = self

@@ -4120,6 +4120,22 @@ restored from its peer in a VM on the current release, the old copy
 removed, the old VM destroyed once nothing of the workspace is left in it,
 and the container started again.
 
+**A move that has no room for its new VM shuts its old one down first**,
+when the moving environment is the last of the workspace in it
+(`Pool::free_retiring`). The new VM was made before the old one was
+given up, so a host holding two VMs with no memory for a third could move
+nothing: each environment waited on another's move to free a VM, and all
+of them retried every minute and failed (2026-10-20: three environments
+on two 10 GiB VMs of a 31 GiB host, after a release). By the time the new
+VM is chosen, everything the move carries is on this host — the snapshot
+in the folder's refs, the agent's home in a tar — so the old VM is shut
+down (stopped hard after a minute) and its memory counted free. It is shut
+down, not removed: a move that fails after that starts it again
+(`Pool::bring_back`), and one that succeeds removes it as before. Moves
+then free VMs in turn: the last environment of one VM moves into a new
+one, the others follow into the room it has, and the last of the next
+VM frees that one.
+
 **A move is said as it happens** (David, 2026-10-19, after one ran for
 three minutes under a safe-mode banner: "There was no indication why
 anything had failed"). From the snapshot to the start at the end, the
