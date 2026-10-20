@@ -1557,6 +1557,7 @@ impl FileTree {
         // file does (`logview`, `portview`); what they list is the selected
         // environment's, so they follow the aim the way the tree does.
         let (logs_section, logs_list, logs_body) = section(crate::logview::LOG_ICON, "Logs");
+        logs_list.add_css_class("log-list");
         let mut log_sparklines = Vec::new();
         let mut log_badges = Vec::new();
         for kind in crate::logview::LogKind::ALL {
@@ -1566,11 +1567,14 @@ impl FileTree {
             let trailing = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             trailing.append(&badge);
             trailing.append(&sparkline.widget);
+            // The icon, the name, and the activity: a short set, the
+            // description left to the log's tab (David, 2026-10-20: "Drop
+            // the descriptions from the 'Logs' items").
             logs_list.append(&section_row(
                 None,
                 Some(kind.icon()),
                 kind.title(),
-                kind.subtitle(),
+                "",
                 Some(trailing.upcast_ref()),
             ));
             log_sparklines.push(sparkline);
@@ -1618,6 +1622,10 @@ impl FileTree {
                 .label("Add forwardPorts in devcontainer.json.")
                 .css_classes(["caption", "dim-label", "ghost-text"])
                 .xalign(0.0)
+                // The row's width, not thirty characters': unexpanded it
+                // wrapped a one-line sentence wherever the flank had the
+                // height to give it a second line.
+                .hexpand(true)
                 .wrap(true)
                 .wrap_mode(gtk::pango::WrapMode::WordChar)
                 .max_width_chars(30)
@@ -1678,6 +1686,7 @@ impl FileTree {
             .label("Add tasks in a Taskfile.yml.")
             .css_classes(["caption", "dim-label", "ghost-text"])
             .xalign(0.0)
+            .hexpand(true)
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .max_width_chars(30)

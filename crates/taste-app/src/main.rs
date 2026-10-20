@@ -864,6 +864,10 @@ fn main() -> glib::ExitCode {
                     so a dot in one list sits over a dot in the other. */\n\
                  .section-list > row { min-height: 40px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
+                 /* The Logs rows are one line — icon, name, activity — \
+                    a short set rather than the two-line rows beside them \
+                    (David, 2026-10-20: \"Make each entry much shorter\"). */\n\
+                 .section-list.log-list > row { min-height: 28px; }\n\
                  /* The checklists' rows are inset and rounded the same way, \
                     on the same 4 — libadwaita's own navigation-sidebar row \
                     sits at 6, and one pane with two insets four pixels \
