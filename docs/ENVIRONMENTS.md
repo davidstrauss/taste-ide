@@ -4536,6 +4536,17 @@ branches, whenever either moves (`peer::UPSTREAM_REMOTE`). An environment
 rebasing a pull request's branch onto `origin/main` was rebasing onto the
 user's local `main`, however long ago that was pulled.
 
+**Personal's checkout tracks what the folder tracks** (David, 2026-10-20:
+"I don't even want the agent to be able to set it; I just want it to be
+correct"). It was given the folder's remote-tracking refs and no remote to
+own them, so git would not take `origin/<branch>` as an upstream and `git
+status` counted nothing. Now its remotes' URLs and fetch rules and every
+branch's upstream are the folder's (`GitWorkspace::tracking_config`,
+`peer::share_tracking`), written at every share and after every sync pass,
+and only when they differ: one the agent sets lasts until the next ref
+moves. A URL's userinfo is dropped where it can be a token, and push URLs
+and URL rewrites are not given at all.
+
 **An agent fetches through the IDE** (`git_fetch`): the folder's fetch,
 then the share above, answering with the refs that moved and how long ago
 the folder last fetched (its `FETCH_HEAD`). A remote whose key would ask

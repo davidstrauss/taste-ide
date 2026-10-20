@@ -620,6 +620,56 @@ git config "branch.$branch.remote" personal
 git config "branch.$branch.merge" "refs/remotes/personal/$branch"
 "#;
 
+/// Run in Personal's checkout with the folder's remotes and upstreams as
+/// key and value pairs (`GitWorkspace::tracking_config`): the checkout's own
+/// are made exactly those — written only when they differ, so most runs
+/// change nothing — and any the folder does not have are taken out,
+/// whoever set them. Prints `changed` when it wrote.
+pub const TRACKING_SCRIPT: &str = r#"set -e
+re='^(remote\..+\.(url|fetch)|branch\..+\.(remote|merge|pushremote))$'
+pairs() { while [ $# -ge 2 ]; do printf '%s %s\n' "$1" "$2"; shift 2; done; }
+apply() { while [ $# -ge 2 ]; do git config --local --add "$1" "$2"; shift 2; done; }
+have=$(git config --local --get-regexp "$re" || true)
+[ "$(printf '%s\n' "$have" | sed '/^$/d' | sort)" = "$(pairs "$@" | sort)" ] && exit 0
+printf '%s\n' "$have" | sed '/^$/d' | cut -d' ' -f1 | sort -u | while read -r key; do
+  git config --local --unset-all "$key"
+done
+apply "$@"
+echo changed
+"#;
+
+/// Make Personal's checkout at `path` track what the user's folder tracks:
+/// its remotes and its branches' upstreams, as the folder's config has them
+/// (`TRACKING_SCRIPT`). The IDE's to set and nobody else's — an upstream
+/// set in the checkout is replaced by the folder's at the next share —
+/// so `git status` there counts against the same upstream as in the
+/// folder (David, 2026-10-20: "I don't even want the agent to be able to
+/// set it; I just want it to be correct").
+pub fn share_tracking(folder: &Path, files: &Files, path: &Path) -> Result<()> {
+    let Some(git) = taste_git::GitWorkspace::discover(folder) else {
+        return Ok(());
+    };
+    let mut argv: Vec<String> = vec![
+        "sh".into(),
+        "-c".into(),
+        TRACKING_SCRIPT.into(),
+        "share-tracking".into(),
+    ];
+    for (key, value) in git.tracking_config() {
+        argv.push(key);
+        argv.push(value);
+    }
+    let out = files.exec(path, &argv)?;
+    if !out.success() {
+        bail!(
+            "setting the checkout's remotes and upstreams in {}: {}",
+            path.display(),
+            out.stderr_utf8().trim()
+        );
+    }
+    Ok(())
+}
+
 /// Push Personal's branches from the folder (`folder`, the primary's peer)
 /// into the checkout at `path` in `vm`, pruning what Personal no longer
 /// has, then set its `personal` remote up ([`PERSONAL_REMOTE_SCRIPT`]).
@@ -2952,6 +3002,66 @@ mod tests {
             std::fs::read_to_string(pair.dir.join("checkout/sub/s.txt")).unwrap(),
             "an edit in the submodule\n"
         );
+    }
+
+    /// The checkout is given the folder's remotes and upstreams exactly:
+    /// one the agent set there is replaced, one the folder lacks goes, and
+    /// a second run with nothing new writes nothing.
+    #[test]
+    fn the_checkout_tracks_what_the_folder_tracks() {
+        let pair = Pair::new("tracking");
+        pair.git(".", &["init", "-q", "-b", "main", "checkout2"]);
+        let checkout = pair.dir.join("checkout2");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("sh")
+                .current_dir(&checkout)
+                .arg("-c")
+                .arg(TRACKING_SCRIPT)
+                .arg("share-tracking")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let config = |key: &str| {
+            let out = std::process::Command::new("git")
+                .current_dir(&checkout)
+                .args(["config", "--local", "--get-all", key])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // What an agent set by hand.
+        pair.git("checkout2", &["config", "branch.main.remote", "elsewhere"]);
+        pair.git(
+            "checkout2",
+            &["config", "branch.side.merge", "refs/heads/side"],
+        );
+        let want = [
+            "remote.origin.url",
+            "git@github.com:o/r.git",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+            "branch.main.remote",
+            "origin",
+            "branch.main.merge",
+            "refs/heads/main",
+        ];
+        assert_eq!(run(&want), "changed");
+        assert_eq!(config("branch.main.remote"), "origin");
+        assert_eq!(config("branch.main.merge"), "refs/heads/main");
+        assert_eq!(config("remote.origin.url"), "git@github.com:o/r.git");
+        assert_eq!(
+            config("branch.side.merge"),
+            "",
+            "the folder has no such upstream"
+        );
+        assert_eq!(run(&want), "", "nothing new: nothing written");
     }
 
     /// An environment's checkout, given Personal's branches the way the IDE

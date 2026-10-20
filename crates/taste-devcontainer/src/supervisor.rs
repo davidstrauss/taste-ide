@@ -1752,6 +1752,11 @@ impl Supervisor {
             let pass = self.sync_primary_blocking(&vm_info, &keys, &path, None, 0);
             self.folder_passes.fetch_add(1, Ordering::SeqCst);
             pass?;
+            // Each pass puts the checkout's upstreams back to the folder's,
+            // so one set there lasts until the next ref moves, not longer.
+            if let Err(e) = crate::peer::share_tracking(&self.env.peer, &self.files(), &path) {
+                tracing::debug!("the checkout's upstreams were not set: {e:#}");
+            }
         } else {
             crate::peer::fetch_from_guest(
                 &self.env.peer,
@@ -2042,6 +2047,11 @@ impl Supervisor {
             &path,
             &[crate::peer::REMOTES_REFSPEC],
         )?;
+        // Personal's checkout tracks what the folder tracks: the remote
+        // the refs just given belong to, and each branch's upstream.
+        if self.env.id.is_primary() {
+            crate::peer::share_tracking(&self.env.peer, &self.files(), &path)?;
+        }
         // And each submodule's, which the fetch may have moved too.
         crate::peer::share_submodules_remotes(
             &self.env.peer,

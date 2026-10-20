@@ -25,7 +25,9 @@ pub mod presence;
 pub mod private;
 pub mod refs;
 mod relation;
-pub use relation::{record_remote_tip, Canonical, PullPlan, PushTarget};
+pub use relation::{
+    is_tracking_key, record_remote_tip, without_secret, Canonical, PullPlan, PushTarget,
+};
 pub mod review;
 pub mod snapshot;
 pub mod submodule_setup;
@@ -1906,6 +1908,50 @@ mod tests {
             "the push sends main's two and the branch's one, which is all a \
              pull request shows; the old copy on origin/topic is its own: {sync:?}"
         );
+    }
+
+    /// What Personal's checkout is given of the folder's config: remotes'
+    /// URLs and fetch rules and branches' upstreams, a token in a URL left
+    /// out, and nothing else.
+    #[test]
+    fn the_tracking_config_is_the_remotes_and_upstreams_and_no_secret() {
+        let (dir, ws) = temp_repo();
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.remote("origin", "https://someone:ghp_secret@github.com/o/r.git")
+            .unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("branch.topic.remote", "origin").unwrap();
+        config
+            .set_str("branch.topic.merge", "refs/heads/topic")
+            .unwrap();
+        config
+            .set_str("remote.origin.pushurl", "https://x:y@github.com/o/r.git")
+            .unwrap();
+        config.set_str("user.name", "Someone").unwrap();
+        let got = ws.tracking_config();
+        assert!(got.contains(&(
+            "remote.origin.url".into(),
+            "https://github.com/o/r.git".into()
+        )));
+        assert!(got.contains(&(
+            "remote.origin.fetch".into(),
+            "+refs/heads/*:refs/remotes/origin/*".into()
+        )));
+        assert!(got.contains(&("branch.topic.merge".into(), "refs/heads/topic".into())));
+        assert!(!got
+            .iter()
+            .any(|(k, v)| k.contains("pushurl") || v.contains("secret")));
+        assert!(!got.iter().any(|(k, _)| k == "user.name"));
+        assert_eq!(
+            without_secret("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+        assert_eq!(
+            without_secret("ssh://git@github.com/o/r.git"),
+            "ssh://git@github.com/o/r.git"
+        );
+        assert!(is_tracking_key("branch.feature/x.pushremote"));
+        assert!(!is_tracking_key("remote.origin.pushurl"));
     }
 
     #[test]

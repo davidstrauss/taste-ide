@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 7;
+pub const GUIDANCE_REVISION: u32 = 8;
 
 /// When the user's folder last fetched: its `FETCH_HEAD`, which every
 /// fetch writes, as a person reads an age. `None` when it never has.
@@ -383,7 +383,9 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              fetches or pulls, and gives your checkout the result: Personal's checkout gets \
              the remote's branches as origin/*; any other environment gets them as \
              upstream/*, beside origin/* (the user's own branches) and personal/*. To fetch \
-             now, call git_fetch. A pull request's branch is brought up to date by \
+             now, call git_fetch. Personal's checkout's remotes and branch upstreams \
+             are the IDE's, copied from the user's folder: do not set them. A pull \
+             request's branch is brought up to date by \
              rebasing it onto the remote's default branch (origin/main in Personal's \
              checkout, upstream/main elsewhere), never onto its own pushed copy. Before you \
              rewrite a branch (rebase, amend, reword, \
@@ -6185,8 +6187,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "d5d4c603847df2ed6169ef7a2943f4e1425acc01f3e8d9c10aa7084a7d7477bc";
-        const AT_REVISION: u32 = 7;
+            "861ad7ad24bfac9f6c19b69f407fe5eabaeb2b6e720520e9e20c17c7fc541127";
+        const AT_REVISION: u32 = 8;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

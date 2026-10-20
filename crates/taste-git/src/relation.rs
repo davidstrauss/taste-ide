@@ -297,6 +297,46 @@ impl GitWorkspace {
         self.pull_plan_onto(branch, &target, own)
     }
 
+    /// The folder's remotes and branch upstreams, as Personal's checkout
+    /// in a VM is given them (`taste_devcontainer::peer::share_tracking`):
+    /// each remote's URL and fetch rules, and each branch's `remote`,
+    /// `merge`, and `pushRemote` — from this repository's own config, in
+    /// git's lower-cased key form. A URL's userinfo is left out where it
+    /// can be a secret (an `https://token@host` remote), and push URLs and
+    /// URL rewrites are not given at all: the checkout cannot reach a
+    /// remote, and the user's credentials never go where an agent works.
+    /// So `git status` there counts against the same upstream the user's
+    /// does, and nothing there sets one (David, 2026-10-20: "I don't even
+    /// want the agent to be able to set it; I just want it to be correct").
+    pub fn tracking_config(&self) -> Vec<(String, String)> {
+        let Ok(config) = self.repo.config() else {
+            return Vec::new();
+        };
+        let Ok(local) = config.open_level(git2::ConfigLevel::Local) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let Ok(entries) = local.entries(None) else {
+            return out;
+        };
+        let mut entries = entries;
+        while let Some(Ok(entry)) = entries.next() {
+            let (Some(name), Some(value)) = (entry.name(), entry.value()) else {
+                continue;
+            };
+            if !is_tracking_key(name) {
+                continue;
+            }
+            let value = if name.ends_with(".url") {
+                without_secret(value)
+            } else {
+                value.to_string()
+            };
+            out.push((name.to_string(), value));
+        }
+        out
+    }
+
     /// What the header's ↓ pulls `branch` from: its push target's tip as
     /// it is kept here (`refs/remotes/<remote>/<branch>`), when the push
     /// target is a named remote that has the branch. A full ref name.
@@ -708,6 +748,46 @@ impl GitWorkspace {
         args.push(format!("refs/heads/{branch}:refs/heads/{}", target.branch));
         args.extend(extra_refspecs.iter().map(|s| (*s).to_string()));
         self.git_command_owned(args)
+    }
+}
+
+/// Whether a config key is one [`GitWorkspace::tracking_config`] gives:
+/// `remote.<name>.url` or `.fetch`, or `branch.<name>.remote`, `.merge`,
+/// or `.pushremote`, as git names them (lower-cased first and last parts).
+pub fn is_tracking_key(key: &str) -> bool {
+    let Some((section, rest)) = key.split_once('.') else {
+        return false;
+    };
+    let Some((name, field)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    match section {
+        "remote" => matches!(field, "url" | "fetch"),
+        "branch" => matches!(field, "remote" | "merge" | "pushremote"),
+        _ => false,
+    }
+}
+
+/// `url` without userinfo that can be a secret: `https://user:token@host/x`
+/// is `https://host/x`. An ssh URL's user (`ssh://git@host`, `git@host:x`)
+/// is a login name, not a credential, and stays.
+pub fn without_secret(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    if matches!(scheme, "ssh" | "git+ssh" | "ssh+git") {
+        return url.to_string();
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://{host}{path}"),
+        None => url.to_string(),
     }
 }
 
