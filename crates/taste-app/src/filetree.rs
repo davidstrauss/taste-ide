@@ -845,6 +845,108 @@ struct StatusSnapshot {
     merged: Option<taste_git::merged::MergedInto>,
     /// What syncs though git ignores it (`Worktree::sync_ignored`).
     sync_ignored: taste_devcontainer::worktree::SyncIgnored,
+    /// What the sync counts' cards say of submodules.
+    submodule_sync: SubmoduleSync,
+}
+
+/// The submodules in a push or a pull of the branch, for the ↑, ↓, and ⇊
+/// cards (David, 2026-10-20: "The tooltip for pull and push should also
+/// include submodule info when relevant").
+#[derive(Debug, Clone, Default)]
+struct SubmoduleSync {
+    /// Push's submodule pushes first (`GitWorkspace::submodule_pushes`):
+    /// each submodule, its branch, and the commits it sends — or why the
+    /// push would refuse.
+    pushes: Option<Result<Vec<(PathBuf, String, usize)>, String>>,
+    /// The submodules ↓'s commits move.
+    own_moves: Vec<PathBuf>,
+    /// The submodules ⇊'s commits move.
+    canon_moves: Vec<PathBuf>,
+}
+
+impl SubmoduleSync {
+    fn read(git: &GitWorkspace, branch: &str) -> Self {
+        let head = format!("refs/heads/{branch}");
+        let moves = |target: Option<String>| {
+            target
+                .map(|target| git.submodule_moves(&head, &target))
+                .unwrap_or_default()
+        };
+        Self {
+            pushes: Some(git.submodule_pushes(branch).map(|pushes| {
+                pushes
+                    .into_iter()
+                    .map(|push| (push.path, push.branch, push.commits))
+                    .collect()
+            })),
+            own_moves: moves(git.own_target_of(branch)),
+            canon_moves: moves(git.canonical_ref_of(branch)),
+        }
+    }
+}
+
+impl SubmoduleSync {
+    /// ↑'s card, told what goes first: each submodule branch and what it
+    /// sends, or why the push would refuse.
+    fn tell_push(&self, card: &mut SyncCard) {
+        match &self.pushes {
+            Some(Ok(pushes)) => {
+                // The name in the value, which wraps, not the label, which
+                // sets the column: a long submodule path there squeezed
+                // every value on the card to a word a line.
+                for (path, branch, commits) in pushes {
+                    card.facts.push((
+                        "Submodule".to_string(),
+                        format!(
+                            "{}: {} on {branch}, pushed first",
+                            path.display(),
+                            count(*commits, "commit")
+                        ),
+                    ));
+                }
+            }
+            Some(Err(reason)) => add_warning(card, reason),
+            None => {}
+        }
+    }
+
+    /// A pull's card, told which submodules its commits move.
+    fn tell_moves(moves: &[PathBuf], card: &mut SyncCard) {
+        if moves.is_empty() {
+            return;
+        }
+        card.facts.push((
+            if moves.len() == 1 {
+                "Submodule".to_string()
+            } else {
+                "Submodules".to_string()
+            },
+            format!(
+                "{} {} to a new commit",
+                submodule_names(moves),
+                if moves.len() == 1 { "moves" } else { "move" }
+            ),
+        ));
+    }
+}
+
+/// `warning` beside whatever the card already warns of.
+fn add_warning(card: &mut SyncCard, warning: &str) {
+    card.warning = Some(match card.warning.take() {
+        Some(said) => format!("{said}\n{warning}"),
+        None => warning.to_string(),
+    });
+}
+
+/// The paths of `moves`, as a card's value: "tpl", "tpl and ext/lib".
+fn submodule_names(moves: &[PathBuf]) -> String {
+    let names: Vec<String> = moves.iter().map(|p| p.display().to_string()).collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
 }
 
 use crate::sync_card::{count, SyncCard};
@@ -5402,7 +5504,12 @@ impl FileTree {
                     let branch = branch.as_deref()?;
                     folder.as_ref()?.merged_into_default(branch)
                 });
+                let submodule_sync = match (folder.as_ref(), branch.as_deref()) {
+                    (Some(git), Some(branch)) => SubmoduleSync::read(git, branch),
+                    _ => SubmoduleSync::default(),
+                };
                 Ok(StatusSnapshot {
+                    submodule_sync,
                     merged,
                     submodules: worktree.submodule_heads(),
                     submodule_setup: crate::submodule_bar::posed_for_probe().unwrap_or_else(|| {
@@ -5727,6 +5834,11 @@ impl FileTree {
                                                 "Click to push".to_string()
                                             }),
                                         });
+                                    if ahead > 0 {
+                                        if let Some(card) = self.push_card.borrow_mut().as_mut() {
+                                            snapshot.submodule_sync.tell_push(card);
+                                        }
+                                    }
                                     // With the background fetch held back
                                     // for a key's touch the counts are as
                                     // old as the last Pull, so both pulls
@@ -5798,11 +5910,16 @@ impl FileTree {
                                                      remote to pull from it",
                                                 )
                                         } else {
-                                            SyncCard::new(format!("Catch up with {upstream}"))
-                                                .fact("New there", count(behind, "commit"))
-                                                .gesture(format!(
-                                                    "Click: fast-forward · Hold {hold} s: rebase"
-                                                ))
+                                            let mut card =
+                                                SyncCard::new(format!("Catch up with {upstream}"))
+                                                    .fact("New there", count(behind, "commit"));
+                                            SubmoduleSync::tell_moves(
+                                                &snapshot.submodule_sync.own_moves,
+                                                &mut card,
+                                            );
+                                            card.gesture(format!(
+                                                "Click: fast-forward · Hold {hold} s: rebase"
+                                            ))
                                         }
                                         .warning_if(held.clone()),
                                     );
@@ -5822,22 +5939,35 @@ impl FileTree {
                                             }
                                             self.canon_button
                                                 .set_sensitive((new > 0 || stale) && writable);
+                                            let canon_moves = &snapshot.submodule_sync.canon_moves;
                                             *self.canon_card.borrow_mut() = Some(
                                                 if new == 0 {
                                                     SyncCard::new(format!("Up to date with {name}"))
                                                         .fact("Yours", count(mine, "commit"))
                                                 } else if mine == 0 {
-                                                    SyncCard::new(format!("Fast-forward to {name}"))
-                                                        .fact("New there", count(new, "change"))
-                                                        .gesture("Click to fast-forward")
+                                                    let mut card = SyncCard::new(format!(
+                                                        "Fast-forward to {name}"
+                                                    ))
+                                                    .fact("New there", count(new, "change"));
+                                                    SubmoduleSync::tell_moves(
+                                                        canon_moves,
+                                                        &mut card,
+                                                    );
+                                                    card.gesture("Click to fast-forward")
                                                 } else {
-                                                    SyncCard::new(format!("Rebase onto {name}"))
-                                                        .fact("New there", count(new, "change"))
-                                                        .fact("Yours", count(mine, "commit"))
-                                                        .gesture(format!(
-                                                            "Hold {hold} s to rebase · a click \
-                                                             only fast-forwards"
-                                                        ))
+                                                    let mut card = SyncCard::new(format!(
+                                                        "Rebase onto {name}"
+                                                    ))
+                                                    .fact("New there", count(new, "change"))
+                                                    .fact("Yours", count(mine, "commit"));
+                                                    SubmoduleSync::tell_moves(
+                                                        canon_moves,
+                                                        &mut card,
+                                                    );
+                                                    card.gesture(format!(
+                                                        "Hold {hold} s to rebase · a click \
+                                                         only fast-forwards"
+                                                    ))
                                                 }
                                                 .warning_if(held.clone()),
                                             );

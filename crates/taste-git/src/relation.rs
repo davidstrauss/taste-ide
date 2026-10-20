@@ -811,6 +811,9 @@ pub struct SubmodulePush {
     pub branch: String,
     /// Where it goes, for the keys and the askpass.
     pub url: Option<String>,
+    /// The commits it sends that no remote-tracking ref of the submodule
+    /// has — what the Push card says it takes along.
+    pub commits: usize,
     pub program: String,
     pub args: Vec<String>,
 }
@@ -908,15 +911,62 @@ impl GitWorkspace {
             args.push(target.remote.clone());
             args.push(format!("refs/heads/{name}:refs/heads/{}", target.branch));
             let (program, args) = within.git_command_owned(args);
+            let commits = sub
+                .revwalk()
+                .ok()
+                .and_then(|mut walk| {
+                    walk.push(recorded).ok()?;
+                    let _ = walk.hide_glob("refs/remotes/*");
+                    Some(walk.take(1000).count())
+                })
+                .unwrap_or(0);
             pushes.push(SubmodulePush {
                 url: within.push_url_of(&name),
                 path,
                 branch: name,
+                commits,
                 program,
                 args,
             });
         }
         Ok(pushes)
+    }
+
+    /// The submodules whose recorded commit `target`'s new commits move:
+    /// what a pull of them changes beyond the branch's own files, read from
+    /// the merge base with `branch` to `target`. Both are full ref names.
+    pub fn submodule_moves(&self, branch: &str, target: &str) -> Vec<PathBuf> {
+        let tip = |name: &str| {
+            self.repo
+                .find_reference(name)
+                .ok()
+                .and_then(|r| r.peel_to_commit().ok())
+        };
+        let (Some(mine), Some(theirs)) = (tip(branch), tip(target)) else {
+            return Vec::new();
+        };
+        let Ok(base) = self.repo.merge_base(mine.id(), theirs.id()) else {
+            return Vec::new();
+        };
+        if base == theirs.id() {
+            return Vec::new();
+        }
+        let (Ok(base), Ok(theirs)) = (
+            self.repo.find_commit(base).and_then(|c| c.tree()),
+            theirs.tree(),
+        ) else {
+            return Vec::new();
+        };
+        let Ok(diff) = self
+            .repo
+            .diff_tree_to_tree(Some(&base), Some(&theirs), None)
+        else {
+            return Vec::new();
+        };
+        diff.deltas()
+            .filter(|delta| delta.new_file().mode() == git2::FileMode::Commit)
+            .filter_map(|delta| delta.new_file().path().map(Path::to_path_buf))
+            .collect()
     }
 }
 

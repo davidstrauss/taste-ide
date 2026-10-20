@@ -231,7 +231,8 @@ give the fixture more branches than fit, since the create row under the
 scrolling list is what a long list once cut off);
 `TASTE_PROBE_CARD=push` (or `pull`, `canon`) shows that sync count's hover
 card once the counts land (`sync_card.rs`, drawn in the window, so the
-shot has it), since a shot has no pointer to hover with;
+shot has it), since a shot has no pointer to hover with, and shoots the
+card whole as `window.sync-card` beside the pane it runs past;
 `TASTE_PROBE_SYNC=running` (or `conflict`, `failed`, `done`) poses the
 title bar's cloud — the folder's sync and the Google Cloud connection,
 one badge — in that state with its popover open;

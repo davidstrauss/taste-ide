@@ -2210,6 +2210,16 @@ mod tests {
         let pushes = ws.submodule_pushes("intel").unwrap();
         assert_eq!(pushes.len(), 1, "{pushes:?}");
         assert_eq!(pushes[0].branch, "release-stages");
+        assert_eq!(pushes[0].commits, 1, "the one commit the remote lacks");
+        // What a pull of the branch from main's side would move, and what
+        // main's own commits would not.
+        assert_eq!(
+            ws.submodule_moves("refs/heads/main", "refs/heads/intel"),
+            [PathBuf::from("tpl")]
+        );
+        assert!(ws
+            .submodule_moves("refs/heads/intel", "refs/heads/main")
+            .is_empty());
         for push in &pushes {
             let out = run(&deck, &push.program, &push.args);
             assert!(

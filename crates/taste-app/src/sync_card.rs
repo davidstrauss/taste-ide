@@ -71,6 +71,9 @@ impl SyncCard {
         let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
         card.add_css_class("osd");
         card.add_css_class("sync-card");
+        // `TASTE_PROBE_CARD` shoots it by this name, whole: drawn on the
+        // window's layer, it runs past the pane a pane's shot is cut to.
+        card.set_widget_name("sync-card");
         let title = gtk::Label::builder()
             .label(&self.title)
             .xalign(0.0)
@@ -194,6 +197,12 @@ impl Layer {
         };
         let widget = card.widget();
         let (_, natural_w, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+        let natural_w = natural_w.min(self.layer.width() - 8).max(1);
+        // A fixed child is allocated its minimum, which for a wrapping
+        // label is its longest word: a card's values wrapped a word a line
+        // under any title shorter than they were. Its natural width asked
+        // for outright.
+        widget.set_size_request(natural_w, -1);
         let (_, natural_h, _, _) = widget.measure(gtk::Orientation::Vertical, natural_w);
         let (w, h) = (f64::from(natural_w), f64::from(natural_h));
         let (layer_w, layer_h) = (
