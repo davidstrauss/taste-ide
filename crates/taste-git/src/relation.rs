@@ -79,16 +79,6 @@ pub struct Canonical {
     /// The branch's own commits: those whose change is not there. What a
     /// pull request from it shows.
     pub own: usize,
-    /// The commits a push of the branch onto it would land, when that push
-    /// is a fast-forward — the branch is on top of it — and lands any: the
-    /// header's ⇈, which merges by pushing and never by rewriting it.
-    pub lands: Option<usize>,
-    /// The commits there the branch does not have, by commit: what a push
-    /// of the branch onto it would have to replace when it is not a
-    /// fast-forward — the forced ⇈, held for longest of all.
-    pub behind: usize,
-    /// Its tip as last fetched: what a forced push onto it is leased on.
-    pub tip: String,
 }
 
 /// Where a branch's push goes.
@@ -382,15 +372,11 @@ impl GitWorkspace {
                 (new, own)
             }
         };
-        let (ahead, behind) = self.repo.graph_ahead_behind(tip, there).ok()?;
         Some(Canonical {
             name: short_ref(&full),
             full,
             new,
             own,
-            lands: (behind == 0 && ahead > 0).then_some(ahead),
-            behind,
-            tip: there.to_string(),
         })
     }
 
@@ -674,37 +660,6 @@ impl GitWorkspace {
             status.own_ahead = walk.filter(Result::is_ok).count();
         }
         Ok(status)
-    }
-
-    /// The ⇈: `branch` pushed onto the canonical branch on its remote —
-    /// `<remote> refs/heads/<branch>:refs/heads/<name>`. Unforced, git
-    /// refuses it unless it is a fast-forward there, which is how a merge by
-    /// push leaves the history everyone else's work stands on alone. With
-    /// `replacing`, the tip last fetched there, it replaces that history,
-    /// leased on it: the forced ⇈, held for longest of all. `None` without
-    /// a canonical branch, or one this cannot name a remote for.
-    pub fn push_onto_canonical_command(
-        &self,
-        branch: &str,
-        replacing: Option<&str>,
-    ) -> Option<(String, Vec<String>)> {
-        let full = self.canonical_ref_of(branch)?;
-        let rest = full.strip_prefix("refs/remotes/")?;
-        let remote = self
-            .remotes()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|remote| rest.starts_with(&format!("{remote}/")))
-            .max_by_key(String::len)?;
-        let name = &rest[remote.len() + 1..];
-        let mut args = self.align_args();
-        args.extend(["push", crate::PUSH_SUBMODULES].map(String::from));
-        if let Some(expected) = replacing {
-            args.push(format!("--force-with-lease=refs/heads/{name}:{expected}"));
-        }
-        args.push(remote);
-        args.push(format!("refs/heads/{branch}:refs/heads/{name}"));
-        Some(self.git_command_owned(args))
     }
 
     /// The push of `branch` by name, as [`GitWorkspace::push_target`]

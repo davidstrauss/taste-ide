@@ -39,13 +39,6 @@ pub const HOLD: Duration = Duration::from_secs(2);
 /// holding 10 seconds"). A button holds this long by [`HoldButton::set_hold`].
 pub const LONG_HOLD: Duration = Duration::from_secs(10);
 
-/// The hold for replacing the default branch from another branch entirely
-/// — the header's ⇈ when the branch is not on top of it — which should
-/// almost never be what anyone means (David, 2026-10-19: "it should be 20
-/// seconds to force-push to the default branch from another branch
-/// entirely. That should be extremely rare").
-pub const LONGEST_HOLD: Duration = Duration::from_secs(20);
-
 /// What the toast says when a press ends early.
 pub fn early_release_note(hold: Duration) -> String {
     format!("Hold for {} seconds to confirm", hold.as_secs())
@@ -362,10 +355,6 @@ mod tests {
         assert_eq!(
             super::early_release_note(super::LONG_HOLD),
             "Hold for 10 seconds to confirm"
-        );
-        assert_eq!(
-            super::early_release_note(super::LONGEST_HOLD),
-            "Hold for 20 seconds to confirm"
         );
     }
 }

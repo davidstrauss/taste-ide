@@ -382,11 +382,6 @@ pub struct FileTree {
     /// Push's hold: a click pushes, and a push that replaces commits on
     /// the remote is held for ([`FileTree::push`]).
     push_hold: Rc<crate::holdbutton::HoldButton>,
-    /// The ⇈: this branch pushed onto the canonical branch, a merge by
-    /// fast-forward ([`FileTree::merge_onto_canonical`]).
-    merge_face: gtk::Label,
-    merge_button: gtk::Button,
-    merge_hold: Rc<crate::holdbutton::HoldButton>,
     push_button: gtk::Button,
     /// A push or sync is running. Status refreshes land constantly (the
     /// watcher, every save, the agent), and one arriving mid-operation
@@ -1028,24 +1023,40 @@ fn push_hold_for(on_canonical: bool, replacing: bool) -> std::time::Duration {
     }
 }
 
-/// How long ⇈ is held for: as a push from the default branch's checkout
-/// is, when it lands as a fast-forward; for [`LONGEST_HOLD`] when it would
-/// replace the default branch's history from another branch entirely,
-/// which should almost never be meant (`crate::holdbutton`).
-fn merge_hold_for(fast_forward: bool) -> std::time::Duration {
-    if fast_forward {
-        crate::holdbutton::HOLD
-    } else {
-        crate::holdbutton::LONGEST_HOLD
+/// A sync count's button: its drawn arrow (`crate::sync_arrow`) and its
+/// count — glyph, space, number — in a sync button's stack. The count is
+/// the label returned; the arrow is drawn in its colour.
+fn arrow_button(arrow: crate::sync_arrow::Arrow, tooltip: &str) -> (gtk::Button, gtk::Label) {
+    let count = gtk::Label::new(Some(" 0"));
+    let face = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let drawn = crate::sync_arrow::SyncArrow::new(arrow);
+    face.append(&drawn);
+    face.append(&count);
+    // The arrow is drawn in the count's colour, so it is drawn again when
+    // that changes: the warning class Push wears when it replaces, and the
+    // dimming of a disabled button, which reach the count and not it.
+    {
+        let drawn = drawn.downgrade();
+        count.connect_css_classes_notify(move |_| {
+            if let Some(drawn) = drawn.upgrade() {
+                drawn.queue_draw();
+            }
+        });
     }
-}
-
-/// A count under a double arrow, ⇊ or ⇈, as Pango markup: two of the UI
-/// font's own arrows drawn into each other, so it matches the ↓ and ↑
-/// beside it. The ⇊ character is not in the UI font, and the fallback's
-/// sat heavier and tight against its count.
-fn double_arrow(arrow: char, count: usize) -> String {
-    format!("<span letter_spacing=\"-3500\">{arrow}</span>{arrow} {count}")
+    {
+        let drawn = drawn.downgrade();
+        count.connect_state_flags_changed(move |_, _| {
+            if let Some(drawn) = drawn.upgrade() {
+                drawn.queue_draw();
+            }
+        });
+    }
+    let button = gtk::Button::builder()
+        .child(&sync_button_stack(&face))
+        .tooltip_text(tooltip)
+        .css_classes(["flat", "sync-count"])
+        .build();
+    (button, count)
 }
 
 /// What a push of `sync`'s branch replaces on its push target, when it
@@ -1145,7 +1156,8 @@ impl FileTree {
         // swaps the page and nothing around it moves (David, 2026-09-21:
         // "When I press to push or pull and it turns into a spinner, no
         // positions of anything should change").
-        let (push_button, push_face) = sync_button_with_label("↑ 0", "Push commits to the remote");
+        let (push_button, push_face) =
+            arrow_button(crate::sync_arrow::Arrow::Up, "Push commits to the remote");
         push_button.set_sensitive(false);
         let push_hold = crate::holdbutton::HoldButton::around(
             &push_button,
@@ -1155,8 +1167,8 @@ impl FileTree {
                 .expect("a sync button's child is its stack"),
             "face",
         );
-        let (pull_button, pull_face) = sync_button_with_label(
-            "↓ 0",
+        let (pull_button, pull_face) = arrow_button(
+            crate::sync_arrow::Arrow::Down,
             "Pull: a click fetches and fast-forwards; hold to rebase onto the remote tip",
         );
         pull_button.set_sensitive(false);
@@ -1168,25 +1180,9 @@ impl FileTree {
                 .expect("a sync button's child is its stack"),
             "face",
         );
-        let (canon_button, canon_face) = sync_button_with_label(
-            "⇊ 0",
+        let (canon_button, canon_face) = arrow_button(
+            crate::sync_arrow::Arrow::DoubleDown,
             "Rebase onto the remote's default branch: hold to rebase",
-        );
-        canon_face.set_markup(&double_arrow('↓', 0));
-        let (merge_button, merge_face) = sync_button_with_label(
-            "⇈ 0",
-            "Merge onto the remote's default branch: hold to push this branch onto it",
-        );
-        merge_face.set_markup(&double_arrow('↑', 0));
-        merge_button.set_sensitive(false);
-        merge_button.set_visible(false);
-        let merge_hold = crate::holdbutton::HoldButton::around(
-            &merge_button,
-            &merge_button
-                .child()
-                .and_downcast::<gtk::Stack>()
-                .expect("a sync button's child is its stack"),
-            "face",
         );
         canon_button.set_sensitive(false);
         canon_button.set_visible(false);
@@ -1343,7 +1339,7 @@ impl FileTree {
         sync_row.append(&abort_button);
         sync_row.append(&continue_button);
         sync_row.append(&init_button);
-        // The four counts as one group, parted by their own padding rather
+        // The three counts as one group, parted by their own padding rather
         // than the row's spacing: they are one instrument — where this
         // branch stands against its remote copy and the canonical branch —
         // and the room is the branch name's.
@@ -1351,7 +1347,6 @@ impl FileTree {
         counts.append(&canon_button);
         counts.append(&pull_button);
         counts.append(&push_button);
-        counts.append(&merge_button);
         sync_row.append(&counts);
         sync_row.append(&sync_button);
 
@@ -1657,9 +1652,6 @@ impl FileTree {
             pull_button: pull_button.clone(),
             _pull_hold: pull_hold.clone(),
             push_hold: push_hold.clone(),
-            merge_face,
-            merge_button: merge_button.clone(),
-            merge_hold: merge_hold.clone(),
             push_button: push_button.clone(),
             sync_busy: std::cell::Cell::new(false),
             abort_button: abort_button.clone(),
@@ -1935,19 +1927,6 @@ impl FileTree {
                 push_hold.set_on_confirm(run);
             } else {
                 push_hold.set_on_click(run);
-            }
-        }
-        for held in [false, true] {
-            let weak = weak.clone();
-            let run = move || {
-                if let Some(tree) = weak.upgrade() {
-                    tree.merge_onto_canonical(held);
-                }
-            };
-            if held {
-                merge_hold.set_on_confirm(run);
-            } else {
-                merge_hold.set_on_click(run);
             }
         }
         let weak = Rc::downgrade(&tree);
@@ -2682,19 +2661,12 @@ impl FileTree {
     /// "the push button on my personal env showed that I had 1 commit to
     /// push to *myself*").
     fn clear_sync_counts(&self) {
-        self.push_face.set_label("↑ 0");
+        self.push_face.set_label(" 0");
         self.push_face.remove_css_class("warning");
-        self.pull_face.set_label("↓ 0");
-        self.canon_face.set_markup(&double_arrow('↓', 0));
-        self.merge_face.set_markup(&double_arrow('↑', 0));
+        self.pull_face.set_label(" 0");
+        self.canon_face.set_label(" 0");
         self.canon_button.set_visible(false);
-        self.merge_button.set_visible(false);
-        for button in [
-            &self.push_button,
-            &self.pull_button,
-            &self.canon_button,
-            &self.merge_button,
-        ] {
+        for button in [&self.push_button, &self.pull_button, &self.canon_button] {
             button.set_sensitive(false);
             button.set_tooltip_text(None);
         }
@@ -5219,7 +5191,6 @@ impl FileTree {
         self.init_button.set_visible(true);
         self.branch_label.set_visible(false);
         self.canon_button.set_visible(false);
-        self.merge_button.set_visible(false);
         self.pull_button.set_visible(false);
         self.push_button.set_visible(false);
         self.sync_button.set_visible(false);
@@ -5314,7 +5285,6 @@ impl FileTree {
                         &self.push_button,
                         &self.pull_button,
                         &self.canon_button,
-                        &self.merge_button,
                     ] {
                         button_idle(button);
                     }
@@ -5325,7 +5295,6 @@ impl FileTree {
                         self.push_button.set_sensitive(false);
                         self.pull_button.set_sensitive(false);
                         self.canon_button.set_sensitive(false);
-                        self.merge_button.set_sensitive(false);
                         self.set_sync_label("rebase paused — resolve, mark, Continue");
                     } else {
                         match snapshot.sync {
@@ -5354,9 +5323,9 @@ impl FileTree {
                                     // has, which is a hold.
                                     let own = sync.own_ahead;
                                     self.push_face.set_label(&if sync.push_unknown {
-                                        "↑ ?".to_string()
+                                        " ?".to_string()
                                     } else {
-                                        format!("↑ {own}")
+                                        format!(" {own}")
                                     });
                                     if replacing.is_some() {
                                         self.push_face.add_css_class("warning");
@@ -5451,7 +5420,7 @@ impl FileTree {
                                     // ↓: the branch's own copy on the remote,
                                     // which someone else may have pushed to.
                                     let behind = sync.own_behind;
-                                    self.pull_face.set_label(&format!("↓ {behind}"));
+                                    self.pull_face.set_label(&format!(" {behind}"));
                                     self.pull_button.set_sensitive(
                                         (behind > 0 || stale)
                                             && !sync.new_branch
@@ -5491,7 +5460,7 @@ impl FileTree {
                                             let (name, new, mine) =
                                                 (&canonical.name, canonical.new, canonical.own);
                                             self.canon_button.set_visible(true);
-                                            self.canon_face.set_markup(&double_arrow('↓', new));
+                                            self.canon_face.set_label(&format!(" {new}"));
                                             self.canon_button
                                                 .set_sensitive((new > 0 || stale) && writable);
                                             self.canon_button.set_tooltip_text(Some(
@@ -5520,54 +5489,6 @@ impl FileTree {
                                             ));
                                         }
                                         None => self.canon_button.set_visible(false),
-                                    }
-                                    // ⇈: this branch pushed onto the
-                                    // canonical branch — a merge, by
-                                    // fast-forward only, held for as a push
-                                    // from the default branch is.
-                                    match &sync.canonical {
-                                        Some(canonical) => {
-                                            let name = &canonical.name;
-                                            let mine = canonical.own;
-                                            let forced = canonical.lands.is_none();
-                                            let merge_hold = merge_hold_for(!forced);
-                                            self.merge_hold.set_hold(merge_hold);
-                                            let secs = merge_hold.as_secs();
-                                            self.merge_button.set_visible(true);
-                                            self.merge_face.set_markup(&double_arrow('↑', mine));
-                                            if forced && mine > 0 {
-                                                self.merge_face.add_css_class("warning");
-                                            } else {
-                                                self.merge_face.remove_css_class("warning");
-                                            }
-                                            self.merge_button.set_sensitive(mine > 0 && writable);
-                                            self.merge_button.set_tooltip_text(Some(&match (
-                                                canonical.lands,
-                                                mine,
-                                            ) {
-                                                (_, 0) => format!(
-                                                    "Nothing of this branch's own to put on {name}"
-                                                ),
-                                                (Some(lands), _) => format!(
-                                                    "Merge onto {name}: hold for {secs} seconds \
-                                                     to push this branch onto it, landing \
-                                                     {lands} commit{}. A fast-forward",
-                                                    plural(lands)
-                                                ),
-                                                (None, _) => format!(
-                                                    "Replace {name} with this branch: hold for \
-                                                     {secs} seconds. It drops the {} commit{} \
-                                                     there that this branch lacks, {} of them \
-                                                     change{} it does not have. Rebasing onto \
-                                                     {name} first (⇊) makes this a fast-forward",
-                                                    canonical.behind,
-                                                    plural(canonical.behind),
-                                                    canonical.new,
-                                                    plural(canonical.new)
-                                                ),
-                                            }));
-                                        }
-                                        None => self.merge_button.set_visible(false),
                                     }
                                 }
                                 None => {
@@ -5627,7 +5548,6 @@ impl FileTree {
         // Shown by the status that says there is a canonical branch.
         if !is_repo {
             self.canon_button.set_visible(false);
-            self.merge_button.set_visible(false);
         }
         self.push_button.set_visible(is_repo);
         self.sync_button.set_visible(is_repo);
@@ -8546,7 +8466,6 @@ impl FileTree {
             &self.push_button,
             &self.pull_button,
             &self.canon_button,
-            &self.merge_button,
             &self.sync_button,
         ] {
             if other != button {
@@ -8647,115 +8566,6 @@ impl FileTree {
                 self.push_now(None);
             }
         }
-    }
-
-    /// The ⇈: this branch pushed onto the canonical branch on its remote,
-    /// which merges it there without a merge commit — a fast-forward, never
-    /// forced, so it is offered only while the branch is on top of it
-    /// (`Canonical::lands`) and git refuses it if that has changed since.
-    /// Held for as a push from the default branch's checkout is, since it
-    /// moves that branch (David, 2026-10-19: "merge this branch into the
-    /// canonical branch on origin").
-    fn merge_onto_canonical(self: &Rc<Self>, held: bool) {
-        if self.refuse_read_only() {
-            return;
-        }
-        let Some(branch) = self.status_branch.borrow().clone() else {
-            return;
-        };
-        let Some((command, remote, canonical)) = self.git.borrow().as_ref().and_then(|git| {
-            let canonical = git.canonical_of(&branch)?;
-            // Forced only when it is not a fast-forward, leased on the tip
-            // last fetched there; the hold was twenty seconds for it.
-            let replacing = canonical.lands.is_none().then(|| canonical.tip.clone());
-            Some((
-                git.push_onto_canonical_command(&branch, replacing.as_deref())?,
-                git.upstream_remote_url(),
-                canonical,
-            ))
-        }) else {
-            return;
-        };
-        let name = canonical.name.clone();
-        let plural = |n: usize| if n == 1 { "" } else { "s" };
-        if canonical.own == 0 {
-            self.workspace.events.publish(Event::Toast(format!(
-                "Nothing of {branch}'s own to put on {name}"
-            )));
-            return;
-        }
-        if !held {
-            self.workspace
-                .events
-                .publish(Event::Toast(match canonical.lands {
-                    Some(lands) => format!(
-                        "Not merged: hold ⇈ for {} seconds to push {branch} onto {name}, landing \
-                     {lands} commit{}",
-                        merge_hold_for(true).as_secs(),
-                        plural(lands)
-                    ),
-                    None => format!(
-                        "Not merged: {branch} is not on top of {name}. Rebase onto it first (⇊), \
-                     or hold ⇈ for {} seconds to replace {name} with it, dropping the {} \
-                     commit{} there it lacks",
-                        merge_hold_for(false).as_secs(),
-                        canonical.behind,
-                        plural(canonical.behind)
-                    ),
-                }));
-            return;
-        }
-        let done = match canonical.lands {
-            Some(lands) => format!(
-                "Merged {branch} onto {name}: {lands} commit{}",
-                plural(lands)
-            ),
-            None => format!(
-                "Replaced {name} with {branch}, dropping {} commit{}",
-                canonical.behind,
-                plural(canonical.behind)
-            ),
-        };
-        self.begin_sync_op(&self.merge_button);
-        let events = self.workspace.events.clone();
-        let root = self.workspace.root().to_path_buf();
-        let note_agent = self.note_agent.borrow().clone();
-        let share_remotes = self.share_remotes.borrow().clone();
-        let spec = {
-            let (program, args) = command;
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            taste_core::ExecContext::host().resolve(&program, &arg_refs, false)
-        };
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let envs = crate::ssh_agent::network_env(root, remote).await;
-            let handle =
-                crate::runtime::runtime().spawn(run_git_step(spec.program, spec.args, envs));
-            match handle.await {
-                Ok(Ok(_)) => {
-                    events.publish(Event::Toast(done));
-                    if let Some(note_agent) = note_agent {
-                        note_agent(format!(
-                            "The user pushed {branch} onto {name}: its commits are on the \
-                             default branch now."
-                        ));
-                    }
-                    if let Some(share) = share_remotes {
-                        let _ = crate::runtime::runtime()
-                            .spawn_blocking(move || share())
-                            .await;
-                    }
-                }
-                Ok(Err(reason)) => {
-                    events.publish(Event::Toast(format!("Merge failed: {reason}")));
-                }
-                Err(_) => events.publish(Event::Toast("Merge failed: interrupted".into())),
-            }
-            if let Some(tree) = weak.upgrade() {
-                tree.end_sync_op();
-            }
-            events.publish(Event::GitStatusChanged);
-        });
     }
 
     /// The push itself, replacing what the push target has when `expected`
@@ -9640,15 +9450,6 @@ mod tests {
         assert_eq!(super::push_hold_for(true, false), HOLD);
         assert_eq!(super::push_hold_for(false, true), HOLD);
         assert_eq!(super::push_hold_for(false, false), HOLD);
-    }
-
-    /// ⇈ as a fast-forward is the ordinary hold; replacing the default
-    /// branch from another branch is the longest there is.
-    #[test]
-    fn replacing_the_default_branch_from_another_holds_longest() {
-        use crate::holdbutton::{HOLD, LONGEST_HOLD};
-        assert_eq!(super::merge_hold_for(true), HOLD);
-        assert_eq!(super::merge_hold_for(false), LONGEST_HOLD);
     }
 
     use super::files_reached;

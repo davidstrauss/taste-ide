@@ -1894,28 +1894,12 @@ mod tests {
         assert_eq!(ws.canonical_of("main"), None, "main's own copy is Pull's");
         assert!(ws.sync_status_of("main").unwrap().on_canonical);
         assert!(!ws.sync_status_of("topic").unwrap().on_canonical);
-        assert_eq!(
-            canonical.lands, None,
-            "not on top of main: no merge by push"
-        );
 
         git(&mine, &["rebase", "-q", "origin/main"]);
         let ws = GitWorkspace::discover(&mine).unwrap();
         let sync = ws.sync_status_of("topic").unwrap();
         let canonical = sync.canonical.clone().unwrap();
-        assert_eq!(
-            (canonical.new, canonical.own, canonical.lands),
-            (0, 1, Some(1)),
-            "{sync:?}"
-        );
-        // ⇈: the branch pushed onto main, a fast-forward, and main moves.
-        let (_, args) = ws.push_onto_canonical_command("topic", None).unwrap();
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        assert_eq!(
-            &args[args.len() - 2..],
-            ["origin", "refs/heads/topic:refs/heads/main"]
-        );
-        assert!(!args.iter().any(|a| a.starts_with("--force")), "{args:?}");
+        assert_eq!((canonical.new, canonical.own), (0, 1), "{sync:?}");
         assert_eq!(
             (sync.ahead, sync.own_ahead, sync.own_behind, sync.rewritten),
             (3, 1, 0, Some(0)),

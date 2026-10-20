@@ -4498,7 +4498,7 @@ fork's rebased branch; a click says what the push replaces, and how many
 of those commits make a change the branch no longer has. Someone else's
 commit among them is not a rewrite, and Pull's rebase is still the answer.
 
-**The header's four arrows** (David, 2026-10-19: "I'm rebasing branches
+**The header's three arrows** (David, 2026-10-19: "I'm rebasing branches
 for PRs all the time"). Pull had one target, the branch's upstream, which
 for a pull request's branch is its own pushed copy — the wrong thing to
 rebase onto almost every time. Now each button has one target, a click
@@ -4510,24 +4510,20 @@ change, not by commit:
   `master`), never a local branch (`GitWorkspace::canonical_of`). N is the
   changes there the branch lacks. A click fast-forwards when the branch has
   nothing of its own; a hold rebases onto it. Absent on that branch itself.
+  Its arrow is a ↓ with a double stem, since neither ⇊ nor ⇓ is in
+  Adwaita Sans, and a fallback's sat heavier and apart from its count. All
+  three arrows are drawn by one function (`sync_arrow.rs`), in the UI font's
+  own ↓ box and at a weight taken from it, so they stay one set.
 - **↓ N** — the branch's own copy on the remote, for commits someone else
   pushed to it: a click fast-forwards, a hold rebases. 0 when what it lacks
   is its own old copies (above).
 - **↑ N** — push, N being the branch's own commits, not the ones a rebase
   brought along from the canonical branch; amber when the push replaces
   history, which is a hold.
-- **⇈ N** — merge onto the canonical branch by pushing this branch onto it
-  (`push_onto_canonical_command`): a fast-forward when the branch is on top
-  of it; otherwise, amber, it replaces that branch's history, leased on the
-  tip last fetched.
 
-The holds (`filetree::push_hold_for`, `merge_hold_for`): a plain push of a
-branch is a click and replacing it two seconds; on the default branch's
-own checkout every push is two seconds and replacing its history ten; ⇈ is
-two seconds as a fast-forward and twenty when it would replace the default
-branch from another branch entirely, which should almost never be meant.
-The double arrows are two of the UI font's own arrows drawn together, the
-⇊ character not being in it.
+The holds (`filetree::push_hold_for`): a plain push of a branch is a click
+and replacing it two seconds; on the default branch's own checkout every
+push is two seconds and replacing its history ten.
 
 **What a fetch brings reaches every checkout.** The fetch is the folder's,
 with the user's keys; no checkout in a VM can make one. After the file

@@ -73,6 +73,7 @@ mod startup;
 mod stripes;
 mod submodule_bar;
 mod submodule_diff;
+mod sync_arrow;
 mod sync_mark;
 mod syncstatus;
 mod tabfamily;
@@ -632,13 +633,12 @@ fn main() -> glib::ExitCode {
                     read, not chosen. */\n\
                  listview.transcript > row { padding: 0; margin: 0; \
                    min-height: 0; background: none; outline: none; }\n\
-                 /* The file tree's sync counts — ⇊ ↓ ↑ ⇈ — four buttons \
-                    in a row beside the branch name, in a pane whose \
-                    minimum width decides whether the window tiles: a \
-                    flat button's ten pixels a side made the four of them \
-                    widen the pane by fifty (filetree.rs). The row's own \
-                    spacing still parts them. */\n\
-                 button.sync-count { padding-left: 4px; padding-right: 4px; }\n\
+                 /* The file tree's sync counts — ⇊ ↓ ↑ — in a row beside \
+                    the branch name, in a pane whose minimum width decides \
+                    whether the window tiles: a little under a flat \
+                    button's ten pixels a side, so a branch name like \
+                    datum-call keeps its room (filetree.rs). */\n\
+                 button.sync-count { padding-left: 8px; padding-right: 8px; }\n\
                  /* The transcript's scrollbar counts rows (chat/rowbar.rs), \
                     so it is a scrollbar of its own rather than the \
                     scrolled window's, and the fading the scrolled window \
