@@ -24,7 +24,7 @@ pub(super) struct RowView {
     /// The row as it was built, which a change is told apart from.
     shown: Row,
     /// Its line's segments above and below its dot, for a row on the rail.
-    lines: Option<super::rail::Rail>,
+    pub(super) lines: Option<super::rail::Rail>,
     /// A streaming answer's buffer: a stream is hundreds of updates, each a
     /// few words.
     stream: Option<gtk::TextBuffer>,

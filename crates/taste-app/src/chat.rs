@@ -11859,6 +11859,34 @@ impl ChatPane {
                 report(&pane, "jumped to the middle", &held);
                 return;
             }
+            // `end`: left at the bottom, for a shot of the newest turns as a
+            // restore draws them.
+            if std::env::var("TASTE_PROBE_HISTORY_AT").as_deref() == Ok("end") {
+                return;
+            }
+            // `prompt`: at the last prompt's card, as a click on the pinned
+            // copy goes there, for a shot of the newest turn's steps.
+            if std::env::var("TASTE_PROBE_HISTORY_AT").as_deref() == Ok("prompt") {
+                let prompt = pane.last_prompt.borrow().clone();
+                if let Some(prompt) = prompt {
+                    pane.scroll_to_item(&prompt, 0.0);
+                }
+                // Each drawn row's line as the model has it and as its rail
+                // draws it: the two must agree.
+                glib::timeout_future(std::time::Duration::from_millis(1500)).await;
+                let mut ids: Vec<model::RowId> = pane.bound.borrow().keys().copied().collect();
+                ids.sort();
+                for id in ids.iter().rev().take(12).rev() {
+                    let model_rail = pane.model.borrow().row(*id).and_then(|row| row.rail);
+                    let drawn = pane
+                        .bound
+                        .borrow()
+                        .get(id)
+                        .and_then(|(_, view)| view.lines.as_ref().map(|rail| rail.lines()));
+                    println!("probe history: row {id}: model {model_rail:?} drawn {drawn:?}");
+                }
+                return;
+            }
             if std::env::var("TASTE_PROBE_HISTORY_AT").as_deref() == Ok("drag") {
                 pane.probe_drag().await;
                 return;
@@ -12335,6 +12363,12 @@ impl ChatPane {
             {
                 line.push('.');
                 line.push_str(&class);
+            }
+            // The rail's lines are drawn, not widgets: said, so a line the
+            // live row lacks is a difference like any other.
+            if let Some(rail) = widget.downcast_ref::<rail::Rail>() {
+                let (top, bottom) = rail.lines();
+                line.push_str(&format!(" lines={top}/{bottom}"));
             }
             if let Some(label) = widget.downcast_ref::<gtk::Label>() {
                 line.push_str(&format!(" {:?}", label.text()));

@@ -134,7 +134,7 @@ restore draws it, then read a page at a time up to its first message, a
 jump to the middle, and back down, printing the items and the rows drawn,
 the row at the top of the view, whether the view showed nothing drawn, and
 the longest the main thread was held, at each step, and how many pages up
-came up blank (`TASTE_PROBE_HISTORY_AT=middle` jumps to the middle and stays, for the shot; `=drag` drags the scrollbar's slider as GtkRange does — down to halfway, held, nudged a pixel either way, on to the top — and prints how far the slider strayed from the pointer, how often the view moved against it, and how often the extent changed under it (`chat/rowbar.rs`); `TASTE_PROBE_HISTORY_FILE=<a stash .jsonl>` draws a
+came up blank (`TASTE_PROBE_HISTORY_AT=middle` jumps to the middle and stays, for the shot; `=end` stays at the bottom; `=prompt` goes to the last prompt's card and prints each drawn row's line as the model has it against the line its rail draws; `=drag` drags the scrollbar's slider as GtkRange does — down to halfway, held, nudged a pixel either way, on to the top — and prints how far the slider strayed from the pointer, how often the view moved against it, and how often the extent changed under it (`chat/rowbar.rs`); `TASTE_PROBE_HISTORY_FILE=<a stash .jsonl>` draws a
 real conversation instead — copy one under `target/`, never commit it);
 give it `TASTE_PROBE_DELAY_MS=150000` —, `kept` — the same file written to
 the chat's archive and its last session drawn as a resume draws it, the

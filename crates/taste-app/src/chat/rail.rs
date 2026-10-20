@@ -199,10 +199,22 @@ impl Rail {
         rail
     }
 
+    /// Whether the line runs up from the dot, and down from it, as drawn.
+    pub fn lines(&self) -> (bool, bool) {
+        (self.imp().top.get(), self.imp().bottom.get())
+    }
+
     /// Whether the line runs up from the dot, and down from it.
     pub fn set_lines(&self, top: bool, bottom: bool) {
         let imp = self.imp();
-        if imp.top.replace(top) != top || imp.bottom.replace(bottom) != bottom {
+        // Both set, then compared: `||` between the two replaces stopped at
+        // the first change, so a new rail given both lines kept only the
+        // top one, and every row built new — a restore, a row scrolled back
+        // into view — lost its line down to the next (2026-10-20: "The
+        // line through the dots should be contiguous").
+        let top_moved = imp.top.replace(top) != top;
+        let bottom_moved = imp.bottom.replace(bottom) != bottom;
+        if top_moved || bottom_moved {
             self.queue_draw();
         }
     }
@@ -237,5 +249,21 @@ impl Rail {
         }
         self.queue_allocate();
         self.queue_draw();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A rail set to both lines has both, however it stood before.
+    #[test]
+    fn a_new_rail_keeps_both_its_lines() {
+        crate::gtk_test::on_gtk_thread("a_new_rail_keeps_both_its_lines", || {
+            let content = gtk::Label::new(None);
+            let rail = super::Rail::new(&content, 0);
+            rail.set_lines(true, true);
+            assert_eq!(rail.lines(), (true, true));
+            rail.set_lines(false, true);
+            assert_eq!(rail.lines(), (false, true));
+        });
     }
 }

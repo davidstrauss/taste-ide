@@ -1675,6 +1675,37 @@ mod tests {
         assert_eq!(shape(&restored), rows);
     }
 
+    /// Every row of a turn's timeline runs down to the next, whatever
+    /// kind each is — a step, an answer between steps, a note — and the
+    /// line is unbroken but for the dots (David, 2026-10-20: "The line
+    /// through the dots should be contiguous").
+    #[test]
+    fn the_line_runs_down_from_every_row_but_the_last() {
+        let first = format!("{PROMPT_PREFIX}1");
+        let mut model = Model::default();
+        model.prompt_sent(&first, "Fix it.".into(), Vec::new(), Delivery::Sent);
+        model.prompt_taken(&first, None);
+        model.prompt_note(&first, "oriented with this prompt");
+        model.read(step("a"));
+        model.read(Record::update(SessionUpdate::AgentMessageChunk(text(
+            "Reading a.",
+        ))));
+        model.read(step("b"));
+        model.read(Record::update(SessionUpdate::AgentMessageChunk(text(
+            "Done.",
+        ))));
+        let rails: Vec<(bool, bool)> = model
+            .rows()
+            .iter()
+            .filter_map(|row| row.rail.map(|rail| (rail.top, rail.bottom)))
+            .collect();
+        let last = rails.len() - 1;
+        for (index, (top, bottom)) in rails.iter().enumerate() {
+            assert!(*top, "row {index} runs up: {rails:?}");
+            assert_eq!(*bottom, index != last, "row {index} runs down: {rails:?}");
+        }
+    }
+
     /// A message sent during a turn waits inside it: the line runs on from
     /// the step above it to the step below, which is still that turn's
     /// (David, 2026-10-19: "Discontinuity for the line"). Taken with
