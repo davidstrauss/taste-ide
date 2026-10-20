@@ -8602,7 +8602,54 @@ impl FileTree {
             });
             row.add_controller(context);
         }
+
+        // Dragged out, to a browser's upload, a file manager, or the
+        // composer (`file_drag`): the file on this host where the folder
+        // has it, a copy out of the VM made at the drop where it does not.
+        {
+            let source = gtk::DragSource::builder()
+                .actions(gtk::gdk::DragAction::COPY)
+                .build();
+            let tree = Rc::downgrade(self);
+            let node = node.clone();
+            source.connect_prepare(move |_, _, _| {
+                let tree = tree.upgrade()?;
+                Some(crate::file_drag::provider(tree.drag_source_of(&node)?))
+            });
+            let dragged = row.downgrade();
+            source.connect_drag_begin(move |source, _| {
+                if let Some(row) = dragged.upgrade() {
+                    source.set_icon(Some(&gtk::WidgetPaintable::new(Some(&row))), 0, 0);
+                }
+            });
+            row.add_controller(source);
+        }
         row
+    }
+
+    /// What dragging `node` out carries: the path on this host when there
+    /// is one — the folder itself on a checkout that is local, the folder's
+    /// mirror of the primary's checkout for what git does not ignore — or
+    /// the file in the checkout, to be copied at the drop. `None` for a
+    /// folder this host does not have, which a drop would have to copy
+    /// whole.
+    fn drag_source_of(&self, node: &FileNode) -> Option<crate::file_drag::Source> {
+        use crate::file_drag::Source;
+        if node.ghost || node.create.is_some() {
+            return None;
+        }
+        let watching = self.watching.borrow().is_some();
+        if !watching && self.workspace.files().is_local() {
+            return Some(Source::Host(node.path.clone()));
+        }
+        if !watching && self.state_of(node) != FileState::Ignored {
+            let rel = node.path.strip_prefix(self.view_root()).ok()?;
+            return Some(Source::Host(self.workspace.root().join(rel)));
+        }
+        (!node.is_dir).then(|| Source::Remote {
+            files: self.worktree().files(),
+            path: node.path.clone(),
+        })
     }
 
     /// A ghost: config the workspace could have, drawn faint, one activation

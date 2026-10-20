@@ -31,6 +31,7 @@ mod editor;
 mod elicit;
 mod env_channel;
 mod environments;
+mod file_drag;
 mod file_icons;
 mod filetree;
 mod fleet;
