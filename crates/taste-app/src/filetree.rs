@@ -4830,6 +4830,9 @@ impl FileTree {
         dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("ok"));
         dialog.set_close_response("cancel");
+        // The name is what the dialog asks for: typed at once, without a
+        // click into the field first (David, 2026-10-20).
+        dialog.set_focus(Some(&entry));
         let tree = self.clone();
         dialog.connect_response(None, move |_, response| {
             let name = entry.text().to_string();
@@ -5210,6 +5213,15 @@ impl FileTree {
                 );
             }
             menu.append_section(None, &sync_section);
+        }
+
+        // The folder's own menu — its row in the header — opens another
+        // window, which asks for its folder (`main::open_new_window`,
+        // through the window's action; David, 2026-10-20).
+        if node.is_dir && node.path == self.view_root() {
+            let window_section = gio::Menu::new();
+            window_section.append(Some("Open folder in new window…"), Some("win.open-folder"));
+            menu.append_section(None, &window_section);
         }
 
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
@@ -8913,7 +8925,7 @@ impl FileTree {
     /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CARD=push` (or `pull`,
     /// `canon`) shows that button's hover card once the counts have
     /// landed, as a hover would: a shot has no pointer to hover with.
-    fn probe_card(&self) {
+    fn probe_card(self: &Rc<Self>) {
         if std::env::var("TASTE_PROBE_CHECK").is_err() {
             return;
         }
@@ -8950,6 +8962,31 @@ impl FileTree {
             let button = self.branch_label.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
                 button.popup();
+            });
+        }
+        // `TASTE_PROBE_NAME_PROMPT=1`: the New file dialog opened as its
+        // row opens it, and a second later what holds the keyboard — the
+        // name field, or something a typed name would not reach.
+        static NAME_PROMPT: std::sync::Once = std::sync::Once::new();
+        if std::env::var("TASTE_PROBE_NAME_PROMPT").is_ok() && !NAME_PROMPT.is_completed() {
+            NAME_PROMPT.call_once(|| {});
+            let tree = self.clone();
+            let root = self.widget.root();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+                tree.prompt_name_or("New File", "Create", "", |_, _| {}, |_| {});
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
+                    let focus = root.and_then(|root| root.focus());
+                    println!(
+                        "name prompt: focus on {}",
+                        focus
+                            .map(|w| {
+                                let in_entry = w.ancestor(gtk::Entry::static_type()).is_some()
+                                    || w.is::<gtk::Entry>();
+                                format!("{} (in the name field: {in_entry})", w.type_().name())
+                            })
+                            .unwrap_or_else(|| "nothing".to_string())
+                    );
+                });
             });
         }
         // `TASTE_PROBE_TREE_END=1`: the listing scrolled to its end, where
