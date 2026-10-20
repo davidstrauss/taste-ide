@@ -26,7 +26,7 @@
 //! `push.default`, read as git reads them.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
@@ -774,11 +774,14 @@ impl GitWorkspace {
         extra_refspecs: &[&str],
     ) -> (String, Vec<String>) {
         let target = self.push_target(branch);
-        // The submodule commits the branch records go first, as
-        // [`GitWorkspace::push_command`]'s do, and on this repository's
-        // host in its scheme ([`crate::transport`]).
+        // The submodule commits the branch records are pushed first, each
+        // on its own branch ([`GitWorkspace::submodule_pushes`]); this one
+        // only checks they are there. git's `on-demand` hands the parent's
+        // refspec to each submodule's push, and a submodule without a
+        // branch of that name refused the whole push (2026-10-20:
+        // "src refspec 'refs/heads/intel-2026-10' must name a ref").
         let mut args = self.align_args();
-        args.extend(["push", crate::PUSH_SUBMODULES].map(String::from));
+        args.extend(["push", crate::PUSH_SUBMODULES_CHECK].map(String::from));
         if self
             .config_string(&format!("branch.{branch}.merge"))
             .is_none()
@@ -795,6 +798,125 @@ impl GitWorkspace {
         args.push(format!("refs/heads/{branch}:refs/heads/{}", target.branch));
         args.extend(extra_refspecs.iter().map(|s| (*s).to_string()));
         self.git_command_owned(args)
+    }
+}
+
+/// A submodule's push that the parent's push needs first: its commit the
+/// parent records, on the submodule's branch that holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmodulePush {
+    /// The submodule's path in the parent.
+    pub path: PathBuf,
+    /// The branch pushed.
+    pub branch: String,
+    /// Where it goes, for the keys and the askpass.
+    pub url: Option<String>,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl GitWorkspace {
+    /// The pushes of submodule commits that `branch` records and no
+    /// remote-tracking ref of the submodule has: each on the submodule's
+    /// branch that holds it — the one checked out when it does, else any —
+    /// to the same name on its push target, its upstream set when it has
+    /// none. An error names a submodule whose commit no branch holds, which
+    /// nothing can push: the parent is not pushed pointing at a commit
+    /// only this machine has (David, 2026-10-06). A submodule not cloned
+    /// here is passed over; the parent's `--recurse-submodules=check`
+    /// refuses then, in git's words.
+    pub fn submodule_pushes(
+        &self,
+        branch: &str,
+    ) -> std::result::Result<Vec<SubmodulePush>, String> {
+        let Ok(tip) = self.repo.revparse_single(&format!("refs/heads/{branch}")) else {
+            return Ok(Vec::new());
+        };
+        let Ok(tree) = tip.peel_to_tree() else {
+            return Ok(Vec::new());
+        };
+        let Ok(submodules) = self.repo.submodules() else {
+            return Ok(Vec::new());
+        };
+        let mut pushes = Vec::new();
+        for submodule in submodules {
+            let path = submodule.path().to_path_buf();
+            let Ok(entry) = tree.get_path(&path) else {
+                continue;
+            };
+            if entry.kind() != Some(git2::ObjectType::Commit) {
+                continue;
+            }
+            let recorded = entry.id();
+            let Ok(sub) = submodule.open() else {
+                continue;
+            };
+            let holds = |tip: Option<Oid>| {
+                tip.is_some_and(|tip| {
+                    tip == recorded || sub.graph_descendant_of(tip, recorded).unwrap_or(false)
+                })
+            };
+            let remote_has = sub
+                .references_glob("refs/remotes/*")
+                .map(|refs| refs.flatten().any(|r| holds(r.target())))
+                .unwrap_or(false);
+            if remote_has {
+                continue;
+            }
+            let head = sub
+                .head()
+                .ok()
+                .filter(|head| head.is_branch())
+                .and_then(|head| Some((head.shorthand()?.to_string(), head.target())));
+            let chosen = match head {
+                Some((name, tip)) if holds(tip) => Some(name),
+                _ => sub
+                    .branches(Some(git2::BranchType::Local))
+                    .ok()
+                    .and_then(|branches| {
+                        branches.flatten().find_map(|(b, _)| {
+                            holds(b.get().target())
+                                .then(|| b.name().ok().flatten().map(str::to_string))
+                                .flatten()
+                        })
+                    }),
+            };
+            let Some(name) = chosen else {
+                return Err(format!(
+                    "the submodule {} records {}, which is on none of its branches: check out a \
+                     branch at it there, then push again",
+                    path.display(),
+                    &recorded.to_string()[..7]
+                ));
+            };
+            let Some(workdir) = sub.workdir() else {
+                continue;
+            };
+            let Some(within) = GitWorkspace::discover(workdir) else {
+                continue;
+            };
+            let target = within.push_target(&name);
+            // On the parent's host, in the parent's scheme, as its fetch.
+            let mut args = self.align_args();
+            args.push("push".to_string());
+            if within
+                .config_string(&format!("branch.{name}.merge"))
+                .is_none()
+            {
+                args.push("--set-upstream".to_string());
+            }
+            args.push(target.remote.clone());
+            args.push(format!("refs/heads/{name}:refs/heads/{}", target.branch));
+            let (program, args) = within.git_command_owned(args);
+            pushes.push(SubmodulePush {
+                url: within.push_url_of(&name),
+                path,
+                branch: name,
+                program,
+                args,
+            });
+        }
+        Ok(pushes)
     }
 }
 

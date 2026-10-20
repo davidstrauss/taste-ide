@@ -27,6 +27,7 @@ pub mod refs;
 mod relation;
 pub use relation::{
     is_tracking_key, record_remote_tip, without_secret, Canonical, PullPlan, PushTarget,
+    SubmodulePush,
 };
 pub mod review;
 pub mod snapshot;
@@ -142,6 +143,12 @@ pub enum FileState {
 /// records that a submodule's remote lacks, first, or push nothing
 /// ([`GitWorkspace::push_command`]).
 pub const PUSH_SUBMODULES: &str = "--recurse-submodules=on-demand";
+
+/// How a push of a named branch treats submodules: their commits are
+/// pushed first, each on its own branch ([`GitWorkspace::submodule_pushes`]),
+/// and this only checks they reached a remote — refusing, as on-demand
+/// does, a parent that would point at a commit only this machine has.
+pub const PUSH_SUBMODULES_CHECK: &str = "--recurse-submodules=check";
 
 /// `git status --porcelain=v1 -z --untracked-files=all`, as the same map
 /// [`GitWorkspace::status`] gives — for a working copy this process cannot
@@ -1333,7 +1340,7 @@ mod tests {
             &args[args.len() - 5..],
             [
                 "push",
-                PUSH_SUBMODULES,
+                PUSH_SUBMODULES_CHECK,
                 "--set-upstream",
                 "origin",
                 "refs/heads/devcontainer:refs/heads/devcontainer"
@@ -1452,7 +1459,7 @@ mod tests {
             &args[args.len() - 4..],
             [
                 "push",
-                PUSH_SUBMODULES,
+                PUSH_SUBMODULES_CHECK,
                 fork,
                 "refs/heads/topic:refs/heads/topic"
             ]
@@ -1552,7 +1559,7 @@ mod tests {
             &args[args.len() - 4..],
             [
                 "push",
-                PUSH_SUBMODULES,
+                PUSH_SUBMODULES_CHECK,
                 "fork",
                 "refs/heads/topic:refs/heads/topic"
             ],
@@ -2137,6 +2144,105 @@ mod tests {
             git(&root.join("tpl.git"), &["rev-parse", "main"]),
             recorded,
             "the submodule's commit reached its remote"
+        );
+    }
+
+    /// A branch's push whose submodule commit is on a branch of another
+    /// name: git's on-demand handed the parent's refspec to the submodule,
+    /// which had no such branch, and refused the push (2026-10-20). The
+    /// submodule's own branch goes first, upstream set; the branch after,
+    /// checked; and a commit on no branch is refused by name.
+    #[test]
+    fn a_branch_push_takes_its_submodule_branch_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |cwd: &Path, program: &str, args: &[String]| {
+            std::process::Command::new(program)
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+                .env("GIT_CONFIG_VALUE_0", "always")
+                .output()
+                .unwrap()
+        };
+        let git = |cwd: &Path, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let out = run(cwd, "git", &args);
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(root, &["init", "-q", "--bare", "-b", "main", "tpl.git"]);
+        git(root, &["clone", "-q", "tpl.git", "tpl-work"]);
+        git(
+            &root.join("tpl-work"),
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+        );
+        git(
+            &root.join("tpl-work"),
+            &["push", "-q", "origin", "HEAD:main"],
+        );
+        git(root, &["init", "-q", "--bare", "-b", "main", "deck.git"]);
+        git(root, &["clone", "-q", "deck.git", "deck"]);
+        let deck = root.join("deck");
+        let tpl_url = root.join("tpl.git").display().to_string();
+        git(&deck, &["submodule", "add", "-q", &tpl_url, "tpl"]);
+        git(&deck, &["commit", "-q", "-m", "add the template"]);
+        git(&deck, &["push", "-q", "-u", "origin", "HEAD:main"]);
+        // The deck on its own branch, the template on another.
+        git(&deck, &["switch", "-q", "-c", "intel"]);
+        let tpl = deck.join("tpl");
+        git(&tpl, &["switch", "-q", "-c", "release-stages"]);
+        git(&tpl, &["commit", "-q", "--allow-empty", "-m", "badges"]);
+        let recorded = git(&tpl, &["rev-parse", "HEAD"]);
+        git(&deck, &["add", "tpl"]);
+        git(&deck, &["commit", "-q", "-m", "take the badges"]);
+
+        let ws = GitWorkspace::discover(&deck).unwrap();
+        let pushes = ws.submodule_pushes("intel").unwrap();
+        assert_eq!(pushes.len(), 1, "{pushes:?}");
+        assert_eq!(pushes[0].branch, "release-stages");
+        for push in &pushes {
+            let out = run(&deck, &push.program, &push.args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let (program, args) = ws.push_branch_command("intel", &[]);
+        let out = run(&deck, &program, &args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            git(&root.join("tpl.git"), &["rev-parse", "release-stages"]),
+            recorded
+        );
+        assert!(
+            ws.submodule_pushes("intel").unwrap().is_empty(),
+            "once pushed, nothing more to push"
+        );
+
+        // A commit no branch holds: refused, by name.
+        git(&tpl, &["switch", "-q", "--detach"]);
+        git(&tpl, &["commit", "-q", "--allow-empty", "-m", "loose"]);
+        git(&deck, &["add", "tpl"]);
+        git(&deck, &["commit", "-q", "-m", "take the loose one"]);
+        let refused = ws.submodule_pushes("intel").unwrap_err();
+        assert!(
+            refused.contains("tpl") && refused.contains("none of its branches"),
+            "{refused}"
         );
     }
 

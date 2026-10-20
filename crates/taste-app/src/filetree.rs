@@ -9215,6 +9215,62 @@ impl FileTree {
         let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
+            // The submodule commits the branch records go first, each on
+            // its own branch (`GitWorkspace::submodule_pushes`); the
+            // branch's push only checks they arrived.
+            if let Some(branch) = branch.clone() {
+                let pushes = {
+                    let root = root.clone();
+                    crate::runtime::runtime()
+                        .spawn_blocking(move || {
+                            taste_git::GitWorkspace::discover(&root)
+                                .map(|git| git.submodule_pushes(&branch))
+                                .unwrap_or(Ok(Vec::new()))
+                        })
+                        .await
+                        .unwrap_or_else(|_| Err("interrupted".to_string()))
+                };
+                let failed = match pushes {
+                    Err(reason) => Some(reason),
+                    Ok(pushes) => {
+                        let mut failed = None;
+                        for push in pushes {
+                            let spec = {
+                                let exec = taste_core::ExecContext::host();
+                                let arg_refs: Vec<&str> =
+                                    push.args.iter().map(String::as_str).collect();
+                                exec.resolve(&push.program, &arg_refs, false)
+                            };
+                            let envs = crate::ssh_agent::network_env(root.clone(), push.url).await;
+                            let handle = crate::runtime::runtime().spawn(run_git_step(
+                                spec.program,
+                                spec.args,
+                                envs,
+                            ));
+                            let reason = match handle.await {
+                                Ok(Ok(_)) => continue,
+                                Ok(Err(reason)) => reason,
+                                Err(_) => "interrupted".to_string(),
+                            };
+                            failed = Some(format!(
+                                "the submodule {}'s branch {}: {reason}",
+                                push.path.display(),
+                                push.branch
+                            ));
+                            break;
+                        }
+                        failed
+                    }
+                };
+                if let Some(reason) = failed {
+                    events.publish(Event::Toast(format!("Push failed: {reason}")));
+                    if let Some(tree) = weak.upgrade() {
+                        tree.end_sync_op();
+                    }
+                    events.publish(Event::GitStatusChanged);
+                    return;
+                }
+            }
             let envs = crate::ssh_agent::network_env(root.clone(), remote).await;
             let handle =
                 crate::runtime::runtime().spawn(run_git_step(spec.program, spec.args, envs));
