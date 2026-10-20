@@ -41,6 +41,9 @@ impl ChatPane {
     pub(super) fn build_row(&self, row: &Row) -> RowView {
         let mut stream = None;
         let (inner, railed): (gtk::Widget, Option<Railed>) = match &row.kind {
+            Kind::User(user) if user.within_turn => {
+                (self.on_rail_line(&self.user_widget(row.id, user)), None)
+            }
             Kind::User(user) => (self.user_widget(row.id, user).upcast(), None),
             Kind::Answer(answer) => {
                 let (railed, buffer) = self.answer_widget(row, answer);
@@ -238,6 +241,38 @@ impl ChatPane {
     /// Where a prompt was typed, which the agent took further down: a
     /// marker that jumps to it. Between two steps the line runs on through
     /// it, beside the rail as a step's content stands.
+    /// `content` in the timeline's column with the line running past it
+    /// beside the content: a prompt waiting inside a turn, which goes on
+    /// below it (`User::within_turn`).
+    fn on_rail_line(&self, content: &impl IsA<gtk::Widget>) -> gtk::Widget {
+        let rail = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .width_request(RAIL_WIDTH)
+            .hexpand(false)
+            .build();
+        rail.append(
+            &gtk::Box::builder()
+                .css_classes(["rail-line"])
+                // On the rail's own pixel column, `(RAIL_WIDTH - 1) / 2`,
+                // where the step rail draws its line (rail.rs): centred,
+                // a 1px line in the 16px column fell between two pixels
+                // and smeared across both, half a pixel off the steps'.
+                .halign(gtk::Align::Start)
+                .margin_start((RAIL_WIDTH - 1) / 2)
+                .vexpand(true)
+                .build(),
+        );
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
+        row.set_margin_start(ROW_OWN_SIDE);
+        row.append(&rail);
+        // The row carries the inset, as a step's does, so the card's edge
+        // is the steps' text's.
+        content.set_margin_start(0);
+        content.set_hexpand(true);
+        row.append(content);
+        row.upcast()
+    }
+
     fn marker_widget(&self, prompt: &str, through: bool) -> gtk::Widget {
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         content.append(&gtk::Image::from_icon_name("go-down-symbolic"));
@@ -276,7 +311,12 @@ impl ChatPane {
         rail.append(
             &gtk::Box::builder()
                 .css_classes(["rail-line"])
-                .halign(gtk::Align::Center)
+                // On the rail's own pixel column, `(RAIL_WIDTH - 1) / 2`,
+                // where the step rail draws its line (rail.rs): centred,
+                // a 1px line in the 16px column fell between two pixels
+                // and smeared across both, half a pixel off the steps'.
+                .halign(gtk::Align::Start)
+                .margin_start((RAIL_WIDTH - 1) / 2)
                 .vexpand(true)
                 .visible(through)
                 .build(),

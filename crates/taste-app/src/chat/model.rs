@@ -111,6 +111,12 @@ pub(super) struct User {
     /// The IDE's id for it, for a prompt it sent and is following.
     pub prompt: Option<PromptId>,
     pub delivery: Delivery,
+    /// Sent while a turn was under way, and waiting behind it: the card
+    /// stands inside that turn's timeline, the line running past it, since
+    /// the turn goes on below it (David, 2026-10-19: "Discontinuity for the
+    /// line"). Seated as a prompt once the agent takes it
+    /// ([`Model::prompt_taken`]).
+    pub within_turn: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -909,6 +915,47 @@ impl Model {
         self.changed(id);
     }
 
+    /// A prompt that waited inside a turn, taken with nothing of that turn
+    /// drawn after it: it is a prompt where it stands. The turn's line ends
+    /// at the dot above it, and the next step's runs up from its box.
+    fn seat_in_place(&mut self, id: RowId, at: usize) {
+        let within = matches!(
+            self.row(id).map(|row| &row.kind),
+            Some(Kind::User(User {
+                within_turn: true,
+                ..
+            }))
+        );
+        if !within {
+            return;
+        }
+        if let Some(Row {
+            kind: Kind::User(user),
+            ..
+        }) = self.row_mut(id)
+        {
+            user.within_turn = false;
+        }
+        self.changed(id);
+        let above = self.rows[..at]
+            .iter()
+            .rev()
+            .find(|row| row.rail.is_some())
+            .map(|row| row.id);
+        if let Some(above) = above {
+            if let Some(rail) = self.row_mut(above).and_then(|row| row.rail.as_mut()) {
+                rail.bottom = false;
+            }
+            self.changed(above);
+            if self.last_step == Some(above) {
+                self.last_step = None;
+                self.after_prompt = true;
+            }
+        }
+        self.plan = None;
+        self.turn_answers.clear();
+    }
+
     /// The agent has taken prompt `prompt` — after waiting behind a turn,
     /// with the note it went out after. Where anything has been drawn since
     /// it was typed, it moves to the end, where the conversation took it,
@@ -931,6 +978,7 @@ impl Model {
         };
         let ours = |row: &Row| row.of_prompt.as_deref() == Some(prompt);
         if self.rows[at + 1..].iter().all(ours) {
+            self.seat_in_place(old, at);
             return;
         }
         self.finalize();
@@ -955,9 +1003,10 @@ impl Model {
             .find(|row| !ours(row))
             .is_some_and(|row| row.rail.is_some());
         let through = above.is_some() && below;
-        let Some(Kind::User(user)) = self.row(old).map(|row| row.kind.clone()) else {
+        let Some(Kind::User(mut user)) = self.row(old).map(|row| row.kind.clone()) else {
             return;
         };
+        user.within_turn = false;
         if let Some(row) = self.row_mut(old) {
             row.kind = Kind::Marker {
                 prompt: prompt.to_string(),
@@ -1118,10 +1167,23 @@ impl Model {
         delivery: Delivery,
     ) -> RowId {
         // A prompt starts a turn: the turn owns its plan and its answer, and
-        // the timeline above ends at its last dot.
-        self.plan = None;
-        self.turn_answers.clear();
-        self.end_steps();
+        // the timeline above ends at its last dot. One sent while a turn is
+        // under way starts nothing yet: it waits inside that turn, which
+        // goes on below it, so the line runs on past it.
+        let within_turn = matches!(delivery, Delivery::Queued | Delivery::Asking { .. })
+            && self.last_step.is_some();
+        if !within_turn {
+            self.plan = None;
+            self.turn_answers.clear();
+            self.end_steps();
+        } else if let Some(above) = self.last_step {
+            // The turn goes on past the card: the step above runs down
+            // into it.
+            if let Some(rail) = self.row_mut(above).and_then(|row| row.rail.as_mut()) {
+                rail.bottom = true;
+            }
+            self.changed(above);
+        }
         self.lines.push(("you", text.clone()));
         let id = self.push(
             Kind::User(User {
@@ -1129,6 +1191,7 @@ impl Model {
                 attachments,
                 prompt: prompt.clone(),
                 delivery,
+                within_turn,
             }),
             None,
             Dot::Plain,
@@ -1610,6 +1673,76 @@ mod tests {
         ];
         let restored = Model::of_record(0, record);
         assert_eq!(shape(&restored), rows);
+    }
+
+    /// A message sent during a turn waits inside it: the line runs on from
+    /// the step above it to the step below, which is still that turn's
+    /// (David, 2026-10-19: "Discontinuity for the line"). Taken with
+    /// nothing drawn after it, it is seated where it stands: the turn's line
+    /// ends at the dot above it, and the next step's runs up from its box.
+    #[test]
+    fn a_prompt_sent_during_a_turn_keeps_the_line_running() {
+        let first = format!("{PROMPT_PREFIX}1");
+        let second = format!("{PROMPT_PREFIX}2");
+        let mut model = Model::default();
+        model.prompt_sent(&first, "Fix it.".into(), Vec::new(), Delivery::Sent);
+        model.prompt_taken(&first, None);
+        model.read(step("a"));
+        model.prompt_sent(
+            &second,
+            "And the docs.".into(),
+            Vec::new(),
+            Delivery::Queued,
+        );
+        model.read(step("b"));
+        let rows = model.rows();
+        assert!(rows[1].rail.is_some_and(|rail| rail.bottom), "a runs down");
+        assert!(
+            matches!(
+                &rows[2].kind,
+                Kind::User(User {
+                    within_turn: true,
+                    ..
+                })
+            ),
+            "{:?}",
+            rows[2].kind
+        );
+        let b = rows[3].rail.expect("a step");
+        assert!(b.top && !b.after_prompt, "b runs up to a: {b:?}");
+
+        let mut model = Model::default();
+        model.prompt_sent(&first, "Fix it.".into(), Vec::new(), Delivery::Sent);
+        model.prompt_taken(&first, None);
+        model.read(step("a"));
+        model.prompt_sent(
+            &second,
+            "And the docs.".into(),
+            Vec::new(),
+            Delivery::Queued,
+        );
+        model.prompt_taken(&second, Some("[queued note]".into()));
+        model.read(step("c"));
+        let rows = model.rows();
+        assert_eq!(
+            rows.len(),
+            4,
+            "seated where it stands: {:#?}",
+            shape(&model)
+        );
+        assert!(
+            rows[1].rail.is_some_and(|rail| !rail.bottom),
+            "a's line ends"
+        );
+        assert!(matches!(
+            &rows[2].kind,
+            Kind::User(User {
+                within_turn: false,
+                ..
+            })
+        ));
+        let c = rows[3].rail.expect("a step");
+        assert!(c.top && c.after_prompt, "c runs up from the box: {c:?}");
     }
 
     /// A prompt the agent refused stays, marked; one withdrawn before it
