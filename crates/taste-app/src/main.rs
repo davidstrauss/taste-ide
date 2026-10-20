@@ -1616,7 +1616,7 @@ const CHOOSE_FOLDER: &str = "--choose-folder";
 /// the environment the child would otherwise inherit it from.
 fn launch_window(folder: Option<&std::path::Path>) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(own_program()?);
     match folder {
         Some(folder) => command.arg(folder),
         None => command.arg(CHOOSE_FOLDER),
@@ -1628,6 +1628,33 @@ fn launch_window(folder: Option<&std::path::Path>) -> std::io::Result<std::proce
             .env("TASTE_HOST_OPEN_TOKEN", token);
     }
     command.spawn()
+}
+
+/// The program this window runs, to start another window with. A program
+/// rebuilt or upgraded while it runs leaves this process's path to it as
+/// `<path> (deleted)`, which nothing can start, and a new window failed
+/// with a bare "No such file or directory" (2026-10-20): the program now
+/// at that path is the one to start — the newer build — and, when there is
+/// none, the error says which program went.
+fn own_program() -> std::io::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    if exe.exists() {
+        return Ok(exe);
+    }
+    let replaced = exe
+        .to_str()
+        .and_then(|path| path.strip_suffix(" (deleted)"))
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.exists());
+    replaced.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "this window's program, {}, is no longer on disk",
+                exe.display()
+            ),
+        )
+    })
 }
 
 /// How many runs' app logs are kept: the newest, by the start time in
