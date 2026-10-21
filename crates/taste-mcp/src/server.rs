@@ -1571,8 +1571,8 @@ impl McpServer {
                 tool(
                     "suggest_replies",
                     "When your turn ends on a question or a choice, offer the user up to four \
-                     short replies, shown as buttons under your message; a click sends that \
-                     reply as their next message. Each reply must make sense alone, read \
+                     short replies, shown as choices under your message beside a box for \
+                     their own; the one they send arrives as their next message. Each reply must make sense alone, read \
                      with only the question above it: name what it chooses (\"Add checks to \
                      TEST-26 only\", \"File it as a bug\"), never point at your text (\"all \
                      of it\", \"option 2\", \"the first one\"). The question must stand on what \
@@ -1582,7 +1582,7 @@ impl McpServer {
                      with what the user needs to answer it (the command to run, what to look \
                      for). Something asked only in a file, a commit, or the backlog has not \
                      been asked. Do not ask what the user already decided or left to you. Call \
-                     it last, after your answer and the question are written: the buttons \
+                     it last, after your answer and the question are written: the choices \
                      stand under them. The user can still type anything instead.",
                     json!({
                         "type": "object",
@@ -2200,7 +2200,7 @@ impl McpServer {
                 // go ahead?" (2026-10-02). The answer still comes first.
                 Ok(json!({
                     "shown": shown,
-                    "next": "The buttons appear under your last message when your turn ends. \
+                    "next": "The choices appear under your last message when your turn ends. \
                              If your answer or the question is not written yet, write it now; \
                              then end your turn. The user's pick, or whatever they type \
                              instead, arrives as their next message.",
@@ -5971,7 +5971,7 @@ fn is_config_path(root: &std::path::Path, path: &std::path::Path) -> bool {
 }
 
 /// How many replies `suggest_replies` shows, and how long each may be:
-/// buttons in a chat column, not a menu.
+/// choices in a chat column, not a menu.
 const MAX_REPLIES: usize = 4;
 const MAX_REPLY_CHARS: usize = 80;
 

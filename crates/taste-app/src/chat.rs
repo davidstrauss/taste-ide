@@ -738,7 +738,7 @@ pub struct ChatPane {
     /// the conversation: shown when its turn ends, gone when the next one
     /// begins. A click sends that reply as the user's message.
     replies_bar: gtk::Revealer,
-    replies_box: adw::WrapBox,
+    replies_box: gtk::Box,
     /// Offered during the turn, shown when it ends: a question is answered
     /// once it has been asked, not while the agent is still writing it.
     pending_replies: RefCell<Vec<String>>,
@@ -2791,15 +2791,17 @@ impl ChatPane {
         // Slide, don't blink: the card pushes the composer down, and a
         // question that appears instantly under a moving cursor is how a
         // click lands on a button nobody read.
-        // The agent's suggested replies: pills under its last message, in
-        // the column the permission card uses, one line when they fit.
-        let replies_box = adw::WrapBox::builder()
-            .child_spacing(6)
-            .line_spacing(6)
+        // The agent's suggested replies: a card of choices under its last
+        // message, in the column the permission card uses, drawn as the
+        // question card draws its options (`show_replies`).
+        let replies_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
             .margin_start(PANE_BAR_INSET)
             .margin_end(PANE_BAR_INSET)
             .margin_top(4)
             .margin_bottom(6)
+            .css_classes(["card", "permission-card"])
             .build();
         replies_box.set_widget_name("suggested-replies");
         let replies_bar = gtk::Revealer::builder()
@@ -8018,36 +8020,101 @@ impl ChatPane {
         if !replies.is_empty() {
             self.update_model(|model| model.unclip_turn());
         }
-        for (index, reply) in replies.iter().enumerate() {
-            // A label of its own, wrapping: a button's own label never
-            // wraps, so a reply longer than the column was cut off at its
-            // edge (David, 2026-10-05: "Long options cut off").
-            let label = gtk::Label::builder()
-                .label(reply)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .justify(gtk::Justification::Center)
-                .build();
-            let button = gtk::Button::builder()
-                .child(&label)
-                .tooltip_text(format!("Reply “{reply}”"))
-                .css_classes(if index == 0 {
-                    vec!["pill-action", "suggested-reply", "suggested-reply-first"]
-                } else {
-                    vec!["pill-action", "suggested-reply"]
-                })
-                .build();
-            let weak = Rc::downgrade(self);
-            let reply = reply.clone();
-            button.connect_clicked(move |_| {
-                let Some(pane) = weak.upgrade() else { return };
-                pane.clear_replies();
-                if let Err(why) = pane.send_from(reply.clone(), Vec::new()) {
-                    pane.meta_row(&format!("the reply was not sent: {why}"));
+        if replies.is_empty() {
+            self.replies_bar.set_reveal_child(false);
+            return;
+        }
+        // One radio a reply, the likeliest first and picked, and a reply of
+        // the user's own as the last, as the question card has it; Send
+        // sends the one picked the way Dispatch sends a typed one, which
+        // leaves whatever is half-typed there alone.
+        let mut picks: Vec<(gtk::CheckButton, String)> = Vec::new();
+        let mut leader: Option<gtk::CheckButton> = None;
+        for reply in &replies {
+            let button = gtk::CheckButton::new();
+            match &leader {
+                Some(leader) => button.set_group(Some(leader)),
+                None => {
+                    button.set_active(true);
+                    leader = Some(button.clone());
+                }
+            }
+            self.replies_box
+                .append(&question_option(&button, reply, None, false));
+            picks.push((button, reply.clone()));
+        }
+        let own = gtk::CheckButton::builder()
+            .valign(gtk::Align::Center)
+            .build();
+        if let Some(leader) = &leader {
+            own.set_group(Some(leader));
+        }
+        let entry = gtk::Entry::builder()
+            .placeholder_text("Your own answer")
+            .hexpand(true)
+            .build();
+        own.update_relation(&[gtk::accessible::Relation::LabelledBy(&[entry.upcast_ref()])]);
+        {
+            let focus = gtk::EventControllerFocus::new();
+            let own = own.clone();
+            focus.connect_enter(move |_| own.set_active(true));
+            entry.add_controller(focus);
+        }
+        {
+            let own = own.clone();
+            entry.connect_changed(move |entry| {
+                if !entry.text().is_empty() {
+                    own.set_active(true);
                 }
             });
-            self.replies_box.append(&button);
         }
+        {
+            let entry = entry.clone();
+            own.connect_toggled(move |own| {
+                if own.is_active() && !entry.has_focus() {
+                    entry.grab_focus();
+                }
+            });
+        }
+        let own_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        own_row.add_css_class("question-option");
+        own_row.append(&own);
+        own_row.append(&entry);
+        self.replies_box.append(&own_row);
+        let send = gtk::Button::builder()
+            .label("Send")
+            .css_classes(["suggested-action", "pill-action"])
+            .halign(gtk::Align::End)
+            .tooltip_text("Send the reply picked")
+            .build();
+        let go: Rc<dyn Fn()> = {
+            let (weak, own, entry) = (Rc::downgrade(self), own.clone(), entry.clone());
+            Rc::new(move || {
+                let Some(pane) = weak.upgrade() else { return };
+                let reply = if own.is_active() {
+                    entry.text().trim().to_string()
+                } else {
+                    picks
+                        .iter()
+                        .find(|(button, _)| button.is_active())
+                        .map(|(_, reply)| reply.clone())
+                        .unwrap_or_default()
+                };
+                if reply.is_empty() {
+                    return;
+                }
+                pane.clear_replies();
+                if let Err(why) = pane.send_from(reply, Vec::new()) {
+                    pane.meta_row(&format!("the reply was not sent: {why}"));
+                }
+            })
+        };
+        {
+            let go = go.clone();
+            entry.connect_activate(move |_| go());
+        }
+        send.connect_clicked(move |_| go());
+        self.replies_box.append(&send);
         self.replies_bar.set_reveal_child(!replies.is_empty());
     }
 
@@ -13782,62 +13849,19 @@ impl ChatPane {
                     let mut buttons: Vec<(gtk::CheckButton, String)> = Vec::new();
                     let mut leader: Option<gtk::CheckButton> = None;
                     for choice in choices {
-                        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
-                        text.set_hexpand(true);
-                        // The title's first line centred on the indicator:
-                        // the check is 26px tall and a body line's centre
-                        // is 9px down its label (the probe's geometry dump,
-                        // `first_line`), so the words start 13 - 9 lower.
-                        text.set_margin_top(QUESTION_TITLE_DROP);
-                        let title = gtk::Label::builder()
-                            .label(&choice.title)
-                            .xalign(0.0)
-                            .wrap(true)
-                            .wrap_mode(gtk::pango::WrapMode::WordChar)
-                            .build();
-                        text.append(&title);
-                        if let Some(description) = &choice.description {
-                            text.append(
-                                &gtk::Label::builder()
-                                    .label(description)
-                                    .xalign(0.0)
-                                    .wrap(true)
-                                    .wrap_mode(gtk::pango::WrapMode::WordChar)
-                                    .attributes(&no_hyphens())
-                                    .css_classes(["caption", "dim-label"])
-                                    .build(),
-                            );
-                        }
-                        // The indicator beside the option's TITLE, not
-                        // centred on title and description together, which
-                        // is where a check button puts it: so the button is
-                        // only the indicator, at the top of the row, and a
-                        // click on the words picks it too.
-                        let button = gtk::CheckButton::builder()
-                            .valign(gtk::Align::Start)
-                            .build();
-                        button.update_relation(&[gtk::accessible::Relation::LabelledBy(&[
-                            title.upcast_ref()
-                        ])]);
+                        let button = gtk::CheckButton::new();
                         if !many {
                             match &leader {
                                 Some(leader) => button.set_group(Some(leader)),
                                 None => leader = Some(button.clone()),
                             }
                         }
-                        let click = gtk::GestureClick::new();
-                        {
-                            let button = button.clone();
-                            click.connect_released(move |_, _, _, _| {
-                                button.set_active(!many || !button.is_active());
-                            });
-                        }
-                        text.add_controller(click);
-                        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                        row.add_css_class("question-option");
-                        row.append(&button);
-                        row.append(&text);
-                        group.append(&row);
+                        group.append(&question_option(
+                            &button,
+                            &choice.title,
+                            choice.description.as_deref(),
+                            many,
+                        ));
                         buttons.push((button, choice.value.clone()));
                     }
                     // The answer of the user's own is an option like the
@@ -15996,6 +16020,61 @@ fn working_line(
             duration_text(quiet)
         )
     }
+}
+
+/// One option of a question — the question card's, and the suggested
+/// replies', which are the same choice (David, 2026-10-20: "The chat radio
+/// question interface is nicer than the chat button answer interface") —
+/// its indicator beside its words. The indicator stands beside the
+/// option's TITLE, not centred on title and description together, which is
+/// where a check button puts it: so the button is only the indicator, at
+/// the top of the row, and a click on the words picks it too.
+fn question_option(
+    button: &gtk::CheckButton,
+    title: &str,
+    description: Option<&str>,
+    many: bool,
+) -> gtk::Box {
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text.set_hexpand(true);
+    // The title's first line centred on the indicator: the check is 26px
+    // tall and a body line's centre is 9px down its label (the probe's
+    // geometry dump, `first_line`), so the words start 13 - 9 lower.
+    text.set_margin_top(QUESTION_TITLE_DROP);
+    let label = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
+    text.append(&label);
+    if let Some(description) = description {
+        text.append(
+            &gtk::Label::builder()
+                .label(description)
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .attributes(&no_hyphens())
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+    }
+    button.set_valign(gtk::Align::Start);
+    button.update_relation(&[gtk::accessible::Relation::LabelledBy(&[label.upcast_ref()])]);
+    let click = gtk::GestureClick::new();
+    {
+        let button = button.clone();
+        click.connect_released(move |_, _, _, _| {
+            button.set_active(!many || !button.is_active());
+        });
+    }
+    text.add_controller(click);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("question-option");
+    row.append(button);
+    row.append(&text);
+    row
 }
 
 /// Session-cumulative token usage, humanized. Account-level quotas (5-hour
