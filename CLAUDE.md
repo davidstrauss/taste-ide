@@ -164,7 +164,7 @@ its viewer tab instead, `viewer.rs`, and `build-aux/headless/fixtures/sample.pdf
 is a one-page PDF for it, and `TASTE_PROBE_CHANGED=pending` or `=auto` poses
 the viewer's changed-on-disk bar — a change waiting, or Reload automatically
 on — and `=unseen` puts `sample.typ` in front and changes the viewer behind
-it, for the mark a background tab wears, `=page:N` turns a PDF to page N, `=keys` presses Page Down in it and prints the scroll before and after, and `=reload` scrolls a PDF down, reloads it,
+it, for the mark a background tab wears, `=page:N` turns a PDF to page N, `=keys` presses Page Down in it and prints the scroll before and after, `=single` lays it out one page at a time, `=next` that and the Right arrow pressed, and `=zoom:VALUE` zooms it (`page-fit`, `1.5`), each printing what the toolbar says and the page in view (`build-aux/headless/fixtures/pages.pdf` is four numbered pages for these), and `=reload` scrolls a PDF down, reloads it,
 and prints where it came back, as a pixel offset and a page: swap the file just
 before the reload for one whose earlier page is taller to check that a reload
 holds the place in the document rather than the pixel) opens it on its preview face in front,

@@ -248,6 +248,8 @@ pub struct ViewerPage {
     /// The PDF's view, while it has one: a reload replaces the document in
     /// it rather than the view, so the scroll and the zoom hold.
     pdf_view: RefCell<Option<webkit6::WebView>>,
+    /// The PDF's zoom and layout controls, over its view.
+    pdf_tools: RefCell<Option<Rc<PdfTools>>>,
     /// The PDF's text, a string a page, once read ([`Self::read_text`]),
     /// for the universal find (David, 2026-10-06: "Universal find should
     /// work on open PDFs. You should even OCR if necessary"). A page drawn
@@ -292,6 +294,7 @@ impl ViewerPage {
             pending: Cell::new(false),
             auto: Cell::new(false),
             pdf_view: RefCell::new(None),
+            pdf_tools: RefCell::new(None),
             text: RefCell::new(None),
             text_generation: Cell::new(0),
             reading: Cell::new(false),
@@ -428,6 +431,50 @@ impl ViewerPage {
                     );
                 });
             }
+            // `single`, one page at a time; `next`, that and the Right
+            // arrow pressed; `zoom:VALUE`, a zoom ("page-fit", "1.5") —
+            // each with the toolbar's word for what is shown printed.
+            layout if layout == "single" || layout == "next" || layout.starts_with("zoom:") => {
+                let Some(view) = self.pdf_view.borrow().clone() else {
+                    return;
+                };
+                let tools = self.pdf_tools.borrow().clone();
+                let script = match layout {
+                    "single" => "window.tasteSetView('single')".to_string(),
+                    "next" => "window.tasteSetView('single'); \
+                               setTimeout(() => document.dispatchEvent(new KeyboardEvent('keydown', \
+                               {key: 'ArrowRight', bubbles: true})), 300)"
+                        .to_string(),
+                    zoom => format!("window.tasteSetView(null, {:?})", &zoom[5..]),
+                };
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                    run_js(&view, &script);
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(1200),
+                        move || {
+                            if let Some(tools) = tools {
+                                eprintln!(
+                                    "probe viewer tools: zoom {:?}, single {}",
+                                    tools.zoom.label(),
+                                    tools.single.is_active()
+                                );
+                            }
+                            webkit6::prelude::WebViewExt::evaluate_javascript(
+                                &view,
+                                "'page ' + window.tasteScroll()",
+                                None,
+                                None,
+                                None::<&gtk::gio::Cancellable>,
+                                |result| {
+                                    if let Ok(value) = result {
+                                        eprintln!("probe viewer page: {}", value.to_str());
+                                    }
+                                },
+                            );
+                        },
+                    );
+                });
+            }
             "auto" => {
                 if let Some(auto) = &self.banner.auto {
                     auto.set_active(true);
@@ -514,7 +561,22 @@ impl ViewerPage {
                 let id = next_pdf_id();
                 pdf_documents().borrow_mut().insert(id, bytes);
                 self.pdf_id.set(Some(id));
-                let view = pdf_view(id);
+                // The page tells the toolbar its mode and zoom, however
+                // they changed, through a message of its own.
+                let manager = webkit6::UserContentManager::new();
+                manager.register_script_message_handler("tasteView", None);
+                let single = LAST_SINGLE.with(Cell::get);
+                let view = pdf_view(id, &manager, single);
+                let tools = PdfTools::new(&view, single);
+                {
+                    let tools = Rc::downgrade(&tools);
+                    manager.connect_script_message_received(Some("tasteView"), move |_, value| {
+                        if let Some(tools) = tools.upgrade() {
+                            tools.reported(&value.to_str());
+                        }
+                    });
+                }
+                *self.pdf_tools.borrow_mut() = Some(tools.clone());
                 *self.pdf_view.borrow_mut() = Some(view.clone());
                 self.loaded.set(false);
                 // Its text, once the page that draws it has loaded.
@@ -527,7 +589,10 @@ impl ViewerPage {
                         }
                     }
                 });
-                view.upcast()
+                let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                column.append(&tools.widget);
+                column.append(&view);
+                column.upcast()
             }
             _ => gtk::Label::new(Some("This file could not be shown.")).upcast(),
         };
@@ -876,6 +941,10 @@ html, body { margin: 0; height: 100%; background: transparent; }
 .pane.behind { visibility: hidden; z-index: -1; }
 .pdfViewer .page { border: none; margin: 12px auto;
   box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+/* One page at a time, inside the 5px pdf.js leaves above and below a
+   fitted page: at 12 the whole page stood a few pixels taller than the
+   pane, its foot under the edge. */
+body.single .pdfViewer .page { margin: 2px auto; }
 #failed { font: 15px/1.5 system-ui, sans-serif; margin: 15vh auto; max-width: 32em;
   padding: 0 24px; opacity: .8; }
 </style></head>
@@ -893,7 +962,7 @@ try {
   const pdfjsLib = await import("./pdf.min.mjs");
   globalThis.pdfjsLib = pdfjsLib;
   pdfjsLib.GlobalWorkerOptions.workerSrc = "./pdf.worker.min.mjs";
-  const { EventBus, PDFViewer, PDFLinkService, PDFFindController } =
+  const { EventBus, PDFViewer, PDFLinkService, PDFFindController, ScrollMode } =
     await import("./pdf_viewer.mjs");
   // Images are decoded and drawn by pdf.js itself, never handed to the
   // browser's decoder or to an offscreen canvas: on a WebKit drawing with
@@ -920,9 +989,65 @@ try {
   };
   let shown = pane(document.getElementById("a"));
   let behind = pane(document.getElementById("b"));
+  // How the document is laid out and how large (the tab's toolbar,
+  // viewer.rs): the pages in one scrolling column at the pane's width, or
+  // one page at a time fitted whole (David, 2026-10-20: "For single-page,
+  // I'd like 'page fit' as the default level. For continuous, 'page
+  // width.'"). The mode the tab opens in comes in the address.
+  const view = {
+    mode: new URLSearchParams(location.search).get("mode") === "single" ? "single" : "continuous",
+  };
+  const fitOf = (mode) => mode === "single" ? "page-fit" : "page-width";
+  const scrollModeOf = (mode) => mode === "single" ? ScrollMode.PAGE : ScrollMode.VERTICAL;
+  view.scale = fitOf(view.mode);
+  const single = () => view.mode === "single";
+  const layOut = () => document.body.classList.toggle("single", single());
+  // The toolbar told the mode and the zoom, however they changed: its
+  // buttons, Ctrl and the wheel, the keys.
+  const report = () => {
+    const handlers = window.webkit && window.webkit.messageHandlers;
+    if (!handlers || !handlers.tasteView || !shown.doc) return;
+    handlers.tasteView.postMessage(JSON.stringify({
+      mode: view.mode,
+      value: String(shown.viewer.currentScaleValue),
+      percent: Math.round(shown.viewer.currentScale * 100),
+    }));
+  };
+  for (const it of [shown, behind]) {
+    it.eventBus.on("scalechanging", () => {
+      if (it !== shown) return;
+      setTimeout(() => { view.scale = shown.viewer.currentScaleValue; report(); }, 0);
+    });
+  }
   shown.eventBus.on("pagesinit", () => {
-    shown.viewer.currentScaleValue = "page-width";
+    layOut();
+    shown.viewer.scrollMode = scrollModeOf(view.mode);
+    shown.viewer.currentScaleValue = view.scale;
+    report();
   }, { once: true });
+  // The toolbar's: a mode, at its own fit unless a zoom is given, and the
+  // page in view kept.
+  window.tasteSetView = (mode, scale) => {
+    if (!shown.doc) return;
+    if (mode && mode !== view.mode) {
+      view.mode = mode;
+      layOut();
+      const page = shown.viewer.currentPageNumber;
+      shown.viewer.scrollMode = scrollModeOf(mode);
+      shown.viewer.currentPageNumber = page;
+      if (!scale) scale = fitOf(mode);
+    }
+    if (scale) {
+      view.scale = scale;
+      shown.viewer.currentScaleValue = scale;
+    }
+    if (window.tasteMapDraw) window.tasteMapDraw();
+    report();
+  };
+  window.tasteZoom = (steps) => {
+    if (!shown.doc) return;
+    if (steps > 0) shown.viewer.increaseScale(); else shown.viewer.decreaseScale();
+  };
   show(shown, await open("document.pdf"));
 
   let generation = 0;
@@ -980,6 +1105,7 @@ try {
       };
       const drawn = (event) => { if (event.pageNumber === page) finish(); };
       into.eventBus.on("pagesinit", () => {
+        into.viewer.scrollMode = scrollModeOf(view.mode);
         into.viewer.currentScaleValue = scale;
         if (at) {
           page = Math.min(at.pageNumber, next.numPages);
@@ -999,6 +1125,7 @@ try {
     from.container.classList.add("behind");
     shown = into;
     behind = from;
+    report();
     if (window.tasteMapBuild) window.tasteMapBuild();
     const old = from.doc;
     from.doc = null;
@@ -1050,10 +1177,19 @@ try {
     }
     if (mine === mapGeneration) { thumbs = next; draw(); }
   };
-  // Each page's span in the view and in the strip, top to bottom.
+  // Each page's span in the view and in the strip, top to bottom. One
+  // page at a time, the view holds only the page in it, so the strip lays
+  // the pictures out alone, and the view is that page's.
   const spans = () => {
     const out = [];
     let y = 0;
+    if (single()) {
+      for (let i = 0; i < thumbs.length; i++) {
+        out.push({ mapTop: y, mapBottom: y + thumbs[i].h });
+        y += thumbs[i].h + GAP;
+      }
+      return out;
+    }
     for (let i = 0; i < thumbs.length; i++) {
       const view = shown.viewer.getPageView(i);
       const div = view && view.div;
@@ -1090,6 +1226,10 @@ try {
     const pane = shown.container;
     const drawn = list.length ? list[list.length - 1].mapBottom : 0;
     const room = map.clientHeight;
+    if (single()) {
+      const n = list.length, at = shown.viewer.currentPageNumber - 1;
+      return drawn > room && n > 1 ? (drawn - room) * Math.min(Math.max(at / (n - 1), 0), 1) : 0;
+    }
     const most = pane.scrollHeight - pane.clientHeight;
     return drawn > room && most > 0 ? (drawn - room) * Math.min(Math.max(pane.scrollTop / most, 0), 1) : 0;
   };
@@ -1123,8 +1263,16 @@ try {
         }
       }
       const pane = shown.container;
-      const top = toMap(list, pane.scrollTop) - offset;
-      const bottom = toMap(list, pane.scrollTop + pane.clientHeight) - offset;
+      let top, bottom;
+      if (single()) {
+        const s = list[Math.min(shown.viewer.currentPageNumber - 1, list.length - 1)];
+        const of = (y) => Math.min(Math.max(y / Math.max(pane.scrollHeight, 1), 0), 1);
+        top = s.mapTop + of(pane.scrollTop) * (s.mapBottom - s.mapTop) - offset;
+        bottom = s.mapTop + of(pane.scrollTop + pane.clientHeight) * (s.mapBottom - s.mapTop) - offset;
+      } else {
+        top = toMap(list, pane.scrollTop) - offset;
+        bottom = toMap(list, pane.scrollTop + pane.clientHeight) - offset;
+      }
       ctx.globalAlpha = 0.25;
       ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--map-accent").trim() || '#3584e4';
       ctx.fillRect(0, top, w, Math.max(bottom - top, 2));
@@ -1138,6 +1286,15 @@ try {
     if (!list.length) return;
     const y = event.clientY - map.getBoundingClientRect().top + offsetOf(list);
     const pane = shown.container;
+    if (single()) {
+      let i = list.findIndex((s) => y <= s.mapBottom);
+      if (i < 0) i = list.length - 1;
+      if (shown.viewer.currentPageNumber !== i + 1) shown.viewer.currentPageNumber = i + 1;
+      const s = list[i];
+      const f = Math.min(Math.max((y - s.mapTop) / Math.max(s.mapBottom - s.mapTop, 1), 0), 1);
+      pane.scrollTop = f * pane.scrollHeight - pane.clientHeight / 2;
+      return;
+    }
     pane.scrollTop = toView(list, y) - pane.clientHeight / 2;
   };
   map.addEventListener("pointerdown", (event) => {
@@ -1157,7 +1314,9 @@ try {
     it.container.addEventListener("scroll", draw, { passive: true });
     it.eventBus.on("updateviewarea", draw);
     it.eventBus.on("pagesloaded", draw);
+    it.eventBus.on("pagechanging", draw);
   }
+  window.tasteMapDraw = draw;
   new ResizeObserver(draw).observe(map);
   window.tasteMapBuild = () => { if (shown.doc) build(shown.doc); };
   build(shown.doc);
@@ -1167,10 +1326,50 @@ try {
   // page — moved nothing (David, 2026-10-06: "pgup/pgdown should also work
   // in pdfs"). A screenful less a line, so a line stays in view across
   // the turn; Space as Page Down, Shift+Space as Page Up; Home and End.
+  // Ctrl and = or −, a step of zoom; Ctrl and 0, the mode's own fit. One
+  // page at a time, the keys that page on turn the page at its end — and
+  // Left and Right always do; Home and End are the first and the last.
   document.addEventListener("keydown", (event) => {
+    if (event.ctrlKey && !event.altKey && !event.metaKey) {
+      if (event.key === "=" || event.key === "+") window.tasteZoom(1);
+      else if (event.key === "-") window.tasteZoom(-1);
+      else if (event.key === "0") window.tasteSetView(null, fitOf(view.mode));
+      else return;
+      event.preventDefault();
+      return;
+    }
     if (event.ctrlKey || event.altKey || event.metaKey) return;
     const pane = shown.container, line = 40;
     const screen = Math.max(pane.clientHeight - line, line);
+    if (single()) {
+      const v = shown.viewer;
+      const atBottom = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 2;
+      const atTop = pane.scrollTop <= 1;
+      const key = event.key;
+      const forward = key === "PageDown" || key === "ArrowRight"
+        || (key === " " && !event.shiftKey) || (key === "ArrowDown" && atBottom);
+      const back = key === "PageUp" || key === "ArrowLeft"
+        || (key === " " && event.shiftKey) || (key === "ArrowUp" && atTop);
+      if (forward) {
+        if (atBottom || key === "ArrowRight") { if (v.nextPage()) pane.scrollTop = 0; }
+        else pane.scrollBy({ top: screen });
+      } else if (back) {
+        if (atTop || key === "ArrowLeft") { if (v.previousPage()) pane.scrollTop = pane.scrollHeight; }
+        else pane.scrollBy({ top: -screen });
+      } else if (key === "ArrowDown") {
+        pane.scrollBy({ top: line });
+      } else if (key === "ArrowUp") {
+        pane.scrollBy({ top: -line });
+      } else if (key === "Home") {
+        v.currentPageNumber = 1;
+      } else if (key === "End") {
+        v.currentPageNumber = v.pagesCount;
+      } else {
+        return;
+      }
+      event.preventDefault();
+      return;
+    }
     const by = {
       PageDown: screen, PageUp: -screen, ArrowDown: line, ArrowUp: -line,
       " ": event.shiftKey ? -screen : screen,
@@ -1186,17 +1385,43 @@ try {
     }
     event.preventDefault();
   });
+  // The wheel past a page's end turns it, one page at a time: a wheel's
+  // worth of travel there, and a breath after each turn so a touchpad's
+  // glide does not run through several.
+  let travel = 0, turnedAt = 0;
   for (const container of document.querySelectorAll(".pane")) {
     container.addEventListener("wheel", (event) => {
-      if (!event.ctrlKey) return;
+      if (event.ctrlKey) {
+        event.preventDefault();
+        shown.viewer.currentScale *= event.deltaY < 0 ? 1.1 : 1 / 1.1;
+        return;
+      }
+      if (!single()) return;
+      const pane = shown.container;
+      const atBottom = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 2;
+      const atTop = pane.scrollTop <= 1;
+      if (!((event.deltaY > 0 && atBottom) || (event.deltaY < 0 && atTop))) {
+        travel = 0;
+        return;
+      }
       event.preventDefault();
-      shown.viewer.currentScale *= event.deltaY < 0 ? 1.1 : 1 / 1.1;
+      if (performance.now() - turnedAt < 350) return;
+      travel += event.deltaY;
+      if (Math.abs(travel) < 120) return;
+      const forward = travel > 0;
+      travel = 0;
+      turnedAt = performance.now();
+      if (forward ? shown.viewer.nextPage() : shown.viewer.previousPage()) {
+        pane.scrollTop = forward ? 0 : pane.scrollHeight;
+      }
     }, { passive: false });
   }
+  // A fit, kept as the pane is resized: the width, or the whole page.
   new ResizeObserver(() => {
     for (const it of [shown, behind]) {
-      if (it.doc && it.viewer.currentScaleValue === "page-width") {
-        it.viewer.currentScaleValue = "page-width";
+      const value = it.doc && it.viewer.currentScaleValue;
+      if (value === "page-width" || value === "page-fit" || value === "auto") {
+        it.viewer.currentScaleValue = value;
       }
     }
   }).observe(document.body);
@@ -1283,14 +1508,174 @@ fn register_pdf_scheme() {
     });
 }
 
+thread_local! {
+    /// The layout last chosen, which the next PDF opens in: a reader who
+    /// wants slides one at a time wants the next deck that way too.
+    static LAST_SINGLE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A PDF's zoom and layout, over its view (David, 2026-10-20: "I'd like
+/// zoom tools for PDFs and a choice of continuous or single-page"): zoom
+/// out, the zoom — a menu of the two fits and the usual steps, which wears
+/// the zoom in force — and zoom in; then the pages in one scrolling
+/// column, or one at a time. Each layout opens at its own fit, the width
+/// for a column and the whole page for one at a time. The page reports
+/// every change back ([`PdfTools::reported`]), Ctrl and the wheel's
+/// included, so what the toolbar says is what the page shows.
+struct PdfTools {
+    widget: gtk::Box,
+    zoom: gtk::MenuButton,
+    continuous: gtk::ToggleButton,
+    single: gtk::ToggleButton,
+    /// Set while the toolbar is told rather than pressed, so a report does
+    /// not echo back to the page as a choice.
+    quiet: Cell<bool>,
+}
+
+/// The zoom menu's steps, as the page takes them.
+const ZOOM_STEPS: &[(&str, &str)] = &[
+    ("50%", "0.5"),
+    ("75%", "0.75"),
+    ("100%", "1"),
+    ("125%", "1.25"),
+    ("150%", "1.5"),
+    ("200%", "2"),
+    ("400%", "4"),
+];
+
+impl PdfTools {
+    fn new(view: &webkit6::WebView, single: bool) -> Rc<Self> {
+        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        widget.add_css_class("toolbar");
+        widget.add_css_class("pdf-tools");
+        let zoom_out = gtk::Button::builder()
+            .icon_name("zoom-out-symbolic")
+            .tooltip_text("Zoom out (Ctrl+−)")
+            .css_classes(["flat"])
+            .build();
+        let menu = gtk::gio::Menu::new();
+        let fits = gtk::gio::Menu::new();
+        fits.append(Some("Page fit"), Some("pdf.zoom::page-fit"));
+        fits.append(Some("Page width"), Some("pdf.zoom::page-width"));
+        menu.append_section(None, &fits);
+        let steps = gtk::gio::Menu::new();
+        for (label, value) in ZOOM_STEPS {
+            steps.append(Some(label), Some(&format!("pdf.zoom::{value}")));
+        }
+        menu.append_section(None, &steps);
+        let zoom = gtk::MenuButton::builder()
+            .label(if single { "Page fit" } else { "Page width" })
+            .menu_model(&menu)
+            .tooltip_text("Zoom")
+            .css_classes(["flat"])
+            .build();
+        let zoom_in = gtk::Button::builder()
+            .icon_name("zoom-in-symbolic")
+            .tooltip_text("Zoom in (Ctrl+=)")
+            .css_classes(["flat"])
+            .build();
+        let gap = gtk::Box::builder().hexpand(true).build();
+        let continuous = gtk::ToggleButton::builder()
+            .icon_name("view-continuous-symbolic")
+            .tooltip_text("Continuous")
+            .active(!single)
+            .build();
+        let single_button = gtk::ToggleButton::builder()
+            .icon_name("view-paged-symbolic")
+            .tooltip_text("Single page")
+            .group(&continuous)
+            .active(single)
+            .build();
+        let layout = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        layout.add_css_class("linked");
+        layout.append(&continuous);
+        layout.append(&single_button);
+        widget.append(&zoom_out);
+        widget.append(&zoom);
+        widget.append(&zoom_in);
+        widget.append(&gap);
+        widget.append(&layout);
+        let tools = Rc::new(Self {
+            widget,
+            zoom,
+            continuous,
+            single: single_button,
+            quiet: Cell::new(false),
+        });
+        let actions = gtk::gio::SimpleActionGroup::new();
+        let zoom_to = gtk::gio::SimpleAction::new("zoom", Some(glib::VariantTy::STRING));
+        {
+            let view = view.clone();
+            zoom_to.connect_activate(move |_, value| {
+                if let Some(value) = value.and_then(|v| v.str().map(str::to_string)) {
+                    run_js(&view, &format!("window.tasteSetView(null, {value:?})"));
+                }
+            });
+        }
+        actions.add_action(&zoom_to);
+        tools.widget.insert_action_group("pdf", Some(&actions));
+        for (button, steps) in [(&zoom_out, -1), (&zoom_in, 1)] {
+            let view = view.clone();
+            button.connect_clicked(move |_| run_js(&view, &format!("window.tasteZoom({steps})")));
+        }
+        for (button, mode) in [(&tools.continuous, "continuous"), (&tools.single, "single")] {
+            let (view, weak) = (view.clone(), Rc::downgrade(&tools));
+            button.connect_toggled(move |button| {
+                let Some(tools) = weak.upgrade() else { return };
+                if !button.is_active() || tools.quiet.get() {
+                    return;
+                }
+                LAST_SINGLE.with(|last| last.set(mode == "single"));
+                run_js(&view, &format!("window.tasteSetView({mode:?})"));
+            });
+        }
+        tools
+    }
+
+    /// What the page says it shows: `{"mode", "value", "percent"}`.
+    fn reported(&self, json: &str) {
+        let Ok(said) = serde_json::from_str::<serde_json::Value>(json) else {
+            return;
+        };
+        let mode = said["mode"].as_str().unwrap_or("continuous");
+        let label = match said["value"].as_str().unwrap_or("") {
+            "page-fit" => "Page fit".to_string(),
+            "page-width" => "Page width".to_string(),
+            _ => format!("{}%", said["percent"].as_i64().unwrap_or(100)),
+        };
+        self.quiet.set(true);
+        self.zoom.set_label(&label);
+        if mode == "single" {
+            self.single.set_active(true);
+        } else {
+            self.continuous.set_active(true);
+        }
+        self.quiet.set(false);
+    }
+}
+
+fn run_js(view: &webkit6::WebView, script: &str) {
+    webkit6::prelude::WebViewExt::evaluate_javascript(
+        view,
+        script,
+        None,
+        None,
+        None::<&gtk::gio::Cancellable>,
+        |_| {},
+    );
+}
+
 /// The PDF of `id`, in a WebKit view that loads nothing but the viewer
 /// scheme: navigation anywhere else is refused, and a link the user
 /// clicks opens in their browser instead.
-fn pdf_view(id: u64) -> webkit6::WebView {
+/// It opens one page at a time when `single`, and `manager` carries its
+/// reports to the toolbar.
+fn pdf_view(id: u64, manager: &webkit6::UserContentManager, single: bool) -> webkit6::WebView {
     register_pdf_scheme();
     let session = webkit6::NetworkSession::new_ephemeral();
     let view = webkit6::WebView::builder()
         .network_session(&session)
+        .user_content_manager(manager)
         .vexpand(true)
         .hexpand(true)
         .build();
@@ -1356,7 +1741,13 @@ fn pdf_view(id: u64) -> webkit6::WebView {
             |_| {},
         );
     });
-    webkit6::prelude::WebViewExt::load_uri(&view, &format!("{PDF_SCHEME}://{id}/index.html"));
+    webkit6::prelude::WebViewExt::load_uri(
+        &view,
+        &format!(
+            "{PDF_SCHEME}://{id}/index.html?mode={}",
+            if single { "single" } else { "continuous" }
+        ),
+    );
     view
 }
 
