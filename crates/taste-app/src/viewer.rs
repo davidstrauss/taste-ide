@@ -16,7 +16,8 @@
 //! The file's bytes are read through the files service like any other
 //! file's, so a viewer works the same on a checkout in a VM. What is
 //! text-like — SVG, which is XML — stays in the text editor, where it can
-//! be edited.
+//! be edited, and previews there as a picture drawn by the confined helper
+//! (`editor::Editor::show_svg`), with an image's zoom ([`ZoomImage`]).
 //!
 //! A viewer does not follow its file as it changes. When the file changes
 //! on disk, the tab says so in a banner and offers to reload it (David,
@@ -248,8 +249,10 @@ pub struct ViewerPage {
     /// The PDF's view, while it has one: a reload replaces the document in
     /// it rather than the view, so the scroll and the zoom hold.
     pdf_view: RefCell<Option<webkit6::WebView>>,
-    /// The PDF's zoom and layout controls, over its view.
+    /// The PDF's zoom and layout controls, on the editor's view bar.
     pdf_tools: RefCell<Option<Rc<PdfTools>>>,
+    /// An image's picture and its zoom, kept across a reload.
+    image: RefCell<Option<Rc<ZoomImage>>>,
     /// The PDF's text, a string a page, once read ([`Self::read_text`]),
     /// for the universal find (David, 2026-10-06: "Universal find should
     /// work on open PDFs. You should even OCR if necessary"). A page drawn
@@ -295,6 +298,7 @@ impl ViewerPage {
             auto: Cell::new(false),
             pdf_view: RefCell::new(None),
             pdf_tools: RefCell::new(None),
+            image: RefCell::new(None),
             text: RefCell::new(None),
             text_generation: Cell::new(0),
             reading: Cell::new(false),
@@ -455,7 +459,7 @@ impl ViewerPage {
                             if let Some(tools) = tools {
                                 eprintln!(
                                     "probe viewer tools: zoom {:?}, single {}",
-                                    tools.zoom.label(),
+                                    tools.zoom.label.label(),
                                     tools.single.is_active()
                                 );
                             }
@@ -547,6 +551,18 @@ impl ViewerPage {
             self.read_text();
             return;
         }
+        // An image again: the new drawing in the same picture, at the zoom
+        // it was at.
+        let image = self.image.borrow().clone();
+        if let (Some(image), Content::Image(texture)) = (image, &loaded.content) {
+            self.shown.set(loaded.fingerprint);
+            image.set_picture(
+                texture,
+                (f64::from(texture.width()), f64::from(texture.height())),
+                1.0,
+            );
+            return;
+        }
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
@@ -555,7 +571,14 @@ impl ViewerPage {
         }
         self.shown.set(loaded.fingerprint);
         let shown: gtk::Widget = match (self.kind, loaded.content) {
-            (ViewKind::Image, Content::Image(texture)) => image_view(&texture),
+            (ViewKind::Image, Content::Image(texture)) => {
+                let image = ZoomImage::new(
+                    &texture,
+                    (f64::from(texture.width()), f64::from(texture.height())),
+                );
+                *self.image.borrow_mut() = Some(image.clone());
+                image.scroller.clone().upcast()
+            }
             (ViewKind::Media, Content::Bytes(bytes)) => media_view(&bytes),
             (ViewKind::Pdf, Content::Bytes(bytes)) => {
                 let id = next_pdf_id();
@@ -589,15 +612,24 @@ impl ViewerPage {
                         }
                     }
                 });
-                let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                column.append(&tools.widget);
-                column.append(&view);
-                column.upcast()
+                view.upcast()
             }
             _ => gtk::Label::new(Some("This file could not be shown.")).upcast(),
         };
         shown.set_vexpand(true);
         self.content.append(&shown);
+    }
+
+    /// The controls the editor's view bar carries for this tab, on its
+    /// left: a PDF's zoom and layout, an image's zoom.
+    pub fn tools(&self) -> Option<gtk::Widget> {
+        if let Some(tools) = self.pdf_tools.borrow().as_ref() {
+            return Some(tools.widget.clone().upcast());
+        }
+        self.image
+            .borrow()
+            .as_ref()
+            .map(|image| image.tools.clone().upcast())
     }
 
     /// Take the keyboard, as the tab comes to the front: a PDF pages with
@@ -818,27 +850,6 @@ impl Drop for ViewerPage {
 
 /// An image, scaled down to fit and never up, centred on the pane, with
 /// its size under it.
-fn image_view(texture: &gtk::gdk::Texture) -> gtk::Widget {
-    let picture = gtk::Picture::for_paintable(texture);
-    picture.set_content_fit(gtk::ContentFit::ScaleDown);
-    picture.set_can_shrink(true);
-    picture.set_vexpand(true);
-    picture.set_hexpand(true);
-    let size = gtk::Label::builder()
-        .label(format!("{} × {}", texture.width(), texture.height()))
-        .css_classes(["caption", "dim-label"])
-        .margin_top(6)
-        .margin_bottom(6)
-        .build();
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    column.set_margin_top(12);
-    column.set_margin_start(12);
-    column.set_margin_end(12);
-    column.append(&picture);
-    column.append(&size);
-    column.upcast()
-}
-
 /// Audio or video, with GTK's own controls, from the bytes read.
 fn media_view(bytes: &glib::Bytes) -> gtk::Widget {
     let stream = gtk::gio::MemoryInputStream::from_bytes(bytes);
@@ -1514,6 +1525,369 @@ thread_local! {
     static LAST_SINGLE: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The zoom as GNOME's document viewer has it (David, 2026-10-20: "There
+/// is a standard GNOME approach to zooming controls. Can we use that?"):
+/// one button wearing the zoom in force as a percentage, whatever set it,
+/// on a label of a fixed width so nothing beside it moves as it changes;
+/// its menu the fits as radio items, the one in force checked, and the
+/// steps under them. Ctrl and the wheel, and Ctrl and = or −, step it.
+pub(crate) struct ZoomMenu {
+    pub button: gtk::MenuButton,
+    label: gtk::Label,
+    fit: gtk::gio::SimpleAction,
+}
+
+/// The zoom menu's steps, Papers's.
+const ZOOM_STEPS: &[f64] = &[0.5, 0.7, 0.85, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 4.0];
+
+/// A zoom as the button says it: "100%", "76.3%".
+fn percent_words(percent: f64) -> String {
+    if (percent - percent.round()).abs() < 0.05 {
+        format!("{}%", percent.round())
+    } else {
+        format!("{percent:.1}%")
+    }
+}
+
+impl ZoomMenu {
+    /// `fits` as (what the menu says, what `on_fit` is told); a step tells
+    /// `on_scale` its scale.
+    pub(crate) fn new(
+        fits: &[(&str, &str)],
+        on_fit: impl Fn(&str) + 'static,
+        on_scale: impl Fn(f64) + 'static,
+    ) -> Self {
+        let menu = gtk::gio::Menu::new();
+        let fit_section = gtk::gio::Menu::new();
+        for (label, value) in fits {
+            fit_section.append(Some(label), Some(&format!("zoom.fit::{value}")));
+        }
+        menu.append_section(None, &fit_section);
+        let steps = gtk::gio::Menu::new();
+        for step in ZOOM_STEPS {
+            steps.append(
+                Some(&percent_words(step * 100.0)),
+                Some(&format!("zoom.to::{step}")),
+            );
+        }
+        menu.append_section(None, &steps);
+        let label = gtk::Label::builder()
+            .label("100%")
+            // "1234.5%", the widest it says.
+            .width_chars(7)
+            .xalign(1.0)
+            .build();
+        let face = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        face.append(&label);
+        face.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+        let button = gtk::MenuButton::builder()
+            .child(&face)
+            .menu_model(&menu)
+            .tooltip_text("Zoom")
+            .css_classes(["flat"])
+            .build();
+        let actions = gtk::gio::SimpleActionGroup::new();
+        let fit = gtk::gio::SimpleAction::new_stateful(
+            "fit",
+            Some(glib::VariantTy::STRING),
+            &"".to_variant(),
+        );
+        fit.connect_activate(move |action, value| {
+            if let Some(value) = value {
+                action.set_state(value);
+                if let Some(value) = value.str() {
+                    on_fit(value);
+                }
+            }
+        });
+        actions.add_action(&fit);
+        let to = gtk::gio::SimpleAction::new("to", Some(glib::VariantTy::STRING));
+        {
+            let fit = fit.clone();
+            to.connect_activate(move |_, value| {
+                if let Some(scale) = value.and_then(|v| v.str()).and_then(|v| v.parse().ok()) {
+                    fit.set_state(&"".to_variant());
+                    on_scale(scale);
+                }
+            });
+        }
+        actions.add_action(&to);
+        button.insert_action_group("zoom", Some(&actions));
+        Self { button, label, fit }
+    }
+
+    /// What is shown: the zoom in force, and the fit that set it if one did.
+    pub(crate) fn show(&self, percent: f64, fit: Option<&str>) {
+        self.label.set_label(&percent_words(percent));
+        self.fit.set_state(&fit.unwrap_or("").to_variant());
+    }
+}
+
+/// The zoom steps the buttons and Ctrl and the wheel move between.
+const IMAGE_STEPS: &[f64] = &[
+    0.1, 0.25, 0.5, 0.7, 0.85, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 4.0, 6.0, 8.0,
+];
+
+/// How a picture is sized in its pane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ImageZoom {
+    /// Whole in the pane, never past its own size.
+    Fit,
+    /// As wide as the pane, scrolling down.
+    FitWidth,
+    /// At a scale of its own size.
+    Scale(f64),
+}
+
+/// A picture with the PDF's zoom tools (David, 2026-10-20: "Images
+/// actually should get the zoom and fit interface, too"): fit, fit width,
+/// and steps from a tenth to eight times, the buttons and Ctrl and the
+/// wheel moving between them, and the picture's size beside them. An
+/// image file's viewer and an SVG file's preview. A picture drawn at a
+/// scale of its own (an SVG's) is asked for again when a zoom goes past it
+/// ([`ZoomImage::set_redraw`]), so a zoomed drawing stays sharp.
+pub(crate) struct ZoomImage {
+    /// The zoom out, the zoom, the zoom in, and the size: the view bar's
+    /// left (`Editor::show_view_modes`).
+    pub tools: gtk::Box,
+    pub scroller: gtk::ScrolledWindow,
+    picture: gtk::Picture,
+    menu: ZoomMenu,
+    size_label: gtk::Label,
+    zoom: Cell<ImageZoom>,
+    /// The picture's own size, in logical pixels.
+    natural: Cell<(f64, f64)>,
+    /// The scale the picture was drawn at, over its logical size.
+    drawn_at: Cell<f64>,
+    redraw: RefCell<Option<Rc<dyn Fn(f64)>>>,
+}
+
+impl ZoomImage {
+    pub(crate) fn new(paintable: &impl IsA<gtk::gdk::Paintable>, natural: (f64, f64)) -> Rc<Self> {
+        let picture = gtk::Picture::for_paintable(paintable);
+        picture.set_can_shrink(true);
+        let center = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        center.set_halign(gtk::Align::Center);
+        center.set_valign(gtk::Align::Center);
+        center.set_margin_top(12);
+        center.set_margin_bottom(12);
+        center.set_margin_start(12);
+        center.set_margin_end(12);
+        center.append(&picture);
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&center)
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+        let size_label = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .margin_start(8)
+            .build();
+        let tools = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        let this = Rc::new_cyclic(|weak: &std::rc::Weak<Self>| {
+            let (on_fit, on_scale) = (weak.clone(), weak.clone());
+            let menu = ZoomMenu::new(
+                &[("Best Fit", "fit"), ("Fit Width", "width")],
+                move |fit| {
+                    if let Some(this) = on_fit.upgrade() {
+                        this.set_zoom(if fit == "width" {
+                            ImageZoom::FitWidth
+                        } else {
+                            ImageZoom::Fit
+                        });
+                    }
+                },
+                move |scale| {
+                    if let Some(this) = on_scale.upgrade() {
+                        this.set_zoom(ImageZoom::Scale(scale));
+                    }
+                },
+            );
+            tools.append(&size_label);
+            tools.append(&menu.button);
+            Self {
+                tools,
+                scroller,
+                picture,
+                menu,
+                size_label,
+                zoom: Cell::new(ImageZoom::Fit),
+                natural: Cell::new(natural),
+                drawn_at: Cell::new(1.0),
+                redraw: RefCell::new(None),
+            }
+        });
+        // Ctrl and the wheel zoom, as in the PDF; the wheel alone scrolls.
+        let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let weak = Rc::downgrade(&this);
+            wheel.connect_scroll(move |controller, _, dy| {
+                let ctrl = controller
+                    .current_event_state()
+                    .contains(gtk::gdk::ModifierType::CONTROL_MASK);
+                let Some(this) = weak.upgrade().filter(|_| ctrl) else {
+                    return glib::Propagation::Proceed;
+                };
+                this.step(if dy < 0.0 { 1 } else { -1 });
+                glib::Propagation::Stop
+            });
+        }
+        this.scroller.add_controller(wheel);
+        // A fit's percentage is the pane's to decide, and changes with it:
+        // said again whenever the picture's width does.
+        {
+            let weak = Rc::downgrade(&this);
+            let last = Cell::new(-1);
+            this.picture.add_tick_callback(move |picture, _| {
+                if picture.width() != last.get() {
+                    last.set(picture.width());
+                    if let Some(this) = weak.upgrade() {
+                        this.say_zoom();
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+        this.apply();
+        this
+    }
+
+    /// A new drawing of the same picture — a reload, or an SVG drawn again
+    /// — at `drawn_at` over its `natural` size, at the zoom in force.
+    pub(crate) fn set_picture(
+        &self,
+        paintable: &impl IsA<gtk::gdk::Paintable>,
+        natural: (f64, f64),
+        drawn_at: f64,
+    ) {
+        self.picture.set_paintable(Some(paintable));
+        self.natural.set(natural);
+        self.drawn_at.set(drawn_at);
+        self.apply();
+    }
+
+    /// Why the picture could not be drawn, where its size is said.
+    pub(crate) fn show_error(&self, why: &str) {
+        self.size_label.set_label(&format!("Not drawn: {why}"));
+    }
+
+    /// What draws the picture again at a scale, for one past its drawing.
+    pub(crate) fn set_redraw(&self, redraw: Rc<dyn Fn(f64)>) {
+        *self.redraw.borrow_mut() = Some(redraw);
+    }
+
+    fn set_zoom(&self, zoom: ImageZoom) {
+        self.zoom.set(zoom);
+        self.apply();
+    }
+
+    /// The scale on screen now, over the picture's own size. A fit's is
+    /// the picture's box over its size — the box fills the pane, so Best
+    /// Fit's is the lesser of the two ratios and never past one, and Fit
+    /// Width's is the width's.
+    fn scale_now(&self) -> f64 {
+        let (width, height) = self.natural.get();
+        let (boxed_w, boxed_h) = (
+            f64::from(self.picture.width()),
+            f64::from(self.picture.height()),
+        );
+        let known = width > 0.0 && height > 0.0 && boxed_w > 0.0 && boxed_h > 0.0;
+        match self.zoom.get() {
+            ImageZoom::Scale(scale) => scale,
+            ImageZoom::Fit if known => (boxed_w / width).min(boxed_h / height).min(1.0),
+            ImageZoom::FitWidth if known => boxed_w / width,
+            _ => 1.0,
+        }
+    }
+
+    /// A step in or out from the scale on screen, whatever the zoom was.
+    fn step(&self, steps: i32) {
+        let now = self.scale_now();
+        let next = if steps > 0 {
+            IMAGE_STEPS.iter().copied().find(|s| *s > now * 1.001)
+        } else {
+            IMAGE_STEPS.iter().rev().copied().find(|s| *s < now * 0.999)
+        };
+        if let Some(next) = next {
+            self.set_zoom(ImageZoom::Scale(next));
+        }
+    }
+
+    /// The zoom button, told the scale on screen and the fit that set it.
+    fn say_zoom(&self) {
+        self.menu.show(
+            self.scale_now() * 100.0,
+            match self.zoom.get() {
+                ImageZoom::Fit => Some("fit"),
+                ImageZoom::FitWidth => Some("width"),
+                ImageZoom::Scale(_) => None,
+            },
+        );
+    }
+
+    fn apply(&self) {
+        let (width, height) = self.natural.get();
+        self.size_label
+            .set_label(&format!("{} × {}", width.round(), height.round()));
+        let center = self.picture.parent();
+        match self.zoom.get() {
+            ImageZoom::Fit => {
+                self.scroller
+                    .set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
+                self.picture.set_size_request(-1, -1);
+                self.picture.set_content_fit(gtk::ContentFit::ScaleDown);
+                self.picture.set_can_shrink(true);
+                if let Some(center) = &center {
+                    center.set_halign(gtk::Align::Fill);
+                    center.set_valign(gtk::Align::Fill);
+                }
+                self.picture.set_hexpand(true);
+                self.picture.set_vexpand(true);
+            }
+            ImageZoom::FitWidth => {
+                self.scroller
+                    .set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+                self.picture.set_size_request(-1, -1);
+                self.picture.set_content_fit(gtk::ContentFit::Contain);
+                self.picture.set_can_shrink(true);
+                if let Some(center) = &center {
+                    center.set_halign(gtk::Align::Fill);
+                    center.set_valign(gtk::Align::Start);
+                }
+                self.picture.set_hexpand(true);
+                self.picture.set_vexpand(false);
+            }
+            ImageZoom::Scale(scale) => {
+                self.scroller
+                    .set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+                self.picture.set_content_fit(gtk::ContentFit::Fill);
+                self.picture.set_can_shrink(false);
+                self.picture.set_size_request(
+                    (width * scale).round().max(1.0) as i32,
+                    (height * scale).round().max(1.0) as i32,
+                );
+                if let Some(center) = &center {
+                    center.set_halign(gtk::Align::Center);
+                    center.set_valign(gtk::Align::Center);
+                }
+                self.picture.set_hexpand(false);
+                self.picture.set_vexpand(false);
+            }
+        }
+        self.say_zoom();
+        // Past what the picture was drawn at: drawn again, sharper — but
+        // never past eight times, the most it is drawn at, so a drawing at
+        // the most cannot ask for another.
+        let wanted = (self.scale_now() * f64::from(crate::mermaid::display_scale())).min(8.0);
+        if wanted > self.drawn_at.get() * 1.05 {
+            if let Some(redraw) = self.redraw.borrow().clone() {
+                redraw(wanted);
+            }
+        }
+    }
+}
+
 /// A PDF's zoom and layout, over its view (David, 2026-10-20: "I'd like
 /// zoom tools for PDFs and a choice of continuous or single-page"): zoom
 /// out, the zoom — a menu of the two fits and the usual steps, which wears
@@ -1524,7 +1898,7 @@ thread_local! {
 /// included, so what the toolbar says is what the page shows.
 struct PdfTools {
     widget: gtk::Box,
-    zoom: gtk::MenuButton,
+    zoom: ZoomMenu,
     continuous: gtk::ToggleButton,
     single: gtk::ToggleButton,
     /// Set while the toolbar is told rather than pressed, so a report does
@@ -1532,49 +1906,29 @@ struct PdfTools {
     quiet: Cell<bool>,
 }
 
-/// The zoom menu's steps, as the page takes them.
-const ZOOM_STEPS: &[(&str, &str)] = &[
-    ("50%", "0.5"),
-    ("75%", "0.75"),
-    ("100%", "1"),
-    ("125%", "1.25"),
-    ("150%", "1.5"),
-    ("200%", "2"),
-    ("400%", "4"),
-];
-
 impl PdfTools {
     fn new(view: &webkit6::WebView, single: bool) -> Rc<Self> {
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        widget.add_css_class("toolbar");
         widget.add_css_class("pdf-tools");
-        let zoom_out = gtk::Button::builder()
-            .icon_name("zoom-out-symbolic")
-            .tooltip_text("Zoom out (Ctrl+−)")
-            .css_classes(["flat"])
-            .build();
-        let menu = gtk::gio::Menu::new();
-        let fits = gtk::gio::Menu::new();
-        fits.append(Some("Page fit"), Some("pdf.zoom::page-fit"));
-        fits.append(Some("Page width"), Some("pdf.zoom::page-width"));
-        menu.append_section(None, &fits);
-        let steps = gtk::gio::Menu::new();
-        for (label, value) in ZOOM_STEPS {
-            steps.append(Some(label), Some(&format!("pdf.zoom::{value}")));
-        }
-        menu.append_section(None, &steps);
-        let zoom = gtk::MenuButton::builder()
-            .label(if single { "Page fit" } else { "Page width" })
-            .menu_model(&menu)
-            .tooltip_text("Zoom")
-            .css_classes(["flat"])
-            .build();
-        let zoom_in = gtk::Button::builder()
-            .icon_name("zoom-in-symbolic")
-            .tooltip_text("Zoom in (Ctrl+=)")
-            .css_classes(["flat"])
-            .build();
-        let gap = gtk::Box::builder().hexpand(true).build();
+        let zoom = {
+            let (fit_view, step_view) = (view.clone(), view.clone());
+            ZoomMenu::new(
+                &[
+                    ("Fit Page", "page-fit"),
+                    ("Fit Width", "page-width"),
+                    ("Automatic", "auto"),
+                ],
+                move |fit| run_js(&fit_view, &format!("window.tasteSetView(null, {fit:?})")),
+                move |scale| {
+                    run_js(
+                        &step_view,
+                        &format!("window.tasteSetView(null, \"{scale}\")"),
+                    )
+                },
+            )
+        };
+        zoom.show(100.0, Some(if single { "page-fit" } else { "page-width" }));
+        let gap = gtk::Box::builder().width_request(6).build();
         let continuous = gtk::ToggleButton::builder()
             .icon_name("view-continuous-symbolic")
             .tooltip_text("Continuous")
@@ -1590,9 +1944,7 @@ impl PdfTools {
         layout.add_css_class("linked");
         layout.append(&continuous);
         layout.append(&single_button);
-        widget.append(&zoom_out);
-        widget.append(&zoom);
-        widget.append(&zoom_in);
+        widget.append(&zoom.button);
         widget.append(&gap);
         widget.append(&layout);
         let tools = Rc::new(Self {
@@ -1602,22 +1954,6 @@ impl PdfTools {
             single: single_button,
             quiet: Cell::new(false),
         });
-        let actions = gtk::gio::SimpleActionGroup::new();
-        let zoom_to = gtk::gio::SimpleAction::new("zoom", Some(glib::VariantTy::STRING));
-        {
-            let view = view.clone();
-            zoom_to.connect_activate(move |_, value| {
-                if let Some(value) = value.and_then(|v| v.str().map(str::to_string)) {
-                    run_js(&view, &format!("window.tasteSetView(null, {value:?})"));
-                }
-            });
-        }
-        actions.add_action(&zoom_to);
-        tools.widget.insert_action_group("pdf", Some(&actions));
-        for (button, steps) in [(&zoom_out, -1), (&zoom_in, 1)] {
-            let view = view.clone();
-            button.connect_clicked(move |_| run_js(&view, &format!("window.tasteZoom({steps})")));
-        }
         for (button, mode) in [(&tools.continuous, "continuous"), (&tools.single, "single")] {
             let (view, weak) = (view.clone(), Rc::downgrade(&tools));
             button.connect_toggled(move |button| {
@@ -1638,13 +1974,11 @@ impl PdfTools {
             return;
         };
         let mode = said["mode"].as_str().unwrap_or("continuous");
-        let label = match said["value"].as_str().unwrap_or("") {
-            "page-fit" => "Page fit".to_string(),
-            "page-width" => "Page width".to_string(),
-            _ => format!("{}%", said["percent"].as_i64().unwrap_or(100)),
-        };
+        let value = said["value"].as_str().unwrap_or("");
+        let fit = matches!(value, "page-fit" | "page-width" | "auto").then_some(value);
         self.quiet.set(true);
-        self.zoom.set_label(&label);
+        self.zoom
+            .show(said["percent"].as_f64().unwrap_or(100.0), fit);
         if mode == "single" {
             self.single.set_active(true);
         } else {

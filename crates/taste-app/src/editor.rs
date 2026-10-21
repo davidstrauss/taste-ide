@@ -78,6 +78,11 @@ struct EditorPage {
     /// Which rebuild of the preview is the latest: one overtaken by a newer
     /// edit before it was whole is dropped rather than shown late.
     preview_generation: Rc<Cell<u64>>,
+    /// An SVG's preview: the picture the confined helper drew, with its
+    /// zoom, made the first time it is shown.
+    svg: RefCell<Option<Rc<crate::viewer::ZoomImage>>>,
+    /// Which drawing of the SVG is the latest.
+    svg_generation: Rc<Cell<u64>>,
     /// Revealed when the file changed on disk UNDER unsaved edits.
     conflict_bar: crate::viewer::ChangedBar,
     /// Hash of the bytes the last save wrote: the watcher echoes our own
@@ -633,9 +638,10 @@ pub struct Editor {
     /// hits, definitions and commits — the pane whose content they are in.
     results: Rc<crate::results::ResultsPanel>,
     tabs: adw::TabView,
-    /// The bar under the tab bar with the selected tab's view modes on its
-    /// right, the PDF's toolbar's shape ([`Editor::show_view_modes`]).
-    view_bar: gtk::Box,
+    /// The selected tab's own controls at the tab bar's end: a PDF's or an
+    /// image's zoom ([`Editor::show_view_modes`]).
+    view_tools: gtk::Box,
+    /// Its view modes, as toggles after them.
     view_modes: gtk::Box,
     /// The face the last rendered document was switched to: a response
     /// opened after the reader chose its Markdown opens on its Markdown.
@@ -759,31 +765,26 @@ impl Editor {
             .css_classes(["editor-strip"])
             .build();
 
-        // The selected tab's view modes — a file's Edit, Preview, and
-        // Changes; a port's faces; a log's Follow — as toggles on the right
-        // of a bar under the tabs, the PDF toolbar's shape (David,
-        // 2026-10-20: "Can we move Markdown preview and other interfaces
-        // with a toggled view to this model?"). Hidden for a tab with none;
-        // a PDF's own bar is the same bar, with its zoom on the left.
+        // The selected tab's controls at the tab bar's right end: its own
+        // tools (a PDF's or an image's zoom, GNOME's zoom menu) and its view
+        // modes — a file's Edit, Preview, and Changes; a port's faces; a
+        // log's Follow — as one-click toggles (David, 2026-10-20: "pack
+        // these now quite lean controls into the right side of the
+        // document tab bar area").
         let view_modes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        let view_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        view_bar.add_css_class("toolbar");
-        view_bar.add_css_class("view-bar");
-        view_bar.append(&gtk::Box::builder().hexpand(true).build());
-        view_bar.append(&view_modes);
-        view_bar.set_visible(false);
-        // A BOX at the bar's end, because at the consolidated rung this
-        // strip carries the console's tabs too, and the console's New
+        view_modes.set_valign(gtk::Align::Center);
+        let view_tools = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        view_tools.set_valign(gtk::Align::Center);
+        // At the tab bar's end, in a box, because at the consolidated rung
+        // this strip carries the console's tabs too, and the console's New
         // Terminal button belongs on the bar that draws them
-        // (`attach_end_action`), at the far right end at both rungs.
-        let end_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        // The way to a tab that scrolled off, and GNOME Builder's: a menu
-        // of the strip's pages, at the strip's end (`crate::pages_menu`).
-        // At the consolidated rung this one strip carries the files, the
-        // chat's faces and the console's tabs, and at 900px about four of
-        // them are on screen at a time. Before the console's + when that
-        // arrives, so "add one more tab" keeps the far right end.
-        end_actions.append(&crate::pages_menu::pages_menu(&tabs));
+        // (`attach_end_action`), after these, at the far right end at both
+        // rungs. No menu of the strip's pages any more (David, 2026-10-20:
+        // "Drop the whole 'down arrow' tab listing interface, both for
+        // documents and terminals").
+        let end_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        end_actions.append(&view_tools);
+        end_actions.append(&view_modes);
         tab_bar.set_end_action_widget(Some(&end_actions));
         let back_button = gtk::Button::builder()
             .icon_name("go-previous-symbolic")
@@ -828,7 +829,6 @@ impl Editor {
         let results = crate::results::ResultsPanel::new();
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&top_row);
-        widget.append(&view_bar);
         widget.append(&stack);
         widget.append(&results.widget);
 
@@ -838,7 +838,7 @@ impl Editor {
             workspace,
             results: results.clone(),
             tabs,
-            view_bar,
+            view_tools,
             view_modes,
             doc_source: Cell::new(false),
             pages: RefCell::new(HashMap::new()),
@@ -2216,6 +2216,23 @@ impl Editor {
         (modes, true)
     }
 
+    /// The selected tab's own controls for the bar's left: a viewer's zoom
+    /// (a PDF's with its layout), or an SVG's preview's.
+    fn view_tools_of_selection(&self) -> Option<gtk::Widget> {
+        if let Some(surface) = self.selected_surface() {
+            return match &surface.kind {
+                SurfaceKind::View(page) => page.tools(),
+                _ => None,
+            };
+        }
+        let (path, page) = self.selected()?;
+        if !is_svg(&path) || !self.wysiwyg_active(&path, &page) || page.changes_view.get() {
+            return None;
+        }
+        let tools = page.svg.borrow().as_ref()?.tools.clone();
+        Some(tools.upcast())
+    }
+
     /// The view bar, for the selected tab: its modes as toggles — linked
     /// and one at a time when they exclude one another — or no bar.
     fn show_view_modes(self: &Rc<Self>) {
@@ -2223,7 +2240,18 @@ impl Editor {
             self.view_modes.remove(&child);
         }
         let (modes, exclusive) = self.view_modes_of_selection();
-        self.view_bar.set_visible(!modes.is_empty());
+        while let Some(child) = self.view_tools.first_child() {
+            self.view_tools.remove(&child);
+        }
+        let tools = self.view_tools_of_selection();
+        if let Some(tools) = &tools {
+            if let Some(parent) = tools.parent().and_downcast::<gtk::Box>() {
+                parent.remove(tools);
+            }
+            self.view_tools.append(tools);
+        }
+        self.view_tools.set_visible(tools.is_some());
+        self.view_modes.set_visible(!modes.is_empty());
         if exclusive {
             self.view_modes.add_css_class("linked");
         } else {
@@ -3422,6 +3450,8 @@ impl Editor {
             changes_holder,
             preview_holder,
             preview_generation: Rc::new(Cell::new(0)),
+            svg: RefCell::new(None),
+            svg_generation: Rc::new(Cell::new(0)),
             conflict_bar,
             saved_hash: Cell::new(None),
             warned: Cell::new(false),
@@ -3801,13 +3831,24 @@ impl Editor {
             page.stack.set_visible_child_name("changes");
             self.refresh_changes(path, page);
         } else {
-            page.stack
-                .set_visible_child_name(if self.wysiwyg_active(path, page) {
-                    "preview"
-                } else {
-                    "edit"
-                });
+            self.show_face(path, page);
         }
+    }
+
+    /// The face a file shows when its changes are not: its source, its
+    /// rendered preview, or for an SVG the picture (made if it is not yet).
+    fn show_face(&self, path: &Path, page: &EditorPage) {
+        let name = match (self.wysiwyg_active(path, page), is_svg(path)) {
+            (true, true) => {
+                if page.svg.borrow().is_none() {
+                    self.show_svg(page);
+                }
+                "image"
+            }
+            (true, false) => "preview",
+            _ => "edit",
+        };
+        page.stack.set_visible_child_name(name);
     }
 
     /// Open (or focus) one file of a review: the branch's blob against the
@@ -4477,6 +4518,11 @@ impl Editor {
         if is_notebook(path) {
             return !page.raw_source.get();
         }
+        // An SVG is drawn by the helper, whatever its lines — a path's
+        // data is often one long line, which makes the file plain.
+        if is_svg(path) {
+            return !page.raw_source.get();
+        }
         is_markdown(path)
             && !page.raw_source.get()
             && !page.plain.get()
@@ -4494,9 +4540,10 @@ impl Editor {
             page.view.set_show_line_numbers(true);
             page.view.set_editable(page.foreign_env.is_none());
             // A notebook's face is drawn whatever its source's lines —
-            // its pictures are base64 on one line each — and anything
-            // else plain has no other face.
-            if !is_notebook(path) {
+            // its pictures are base64 on one line each — and an SVG's,
+            // whose path data is one; anything else plain has no other
+            // face.
+            if !is_notebook(path) && !is_svg(path) {
                 return;
             }
         } else {
@@ -4508,7 +4555,11 @@ impl Editor {
             // type work that a save would then have to refuse.
             page.view.set_editable(page.foreign_env.is_none());
         }
-        if self.wysiwyg_active(path, page) {
+        if is_svg(path) {
+            if self.wysiwyg_active(path, page) {
+                self.show_svg(page);
+            }
+        } else if self.wysiwyg_active(path, page) {
             // Full-quality preview: pulldown-cmark rendered into native
             // widgets, with copy affordances on code spans and blocks.
             let text = page
@@ -4587,13 +4638,75 @@ impl Editor {
             }
         }
         if !page.changes_view.get() {
-            page.stack
-                .set_visible_child_name(if self.wysiwyg_active(path, page) {
-                    "preview"
-                } else {
-                    "edit"
-                });
+            self.show_face(path, page);
         }
+    }
+
+    /// An SVG's preview: the buffer drawn by the confined helper — the
+    /// IDE's process never parses it — at the window's scale, and again at
+    /// a zoom's when one goes past it, sharp at any size.
+    fn show_svg(&self, page: &EditorPage) {
+        let svg = page
+            .buffer
+            .text(&page.buffer.start_iter(), &page.buffer.end_iter(), true)
+            .to_string();
+        // Out of the cell before the match: the arm that makes one writes
+        // it, and a borrow held through the match would still be there.
+        let existing = page.svg.borrow().clone();
+        let image = match existing {
+            Some(image) => image,
+            None => {
+                let image = crate::viewer::ZoomImage::new(
+                    &gtk::gdk::Paintable::new_empty(1, 1),
+                    (1.0, 1.0),
+                );
+                page.stack.add_named(&image.scroller, Some("image"));
+                *page.svg.borrow_mut() = Some(image.clone());
+                image
+            }
+        };
+        let family = crate::mermaid::interface_family();
+        let svg = std::sync::Arc::new(svg);
+        let latest = page.svg_generation.clone();
+        let weak = Rc::downgrade(&image);
+        let draw: Rc<dyn Fn(f64)> = Rc::new(move |scale: f64| {
+            let generation = latest.get() + 1;
+            latest.set(generation);
+            let (svg, family, latest, weak) =
+                (svg.clone(), family.clone(), latest.clone(), weak.clone());
+            glib::spawn_future_local(async move {
+                let drawn = crate::runtime::runtime()
+                    .spawn_blocking(move || crate::mermaid::svg_pixels(&svg, &family, scale as f32))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("the renderer stopped: {e}")));
+                let Some(image) = weak.upgrade() else { return };
+                if latest.get() != generation {
+                    return;
+                }
+                match drawn {
+                    Ok(pixels) if pixels.width > 0 && pixels.height > 0 => {
+                        let natural = (
+                            f64::from(pixels.logical_width),
+                            f64::from(pixels.logical_width) * f64::from(pixels.height)
+                                / f64::from(pixels.width),
+                        );
+                        let stride = pixels.width as usize * 4;
+                        let texture = gtk::gdk::MemoryTexture::new(
+                            pixels.width as i32,
+                            pixels.height as i32,
+                            gtk::gdk::MemoryFormat::R8g8b8a8Premultiplied,
+                            &glib::Bytes::from_owned(pixels.rgba),
+                            stride,
+                        );
+                        image.set_picture(&texture, natural, scale);
+                    }
+                    Ok(_) => image.show_error("it has no size"),
+                    Err(why) => image.show_error(&why),
+                }
+            });
+        });
+        image.set_redraw(draw.clone());
+        draw(f64::from(crate::mermaid::display_scale()));
     }
 
     /// The page's notebook session, made the first time it is asked for:
@@ -4802,7 +4915,15 @@ fn is_notebook(path: &Path) -> bool {
 /// Whether a file has a face besides its source: Markdown's preview, a
 /// notebook's cells.
 fn has_preview(path: &Path) -> bool {
-    is_markdown(path) || is_notebook(path)
+    is_markdown(path) || is_notebook(path) || is_svg(path)
+}
+
+/// An SVG file: XML to edit, a picture to preview (David, 2026-10-20: "I
+/// want SVG viewing").
+fn is_svg(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
 }
 
 fn is_markdown(path: &Path) -> bool {

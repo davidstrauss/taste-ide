@@ -1870,8 +1870,8 @@ itself. See the responsive ladder.)
   bar and then forgotten leaves the window at 960sp. **Bar furniture does
   not graft.** The fix is not to hide the button in a page — it is for
   the rung change to install it on whichever bar is hosting the family,
-  which is what `set_rung` does in both directions, composing it beside
-  the editor's pages menu rather than replacing it. The button is
+  which is what `set_rung` does in both directions, composing it after
+  the selected tab's controls at the editor's bar's end. The button is
   at the far right end of the bar at both rungs, and since the editor's
   bar says nothing about which environment is selected, its tooltip names
   the one a terminal would open in.
@@ -2012,8 +2012,8 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   scrollback.
 
   The pinned section is four icons wide and always on screen; the documents
-  and terminals scroll beside it, and the pages menu at the strip's end is
-  how a tab you cannot see is found.
+  and terminals scroll beside it, and a tab you cannot see is found by
+  scrolling the strip.
 
   The flank stays put: it keeps its column, with the backlog in it. An
   earlier version of this rung also collapsed it;

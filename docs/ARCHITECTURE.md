@@ -776,10 +776,11 @@ section a page is in, and are pinned again on arrival. Nothing else
 crosses: no pane hands over a header
 any more, because the console does not have one. The section the user was
 reading is remembered by name, so it survives a strip that also holds
-files and terminals. A menu of the strip's pages at its end
-(`pages_menu.rs` — GNOME Builder's frame menu, not `AdwTabOverview`) is
-how a tab that scrolled off is found: it opens over the strip and closes
-back into the same button, so nothing changes place to get there.
+files and terminals. A tab that scrolled off is found by scrolling the
+strip: the menu of its pages that once stood at its end is gone (David,
+2026-10-20: "Drop the whole 'down arrow' tab listing interface, both for
+documents and terminals"), and the end of the editor's bar carries the
+selected tab's own controls instead (below).
 
 The flank does not move: it keeps its column, so the geometry above the
 console is what it was — and it keeps the backlog, which is the
@@ -1010,9 +1011,14 @@ no-op at every other width.
   the service's OpenAPI or Swagger document, lists its operations, writes
   an example body from the request schema, formats JSON and shows the
   answer highlighted. The face, like a log's Follow, is chosen on the
-  editor's view bar — the toggles under the tab bar that switch a Markdown
-  file between Edit, Preview, and Changes (`Editor::show_view_modes`; the
-  PDF's own toolbar has the same shape, its zoom on the left). These tabs are *surfaces*, keyed outside the
+  editor's tab bar — the one-click toggles at its right end that switch a
+  Markdown file between Edit, Preview, and Changes, after the tab's own
+  tools: a PDF's or an image's zoom, GNOME's zoom menu (one button wearing
+  the zoom as a percentage, the fits as radio items and the steps under
+  them), and a PDF's Continuous and Single page (`Editor::show_view_modes`;
+  David, 2026-10-20: "pack these now quite lean controls into the right
+  side of the document tab bar area"). An SVG file is edited as XML and
+  previewed as a picture, drawn by the confined helper Mermaid uses. These tabs are *surfaces*, keyed outside the
   filesystem's namespace (`log:<env>/…`, `port:<env>/<port>`) the way
   review tabs are, so nothing that walks open files takes one for a file;
   they do stow and return with their environment's tab set. Their width
@@ -1311,7 +1317,7 @@ it, and carries its actions.
   supervisor's own ring and fed live by the same `Event::DevcontainerLog`
   the console used to append, so a build is watchable while it runs, and
   "View Log" (`Event::ShowDevcontainerLog`) opens exactly that page.
-  Following is the log page's own mode, a toggle on the editor's view bar.
+  Following is the log page's own mode, a toggle at the end of the editor's tab bar.
 
   - **New Terminal is on the tab bar**, at its end, right-anchored — the
     strip it adds a tab to is the thing it acts on, and the platform puts
@@ -1326,13 +1332,11 @@ it, and carries its actions.
     `Console::release_new_terminal_button` /
     `reclaim_new_terminal_button` hand it over and take it back, and
     `Editor::attach_end_action` composes it into a box at the bar's end
-    beside the pages menu rather than replacing it, so it is at the
+    after the selected tab's controls rather than replacing them, so it is at the
     far right end of the bar at both rungs — the same place, whichever
     bar it is. It creates a terminal in the *selected* environment at
     both rungs, and because the editor's bar says nothing about which
     environment that is, the tooltip names it ("New terminal in i-0007").
-    (The pane's own pages menu stays on this pane's bar; at the
-    consolidated rung the editor's own pages menu lists the one strip.)
   - **The Resources tab** is the selected environment's podman objects —
     container, image, volumes with their own guarded removal — its own
     tab rather than one page of a switcher. Debugging a broken container

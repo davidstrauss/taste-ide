@@ -569,19 +569,12 @@ impl Console {
             .css_classes(["flat"])
             .valign(gtk::Align::Center)
             .build();
-        // The same way to a scrolled-off tab the editor's strip has — a
-        // menu of the pages, as GNOME Builder's frames do
-        // (`crate::pages_menu`): an environment with two sections and
-        // a few terminals already scrolls this bar in a 700px pane. The
-        // + comes first and the menu keeps the far right end, the order
-        // the editor's bar has (its pencil, then its menu) — the two strips
-        // stack, and their ends should read the same way (David,
-        // 2026-09-06: "swap these"). In a box so the + can be handed to
-        // the editor's bar at the consolidated rung without taking the
-        // menu with it (`release_new_terminal_button`).
+        // In a box so the + can be handed to the editor's bar at the
+        // consolidated rung (`release_new_terminal_button`). No menu of the
+        // pages beside it any more (David, 2026-10-20: "Drop the whole 'down
+        // arrow' tab listing interface, both for documents and terminals").
         let end_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         end_actions.append(&new_tab_button);
-        end_actions.append(&crate::pages_menu::pages_menu(&tabs));
         tab_bar.set_end_action_widget(Some(&end_actions));
 
         // There is no header, no `⋮` menu and no Refresh here any more.

@@ -27,16 +27,6 @@ use gtk::glib;
 
 pub use taste_core::search::Query;
 
-thread_local! {
-    static CURRENT: RefCell<Query> = RefCell::new(Query::default());
-}
-
-/// The query as last published, for widgets built on demand (the pages
-/// menu) that have no subscription of their own.
-pub fn current_query() -> Query {
-    CURRENT.with(|q| q.borrow().clone())
-}
-
 /// A place the semantic index found for the query: the file (absolute),
 /// the chunk's lines, how alike, and the chunk's first line to show. What
 /// the tree and the editor are handed once the index has answered.
@@ -981,7 +971,6 @@ impl Search {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         *self.query.borrow_mut() = query.clone();
-        CURRENT.with(|q| *q.borrow_mut() = query.clone());
         self.status.borrow_mut().clear();
         self.panel_hits.borrow_mut().clear();
         self.sync_meaning_sensitivity();

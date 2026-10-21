@@ -56,7 +56,6 @@ mod mermaid;
 mod notebook;
 mod notify;
 mod orchestration;
-mod pages_menu;
 mod palette;
 mod portview;
 mod power;

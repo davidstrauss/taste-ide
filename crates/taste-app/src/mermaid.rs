@@ -282,6 +282,28 @@ struct Key {
     kind: Kind,
 }
 
+/// An SVG document's pixels, as the confined helper drew them: what an
+/// SVG file's preview shows (`viewer::ZoomImage`).
+pub struct SvgPixels {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// The width the document stands for, in logical pixels.
+    pub logical_width: f32,
+}
+
+/// Draw `svg` at `scale` in the confined helper, as a notebook's figure is
+/// — the IDE's process never parses it. `family` is the interface's
+/// ([`interface_family`], read on the main thread). Blocking.
+pub fn svg_pixels(svg: &str, family: &str, scale: f32) -> Result<SvgPixels, String> {
+    render(svg, false, family, scale, Kind::Svg).map(|raster| SvgPixels {
+        rgba: raster.rgba,
+        width: raster.width,
+        height: raster.height,
+        logical_width: raster.logical_width,
+    })
+}
+
 /// What the helper is asked to draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Kind {
@@ -336,7 +358,7 @@ fn keep(key: Key, drawn: Drawn) {
 }
 
 /// The window's interface font, by family: what the diagram is set in.
-fn interface_family() -> String {
+pub(crate) fn interface_family() -> String {
     gtk::Settings::default()
         .and_then(|settings| settings.gtk_font_name())
         .and_then(|name| gtk::pango::FontDescription::from_string(&name).family())
@@ -347,7 +369,7 @@ fn interface_family() -> String {
 /// The scale to draw at before the box is on a monitor: the largest any
 /// monitor has, so a diagram drawn off-screen — the preview builds its
 /// next rendering beside the one on screen — is sharp wherever it lands.
-fn display_scale() -> i32 {
+pub(crate) fn display_scale() -> i32 {
     gtk::gdk::Display::default()
         .map(|display| {
             let monitors = display.monitors();

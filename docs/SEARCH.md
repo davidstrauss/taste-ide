@@ -151,7 +151,6 @@ the same recipes made the box a slab on dark and nothing at all on light.
 | Commit messages | `ide_find` only | `taste_git::search_commits`: the last two thousand commits on HEAD | one revwalk, blocking pool — not listed in the window since a listing is one document's; a home in the branch menu is open |
 | Branches | filter (the branch menu) + count on the button | the branch list the tree already holds | trivial |
 | Backlog: issues and environments | filter, with a running rule while inner sources search | title, id, body, comments; plus counts of hits *inside* each environment's chat and terminals | strings trivial; inner hits arrive as those sources finish |
-| Editor tabs and terminal tabs | pages menu filters to matches | page titles | trivial |
 | Terminal scrollback | the terminal tab on screen's listing + count on the environment's row | every terminal in the strip — the user's shells, the agent's, the `ide_exec` mirrors — read through `vte_terminal_get_text_range_format` 400 rows per frame, matched line by line (`Console::attach_search`); a tab change re-lists from the scan already done | on the GTK thread by necessity, so chunked and cancellable (`Search::is_current`) |
 | Environment Build log | filter (the Logs row hides, or dims under the ghost) + badge; the log tab's listing in the editor | the environment's log buffer | trivial |
 | Environment Runtime output, Taste IDE log | filter + badge on the Logs row; the log tab's listing in the editor | the supervisor's runtime ring (`podman logs`, podman's events, agents' commands), the app log ring | trivial |
@@ -240,9 +239,6 @@ line is shown.
   in the editor, or the environment the panes are aimed at.
 - **Enter** activates the current result: opens the file at the line,
   scrolls the terminal or the transcript to the hit, selects the row.
-- A tab set is stepped by its pages menu, which under a query lists only
-  the matching pages (all of them, with matches marked, when the ghost is
-  on).
 
 ## Progress
 
@@ -289,10 +285,11 @@ screen, scoped) answer. The answer carries the caveat in its own `note`.
 
 ## Known limits
 
-- **Tabs cannot hide.** `AdwTabBar` has no per-tab visibility or styling,
-  so tab sets are filtered through their pages menu rather than in the
-  strip. Recorded as future work in the spike; the fix is a tab view that
-  can hide pages without moving them.
+- **Tabs are not filtered.** `AdwTabBar` has no per-tab visibility or
+  styling, and the pages menu that once listed the matching tabs is gone
+  (2026-10-20), so a query does not answer in the tab strips. Recorded as
+  future work in the spike; the fix is a tab view that can hide pages
+  without moving them.
 - **Log and port tabs are not searched.** They are surfaces, not files
   (`editor.rs` → `SurfaceEntry`), so the open-buffers source does not see
   them. The environment log is searched through the console's listing
