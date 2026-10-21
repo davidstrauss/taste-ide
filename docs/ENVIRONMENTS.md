@@ -1871,7 +1871,7 @@ itself. See the responsive ladder.)
   not graft.** The fix is not to hide the button in a page — it is for
   the rung change to install it on whichever bar is hosting the family,
   which is what `set_rung` does in both directions, composing it beside
-  the editor's display-mode menu rather than replacing it. The button is
+  the editor's pages menu rather than replacing it. The button is
   at the far right end of the bar at both rungs, and since the editor's
   bar says nothing about which environment is selected, its tooltip names
   the one a terminal would open in.

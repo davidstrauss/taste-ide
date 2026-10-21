@@ -236,7 +236,15 @@ pub enum Focused {
 
 /// The startup page's tab glyph and its key among the surfaces.
 const STARTUP_ICON: &str = "emblem-synchronizing-symbolic";
-/// A rendered document's two faces in the mode menu: the preview wears
+/// One view mode of the selected tab, as the view bar offers it.
+struct ViewMode {
+    label: String,
+    icon: &'static str,
+    current: bool,
+    act: Rc<dyn Fn()>,
+}
+
+/// A rendered document's two faces in the view bar: the preview wears
 /// what a Markdown file's Preview wears, and the Markdown itself the plain
 /// text glyph rather than Edit's pencil, since a document is read-only.
 const DOC_PREVIEW_ICON: &str = "x-office-document-symbolic";
@@ -625,8 +633,10 @@ pub struct Editor {
     /// hits, definitions and commits — the pane whose content they are in.
     results: Rc<crate::results::ResultsPanel>,
     tabs: adw::TabView,
-    mode_menu: gtk::MenuButton,
-    mode_popover: gtk::Popover,
+    /// The bar under the tab bar with the selected tab's view modes on its
+    /// right, the PDF's toolbar's shape ([`Editor::show_view_modes`]).
+    view_bar: gtk::Box,
+    view_modes: gtk::Box,
     /// The face the last rendered document was switched to: a response
     /// opened after the reader chose its Markdown opens on its Markdown.
     doc_source: Cell<bool>,
@@ -749,27 +759,24 @@ impl Editor {
             .css_classes(["editor-strip"])
             .build();
 
-        // One display-mode dropdown (canonical flat style, like the
-        // console's + button): Edit / Preview / Changes, icon + name each.
-        let mode_popover = gtk::Popover::new();
-        let mode_menu = gtk::MenuButton::builder()
-            .icon_name("document-edit-symbolic")
-            .tooltip_text("Display mode for this file")
-            .css_classes(["flat"])
-            .sensitive(false)
-            .popover(&mode_popover)
-            .build();
-        // Canonical placement: an action widget INSIDE the tab bar, so
-        // heights always match.
-        //
-        // A BOX rather than the menu itself, because at the consolidated
-        // rung this strip carries the console's tabs too, and the console's
-        // New Terminal button belongs on the bar that draws them
-        // (`attach_end_action`). Guests append after the mode menu, so
-        // "add one more tab" stays at the far right end of the bar at both
-        // rungs — the same place, whichever bar it is.
+        // The selected tab's view modes — a file's Edit, Preview, and
+        // Changes; a port's faces; a log's Follow — as toggles on the right
+        // of a bar under the tabs, the PDF toolbar's shape (David,
+        // 2026-10-20: "Can we move Markdown preview and other interfaces
+        // with a toggled view to this model?"). Hidden for a tab with none;
+        // a PDF's own bar is the same bar, with its zoom on the left.
+        let view_modes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let view_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        view_bar.add_css_class("toolbar");
+        view_bar.add_css_class("view-bar");
+        view_bar.append(&gtk::Box::builder().hexpand(true).build());
+        view_bar.append(&view_modes);
+        view_bar.set_visible(false);
+        // A BOX at the bar's end, because at the consolidated rung this
+        // strip carries the console's tabs too, and the console's New
+        // Terminal button belongs on the bar that draws them
+        // (`attach_end_action`), at the far right end at both rungs.
         let end_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        end_actions.append(&mode_menu);
         // The way to a tab that scrolled off, and GNOME Builder's: a menu
         // of the strip's pages, at the strip's end (`crate::pages_menu`).
         // At the consolidated rung this one strip carries the files, the
@@ -821,6 +828,7 @@ impl Editor {
         let results = crate::results::ResultsPanel::new();
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&top_row);
+        widget.append(&view_bar);
         widget.append(&stack);
         widget.append(&results.widget);
 
@@ -830,8 +838,8 @@ impl Editor {
             workspace,
             results: results.clone(),
             tabs,
-            mode_menu: mode_menu.clone(),
-            mode_popover: mode_popover.clone(),
+            view_bar,
+            view_modes,
             doc_source: Cell::new(false),
             pages: RefCell::new(HashMap::new()),
             restore_modes: RefCell::new(HashMap::new()),
@@ -873,13 +881,6 @@ impl Editor {
         forward_button.connect_clicked(move |_| {
             if let Some(editor) = weak.upgrade() {
                 editor.navigate(1);
-            }
-        });
-
-        let weak = Rc::downgrade(&editor);
-        mode_popover.connect_show(move |_| {
-            if let Some(editor) = weak.upgrade() {
-                editor.populate_mode_menu();
             }
         });
 
@@ -2078,238 +2079,189 @@ impl Editor {
         if let Some(query) = standing.filter(|q| !q.is_empty()) {
             self.answer_search(&query);
         }
-        // A surface's modes are its own: the port's face, the log's follow.
-        if let Some(surface) = self.selected_surface() {
-            self.mode_menu.set_icon_name(match &surface.kind {
-                SurfaceKind::Log(page, _) => {
-                    if page.is_following() {
-                        "go-bottom-symbolic"
-                    } else {
-                        crate::logview::LOG_ICON
-                    }
-                }
-                SurfaceKind::Task(page, _) => {
-                    if page.is_following() {
-                        "go-bottom-symbolic"
-                    } else {
-                        crate::tasks::TASK_ICON
-                    }
-                }
-                // The startup page's toggle is its log's: the one on
-                // screen under the checklist.
-                SurfaceKind::Startup(page) => {
-                    if page.current_log().is_following() {
-                        "go-bottom-symbolic"
-                    } else {
-                        crate::logview::LOG_ICON
-                    }
-                }
-                SurfaceKind::Port(page) => page.face().icon(),
-                // A rendered document names its face, as a Markdown
-                // file's toggle does.
-                SurfaceKind::Doc(page, _) if page.has_faces() => {
-                    if page.showing_source() {
-                        DOC_SOURCE_ICON
-                    } else {
-                        DOC_PREVIEW_ICON
-                    }
-                }
-                SurfaceKind::Doc(page, _) => page.icon,
-                SurfaceKind::View(page) => page.icon(),
-            });
-            // A document has no modes of its own unless it is rendered,
-            // and a viewer has none.
-            self.mode_menu.set_sensitive(match &surface.kind {
-                SurfaceKind::Doc(page, _) => page.has_faces(),
-                SurfaceKind::View(_) => false,
-                _ => true,
-            });
-            self.publish_state();
-            return;
-        }
-        let selected = self.selected();
-        // The dropdown's own icon names the current mode.
-        let icon = selected
-            .as_ref()
-            .map(|(path, page)| {
-                if page.changes_view.get() {
-                    "view-dual-symbolic"
-                } else if has_preview(path) && !page.raw_source.get() {
-                    "x-office-document-symbolic"
-                } else {
-                    "document-edit-symbolic"
-                }
-            })
-            .unwrap_or("document-edit-symbolic");
-        self.mode_menu.set_icon_name(icon);
-        // Disabled (never hidden) when nothing is selected.
-        self.mode_menu.set_sensitive(selected.is_some());
+        self.show_view_modes();
         self.publish_state();
     }
 
-    /// The display-mode menu: Edit / Preview / Changes, each icon + name,
-    /// checkmark on the active one. Preview stays listed (disabled) for
-    /// non-markdown files.
-    fn populate_mode_menu(self: &Rc<Self>) {
+    /// The selected tab's view modes, and whether they exclude one another
+    /// (a file's Edit, Preview, and Changes; a port's two faces; a rendered
+    /// document's two) or are one switch (a log's Follow). Preview is a
+    /// Markdown file's only; a viewer and a plain document have none.
+    fn view_modes_of_selection(self: &Rc<Self>) -> (Vec<ViewMode>, bool) {
+        let mode = |label: &str, icon: &'static str, current: bool, act: Rc<dyn Fn()>| ViewMode {
+            label: label.to_string(),
+            icon,
+            current,
+            act,
+        };
         if let Some(surface) = self.selected_surface() {
-            self.populate_surface_menu(&surface);
-            return;
+            return match &surface.kind {
+                SurfaceKind::Port(page) => (
+                    [
+                        crate::portview::PortFace::Browser,
+                        crate::portview::PortFace::Rest,
+                    ]
+                    .into_iter()
+                    .map(|face| {
+                        let page = page.clone();
+                        mode(
+                            face.label(),
+                            face.icon(),
+                            page.face() == face,
+                            Rc::new(move || page.set_face(face)),
+                        )
+                    })
+                    .collect(),
+                    true,
+                ),
+                SurfaceKind::Log(page, _) | SurfaceKind::Task(page, _) => {
+                    let following = page.is_following();
+                    let page = page.clone();
+                    (
+                        vec![mode(
+                            "Follow",
+                            "go-bottom-symbolic",
+                            following,
+                            Rc::new(move || page.set_follow(!page.is_following())),
+                        )],
+                        false,
+                    )
+                }
+                // The startup page's switch is its log's: the one on screen
+                // under the checklist.
+                SurfaceKind::Startup(startup) => {
+                    let log = startup.current_log();
+                    (
+                        vec![mode(
+                            "Follow",
+                            "go-bottom-symbolic",
+                            log.is_following(),
+                            Rc::new(move || log.set_follow(!log.is_following())),
+                        )],
+                        false,
+                    )
+                }
+                SurfaceKind::Doc(page, _) if page.has_faces() => {
+                    let source = page.showing_source();
+                    (
+                        [
+                            ("Preview", DOC_PREVIEW_ICON, false),
+                            ("Markdown", DOC_SOURCE_ICON, true),
+                        ]
+                        .into_iter()
+                        .map(|(label, icon, face)| {
+                            let (editor, page) = (Rc::downgrade(self), page.clone());
+                            mode(
+                                label,
+                                icon,
+                                source == face,
+                                Rc::new(move || {
+                                    page.show_source(face);
+                                    if let Some(editor) = editor.upgrade() {
+                                        editor.doc_source.set(face);
+                                    }
+                                }),
+                            )
+                        })
+                        .collect(),
+                        true,
+                    )
+                }
+                SurfaceKind::Doc(..) | SurfaceKind::View(_) => (Vec::new(), true),
+            };
         }
         let Some((path, page)) = self.selected() else {
-            return;
+            return (Vec::new(), true);
         };
         let is_md = has_preview(&path);
         let changes = page.changes_view.get();
         let preview = is_md && !page.raw_source.get() && !changes;
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["navigation-sidebar"])
-            .build();
-        for (label, icon, mode, enabled, current) in [
-            (
-                "Edit",
-                "document-edit-symbolic",
-                "edit",
-                true,
-                !changes && !preview,
-            ),
-            (
-                "Preview",
-                "x-office-document-symbolic",
-                "preview",
-                is_md,
-                preview,
-            ),
-            ("Changes", "view-dual-symbolic", "changes", true, changes),
-        ] {
-            let row = adw::ActionRow::builder()
-                .title(label)
-                .activatable(enabled)
-                .sensitive(enabled)
-                .build();
-            row.add_prefix(&gtk::Image::from_icon_name(icon));
-            if current {
-                row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
-            }
+        let file_mode = |name: &'static str| -> Rc<dyn Fn()> {
             let weak = Rc::downgrade(self);
-            let mode: &'static str = mode;
-            row.connect_activated(move |_| {
+            Rc::new(move || {
                 let Some(editor) = weak.upgrade() else { return };
-                editor.mode_popover.popdown();
                 let Some((path, page)) = editor.selected() else {
                     return;
                 };
-                match mode {
-                    "edit" => {
-                        page.raw_source.set(true);
+                match name {
+                    "edit" | "preview" => {
+                        page.raw_source.set(name == "edit");
                         editor.set_changes_view(&path, &page, false);
                         editor.refresh_markdown_mode(&path, &page);
                     }
-                    "preview" => {
-                        page.raw_source.set(false);
-                        editor.set_changes_view(&path, &page, false);
-                        editor.refresh_markdown_mode(&path, &page);
-                    }
-                    "changes" => editor.set_changes_view(&path, &page, true),
-                    _ => {}
+                    _ => editor.set_changes_view(&path, &page, true),
                 }
-                editor.sync_toggle_to_selection();
-                // The mode is part of what a restart puts back.
-                editor.publish_state();
-            });
-            list.append(&row);
+            })
+        };
+        let mut modes = vec![mode(
+            "Edit",
+            "document-edit-symbolic",
+            !changes && !preview,
+            file_mode("edit"),
+        )];
+        if is_md {
+            modes.push(mode(
+                "Preview",
+                "x-office-document-symbolic",
+                preview,
+                file_mode("preview"),
+            ));
         }
-        list.set_width_request(200);
-        self.mode_popover.set_child(Some(&list));
+        modes.push(mode(
+            "Changes",
+            "view-dual-symbolic",
+            changes,
+            file_mode("changes"),
+        ));
+        (modes, true)
     }
 
-    /// The display-mode menu for a surface. The same menu, the same shape
-    /// (icon, name, checkmark on the current one), different modes: a
-    /// port's two faces, a log's follow.
-    fn populate_surface_menu(self: &Rc<Self>, surface: &Rc<SurfaceEntry>) {
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["navigation-sidebar"])
-            .build();
-        let mut rows: Vec<(String, &'static str, bool, Box<dyn Fn()>)> = Vec::new();
-        match &surface.kind {
-            SurfaceKind::Port(page) => {
-                for face in [
-                    crate::portview::PortFace::Browser,
-                    crate::portview::PortFace::Rest,
-                ] {
-                    let page = page.clone();
-                    rows.push((
-                        face.label().to_string(),
-                        face.icon(),
-                        page.face() == face,
-                        Box::new(move || page.set_face(face)),
-                    ));
-                }
-            }
-            SurfaceKind::Log(page, _) | SurfaceKind::Task(page, _) => {
-                let following = page.is_following();
-                let page = page.clone();
-                rows.push((
-                    "Follow".to_string(),
-                    "go-bottom-symbolic",
-                    following,
-                    Box::new(move || page.set_follow(!following)),
-                ));
-            }
-            SurfaceKind::Startup(startup) => {
-                let log = startup.current_log();
-                let following = log.is_following();
-                rows.push((
-                    "Follow".to_string(),
-                    "go-bottom-symbolic",
-                    following,
-                    Box::new(move || log.set_follow(!following)),
-                ));
-            }
-            SurfaceKind::Doc(page, _) if page.has_faces() => {
-                let source = page.showing_source();
-                for (label, icon, face) in [
-                    ("Preview", DOC_PREVIEW_ICON, false),
-                    ("Markdown", DOC_SOURCE_ICON, true),
-                ] {
-                    let editor = Rc::downgrade(self);
-                    let page = page.clone();
-                    rows.push((
-                        label.to_string(),
-                        icon,
-                        source == face,
-                        Box::new(move || {
-                            page.show_source(face);
-                            if let Some(editor) = editor.upgrade() {
-                                editor.doc_source.set(face);
-                            }
-                        }),
-                    ));
-                }
-            }
-            SurfaceKind::Doc(..) | SurfaceKind::View(_) => {}
+    /// The view bar, for the selected tab: its modes as toggles — linked
+    /// and one at a time when they exclude one another — or no bar.
+    fn show_view_modes(self: &Rc<Self>) {
+        while let Some(child) = self.view_modes.first_child() {
+            self.view_modes.remove(&child);
         }
-        for (label, icon, current, act) in rows {
-            let row = adw::ActionRow::builder()
-                .title(&label)
-                .activatable(true)
+        let (modes, exclusive) = self.view_modes_of_selection();
+        self.view_bar.set_visible(!modes.is_empty());
+        if exclusive {
+            self.view_modes.add_css_class("linked");
+        } else {
+            self.view_modes.remove_css_class("linked");
+        }
+        let mut first: Option<gtk::ToggleButton> = None;
+        for mode in modes {
+            let button = gtk::ToggleButton::builder()
+                .icon_name(mode.icon)
+                .tooltip_text(&mode.label)
                 .build();
-            row.add_prefix(&gtk::Image::from_icon_name(icon));
-            if current {
-                row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+            if exclusive {
+                match &first {
+                    Some(first) => button.set_group(Some(first)),
+                    None => first = Some(button.clone()),
+                }
             }
-            let weak = Rc::downgrade(self);
-            row.connect_activated(move |_| {
-                let Some(editor) = weak.upgrade() else { return };
-                editor.mode_popover.popdown();
+            button.set_active(mode.current);
+            let (weak, act) = (Rc::downgrade(self), mode.act.clone());
+            button.connect_toggled(move |button| {
+                // One of a group turning off as another turns on is not a
+                // choice.
+                if exclusive && !button.is_active() {
+                    return;
+                }
                 act();
-                editor.sync_toggle_to_selection();
+                // Rebuilt after this signal, not inside it: the button
+                // pressed is one of the ones it removes. The mode is part
+                // of what a restart puts back.
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.sync_toggle_to_selection();
+                    }
+                });
             });
-            list.append(&row);
+            self.view_modes.append(&button);
         }
-        list.set_width_request(200);
-        self.mode_popover.set_child(Some(&list));
     }
 
     fn surface_by_tab(&self, tab: &adw::TabPage) -> Option<(PathBuf, Rc<SurfaceEntry>)> {

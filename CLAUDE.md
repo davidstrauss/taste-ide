@@ -156,7 +156,7 @@ effort slider — posed from what the pinned adapter advertises, which a
 probe otherwise never has, since that half of the shade needs a session);
 `TASTE_PROBE_DOC` (`edit`, `command`, `prompt`, `changes` — a submodule's change as the Dirty list opens it, `submodule_diff.rs` —, `response` — an
 answer's rendered face —, and `source` — the same answer on its Markdown,
-the face the editor's mode menu switches it to) opens that step of the
+the face the editor's view bar switches it to) opens that step of the
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_PREVIEW=README.md` (a markdown file, relative
 to where the probe was started; an image, a PDF, or audio or video opens in

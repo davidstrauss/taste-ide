@@ -1009,9 +1009,10 @@ no-op at every other width.
   client that finds
   the service's OpenAPI or Swagger document, lists its operations, writes
   an example body from the request schema, formats JSON and shows the
-  answer highlighted. The face, like a log's Follow, is chosen from the
-  editor's display-mode menu — the same menu that switches a Markdown file
-  between Edit and Preview. These tabs are *surfaces*, keyed outside the
+  answer highlighted. The face, like a log's Follow, is chosen on the
+  editor's view bar — the toggles under the tab bar that switch a Markdown
+  file between Edit, Preview, and Changes (`Editor::show_view_modes`; the
+  PDF's own toolbar has the same shape, its zoom on the left). These tabs are *surfaces*, keyed outside the
   filesystem's namespace (`log:<env>/…`, `port:<env>/<port>`) the way
   review tabs are, so nothing that walks open files takes one for a file;
   they do stow and return with their environment's tab set. Their width
@@ -1310,7 +1311,7 @@ it, and carries its actions.
   supervisor's own ring and fed live by the same `Event::DevcontainerLog`
   the console used to append, so a build is watchable while it runs, and
   "View Log" (`Event::ShowDevcontainerLog`) opens exactly that page.
-  Following is the log page's own mode, in the editor's display-mode menu.
+  Following is the log page's own mode, a toggle on the editor's view bar.
 
   - **New Terminal is on the tab bar**, at its end, right-anchored — the
     strip it adds a tab to is the thing it acts on, and the platform puts
@@ -1324,8 +1325,8 @@ it, and carries its actions.
     change to install it on whichever bar is hosting the family.
     `Console::release_new_terminal_button` /
     `reclaim_new_terminal_button` hand it over and take it back, and
-    `Editor::attach_end_action` composes it into a box beside the file's
-    display-mode menu rather than replacing that menu, so it is at the
+    `Editor::attach_end_action` composes it into a box at the bar's end
+    beside the pages menu rather than replacing it, so it is at the
     far right end of the bar at both rungs — the same place, whichever
     bar it is. It creates a terminal in the *selected* environment at
     both rungs, and because the editor's bar says nothing about which
