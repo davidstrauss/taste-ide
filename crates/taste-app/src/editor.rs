@@ -2216,6 +2216,43 @@ impl Editor {
         (modes, true)
     }
 
+    /// The keyboard to the selected tab's document, as its face is now —
+    /// after a control on the tab bar was used (David, 2026-10-20: "After I
+    /// select single/continuous or a zoom level (or anything else in that
+    /// bar), focus should return to the doc").
+    fn focus_document(&self) {
+        if let Some(surface) = self.selected_surface() {
+            match &surface.kind {
+                SurfaceKind::View(page) => page.focus(),
+                _ => {
+                    surface
+                        .tab
+                        .child()
+                        .child_focus(gtk::DirectionType::TabForward);
+                }
+            }
+            return;
+        }
+        let Some((_, page)) = self.selected() else {
+            return;
+        };
+        match page.stack.visible_child_name().as_deref() {
+            Some("edit") => {
+                page.view.grab_focus();
+            }
+            Some("image") => {
+                if let Some(image) = page.svg.borrow().as_ref() {
+                    image.scroller.grab_focus();
+                }
+            }
+            _ => {
+                if let Some(face) = page.stack.visible_child() {
+                    face.child_focus(gtk::DirectionType::TabForward);
+                }
+            }
+        }
+    }
+
     /// The selected tab's own controls for the bar's left: a viewer's zoom
     /// (a PDF's with its layout), or an SVG's preview's.
     fn view_tools_of_selection(&self) -> Option<gtk::Widget> {
@@ -2259,9 +2296,12 @@ impl Editor {
         }
         let mut first: Option<gtk::ToggleButton> = None;
         for mode in modes {
+            // A click does not take the keyboard from the document; the
+            // document is given it again once the mode has changed it.
             let button = gtk::ToggleButton::builder()
                 .icon_name(mode.icon)
                 .tooltip_text(&mode.label)
+                .focus_on_click(false)
                 .build();
             if exclusive {
                 match &first {
@@ -2285,6 +2325,7 @@ impl Editor {
                 glib::idle_add_local_once(move || {
                     if let Some(editor) = weak.upgrade() {
                         editor.sync_toggle_to_selection();
+                        editor.focus_document();
                     }
                 });
             });
@@ -2713,6 +2754,76 @@ impl Editor {
         let weak = Rc::downgrade(self);
         glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
             let Some(editor) = weak.upgrade() else { return };
+            // `TASTE_PROBE_FOCUS=1`: a control on the tab bar used — the
+            // zoom menu opened and closed where there is one, else another
+            // mode's toggle — and where the keyboard is after, printed.
+            if std::env::var("TASTE_PROBE_FOCUS").is_ok() {
+                let weak = Rc::downgrade(&editor);
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                    let Some(editor) = weak.upgrade() else { return };
+                    let say = |editor: &Rc<Editor>, after: &str| {
+                        let focus = editor.widget.root().and_then(|root| root.focus());
+                        println!(
+                            "focus probe: after {after}, focus on {} (in the tab: {})",
+                            focus
+                                .as_ref()
+                                .map(|w| w.type_().name().to_string())
+                                .unwrap_or_else(|| "nothing".into()),
+                            focus.is_some_and(|w| w.is_ancestor(&editor.tabs))
+                        );
+                    };
+                    let mut walk = editor.view_tools.first_child();
+                    let mut menu: Option<gtk::MenuButton> = None;
+                    while let Some(widget) = walk {
+                        if let Some(found) = widget.downcast_ref::<gtk::MenuButton>() {
+                            menu = Some(found.clone());
+                            break;
+                        }
+                        walk = widget
+                            .first_child()
+                            .or_else(|| widget.next_sibling())
+                            .or_else(|| widget.parent().and_then(|p| p.next_sibling()));
+                    }
+                    if let Some(menu) = menu {
+                        menu.popup();
+                        let weak = Rc::downgrade(&editor);
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(500),
+                            move || {
+                                menu.popdown();
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(500),
+                                    move || {
+                                        if let Some(editor) = weak.upgrade() {
+                                            say(&editor, "the zoom menu");
+                                        }
+                                    },
+                                );
+                            },
+                        );
+                        return;
+                    }
+                    let mut toggle = editor.view_modes.first_child();
+                    while let Some(widget) = toggle {
+                        if let Some(button) = widget.downcast_ref::<gtk::ToggleButton>() {
+                            if !button.is_active() {
+                                button.set_active(true);
+                                break;
+                            }
+                        }
+                        toggle = widget.next_sibling();
+                    }
+                    let weak = Rc::downgrade(&editor);
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(600),
+                        move || {
+                            if let Some(editor) = weak.upgrade() {
+                                say(&editor, "a mode's toggle");
+                            }
+                        },
+                    );
+                });
+            }
             let Some(page) = editor.pages.borrow().get(&path).cloned() else {
                 return;
             };
@@ -2976,6 +3087,14 @@ impl Editor {
             // Its text answers the universal find, and OCR for the pages
             // without any runs where the file is.
             page.set_source(files.clone(), path.clone());
+            {
+                let weak = Rc::downgrade(&editor);
+                page.connect_tools_closed(Rc::new(move || {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.focus_document();
+                    }
+                }));
+            }
             {
                 let weak = Rc::downgrade(&editor);
                 page.set_on_text(Rc::new(move || {
@@ -4661,6 +4780,13 @@ impl Editor {
                     (1.0, 1.0),
                 );
                 page.stack.add_named(&image.scroller, Some("image"));
+                // Its zoom menu closing gives the picture the keyboard back.
+                let scroller = image.scroller.downgrade();
+                image.connect_zoom_closed(Rc::new(move || {
+                    if let Some(scroller) = scroller.upgrade() {
+                        scroller.grab_focus();
+                    }
+                }));
                 *page.svg.borrow_mut() = Some(image.clone());
                 image
             }

@@ -231,6 +231,10 @@ folder and takes the focus out of the tree, printing the lit row against
 the file in front at each step — the highlight maps to what is open;
 `TASTE_PROBE_NAME_PROMPT=1` opens the New file dialog and prints where
 the keyboard is;
+`TASTE_PROBE_FOCUS=1` (with `TASTE_PROBE_PREVIEW`) uses a control at the
+tab bar's end — the zoom menu opened and closed where the tab has one,
+else another mode's toggle — and prints where the keyboard is after,
+which should be the document;
 `TASTE_PROBE_BRANCHES=1` opens the branch switcher once the branches are
 read and shoots it as `window.branch-menu` (a popover, its own surface;
 give the fixture more branches than fit, since the create row under the

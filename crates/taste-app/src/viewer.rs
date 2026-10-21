@@ -637,6 +637,19 @@ impl ViewerPage {
     pub fn focus(&self) {
         if let Some(view) = self.pdf_view.borrow().as_ref() {
             view.grab_focus();
+        } else if let Some(image) = self.image.borrow().as_ref() {
+            image.scroller.grab_focus();
+        }
+    }
+
+    /// `done` when a zoom menu of this tab's closes — the document takes
+    /// the keyboard back. Its tools are made with the page, before this.
+    pub fn connect_tools_closed(&self, done: Rc<dyn Fn()>) {
+        if let Some(tools) = self.pdf_tools.borrow().as_ref() {
+            tools.zoom.connect_closed(done.clone());
+        }
+        if let Some(image) = self.image.borrow().as_ref() {
+            image.connect_zoom_closed(done);
         }
     }
 
@@ -1580,10 +1593,13 @@ impl ZoomMenu {
         let face = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         face.append(&label);
         face.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+        // A click opens the menu without taking the keyboard from the
+        // document; the menu gives it back when it closes ([`Self::connect_closed`]).
         let button = gtk::MenuButton::builder()
             .child(&face)
             .menu_model(&menu)
             .tooltip_text("Zoom")
+            .focus_on_click(false)
             .css_classes(["flat"])
             .build();
         let actions = gtk::gio::SimpleActionGroup::new();
@@ -1614,6 +1630,20 @@ impl ZoomMenu {
         actions.add_action(&to);
         button.insert_action_group("zoom", Some(&actions));
         Self { button, label, fit }
+    }
+
+    /// `done` when the menu closes, a zoom chosen or not: what gives the
+    /// keyboard back to the document (David, 2026-10-20: "After I select
+    /// single/continuous or a zoom level … focus should return to the
+    /// doc").
+    pub(crate) fn connect_closed(&self, done: Rc<dyn Fn()>) {
+        if let Some(popover) = self.button.popover() {
+            popover.connect_closed(move |_| {
+                let done = done.clone();
+                // After the popover has given the focus back to its button.
+                glib::idle_add_local_once(move || done());
+            });
+        }
     }
 
     /// What is shown: the zoom in force, and the fit that set it if one did.
@@ -1678,6 +1708,7 @@ impl ZoomImage {
             .child(&center)
             .vexpand(true)
             .hexpand(true)
+            .focusable(true)
             .build();
         let size_label = gtk::Label::builder()
             .css_classes(["caption", "dim-label"])
@@ -1765,6 +1796,11 @@ impl ZoomImage {
         self.natural.set(natural);
         self.drawn_at.set(drawn_at);
         self.apply();
+    }
+
+    /// `done` when its zoom menu closes: the keyboard back to the picture.
+    pub(crate) fn connect_zoom_closed(&self, done: Rc<dyn Fn()>) {
+        self.menu.connect_closed(done);
     }
 
     /// Why the picture could not be drawn, where its size is said.
@@ -1932,11 +1968,13 @@ impl PdfTools {
         let continuous = gtk::ToggleButton::builder()
             .icon_name("view-continuous-symbolic")
             .tooltip_text("Continuous")
+            .focus_on_click(false)
             .active(!single)
             .build();
         let single_button = gtk::ToggleButton::builder()
             .icon_name("view-paged-symbolic")
             .tooltip_text("Single page")
+            .focus_on_click(false)
             .group(&continuous)
             .active(single)
             .build();
