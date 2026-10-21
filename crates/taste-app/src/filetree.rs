@@ -638,6 +638,11 @@ pub struct FileTree {
     /// its folder was just expanded and the rows land asynchronously.
     /// Retried as they arrive; cleared by the next focus change.
     pending_select: RefCell<Option<PathBuf>>,
+    /// A selection that is not the file in front, on purpose: the New
+    /// file… row while its name is asked for.
+    selection_held: Cell<bool>,
+    /// A check of the selection against the file in front is queued.
+    selection_check_queued: Cell<bool>,
     on_open_log: RefCell<Option<OpenLogCallback>>,
     on_open_port: RefCell<Option<OpenPortCallback>>,
     /// A click on a file that has hits and is already on screen: step to
@@ -1970,6 +1975,8 @@ impl FileTree {
             log_hits: RefCell::new(Vec::new()),
             files_hits: Cell::new(0),
             pending_select: RefCell::new(None),
+            selection_held: Cell::new(false),
+            selection_check_queued: Cell::new(false),
             on_open_log: RefCell::new(None),
             on_open_port: RefCell::new(None),
             on_step_file: RefCell::new(None),
@@ -2332,6 +2339,24 @@ impl FileTree {
                     tree.set_showing(showing);
                 }
             });
+        }
+
+        // Focus leaving the tree takes the highlight back to the file in
+        // front: a click on a folder's arrow selects its row without
+        // activating it, so nothing gave it back, and the folder stayed
+        // lit beside the PDF being read (David, 2026-10-20: "The wrong
+        // thing is selected in files despite focus being on the PDF").
+        // Inside the tree a lit row is where the keyboard is, and stays.
+        {
+            let focus = gtk::EventControllerFocus::new();
+            let weak = Rc::downgrade(&tree);
+            focus.connect_leave(move |_| {
+                let Some(tree) = weak.upgrade() else { return };
+                if tree.pending_select.borrow().is_none() && !tree.selection_held.get() {
+                    tree.keep_selection_on_front();
+                }
+            });
+            tree.list_holder.add_controller(focus);
         }
 
         // The panel does not aim the panes itself: the window owns that
@@ -3867,6 +3892,22 @@ impl FileTree {
             })
         });
         selection.set_selected(at.unwrap_or(gtk::INVALID_LIST_POSITION));
+    }
+
+    /// [`Self::restore_tree_selection`], when the lit row is not the file
+    /// in front already.
+    fn keep_selection_on_front(&self) {
+        let Some((_, selection, _)) = self.tree_selection() else {
+            return;
+        };
+        let lit = selection
+            .selected_item()
+            .and_downcast::<gtk::TreeListRow>()
+            .and_then(|row| row.item().and_downcast::<BoxedAnyObject>())
+            .map(|item| item.borrow::<FileNode>().path.clone());
+        if lit.is_some() && lit != *self.file_in_front.borrow() {
+            self.restore_tree_selection();
+        }
     }
 
     fn clear_tree_selection(&self) {
@@ -8334,6 +8375,20 @@ impl FileTree {
                             tree.select_file(path);
                         }
                     });
+                } else if !tree.selection_check_queued.replace(true) {
+                    // Rows spliced in or out above the lit one leave the
+                    // selection at its old position, on whatever row is
+                    // there now: a folder lit while a PDF was in front
+                    // (David, 2026-10-20: "The wrong thing is selected in
+                    // files"). Once a burst of splices is over, the lit
+                    // row is the file in front again, or none is.
+                    let tree = tree.clone();
+                    glib::idle_add_local_once(move || {
+                        tree.selection_check_queued.set(false);
+                        if tree.pending_select.borrow().is_none() && !tree.selection_held.get() {
+                            tree.keep_selection_on_front();
+                        }
+                    });
                 }
             });
         }
@@ -8453,11 +8508,13 @@ impl FileTree {
                 // the create is refused or fails — and only once it exists
                 // does the new file take it, or the row stayed lit over a
                 // failure (review, 2026-10-20).
+                tree.selection_held.set(true);
                 tree.clone().prompt_name_or(
                     title,
                     "Create",
                     "",
                     move |tree, name| {
+                        tree.selection_held.set(false);
                         let path = dir.join(name);
                         tree.create_file_then(&path.clone(), folder, move |tree, made| {
                             if made && !folder {
@@ -8467,7 +8524,10 @@ impl FileTree {
                             }
                         });
                     },
-                    |tree| tree.restore_tree_selection(),
+                    |tree| {
+                        tree.selection_held.set(false);
+                        tree.restore_tree_selection();
+                    },
                 );
             } else if node.is_dir || node.ghost {
                 // A ghost folder opens rather than appears: what it is for
@@ -9124,6 +9184,93 @@ impl FileTree {
                                 format!("{} (in the name field: {in_entry})", w.type_().name())
                             })
                             .unwrap_or_else(|| "nothing".to_string())
+                    );
+                });
+            });
+        }
+        // `TASTE_PROBE_SELECTION=1`: README.md in front, then the first
+        // folder above it opened — rows spliced in over the lit one — and
+        // the lit row against the file in front, before and after.
+        static SELECTION: std::sync::Once = std::sync::Once::new();
+        if std::env::var("TASTE_PROBE_SELECTION").is_ok() && !SELECTION.is_completed() {
+            SELECTION.call_once(|| {});
+            let tree = self.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                let readme = tree.view_root().join("README.md");
+                tree.select_for_editor(crate::editor::Focused::File(readme));
+                let lit = |tree: &Rc<FileTree>| {
+                    tree.tree_selection()
+                        .and_then(|(_, selection, _)| selection.selected_item())
+                        .and_downcast::<gtk::TreeListRow>()
+                        .and_then(|row| row.item().and_downcast::<BoxedAnyObject>())
+                        .map(|item| item.borrow::<FileNode>().path.display().to_string())
+                };
+                println!("selection probe: before, lit {:?}", lit(&tree));
+                let folder = tree.tree_selection().and_then(|(_, _, model)| {
+                    (0..model.n_items())
+                        .filter_map(|i| model.row(i))
+                        .find(|row| {
+                            row.item()
+                                .and_downcast::<BoxedAnyObject>()
+                                .is_some_and(|item| item.borrow::<FileNode>().is_dir)
+                        })
+                });
+                if let Some(folder) = folder {
+                    folder.set_expanded(true);
+                }
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                    println!(
+                        "selection probe: after a folder above opened, lit {:?}, in front {:?}",
+                        lit(&tree),
+                        tree.file_in_front
+                            .borrow()
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                    );
+                    // Files made above it, and the tree brought current in
+                    // place, as a build writing beside the file does.
+                    let root = tree.view_root();
+                    for name in ["AA.md", "AB.md", "AC.md"] {
+                        let _ = std::fs::write(root.join(name), "x");
+                    }
+                    tree.refresh_tree();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(2500),
+                        move || {
+                            println!(
+                            "selection probe: after files landed above it, lit {:?}, in front {:?}",
+                            lit(&tree),
+                            tree.file_in_front.borrow().as_ref().map(|p| p.display().to_string())
+                        );
+                            // A folder lit in the list, as a click on its
+                            // arrow leaves it, and the focus taken elsewhere.
+                            if let Some((list, selection, model)) = tree.tree_selection() {
+                                list.grab_focus();
+                                if let Some(at) = (0..model.n_items()).find(|&i| {
+                                    model
+                                        .row(i)
+                                        .and_then(|row| row.item().and_downcast::<BoxedAnyObject>())
+                                        .is_some_and(|item| item.borrow::<FileNode>().is_dir)
+                                }) {
+                                    selection.set_selected(at);
+                                }
+                            }
+                            println!("selection probe: a folder lit, lit {:?}", lit(&tree));
+                            tree.sync_button.grab_focus();
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(500),
+                                move || {
+                                    println!(
+                                "selection probe: focus left the tree, lit {:?}, in front {:?}",
+                                lit(&tree),
+                                tree.file_in_front
+                                    .borrow()
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                            );
+                                },
+                            );
+                        },
                     );
                 });
             });

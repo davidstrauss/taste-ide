@@ -225,6 +225,12 @@ and All rows start their icon and text, which stand in one column;
 `TASTE_PROBE_TREE_END=1` scrolls the file tree to the end of its listing,
 where every folder's New file… and New folder… rows are (pair it with
 `TASTE_PROBE_VIEW=hero`: a watched environment is read-only and has none);
+`TASTE_PROBE_SELECTION=1` puts README.md in front, opens a folder above
+it, makes files above it and refreshes the tree in place, then lights a
+folder and takes the focus out of the tree, printing the lit row against
+the file in front at each step — the highlight maps to what is open;
+`TASTE_PROBE_NAME_PROMPT=1` opens the New file dialog and prints where
+the keyboard is;
 `TASTE_PROBE_BRANCHES=1` opens the branch switcher once the branches are
 read and shoots it as `window.branch-menu` (a popover, its own surface;
 give the fixture more branches than fit, since the create row under the
