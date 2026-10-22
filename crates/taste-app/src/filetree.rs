@@ -49,6 +49,102 @@ fn subtree_hits(outline: &[crate::tasks::OutlineEntry], at: usize, hits: &[usize
         .sum()
 }
 
+/// The last runs under a heading — every task beneath it, the heading's own
+/// run aside — as a folded heading's arrow badges them: failed, running,
+/// and succeeded, how many of each, in a traffic light's order.
+fn subtree_states(
+    outline: &[crate::tasks::OutlineEntry],
+    at: usize,
+    states: &[crate::tasks::RunState],
+) -> FoldStates {
+    use crate::tasks::RunState;
+    let depth = outline[at].depth;
+    let mut counts = FoldStates::default();
+    for entry in outline[at + 1..].iter().take_while(|e| e.depth > depth) {
+        match entry.task.map(|i| states[i]) {
+            Some(RunState::Failed) => counts.failed += 1,
+            Some(RunState::Running) => counts.running += 1,
+            Some(RunState::Succeeded) => counts.succeeded += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+/// How many tasks under a folded heading last failed, are running, and
+/// last succeeded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FoldStates {
+    failed: usize,
+    running: usize,
+    succeeded: usize,
+}
+
+impl FoldStates {
+    /// The lights, top to bottom, with their words: red, amber, and green,
+    /// each only when some task under the heading is in that state.
+    fn lights(self) -> Vec<(&'static str, String)> {
+        [
+            ("red", self.failed, "failed"),
+            ("amber", self.running, "running"),
+            ("green", self.succeeded, "succeeded"),
+        ]
+        .into_iter()
+        .filter(|(_, n, _)| *n > 0)
+        .map(|(class, n, words)| (class, format!("{n} {words}")))
+        .collect()
+    }
+}
+
+/// A heading's fold arrow, and — folded — the lights of what it hides
+/// beside the arrow's tip, a column of badges at the slot's end, each
+/// overlapping the one above it (David, 2026-10-22: "badge the collapsing
+/// arrow with the combination of statuses within … it could theoretically
+/// show a whole traffic light"; "It's okay to stack the traffic light
+/// indicators a bit. We just need to represent the existence of each").
+/// Running is amber here, where a task's own row spins: a badge is too
+/// small to.
+fn fold_arrow(open: bool, states: FoldStates) -> gtk::Widget {
+    let arrow = fold_glyph(open);
+    let lights = states.lights();
+    if open || lights.is_empty() {
+        return arrow.upcast();
+    }
+    arrow.set_hexpand(true);
+    arrow.set_halign(gtk::Align::Center);
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["fold-lights"])
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .can_target(false)
+        .build();
+    for (class, _) in &lights {
+        column.append(
+            &gtk::Box::builder()
+                .css_classes(["env-badge", class])
+                .valign(gtk::Align::Center)
+                .build(),
+        );
+    }
+    let overlay = gtk::Overlay::builder().child(&arrow).build();
+    overlay.add_overlay(&column);
+    overlay.upcast()
+}
+
+/// What a fold's tooltip says of the lights on its arrow: ", 1 failed, 2
+/// succeeded", or nothing when the heading is open or hides no runs.
+fn fold_words(open: bool, states: FoldStates) -> String {
+    if open {
+        return String::new();
+    }
+    states
+        .lights()
+        .into_iter()
+        .map(|(_, words)| format!(" · {words}"))
+        .collect()
+}
+
 /// The Tasks list's height before it scrolls: five of its rows.
 const TASKS_MAX_HEIGHT: i32 = 5 * 40;
 
@@ -3450,13 +3546,15 @@ impl FileTree {
                 open.contains(&above.join(":"))
             })
         };
+        let states: Vec<crate::tasks::RunState> = rows.iter().map(|row| row.state).collect();
         for (at, entry) in outline.iter().enumerate() {
             // Whether this line or anything under it answers the query: a
             // heading stays for its tasks' sake.
             let subtree = subtree_hits(&outline, at, &hits);
+            let below = subtree_states(&outline, at, &states);
             let fold = entry
                 .folds
-                .then(|| (entry.path.as_str(), open.contains(&entry.path)));
+                .then(|| (entry.path.as_str(), open.contains(&entry.path), below));
             let item = match entry.task {
                 Some(index) => {
                     let row = &rows[index];
@@ -3465,7 +3563,7 @@ impl FileTree {
                 }
                 None => {
                     row_names.push(None);
-                    self.task_heading(&entry.label, &entry.path, open.contains(&entry.path))
+                    self.task_heading(&entry.label, &entry.path, open.contains(&entry.path), below)
                 }
             };
             // The depth's indent, and the row's start inset — except on a
@@ -3548,13 +3646,22 @@ impl FileTree {
     /// doesn't seem to drill down for sections like \"dev\""); it runs
     /// and opens nothing, so it is neither selectable nor activated, and
     /// nothing lights it.
-    fn task_heading(self: &Rc<Self>, label: &str, path: &str, open: bool) -> gtk::ListBoxRow {
+    fn task_heading(
+        self: &Rc<Self>,
+        label: &str,
+        path: &str,
+        open: bool,
+        below: FoldStates,
+    ) -> gtk::ListBoxRow {
         let line = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
         // Both insets, as `section_row` states them: with only the end one
         // the arrow sat ROW_INSET left of every task's light below it.
         line.set_margin_start(ROW_INSET);
         line.set_margin_end(ROW_INSET);
-        line.append(&leading_slot(&fold_glyph(open)));
+        let arrow = fold_arrow(open, below);
+        line.append(&leading_slot(&arrow));
+        // The whole slot, so the lights stand at its end beside the arrow.
+        arrow.set_halign(gtk::Align::Fill);
         line.append(
             &gtk::Label::builder()
                 .label(label)
@@ -3571,7 +3678,7 @@ impl FileTree {
             .tooltip_text(if open {
                 format!("Fold the {path} tasks")
             } else {
-                format!("Show the {path} tasks")
+                format!("Show the {path} tasks{}", fold_words(open, below))
             })
             .build();
         row.set_cursor_from_name(Some("pointer"));
@@ -3602,7 +3709,7 @@ impl FileTree {
         label: &str,
         hits: usize,
         runnable: bool,
-        fold: Option<(&str, bool)>,
+        fold: Option<(&str, bool, FoldStates)>,
     ) -> gtk::ListBoxRow {
         let running = row.state == crate::tasks::RunState::Running;
         let button = gtk::Button::builder()
@@ -3709,7 +3816,7 @@ impl FileTree {
         // gives its start inset up to the strip, and the strip puts the
         // arrow back where the slot centres a light, so the arrow and the
         // lights below it are one column.
-        if let (Some((path, open)), Some(line)) = (fold, item.child()) {
+        if let (Some((path, open, below)), Some(line)) = (fold, item.child()) {
             if let Some(slot) = line.first_child().and_downcast::<gtk::Box>() {
                 while let Some(child) = slot.first_child() {
                     slot.remove(&child);
@@ -3717,13 +3824,13 @@ impl FileTree {
                 line.set_margin_start(0);
                 slot.set_width_request(ROW_INSET + LEAD_WIDTH);
                 slot.set_valign(gtk::Align::Fill);
-                let arrow = fold_glyph(open);
+                let arrow = fold_arrow(open, below);
                 arrow.set_margin_start(ROW_INSET);
                 arrow.set_hexpand(true);
-                arrow.set_halign(gtk::Align::Center);
+                arrow.set_halign(gtk::Align::Fill);
                 arrow.set_valign(gtk::Align::Center);
                 slot.append(&arrow);
-                self.make_fold_target(&slot, path, open);
+                self.make_fold_target(&slot, path, open, below);
             }
         }
         item
@@ -3731,11 +3838,17 @@ impl FileTree {
 
     /// Make `target` fold or open the heading at `path` on a click, which
     /// goes no further — a heading that is a task is not opened by it.
-    fn make_fold_target(self: &Rc<Self>, target: &impl IsA<gtk::Widget>, path: &str, open: bool) {
+    fn make_fold_target(
+        self: &Rc<Self>,
+        target: &impl IsA<gtk::Widget>,
+        path: &str,
+        open: bool,
+        below: FoldStates,
+    ) {
         target.set_tooltip_text(Some(&if open {
             format!("Fold the {path} tasks")
         } else {
-            format!("Show the {path} tasks")
+            format!("Show the {path} tasks{}", fold_words(open, below))
         }));
         target.set_cursor_from_name(Some("pointer"));
         let click = gtk::GestureClick::new();
@@ -4454,6 +4567,11 @@ impl FileTree {
         };
         self.set_tasks(
             vec![
+                // Folded, and every light under it: its arrow's badges.
+                // First, so the list's first rows have it in the frame.
+                row("ci:check", "Lint and format", RunState::Failed),
+                row("ci:test", "The whole suite", RunState::Running),
+                row("ci:e2e", "Against a server", RunState::Succeeded),
                 row("build", "Build the workspace", RunState::Succeeded),
                 row("test", "Run the test suite", RunState::Running),
                 row("lint", "", RunState::Idle),
@@ -5905,8 +6023,11 @@ impl FileTree {
                                                 "Click to push".to_string()
                                             }),
                                         });
-                                    if ahead > 0 {
-                                        if let Some(card) = self.push_card.borrow_mut().as_mut() {
+                                    if let Some(card) = self.push_card.borrow_mut().as_mut() {
+                                        // What ↑ counts, listed under the
+                                        // facts.
+                                        card.commits = sync.sends.clone();
+                                        if ahead > 0 {
                                             snapshot.submodule_sync.tell_push(card);
                                         }
                                     }
@@ -5975,6 +6096,7 @@ impl FileTree {
                                             // branch onto (review, 2026-10-20).
                                             SyncCard::new(format!("Can't pull from {upstream}"))
                                                 .fact("New there", count(behind, "commit"))
+                                                .commits(sync.incoming.clone())
                                                 .fact(
                                                     "Why",
                                                     "it is a URL, not a remote; add it as a \
@@ -5983,7 +6105,8 @@ impl FileTree {
                                         } else {
                                             let mut card =
                                                 SyncCard::new(format!("Catch up with {upstream}"))
-                                                    .fact("New there", count(behind, "commit"));
+                                                    .fact("New there", count(behind, "commit"))
+                                                    .commits(sync.incoming.clone());
                                             SubmoduleSync::tell_moves(
                                                 &snapshot.submodule_sync.own_moves,
                                                 &mut card,
@@ -6019,7 +6142,8 @@ impl FileTree {
                                                     let mut card = SyncCard::new(format!(
                                                         "Fast-forward to {name}"
                                                     ))
-                                                    .fact("New there", count(new, "change"));
+                                                    .fact("New there", count(new, "change"))
+                                                    .commits(canonical.incoming.clone());
                                                     SubmoduleSync::tell_moves(
                                                         canon_moves,
                                                         &mut card,
@@ -6030,7 +6154,8 @@ impl FileTree {
                                                         "Rebase onto {name}"
                                                     ))
                                                     .fact("New there", count(new, "change"))
-                                                    .fact("Yours", count(mine, "commit"));
+                                                    .fact("Yours", count(mine, "commit"))
+                                                    .commits(canonical.incoming.clone());
                                                     SubmoduleSync::tell_moves(
                                                         canon_moves,
                                                         &mut card,
@@ -9373,6 +9498,11 @@ impl FileTree {
         let Ok(which) = std::env::var("TASTE_PROBE_CARD") else {
             return;
         };
+        // `push:detail` also opens the first commit's detail card.
+        let (which, detail) = match which.split_once(':') {
+            Some((which, "detail")) => (which.to_string(), true),
+            _ => (which, false),
+        };
         let card = match which.as_str() {
             "pull" => &self.pull_card,
             "canon" => &self.canon_card,
@@ -9382,6 +9512,15 @@ impl FileTree {
         let Some(card) = card.borrow().clone() else {
             return;
         };
+        // Drawn again only when it says something new, as a hovered card
+        // is: the counts refresh many times a second under a probe, and a
+        // card drawn again at each lost the detail opened beside it.
+        thread_local! {
+            static LAST: RefCell<Option<SyncCard>> = const { RefCell::new(None) };
+        }
+        if LAST.with(|last| last.replace(Some(card.clone()))) == Some(card.clone()) {
+            return;
+        }
         let button: &gtk::Button = match which.as_str() {
             "pull" => &self.pull_button,
             "canon" => &self.canon_button,
@@ -9391,7 +9530,17 @@ impl FileTree {
             let (button, layer) = (button.clone(), layer.clone());
             // After the frame that lays the header out, so the card is
             // placed against where the button is.
-            glib::idle_add_local_once(move || layer.show(button.upcast_ref(), &card));
+            glib::idle_add_local_once(move || {
+                layer.show(button.upcast_ref(), &card);
+                // After the card has been laid out, as a hover comes after
+                // it: the detail stands level with its row.
+                if detail {
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(300),
+                        move || layer.probe_first_detail(&card),
+                    );
+                }
+            });
         }
     }
 
@@ -10515,6 +10664,51 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// A folded heading's lights are what is under it — every task in the
+    /// namespace and deeper, the heading's own run aside — in a traffic
+    /// light's order, each counted.
+    #[test]
+    fn a_folded_heading_badges_what_it_hides() {
+        use crate::tasks::RunState;
+        let names: Vec<String> = ["serve", "serve:e2e", "serve:api", "serve:deep:x", "other"]
+            .map(String::from)
+            .to_vec();
+        let states = [
+            RunState::Failed,
+            RunState::Succeeded,
+            RunState::Running,
+            RunState::Succeeded,
+            RunState::Failed,
+        ];
+        let outline = crate::tasks::outline(&names);
+        let at = outline
+            .iter()
+            .position(|entry| entry.folds && entry.path == "serve")
+            .unwrap();
+        let below = super::subtree_states(&outline, at, &states);
+        assert_eq!(
+            below,
+            super::FoldStates {
+                failed: 0,
+                running: 1,
+                succeeded: 2
+            }
+        );
+        assert_eq!(
+            below
+                .lights()
+                .into_iter()
+                .map(|(class, _)| class)
+                .collect::<Vec<_>>(),
+            ["amber", "green"]
+        );
+        assert_eq!(
+            super::fold_words(false, below),
+            " · 1 running · 2 succeeded"
+        );
+        assert_eq!(super::fold_words(true, below), "");
+    }
 
     /// A rewrite whose every change is in the branch says nothing is
     /// lost; one that drops changes says how many.

@@ -248,7 +248,9 @@ scrolling list is what a long list once cut off);
 `TASTE_PROBE_CARD=push` (or `pull`, `canon`) shows that sync count's hover
 card once the counts land (`sync_card.rs`, drawn in the window, so the
 shot has it), since a shot has no pointer to hover with, and shoots the
-card whole as `window.sync-card` beside the pane it runs past;
+card whole as `window.sync-card` beside the pane it runs past (`push:detail`
+also opens its first commit's detail card beside it, `window.commit-card`;
+open a scratch clone whose remote is behind, or the list is empty);
 `TASTE_PROBE_SYNC=running` (or `conflict`, `failed`, `done`) poses the
 title bar's cloud — the folder's sync and the Google Cloud connection,
 one badge — in that state with its popover open;

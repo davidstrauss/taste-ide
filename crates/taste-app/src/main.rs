@@ -649,6 +649,14 @@ fn main() -> glib::ExitCode {
                  .sync-card.osd { border-radius: 8px; padding: 8px 10px; \
                    background-color: alpha(black, 0.9); \
                    box-shadow: 0 2px 6px alpha(black, 0.3); }\n\
+                 /* Its commits: a row lit under the pointer and while its \
+                    detail card is up, the light reaching past the text by \
+                    the list's own outset, so the text stays in the card's \
+                    column. */\n\
+                 .sync-card .commit-list { margin: 2px -6px 0; }\n\
+                 .sync-card .commit-row { padding: 2px 6px; border-radius: 6px; }\n\
+                 .sync-card .commit-row:hover, .sync-card .commit-row.lit { \
+                   background-color: alpha(white, 0.12); }\n\
                  /* The transcript's scrollbar counts rows (chat/rowbar.rs), \
                     so it is a scrollbar of its own rather than the \
                     scrolled window's, and the fading the scrolled window \
@@ -970,6 +978,10 @@ fn main() -> glib::ExitCode {
                    border-radius: 999px; \
                    box-shadow: 0 0 0 1px var(--view-bg-color); }\n\
                  .env-badge.attention { background-color: @accent_bg_color; }\n\
+                 /* A folded task heading's lights (filetree.rs → \
+                    fold_arrow): stacked, each over the last by two pixels, \
+                    its ring keeping the two apart. */\n\
+                 .fold-lights > .env-badge + .env-badge { margin-top: -2px; }\n\
                  .env-badge.green { background-color: @success_color; }\n\
                  .env-badge.amber { background-color: @warning_color; }\n\
                  .env-badge.red { background-color: @error_color; }\n\

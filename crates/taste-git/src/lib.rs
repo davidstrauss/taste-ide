@@ -275,6 +275,32 @@ pub struct StashEntry {
     pub paths: std::collections::HashSet<PathBuf>,
 }
 
+/// One commit of a sync count, as the file tree's ↑, ↓, and ⇊ cards list
+/// it: the row's summary, and what the detail card beside the row says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitLine {
+    pub id: String,
+    pub summary: String,
+    /// The message after its summary line, trimmed; empty for a one-line
+    /// message.
+    pub body: String,
+    pub author: String,
+    /// When it was written, in seconds since the epoch.
+    pub when: i64,
+}
+
+/// A count's commits, newest first: as many as a card lists
+/// ([`COMMIT_LIST_CAP`]), and how many more the count holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitList {
+    pub commits: Vec<CommitLine>,
+    pub more: usize,
+}
+
+/// How many commits a count's list carries. A card scrolls past about ten;
+/// beyond this many it says how many more there are rather than list them.
+pub const COMMIT_LIST_CAP: usize = 50;
+
 /// One commit whose message matched a search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitHit {
@@ -1037,6 +1063,10 @@ pub struct SyncStatus {
     /// writes one): its tip there is asked for and counted, but no ref here
     /// keeps it, so ↓ has nothing to move the branch onto.
     pub push_by_url: bool,
+    /// The commits [`SyncStatus::own_ahead`] counts: what ↑'s card lists.
+    pub sends: CommitList,
+    /// The commits [`SyncStatus::own_behind`] counts: what ↓'s card lists.
+    pub incoming: CommitList,
 }
 
 impl SyncStatus {
@@ -1055,6 +1085,8 @@ impl SyncStatus {
             canonical: None,
             on_canonical: false,
             push_by_url: false,
+            sends: CommitList::default(),
+            incoming: CommitList::default(),
         }
     }
 }
@@ -1832,6 +1864,77 @@ mod tests {
             matches!(ws.pull_plan_of("other"), Some(PullPlan::Rebase { .. })),
             "{:?}",
             ws.pull_plan_of("other")
+        );
+    }
+
+    /// Each sync count carries the commits it counts, newest first, so the
+    /// header's cards can list what ↑ sends, what ↓ brings, and what ⇊
+    /// would rebase onto: the same commits, as many as the number says.
+    #[test]
+    fn each_count_lists_the_commits_it_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Ada")
+                .env("GIT_AUTHOR_EMAIL", "a@a")
+                .env("GIT_COMMITTER_NAME", "Ada")
+                .env("GIT_COMMITTER_EMAIL", "a@a")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let commit = |cwd: &Path, name: &str, message: &str| {
+            std::fs::write(cwd.join(name), message).unwrap();
+            git(cwd, &["add", name]);
+            git(cwd, &["commit", "-q", "-m", message]);
+        };
+        git(root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(root, &["clone", "-q", "remote.git", "mine"]);
+        git(root, &["clone", "-q", "remote.git", "theirs"]);
+        let (mine, theirs) = (root.join("mine"), root.join("theirs"));
+        git(&mine, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&mine, &["push", "-q", "origin", "HEAD:main"]);
+        git(&mine, &["switch", "-q", "-c", "topic"]);
+        commit(&mine, "a.txt", "first of mine");
+        git(&mine, &["push", "-q", "-u", "origin", "topic"]);
+        commit(&mine, "b.txt", "second of mine\n\nWith a body.");
+        // Someone pushes to the branch, and to main.
+        git(&theirs, &["fetch", "-q"]);
+        git(&theirs, &["switch", "-q", "topic"]);
+        commit(&theirs, "c.txt", "theirs on topic");
+        git(&theirs, &["push", "-q", "origin", "topic"]);
+        git(&theirs, &["switch", "-q", "main"]);
+        commit(&theirs, "d.txt", "theirs on main");
+        git(&theirs, &["push", "-q", "origin", "main"]);
+        git(&mine, &["fetch", "-q"]);
+
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        let sync = ws.sync_status_of("topic").unwrap();
+        let summaries = |list: &CommitList| {
+            list.commits
+                .iter()
+                .map(|c| c.summary.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sync.own_ahead, 1, "{sync:?}");
+        assert_eq!(summaries(&sync.sends), ["second of mine"]);
+        assert_eq!(sync.sends.commits[0].body, "With a body.");
+        assert_eq!(sync.sends.commits[0].author, "Ada");
+        assert_eq!(sync.own_behind, 1, "{sync:?}");
+        assert_eq!(summaries(&sync.incoming), ["theirs on topic"]);
+        let canonical = sync.canonical.as_ref().unwrap();
+        assert_eq!(canonical.new, 1, "{canonical:?}");
+        assert_eq!(summaries(&canonical.incoming), ["theirs on main"]);
+        assert_eq!(
+            (sync.sends.more, sync.incoming.more, canonical.incoming.more),
+            (0, 0, 0)
         );
     }
 

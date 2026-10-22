@@ -79,6 +79,8 @@ pub struct Canonical {
     /// The branch's own commits: those whose change is not there. What a
     /// pull request from it shows.
     pub own: usize,
+    /// The commits [`Canonical::new`] counts: what ⇊'s card lists.
+    pub incoming: crate::CommitList,
 }
 
 /// Where a branch's push goes.
@@ -400,22 +402,74 @@ impl GitWorkspace {
             .ok()?
             .get()
             .target()?;
-        let (new, own) = match self.diverged(tip, there) {
-            Some((theirs, mine)) => (
-                self.unmatched(&theirs, &mine),
-                self.unmatched(&mine, &theirs),
-            ),
+        let (incoming, own) = match self.diverged(tip, there) {
+            Some((theirs, mine)) => {
+                let new = self.unmatched_of(&theirs, &mine);
+                (
+                    self.commit_list(new.iter().copied(), new.len()),
+                    self.unmatched(&mine, &theirs),
+                )
+            }
             // Too far apart to compare change by change: by commit.
             None => {
                 let (own, new) = self.repo.graph_ahead_behind(tip, there).ok()?;
-                (new, own)
+                (self.commits_between(there, &[tip], new), own)
             }
         };
         Some(Canonical {
             name: short_ref(&full),
             full,
-            new,
+            new: incoming.commits.len() + incoming.more,
             own,
+            incoming,
+        })
+    }
+
+    /// The commits `from` has that none of `hide` do, newest first, as a
+    /// card lists them; `count` is how many there are, already counted.
+    fn commits_between(&self, from: Oid, hide: &[Oid], count: usize) -> crate::CommitList {
+        let Ok(mut walk) = self.repo.revwalk() else {
+            return crate::CommitList::default();
+        };
+        if walk.push(from).is_err() || hide.iter().any(|oid| walk.hide(*oid).is_err()) {
+            return crate::CommitList::default();
+        }
+        let _ = walk.set_sorting(git2::Sort::TIME);
+        let listed: Vec<Oid> = walk
+            .filter_map(Result::ok)
+            .take(crate::COMMIT_LIST_CAP)
+            .collect();
+        self.commit_list(listed, count)
+    }
+
+    /// `oids`, up to [`crate::COMMIT_LIST_CAP`] of them, as a card lists
+    /// them, out of `count`.
+    fn commit_list(&self, oids: impl IntoIterator<Item = Oid>, count: usize) -> crate::CommitList {
+        let commits: Vec<crate::CommitLine> = oids
+            .into_iter()
+            .take(crate::COMMIT_LIST_CAP)
+            .filter_map(|oid| self.commit_line(oid))
+            .collect();
+        crate::CommitList {
+            more: count.saturating_sub(commits.len()),
+            commits,
+        }
+    }
+
+    fn commit_line(&self, oid: Oid) -> Option<crate::CommitLine> {
+        let commit = self.repo.find_commit(oid).ok()?;
+        let message = String::from_utf8_lossy(commit.message_bytes()).to_string();
+        let (summary, body) = match message.split_once('\n') {
+            Some((summary, body)) => (summary.trim().to_string(), body.trim().to_string()),
+            None => (message.trim().to_string(), String::new()),
+        };
+        let author = commit.author();
+        Some(crate::CommitLine {
+            id: oid.to_string(),
+            summary,
+            body,
+            author: String::from_utf8_lossy(author.name_bytes()).to_string(),
+            when: commit.time().seconds(),
         })
     }
 
@@ -470,18 +524,24 @@ impl GitWorkspace {
     /// How many of `commits` make a change none of `against` does: merges
     /// passed over, having no change of their own to compare.
     fn unmatched(&self, commits: &[Oid], against: &[Oid]) -> usize {
+        self.unmatched_of(commits, against).len()
+    }
+
+    /// The commits [`Self::unmatched`] counts, in the order given.
+    fn unmatched_of(&self, commits: &[Oid], against: &[Oid]) -> Vec<Oid> {
         let theirs: std::collections::HashSet<Change> = against
             .iter()
             .filter_map(|oid| self.change_of(*oid))
             .collect();
         commits
             .iter()
-            .filter(|oid| !self.is_merge(**oid))
+            .copied()
+            .filter(|oid| !self.is_merge(*oid))
             .filter(|oid| {
-                self.change_of(**oid)
+                self.change_of(*oid)
                     .is_none_or(|key| !theirs.contains(&key))
             })
-            .count()
+            .collect()
     }
 
     fn is_merge(&self, oid: Oid) -> bool {
@@ -727,24 +787,35 @@ impl GitWorkspace {
         // onto main sends main's new commits too, and they are not its own.
         status.canonical = self.canonical_of(branch);
         status.on_canonical = self.pushes_to_canonical(branch);
-        status.own_ahead = status.ahead;
-        if let Some(canonical) = &status.canonical {
-            let canonical_tip = self
-                .repo
-                .find_reference(&canonical.full)
-                .ok()
-                .and_then(|r| r.target());
-            let mut walk = self.repo.revwalk()?;
-            walk.push(tip)?;
-            if let Some(there) = there {
-                walk.hide(there)?;
-            } else {
-                let _ = walk.hide_glob("refs/remotes/*");
-            }
-            if let Some(canonical_tip) = canonical_tip {
-                walk.hide(canonical_tip)?;
-            }
-            status.own_ahead = walk.filter(Result::is_ok).count();
+        // ↑'s commits, walked as `ahead` was counted — less the canonical
+        // branch's, when there is one, which makes the count `own_ahead`.
+        let canonical_tip = status
+            .canonical
+            .as_ref()
+            .and_then(|canonical| self.repo.find_reference(&canonical.full).ok())
+            .and_then(|r| r.target());
+        let mut walk = self.repo.revwalk()?;
+        walk.push(tip)?;
+        if let Some(there) = there {
+            walk.hide(there)?;
+        } else {
+            let _ = walk.hide_glob("refs/remotes/*");
+        }
+        if let Some(canonical_tip) = canonical_tip {
+            walk.hide(canonical_tip)?;
+        }
+        let sends: Vec<Oid> = walk.filter_map(Result::ok).collect();
+        status.own_ahead = if status.canonical.is_some() {
+            sends.len()
+        } else {
+            status.ahead
+        };
+        status.sends = self.commit_list(sends, status.own_ahead);
+        // ↓'s: what the push target has that the branch lacks, unless
+        // those are the branch's own rewritten, which `own_behind` is then
+        // 0 for.
+        if let Some(there) = there.filter(|_| status.own_behind > 0) {
+            status.incoming = self.commits_between(there, &[tip], status.own_behind);
         }
         Ok(status)
     }

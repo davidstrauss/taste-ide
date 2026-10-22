@@ -3593,8 +3593,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // The chooser is a popover, its own surface.
                         &["window", "window.custom-models"]
                     } else if std::env::var("TASTE_PROBE_CARD").is_ok() {
-                        // The card on its own, and the pane it hangs from.
-                        &["filetree", "window.sync-card"]
+                        // The card on its own, the commit detail beside it
+                        // (`push:detail`), the pane it hangs from, and the
+                        // window, where the two cards stand side by side.
+                        &[
+                            "window",
+                            "filetree",
+                            "window.sync-card",
+                            "window.commit-card",
+                        ]
                     } else if std::env::var("TASTE_PROBE_BRANCHES").is_ok() {
                         // The branch switcher, opened by the file tree once
                         // its branches are read: a popover, its own surface.
