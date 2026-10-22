@@ -418,6 +418,29 @@ impl GitWorkspace {
         Ok(out)
     }
 
+    /// Pin every ref under `from` whose commit the same-named branch here
+    /// does not contain — a branch Personal moved past or away from the
+    /// folder's — under `to` and its name, so nothing that later moves the
+    /// ref under `from` leaves those commits unnamed. How many were pinned.
+    /// `from` is a namespace such as `refs/taste/vm/`; `to` one such as
+    /// `refs/taste/moved/<vm>/`.
+    pub fn pin_uncontained(&self, from: &str, to: &str) -> Result<usize> {
+        let mut pinned = 0;
+        for (name, oid) in self.refs_under(from)? {
+            let branch = &name[from.len()..];
+            let contained = self
+                .read_ref(&format!("refs/heads/{branch}"))?
+                .is_some_and(|tip| {
+                    tip == oid || self.repo.graph_descendant_of(tip, oid).unwrap_or(false)
+                });
+            if !contained {
+                self.set_ref(&format!("{to}{branch}"), oid)?;
+                pinned += 1;
+            }
+        }
+        Ok(pinned)
+    }
+
     pub fn delete_ref(&self, name: &str) -> Result<()> {
         if self.head_ref_name().as_deref() == Some(name) {
             bail!("refusing to delete the checked-out branch {name}");
@@ -525,6 +548,43 @@ impl GitWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Personal's copy of a branch the folder's branch contains is left
+    /// alone; one ahead of it, or on a branch the folder lacks, is pinned.
+    #[test]
+    fn what_the_folders_branch_lacks_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tree = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree).unwrap();
+        let first = repo.commit(None, &sig, &sig, "first", &tree, &[]).unwrap();
+        let parent = repo.find_commit(first).unwrap();
+        let second = repo
+            .commit(None, &sig, &sig, "second", &tree, &[&parent])
+            .unwrap();
+        let ws = crate::GitWorkspace::discover(dir.path()).unwrap();
+        ws.set_ref("refs/heads/main", second).unwrap();
+        ws.set_ref("refs/heads/topic", first).unwrap();
+        // Behind the folder's main: contained. Ahead of topic: not.
+        ws.set_ref("refs/taste/vm/main", first).unwrap();
+        ws.set_ref("refs/taste/vm/topic", second).unwrap();
+        ws.set_ref("refs/taste/vm/agents/i-0001", first).unwrap();
+        assert_eq!(
+            ws.pin_uncontained("refs/taste/vm/", "refs/taste/moved/vm1/")
+                .unwrap(),
+            2
+        );
+        assert_eq!(ws.read_ref("refs/taste/moved/vm1/main").unwrap(), None);
+        assert_eq!(
+            ws.read_ref("refs/taste/moved/vm1/topic").unwrap(),
+            Some(second)
+        );
+        assert_eq!(
+            ws.read_ref("refs/taste/moved/vm1/agents/i-0001").unwrap(),
+            Some(first)
+        );
+    }
 
     /// A ref the IDE set, and nobody moved since, is the IDE's; one the
     /// user committed to is theirs.

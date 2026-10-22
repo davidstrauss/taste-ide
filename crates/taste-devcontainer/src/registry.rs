@@ -1889,6 +1889,16 @@ impl EnvironmentRegistry {
             let previous = host.read_ref(&snapshot_ref)?;
             let dirty = !host.status()?.is_empty();
             if dirty {
+                // The folder's work replaces the snapshot Personal left, which
+                // may be work of its own the folder never took — a conflict
+                // left unresolved. Pinned first, it is not lost to the
+                // replacing (2026-10-22's audit).
+                if let Some(previous) = previous {
+                    host.set_ref(
+                        &format!("refs/taste/kept/snapshot/primary-{}", now_secs()),
+                        previous,
+                    )?;
+                }
                 host.snapshot_worktree(&snapshot_ref)?;
                 self.note_vm(
                     &vm.domain,
@@ -3381,13 +3391,38 @@ impl EnvironmentRegistry {
         // anew from its peer and its last snapshot (docs/ENVIRONMENTS.md →
         // "Uncommitted work, backups, and artifacts"). Moving is restore.
         if substrate.vm_details().is_some() {
+            // Gone means libvirt no longer has it. A VM it has that did not
+            // come up — a boot that failed, a host short of memory — still
+            // holds the checkout and the agent's home: placed anew from the
+            // last snapshot, both were left behind in it (2026-10-22's
+            // audit). Its environments wait for it, saying why, and a pool
+            // that cannot be asked places nothing anew.
+            let defined: Option<std::collections::HashSet<String>> = pool
+                .all_vms()
+                .await
+                .ok()
+                .map(|vms| vms.into_iter().map(|vm| vm.domain).collect());
             let orphaned: Vec<Arc<Supervisor>> = self
                 .list()
                 .into_iter()
                 .filter(|s| !s.id().is_primary())
                 .filter(|s| {
                     s.checkout().vm().is_some_and(|vm| {
-                        self.substrate_of_vm(vm).is_none() && !pool.is_cloud_host(vm)
+                        self.substrate_of_vm(vm).is_none()
+                            && !pool.is_cloud_host(vm)
+                            && defined.as_ref().is_some_and(|defined| {
+                                if defined.contains(vm) {
+                                    let note = format!(
+                                        "environment {} waits for VM {vm}, which did not come \
+                                         up; it holds its checkout, so it is not placed anew",
+                                        s.id()
+                                    );
+                                    taste_core::app_log::push("warn", "environments", &note);
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
                     })
                 })
                 .collect();
@@ -4683,6 +4718,44 @@ impl EnvironmentRegistry {
         .await
         .context("the snapshot did not finish")
         .and_then(|done| done.context("snapshotting before the move"));
+        // Personal's branches as the folder last fetched them, where they
+        // hold commits the folder's own branch does not: the checkout made
+        // anew is seeded from the folder's branches, and the next fetch
+        // from it moved `refs/taste/vm/*` off those commits for good
+        // (2026-10-22's audit). Pinned, they stay named here.
+        if snapshot.is_ok() && env.is_primary() {
+            let folder = self.workspace_root.clone();
+            let pin = format!("refs/taste/moved/{old_domain}/");
+            let pinned = tokio::task::spawn_blocking(move || {
+                taste_git::GitWorkspace::discover(&folder)
+                    .context("the folder is not a git repository")?
+                    .pin_uncontained("refs/taste/vm/", &pin)
+            })
+            .await
+            .context("pinning Personal's branches did not finish")
+            .and_then(|pinned| pinned);
+            match pinned {
+                Ok(0) => {}
+                Ok(n) => self.note_vm(
+                    &old_domain,
+                    format!(
+                        "{env}: {n} of Personal's branches held commits the folder's do not; \
+                         kept as refs/taste/moved/{old_domain}/…"
+                    ),
+                ),
+                Err(e) => {
+                    supervisor.end_move(was_running);
+                    if was_running {
+                        if let Err(again) = supervisor.reload().await {
+                            tracing::warn!(
+                                "{env} did not start again in VM {old_domain}: {again:#}"
+                            );
+                        }
+                    }
+                    return Err(e.context("keeping Personal's branches before the move"));
+                }
+            }
+        }
         if let Err(e) = snapshot {
             // Stopped, and nothing carried: it is started again where it is.
             supervisor.end_move(was_running);
