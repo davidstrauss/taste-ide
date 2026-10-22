@@ -207,18 +207,15 @@ pub fn render_in(
     render_full(text, on_link, issues, base, None)
 }
 
-fn render_full(
+/// `text` laid out as the blocks it is drawn as ([`Item`]), with no
+/// widget made: what a rendering builds ([`render_full`]), and what an
+/// incremental one compares with what it has built ([`Incremental`]).
+fn layout(
     text: &str,
-    on_link: Rc<dyn Fn(&str)>,
-    issues: Option<crate::issue_pill::SharedIssueIndex>,
-    images: Option<DocumentBase>,
-    readiness: Option<&Readiness>,
-) -> gtk::Widget {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    root.set_margin_top(16);
-    root.set_margin_bottom(16);
-    root.set_margin_start(16);
-    root.set_margin_end(16);
+    issues: Option<&crate::issue_pill::SharedIssueIndex>,
+    images: Option<&DocumentBase>,
+) -> Vec<Item> {
+    let items: RefCell<Vec<Item>> = RefCell::new(Vec::new());
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -302,65 +299,18 @@ fn render_full(
     let flush = |markup: &mut String,
                  spans: &mut Vec<String>,
                  heading: &mut Option<HeadingLevel>,
-                 quote_depth: usize,
-                 root: &gtk::Box,
-                 on_link: &Rc<dyn Fn(&str)>| {
+                 quote_depth: usize| {
         end_block(markup, heading, Block::Paragraph);
         let (markup, _) = std::mem::take(&mut *run.borrow_mut());
         if markup.trim().is_empty() {
             spans.clear();
             return;
         }
-        let label = gtk::Label::builder()
-            .use_markup(true)
-            .label(markup.as_str())
-            .wrap(true)
-            .max_width_chars(40)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .xalign(0.0)
-            .selectable(true)
-            .build();
-        if quote_depth > 0 {
-            label.set_margin_start(14 * quote_depth as i32);
-            label.add_css_class("dim-label");
-        }
-        if let Some(index) = issues.as_ref() {
-            crate::issue_pill::install_tooltips(&label, index.clone());
-        }
-        let span_texts = std::mem::take(spans);
-        let on_link = on_link.clone();
-        let base = images.clone();
-        label.connect_activate_link(move |label, href| {
-            if let Some(index) = href.strip_prefix("copy:") {
-                if let Some(text) = index.parse::<usize>().ok().and_then(|i| span_texts.get(i)) {
-                    label.clipboard().set_text(text);
-                    if let Some(root) = label.root() {
-                        if let Some(overlay) = find_toast_overlay(root.upcast_ref()) {
-                            overlay.add_toast(adw::Toast::new("Copied"));
-                        }
-                    }
-                }
-                return glib::Propagation::Stop;
-            }
-            if href.starts_with("http://")
-                || href.starts_with("https://")
-                || href.starts_with(crate::issue_pill::SCHEME)
-            {
-                on_link(href);
-                return glib::Propagation::Stop;
-            }
-            // A path of this checkout: the file, in the editor.
-            if let Some(base) = &base {
-                if let Some((path, at)) = base.resolve_link(href) {
-                    (base.open_file)(path, at);
-                }
-            }
-            glib::Propagation::Stop // anything else goes nowhere
+        items.borrow_mut().push(Item::Run {
+            markup,
+            spans: std::mem::take(spans),
+            quote_depth,
         });
-        // In its frame, which paints the pills' capsules under the text
-        // (`issue_pill::PillText`); the label itself is still the thing
-        // selected, clicked, and asked for tooltips above.
-        root.append(&crate::issue_pill::PillText::wrap(&label));
     };
 
     for event in parser {
@@ -368,26 +318,12 @@ fn render_full(
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     if run.borrow().0.len() >= RUN_AT_HEADING {
-                        flush(
-                            &mut markup,
-                            &mut spans,
-                            &mut heading,
-                            quote_depth,
-                            &root,
-                            &on_link,
-                        );
+                        flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     }
                     heading = Some(level);
                 }
                 Tag::CodeBlock(kind) => {
-                    flush(
-                        &mut markup,
-                        &mut spans,
-                        &mut heading,
-                        quote_depth,
-                        &root,
-                        &on_link,
-                    );
+                    flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     code_info = match kind {
                         CodeBlockKind::Fenced(info) => info.to_string(),
                         CodeBlockKind::Indented => String::new(),
@@ -413,14 +349,7 @@ fn render_full(
                     }
                 }
                 Tag::BlockQuote(_) => {
-                    flush(
-                        &mut markup,
-                        &mut spans,
-                        &mut heading,
-                        quote_depth,
-                        &root,
-                        &on_link,
-                    );
+                    flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     quote_depth += 1;
                 }
                 Tag::Emphasis => markup.push_str("<i>"),
@@ -435,14 +364,7 @@ fn render_full(
                 }
                 Tag::Image { dest_url, .. } => image = Some((dest_url.to_string(), String::new())),
                 Tag::Table(alignments) => {
-                    flush(
-                        &mut markup,
-                        &mut spans,
-                        &mut heading,
-                        quote_depth,
-                        &root,
-                        &on_link,
-                    );
+                    flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     table = Some((alignments, Vec::new()));
                 }
                 Tag::TableRow | Tag::TableHead => {
@@ -468,14 +390,7 @@ fn render_full(
                     // Inside a top-level item too: one bullet of many
                     // paragraphs was a label of 14,097 characters.
                     if list_stack.len() <= 1 && run.borrow().0.len() >= RUN_MOST {
-                        flush(
-                            &mut markup,
-                            &mut spans,
-                            &mut heading,
-                            quote_depth,
-                            &root,
-                            &on_link,
-                        );
+                        flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     }
                 }
                 TagEnd::Item => {
@@ -484,56 +399,26 @@ fn render_full(
                     // another, too: a long list is a run of its own, and
                     // its numbering is the list's, not the label's.
                     if list_stack.len() == 1 && run.borrow().0.len() >= RUN_MOST {
-                        flush(
-                            &mut markup,
-                            &mut spans,
-                            &mut heading,
-                            quote_depth,
-                            &root,
-                            &on_link,
-                        );
+                        flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     }
                 }
                 TagEnd::CodeBlock => {
                     if let Some(code) = code_block.take() {
-                        let code = code.trim_end_matches('\n');
-                        let card = code_card(code, true);
-                        if crate::mermaid::is_mermaid(&code_info) {
-                            // The block as code stays the fallback: a
-                            // diagram that does not parse is shown as
-                            // written, with the reason under it.
-                            root.append(&crate::mermaid::diagram(
-                                code,
-                                card,
-                                readiness.map(Readiness::hold),
-                            ));
-                        } else {
-                            root.append(&card);
-                        }
+                        items.borrow_mut().push(Item::Code {
+                            code: code.trim_end_matches('\n').to_string(),
+                            info: code_info.clone(),
+                            open: false,
+                        });
                     }
                 }
                 TagEnd::List(_) => {
                     list_stack.pop();
                     if list_stack.is_empty() && run.borrow().0.len() >= RUN_MOST {
-                        flush(
-                            &mut markup,
-                            &mut spans,
-                            &mut heading,
-                            quote_depth,
-                            &root,
-                            &on_link,
-                        );
+                        flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     }
                 }
                 TagEnd::BlockQuote(_) => {
-                    flush(
-                        &mut markup,
-                        &mut spans,
-                        &mut heading,
-                        quote_depth,
-                        &root,
-                        &on_link,
-                    );
+                    flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     quote_depth = quote_depth.saturating_sub(1);
                 }
                 TagEnd::Emphasis => markup.push_str("</i>"),
@@ -545,23 +430,11 @@ fn render_full(
                 }
                 TagEnd::Image => {
                     if let Some((source, alt)) = image.take() {
-                        let file = images.as_ref().and_then(|base| base.resolve(&source));
-                        match (file, images.as_ref()) {
-                            (Some(path), Some(base)) => {
-                                flush(
-                                    &mut markup,
-                                    &mut spans,
-                                    &mut heading,
-                                    quote_depth,
-                                    &root,
-                                    &on_link,
-                                );
-                                root.append(&picture(
-                                    base,
-                                    path,
-                                    &alt,
-                                    readiness.map(Readiness::hold),
-                                ));
+                        let file = images.and_then(|base| base.resolve(&source));
+                        match file {
+                            Some(path) => {
+                                flush(&mut markup, &mut spans, &mut heading, quote_depth);
+                                items.borrow_mut().push(Item::Picture { path, alt });
                             }
                             _ if source.starts_with("http://")
                                 || source.starts_with("https://") =>
@@ -589,7 +462,7 @@ fn render_full(
                 }
                 TagEnd::Table => {
                     if let Some((alignments, rows)) = table.take() {
-                        root.append(&table_card(&alignments, &rows));
+                        items.borrow_mut().push(Item::Table { alignments, rows });
                     }
                 }
                 _ => {}
@@ -605,7 +478,7 @@ fn render_full(
                     .and_then(|r| r.last_mut())
                 {
                     cell.push_str(&text);
-                } else if let Some(index) = issues.as_ref().filter(|_| !in_link) {
+                } else if let Some(index) = issues.filter(|_| !in_link) {
                     markup.push_str(&crate::issue_pill::pillify(&text, index));
                 } else {
                     markup.push_str(&glib::markup_escape_text(&text));
@@ -630,7 +503,7 @@ fn render_full(
                 // and a reader should not get a copy link for one and a
                 // pill for the other (David, 2026-09-16: "These issues
                 // aren't pills").
-                if let Some(index) = issues.as_ref().filter(|_| !in_link) {
+                if let Some(index) = issues.filter(|_| !in_link) {
                     let bare = code.trim();
                     let whole = matches!(
                         crate::issue_pill::find_refs(bare).as_slice(),
@@ -652,15 +525,8 @@ fn render_full(
             Event::SoftBreak => markup.push(' '),
             Event::HardBreak => markup.push('\n'),
             Event::Rule => {
-                flush(
-                    &mut markup,
-                    &mut spans,
-                    &mut heading,
-                    quote_depth,
-                    &root,
-                    &on_link,
-                );
-                root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+                flush(&mut markup, &mut spans, &mut heading, quote_depth);
+                items.borrow_mut().push(Item::Rule);
             }
             Event::TaskListMarker(done) => {
                 markup.push_str(if done { "☑ " } else { "☐ " });
@@ -668,15 +534,269 @@ fn render_full(
             _ => {}
         }
     }
-    flush(
-        &mut markup,
-        &mut spans,
-        &mut heading,
-        quote_depth,
-        &root,
-        &on_link,
-    );
+    flush(&mut markup, &mut spans, &mut heading, quote_depth);
+    let mut items = items.into_inner();
+    // A fence not yet closed — an answer still streaming — is code as it
+    // stands, never a diagram drawn again at every line.
+    let fences = text
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with("```") || line.starts_with("~~~")
+        })
+        .count();
+    if fences % 2 == 1 {
+        if let Some(Item::Code { open, .. }) = items.last_mut() {
+            *open = true;
+        }
+    }
+    items
+}
+
+/// One block of a document as [`layout`] lays it out, before a widget is
+/// made of it.
+#[derive(Debug, Clone, PartialEq)]
+enum Item {
+    /// A run of prose: one label's markup, its code spans' texts (the
+    /// copy links), and how deep in quotes it stands.
+    Run {
+        markup: String,
+        spans: Vec<String>,
+        quote_depth: usize,
+    },
+    /// A block of code — a diagram when `info` names Mermaid and the
+    /// fence has closed (`open` while it has not).
+    Code {
+        code: String,
+        info: String,
+        open: bool,
+    },
+    Table {
+        alignments: Vec<pulldown_cmark::Alignment>,
+        rows: Vec<Vec<String>>,
+    },
+    /// A picture of the document's own checkout.
+    Picture {
+        path: PathBuf,
+        alt: String,
+    },
+    Rule,
+}
+
+/// What a document's links and pills answer to, for building its items.
+#[derive(Clone)]
+struct Context {
+    on_link: Rc<dyn Fn(&str)>,
+    issues: Option<crate::issue_pill::SharedIssueIndex>,
+    images: Option<DocumentBase>,
+}
+
+/// An item's widget, and for a run its label and its code spans, which a
+/// run grown in place is given anew.
+struct Built {
+    item: Item,
+    widget: gtk::Widget,
+    run: Option<(gtk::Label, Rc<RefCell<Vec<String>>>)>,
+}
+
+fn build(item: &Item, context: &Context, readiness: Option<&Readiness>) -> Built {
+    let mut run = None;
+    let widget: gtk::Widget = match item {
+        Item::Run {
+            markup,
+            spans,
+            quote_depth,
+        } => {
+            let label = gtk::Label::builder()
+                .use_markup(true)
+                .label(markup.as_str())
+                .wrap(true)
+                .max_width_chars(40)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .xalign(0.0)
+                .selectable(true)
+                .build();
+            if *quote_depth > 0 {
+                label.set_margin_start(14 * *quote_depth as i32);
+                label.add_css_class("dim-label");
+            }
+            if let Some(index) = context.issues.as_ref() {
+                crate::issue_pill::install_tooltips(&label, index.clone());
+            }
+            let span_texts = Rc::new(RefCell::new(spans.clone()));
+            let on_link = context.on_link.clone();
+            let base = context.images.clone();
+            {
+                let span_texts = span_texts.clone();
+                label.connect_activate_link(move |label, href| {
+                    if let Some(index) = href.strip_prefix("copy:") {
+                        let text = index
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| span_texts.borrow().get(i).cloned());
+                        if let Some(text) = text {
+                            label.clipboard().set_text(&text);
+                            if let Some(root) = label.root() {
+                                if let Some(overlay) = find_toast_overlay(root.upcast_ref()) {
+                                    overlay.add_toast(adw::Toast::new("Copied"));
+                                }
+                            }
+                        }
+                        return glib::Propagation::Stop;
+                    }
+                    if href.starts_with("http://")
+                        || href.starts_with("https://")
+                        || href.starts_with(crate::issue_pill::SCHEME)
+                    {
+                        on_link(href);
+                        return glib::Propagation::Stop;
+                    }
+                    // A path of this checkout: the file, in the editor.
+                    if let Some(base) = &base {
+                        if let Some((path, at)) = base.resolve_link(href) {
+                            (base.open_file)(path, at);
+                        }
+                    }
+                    glib::Propagation::Stop // anything else goes nowhere
+                });
+            }
+            run = Some((label.clone(), span_texts));
+            // In its frame, which paints the pills' capsules under the text
+            // (`issue_pill::PillText`); the label itself is still the thing
+            // selected, clicked, and asked for tooltips above.
+            crate::issue_pill::PillText::wrap(&label).upcast()
+        }
+        Item::Code { code, info, open } => {
+            let card = code_card(code, true);
+            if !*open && crate::mermaid::is_mermaid(info) {
+                // The block as code stays the fallback: a diagram that does
+                // not parse is shown as written, with the reason under it.
+                crate::mermaid::diagram(code, card, readiness.map(Readiness::hold))
+            } else {
+                card
+            }
+        }
+        Item::Table { alignments, rows } => table_card(alignments, rows),
+        Item::Picture { path, alt } => match context.images.as_ref() {
+            Some(base) => picture(base, path.clone(), alt, readiness.map(Readiness::hold)),
+            None => gtk::Label::new(Some(alt)).upcast(),
+        },
+        Item::Rule => gtk::Separator::new(gtk::Orientation::Horizontal).upcast(),
+    };
+    Built {
+        item: item.clone(),
+        widget,
+        run,
+    }
+}
+
+/// The box a document's blocks stand in.
+fn document_box() -> gtk::Box {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    root.set_margin_top(16);
+    root.set_margin_bottom(16);
+    root.set_margin_start(16);
+    root.set_margin_end(16);
+    root
+}
+
+fn render_full(
+    text: &str,
+    on_link: Rc<dyn Fn(&str)>,
+    issues: Option<crate::issue_pill::SharedIssueIndex>,
+    images: Option<DocumentBase>,
+    readiness: Option<&Readiness>,
+) -> gtk::Widget {
+    let root = document_box();
+    let context = Context {
+        on_link,
+        issues,
+        images,
+    };
+    for item in layout(text, context.issues.as_ref(), context.images.as_ref()) {
+        root.append(&build(&item, &context, readiness).widget);
+    }
     root.upcast()
+}
+
+/// A document drawn as it grows — an answer as it streams — without what
+/// is drawn moving (David, 2026-10-21: "process MD in chat as it comes in,
+/// but without jitter from reformatting/reflowing existing chunks"). Each
+/// new text is laid out whole ([`layout`]) and compared, block by block,
+/// with what is built: a block that has not changed keeps its widget; the
+/// first that has, when it is a run of prose — the paragraph being
+/// written, joined to the ones before it — is given its new markup in the
+/// same label, whose lines above the change wrap as they did; what follows
+/// is built. A block that has ended does not change, so only the bottom of
+/// the document ever moves, and it is what [`render_in`] draws of the same
+/// text, widget for widget.
+pub struct Incremental {
+    pub root: gtk::Box,
+    context: Context,
+    built: RefCell<Vec<Built>>,
+}
+
+impl Incremental {
+    pub fn new(
+        on_link: Rc<dyn Fn(&str)>,
+        issues: Option<crate::issue_pill::SharedIssueIndex>,
+        images: Option<DocumentBase>,
+    ) -> Self {
+        Self {
+            root: document_box(),
+            context: Context {
+                on_link,
+                issues,
+                images,
+            },
+            built: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Draw `text`, keeping what is drawn of it already.
+    pub fn set_text(&self, text: &str) {
+        let items = layout(
+            text,
+            self.context.issues.as_ref(),
+            self.context.images.as_ref(),
+        );
+        let mut built = self.built.borrow_mut();
+        let mut kept = built
+            .iter()
+            .zip(&items)
+            .take_while(|(built, item)| built.item == **item)
+            .count();
+        // The run being written: its label given the run's new markup.
+        if let (Some(old), Some(new)) = (built.get_mut(kept), items.get(kept)) {
+            if let (
+                Item::Run {
+                    quote_depth: was, ..
+                },
+                Item::Run {
+                    markup,
+                    spans,
+                    quote_depth: is,
+                },
+                Some((label, span_texts)),
+            ) = (&old.item, new, &old.run)
+            {
+                if was == is {
+                    label.set_markup(markup);
+                    *span_texts.borrow_mut() = spans.clone();
+                    old.item = new.clone();
+                    kept += 1;
+                }
+            }
+        }
+        for gone in built.drain(kept..) {
+            self.root.remove(&gone.widget);
+        }
+        for item in &items[kept..] {
+            let made = build(item, &self.context, None);
+            self.root.append(&made.widget);
+            built.push(made);
+        }
+    }
 }
 
 /// What a block of prose was, for the space above the next one.
@@ -958,6 +1078,99 @@ mod tests {
             child = current.next_sibling();
         }
         found
+    }
+
+    /// A document streamed into [`Incremental`] a few characters at a
+    /// time: a block, once another follows it, keeps its widget through
+    /// every later update — nothing drawn is drawn again — and what is
+    /// drawn at the end is what [`render_in`] draws of the whole text.
+    #[test]
+    fn a_streamed_document_keeps_what_it_has_drawn() {
+        crate::gtk_test::on_gtk_thread("markdown streaming: no display — skipped", || {
+            let text = "# Plan\n\nFirst we **read** the `config`.\n\n- one\n- two\n\n\
+                        ```rust\nfn main() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n\
+                        ---\n\nAnd a last paragraph, long enough to wrap in the column.";
+            let doc = Incremental::new(Rc::new(|_: &str| {}), None, None);
+            let children = |root: &gtk::Box| {
+                let mut out = Vec::new();
+                let mut child = root.first_child();
+                while let Some(widget) = child {
+                    child = widget.next_sibling();
+                    out.push(widget);
+                }
+                out
+            };
+            let mut seen: Vec<gtk::Widget> = Vec::new();
+            let bytes: Vec<usize> = (0..=text.len())
+                .step_by(7)
+                .chain(std::iter::once(text.len()))
+                .filter(|at| text.is_char_boundary(*at))
+                .collect();
+            for at in bytes {
+                doc.set_text(&text[..at]);
+                let now = children(&doc.root);
+                // Every block but the last one drawn before this update is
+                // the same widget now.
+                for (index, before) in seen.iter().enumerate().take(seen.len().saturating_sub(1)) {
+                    assert_eq!(
+                        now.get(index),
+                        Some(before),
+                        "block {index} was drawn again at byte {at}"
+                    );
+                }
+                seen = now;
+            }
+            let whole = render_in(text, Rc::new(|_: &str| {}), None, None);
+            let drawn = children(&doc.root);
+            let rendered = children(whole.downcast_ref::<gtk::Box>().unwrap());
+            assert_eq!(drawn.len(), rendered.len());
+            for (a, b) in drawn.iter().zip(&rendered) {
+                assert_eq!(a.type_(), b.type_());
+            }
+            assert_eq!(prose(doc.root.upcast_ref()), prose(&whole));
+        });
+    }
+
+    /// What a streamed answer costs a frame: an answer of about 4 KB —
+    /// paragraphs, a list, code — drawn as it grows, 40 bytes an update,
+    /// the slowest update and the mean printed. `cargo test -p taste-app
+    /// perf_streamed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn perf_streamed_answer() {
+        crate::gtk_test::on_gtk_thread("perf: no display — skipped", || {
+            let mut text = String::new();
+            for n in 0..20 {
+                text.push_str(&format!(
+                    "Paragraph {n} says something about the change, with **bold** and a \
+                     `code span` in it, long enough to wrap twice in a column.\n\n- one \
+                     point\n- another point\n\n```rust\nfn f{n}() -> u32 {{ {n} }}\n```\n\n"
+                ));
+            }
+            let doc = Incremental::new(Rc::new(|_: &str| {}), None, None);
+            let mut slowest = std::time::Duration::ZERO;
+            let mut total = std::time::Duration::ZERO;
+            let mut updates = 0u32;
+            let mut at = 0;
+            while at < text.len() {
+                at = (at + 40).min(text.len());
+                while !text.is_char_boundary(at) {
+                    at += 1;
+                }
+                let started = std::time::Instant::now();
+                doc.set_text(&text[..at]);
+                let took = started.elapsed();
+                slowest = slowest.max(took);
+                total += took;
+                updates += 1;
+            }
+            println!(
+                "perf streamed answer: {} bytes in {updates} updates, mean {:.2} ms, slowest {:.2} ms",
+                text.len(),
+                total.as_secs_f64() * 1000.0 / f64::from(updates),
+                slowest.as_secs_f64() * 1000.0
+            );
+        });
     }
 
     /// A heading, its paragraphs, and a list are ONE label, so a selection

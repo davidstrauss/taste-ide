@@ -502,9 +502,21 @@ its data when the list binds it (`chat/rows.rs`), in a millisecond or so
 unbinds. The list keeps the reader's place as items are measured, binds
 only those near the view, and recycles the rest; nothing stands in for a
 row not yet drawn. A change to a row is drawn where the list has it: its
-line, its light, and a streaming answer's words patched in place, and
-anything else built again. The reader can scroll to the first message the
-record holds (up to the newest 32 MiB of it).
+line, its light, and an answer patched in place, and anything else built
+again. An answer is Markdown as it streams, not text formatted at its end
+(`markdown_view::Incremental`; David, 2026-10-21: "process MD in chat as
+it comes in, but without jitter from reformatting/reflowing existing
+chunks"): each update is laid out whole and compared block by block with
+what is drawn, a block that has not changed keeps its widget, the run of
+prose being written is given its new markup in the same label, whose lines
+above the change wrap as they did, and what follows is built — a block
+that has ended does not change, so only the bottom moves. Updates are
+drawn once a frame; a fence still open is code, never a diagram drawn
+again at every line; a long answer is clipped as it streams by the rule
+it is clipped by once it ends, so the head shown stops growing and the
+more line counts on; and what is drawn is widget for widget what a
+restored conversation draws of the same text. The reader can scroll to
+the first message the record holds (up to the newest 32 MiB of it).
 
 **The transcript's scrollbar counts rows, not pixels** (`chat/rowbar.rs`).
 The list knows the height of only the rows it has built and estimates the

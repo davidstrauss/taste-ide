@@ -16252,27 +16252,6 @@ fn present_image_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, texture: &g
     dialog.present(Some(anchor));
 }
 
-/// A response's prose as the transcript shows it: the markdown preview's
-/// renderer, less a document's inset — 16 on every side, which in the
-/// transcript is one more step, where the rail is the inset — and with a
-/// chat's 6px between blocks rather than a document's 10.
-fn response_prose(
-    text: &str,
-    on_link: Rc<dyn Fn(&str)>,
-    issues: Option<crate::issue_pill::SharedIssueIndex>,
-    base: Option<crate::markdown_view::DocumentBase>,
-) -> gtk::Widget {
-    let rendered = crate::markdown_view::render_in(text, on_link, issues, base);
-    rendered.set_margin_top(0);
-    rendered.set_margin_bottom(0);
-    rendered.set_margin_start(0);
-    rendered.set_margin_end(0);
-    if let Some(blocks) = rendered.downcast_ref::<gtk::Box>() {
-        blocks.set_spacing(6);
-    }
-    rendered
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

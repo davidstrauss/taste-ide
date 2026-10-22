@@ -25,9 +25,29 @@ pub(super) struct RowView {
     shown: Row,
     /// Its line's segments above and below its dot, for a row on the rail.
     pub(super) lines: Option<super::rail::Rail>,
-    /// A streaming answer's buffer: a stream is hundreds of updates, each a
-    /// few words.
-    stream: Option<gtk::TextBuffer>,
+    /// An answer's document, which every change to the answer — its text
+    /// growing, its end, its being shown whole — is drawn into in place.
+    answer: Option<Rc<AnswerView>>,
+}
+
+/// An answer's drawing: its Markdown, drawn as it streams without what is
+/// drawn moving (`markdown_view::Incremental`), and under it the line that
+/// opens the whole of a long one.
+pub(super) struct AnswerView {
+    body: gtk::Box,
+    doc: crate::markdown_view::Incremental,
+    more: gtk::Box,
+    /// What the more line says now: the lines it hides, and whether the
+    /// answer has ended, when the document it opens is the whole of it.
+    more_for: Cell<Option<(usize, bool)>>,
+    /// Text waiting to be drawn, and whether a frame's drawing is asked
+    /// for: a stream is hundreds of updates, each a few words, and they are
+    /// drawn once a frame.
+    pending: RefCell<Option<String>>,
+    queued: Cell<bool>,
+    /// Drawn at least once: a row built, or bound as the list scrolls to
+    /// it, shows its text at once; only the updates after wait a frame.
+    drawn: Cell<bool>,
 }
 
 /// A row's piece of the rail, as [`ChatPane::on_rail`] built it.
@@ -39,15 +59,15 @@ struct Railed {
 impl ChatPane {
     /// `row`'s widgets.
     pub(super) fn build_row(&self, row: &Row) -> RowView {
-        let mut stream = None;
+        let mut answer_view = None;
         let (inner, railed): (gtk::Widget, Option<Railed>) = match &row.kind {
             Kind::User(user) if user.within_turn => {
                 (self.on_rail_line(&self.user_widget(row.id, user)), None)
             }
             Kind::User(user) => (self.user_widget(row.id, user).upcast(), None),
             Kind::Answer(answer) => {
-                let (railed, buffer) = self.answer_widget(row, answer);
-                stream = buffer;
+                let (railed, view) = self.answer_widget(row, answer);
+                answer_view = Some(view);
                 (railed.row.clone().upcast(), Some(railed))
             }
             Kind::Thought(thought) => self.railed(self.thought_widget(row, thought)),
@@ -69,7 +89,7 @@ impl ChatPane {
             widget: outer.upcast(),
             shown: row.clone(),
             lines: railed.map(|railed| railed.rail),
-            stream,
+            answer: answer_view,
         }
     }
 
@@ -82,16 +102,15 @@ impl ChatPane {
     /// most, and none of which moves anything but itself: whether it could.
     pub(super) fn patch_row(&self, view: &mut RowView, row: &Row) -> bool {
         let same = view.shown.dot == row.dot
-            && match (&view.shown.kind, &row.kind, &view.stream) {
-                (Kind::Answer(was), Kind::Answer(is), Some(buffer)) if !is.done => {
-                    let grew = is.text.len() >= was.text.len()
-                        && is.text.is_char_boundary(was.text.len())
-                        && is.text.starts_with(was.text.as_str());
-                    if grew && is.text.len() > was.text.len() {
-                        let mut end = buffer.end_iter();
-                        buffer.insert(&mut end, &is.text[was.text.len()..]);
+            && match (&view.shown.kind, &row.kind, &view.answer) {
+                // Whatever changed of an answer — its text, its end, its
+                // being shown whole — is drawn into the same widgets: an
+                // answer that ended used to be built again, which moved it.
+                (Kind::Answer(was), Kind::Answer(is), Some(answer)) => {
+                    if was != is {
+                        self.fill_answer(answer, row.id, is);
                     }
-                    grew
+                    true
                 }
                 (was, is, _) => was == is,
             };
@@ -489,21 +508,11 @@ impl ChatPane {
         card
     }
 
-    /// An answer: its text as it streams, rendered as Markdown once it has
-    /// ended — clipped long, the whole of it one click away, and whole when
-    /// the turn's suggested replies choose from it.
-    fn answer_widget(&self, row: &Row, answer: &Answer) -> (Railed, Option<gtk::TextBuffer>) {
+    /// An answer: its Markdown, drawn as it streams and as it ends alike —
+    /// clipped long, the whole of it one click away, and whole when the
+    /// turn's suggested replies choose from it.
+    fn answer_widget(&self, row: &Row, answer: &Answer) -> (Railed, Rc<AnswerView>) {
         let rail = row.rail.unwrap_or_default();
-        if !answer.done {
-            let view = gtk::TextView::builder()
-                .editable(false)
-                .cursor_visible(false)
-                .wrap_mode(gtk::WrapMode::WordChar)
-                .build();
-            let buffer = view.buffer();
-            buffer.set_text(&answer.text);
-            return (self.on_rail(&view, rail, row.dot), Some(buffer));
-        }
         let events = self.workspace.events.clone();
         let on_link: Rc<dyn Fn(&str)> =
             Rc::new(
@@ -514,34 +523,87 @@ impl ChatPane {
                     None => events.publish(taste_core::Event::OpenUrlRequested(url.to_string())),
                 },
             );
+        let doc = crate::markdown_view::Incremental::new(
+            on_link,
+            Some(self.issues.clone()),
+            self.document_base(),
+        );
+        // As a response's prose is set: flush to the column, its blocks a
+        // little closer than a document's.
+        doc.root.set_margin_top(0);
+        doc.root.set_margin_bottom(0);
+        doc.root.set_margin_start(0);
+        doc.root.set_margin_end(0);
+        doc.root.set_spacing(6);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        body.set_hexpand(true);
+        body.append(&doc.root);
+        let more = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        body.append(&more);
+        let view = Rc::new(AnswerView {
+            body: body.clone(),
+            doc,
+            more,
+            more_for: Cell::new(None),
+            pending: RefCell::new(None),
+            queued: Cell::new(false),
+            drawn: Cell::new(false),
+        });
+        self.fill_answer(&view, row.id, answer);
+        (self.on_rail(&body, rail, row.dot), view)
+    }
+
+    /// Draw `answer` into its view: the head of a long one — the same head
+    /// as it streams as once it has ended, `clip_prose` deciding it from
+    /// the first lines alone — and the line that opens the rest. Streaming,
+    /// the text is drawn at the next frame, once however many updates
+    /// arrived; ended, at once.
+    fn fill_answer(&self, view: &Rc<AnswerView>, id: super::model::RowId, answer: &Answer) {
         let (head, hidden) = if answer.whole {
             (answer.text.clone(), 0)
         } else {
             crate::chatdoc::clip_prose(&answer.text, PROSE_CLIP_LINES, PROSE_CLIP_CHARS)
         };
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        body.set_hexpand(true);
-        body.append(&response_prose(
-            &head,
-            on_link,
-            Some(self.issues.clone()),
-            self.document_base(),
-        ));
-        if hidden > 0 {
-            let key = self.row_doc(row.id, "response");
-            body.append(&self.more_button(
-                &key,
-                hidden,
-                "Open the whole response in the editor",
-                Document::Text {
-                    title: stamp_now(),
-                    body: answer.text.clone(),
-                    markdown: true,
-                    role: crate::chatdoc::TextRole::Response,
-                },
-            ));
+        if answer.done || !view.drawn.replace(true) {
+            view.pending.borrow_mut().take();
+            view.doc.set_text(&head);
+        } else {
+            *view.pending.borrow_mut() = Some(head);
+            if !view.queued.replace(true) {
+                let weak = Rc::downgrade(view);
+                view.body.add_tick_callback(move |_, _| {
+                    if let Some(view) = weak.upgrade() {
+                        view.queued.set(false);
+                        if let Some(text) = view.pending.borrow_mut().take() {
+                            view.doc.set_text(&text);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                });
+            }
         }
-        (self.on_rail(&body, rail, row.dot), None)
+        // The more line, said anew when what it hides changes, and once
+        // more when the answer ends, so the document it opens is the whole.
+        let wanted = (hidden > 0).then_some((hidden, answer.done));
+        if view.more_for.replace(wanted) != wanted {
+            while let Some(child) = view.more.first_child() {
+                view.more.remove(&child);
+            }
+            if hidden > 0 {
+                let key = self.row_doc(id, "response");
+                view.more.append(&self.more_button(
+                    &key,
+                    hidden,
+                    "Open the whole response in the editor",
+                    Document::Text {
+                        title: stamp_now(),
+                        body: answer.text.clone(),
+                        markdown: true,
+                        role: crate::chatdoc::TextRole::Response,
+                    },
+                ));
+            }
+        }
     }
 
     /// Where a response's paths point, and where its images are: the
