@@ -4,7 +4,8 @@
     "dockerfile": "Containerfile"
   },
   "runArgs": [
-    "--userns=keep-id:uid=1000,gid=1000"
+    "--userns=keep-id:uid=1000,gid=1000",
+    "--hostname=safemode"
   ],
   "containerUser": "agent",
   "workspaceFolder": "/workspace"

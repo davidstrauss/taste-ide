@@ -158,6 +158,26 @@ mod tests {
         crate::security::validate_security(&config, dir.path()).unwrap();
     }
 
+    /// A shell in the baseline says so in its prompt — `agent@safemode` —
+    /// where the container's id stood, which read like any project's
+    /// container (David, 2026-10-22: "I'd like it to be obvious in the
+    /// terminal when that's what's active"). The hostname rather than the
+    /// user: the user names the agent's home, which a conversation's
+    /// continuity needs to be the same in every topology.
+    #[test]
+    fn a_shell_in_the_baseline_says_safemode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ensure_baseline_config_in(dir.path()).unwrap();
+        assert!(
+            config
+                .run_args
+                .iter()
+                .any(|arg| arg == "--hostname=safemode"),
+            "{:?}",
+            config.run_args
+        );
+    }
+
     /// The baseline exists to host an agent, and the conventions for that
     /// are checked at runtime by the hosting probe — but node and the agent
     /// home are decided *here*, in the image, and a baseline missing either
