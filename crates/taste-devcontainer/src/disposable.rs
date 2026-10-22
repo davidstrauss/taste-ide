@@ -198,6 +198,10 @@ report() {{
 }}
 for c in */; do
   c=${{c%/}}
+  # A checkout being built, or one an unfinished placement left and the
+  # next set aside (registry.rs, `staging_path`): neither holds anything
+  # its source does not.
+  case "$c" in *.placing|*.partial-*) continue ;; esac
   [ -e "$c/.git" ] || continue
   report "$c" "$c"
   git -C "$c" submodule foreach --quiet --recursive 'echo "$displaypath"' 2>/dev/null \

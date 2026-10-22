@@ -1775,6 +1775,12 @@ impl EnvironmentRegistry {
         // Each step into the VM's story, since "placing the checkout" is
         // a stage of the banner's bar with View Log beside it, and a stage
         // that writes nothing reads as a stall (David, 2026-09-22).
+        if set_aside_partial(&files, &path)? {
+            self.note_vm(
+                &vm.domain,
+                "an unfinished checkout from an earlier placement was set aside; placing anew",
+            );
+        }
         let sync = if files.exists(&path.join(".git")) {
             self.note_vm(
                 &vm.domain,
@@ -1840,13 +1846,16 @@ impl EnvironmentRegistry {
                 Ok(())
             };
             files.mkdir_all(&workspace_dir)?;
-            let target = path.display().to_string();
+            // Built beside its place and moved in whole (`staging_path`).
+            let staging = staging_path(&path);
+            clear_staging(&files, &staging)?;
+            let target = staging.display().to_string();
             run(
                 &workspace_dir,
                 &["git", "init", "-q", "--initial-branch", &branch, &target],
             )?;
             run(
-                &path,
+                &staging,
                 &[
                     "git",
                     "config",
@@ -1866,7 +1875,7 @@ impl EnvironmentRegistry {
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .filter(|v| !v.is_empty());
                 if let Some(value) = value {
-                    run(&path, &["git", "config", key, &value])?;
+                    run(&staging, &["git", "config", key, &value])?;
                 }
             }
             // Uncommitted work travels as a snapshot ref and is put back
@@ -1902,7 +1911,7 @@ impl EnvironmentRegistry {
                 &peer,
                 vm,
                 &keys,
-                &path,
+                &staging,
                 &crate::peer::PRIMARY_SEED_REFSPECS,
                 &mut |p| {
                     if !p.remote && p.phase == "Writing objects" {
@@ -1929,7 +1938,7 @@ impl EnvironmentRegistry {
             )?;
             if dirty || previous.is_some() {
                 let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;
-                run(&path, &["sh", "-c", &restore])?;
+                run(&staging, &["sh", "-c", &restore])?;
                 let what = if dirty {
                     "the folder's"
                 } else {
@@ -1944,6 +1953,7 @@ impl EnvironmentRegistry {
                     format!("restored {what} uncommitted work into the checkout"),
                 );
             }
+            put_in_place(&files, &staging, &path)?;
             self.note_vm(&vm.domain, "the checkout is placed");
             let mut words = format!("Placed fresh on {branch}");
             if let Some(sent) = &sent {
@@ -2387,6 +2397,15 @@ impl EnvironmentRegistry {
             }
             Ok(out.stdout_utf8())
         };
+        // An earlier placement cut off before it finished — a repository
+        // with no ref in it — is set aside rather than taken for the
+        // environment's checkout or refused forever as someone else's.
+        if set_aside_partial(&files, &path)? {
+            self.note_vm(
+                &vm.domain,
+                format!("{id}: an unfinished checkout from an earlier placement was set aside"),
+            );
+        }
         if files.exists(&path) {
             bail!(
                 "{} already exists in VM {}; it is not this environment's",
@@ -2395,12 +2414,15 @@ impl EnvironmentRegistry {
             );
         }
         files.mkdir_all(&workspace_dir)?;
+        // Built beside its place and moved in whole (`staging_path`).
+        let staging = staging_path(&path);
+        clear_staging(&files, &staging)?;
         run(
             &workspace_dir,
-            &["git", "init", "-q", &path.display().to_string()],
+            &["git", "init", "-q", &staging.display().to_string()],
         )?;
         run(
-            &path,
+            &staging,
             &[
                 "git",
                 "config",
@@ -2409,7 +2431,7 @@ impl EnvironmentRegistry {
             ],
         )?;
         let keys = crate::keys::Keys::for_workspace(&self.workspace_root);
-        crate::peer::push_to_guest(&peer, vm, &keys, &path, &crate::peer::PEER_REFSPECS)?;
+        crate::peer::push_to_guest(&peer, vm, &keys, &staging, &crate::peer::PEER_REFSPECS)?;
         // Where HEAD was: the snapshot's first parent, and the branch that
         // names it. Without a snapshot, the one branch the peer has.
         let snapshot_ref = taste_git::snapshot_ref(id.as_str());
@@ -2431,17 +2453,17 @@ impl EnvironmentRegistry {
         });
         match (at, base, branches.as_slice()) {
             (Some(branch), _, _) => {
-                run(&path, &["git", "checkout", "-q", &branch])?;
+                run(&staging, &["git", "checkout", "-q", &branch])?;
             }
             (None, Some(base), _) => {
                 run(
-                    &path,
+                    &staging,
                     &["git", "checkout", "-q", "--detach", &base.to_string()],
                 )?;
             }
             (None, None, [(name, _)]) => {
                 let branch = name.trim_start_matches("refs/heads/").to_string();
-                run(&path, &["git", "checkout", "-q", &branch])?;
+                run(&staging, &["git", "checkout", "-q", &branch])?;
             }
             (None, None, _) => {
                 bail!("environment {id}'s peer has no snapshot and no single branch to check out")
@@ -2449,8 +2471,9 @@ impl EnvironmentRegistry {
         }
         if base.is_some() {
             let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;
-            run(&path, &["sh", "-c", &restore])?;
+            run(&staging, &["sh", "-c", &restore])?;
         }
+        put_in_place(&files, &staging, &path)?;
         Placement {
             vm: vm.domain.clone(),
             path: path.clone(),
@@ -4892,6 +4915,84 @@ impl EnvironmentRegistry {
     }
 }
 
+/// Where a checkout is built before it takes its place: `<path>.placing`,
+/// renamed over `path` only once it is whole ([`put_in_place`]). Built in
+/// place, a placement cut off midway — the IDE closed, the host lost
+/// power — left a repository there that every later start took for the
+/// checkout: the primary's synced with an empty Personal for good, and an
+/// agent environment's was refused as "already exists" at every retry
+/// (2026-10-22's audit).
+fn staging_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".placing");
+    path.with_file_name(name)
+}
+
+/// An earlier attempt's half-built checkout, removed before this one is
+/// built where it was. It was never anyone's checkout: nothing of the
+/// user's is in it that its source does not still have.
+fn clear_staging(files: &Files, staging: &Path) -> Result<()> {
+    if files.exists(staging) {
+        files
+            .remove(staging, true)
+            .with_context(|| format!("clearing {}", staging.display()))?;
+    }
+    Ok(())
+}
+
+/// `from` renamed to `to` in the guest, beside each other.
+fn rename_in_guest(files: &Files, from: &Path, to: &Path) -> Result<()> {
+    let argv: Vec<String> = vec![
+        "mv".to_string(),
+        "-T".to_string(),
+        from.display().to_string(),
+        to.display().to_string(),
+    ];
+    let out = files
+        .exec(to.parent().unwrap_or(to), &argv)
+        .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+    if !out.success() {
+        bail!(
+            "moving {} to {}: {}",
+            from.display(),
+            to.display(),
+            out.stderr_utf8().trim()
+        );
+    }
+    Ok(())
+}
+
+/// The built checkout, renamed into its place.
+fn put_in_place(files: &Files, staging: &Path, path: &Path) -> Result<()> {
+    rename_in_guest(files, staging, path)
+}
+
+/// A checkout at `path` that a placement from before [`staging_path`]
+/// began and never finished: a repository with not one ref in it — made,
+/// and nothing pushed into it. Set aside as `<path>.partial-<time>`, never
+/// deleted, so the caller places the checkout anew. True when one was.
+/// A repository whose refs git cannot list is left where it is: what it
+/// is cannot be said, so it is not moved.
+fn set_aside_partial(files: &Files, path: &Path) -> Result<bool> {
+    if !files.exists(&path.join(".git")) {
+        return Ok(false);
+    }
+    let argv: Vec<String> = ["git", "for-each-ref", "--count=1", "--format=%(refname)"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let refs = files
+        .exec(path, &argv)
+        .with_context(|| format!("listing the refs of {}", path.display()))?;
+    if !refs.success() || !refs.stdout_utf8().trim().is_empty() {
+        return Ok(false);
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".partial-{}", now_secs()));
+    rename_in_guest(files, path, &path.with_file_name(name))?;
+    Ok(true)
+}
+
 /// The image an environment's running container runs, and what its tag
 /// names now.
 #[derive(Debug, Clone)]
@@ -5219,6 +5320,50 @@ mod tests {
     }
 
     use super::*;
+
+    /// A checkout is built beside its place and moved in whole; a leftover
+    /// half-build is cleared; a repository with no ref in it, left where
+    /// a checkout belongs, is set aside and never deleted; a real one is
+    /// left where it is.
+    #[test]
+    fn a_checkout_takes_its_place_whole_and_a_partial_one_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = Files::Local;
+        let path = dir.path().join("i-0001");
+        let staging = staging_path(&path);
+        assert_eq!(staging, dir.path().join("i-0001.placing"));
+
+        // A leftover half-build is cleared before the next one.
+        std::fs::create_dir_all(staging.join("junk")).unwrap();
+        clear_staging(&files, &staging).unwrap();
+        assert!(!staging.exists());
+
+        // An unfinished placement in the old way: `git init`, nothing more.
+        git2::Repository::init(&path).unwrap();
+        assert!(set_aside_partial(&files, &path).unwrap());
+        assert!(!path.exists());
+        let aside: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            aside.iter().any(|name| name.starts_with("i-0001.partial-")),
+            "{aside:?}"
+        );
+
+        // Built in staging, with a commit, and put in place.
+        let repo = git2::Repository::init(&staging).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tree = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "first", &tree, &[])
+            .unwrap();
+        put_in_place(&files, &staging, &path).unwrap();
+        assert!(path.join(".git").exists() && !staging.exists());
+        // A checkout with refs is the checkout: left where it is.
+        assert!(!set_aside_partial(&files, &path).unwrap());
+        assert!(path.join(".git").exists());
+    }
     use std::os::unix::fs::PermissionsExt;
 
     /// Personal's own request for a rebuild records that it asked, as an
