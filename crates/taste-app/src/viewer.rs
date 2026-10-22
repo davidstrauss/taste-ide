@@ -479,6 +479,74 @@ impl ViewerPage {
                     );
                 });
             }
+            // `present`: the presentation opened from page 2, its window
+            // and page said, drawn to /tmp/probe-present.png, then a page
+            // turned with Right and the window closed.
+            "present" => {
+                let (Some(view), Some(id)) = (self.pdf_view.borrow().clone(), self.pdf_id.get())
+                else {
+                    return;
+                };
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                    let window = present(id, 2, view.upcast_ref());
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(3000),
+                        move || {
+                            let Some(shown) = window.child().and_downcast::<webkit6::WebView>()
+                            else {
+                                return;
+                            };
+                            let say = |shown: &webkit6::WebView,
+                                       when: &'static str,
+                                       fullscreen: bool| {
+                                webkit6::prelude::WebViewExt::evaluate_javascript(
+                                    shown,
+                                    "window.tasteCurrentPage()",
+                                    None,
+                                    None,
+                                    None::<&gtk::gio::Cancellable>,
+                                    move |result| {
+                                        if let Ok(value) = result {
+                                            eprintln!(
+                                            "probe viewer present: {when}, page {}, full screen {fullscreen}",
+                                            value.to_int32()
+                                        );
+                                        }
+                                    },
+                                );
+                            };
+                            say(&shown, "opened", window.is_fullscreen());
+                            let paintable = gtk::WidgetPaintable::new(Some(&window));
+                            let snapshot = gtk::Snapshot::new();
+                            paintable.snapshot(
+                                &snapshot,
+                                f64::from(window.width()),
+                                f64::from(window.height()),
+                            );
+                            if let (Some(node), Some(renderer)) =
+                                (snapshot.to_node(), window.renderer())
+                            {
+                                let texture = renderer.render_texture(&node, None);
+                                let _ = texture.save_to_png("/tmp/probe-present.png");
+                            }
+                            run_js(
+                            &shown,
+                            "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true}))",
+                        );
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(700),
+                                move || {
+                                    say(&shown, "after Right", window.is_fullscreen());
+                                    glib::timeout_add_local_once(
+                                        std::time::Duration::from_millis(500),
+                                        move || window.close(),
+                                    );
+                                },
+                            );
+                        },
+                    );
+                });
+            }
             "auto" => {
                 if let Some(auto) = &self.banner.auto {
                     auto.set_active(true);
@@ -589,8 +657,12 @@ impl ViewerPage {
                 let manager = webkit6::UserContentManager::new();
                 manager.register_script_message_handler("tasteView", None);
                 let single = LAST_SINGLE.with(Cell::get);
-                let view = pdf_view(id, &manager, single);
-                let tools = PdfTools::new(&view, single);
+                let view = pdf_view(
+                    id,
+                    &manager,
+                    &format!("mode={}", if single { "single" } else { "continuous" }),
+                );
+                let tools = PdfTools::new(&view, id, single);
                 {
                     let tools = Rc::downgrade(&tools);
                     manager.connect_script_message_received(Some("tasteView"), move |_, value| {
@@ -969,6 +1041,15 @@ html, body { margin: 0; height: 100%; background: transparent; }
    fitted page: at 12 the whole page stood a few pixels taller than the
    pane, its foot under the edge. */
 body.single .pdfViewer .page { margin: 2px auto; }
+/* Presenting (`present`): the page alone on black, centred, the strip
+   gone, the pointer hidden while it is still. */
+body.presenting { background: #000; }
+body.presenting #map { display: none; }
+body.presenting .pane { inset: 0; }
+body.presenting .pdfViewer { min-height: 100%; display: flex;
+  align-items: center; justify-content: center; }
+body.presenting .pdfViewer .page { margin: 0 auto; box-shadow: none; }
+body.presenting.still, body.presenting.still * { cursor: none; }
 #failed { font: 15px/1.5 system-ui, sans-serif; margin: 15vh auto; max-width: 32em;
   padding: 0 24px; opacity: .8; }
 </style></head>
@@ -1018,8 +1099,13 @@ try {
   // one page at a time fitted whole (David, 2026-10-20: "For single-page,
   // I'd like 'page fit' as the default level. For continuous, 'page
   // width.'"). The mode the tab opens in comes in the address.
+  const params = new URLSearchParams(location.search);
+  // A presentation's window (viewer.rs, `present`): one page at a time,
+  // fitted, from the page the tab was on.
+  const presenting = params.get("present") === "1";
+  document.body.classList.toggle("presenting", presenting);
   const view = {
-    mode: new URLSearchParams(location.search).get("mode") === "single" ? "single" : "continuous",
+    mode: presenting || params.get("mode") === "single" ? "single" : "continuous",
   };
   const fitOf = (mode) => mode === "single" ? "page-fit" : "page-width";
   const scrollModeOf = (mode) => mode === "single" ? ScrollMode.PAGE : ScrollMode.VERTICAL;
@@ -1047,8 +1133,28 @@ try {
     layOut();
     shown.viewer.scrollMode = scrollModeOf(view.mode);
     shown.viewer.currentScaleValue = view.scale;
+    if (presenting) {
+      shown.viewer.currentPageNumber = Math.max(parseInt(params.get("page") || "1", 10) || 1, 1);
+    }
     report();
   }, { once: true });
+  // The page in view, which a presentation starts from.
+  window.tasteCurrentPage = () => shown.doc ? shown.viewer.currentPageNumber : 1;
+  if (presenting) {
+    // A click turns to the next page, as a clicker does.
+    document.addEventListener("click", () => {
+      if (shown.doc) shown.viewer.nextPage();
+    });
+    // The pointer hidden after a moment's stillness, back when it moves.
+    let still = null;
+    const stir = () => {
+      document.body.classList.remove("still");
+      clearTimeout(still);
+      still = setTimeout(() => document.body.classList.add("still"), 1500);
+    };
+    document.addEventListener("mousemove", stir);
+    stir();
+  }
   // The toolbar's: a mode, at its own fit unless a zoom is given, and the
   // page in view kept.
   window.tasteSetView = (mode, scale) => {
@@ -1342,8 +1448,8 @@ try {
   }
   window.tasteMapDraw = draw;
   new ResizeObserver(draw).observe(map);
-  window.tasteMapBuild = () => { if (shown.doc) build(shown.doc); };
-  build(shown.doc);
+  window.tasteMapBuild = () => { if (shown.doc && !presenting) build(shown.doc); };
+  if (!presenting) build(shown.doc);
   window.tasteReadyResolve();
   // The keys a reader pages with. The document scrolls inside a pane, not
   // the page, so the browser's own Page Up and Down — which scroll the
@@ -1943,9 +2049,34 @@ struct PdfTools {
 }
 
 impl PdfTools {
-    fn new(view: &webkit6::WebView, single: bool) -> Rc<Self> {
+    fn new(view: &webkit6::WebView, id: u64, single: bool) -> Rc<Self> {
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         widget.add_css_class("pdf-tools");
+        // Present: the document full screen, a page at a time, from the
+        // page in view.
+        let present_button = gtk::Button::builder()
+            .icon_name("x-office-presentation-symbolic")
+            .tooltip_text("Present full screen")
+            .focus_on_click(false)
+            .css_classes(["flat"])
+            .build();
+        {
+            let view = view.clone();
+            present_button.connect_clicked(move |_| {
+                let from = view.clone();
+                webkit6::prelude::WebViewExt::evaluate_javascript(
+                    &view,
+                    "window.tasteCurrentPage ? window.tasteCurrentPage() : 1",
+                    None,
+                    None,
+                    None::<&gtk::gio::Cancellable>,
+                    move |result| {
+                        let page = result.map(|value| value.to_int32()).unwrap_or(1).max(1);
+                        present(id, page, from.upcast_ref());
+                    },
+                );
+            });
+        }
         let zoom = {
             let (fit_view, step_view) = (view.clone(), view.clone());
             ZoomMenu::new(
@@ -1982,6 +2113,7 @@ impl PdfTools {
         layout.add_css_class("linked");
         layout.append(&continuous);
         layout.append(&single_button);
+        widget.append(&present_button);
         widget.append(&zoom.button);
         widget.append(&gap);
         widget.append(&layout);
@@ -2042,7 +2174,7 @@ fn run_js(view: &webkit6::WebView, script: &str) {
 /// clicks opens in their browser instead.
 /// It opens one page at a time when `single`, and `manager` carries its
 /// reports to the toolbar.
-fn pdf_view(id: u64, manager: &webkit6::UserContentManager, single: bool) -> webkit6::WebView {
+fn pdf_view(id: u64, manager: &webkit6::UserContentManager, query: &str) -> webkit6::WebView {
     register_pdf_scheme();
     let session = webkit6::NetworkSession::new_ephemeral();
     let view = webkit6::WebView::builder()
@@ -2115,12 +2247,61 @@ fn pdf_view(id: u64, manager: &webkit6::UserContentManager, single: bool) -> web
     });
     webkit6::prelude::WebViewExt::load_uri(
         &view,
-        &format!(
-            "{PDF_SCHEME}://{id}/index.html?mode={}",
-            if single { "single" } else { "continuous" }
-        ),
+        &format!("{PDF_SCHEME}://{id}/index.html?{query}"),
     );
     view
+}
+
+/// Present the PDF of `id` from `page`: the page alone, fitted, on black,
+/// in a window of its own full screen on the monitor the IDE is on, one
+/// page at a time (David, 2026-10-21: "a button to show PDFs full screen,
+/// page by page, as a sort of presentation mode"). Right, Left, Space,
+/// Page Up and Down, and a click turn the pages; Home and End go to the
+/// first and the last; Escape ends it.
+fn present(id: u64, page: i32, from: &gtk::Widget) -> gtk::Window {
+    let window = gtk::Window::builder()
+        .title("Presentation")
+        .decorated(false)
+        .css_classes(["presentation"])
+        .build();
+    let parent = from.root().and_downcast::<gtk::Window>();
+    if let Some(parent) = &parent {
+        window.set_transient_for(Some(parent));
+    }
+    let view = pdf_view(
+        id,
+        &webkit6::UserContentManager::new(),
+        &format!("present=1&page={page}"),
+    );
+    window.set_child(Some(&view));
+    // Escape before the page sees it: the page has no way to close its
+    // window.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let window = window.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                if let Some(window) = window.upgrade() {
+                    window.close();
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    window.add_controller(keys);
+    let monitor = parent
+        .as_ref()
+        .and_then(|parent| parent.surface())
+        .and_then(|surface| surface.display().monitor_at_surface(&surface));
+    match monitor {
+        Some(monitor) => window.fullscreen_on_monitor(&monitor),
+        None => window.fullscreen(),
+    }
+    window.present();
+    view.grab_focus();
+    window
 }
 
 #[cfg(test)]
