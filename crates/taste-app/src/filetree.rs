@@ -1383,36 +1383,58 @@ fn replacing_push(sync: &taste_git::SyncStatus) -> Option<(String, usize)> {
 
 /// What a push replacing a branch rewritten here replaces, as the IDE
 /// found it (`SyncStatus::rewritten`): the `replaced` commits on the
-/// remote are the branch's own old copies, and either every change in them
-/// is in the branch — compared change by change, so the push loses nothing
-/// — or `dropped` of them make a change it no longer has, which the push
-/// drops (David, 2026-10-19: "make this tooltip more clear if we've been
-/// able to verify that our local commits include the same work, just
-/// rebased").
-fn rewrite_verdict(replaced: usize, dropped: usize, upstream: &str) -> String {
+/// remote are the branch's own old copies, and the remote's whole change
+/// is either in this branch — judged in aggregate, by content, however the
+/// commits were recut — or it is not, by file (David, 2026-10-19: "make
+/// this tooltip more clear if we've been able to verify that our local
+/// commits include the same work, just rebased"; 2026-10-22: "analyze
+/// whether the changes are the same (or a superset) in aggregate").
+fn rewrite_verdict(replaced: usize, carried: &taste_git::Carried, upstream: &str) -> String {
     let (commits, are) = if replaced == 1 {
         ("commit", "is")
     } else {
         ("commits", "are")
     };
-    match dropped {
-        0 => format!(
+    if carried.whole() {
+        return format!(
             "the {replaced} {commits} on {upstream} {are} this branch's own from before it \
-             was rebased or reworded here, and every change in {} is in this branch, so \
-             nothing is lost",
-            if replaced == 1 { "it" } else { "them" }
-        ),
-        1 => format!(
-            "the {replaced} {commits} on {upstream} {are} this branch's own from before it \
-             was rewritten here, and 1 of them makes a change this branch no longer has, \
-             which the push drops"
-        ),
-        n => format!(
-            "the {replaced} {commits} on {upstream} {are} this branch's own from before it \
-             was rewritten here, and {n} of them make changes this branch no longer has, \
-             which the push drops"
-        ),
+             was rewritten here, and everything {} change is in this branch, so nothing is \
+             lost",
+            if replaced == 1 { "it" } else { "they" }
+        );
     }
+    format!(
+        "the {replaced} {commits} on {upstream} {are} this branch's own from before it was \
+         rewritten here, and {}",
+        loss_words(carried)
+    )
+}
+
+/// What of the remote's change a push would not keep, by file: changes this
+/// branch does not have, which it drops, and files changed differently on
+/// each side, whose version there it replaces.
+fn loss_words(carried: &taste_git::Carried) -> String {
+    let files = |paths: &[String]| -> String {
+        let shown: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
+        match paths.len().saturating_sub(shown.len()) {
+            0 => shown.join(", "),
+            more => format!("{} and {more} more", shown.join(", ")),
+        }
+    };
+    let mut said = Vec::new();
+    if !carried.missing.is_empty() {
+        said.push(format!(
+            "the remote's changes to {} are not in this branch; the push drops them",
+            files(&carried.missing)
+        ));
+    }
+    if !carried.differing.is_empty() {
+        said.push(format!(
+            "{} changed differently there and here; the push replaces their version",
+            files(&carried.differing)
+        ));
+    }
+    said.join(". ")
 }
 
 /// Show a button's face again, in place of its spinner. Only the spinner:
@@ -5990,66 +6012,70 @@ impl FileTree {
                                         "Hold {push_secs} s · refused if the remote moved since \
                                          the last fetch"
                                     );
-                                    *self.push_card.borrow_mut() =
-                                        Some(match replacing {
-                                            Some(replaced) => {
-                                                let card = SyncCard::new(format!(
-                                                    "Replace {upstream}{default_branch}"
-                                                ))
-                                                .fact("Sends", sends)
-                                                .fact("Replaces", count(replaced, "commit"));
-                                                match sync.rewritten {
-                                                    Some(0) => card.fact(
-                                                        "Their changes",
-                                                        "all in this branch; nothing is lost",
-                                                    ),
-                                                    Some(dropped) => card.warning(format!(
-                                                    "{} there {} changes this branch no longer \
-                                                     has; the push drops {}",
-                                                    count(dropped, "commit"),
-                                                    if dropped == 1 { "makes" } else { "make" },
-                                                    if dropped == 1 { "it" } else { "them" }
-                                                )),
-                                                    // A fork's branch rebased onto
-                                                    // its base, as the IDE has no
-                                                    // way to check: what is there
-                                                    // matched nothing here, so it
-                                                    // may be anyone's (review,
-                                                    // 2026-10-20).
-                                                    None => card.warning(format!(
-                                                        "{} there {} no match in this \
-                                                         branch: from before a rebase onto \
-                                                         the base, or someone else's",
-                                                        count(replaced, "commit"),
-                                                        if replaced == 1 { "has" } else { "have" },
-                                                    )),
-                                                }
-                                                .gesture(leased)
-                                            }
-                                            None if sync.push_unknown => {
-                                                SyncCard::new(format!("Push to {upstream}"))
-                                                    .fact(
-                                                        "Sends",
-                                                        format!("up to {}", count(ahead, "commit")),
-                                                    )
-                                                    .fact("Remote tip", "not fetched yet")
-                                                    .gesture("Click to push")
-                                            }
-                                            None if sync.new_branch => {
-                                                SyncCard::new(format!("Create {upstream}"))
-                                                    .fact("Sends", sends)
-                                                    .gesture("Click to push")
-                                            }
-                                            None => SyncCard::new(format!(
-                                                "Push to {upstream}{default_branch}"
+                                    *self.push_card.borrow_mut() = Some(match replacing {
+                                        Some(replaced) => {
+                                            let card = SyncCard::new(format!(
+                                                "Replace {upstream}{default_branch}"
                                             ))
                                             .fact("Sends", sends)
-                                            .gesture(if sync.on_canonical {
+                                            .fact("Replaces", count(replaced, "commit"));
+                                            match &sync.rewritten {
+                                                Some(carried) if carried.whole() => card.fact(
+                                                    "Their changes",
+                                                    "all in this branch; nothing is lost",
+                                                ),
+                                                Some(carried) => {
+                                                    let words = loss_words(carried);
+                                                    let mut first = words.chars();
+                                                    card.warning(match first.next() {
+                                                        Some(c) => {
+                                                            c.to_uppercase().chain(first).collect()
+                                                        }
+                                                        None => words,
+                                                    })
+                                                }
+                                                // A fork's branch rebased onto
+                                                // its base, as the IDE has no
+                                                // way to check: what is there
+                                                // matched nothing here, so it
+                                                // may be anyone's (review,
+                                                // 2026-10-20).
+                                                None => card.warning(format!(
+                                                    "{} there {} no match in this \
+                                                         branch: from before a rebase onto \
+                                                         the base, or someone else's",
+                                                    count(replaced, "commit"),
+                                                    if replaced == 1 { "has" } else { "have" },
+                                                )),
+                                            }
+                                            .gesture(leased)
+                                        }
+                                        None if sync.push_unknown => {
+                                            SyncCard::new(format!("Push to {upstream}"))
+                                                .fact(
+                                                    "Sends",
+                                                    format!("up to {}", count(ahead, "commit")),
+                                                )
+                                                .fact("Remote tip", "not fetched yet")
+                                                .gesture("Click to push")
+                                        }
+                                        None if sync.new_branch => {
+                                            SyncCard::new(format!("Create {upstream}"))
+                                                .fact("Sends", sends)
+                                                .gesture("Click to push")
+                                        }
+                                        None => SyncCard::new(format!(
+                                            "Push to {upstream}{default_branch}"
+                                        ))
+                                        .fact("Sends", sends)
+                                        .gesture(
+                                            if sync.on_canonical {
                                                 format!("Hold {push_secs} s")
                                             } else {
                                                 "Click to push".to_string()
-                                            }),
-                                        });
+                                            },
+                                        ),
+                                    });
                                     if let Some(card) = self.push_card.borrow_mut().as_mut() {
                                         // What ↑ counts, listed under the
                                         // facts.
@@ -9677,8 +9703,8 @@ impl FileTree {
                     .as_ref()
                     .and_then(|s| s.upstream.clone())
                     .unwrap_or_else(|| "the remote".to_string());
-                let what = match sync.as_ref().and_then(|s| s.rewritten) {
-                    Some(dropped) => rewrite_verdict(replaced, dropped, &target),
+                let what = match sync.as_ref().and_then(|s| s.rewritten.as_ref()) {
+                    Some(carried) => rewrite_verdict(replaced, carried, &target),
                     None => format!(
                         "{target} has {replaced} commit{} with no match in this branch: from \
                          before a rebase onto the base, or someone else's",
@@ -10741,14 +10767,27 @@ mod tests {
     /// lost; one that drops changes says how many.
     #[test]
     fn a_rewrite_says_whether_anything_is_lost() {
-        let kept = super::rewrite_verdict(2, 0, "origin/datum-call");
+        let kept = super::rewrite_verdict(2, &taste_git::Carried::default(), "origin/datum-call");
         assert!(kept.contains("nothing is lost"), "{kept}");
         assert!(
             kept.contains("the 2 commits on origin/datum-call are"),
             "{kept}"
         );
-        let lost = super::rewrite_verdict(2, 1, "origin/topic");
-        assert!(lost.contains("1 of them makes a change"), "{lost}");
+        let carried = taste_git::Carried {
+            missing: vec!["page.md".into()],
+            differing: ["a", "b", "c", "d"].map(String::from).to_vec(),
+        };
+        let lost = super::rewrite_verdict(2, &carried, "origin/topic");
+        assert!(
+            lost.contains(
+                "the remote's changes to page.md are not in this branch; the push drops them"
+            ),
+            "{lost}"
+        );
+        assert!(
+            lost.contains("a, b, c and 1 more changed differently there and here"),
+            "{lost}"
+        );
         assert!(!lost.contains("nothing is lost"), "{lost}");
     }
 

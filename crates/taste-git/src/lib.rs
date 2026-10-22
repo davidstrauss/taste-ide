@@ -26,7 +26,7 @@ pub mod private;
 pub mod refs;
 mod relation;
 pub use relation::{
-    is_tracking_key, record_remote_tip, without_secret, Canonical, PullPlan, PushTarget,
+    is_tracking_key, record_remote_tip, without_secret, Canonical, Carried, PullPlan, PushTarget,
     SubmodulePush,
 };
 pub mod review;
@@ -1039,10 +1039,10 @@ pub struct SyncStatus {
     /// The push target's commits this branch lacks ([`SyncStatus::replaces`])
     /// are its own from before it was rewritten here — rebased, reworded,
     /// amended — and `behind` is 0, there being nothing to catch up with:
-    /// how many of them make a change this branch does not, which the push
-    /// replacing them drops (`GitWorkspace::rewrite_dropping`). Only for a
-    /// branch with no base.
-    pub rewritten: Option<usize>,
+    /// what the push replacing them would lose, by content
+    /// (`GitWorkspace::rewrite_dropping`, [`Carried`]). Only for a branch
+    /// with no base.
+    pub rewritten: Option<Carried>,
     /// Commits the push target has that this branch lacks — 0 when they
     /// are its own rewritten ([`SyncStatus::rewritten`]): the header's ↓,
     /// which is always about the branch's own remote copy, where `behind`
@@ -1820,7 +1820,7 @@ mod tests {
             Some(PullPlan::Rewritten {
                 mine: 3,
                 theirs: 2,
-                dropped: 0
+                whole: true
             })
         );
 
@@ -2020,7 +2020,87 @@ mod tests {
         git(&mine, &["rebase", "-q", "main"], "1700000300 +0000");
         let ws = GitWorkspace::discover(&mine).unwrap();
         let sync = ws.sync_status_of("topic").unwrap();
-        assert_eq!(sync.rewritten, Some(0), "{sync:?}");
+        assert_eq!(sync.rewritten, Some(Carried::default()), "{sync:?}");
+    }
+
+    /// Whether a push over the remote's old copies loses anything is
+    /// judged in aggregate, by content: two commits recut here as one,
+    /// under another message, lose nothing; a change the remote has that
+    /// was left out here is named by its file; a file both changed in the
+    /// same lines, differently, is named as differing.
+    #[test]
+    fn what_a_rewrite_would_lose_is_judged_by_content_in_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let write = |cwd: &Path, name: &str, text: &str| {
+            std::fs::write(cwd.join(name), text).unwrap();
+            git(cwd, &["add", name]);
+        };
+        git(root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(root, &["clone", "-q", "remote.git", "mine"]);
+        let mine = root.join("mine");
+        write(&mine, "a.txt", "1\n2\n3\n");
+        git(&mine, &["commit", "-q", "-m", "base"]);
+        git(&mine, &["push", "-q", "origin", "HEAD:main"]);
+        git(&mine, &["switch", "-q", "-c", "topic"]);
+        write(&mine, "form.ts", "email first\n");
+        git(&mine, &["commit", "-q", "-m", "forms: start with email"]);
+        write(&mine, "page.md", "the form inside\n");
+        git(&mine, &["commit", "-q", "-m", "blog: the form inside"]);
+        git(&mine, &["push", "-q", "-u", "origin", "topic"]);
+
+        // Recut: one commit, another message, the same work and more.
+        git(&mine, &["reset", "-q", "--soft", "main"]);
+        write(&mine, "extra.txt", "more\n");
+        git(&mine, &["commit", "-q", "-m", "preview form, email first"]);
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        let sync = ws.sync_status_of("topic").unwrap();
+        assert_eq!(sync.rewritten, Some(Carried::default()), "{sync:?}");
+
+        // Left out here: page.md's change is the remote's alone.
+        git(&mine, &["rm", "-q", "--cached", "page.md"]);
+        git(
+            &mine,
+            &["commit", "-q", "--amend", "-m", "preview form, email first"],
+        );
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        let carried = ws.sync_status_of("topic").unwrap().rewritten.unwrap();
+        assert_eq!(carried.missing, ["page.md"]);
+        assert!(carried.differing.is_empty(), "{carried:?}");
+
+        // Changed differently here: form.ts says otherwise.
+        write(&mine, "page.md", "the form inside\n");
+        write(&mine, "form.ts", "password first\n");
+        git(
+            &mine,
+            &[
+                "commit",
+                "-q",
+                "--amend",
+                "-m",
+                "preview form, password first",
+            ],
+        );
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        let carried = ws.sync_status_of("topic").unwrap().rewritten.unwrap();
+        assert!(carried.missing.is_empty(), "{carried:?}");
+        assert_eq!(carried.differing, ["form.ts"]);
     }
 
     /// A branch pushed, then rewritten here — its first commit reworded,
@@ -2081,7 +2161,7 @@ mod tests {
             Some(PullPlan::Rewritten {
                 mine: 3,
                 theirs: 2,
-                dropped: 0
+                whole: true
             })
         );
         let sync = ws.sync_status_of("topic").unwrap();
@@ -2089,10 +2169,10 @@ mod tests {
             (
                 sync.ahead,
                 sync.behind,
-                sync.rewritten,
+                sync.rewritten.clone(),
                 sync.replaces.clone()
             ),
-            (3, 0, Some(0), Some((pushed.clone(), 2))),
+            (3, 0, Some(Carried::default()), Some((pushed.clone(), 2))),
             "{sync:?}"
         );
 
@@ -2108,7 +2188,7 @@ mod tests {
             Some(PullPlan::Rewritten {
                 mine: 2,
                 theirs: 2,
-                dropped: 1
+                whole: false
             })
         );
 
@@ -2129,7 +2209,7 @@ mod tests {
             Some(PullPlan::Rebase { mine: 2, theirs: 3 })
         );
         let sync = ws.sync_status_of("topic").unwrap();
-        assert_eq!((sync.behind, sync.rewritten), (3, None), "{sync:?}");
+        assert_eq!((sync.behind, sync.rewritten.clone()), (3, None), "{sync:?}");
     }
 
     /// A pull request's branch against the branch it goes into: ⇊ counts
@@ -2203,8 +2283,13 @@ mod tests {
         let canonical = sync.canonical.clone().unwrap();
         assert_eq!((canonical.new, canonical.own), (0, 1), "{sync:?}");
         assert_eq!(
-            (sync.ahead, sync.own_ahead, sync.own_behind, sync.rewritten),
-            (3, 1, 0, Some(0)),
+            (
+                sync.ahead,
+                sync.own_ahead,
+                sync.own_behind,
+                sync.rewritten.clone()
+            ),
+            (3, 1, 0, Some(Carried::default())),
             "the push sends main's two and the branch's one, which is all a \
              pull request shows; the old copy on origin/topic is its own: {sync:?}"
         );

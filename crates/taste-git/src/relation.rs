@@ -56,16 +56,40 @@ pub enum PullPlan {
     /// ([`GitWorkspace::rewrite_dropping`]). Nothing to pull: a rebase onto
     /// them replays the branch onto its own old copy, which is how a
     /// rebase the agent had done was undone (2026-10-19). The push
-    /// replaces them; `dropped` of them make a change the branch does not.
+    /// replaces them; `whole` says everything they change is in the branch
+    /// ([`Carried`]).
     Rewritten {
         mine: usize,
         theirs: usize,
-        dropped: usize,
+        whole: bool,
     },
 }
 
-/// A commit's author, author time, and summary ([`GitWorkspace::written`]).
-type Written = (Vec<u8>, i64, Vec<u8>);
+/// What a push replacing what the remote has with this branch would lose,
+/// judged in aggregate, by content: the remote's whole change since the
+/// two parted, merged into this branch's tip
+/// ([`GitWorkspace::rewrite_dropping`]). Where that merge changes nothing,
+/// this branch has every change the remote made — the same, or more —
+/// however its commits were cut, reworded, or reordered (David,
+/// 2026-10-22: "analyze whether the changes are the same (or a superset)
+/// in aggregate, not just match up commits"). Files by path, sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Carried {
+    /// Files where the remote's change is not in this branch: merging it
+    /// in would change them, cleanly. The push drops those changes.
+    pub missing: Vec<String>,
+    /// Files both sides changed in the same places, differently: merging
+    /// conflicts, so whether the remote's change is in this branch cannot
+    /// be said. The push replaces the remote's version with this one.
+    pub differing: Vec<String>,
+}
+
+impl Carried {
+    /// Everything the remote changed is in this branch: nothing is lost.
+    pub fn whole(&self) -> bool {
+        self.missing.is_empty() && self.differing.is_empty()
+    }
+}
 
 /// The branch a branch is rebased onto to bring a pull request up to date
 /// ([`GitWorkspace::canonical_of`]): the header's ⇊.
@@ -496,10 +520,10 @@ impl GitWorkspace {
                 .then(|| self.rewrite_dropping(branch, mine_tip, theirs_tip))
                 .flatten()
             {
-                Some(dropped) => PullPlan::Rewritten {
+                Some(carried) => PullPlan::Rewritten {
                     mine,
                     theirs,
-                    dropped,
+                    whole: carried.whole(),
                 },
                 None => PullPlan::Rebase { mine, theirs },
             },
@@ -554,9 +578,8 @@ impl GitWorkspace {
     }
 
     /// Whether the commits `there` has that `tip` lacks are `branch`'s own
-    /// from before it was rewritten here, and if so how many of them make
-    /// a change `tip`'s own commits do not — the ones a push replacing
-    /// them drops. Its own when either holds:
+    /// from before it was rewritten here, and if so what a push replacing
+    /// them would lose ([`Carried`]). Its own when either holds:
     ///
     /// - every one of them makes the same change as a commit `tip` has
     ///   that `there` lacks (git's patch-id, as `git cherry` compares) —
@@ -570,7 +593,7 @@ impl GitWorkspace {
     /// rebase to take. A rewrite the agent made in a checkout in a VM
     /// reaches the folder's reflog as the IDE moving the branch, so it
     /// reads the same here.
-    pub fn rewrite_dropping(&self, branch: &str, tip: Oid, there: Oid) -> Option<usize> {
+    pub fn rewrite_dropping(&self, branch: &str, tip: Oid, there: Oid) -> Option<Carried> {
         let (theirs, mine) = self.diverged(tip, there)?;
         if theirs.is_empty() || mine.is_empty() {
             return None;
@@ -587,37 +610,84 @@ impl GitWorkspace {
         if !held && theirs.iter().any(|oid| self.is_merge(*oid)) {
             return None;
         }
-        let dropped = self.without_copy(&theirs, &mine);
-        (dropped == 0 || held).then_some(dropped)
+        // Whose they are is one question, what a push loses another. Its
+        // own when it pointed there, or when each of them makes a change
+        // one of its own commits makes; content alone cannot say whose —
+        // someone's empty commit changes nothing, and so is "here". What
+        // replacing them loses is judged by content, in aggregate.
+        let own = held || self.unmatched(&theirs, &mine) == 0;
+        own.then(|| self.carried(tip, there))
     }
 
-    /// How many of `theirs` have no copy in `mine`: none making the same
-    /// change, and none written by the same author at the same moment under
-    /// the same summary — what a rebase, an amend, or a cherry-pick keeps
-    /// even where the change itself moved. A rebase onto a base whose new
-    /// commits touch the lines around a commit's own gives that commit a
-    /// different patch, and by the change alone it read as dropped: two
-    /// commits the push was said to lose were in the branch under their
-    /// own names (2026-10-22: "I am in the middle of a rebase I just
-    /// started. How could this be true?"). Merges are passed over.
-    fn without_copy(&self, theirs: &[Oid], mine: &[Oid]) -> usize {
-        let written: std::collections::HashSet<Written> =
-            mine.iter().filter_map(|oid| self.written(*oid)).collect();
-        self.unmatched_of(theirs, mine)
-            .into_iter()
-            .filter(|oid| self.written(*oid).is_none_or(|w| !written.contains(&w)))
-            .count()
-    }
-
-    /// Who wrote a commit, when, and its summary: what survives a rebase.
-    fn written(&self, oid: Oid) -> Option<Written> {
-        let commit = self.repo.find_commit(oid).ok()?;
-        let author = commit.author();
-        Some((
-            author.email_bytes().to_vec(),
-            author.when().seconds(),
-            commit.summary_bytes().unwrap_or_default().to_vec(),
-        ))
+    /// What a push of `tip` over `there` would lose ([`Carried`]): `there`
+    /// merged into `tip` from where they parted, and each file the merge
+    /// would leave other than `tip` has it named — `missing` where the
+    /// merge is clean, `differing` where it conflicts. A file the remote
+    /// deleted that `tip` keeps is missing too: its deletion is a change.
+    /// With no common ancestor, or a merge that cannot be made, every file
+    /// the remote has that `tip` does not have alike is differing.
+    fn carried(&self, tip: Oid, there: Oid) -> Carried {
+        let tree = |oid: Oid| self.repo.find_commit(oid).ok().and_then(|c| c.tree().ok());
+        let (Some(ours), Some(theirs)) = (tree(tip), tree(there)) else {
+            return Carried::default();
+        };
+        let merged = self
+            .repo
+            .merge_base(tip, there)
+            .ok()
+            .and_then(tree)
+            .and_then(|base| self.repo.merge_trees(&base, &ours, &theirs, None).ok());
+        let Some(merged) = merged else {
+            return Carried {
+                differing: differing_files(&self.repo, &ours, &theirs),
+                ..Carried::default()
+            };
+        };
+        let mut carried = Carried::default();
+        let mut conflicted = std::collections::BTreeSet::new();
+        if let Ok(conflicts) = merged.conflicts() {
+            for conflict in conflicts.flatten() {
+                let path = [conflict.our, conflict.their, conflict.ancestor]
+                    .into_iter()
+                    .flatten()
+                    .map(|entry| String::from_utf8_lossy(&entry.path).to_string())
+                    .next();
+                if let Some(path) = path {
+                    conflicted.insert(path);
+                }
+            }
+        }
+        // Every file the clean part of the merge leaves, against `tip`'s.
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in merged.iter() {
+            let path = String::from_utf8_lossy(&entry.path).to_string();
+            if conflicted.contains(&path) {
+                continue;
+            }
+            let same = ours
+                .get_path(Path::new(&path))
+                .is_ok_and(|ours| ours.id() == entry.id && ours.filemode() == entry.mode as i32);
+            if !same {
+                carried.missing.push(path.clone());
+            }
+            seen.insert(path);
+        }
+        // And every file of `tip`'s the merge no longer has: deleted there.
+        let _ = ours.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if matches!(
+                entry.kind(),
+                Some(git2::ObjectType::Blob) | Some(git2::ObjectType::Commit)
+            ) {
+                let path = format!("{dir}{}", entry.name().unwrap_or_default());
+                if !seen.contains(&path) && !conflicted.contains(&path) {
+                    carried.missing.push(path);
+                }
+            }
+            git2::TreeWalkResult::Ok
+        });
+        carried.missing.sort();
+        carried.differing = conflicted.into_iter().collect();
+        carried
     }
 
     /// The change a commit makes, to be found again after a rebase: its
@@ -1128,4 +1198,19 @@ fn short_ref(name: &str) -> String {
         .or_else(|| name.strip_prefix("refs/heads/"))
         .unwrap_or(name)
         .to_string()
+}
+
+/// Files whose content `theirs` has and `ours` does not have alike, by
+/// path, sorted: what a push of `ours` over `theirs` replaces, where no
+/// merge could say more.
+fn differing_files(repo: &git2::Repository, ours: &git2::Tree, theirs: &git2::Tree) -> Vec<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    if let Ok(diff) = repo.diff_tree_to_tree(Some(ours), Some(theirs), None) {
+        for delta in diff.deltas() {
+            if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+                paths.insert(path.display().to_string());
+            }
+        }
+    }
+    paths.into_iter().collect()
 }
