@@ -77,6 +77,17 @@ impl Presentation {
         });
         this.draw();
         this.watch();
+        // Kept for as long as its button is: the window holds the button and
+        // nothing else, and every handler here holds only a weak reference.
+        // Dropped with the window's construction, it took the file's monitor
+        // with it, and a click on a length upgraded nothing and did nothing
+        // (2026-10-22: "I'm not sure it actually works at all").
+        {
+            let keep = this.clone();
+            this.widget.connect_destroy(move |_| {
+                let _ = &keep;
+            });
+        }
         this
     }
 
@@ -200,12 +211,29 @@ impl Presentation {
                     gtk::ApplicationInhibitFlags::SUSPEND | gtk::ApplicationInhibitFlags::IDLE,
                     Some("Presenting"),
                 );
-                // 0 is the desktop declining.
+                // 0 is the desktop declining, which is said: a presentation
+                // whose machine can still sleep is one the person thinks is
+                // covered.
                 self.cookie.set((cookie != 0).then_some(cookie));
+                taste_core::app_log::push(
+                    if cookie == 0 { "warn" } else { "info" },
+                    "presentation",
+                    if cookie == 0 {
+                        "presentation mode is on, but the desktop declined to keep the machine \
+                         awake"
+                    } else {
+                        "presentation mode is on: the machine is kept awake"
+                    },
+                );
             }
             (false, Some(cookie)) => {
                 application.uninhibit(cookie);
                 self.cookie.set(None);
+                taste_core::app_log::push(
+                    "info",
+                    "presentation",
+                    "presentation mode ended: the machine may sleep again",
+                );
             }
             _ => {}
         }

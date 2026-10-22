@@ -640,10 +640,15 @@ fn main() -> glib::ExitCode {
                    min-height: 0; background: none; outline: none; }\n\
                  /* The file tree's sync counts — ⇊ ↓ ↑ — in a row beside \
                     the branch name, in a pane whose minimum width decides \
-                    whether the window tiles: a little under a flat \
-                    button's ten pixels a side, so a branch name like \
-                    datum-call keeps its room (filetree.rs). */\n\
-                 button.sync-count { padding-left: 8px; padding-right: 8px; }\n\
+                    whether the window tiles: four pixels a side, well \
+                    under a flat button's ten, so the branch name keeps \
+                    its room (David, 2026-10-22: \"a little closer \
+                    together to give the branch name more room\"). */\n\
+                 button.sync-count { padding-left: 4px; padding-right: 4px; }\n\
+                 /* A count's warning: a badge on its arrow's shoulder, \
+                    ringed in the pane's own ground so the stroke under it \
+                    does not run into it (filetree.rs → arrow_button). */\n\
+                 .arrow-badge { margin-top: 0; margin-right: -2px; }\n\
                  /* A sync count's hover card (sync_card.rs): a tooltip's \
                     dark ground, drawn in the window so a shared window \
                     shows it. */\n\

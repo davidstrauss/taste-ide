@@ -1263,6 +1263,10 @@ fn sync_button_stack(face: &impl IsA<gtk::Widget>) -> gtk::Stack {
     stack
 }
 
+/// The class a sync count wears when it warns: its arrow's badge
+/// ([`arrow_button`]), not a colour of its own.
+const WARNED: &str = "sync-warned";
+
 fn sync_button_with_label(text: &str, tooltip: &str) -> (gtk::Button, gtk::Label) {
     let face = gtk::Label::new(Some(text));
     let button = gtk::Button::builder()
@@ -1310,12 +1314,35 @@ fn push_hold_for(on_canonical: bool, replacing: bool) -> std::time::Duration {
 /// A sync count's button: its drawn arrow (`crate::sync_arrow`) and its
 /// count — glyph, space, number — in a sync button's stack. The count is
 /// the label returned; the arrow is drawn in its colour.
+///
+/// A count that warns — a push that replaces, a pull that rebases — says
+/// so with an amber badge on the arrow's shoulder, raised by giving the
+/// count [`WARNED`]. The whole count in amber read as inviting where it
+/// meant caution (David, 2026-10-22: "I'd prefer to see a yellow badge on
+/// the arrow instead of making the whole arrow + number combo golden").
 fn arrow_button(arrow: crate::sync_arrow::Arrow, tooltip: &str) -> (gtk::Button, gtk::Label) {
     let count = gtk::Label::new(Some(" 0"));
     let face = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let drawn = crate::sync_arrow::SyncArrow::new(arrow);
-    face.append(&drawn);
+    let badge = gtk::Box::builder()
+        .css_classes(["env-badge", "amber", "arrow-badge"])
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Start)
+        .can_target(false)
+        .visible(false)
+        .build();
+    let marked = gtk::Overlay::builder().child(&drawn).build();
+    marked.add_overlay(&badge);
+    face.append(&marked);
     face.append(&count);
+    {
+        let badge = badge.downgrade();
+        count.connect_css_classes_notify(move |count| {
+            if let Some(badge) = badge.upgrade() {
+                badge.set_visible(count.has_css_class(WARNED));
+            }
+        });
+    }
     // The arrow is drawn in the count's colour, so it is drawn again when
     // that changes: the warning class Push wears when it replaces, and the
     // dimming of a disabled button, which reach the count and not it.
@@ -3069,10 +3096,10 @@ impl FileTree {
     /// push to *myself*").
     fn clear_sync_counts(&self) {
         self.push_face.set_label(" 0");
-        self.push_face.remove_css_class("warning");
+        self.push_face.remove_css_class(WARNED);
         self.pull_face.set_label(" 0");
-        self.pull_face.remove_css_class("warning");
-        self.canon_face.remove_css_class("warning");
+        self.pull_face.remove_css_class(WARNED);
+        self.canon_face.remove_css_class(WARNED);
         self.canon_face.set_label(" 0");
         self.canon_button.set_visible(false);
         for button in [&self.push_button, &self.pull_button, &self.canon_button] {
@@ -5925,9 +5952,9 @@ impl FileTree {
                                         format!(" {own}")
                                     });
                                     if replacing.is_some() {
-                                        self.push_face.add_css_class("warning");
+                                        self.push_face.add_css_class(WARNED);
                                     } else {
-                                        self.push_face.remove_css_class("warning");
+                                        self.push_face.remove_css_class(WARNED);
                                     }
                                     // A branch the remote does not have yet
                                     // is worth a push with nothing ahead:
@@ -6059,9 +6086,9 @@ impl FileTree {
                                     // forward").
                                     let rebases = behind > 0 && sync.ahead > 0;
                                     if rebases {
-                                        self.pull_face.add_css_class("warning");
+                                        self.pull_face.add_css_class(WARNED);
                                     } else {
-                                        self.pull_face.remove_css_class("warning");
+                                        self.pull_face.remove_css_class(WARNED);
                                     }
                                     self.pull_button.set_sensitive(
                                         (behind > 0 || stale)
@@ -6127,9 +6154,9 @@ impl FileTree {
                                             self.canon_button.set_visible(true);
                                             self.canon_face.set_label(&format!(" {new}"));
                                             if new > 0 && mine > 0 {
-                                                self.canon_face.add_css_class("warning");
+                                                self.canon_face.add_css_class(WARNED);
                                             } else {
-                                                self.canon_face.remove_css_class("warning");
+                                                self.canon_face.remove_css_class(WARNED);
                                             }
                                             self.canon_button
                                                 .set_sensitive((new > 0 || stale) && writable);
