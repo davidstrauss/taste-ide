@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 12;
+pub const GUIDANCE_REVISION: u32 = 13;
 
 /// When the user's folder last fetched: its `FETCH_HEAD`, which every
 /// fetch writes, as a person reads an age. `None` when it never has.
@@ -349,6 +349,11 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              up, or at once when the user sends you a message — a sleep hears none of \
              these. To check on something every few minutes, call wait again with the \
              same set: each return says where everything it watched stands.\n\n\
+             DEVCONTAINER. .devcontainer/ stays usable by VS Code and Codespaces, and \
+             holds only what building and running the project needs: add no \
+             `customizations.vscode` (extensions, settings) and nothing else only an \
+             editor reads. Leave what is already there as it is, editor customizations \
+             included.\n\n\
              PORTS. A service the user's own programs should reach (a browser, a \
              database client, a debugger) is a port in .devcontainer/devcontainer.json \
              `forwardPorts`, with a `portsAttributes` entry giving its `label` and \
@@ -2376,7 +2381,10 @@ impl McpServer {
                         foo.service with a foo.socket so services start on demand, restart \
                         cleanly, and clients never race the daemon. Keep unit files in the \
                         repo and install them in the Containerfile so the config stays \
-                        portable to VS Code and GitHub Codespaces.",
+                        portable to VS Code and GitHub Codespaces. Portable, not \
+                        furnished: add no customizations.vscode (extensions, settings) or \
+                        anything else only an editor reads, and leave what is already \
+                        there as it is.",
                     "act_accordingly": if safe_mode {
                         "Focus on authoring or fixing the devcontainer configuration \
                          following the conventions above; call environment with include \
@@ -6218,8 +6226,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "7b6972831cfebee66a2219a00a7f0415c5387d928dacf476b3e1e78280d6f3c7";
-        const AT_REVISION: u32 = 12;
+            "d9f129d1af86990f8a319c3f589912de51a45e204e5e6f26898972dee4e2ca9c";
+        const AT_REVISION: u32 = 13;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

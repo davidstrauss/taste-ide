@@ -811,7 +811,8 @@ pub(crate) fn author_prompt() -> String {
      2. Write .devcontainer/Containerfile that installs them, and \
      .devcontainer/devcontainer.json that builds it with \
      \"build\": {\"dockerfile\": \"Containerfile\"}. Keep it usable by VS Code and \
-     Codespaces. This IDE does not apply devcontainer features: install tools in the \
+     Codespaces, and no more: add no customizations.vscode (extensions, settings) or \
+     anything else only an editor reads. This IDE does not apply devcontainer features: install tools in the \
      Containerfile instead. If the checkout has a Taskfile.yml (taskfile.dev), install Task \
      in the Containerfile too (Fedora's package is go-task; either binary name works): the \
      IDE lists and runs the project's tasks through it.\n\

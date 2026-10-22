@@ -440,7 +440,13 @@ to.
 - **Devcontainer configs stay VS Code- and Codespaces-compatible**, and
   services inside them are systemd units, socket-activated where that
   fits. The config is shared across ecosystems; ours is not the only
-  thing that reads it.
+  thing that reads it. Compatible is the whole of it: nothing goes in
+  only for an editor's sake — no `customizations.vscode` extensions or
+  settings — and nothing of that kind already there is taken out (David,
+  2026-10-22: "I don't want stuff added that is unnecessary for
+  compatibility like extensions. Nor should the agent remove them if
+  present, though"). Agents are told so in `taste_mcp::guidance`, the
+  environment tool's conventions, and `devcontainer_ui::author_prompt`.
 - **Credentials are the project's, and never imported from the machine.**
   A project is provisioned with its own file or it is unprovisioned;
   nothing reads a machine-wide credential, and nothing offers to copy one
