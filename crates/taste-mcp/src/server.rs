@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 11;
+pub const GUIDANCE_REVISION: u32 = 12;
 
 /// When the user's folder last fetched: its `FETCH_HEAD`, which every
 /// fetch writes, as a person reads an age. `None` when it never has.
@@ -439,7 +439,11 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              user sees your messages, not your reasoning or your tool calls: before the \
              question, say what you did this turn (edits, commits), and in the question \
              name each thing it asks about and what each choice does. Do not ask what the \
-             user already decided or left to you: act on it and say what you did.",
+             user already decided or left to you: act on it and say what you did. One \
+             decision is one list of replies: alternatives, or with `several` true, ones \
+             that combine. Several decisions — some exclusive, some not — are several \
+             questions in one AskUserQuestion call, each its own single or multi-select, \
+             not one list mixing them.",
     );
     if let Some(memory) = memory {
         text.push_str("\n\n");
@@ -1589,7 +1593,9 @@ impl McpServer {
                      for). Something asked only in a file, a commit, or the backlog has not \
                      been asked. Do not ask what the user already decided or left to you. Call \
                      it last, after your answer and the question are written: the choices \
-                     stand under them. The user can still type anything instead.",
+                     stand under them. They are alternatives, one picked; set `several` when \
+                     they combine instead, any of them together, and they are checkboxes \
+                     sent as one list. The user can still type anything instead.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -1599,6 +1605,10 @@ impl McpServer {
                                 "minItems": 1,
                                 "maxItems": 4,
                                 "description": "the replies, most likely first, each under 120 characters"
+                            },
+                            "several": {
+                                "type": "boolean",
+                                "description": "true when the replies combine rather than exclude one another: checkboxes, every one ticked sent together"
                             }
                         },
                         "required": ["replies"]
@@ -2200,6 +2210,7 @@ impl McpServer {
                 self.workspace.events.publish(Event::SuggestedReplies {
                     env: env.clone(),
                     replies,
+                    several: args["several"].as_bool().unwrap_or(false),
                 });
                 // Not "end your turn now": an agent that called this before
                 // answering was told to stop there, and ended a turn the
@@ -6207,8 +6218,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "6addf985b5f32e806a5f276c99b68e22aba173bf7ec679189bd707c53d641f42";
-        const AT_REVISION: u32 = 11;
+            "7b6972831cfebee66a2219a00a7f0415c5387d928dacf476b3e1e78280d6f3c7";
+        const AT_REVISION: u32 = 12;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

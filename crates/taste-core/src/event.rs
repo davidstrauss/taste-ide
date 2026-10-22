@@ -162,11 +162,13 @@ pub enum Event {
     /// nothing was written, and the user chooses a side. Empty: resolved.
     FolderConflict { paths: Vec<std::path::PathBuf> },
     /// An environment's agent offered the user replies to its last
-    /// question (`suggest_replies`): its chat shows them as buttons, and a
-    /// click sends one as the user's message.
+    /// question (`suggest_replies`): its chat shows them as choices, and
+    /// Send sends the one picked — or, when `several` may be picked
+    /// together, every one ticked — as the user's message.
     SuggestedReplies {
         env: crate::environment::EnvironmentId,
         replies: Vec<String>,
+        several: bool,
     },
     MigrationNotice {
         env: crate::environment::EnvironmentId,

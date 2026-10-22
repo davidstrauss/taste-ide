@@ -4512,9 +4512,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
 
                     // An agent's suggested replies, to its own chat.
-                    Event::SuggestedReplies { env, replies } => {
+                    Event::SuggestedReplies {
+                        env,
+                        replies,
+                        several,
+                    } => {
                         if let Some(pane) = chats.pane_for(&env) {
-                            pane.offer_replies(replies);
+                            pane.offer_replies(replies, several);
                         }
                     }
                     Event::TaskOutput { env, name, lines } => {

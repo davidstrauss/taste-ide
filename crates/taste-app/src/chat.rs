@@ -559,12 +559,13 @@ fn pin_text(text: &str, attachments: &[(String, ContentBlock)]) -> String {
 /// 2026-10-08: "If I haven't chosen a reply yet, I should still see the
 /// options on restoring the IDE after closing it"). None when a message
 /// after it answered them, or the server refused them.
-fn replayed_replies(records: &[model::Record]) -> Vec<String> {
+fn replayed_replies(records: &[model::Record]) -> (Vec<String>, bool) {
     let mut replies = Vec::new();
+    let mut several = false;
     let mut call: Option<String> = None;
-    let recover = |replies: &mut Vec<String>,
-                   input: Option<&serde_json::Value>,
-                   status: Option<ToolCallStatus>| {
+    let mut recover = |replies: &mut Vec<String>,
+                       input: Option<&serde_json::Value>,
+                       status: Option<ToolCallStatus>| {
         if status == Some(ToolCallStatus::Failed) {
             replies.clear();
             return;
@@ -572,6 +573,7 @@ fn replayed_replies(records: &[model::Record]) -> Vec<String> {
         let offered = input.map(offered_replies).unwrap_or_default();
         if !offered.is_empty() {
             *replies = offered;
+            several = input.is_some_and(|input| input["several"].as_bool() == Some(true));
         }
     };
     for record in records {
@@ -601,7 +603,7 @@ fn replayed_replies(records: &[model::Record]) -> Vec<String> {
             _ => {}
         }
     }
-    replies
+    (replies, several)
 }
 
 /// Where a prompt sent now starts: queued behind the turn under way, when
@@ -742,6 +744,9 @@ pub struct ChatPane {
     /// Offered during the turn, shown when it ends: a question is answered
     /// once it has been asked, not while the agent is still writing it.
     pending_replies: RefCell<Vec<String>>,
+    /// The pending replies combine — checkboxes, every one ticked sent
+    /// together — rather than exclude one another.
+    replies_several: Cell<bool>,
     /// The card's answer buttons, rebuilt per request from the options the
     /// agent offered — every one of them, which is the whole of i-0025.
     permission_answers: adw::WrapBox,
@@ -3496,6 +3501,7 @@ impl ChatPane {
             replies_bar,
             replies_box,
             pending_replies: RefCell::new(Vec::new()),
+            replies_several: Cell::new(false),
             revive_bar,
             revive_label,
             revive_queue: RefCell::new(std::collections::VecDeque::new()),
@@ -7993,8 +7999,9 @@ impl ChatPane {
 
     /// The agent offered replies to its question (`suggest_replies`):
     /// held until its turn ends, then drawn as buttons (`show_replies`).
-    pub fn offer_replies(self: &Rc<Self>, replies: Vec<String>) {
+    pub fn offer_replies(self: &Rc<Self>, replies: Vec<String>, several: bool) {
         *self.pending_replies.borrow_mut() = replies;
+        self.replies_several.set(several);
         if !self.busy.get() {
             self.show_replies();
         }
@@ -8027,20 +8034,26 @@ impl ChatPane {
         // One radio a reply, the likeliest first and picked, and a reply of
         // the user's own as the last, as the question card has it; Send
         // sends the one picked the way Dispatch sends a typed one, which
-        // leaves whatever is half-typed there alone.
+        // leaves whatever is half-typed there alone. Replies that combine
+        // (`several`) are checkboxes instead, none ticked, and Send sends
+        // every one ticked together (David, 2026-10-21: "I sometimes want
+        // the first and third options. Could these be checkboxes?").
+        let several = self.replies_several.get();
         let mut picks: Vec<(gtk::CheckButton, String)> = Vec::new();
         let mut leader: Option<gtk::CheckButton> = None;
         for reply in &replies {
             let button = gtk::CheckButton::new();
-            match &leader {
-                Some(leader) => button.set_group(Some(leader)),
-                None => {
-                    button.set_active(true);
-                    leader = Some(button.clone());
+            if !several {
+                match &leader {
+                    Some(leader) => button.set_group(Some(leader)),
+                    None => {
+                        button.set_active(true);
+                        leader = Some(button.clone());
+                    }
                 }
             }
             self.replies_box
-                .append(&question_option(&button, reply, None, false));
+                .append(&question_option(&button, reply, None, several));
             picks.push((button, reply.clone()));
         }
         let own = gtk::CheckButton::builder()
@@ -8091,8 +8104,28 @@ impl ChatPane {
             let (weak, own, entry) = (Rc::downgrade(self), own.clone(), entry.clone());
             Rc::new(move || {
                 let Some(pane) = weak.upgrade() else { return };
-                let reply = if own.is_active() {
-                    entry.text().trim().to_string()
+                let typed = entry.text().trim().to_string();
+                let reply = if several {
+                    // Every one ticked, the user's own last, as one list.
+                    let mut chosen: Vec<String> = picks
+                        .iter()
+                        .filter(|(button, _)| button.is_active())
+                        .map(|(_, reply)| reply.clone())
+                        .collect();
+                    if own.is_active() && !typed.is_empty() {
+                        chosen.push(typed);
+                    }
+                    match chosen.len() {
+                        0 => String::new(),
+                        1 => chosen.remove(0),
+                        _ => chosen
+                            .iter()
+                            .map(|reply| format!("- {reply}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    }
+                } else if own.is_active() {
+                    typed
                 } else {
                     picks
                         .iter()
@@ -10398,7 +10431,8 @@ impl ChatPane {
             *self.last_prompt.borrow_mut() = Some(Item::Row(id));
             self.pinned_prompt_label.set_label(&text);
         }
-        *self.pending_replies.borrow_mut() = replies;
+        *self.pending_replies.borrow_mut() = replies.0;
+        self.replies_several.set(replies.1);
         // A message sent while the record was being read is after it.
         self.reattach_pending_cards();
         self.drawing_history.set(false);
@@ -11722,7 +11756,7 @@ impl ChatPane {
                     TextContent::new(
                         serde_json::json!({
                             "shown": 3,
-                            "next": "The buttons appear under your last message when your \
+                            "next": "The choices appear under your last message when your \
                                      turn ends. If your answer or the question is not \
                                      written yet, write it now; then end your turn. The \
                                      user's pick, or whatever they type instead, arrives as \
@@ -11756,7 +11790,10 @@ impl ChatPane {
                         pane.settle_replayed_replies(true);
                     });
                 } else {
-                    self.offer_replies(offers);
+                    // `TASTE_PROBE_REPLIES=several`: replies that combine,
+                    // as checkboxes.
+                    let several = std::env::var("TASTE_PROBE_REPLIES").as_deref() == Ok("several");
+                    self.offer_replies(offers, several);
                 }
             }
             Ok("stopped") => {
