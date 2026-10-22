@@ -1938,6 +1938,91 @@ mod tests {
         );
     }
 
+    /// A branch rebased onto a base whose new commit changed the lines
+    /// around one of its own: that commit's patch is not the one pushed,
+    /// but it is the same commit — its author, author time, and summary
+    /// kept — so the push replaces it and drops nothing.
+    #[test]
+    fn a_commit_whose_patch_a_rebase_changed_is_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &Path, args: &[&str], at: &str| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_AUTHOR_DATE", at)
+                .env("GIT_COMMITTER_DATE", at)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let lines = |changed: &[(usize, &str)]| {
+            (1..=10)
+                .map(|n| {
+                    changed
+                        .iter()
+                        .find(|(at, _)| *at == n)
+                        .map_or(format!("line {n}"), |(_, text)| text.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        git(
+            root,
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+            "1700000000 +0000",
+        );
+        git(
+            root,
+            &["clone", "-q", "remote.git", "mine"],
+            "1700000000 +0000",
+        );
+        let mine = root.join("mine");
+        std::fs::write(mine.join("f.txt"), lines(&[])).unwrap();
+        git(&mine, &["add", "f.txt"], "1700000000 +0000");
+        git(&mine, &["commit", "-q", "-m", "base"], "1700000000 +0000");
+        git(
+            &mine,
+            &["push", "-q", "origin", "HEAD:main"],
+            "1700000000 +0000",
+        );
+        git(&mine, &["switch", "-q", "-c", "topic"], "1700000000 +0000");
+        std::fs::write(mine.join("f.txt"), lines(&[(5, "mine")])).unwrap();
+        git(
+            &mine,
+            &["commit", "-q", "-am", "change line 5"],
+            "1700000100 +0000",
+        );
+        git(
+            &mine,
+            &["push", "-q", "-u", "origin", "topic"],
+            "1700000100 +0000",
+        );
+        // main changes line 3, inside the topic commit's context.
+        git(&mine, &["switch", "-q", "main"], "1700000200 +0000");
+        std::fs::write(mine.join("f.txt"), lines(&[(3, "main's")])).unwrap();
+        git(
+            &mine,
+            &["commit", "-q", "-am", "change line 3"],
+            "1700000200 +0000",
+        );
+        git(&mine, &["push", "-q", "origin", "main"], "1700000200 +0000");
+        git(&mine, &["switch", "-q", "topic"], "1700000300 +0000");
+        git(&mine, &["rebase", "-q", "main"], "1700000300 +0000");
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        let sync = ws.sync_status_of("topic").unwrap();
+        assert_eq!(sync.rewritten, Some(0), "{sync:?}");
+    }
+
     /// A branch pushed, then rewritten here — its first commit reworded,
     /// the rest replayed, as the agent did to `datum-call` (2026-10-19) —
     /// diverges from its push target only by its own old copies. Nothing

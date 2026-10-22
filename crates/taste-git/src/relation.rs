@@ -64,6 +64,9 @@ pub enum PullPlan {
     },
 }
 
+/// A commit's author, author time, and summary ([`GitWorkspace::written`]).
+type Written = (Vec<u8>, i64, Vec<u8>);
+
 /// The branch a branch is rebased onto to bring a pull request up to date
 /// ([`GitWorkspace::canonical_of`]): the header's ⇊.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,8 +587,37 @@ impl GitWorkspace {
         if !held && theirs.iter().any(|oid| self.is_merge(*oid)) {
             return None;
         }
-        let dropped = self.unmatched(&theirs, &mine);
+        let dropped = self.without_copy(&theirs, &mine);
         (dropped == 0 || held).then_some(dropped)
+    }
+
+    /// How many of `theirs` have no copy in `mine`: none making the same
+    /// change, and none written by the same author at the same moment under
+    /// the same summary — what a rebase, an amend, or a cherry-pick keeps
+    /// even where the change itself moved. A rebase onto a base whose new
+    /// commits touch the lines around a commit's own gives that commit a
+    /// different patch, and by the change alone it read as dropped: two
+    /// commits the push was said to lose were in the branch under their
+    /// own names (2026-10-22: "I am in the middle of a rebase I just
+    /// started. How could this be true?"). Merges are passed over.
+    fn without_copy(&self, theirs: &[Oid], mine: &[Oid]) -> usize {
+        let written: std::collections::HashSet<Written> =
+            mine.iter().filter_map(|oid| self.written(*oid)).collect();
+        self.unmatched_of(theirs, mine)
+            .into_iter()
+            .filter(|oid| self.written(*oid).is_none_or(|w| !written.contains(&w)))
+            .count()
+    }
+
+    /// Who wrote a commit, when, and its summary: what survives a rebase.
+    fn written(&self, oid: Oid) -> Option<Written> {
+        let commit = self.repo.find_commit(oid).ok()?;
+        let author = commit.author();
+        Some((
+            author.email_bytes().to_vec(),
+            author.when().seconds(),
+            commit.summary_bytes().unwrap_or_default().to_vec(),
+        ))
     }
 
     /// The change a commit makes, to be found again after a rebase: its
