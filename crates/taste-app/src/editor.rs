@@ -1794,6 +1794,12 @@ impl Editor {
             for page in self.pages.borrow().values() {
                 crate::palette::clear_highlight(page.buffer.upcast_ref());
             }
+            // A PDF's lit hit, too: pdf.js's find keeps it lit until told.
+            for surface in self.surfaces.borrow().values() {
+                if let SurfaceKind::View(page) = &surface.kind {
+                    page.clear_find();
+                }
+            }
             return;
         }
         let Some(tab) = self.tabs.selected_page() else {

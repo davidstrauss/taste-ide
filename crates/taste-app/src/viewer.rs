@@ -553,6 +553,43 @@ impl ViewerPage {
                     );
                 });
             }
+            // `find`: "Page" lit by the find, then the search cleared, the
+            // lit spans counted before and after.
+            "find" => {
+                let Some(view) = self.pdf_view.borrow().clone() else {
+                    return;
+                };
+                let count = |view: &webkit6::WebView, when: &'static str| {
+                    webkit6::prelude::WebViewExt::evaluate_javascript(
+                        view,
+                        "document.querySelectorAll('.textLayer .highlight').length",
+                        None,
+                        None,
+                        None::<&gtk::gio::Cancellable>,
+                        move |result| {
+                            if let Ok(value) = result {
+                                eprintln!("probe viewer find: {when}, {} lit", value.to_int32());
+                            }
+                        },
+                    );
+                };
+                glib::timeout_add_local_once(std::time::Duration::from_millis(2000), move || {
+                    run_js(&view, "window.tasteFind('Page', false, 1)");
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(1500),
+                        move || {
+                            count(&view, "found");
+                            run_js(&view, "window.tasteFindClear()");
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(800),
+                                move || {
+                                    count(&view, "cleared");
+                                },
+                            );
+                        },
+                    );
+                });
+            }
             "auto" => {
                 if let Some(auto) = &self.banner.auto {
                     auto.set_active(true);
@@ -699,6 +736,13 @@ impl ViewerPage {
         };
         shown.set_vexpand(true);
         self.content.append(&shown);
+    }
+
+    /// The search is over: the query lit by [`Self::find`] unlit.
+    pub fn clear_find(&self) {
+        if let Some(view) = self.pdf_view.borrow().as_ref() {
+            run_js(view, "window.tasteFindClear && window.tasteFindClear()");
+        }
     }
 
     /// TASTE_PROBE_LINK only: the page in view, printed.
@@ -1251,6 +1295,12 @@ try {
       pages.push(content.items.map((item) => (item.str || "") + (item.hasEOL ? "\n" : "")).join(""));
     }
     return JSON.stringify(pages);
+  };
+  // The search over: the query unlit, as pdf.js's own find bar unlights
+  // it when it closes — a closed search left "where" lit on the slide
+  // (David, 2026-10-21).
+  window.tasteFindClear = () => {
+    for (const it of [shown, behind]) it.eventBus.dispatch("findbarclose", { source: null });
   };
   // A hit chosen in the find's listing: its page, and the query lit on it
   // by pdf.js's own find.
