@@ -1055,6 +1055,35 @@ impl Supervisor {
         self.moving.lock().unwrap().is_some()
     }
 
+    /// Whether this environment's container exists, as podman says: `Err`
+    /// when podman could not be asked, which is not "no".
+    pub async fn container_exists(&self) -> Result<bool> {
+        let status = self
+            .podman(&["container".into(), "exists".into(), self.container_name()])
+            .status()
+            .await
+            .context("asking podman for the container")?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => bail!("podman could not say whether the container exists ({status})"),
+        }
+    }
+
+    /// The refusal a start gets while the environment is moving: its
+    /// checkout is being carried out of the VM it would start in, and a
+    /// container started there wrote into a copy the move then deleted
+    /// (2026-10-22's audit). The move starts it where it lands.
+    fn refuse_while_moving(&self) -> Result<()> {
+        if self.is_moving() {
+            bail!(
+                "{} is moving to another VM; it starts there when the move ends",
+                self.env.id
+            );
+        }
+        Ok(())
+    }
+
     /// See [`Supervisor::waker`]'s field: called by a start whose VM is not
     /// up, before anything else is tried.
     pub fn set_waker(&self, waker: Placer) {
@@ -3785,6 +3814,7 @@ impl Supervisor {
     }
 
     async fn reload_reporting(&self) -> Result<()> {
+        self.refuse_while_moving()?;
         if self.inside {
             bail!(
                 "the IDE is running inside this devcontainer; rebuild it from \
@@ -3843,6 +3873,7 @@ impl Supervisor {
     /// passed over by `resolve_config` until one of its files changes, so
     /// a broken build is not retried at every launch.
     pub async fn reload_baseline(&self) -> Result<()> {
+        self.refuse_while_moving()?;
         if self.inside {
             bail!("the IDE is running inside this devcontainer; nothing to bring up from here");
         }

@@ -224,10 +224,20 @@ impl Placement {
         serde_json::from_str(&text).ok()
     }
 
+    /// Written whole or not at all: a part file, synced, then renamed over
+    /// the last. A placement cut off by a power loss read as none, and the
+    /// environment was placed again from a peer with nothing in it
+    /// (2026-10-22's audit).
     fn write(&self, env_dir: &Path) -> Result<()> {
+        use std::io::Write;
         let path = env_dir.join(Self::FILE);
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)
-            .with_context(|| format!("writing {}", path.display()))
+        let part = env_dir.join(format!("{}.part", Self::FILE));
+        let mut file =
+            std::fs::File::create(&part).with_context(|| format!("writing {}", part.display()))?;
+        file.write_all(serde_json::to_string_pretty(self)?.as_bytes())
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("writing {}", part.display()))?;
+        std::fs::rename(&part, &path).with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -4612,10 +4622,36 @@ impl EnvironmentRegistry {
         // Said as its state from here to the start at the end, so the row,
         // the startup page, and the chat all show a move under way rather
         // than an environment at rest (`Supervisor::begin_move`).
-        supervisor.begin_move(&format!("{moving}: saving its uncommitted work"));
+        supervisor.begin_move(&format!("{moving}: stopping its container"));
+
+        // The container stops first, and is seen to be gone, so the
+        // snapshot after it is the last word on the checkout: taken first,
+        // anything written between it and the stop — a dev server's
+        // flush, the agent's last edit in the stop's grace — was in no
+        // copy but the old checkout, which the move then deletes
+        // (2026-10-22's audit).
+        let stopped = async {
+            supervisor.stop_orderly().await?;
+            if supervisor.container_exists().await? {
+                bail!("its container is still there after the stop");
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = stopped {
+            self.note_vm(&old_domain, format!("{env}: stopping its container: {e:#}"));
+            supervisor.end_move(was_running);
+            if was_running {
+                if let Err(again) = supervisor.reload().await {
+                    tracing::warn!("{env} did not start again in VM {old_domain}: {again:#}");
+                }
+            }
+            return Err(e.context("stopping its container before the move"));
+        }
 
         // Nothing moves without a fresh snapshot: it is what carries the
         // uncommitted work.
+        supervisor.move_step(&format!("{moving}: saving its uncommitted work"));
         let for_snapshot = supervisor.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
             for_snapshot.snapshot_blocking()?;
@@ -4625,13 +4661,14 @@ impl EnvironmentRegistry {
         .context("the snapshot did not finish")
         .and_then(|done| done.context("snapshotting before the move"));
         if let Err(e) = snapshot {
-            // Nothing stopped yet: it stands as it was.
-            supervisor.end_move(false);
+            // Stopped, and nothing carried: it is started again where it is.
+            supervisor.end_move(was_running);
+            if was_running {
+                if let Err(again) = supervisor.reload().await {
+                    tracing::warn!("{env} did not start again in VM {old_domain}: {again:#}");
+                }
+            }
             return Err(e);
-        }
-        supervisor.move_step(&format!("{moving}: stopping its container"));
-        if let Err(e) = supervisor.stop_orderly().await {
-            self.note_vm(&old_domain, format!("{env}: stopping its container: {e:#}"));
         }
         // Everything up to the checkout's placement leaves the environment
         // where it was: a failure there puts it back as it stood — its
@@ -4771,6 +4808,39 @@ impl EnvironmentRegistry {
     ) -> Result<String> {
         let old_domain = old_domain.to_string();
         let old_path = old_path.to_path_buf();
+        // Nothing of the old copy goes until it is seen to hold nothing this
+        // machine lacks: its commits, its stashes, and its working tree, as
+        // the window's close judges a VM (`disposable`). One that does — or
+        // that cannot be looked at — stays, with its VM, and says why.
+        let pool = self.pool();
+        let old_vm = pool
+            .all_vms()
+            .await
+            .ok()
+            .and_then(|vms| vms.into_iter().find(|vm| vm.domain == old_domain));
+        let unique = match &old_vm {
+            Some(vm) => crate::disposable::unique_to(vm, env.as_str(), supervisor.peer())
+                .await
+                .unwrap_or_else(|e| vec![format!("it could not be looked at: {e:#}")]),
+            // Gone already: there is nothing left to lose or to remove.
+            None => Vec::new(),
+        };
+        if !unique.is_empty() {
+            let note = format!(
+                "{env}: its old checkout and VM {old_domain} are kept, holding what this \
+                 machine lacks — {}",
+                unique.join("; ")
+            );
+            self.note_vm(&old_domain, note.clone());
+            taste_core::app_log::push("warn", "environments", &note);
+            supervisor.end_move(was_running);
+            if was_running {
+                if let Err(e) = supervisor.reload().await {
+                    tracing::warn!("{env} did not start again after its move: {e:#}");
+                }
+            }
+            return Ok(target.domain);
+        }
         // The old copy, through the old VM's files service; best effort,
         // since the VM may go entirely below.
         let old_keeper = self.keepers.lock().unwrap().get(&old_domain).cloned();
@@ -4789,7 +4859,6 @@ impl EnvironmentRegistry {
             .iter()
             .any(|s| s.checkout().vm() == Some(old_domain.as_str()));
         if !still_used {
-            let pool = self.pool();
             if let Some(vm) = pool
                 .all_vms()
                 .await
@@ -4888,15 +4957,19 @@ fn now_secs() -> u64 {
 /// A podman volume out of `substrate` into a tar file on this host;
 /// `false` when there is no such volume to carry.
 fn export_volume(substrate: &Substrate, volume: &str, to: &Path) -> Result<bool> {
-    let exists = substrate
+    // 1 is podman's "no such volume"; anything else but 0 is podman not
+    // answering, which read as "nothing to carry" and the move went on
+    // without the agent's conversation (2026-10-22's audit).
+    let status = substrate
         .std_command(&[])
         .args(["volume", "exists", volume])
         .stdin(std::process::Stdio::null())
         .status()
-        .context("asking podman for the volume")?
-        .success();
-    if !exists {
-        return Ok(false);
+        .context("asking podman for the volume")?;
+    match status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(false),
+        _ => bail!("podman could not say whether volume {volume} exists ({status})"),
     }
     let file = std::fs::File::create(to).with_context(|| format!("creating {}", to.display()))?;
     let out = substrate

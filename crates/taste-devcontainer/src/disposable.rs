@@ -355,6 +355,68 @@ pub enum Verdict {
 /// mark it when nothing on it is missing here, or take back any marker it
 /// had when something is.
 pub async fn look_and_mark(vm: &Vm, stop_containers: bool, recheck: bool) -> Result<Verdict> {
+    let (report, stdout) = match look(vm, stop_containers).await {
+        Ok(look) => look,
+        Err(e) => {
+            withdraw(&vm.domain);
+            return Err(e);
+        }
+    };
+    let reasons = unique_content(&report, &vm.workspace_root);
+    if reasons.is_empty() {
+        let places: Vec<String> = report.checkouts.iter().map(|c| c.place.clone()).collect();
+        let count = places.len();
+        write_marker(vm, places)?;
+        if recheck {
+            use sha2::Digest;
+            let digest: String = sha2::Sha256::digest(&stdout)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let path = recheck_path(&vm.domain);
+            std::fs::write(&path, recheck_script(vm, &digest))
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+        Ok(Verdict::Marked { checkouts: count })
+    } else {
+        withdraw(&vm.domain);
+        Ok(Verdict::Kept { reasons })
+    }
+}
+
+/// What `env`'s checkout on `vm` — and the submodules in it — holds that
+/// its peer here, `peer`, lacks, in words; empty when nothing, or when it
+/// has no checkout there. The peer, not the folder, because an agent
+/// environment's commits and snapshots are fetched into its own (the
+/// folder holds only the branches it publishes); the primary's peer is
+/// the folder. A submodule of an agent environment's is held to a clone
+/// its refs-only peer does not have, so its old checkout is kept: safe,
+/// at a VM's cost. A move asks this of the VM it leaves before it deletes
+/// the old copy (2026-10-22's audit: deleted unchecked, what was written
+/// after the move's snapshot went with it). The VM's containers are left
+/// running and no marker is written or taken back: other environments may
+/// still be using it.
+pub async fn unique_to(vm: &Vm, env: &str, peer: &Path) -> Result<Vec<String>> {
+    let (report, _) = look(vm, false).await?;
+    let mine = |place: &str| place == env || place.starts_with(&format!("{env}/"));
+    let report = Report {
+        checkouts: report
+            .checkouts
+            .into_iter()
+            .filter(|checkout| mine(&checkout.place))
+            .collect(),
+        failures: report
+            .failures
+            .into_iter()
+            .filter(|failure| mine(failure.split(':').next().unwrap_or_default()))
+            .collect(),
+    };
+    Ok(unique_content(&report, peer))
+}
+
+/// The look itself: the report script run in the guest over ssh, its
+/// report read, and its output kept for a digest.
+async fn look(vm: &Vm, stop_containers: bool) -> Result<(Report, Vec<u8>)> {
     let script = report_script(
         &crate::provision::guest_workspace_dir(&vm.workspace_root),
         stop_containers,
@@ -375,33 +437,13 @@ pub async fn look_and_mark(vm: &Vm, stop_containers: bool, recheck: bool) -> Res
     }
     let output = child.wait_with_output().await?;
     if !output.status.success() {
-        withdraw(&vm.domain);
         anyhow::bail!(
             "the guest did not report: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     let report = parse_report(&String::from_utf8_lossy(&output.stdout))?;
-    let reasons = unique_content(&report, &vm.workspace_root);
-    if reasons.is_empty() {
-        let places: Vec<String> = report.checkouts.iter().map(|c| c.place.clone()).collect();
-        let count = places.len();
-        write_marker(vm, places)?;
-        if recheck {
-            use sha2::Digest;
-            let digest: String = sha2::Sha256::digest(&output.stdout)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            let path = recheck_path(&vm.domain);
-            std::fs::write(&path, recheck_script(vm, &digest))
-                .with_context(|| format!("writing {}", path.display()))?;
-        }
-        Ok(Verdict::Marked { checkouts: count })
-    } else {
-        withdraw(&vm.domain);
-        Ok(Verdict::Kept { reasons })
-    }
+    Ok((report, output.stdout))
 }
 
 /// The window's close: every running VM of the workspace looked at as it
