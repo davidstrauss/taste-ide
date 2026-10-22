@@ -624,10 +624,17 @@ impl Substrate {
 pub fn report_download(fetch: taste_core::GuestImageFetch) {
     use taste_core::GuestImagePhase;
     const STEP: u64 = 64 * 1024 * 1024;
+    // The last step said, so each is said once: the test this replaced
+    // fired for every chunk in the MiB after a boundary, 64 lines a step.
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let line = match fetch.phase {
         GuestImagePhase::Fetching if fetch.total > 0 => {
-            let boundary = fetch.done / STEP != fetch.done.saturating_sub(1024 * 1024) / STEP;
-            if !(boundary || fetch.done == fetch.total || fetch.done == 0) {
+            let step = if fetch.done == fetch.total {
+                u64::MAX - 1
+            } else {
+                fetch.done / STEP
+            };
+            if SAID.swap(step, std::sync::atomic::Ordering::Relaxed) == step {
                 return;
             }
             format!(

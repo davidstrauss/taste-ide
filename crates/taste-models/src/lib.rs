@@ -101,7 +101,14 @@ pub async fn fetch_pinned(
     progress: impl Fn(u64, u64) + Send + Sync + 'static,
 ) -> Result<PathBuf> {
     let target = target.to_path_buf();
-    let part = target.with_extension("part");
+    // The whole name and `.part`, not the extension replaced: the guest
+    // image's `….qcow2.xz` came down as `….qcow2.part`, the very name its
+    // decompression writes, and the two overwrote each other (2026-10-22).
+    let part = {
+        let mut name = target.file_name().unwrap_or_default().to_os_string();
+        name.push(".part");
+        target.with_file_name(name)
+    };
     if let Some(dir) = target.parent() {
         tokio::fs::create_dir_all(dir)
             .await

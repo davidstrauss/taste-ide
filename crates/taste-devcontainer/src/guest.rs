@@ -150,6 +150,33 @@ impl GuestImage {
         self.base_path().with_extension("qcow2.sha256")
     }
 
+    /// This release's fetch lock, held until the returned file is
+    /// dropped: an exclusive `flock` on a file beside the base image,
+    /// waited for off the runtime's threads.
+    async fn fetch_lock(&self) -> Result<std::fs::File> {
+        let path = self.base_path().with_extension("qcow2.lock");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsRawFd;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            // SAFETY: the descriptor is the open file's, alive for the call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("locking {}", path.display()));
+            }
+            Ok(file)
+        })
+        .await
+        .context("waiting for the guest image's fetch lock")?
+    }
+
     /// The day the release was built, as its version names it:
     /// `44.20260829.3.1` is 2026-08-29.
     pub fn release_date(&self) -> Option<String> {
@@ -232,6 +259,18 @@ impl GuestImage {
     ) -> Result<PathBuf> {
         let base = self.base_path();
         let unpacked = self.uncompressed_bytes.unwrap_or(0);
+        if self.base_is_present() {
+            self.report(&*report, GuestImagePhase::Ready, unpacked, unpacked);
+            return Ok(base);
+        }
+        // One fetch of a release at a time, on this machine: the fetch
+        // ahead of the moves and a move's own fetch both wrote the same
+        // `.part`, halving each other's bandwidth, and the slower one's
+        // rename found the file already gone (2026-10-22, a move that
+        // waited out both). A second caller waits here and finds the
+        // image present. A file lock, so another project's IDE on this
+        // machine waits the same way.
+        let _lock = self.fetch_lock().await?;
         if self.base_is_present() {
             self.report(&*report, GuestImagePhase::Ready, unpacked, unpacked);
             return Ok(base);

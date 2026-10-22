@@ -4537,6 +4537,29 @@ impl EnvironmentRegistry {
             _ => "moving to a VM on the current release",
         };
         self.note_vm(&old_domain, format!("{env}: {moving}"));
+        // The release's image here before anything stops: fetched with the
+        // environment still running, so a move waits on a gigabyte with
+        // nobody's container down. One move stopped its container and then
+        // waited out the whole fetch (2026-10-22: "I'm not sure this is
+        // ever coming up").
+        if host == environment::Host::Local {
+            if let Ok(image) = crate::guest::image() {
+                if !image.base_is_present() {
+                    self.note_vm(
+                        &old_domain,
+                        format!(
+                            "{env}: fetching guest image {} first; it keeps running meanwhile",
+                            image.release
+                        ),
+                    );
+                    let sandboxed = self.substrate().target().sandboxed();
+                    image
+                        .ensure_base(sandboxed, Arc::new(crate::substrate::report_download))
+                        .await
+                        .context("fetching the guest image the move needs")?;
+                }
+            }
+        }
         // Said as its state from here to the start at the end, so the row,
         // the startup page, and the chat all show a move under way rather
         // than an environment at rest (`Supervisor::begin_move`).
