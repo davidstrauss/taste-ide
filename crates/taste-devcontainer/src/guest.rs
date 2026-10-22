@@ -275,21 +275,64 @@ impl GuestImage {
             self.report(&*report, GuestImagePhase::Ready, unpacked, unpacked);
             return Ok(base);
         }
-        let compressed = if self.is_present() {
-            self.path()
-        } else {
-            let (release, known, fetch_report) = (self.release.clone(), self.bytes, report.clone());
-            self.report(&*report, GuestImagePhase::Fetching, 0, known.unwrap_or(0));
-            self.fetch(move |done, total| {
-                fetch_report(GuestImageFetch {
-                    release: release.clone(),
-                    phase: GuestImagePhase::Fetching,
-                    done,
-                    total: known.unwrap_or(total),
+        // A download already here that will not decompress or verify was
+        // damaged after it landed — a disk, an earlier IDE's overlapping
+        // fetches — and is fetched again at once, where re-fetching is
+        // possible (David, 2026-10-22: "The IDE should be better able to
+        // recover from stuff like corrupt image files"). One fetched just
+        // now was checked against its pin, so its failure is the answer.
+        let mut fresh = false;
+        loop {
+            let compressed = if self.is_present() {
+                self.path()
+            } else {
+                fresh = true;
+                let (release, known, fetch_report) =
+                    (self.release.clone(), self.bytes, report.clone());
+                self.report(&*report, GuestImagePhase::Fetching, 0, known.unwrap_or(0));
+                self.fetch(move |done, total| {
+                    fetch_report(GuestImageFetch {
+                        release: release.clone(),
+                        phase: GuestImagePhase::Fetching,
+                        done,
+                        total: known.unwrap_or(total),
+                    })
                 })
-            })
-            .await?
-        };
+                .await?
+            };
+            match self.unpack(&compressed, sandboxed, report.clone()).await {
+                Ok(base) => return Ok(base),
+                Err(e) if !fresh => {
+                    taste_core::app_log::push(
+                        "warn",
+                        "substrate",
+                        &format!(
+                            "the guest image {} here was damaged ({e:#}); fetching it again",
+                            self.release
+                        ),
+                    );
+                    // Not removed, it would be found again on the next
+                    // pass: the damage is the answer then.
+                    if compressed.exists() && std::fs::remove_file(&compressed).is_err() {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Decompress `compressed` to the base image and verify it against the
+    /// pinned digest before it takes its name. On a failure the download
+    /// is removed with what it made, so nothing damaged is tried twice.
+    async fn unpack(
+        &self,
+        compressed: &std::path::Path,
+        sandboxed: bool,
+        report: Arc<dyn Fn(GuestImageFetch) + Send + Sync>,
+    ) -> Result<PathBuf> {
+        let base = self.base_path();
+        let unpacked = self.uncompressed_bytes.unwrap_or(0);
         self.report(&*report, GuestImagePhase::Decompressing, 0, unpacked);
         // Decompress to a `.part` name and rename only once the digest
         // matches, the way `fetch_pinned` does: a half-written or wrong
@@ -333,8 +376,15 @@ impl GuestImage {
         let output = output.context("running xz")?;
         if !output.status.success() {
             let _ = std::fs::remove_file(&part);
+            // The download is what would not decompress, and a stream's
+            // release names no size to doubt it by (`is_present`): left,
+            // every later try decompressed the same bad file (2026-10-22, a
+            // `.xz` two overlapping fetches had written into). Gone, the
+            // next try fetches it again.
+            let _ = std::fs::remove_file(compressed);
             bail!(
-                "decompressing {}: {}",
+                "decompressing {}: {}; the download was removed, and the next try fetches \
+                 it again",
                 compressed.display(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
@@ -360,6 +410,9 @@ impl GuestImage {
         .context("hashing the base image")??;
         if digest != expected {
             let _ = std::fs::remove_file(&part);
+            // The download decompressed to the wrong bytes: fetched again
+            // next time, as above.
+            let _ = std::fs::remove_file(compressed);
             bail!(
                 "the decompressed guest image does not match its pin: expected {expected}, got {digest}"
             );
