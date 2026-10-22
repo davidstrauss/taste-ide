@@ -3584,6 +3584,45 @@ fn vms_words(n: usize) -> String {
     format!("{n} {}", vms_noun(n))
 }
 
+/// Why what the IDE would do by its own choice — a move, a fetch ahead of
+/// one, a package check — waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// The connection is metered (`taste_core::network`).
+    Metered,
+    /// The user is presenting (`taste_core::presenting`).
+    Presenting,
+}
+
+impl Hold {
+    /// Whether anything is held now, and why. Reads the presentation file:
+    /// for the runtime's threads, not the GTK one.
+    fn now() -> Option<Self> {
+        taste_core::presenting::refresh();
+        if taste_core::network::metered() {
+            Some(Hold::Metered)
+        } else if taste_core::presenting::presenting() {
+            Some(Hold::Presenting)
+        } else {
+            None
+        }
+    }
+
+    fn while_words(self) -> &'static str {
+        match self {
+            Hold::Metered => "while the connection is metered",
+            Hold::Presenting => "while the user is presenting",
+        }
+    }
+
+    fn after_words(self) -> &'static str {
+        match self {
+            Hold::Metered => "once it is not",
+            Hold::Presenting => "once the presentation ends",
+        }
+    }
+}
+
 /// How many lines of a VM's story are kept. A CoreOS boot is several
 /// hundred lines of console; the page that shows them caps itself too.
 const VM_LOG_CAPACITY: usize = 4000;
@@ -3719,6 +3758,11 @@ impl EnvironmentRegistry {
                 idle.push(id);
             }
         }
+        // Not while held: a move with nothing running in it still makes a
+        // VM, which a metered connection pays for and a presentation feels.
+        if Hold::now().is_some() {
+            return;
+        }
         for id in idle {
             self.spawn_relocate(id, "nothing was running in it".to_string());
         }
@@ -3853,9 +3897,10 @@ impl EnvironmentRegistry {
         image: RunningImage,
     ) {
         // A package manager's check downloads its repositories' metadata,
-        // tens of megabytes for dnf: asked again once the connection is
-        // not metered, since the record still says it is due.
-        if taste_core::network::metered() {
+        // tens of megabytes for dnf, and works the container's CPU: asked
+        // again once the connection is not metered and the user is not
+        // presenting, since the record still says it is due.
+        if Hold::now().is_some() {
             return;
         }
         if !self.image_checks.lock().unwrap().insert(key.clone()) {
@@ -3971,9 +4016,10 @@ impl EnvironmentRegistry {
     /// The new release's base image, fetched in the background once a move
     /// needs it, so the move itself does not wait a gigabyte.
     fn prefetch_guest_image(self: &Arc<Self>) {
-        // Fetched ahead by choice, so not on a metered connection; the
-        // moves it is for are held there too (`tick_migrations`).
-        if taste_core::network::metered() {
+        // Fetched ahead by choice, so not on a metered connection or while
+        // the user presents; the moves it is for are held there too
+        // (`tick_migrations`).
+        if Hold::now().is_some() {
             return;
         }
         let moving = self
@@ -4012,11 +4058,11 @@ impl EnvironmentRegistry {
     /// What the clock says is due for each pending move: its agent told,
     /// the coordinator told, or the move forced.
     fn tick_migrations(self: &Arc<Self>) {
-        self.tick_migrations_with(taste_core::network::metered());
+        self.tick_migrations_with(Hold::now());
     }
 
-    /// [`Self::tick_migrations`], told whether the connection is metered.
-    fn tick_migrations_with(self: &Arc<Self>, metered: bool) {
+    /// [`Self::tick_migrations`], told whether moves are held, and why.
+    fn tick_migrations_with(self: &Arc<Self>, hold: Option<Hold>) {
         use crate::migration::Due;
         let now = now_secs();
         let pending: Vec<(EnvironmentId, crate::migration::Migration)> = self
@@ -4032,15 +4078,17 @@ impl EnvironmentRegistry {
             if self.relocations_in_flight.lock().unwrap().contains(&id) {
                 continue;
             }
-            // On a metered connection nothing is nudged, told, or forced:
-            // each ends in a rebuild that downloads a base image or a new
-            // VM's worth, by the IDE's choice. The agent can still ask
-            // (`request_migration`), which is its choice. The person sees
-            // that a nudge was held, once per metered stretch, in that
-            // environment's chat and not the agent's context. When the
-            // stretch ends the agent is nudged first, and a move held past
-            // its two hours waits `AFTER_METERED` beyond that nudge.
-            if metered {
+            // On a metered connection, or while the user presents, nothing
+            // is nudged, told, or forced: each ends in a rebuild that
+            // downloads a base image or a new VM's worth, and swaps an
+            // environment out from under whoever is using it, by the IDE's
+            // choice. The agent can still ask (`request_migration`), which
+            // is its choice. The person sees that a nudge was held, once
+            // per held stretch, in that environment's chat and not the
+            // agent's context. When the stretch ends the agent is nudged
+            // first, and a move held past its two hours waits
+            // `AFTER_METERED` beyond that nudge.
+            if let Some(hold) = hold {
                 if migration.due(now).is_empty() {
                     continue;
                 }
@@ -4053,9 +4101,10 @@ impl EnvironmentRegistry {
                         env: id.clone(),
                         key: Some("metered-migration".to_string()),
                         text: format!(
-                            "The agent would have been asked to {}; not while the connection \
-                             is metered. It is asked once it is not.",
-                            migration.what()
+                            "The agent would have been asked to {}; not {}. It is asked {}.",
+                            migration.what(),
+                            hold.while_words(),
+                            hold.after_words()
                         ),
                     });
                 }
@@ -5212,15 +5261,15 @@ mod tests {
         };
         let _ = heard(&seen);
 
-        registry.tick_migrations_with(true);
-        registry.tick_migrations_with(true);
+        registry.tick_migrations_with(Some(Hold::Metered));
+        registry.tick_migrations_with(Some(Hold::Metered));
         let (nudges, notes) = heard(&seen);
         assert_eq!(nudges, 0, "nothing asked of the agent while metered");
         assert_eq!(notes.len(), 1, "said once: {notes:?}");
         assert!(notes[0].contains("metered"), "{}", notes[0]);
         assert!(notes[0].contains("package updates"), "{}", notes[0]);
 
-        registry.tick_migrations_with(false);
+        registry.tick_migrations_with(None);
         let (nudges, notes) = heard(&seen);
         assert_eq!(nudges, 1, "asked once the connection is not metered");
         assert!(notes.is_empty());
@@ -5251,8 +5300,8 @@ mod tests {
             .insert(primary.clone(), overdue);
         let _ = seen.try_recv();
 
-        registry.tick_migrations_with(true);
-        registry.tick_migrations_with(false);
+        registry.tick_migrations_with(Some(Hold::Metered));
+        registry.tick_migrations_with(None);
         let mut nudged = false;
         while let Ok(event) = seen.try_recv() {
             nudged |= matches!(

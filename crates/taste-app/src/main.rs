@@ -59,6 +59,7 @@ mod orchestration;
 mod palette;
 mod portview;
 mod power;
+mod presentation;
 mod preview_map;
 mod rest;
 mod results;

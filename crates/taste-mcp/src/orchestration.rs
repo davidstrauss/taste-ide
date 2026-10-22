@@ -213,7 +213,8 @@ pub(crate) fn tools() -> Vec<Value> {
                     "environment": {
                         "type": "string",
                         "description": "environment id, which is its issue's id (e.g. i-0007); primary for your own"
-                    }
+                    },
+                    "while_presenting": crate::server::WHILE_PRESENTING.clone()
                 },
                 "required": ["environment"]
             }),
@@ -235,7 +236,8 @@ pub(crate) fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": ["local", "cloud"],
                         "description": "local: a VM on this machine; cloud: a host in the project's cloud"
-                    }
+                    },
+                    "while_presenting": crate::server::WHILE_PRESENTING.clone()
                 },
                 "required": ["environment", "to"]
             }),

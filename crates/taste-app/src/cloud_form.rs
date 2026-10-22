@@ -104,7 +104,7 @@ pub struct CloudForm {
 
 /// One action, as a popover menu item is: flat, full width, an icon and a
 /// label at its start.
-fn menu_item(icon: &str, label: &str, tooltip: &str) -> gtk::Button {
+pub(crate) fn menu_item(icon: &str, label: &str, tooltip: &str) -> gtk::Button {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     content.append(&gtk::Image::from_icon_name(icon));
     content.append(&gtk::Label::builder().label(label).xalign(0.0).build());

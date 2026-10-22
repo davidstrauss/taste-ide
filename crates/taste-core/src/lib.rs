@@ -30,6 +30,7 @@ pub mod orchestration;
 pub mod podman;
 pub mod policy;
 pub mod power;
+pub mod presenting;
 pub mod queued;
 pub mod quota;
 pub mod review;

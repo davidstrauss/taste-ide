@@ -252,6 +252,30 @@ impl McpServer {
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
 pub const GUIDANCE_REVISION: u32 = 13;
 
+/// The flag the tools that rebuild or move an environment take, said once.
+pub(crate) static WHILE_PRESENTING: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
+    json!({
+        "type": "boolean",
+        "description": "the user is presenting and told you to go ahead anyway; only after they said so (default false)"
+    })
+});
+
+/// Refuse what would rebuild or move an environment while the user is
+/// presenting (`taste_core::presenting`), unless the call says they agreed
+/// (`while_presenting`). The refusal tells the agent to ask them: a
+/// presentation is not interrupted unknowingly, and is not a lock either
+/// (David, 2026-10-22: "the agent shouldn't unknowingly disrupt my
+/// presentation").
+fn presenting_gate(args: &Value, what: &str) -> Result<()> {
+    if args["while_presenting"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    match taste_core::presenting::refusal(what, "while_presenting") {
+        Some(said) => anyhow::bail!(said),
+        None => Ok(()),
+    }
+}
+
 /// When the user's folder last fetched: its `FETCH_HEAD`, which every
 /// fetch writes, as a person reads an age. `None` when it never has.
 fn last_fetched(root: &std::path::Path) -> Option<String> {
@@ -1412,7 +1436,8 @@ impl McpServer {
                         "wait_seconds": {
                             "type": "integer", "minimum": 0, "maximum": RELOAD_WAIT_MAX_SECS,
                             "description": format!("how long to wait for the reload to settle before answering (default 0, max {RELOAD_WAIT_MAX_SECS})")
-                        }
+                        },
+                        "while_presenting": WHILE_PRESENTING.clone()
                     }
                 }),
             ),
@@ -1840,7 +1865,10 @@ impl McpServer {
              your container stops for a few minutes, and your checkout, uncommitted work, and \
              this conversation come back. The coordinator approves it; it is forced two hours \
              after it became pending.",
-            empty.clone(),
+            json!({
+                "type": "object",
+                "properties": { "while_presenting": WHILE_PRESENTING.clone() }
+            }),
         ));
         // The project's tasks (taskfile.dev), the ones the Tasks section
         // lists: runs either side starts show in the same row and tab.
@@ -1940,7 +1968,9 @@ impl McpServer {
                 // (`Event::ReloadReport`). This tool asked the user by
                 // name while those hooks ran on the host — the gap the VM
                 // closed (David, 2026-09-21: "Drop the confirmation
-                // dialogs"). What still gates it is capacity, below.
+                // dialogs"). What still gates it is capacity, below, and a
+                // presentation the user is giving.
+                presenting_gate(&args, "rebuild this environment")?;
                 let supervisor = self.supervisor(env)?;
                 // The other gate: the environment cap, because this is the
                 // one tool that can bring a STOPPED environment back up, and
@@ -3805,11 +3835,13 @@ impl McpServer {
                 Ok(json!({ "state": "stopping", "next": "task_output says when it has stopped" }))
             }
             "environment_reinstantiate_request" => {
+                presenting_gate(&args, "reinstantiate this environment")?;
                 let said = self.environments.request_migration(env)?;
                 Ok(json!({ "state": "requested", "next": said }))
             }
             "environment_move" => {
                 self.require_orchestrator(env, "environment_move")?;
+                presenting_gate(&args, "move an environment")?;
                 let target = args
                     .get("environment")
                     .and_then(Value::as_str)
@@ -3862,6 +3894,7 @@ impl McpServer {
             }
             "environment_reinstantiate" => {
                 self.require_orchestrator(env, "environment_reinstantiate")?;
+                presenting_gate(&args, "reinstantiate an environment")?;
                 let target = args
                     .get("environment")
                     .and_then(Value::as_str)

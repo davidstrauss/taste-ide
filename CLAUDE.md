@@ -300,6 +300,11 @@ ready, but the project's quotas too low for a cloud environment host,
 with Request More Quota… —, or ready by default), since every real state of it needs a
 Google account and a project; with `TASTE_PROBE_SYNC` the badge shows
 the worse of the two;
+`TASTE_PROBE_PRESENTING=on` (or `off`) poses the title bar's
+presentation mode (`presentation.rs`, `taste_core::presenting`) an hour
+in, or not on, with its popover open and shot as
+`window.presentation-menu` — without the shared file or the desktop's
+inhibitor, since a probe's machine presents nothing;
 `TASTE_PROBE_CLOSING=1` poses the window as a close leaves it, the
 closing page over everything with its steps partway (`closing.rs`) —
 pair it with `TASTE_PROBE_SYNC=running` for a transfer in the frame;

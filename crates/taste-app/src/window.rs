@@ -1356,6 +1356,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // half speaks once the folder mirrors a checkout in a VM.
     let sync_status = crate::syncstatus::SyncStatus::new();
     header.pack_end(&sync_status.widget);
+    // Presentation mode, beside the cloud (presentation.rs): the machine
+    // kept awake, and what the IDE would do on its own held, for a while.
+    let presentation = crate::presentation::Presentation::new(app);
+    header.pack_end(&presentation.widget);
+    if let Ok(pose) = std::env::var("TASTE_PROBE_PRESENTING") {
+        if std::env::var("TASTE_PROBE_CHECK").is_ok() {
+            presentation.pose_for_probe(pose == "on");
+        }
+    }
     if !supervisor.checkout().is_local() {
         sync_status.show();
     }
@@ -3606,6 +3615,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // The branch switcher, opened by the file tree once
                         // its branches are read: a popover, its own surface.
                         &["window", "window.branch-menu"]
+                    } else if std::env::var("TASTE_PROBE_PRESENTING").is_ok() {
+                        // The popover is its own surface, shot beside the
+                        // window.
+                        &["window", "window.presentation-menu"]
                     } else if std::env::var("TASTE_PROBE_SYNC").is_ok() {
                         // The popover is its own surface, so it is shot as
                         // a target of its own beside the window.
