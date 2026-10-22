@@ -6116,6 +6116,15 @@ impl FileTree {
                                                     .fact("Sends", sends)
                                                     .gesture("Click to push")
                                             }
+                                            // Nothing to push, and its button
+                                            // off: said as ↓ and ⇊ say it — the
+                                            // ref and no more, no gesture to a
+                                            // button that does nothing (David,
+                                            // 2026-10-22: "This is still not
+                                            // consistent").
+                                            None if ahead == 0 => {
+                                                SyncCard::new(format!("Up to date with {upstream}"))
+                                            }
                                             None => SyncCard::new(format!(
                                                 "Push to {upstream}{default_branch}"
                                             ))
@@ -6250,8 +6259,8 @@ impl FileTree {
                                             let canon_moves = &snapshot.submodule_sync.canon_moves;
                                             *self.canon_card.borrow_mut() = Some(
                                                 if new == 0 {
+                                                    // As ↓ and ↑ say it: the ref.
                                                     SyncCard::new(format!("Up to date with {name}"))
-                                                        .fact("Yours", count(mine, "commit"))
                                                 } else if mine == 0 {
                                                     let mut card = SyncCard::new(format!(
                                                         "Fast-forward to {name}"
