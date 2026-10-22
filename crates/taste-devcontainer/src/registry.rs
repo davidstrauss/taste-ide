@@ -4718,6 +4718,36 @@ impl EnvironmentRegistry {
         .await
         .context("the snapshot did not finish")
         .and_then(|done| done.context("snapshotting before the move"));
+        // The checkout's stashes, which no refspec carries: bundled out of
+        // the old checkout while its VM is up, kept on this host, and
+        // fetched into the peer so the old copy's look before it is deleted
+        // finds them here (2026-10-22's audit: a move left every stash
+        // behind). Put back as stashes once the checkout is placed. A
+        // failure here keeps them where they are, in the old checkout,
+        // which that look then keeps.
+        let stashes = if snapshot.is_ok() {
+            let (files, path, peer, env_dir) = (
+                supervisor.files(),
+                old_path.clone(),
+                supervisor.peer().to_path_buf(),
+                self.env_dir(env),
+            );
+            let (env_word, from) = (env.to_string(), old_domain.clone());
+            tokio::task::spawn_blocking(move || {
+                carry_stashes_out(&files, &path, &peer, &env_dir, &env_word, &from)
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
+            .unwrap_or_else(|e| {
+                self.note_vm(
+                    &old_domain,
+                    format!("{env}: its stashes stay in the old checkout: {e:#}"),
+                );
+                None
+            })
+        } else {
+            None
+        };
         // Personal's branches as the folder last fetched them, where they
         // hold commits the folder's own branch does not: the checkout made
         // anew is seeded from the folder's branches, and the next fetch
@@ -4775,6 +4805,25 @@ impl EnvironmentRegistry {
             .await
         {
             Ok(target) => {
+                if let Some(bundle) = stashes {
+                    supervisor.move_step(&format!("{moving}: putting its stashes back"));
+                    let (files, checkout) = (supervisor.files(), supervisor.checkout());
+                    let put = tokio::task::spawn_blocking(move || match checkout {
+                        Checkout::Remote { path, .. } => carry_stashes_in(&files, &path, &bundle),
+                        Checkout::Local(path) => carry_stashes_in(&files, &path, &bundle),
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
+                    if let Err(e) = put {
+                        self.note_vm(
+                            &target.domain,
+                            format!(
+                                "{env}: its stashes were not put back ({e:#}); they are kept \
+                                 on this machine under refs/taste/carried-stashes/"
+                            ),
+                        );
+                    }
+                }
                 supervisor.move_step(&format!("{moving}: clearing out the old VM"));
                 self.finish_move(
                     env,
@@ -4986,6 +5035,92 @@ impl EnvironmentRegistry {
         }
         Ok(target.domain)
     }
+}
+
+/// The git a carry runs in a checkout: none of the checkout's hooks or its
+/// fsmonitor, which are the project's code, run for it.
+const QUIET_GIT: &str = "git -c core.fsmonitor=false -c core.hooksPath=/dev/null";
+
+/// The stashes of the checkout at `path`, as a bundle of
+/// `refs/taste/stashes/NNNN` (`0000` the newest), fetched into `peer` as
+/// `refs/taste/carried-stashes/<env>/<from>/NNNN` and kept beside it in
+/// `env_dir`; `None` when there are none. Their bases are left out of the
+/// bundle: the peer and the checkout made from it have the branches.
+fn carry_stashes_out(
+    files: &Files,
+    path: &Path,
+    peer: &Path,
+    env_dir: &Path,
+    env: &str,
+    from: &str,
+) -> Result<Option<Vec<u8>>> {
+    let script = format!(
+        "set -e\n\
+         n=$({QUIET_GIT} stash list | wc -l)\n\
+         [ \"$n\" -gt 0 ] || exit 0\n\
+         i=0\n\
+         while [ \"$i\" -lt \"$n\" ]; do\n\
+           {QUIET_GIT} update-ref \"refs/taste/stashes/$(printf %04d \"$i\")\" \"stash@{{$i}}\"\n\
+           i=$((i+1))\n\
+         done\n\
+         {QUIET_GIT} bundle create - --glob='refs/taste/stashes/*' --not --branches --tags \\\n\
+           --remotes 2>/dev/null\n"
+    );
+    let out = files
+        .exec(path, &["sh".to_string(), "-c".to_string(), script])
+        .context("bundling the stashes")?;
+    if !out.success() {
+        bail!("bundling the stashes: {}", out.stderr_utf8().trim());
+    }
+    if out.stdout.is_empty() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(env_dir)?;
+    let file = env_dir.join(format!("stashes-{from}.bundle"));
+    std::fs::write(&file, &out.stdout).with_context(|| format!("writing {}", file.display()))?;
+    let fetched = std::process::Command::new("git")
+        .args(taste_git::private::cli_prefix(peer))
+        .args(["fetch", "-q"])
+        .arg(&file)
+        .arg(format!(
+            "+refs/taste/stashes/*:refs/taste/carried-stashes/{env}/{from}/*"
+        ))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("fetching the stashes into the peer")?;
+    if !fetched.status.success() {
+        bail!(
+            "fetching the stashes into the peer: {}",
+            String::from_utf8_lossy(&fetched.stderr).trim()
+        );
+    }
+    Ok(Some(out.stdout))
+}
+
+/// A bundle from [`carry_stashes_out`] put back as stashes in the checkout
+/// at `path`, the oldest first so they keep their order, each with its own
+/// message; the bundle and its refs gone after.
+fn carry_stashes_in(files: &Files, path: &Path, bundle: &[u8]) -> Result<()> {
+    let file = path.join(".git").join("taste-stashes.bundle");
+    files
+        .write(&file, bundle)
+        .with_context(|| format!("writing {}", file.display()))?;
+    let script = format!(
+        "set -e\n\
+         {QUIET_GIT} fetch -q .git/taste-stashes.bundle '+refs/taste/stashes/*:refs/taste/stashes/*'\n\
+         for r in $({QUIET_GIT} for-each-ref --sort=-refname --format='%(refname)' refs/taste/stashes/); do\n\
+           {QUIET_GIT} stash store -m \"$({QUIET_GIT} log -1 --format=%s \"$r\")\" \"$r\"\n\
+           {QUIET_GIT} update-ref -d \"$r\"\n\
+         done\n\
+         rm -f .git/taste-stashes.bundle\n"
+    );
+    let out = files
+        .exec(path, &["sh".to_string(), "-c".to_string(), script])
+        .context("putting the stashes back")?;
+    if !out.success() {
+        bail!("putting the stashes back: {}", out.stderr_utf8().trim());
+    }
+    Ok(())
 }
 
 /// Where a checkout is built before it takes its place: `<path>.placing`,
@@ -5393,6 +5528,86 @@ mod tests {
     }
 
     use super::*;
+
+    /// A checkout's stashes cross a move: bundled out of the old checkout,
+    /// fetched into the peer (where the old copy's look finds them), and
+    /// put back in the new checkout as stashes, in their order, with their
+    /// messages.
+    #[test]
+    fn a_moves_stashes_come_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let old = dir.path().join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        git(&old, &["init", "-q", "-b", "main"]);
+        std::fs::write(old.join("f.txt"), "base\n").unwrap();
+        git(&old, &["add", "f.txt"]);
+        git(&old, &["commit", "-q", "-m", "base"]);
+        let peer = dir.path().join("peer");
+        git(dir.path(), &["clone", "-q", old.to_str().unwrap(), "peer"]);
+        std::fs::write(old.join("f.txt"), "first\n").unwrap();
+        git(&old, &["stash", "push", "-q", "-m", "the first"]);
+        std::fs::write(old.join("f.txt"), "second\n").unwrap();
+        git(&old, &["stash", "push", "-q", "-m", "the second"]);
+
+        let files = Files::Local;
+        let env_dir = dir.path().join("env");
+        let bundle = carry_stashes_out(&files, &old, &peer, &env_dir, "i-0001", "vm-a")
+            .unwrap()
+            .expect("two stashes");
+        // The peer has them, so the old copy's look finds nothing missing.
+        let carried = git(
+            &peer,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/taste/carried-stashes/",
+            ],
+        );
+        assert_eq!(carried.lines().count(), 2, "{carried}");
+
+        let new = dir.path().join("new");
+        git(dir.path(), &["clone", "-q", peer.to_str().unwrap(), "new"]);
+        carry_stashes_in(&files, &new, &bundle).unwrap();
+        assert_eq!(
+            git(&new, &["stash", "list", "--format=%gs"]),
+            "On main: the second\nOn main: the first"
+        );
+        git(&new, &["stash", "pop", "-q"]);
+        assert_eq!(
+            std::fs::read_to_string(new.join("f.txt")).unwrap(),
+            "second\n"
+        );
+        assert!(!new.join(".git/taste-stashes.bundle").exists());
+
+        // None: nothing to carry.
+        let clean = dir.path().join("clean");
+        git(
+            dir.path(),
+            &["clone", "-q", peer.to_str().unwrap(), "clean"],
+        );
+        assert!(
+            carry_stashes_out(&files, &clean, &peer, &env_dir, "i-0001", "vm-b")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     /// A checkout is built beside its place and moved in whole; a leftover
     /// half-build is cleared; a repository with no ref in it, left where
