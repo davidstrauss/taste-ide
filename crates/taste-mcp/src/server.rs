@@ -1592,7 +1592,7 @@ impl McpServer {
                                 "items": { "type": "string" },
                                 "minItems": 1,
                                 "maxItems": 4,
-                                "description": "the replies, most likely first, each under 80 characters"
+                                "description": "the replies, most likely first, each under 120 characters"
                             }
                         },
                         "required": ["replies"]
@@ -2185,8 +2185,8 @@ impl McpServer {
                 }
                 if let Some(long) = replies.iter().find(|r| r.chars().count() > MAX_REPLY_CHARS) {
                     anyhow::bail!(
-                        "each reply is a button, so at most {MAX_REPLY_CHARS} characters; \
-                         shorten \"{long}\""
+                        "each reply is one line of a list of choices, at most \
+                         {MAX_REPLY_CHARS} characters; shorten \"{long}\""
                     );
                 }
                 let shown = replies.len();
@@ -5971,9 +5971,11 @@ fn is_config_path(root: &std::path::Path, path: &std::path::Path) -> bool {
 }
 
 /// How many replies `suggest_replies` shows, and how long each may be:
-/// choices in a chat column, not a menu.
+/// choices in a chat column, not a menu. A choice is a radio's row that
+/// wraps, not a button's face, so a reply may say what it chooses whole
+/// (2026-10-21: an 81-character reply refused as too long for a button).
 const MAX_REPLIES: usize = 4;
-const MAX_REPLY_CHARS: usize = 80;
+const MAX_REPLY_CHARS: usize = 120;
 
 /// One job snapshot as a tool result. A command still running comes back
 /// as a handle rather than a result, and says so in the shape of the
