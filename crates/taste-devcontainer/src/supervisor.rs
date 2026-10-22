@@ -5426,9 +5426,13 @@ fn listening_ports(ss: &str) -> std::collections::HashSet<u16> {
 
 /// Whether nothing on this machine holds `port` on loopback right now: a
 /// bind that succeeds, released at once. Another environment's published
-/// port, or a server of the user's, makes it fail.
+/// port, or a server of the user's, makes it fail. Both loopbacks, where
+/// the host has two: the port is reached as `localhost` (`PortSpec::url`),
+/// and a server of the user's on `::1` alone would answer for it.
 fn port_is_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+        && (!taste_core::network::ipv6_loopback()
+            || std::net::TcpListener::bind(("::1", port)).is_ok())
 }
 
 /// The first port above `port` that is free on loopback, not privileged

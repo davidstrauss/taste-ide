@@ -123,15 +123,23 @@ impl PortSpec {
         }
     }
 
-    /// Where the port is reachable from the host. Published on loopback
-    /// only (see the supervisor's `-p` arguments), so this is the one
-    /// address that is ever right.
+    /// Where the port is reachable from the host: loopback only, and
+    /// named `localhost` rather than `127.0.0.1`, because `localhost` is
+    /// the origin dev servers trust by default and the address is the
+    /// page's origin. Next.js in development refuses its hot-reload
+    /// socket to any other origin (`allowedDevOrigins`), and a page that
+    /// never gets the socket never hydrates: the port tab showed the
+    /// server's HTML with every menu dead, where the user's own browser,
+    /// on `localhost`, worked (2026-10-22). The forward listens on both
+    /// loopbacks (`Keys::ssh_tunnel_argv`), and a port is only chosen when
+    /// both are free (`Supervisor::publish_ports`), so whichever one
+    /// `localhost` resolves to first is this port's.
     pub fn url(&self) -> String {
         let scheme = match self.protocol.as_deref() {
             Some("https") => "https",
             _ => "http",
         };
-        format!("{scheme}://127.0.0.1:{}", self.host)
+        format!("{scheme}://localhost:{}", self.host)
     }
 
     /// Whether the port had to be published on another number.
@@ -709,7 +717,7 @@ mod tests {
         assert_eq!(ports[0].port, 3000);
         assert_eq!(ports[0].label.as_deref(), Some("App"));
         assert_eq!(ports[0].title(), "3000 · App");
-        assert_eq!(ports[0].url(), "http://127.0.0.1:3000");
+        assert_eq!(ports[0].url(), "http://localhost:3000");
         assert_eq!(ports[1].port, 5432);
         assert_eq!(ports[1].label, None);
         assert_eq!(ports[1].title(), "5432");

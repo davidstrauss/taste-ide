@@ -1,4 +1,5 @@
-//! Whether this machine's connection is metered.
+//! Whether this machine's connection is metered, and whether it has an
+//! IPv6 loopback.
 //!
 //! A metered connection — a phone's hotspot, a capped plan — is one where
 //! the IDE waits with what it would download by its own choice: a guest
@@ -24,4 +25,14 @@ pub fn metered() -> bool {
 /// What the desktop says now. True when that changed the answer.
 pub fn set_metered(metered: bool) -> bool {
     METERED.swap(metered, Ordering::Relaxed) != metered
+}
+
+/// Whether this machine has an IPv6 loopback to listen on: a bind to
+/// `[::1]:0` that succeeds, asked once. A forwarded port listens on both
+/// loopbacks where there are two, since it is reached as `localhost`
+/// (`taste_devcontainer::PortSpec::url`); a host with IPv6 switched off
+/// has one, and a bind to `::1` there fails rather than meaning anything.
+pub fn ipv6_loopback() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| std::net::TcpListener::bind(("::1", 0)).is_ok())
 }

@@ -701,7 +701,8 @@ impl PortPage {
 /// The port browser's network guard, as WebKit content-blocker rules:
 /// every load to a loopback, private, shared, or link-local address, an
 /// IPv6 literal, a single-label host, or a `.local`-style name is blocked,
-/// and then the port's own origin on 127.0.0.1 is let back through — any
+/// and then the port's own origin is let back through — on `localhost`,
+/// which is how the tab names it (`PortSpec::url`), and on 127.0.0.1 — any
 /// scheme, so the dev server's own WebSocket (hot reload) still connects.
 /// Public addresses are left alone: egress is a project's already
 /// (ENVIRONMENTS → "Isolation: the standard, and what meets it"), and a
@@ -743,10 +744,12 @@ fn network_guard_rules(port: u16) -> String {
             })
         })
         .collect();
-    rules.push(serde_json::json!({
-        "trigger": { "url-filter": format!(r"^[a-z]+://127\.0\.0\.1:{port}/") },
-        "action": { "type": "ignore-previous-rules" },
-    }));
+    for host in [r"localhost", r"127\.0\.0\.1"] {
+        rules.push(serde_json::json!({
+            "trigger": { "url-filter": format!(r"^[a-z]+://{host}:{port}/") },
+            "action": { "type": "ignore-previous-rules" },
+        }));
+    }
     serde_json::Value::Array(rules).to_string()
 }
 
@@ -1115,13 +1118,19 @@ mod tests {
     fn the_network_guard_blocks_the_host_and_lets_the_port_through() {
         let rules: serde_json::Value = serde_json::from_str(&network_guard_rules(3000)).unwrap();
         let rules = rules.as_array().unwrap();
-        let last = rules.last().unwrap();
-        assert_eq!(last["action"]["type"], "ignore-previous-rules");
+        let allowed: Vec<&str> = rules[rules.len() - 2..]
+            .iter()
+            .inspect(|rule| assert_eq!(rule["action"]["type"], "ignore-previous-rules"))
+            .map(|rule| rule["trigger"]["url-filter"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            last["trigger"]["url-filter"],
-            r"^[a-z]+://127\.0\.0\.1:3000/"
+            allowed,
+            [
+                r"^[a-z]+://localhost:3000/",
+                r"^[a-z]+://127\.0\.0\.1:3000/"
+            ]
         );
-        let blocked: Vec<&str> = rules[..rules.len() - 1]
+        let blocked: Vec<&str> = rules[..rules.len() - 2]
             .iter()
             .map(|rule| rule["trigger"]["url-filter"].as_str().unwrap())
             .collect();

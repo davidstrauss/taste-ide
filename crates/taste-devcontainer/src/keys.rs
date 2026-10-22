@@ -291,9 +291,19 @@ impl Keys {
             "-o".into(),
             LIVENESS[2].into(),
         ];
+        // Both loopbacks, since a port is reached as `localhost`
+        // (`PortSpec::url`), which resolves to `::1` first on most hosts —
+        // where a forward on 127.0.0.1 alone left `::1` to whatever else
+        // held the number. Not on a host with no IPv6 loopback, where the
+        // bind would fail the whole tunnel (`ExitOnForwardFailure`).
+        let six = taste_core::network::ipv6_loopback();
         for forward in forwards {
             args.push("-L".into());
             args.push(format!("127.0.0.1:{forward}:127.0.0.1:{forward}"));
+            if six {
+                args.push("-L".into());
+                args.push(format!("[::1]:{forward}:127.0.0.1:{forward}"));
+            }
         }
         args.push("-p".into());
         args.push(port.to_string());
@@ -462,6 +472,11 @@ mod tests {
         );
         assert!(
             joined.contains("-L 127.0.0.1:3000:127.0.0.1:3000"),
+            "{joined}"
+        );
+        assert_eq!(
+            joined.contains("-L [::1]:3000:127.0.0.1:3000"),
+            taste_core::network::ipv6_loopback(),
             "{joined}"
         );
         assert!(joined.ends_with("-p 40001 core@127.0.0.1"), "{joined}");
