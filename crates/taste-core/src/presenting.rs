@@ -1,5 +1,8 @@
-//! Presentation mode: the user is showing their screen, until a time or
-//! until they end it.
+//! Presentation mode: the user is showing their screen, until a time no
+//! more than [`MAX`] away. Never indefinitely (David, 2026-10-22: "Don't
+//! provide any indefinite option. Max is 8 hours"): a mode that holds the
+//! IDE's own upkeep and keeps the machine awake ends on its own, whoever
+//! forgets it.
 //!
 //! While it lasts, the machine does not sleep or blank (the app holds the
 //! desktop's inhibitor), and the IDE does nothing by its own choice that a
@@ -27,29 +30,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
-/// The mode as this process last read it: 0 when off, [`BY_HAND`] when on
-/// until ended, otherwise when it ends in seconds since the epoch.
+/// The mode as this process last read it: 0 when off, otherwise when it
+/// ends in seconds since the epoch.
 static UNTIL: AtomicU64 = AtomicU64::new(0);
 
-/// "On until the user ends it", in [`UNTIL`].
-const BY_HAND: u64 = u64::MAX;
+/// The longest presentation mode lasts: eight hours from when it starts.
+pub const MAX: std::time::Duration = std::time::Duration::from_secs(8 * 60 * 60);
 
-/// When presentation mode ends.
+/// When presentation mode ends, in seconds since the epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Until {
-    /// At this time, in seconds since the epoch.
-    At(u64),
-    /// When the user ends it.
-    Ended,
-}
+pub struct Until(pub u64);
 
 impl Until {
-    /// "until 15:30" or "until it is ended", in this machine's time zone.
+    /// "until 15:30", in this machine's time zone.
     pub fn words(self) -> String {
-        match self {
-            Until::At(at) => format!("until {}", clock(at)),
-            Until::Ended => "until it is ended".to_string(),
-        }
+        format!("until {}", clock(self.0))
     }
 }
 
@@ -69,12 +64,8 @@ pub fn presenting() -> bool {
 
 /// When presentation mode ends, if it is on, as this process last read it.
 pub fn until() -> Option<Until> {
-    match UNTIL.load(Ordering::Relaxed) {
-        0 => None,
-        BY_HAND => Some(Until::Ended),
-        at if at > now() => Some(Until::At(at)),
-        _ => None,
-    }
+    let at = UNTIL.load(Ordering::Relaxed);
+    (at > now()).then_some(Until(at))
 }
 
 /// Read the file again. True when the answer changed. IO: not on the GTK
@@ -87,12 +78,13 @@ fn refresh_from(path: Option<PathBuf>) -> bool {
     let read = path
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| parse(&text))
-        .map_or(0, encode);
+        .map_or(0, |until| until.0);
     UNTIL.swap(read, Ordering::Relaxed) != read
 }
 
 /// Turn presentation mode on, for every IDE on this machine, until
-/// `until`. IO: not on the GTK thread.
+/// `until` — or [`MAX`] from now, if that is sooner. IO: not on the GTK
+/// thread.
 pub fn start(until: Until) -> Result<()> {
     start_in(file(), until)
 }
@@ -102,12 +94,9 @@ fn start_in(path: Option<PathBuf>, until: Until) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let text = match until {
-        Until::At(at) => at.to_string(),
-        Until::Ended => "ended".to_string(),
-    };
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-    UNTIL.store(encode(until), Ordering::Relaxed);
+    let at = until.0.min(now() + MAX.as_secs());
+    std::fs::write(&path, at.to_string()).with_context(|| format!("writing {}", path.display()))?;
+    UNTIL.store(at, Ordering::Relaxed);
     Ok(())
 }
 
@@ -149,20 +138,13 @@ fn refusal_words(until: Until, what: &str, flag: &str) -> String {
     )
 }
 
+/// The file's end time, if it is still ahead and no further than [`MAX`]:
+/// anything else — a time past, an open-ended mode an older IDE wrote, a
+/// time beyond the cap — is no presentation.
 fn parse(text: &str) -> Option<Until> {
-    let text = text.trim();
-    if text == "ended" {
-        return Some(Until::Ended);
-    }
-    let at: u64 = text.parse().ok()?;
-    (at > now()).then_some(Until::At(at))
-}
-
-fn encode(until: Until) -> u64 {
-    match until {
-        Until::At(at) => at.min(BY_HAND - 1),
-        Until::Ended => BY_HAND,
-    }
+    let at: u64 = text.trim().parse().ok()?;
+    let now = now();
+    (at > now && at <= now + MAX.as_secs()).then_some(Until(at))
 }
 
 fn now() -> u64 {
@@ -189,9 +171,12 @@ mod tests {
 
     #[test]
     fn the_file_says_until_when() {
-        assert_eq!(parse("ended\n"), Some(Until::Ended));
+        // An open-ended mode, as an older IDE wrote it, is not one.
+        assert_eq!(parse("ended\n"), None);
         let later = now() + 600;
-        assert_eq!(parse(&later.to_string()), Some(Until::At(later)));
+        assert_eq!(parse(&later.to_string()), Some(Until(later)));
+        // Nor is one past the cap.
+        assert_eq!(parse(&(now() + MAX.as_secs() + 600).to_string()), None);
         // A time already past is no presentation, whoever forgot the file.
         assert_eq!(parse(&(now() - 1).to_string()), None);
         assert_eq!(parse("soon"), None);
@@ -204,13 +189,15 @@ mod tests {
         end_in(path.clone()).unwrap();
         assert!(!presenting());
         let at = now() + 3600;
-        start_in(path.clone(), Until::At(at)).unwrap();
+        start_in(path.clone(), Until(at)).unwrap();
         // Another process reads it from the file.
         UNTIL.store(0, Ordering::Relaxed);
         assert!(refresh_from(path.clone()));
-        assert_eq!(until(), Some(Until::At(at)));
-        start_in(path.clone(), Until::Ended).unwrap();
-        assert_eq!(until(), Some(Until::Ended));
+        assert_eq!(until(), Some(Until(at)));
+        // Asked for longer than the cap, it ends at the cap.
+        start_in(path.clone(), Until(now() + 24 * 60 * 60)).unwrap();
+        let capped = until().unwrap().0;
+        assert!(capped <= now() + MAX.as_secs(), "{capped}");
         end_in(path.clone()).unwrap();
         assert!(!refresh_from(path));
         assert!(!presenting());
@@ -218,9 +205,13 @@ mod tests {
 
     #[test]
     fn an_agent_is_told_to_ask_and_how_to_say_yes() {
-        let said = refusal_words(Until::Ended, "rebuild this environment", "while_presenting");
+        let said = refusal_words(
+            Until(now() + 60),
+            "rebuild this environment",
+            "while_presenting",
+        );
         assert!(said.contains("rebuild this environment"), "{said}");
         assert!(said.contains("`while_presenting: true`"), "{said}");
-        assert!(said.contains("until it is ended"), "{said}");
+        assert!(said.contains("until "), "{said}");
     }
 }

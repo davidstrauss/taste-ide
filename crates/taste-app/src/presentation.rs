@@ -16,11 +16,14 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use taste_core::presenting::Until;
 
-/// The lengths the popover offers, in minutes.
-const LENGTHS: [(u64, &str); 3] = [
+/// The lengths the popover offers, in minutes: none open-ended, and none
+/// past the mode's cap (`taste_core::presenting::MAX`, eight hours).
+const LENGTHS: [(u64, &str); 5] = [
     (30, "For 30 Minutes"),
     (60, "For 1 Hour"),
     (120, "For 2 Hours"),
+    (240, "For 4 Hours"),
+    (480, "For 8 Hours"),
 ];
 
 /// What the mode does, said under its heading in both faces.
@@ -163,7 +166,7 @@ impl Presentation {
         if let Some(timer) = self.timer.borrow_mut().take() {
             timer.remove();
         }
-        if let Some(Until::At(at)) = until {
+        if let Some(Until(at)) = until {
             let now = glib::DateTime::now_utc().map_or(0, |now| now.to_unix().max(0) as u64);
             let weak = Rc::downgrade(self);
             let timer = glib::timeout_add_seconds_local_once(
@@ -260,23 +263,11 @@ impl Presentation {
                     let weak = Rc::downgrade(self);
                     item.connect_clicked(move |_| {
                         if let Some(this) = weak.upgrade() {
-                            this.set(Some(Until::At(now_or(now) + minutes * 60)));
+                            this.set(Some(Until(now_or(now) + minutes * 60)));
                         }
                     });
                     actions.append(&item);
                 }
-                let open = crate::cloud_form::menu_item(
-                    "display-projector-symbolic",
-                    "Until I End It",
-                    "Presentation mode lasts until you end it here",
-                );
-                let weak = Rc::downgrade(self);
-                open.connect_clicked(move |_| {
-                    if let Some(this) = weak.upgrade() {
-                        this.set(Some(Until::Ended));
-                    }
-                });
-                actions.append(&open);
             }
         }
         self.content.append(&actions);
@@ -299,7 +290,7 @@ impl Presentation {
     pub fn pose_for_probe(self: &Rc<Self>, on: bool) {
         let now = glib::DateTime::now_utc().map_or(0, |now| now.to_unix().max(0) as u64);
         self.posed.set(true);
-        self.until.set(on.then_some(Until::At(now + 3600)));
+        self.until.set(on.then_some(Until(now + 3600)));
         self.draw();
         let widget = self.widget.clone();
         glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
