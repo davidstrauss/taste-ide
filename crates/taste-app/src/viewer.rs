@@ -407,7 +407,7 @@ impl ViewerPage {
                 glib::timeout_add_local_once(std::time::Duration::from_millis(2000), move || {
                     webkit6::prelude::WebViewExt::evaluate_javascript(
                         &view,
-                        "const seen = [window.tasteScroll()]; \
+                        "const seen = [window.tasteScroll(0)]; \
                          for (let i = 0; i < 5; i++) { \
                            document.dispatchEvent(new KeyboardEvent('keydown', {key: 'PageDown', bubbles: true})); \
                            seen.push(window.tasteScroll()); \
@@ -1125,7 +1125,12 @@ html, body { margin: 0; height: 100%; background: transparent; }
   cursor: default; touch-action: none; }
 .pane.behind { visibility: hidden; z-index: -1; }
 .pdfViewer .page { border: none; margin: 12px auto;
-  box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  box-shadow: 0 1px 3px rgba(0,0,0,.25);
+  /* The page's drawing paints its own white; the box behind it showed a
+     white line wherever the drawing came out a pixel short of the box — a
+     column down a slide's edge, a row atop a presented one (David,
+     2026-10-21). */
+  background-color: transparent; }
 /* One page at a time, inside the 5px pdf.js leaves above and below a
    fitted page: at 12 the whole page stood a few pixels taller than the
    pane, its foot under the edge. */
@@ -1620,12 +1625,17 @@ try {
         if (div) tops.push(div.getBoundingClientRect().top - base - gap);
       }
       let to;
+      // A page top within a line of where the view stands is where it
+      // stands already: from the very top, page 1's own top lay six pixels
+      // down, and Page Down went there (David, 2026-10-21: "PgDown
+      // sometimes moves a trivial amount when I'm scrolled at the very
+      // top").
       if (paging > 0) {
-        const next = tops.find((top) => top > at + 1);
+        const next = tops.find((top) => top > at + line);
         to = next === undefined ? at + screen
           : next <= at + pane.clientHeight ? next : Math.min(at + screen, next);
       } else {
-        const back = tops.filter((top) => top < at - 1).pop();
+        const back = tops.filter((top) => top < at - line).pop();
         to = back === undefined ? 0
           : at - back <= pane.clientHeight ? back : Math.max(at - screen, back);
       }
