@@ -1801,6 +1801,7 @@ impl EnvironmentRegistry {
             );
         }
         let sync = if files.exists(&path.join(".git")) {
+            harden_checkout(&files, &path);
             self.note_vm(
                 &vm.domain,
                 format!(
@@ -1982,6 +1983,7 @@ impl EnvironmentRegistry {
                     format!("restored {what} uncommitted work into the checkout"),
                 );
             }
+            harden_checkout(&files, &staging);
             put_in_place(&files, &staging, &path)?;
             self.note_vm(&vm.domain, "the checkout is placed");
             let mut words = format!("Placed fresh on {branch}");
@@ -2502,6 +2504,7 @@ impl EnvironmentRegistry {
             let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;
             run(&staging, &["sh", "-c", &restore])?;
         }
+        harden_checkout(&files, &staging);
         put_in_place(&files, &staging, &path)?;
         Placement {
             vm: vm.domain.clone(),
@@ -5181,6 +5184,33 @@ impl EnvironmentRegistry {
     }
 }
 
+/// What a checkout in a VM is set to so a host's power loss cannot leave
+/// it pointing at objects that never reached the disk: git's own
+/// `core.fsync=committed` — objects, packs, and refs flushed as they are
+/// written — in its `batch` method, one flush per operation rather than
+/// per file. A VM's disk passes the guest's flushes through to the host
+/// (libvirt's default writeback cache), so what git flushes holds; what
+/// it did not, by git's defaults, was its loose objects and its refs
+/// (2026-10-22's audit). A git older than 2.36 ignores both; a failure
+/// here is said and is no reason to stop.
+fn harden_checkout(files: &Files, path: &Path) {
+    for (key, value) in [("core.fsync", "committed"), ("core.fsyncMethod", "batch")] {
+        let argv: Vec<String> = ["git", "config", key, value]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        match files.exec(path, &argv) {
+            Ok(out) if out.success() => {}
+            Ok(out) => tracing::warn!(
+                "setting {key} in {}: {}",
+                path.display(),
+                out.stderr_utf8().trim()
+            ),
+            Err(e) => tracing::warn!("setting {key} in {}: {e}", path.display()),
+        }
+    }
+}
+
 /// The git a carry runs in a checkout: none of the checkout's hooks or its
 /// fsmonitor, which are the project's code, run for it.
 const QUIET_GIT: &str = "git -c core.fsmonitor=false -c core.hooksPath=/dev/null";
@@ -5790,8 +5820,12 @@ mod tests {
         let tree = repo.find_tree(tree).unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "first", &tree, &[])
             .unwrap();
+        harden_checkout(&files, &staging);
         put_in_place(&files, &staging, &path).unwrap();
         assert!(path.join(".git").exists() && !staging.exists());
+        let config = git2::Repository::open(&path).unwrap().config().unwrap();
+        assert_eq!(config.get_string("core.fsync").unwrap(), "committed");
+        assert_eq!(config.get_string("core.fsyncMethod").unwrap(), "batch");
         // A checkout with refs is the checkout: left where it is.
         assert!(!set_aside_partial(&files, &path).unwrap());
         assert!(path.join(".git").exists());
