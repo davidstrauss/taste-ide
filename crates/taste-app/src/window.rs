@@ -65,6 +65,9 @@ fn window_title(root: &Path) -> String {
     }
 }
 
+/// The longest a close waits for a move under way to finish.
+const MOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWindow {
     // A TASTE_PROBE_CHECK instance is scaffolding, not a session: it must
     // observe (render, measure, quit) without leaving a footprint. One of
@@ -5127,8 +5130,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
             use crate::closing::Step;
             cloud_form.freeze();
-            let page = crate::closing::ClosingPage::new(&sync_status.take_over(), true);
+            // `=move`: a move under way, the close waiting on it.
+            let moving = std::env::var("TASTE_PROBE_CLOSING").as_deref() == Ok("move");
+            let page = crate::closing::ClosingPage::new(&sync_status.take_over(), true, moving);
             window.set_content(Some(&page.widget));
+            if moving {
+                page.begin(Step::Move, Some("primary: bringing up the VM it moves to"));
+            }
             page.finish(Step::Save, "4 tabs and 2 chats saved");
             page.finish(
                 Step::StopVms,
@@ -5178,6 +5186,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // new window (2026-10-02).
         let closing = Rc::new(Cell::new(false));
         let primary_for_close = supervisor.clone();
+        let environments_for_close = environments.clone();
         let sync_status_for_close = sync_status.clone();
         let cloud_form_for_close = cloud_form.clone();
         window.connect_close_request(move |window| {
@@ -5204,7 +5213,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // cloud popover's content, and the steps it is waiting on,
             // over the whole window (closing.rs).
             cloud_form_for_close.freeze();
-            let page = crate::closing::ClosingPage::new(&sync_status_for_close.take_over(), remote);
+            // A move under way is let finish, within a bound, before the
+            // rest: cut off, it carries on at the next launch — nothing is
+            // lost since 2026-10-22's audit — but its environment is down
+            // until then.
+            let moving = environments_for_close.moving();
+            let environments = environments_for_close.clone();
+            let page = crate::closing::ClosingPage::new(
+                &sync_status_for_close.take_over(),
+                remote,
+                !moving.is_empty(),
+            );
             window.set_content(Some(&page.widget));
             page.begin(crate::closing::Step::Save, None);
             page.begin(crate::closing::Step::StopVms, None);
@@ -5315,6 +5334,32 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
                 }
                 saved.set(true);
+                if !moving.is_empty() && !skip.get() {
+                    let names = moving
+                        .iter()
+                        .map(|env| env.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    page.begin(Step::Move, Some(&names));
+                    let deadline = std::time::Instant::now() + MOVE_WAIT;
+                    loop {
+                        if skip.get() {
+                            break;
+                        }
+                        if environments.moving().is_empty() {
+                            page.finish(Step::Move, &format!("{names}: moved"));
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            page.fail(
+                                Step::Move,
+                                "Not finished — it carries on when this project next opens",
+                            );
+                            break;
+                        }
+                        glib::timeout_future(std::time::Duration::from_secs(1)).await;
+                    }
+                }
                 if remote && !skip.get() {
                     // One budget for both, so a VM that does not answer
                     // cannot hold the window open longer than it did

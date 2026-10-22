@@ -149,6 +149,11 @@ pub fn guest_checkout_path(
     guest_workspace_dir(workspace_root).join(env.as_str())
 }
 
+/// The size a VM's disk stays under until the VM first boots: a qcow2
+/// overlay as `qemu-img create` makes it is a few hundred KiB, and a first
+/// boot writes hundreds of MiB.
+const NEVER_BOOTED: u64 = 16 * 1024 * 1024;
+
 /// Where the VMs' disks live: `$XDG_DATA_HOME/taste-ide/guests/machines`,
 /// beside the base images they overlay. Data, not state: a disk is derived
 /// and disposable, the way every VM is.
@@ -1138,6 +1143,52 @@ impl LibvirtSession {
     /// view, which stops and reports only what is its own.
     pub async fn list_all(&self) -> Result<Vec<Vm>> {
         self.list_prefixed("taste-", Made::Here).await
+    }
+
+    /// Disks and release files in [`disks_dir`] of domains libvirt does not
+    /// have, an hour or more old: what a VM's making left when it was cut
+    /// off between its disk and its definition (2026-10-22's audit). Only a
+    /// disk too small to have been booted — under [`NEVER_BOOTED`] — is
+    /// removed: one that was is a VM undefined some other way, and may be
+    /// the only copy of what was in it. The hour keeps another IDE's making
+    /// of a VM, between the two, out of reach. What was removed.
+    pub async fn sweep_orphan_disks(&self) -> Result<Vec<PathBuf>> {
+        let names = self.virsh(&["list", "--all", "--name"]).await?;
+        let defined: std::collections::HashSet<&str> = names
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        let Ok(entries) = std::fs::read_dir(disks_dir()) else {
+            return Ok(Vec::new());
+        };
+        let settled = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60);
+        let mut removed = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let (domain, disk) = match name.strip_suffix(".qcow2") {
+                Some(domain) => (domain, true),
+                None => match name.strip_suffix(".release") {
+                    Some(domain) => (domain, false),
+                    None => continue,
+                },
+            };
+            if !domain.starts_with("taste-") || defined.contains(domain) {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let recent = meta.modified().map_or(true, |at| at > settled);
+            if recent || (disk && meta.len() >= NEVER_BOOTED) {
+                continue;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                removed.push(path);
+            }
+        }
+        Ok(removed)
     }
 
     /// Every Taste VM on this host, whichever install made it: the memory

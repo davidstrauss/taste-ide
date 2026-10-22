@@ -219,9 +219,24 @@ struct Placement {
 impl Placement {
     const FILE: &'static str = "placement.json";
 
+    /// The checkout a move left behind and has not yet cleared, in the
+    /// same shape: written once the checkout is placed anew, removed when
+    /// the old copy has been dealt with (`finish_move`), and read at the
+    /// next launch when a close or a crash came between the two
+    /// (`resume_retirements`).
+    const RETIRING: &'static str = "retiring.json";
+
     fn read(env_dir: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(env_dir.join(Self::FILE)).ok()?;
+        Self::read_named(env_dir, Self::FILE)
+    }
+
+    fn read_named(env_dir: &Path, file: &str) -> Option<Self> {
+        let text = std::fs::read_to_string(env_dir.join(file)).ok()?;
         serde_json::from_str(&text).ok()
+    }
+
+    fn clear_named(env_dir: &Path, file: &str) {
+        let _ = std::fs::remove_file(env_dir.join(file));
     }
 
     /// Written whole or not at all: a part file, synced, then renamed over
@@ -229,9 +244,13 @@ impl Placement {
     /// environment was placed again from a peer with nothing in it
     /// (2026-10-22's audit).
     fn write(&self, env_dir: &Path) -> Result<()> {
+        self.write_named(env_dir, Self::FILE)
+    }
+
+    fn write_named(&self, env_dir: &Path, file: &str) -> Result<()> {
         use std::io::Write;
-        let path = env_dir.join(Self::FILE);
-        let part = env_dir.join(format!("{}.part", Self::FILE));
+        let path = env_dir.join(file);
+        let part = env_dir.join(format!("{file}.part"));
         let mut file =
             std::fs::File::create(&part).with_context(|| format!("writing {}", part.display()))?;
         file.write_all(serde_json::to_string_pretty(self)?.as_bytes())
@@ -3186,6 +3205,23 @@ impl EnvironmentRegistry {
             if let Ok(stale) = pool.stale().await {
                 swept.stale_vms = stale.into_iter().map(|vm| vm.domain).collect();
             }
+            match pool.libvirt().sweep_orphan_disks().await {
+                Ok(removed) if !removed.is_empty() => taste_core::app_log::push(
+                    "info",
+                    "substrate",
+                    &format!(
+                        "removed {} file(s) of VMs that were never made: {}",
+                        removed.len(),
+                        removed
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::debug!("sweeping orphan VM disks: {e:#}"),
+            }
         }
         let mut report = ReconcileReport {
             restored: self.restore_from_disk(),
@@ -3588,6 +3624,10 @@ impl EnvironmentRegistry {
         self.start_disk_meter();
         self.start_vm_meter();
         self.start_migration_clock();
+        {
+            let registry = self.clone();
+            tokio::spawn(async move { registry.resume_retirements().await });
+        }
 
         if !report.swept.is_empty() {
             let message = report.swept.summary();
@@ -4224,6 +4264,99 @@ impl EnvironmentRegistry {
         }
     }
 
+    /// A move's clearing of the old checkout, cut off by a close or a crash
+    /// between placing the new checkout and dealing with the old one
+    /// (`finish_move`), finished at the next launch: the old copy looked at
+    /// as a move looks at it, removed — with its VM, when nothing else is
+    /// in it — only when it holds nothing the peer lacks, and kept, and
+    /// said, when it does (2026-10-22's audit: such a VM was never
+    /// removed). A VM that cannot be brought up keeps its record for
+    /// another launch; a cloud host is left to its own lifecycle.
+    async fn resume_retirements(self: &Arc<Self>) {
+        for supervisor in self.list() {
+            let id = supervisor.id().clone();
+            let dir = self.env_dir(&id);
+            let Some(old) = Placement::read_named(&dir, Placement::RETIRING) else {
+                continue;
+            };
+            let clear = || Placement::clear_named(&dir, Placement::RETIRING);
+            // Never moved off it after all: there is nothing to clear.
+            if supervisor.checkout().vm() == Some(old.vm.as_str()) {
+                clear();
+                continue;
+            }
+            let pool = self.pool();
+            let Ok(vms) = pool.all_vms().await else {
+                continue;
+            };
+            let Some(vm) = vms.into_iter().find(|vm| vm.domain == old.vm) else {
+                clear();
+                continue;
+            };
+            if vm.is_cloud() || pool.bring_back(&old.vm).await.is_err() {
+                continue;
+            }
+            let unique = crate::disposable::unique_to(&vm, id.as_str(), supervisor.peer())
+                .await
+                .unwrap_or_else(|e| vec![format!("it could not be looked at: {e:#}")]);
+            if !unique.is_empty() {
+                taste_core::app_log::push(
+                    "warn",
+                    "environments",
+                    &format!(
+                        "{id}: its old checkout in VM {} is kept, holding what this machine \
+                         lacks — {}",
+                        old.vm,
+                        unique.join("; ")
+                    ),
+                );
+                clear();
+                continue;
+            }
+            let still_used = self
+                .list()
+                .iter()
+                .any(|s| s.checkout().vm() == Some(old.vm.as_str()));
+            if still_used {
+                let keeper = self.keepers.lock().unwrap().get(&old.vm).cloned();
+                let Some(keeper) = keeper else { continue };
+                let (files, path) = (Files::Remote(keeper), old.path.clone());
+                let removed = tokio::task::spawn_blocking(move || files.remove(&path, true)).await;
+                if matches!(removed, Ok(Ok(()))) {
+                    clear();
+                }
+            } else {
+                match pool.destroy(&vm).await {
+                    Ok(()) => {
+                        self.keepers.lock().unwrap().remove(&old.vm);
+                        self.substrates.lock().unwrap().remove(&old.vm);
+                        taste_core::app_log::push(
+                            "info",
+                            "environments",
+                            &format!(
+                                "VM {} held only {id}'s old checkout, which a move left \
+                                 behind; it was removed",
+                                old.vm
+                            ),
+                        );
+                        clear();
+                    }
+                    Err(e) => tracing::warn!("removing VM {}: {e:#}", old.vm),
+                }
+            }
+        }
+    }
+
+    /// The environments being moved to another VM right now.
+    pub fn moving(&self) -> Vec<EnvironmentId> {
+        self.relocations_in_flight
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// The environment's agent asks for its move. Recorded, and the
     /// coordinator asked to approve it — except for the primary, whose
     /// agent IS the coordinator, so asking is approving and it moves now.
@@ -4825,6 +4958,14 @@ impl EnvironmentRegistry {
                     }
                 }
                 supervisor.move_step(&format!("{moving}: clearing out the old VM"));
+                if let Err(e) = (Placement {
+                    vm: old_domain.clone(),
+                    path: old_path.clone(),
+                })
+                .write_named(&self.env_dir(env), Placement::RETIRING)
+                {
+                    tracing::warn!("recording {env}'s old checkout to clear: {e:#}");
+                }
                 self.finish_move(
                     env,
                     &supervisor,
@@ -4978,6 +5119,8 @@ impl EnvironmentRegistry {
             );
             self.note_vm(&old_domain, note.clone());
             taste_core::app_log::push("warn", "environments", &note);
+            // Kept on purpose: nothing is left to resume.
+            Placement::clear_named(&self.env_dir(env), Placement::RETIRING);
             supervisor.end_move(was_running);
             if was_running {
                 if let Err(e) = supervisor.reload().await {
@@ -5024,6 +5167,7 @@ impl EnvironmentRegistry {
                 }
             }
         }
+        Placement::clear_named(&self.env_dir(env), Placement::RETIRING);
 
         supervisor.end_move(was_running);
         if was_running {

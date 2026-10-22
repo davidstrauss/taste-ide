@@ -33,6 +33,9 @@ pub enum Step {
     Save,
     /// The workspace's VMs told to stop once the grace is up.
     StopVms,
+    /// A move to another VM under way, let finish: cut off, it carries on
+    /// at the next launch, but its environment is down until then.
+    Move,
     /// Personal's uncommitted work kept as a snapshot.
     Snapshot,
     /// The folder brought up to date with Personal.
@@ -43,9 +46,10 @@ pub enum Step {
 }
 
 impl Step {
-    pub const ALL: [Step; 5] = [
+    pub const ALL: [Step; 6] = [
         Step::Save,
         Step::StopVms,
+        Step::Move,
         Step::Snapshot,
         Step::Sync,
         Step::Mark,
@@ -55,6 +59,7 @@ impl Step {
         match self {
             Step::Save => "Save your tabs and chats",
             Step::StopVms => "Schedule the VMs to stop",
+            Step::Move => "Finish moving to the new VM",
             Step::Snapshot => "Keep Personal's uncommitted work",
             Step::Sync => "Bring your folder up to date",
             Step::Mark => "Let the VMs' disks be cleared when space runs short",
@@ -73,8 +78,9 @@ impl ClosingPage {
     /// The page, around `status` — the cloud popover's content, taken
     /// over. `mirrored` is whether the folder mirrors a checkout in a VM;
     /// when it does not, there is nothing to snapshot or bring over, and
-    /// those steps are not listed.
-    pub fn new(status: &gtk::Widget, mirrored: bool) -> Rc<Self> {
+    /// those steps are not listed. `moving` is whether an environment is
+    /// moving to another VM; when none is, that step is not listed.
+    pub fn new(status: &gtk::Widget, mirrored: bool, moving: bool) -> Rc<Self> {
         let icon = gtk::Image::builder()
             .icon_name("taste-cloud-symbolic")
             .pixel_size(48)
@@ -94,7 +100,8 @@ impl ClosingPage {
         let steps = gtk::Box::new(gtk::Orientation::Vertical, 12);
         let rows: Vec<(Step, StepRow)> = Step::ALL
             .into_iter()
-            .filter(|step| mirrored || matches!(step, Step::Save | Step::StopVms))
+            .filter(|step| mirrored || matches!(step, Step::Save | Step::StopVms | Step::Move))
+            .filter(|step| moving || *step != Step::Move)
             .map(|step| {
                 let row = StepRow::titled(step.title());
                 steps.append(&row.row);
@@ -214,7 +221,13 @@ mod tests {
     #[test]
     fn steps_are_named_as_acts_and_in_order() {
         assert_eq!(Step::ALL[0], Step::Save);
-        assert_eq!(Step::ALL[3], Step::Sync);
+        assert_eq!(Step::ALL[4], Step::Sync);
+        // A move finishes before Personal is snapshotted: mid-move, there
+        // is no one checkout to snapshot.
+        assert!(
+            Step::ALL.iter().position(|s| *s == Step::Move)
+                < Step::ALL.iter().position(|s| *s == Step::Snapshot)
+        );
         for step in Step::ALL {
             let title = step.title();
             assert!(title.chars().next().unwrap().is_uppercase(), "{title}");
