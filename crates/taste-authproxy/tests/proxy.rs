@@ -572,15 +572,17 @@ async fn a_silent_custom_stream_stays_open_while_the_server_answers_health_check
 #[tokio::test]
 async fn an_unreachable_custom_server_is_reported_with_the_wake_attempt() {
     let anthropic = start_upstream().await;
-    // A port nothing listens on.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let closed = listener.local_addr().unwrap().port();
-    drop(listener);
+    // An address nothing listens on: another loopback address than the
+    // tests' own servers bind. A port of 127.0.0.1 found free and let go
+    // was taken by another test's upstream under a parallel run, which
+    // answered this test 200 and counted a hit the other did not expect
+    // (2026-10-21).
+    let closed = "127.0.0.2:9";
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("custom-model.json");
     std::fs::write(
         &path,
-        format!(r#"{{"base_url":"http://127.0.0.1:{closed}","token":"k","model":"m"}}"#),
+        format!(r#"{{"base_url":"http://{closed}","token":"k","model":"m"}}"#),
     )
     .unwrap();
     let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
