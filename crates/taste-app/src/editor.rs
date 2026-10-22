@@ -2263,6 +2263,23 @@ impl Editor {
             };
         }
         let (path, page) = self.selected()?;
+        // A text file's wrap, on its source face.
+        if is_text_file(&path) && !page.changes_view.get() {
+            let wrap = gtk::ToggleButton::builder()
+                .icon_name("view-wrapped-symbolic")
+                .tooltip_text("Wrap lines")
+                .focus_on_click(false)
+                .active(page.view.wrap_mode() != gtk::WrapMode::None)
+                .build();
+            let view = page.view.downgrade();
+            wrap.connect_toggled(move |wrap| {
+                let Some(view) = view.upgrade() else { return };
+                LAST_WRAP.with(|last| last.set(wrap.is_active()));
+                view.set_wrap_mode(wrap_mode(wrap.is_active()));
+                view.grab_focus();
+            });
+            return Some(wrap.upcast());
+        }
         if !is_svg(&path) || !self.wysiwyg_active(&path, &page) || page.changes_view.get() {
             return None;
         }
@@ -3237,6 +3254,11 @@ impl Editor {
         view.set_monospace(true);
         view.set_show_line_numbers(true);
         view.set_highlight_current_line(true);
+        // A text file is prose more often than not: wrapped, as the last
+        // choice on its tab bar's toggle left it (`view_tools_of_selection`).
+        if is_text_file(path) {
+            view.set_wrap_mode(wrap_mode(LAST_WRAP.with(Cell::get)));
+        }
         // Enter keeps the line's indentation (David, 2026-09-08: "pressing
         // enter should keep the same indent"). GtkSourceView defaults this
         // OFF, which put the cursor in column 0 after every newline in
@@ -5042,6 +5064,30 @@ fn is_notebook(path: &Path) -> bool {
 /// notebook's cells.
 fn has_preview(path: &Path) -> bool {
     is_markdown(path) || is_notebook(path) || is_svg(path)
+}
+
+/// A plain text file, whose lines may be wrapped from its tab bar (David,
+/// 2026-10-21: "Have a toggle for open txt files to wrap or not").
+fn is_text_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        ["txt", "text", "log"]
+            .iter()
+            .any(|t| e.eq_ignore_ascii_case(t))
+    })
+}
+
+fn wrap_mode(wrap: bool) -> gtk::WrapMode {
+    if wrap {
+        gtk::WrapMode::WordChar
+    } else {
+        gtk::WrapMode::None
+    }
+}
+
+thread_local! {
+    /// Whether a text file wraps, as the toggle last left it: the next one
+    /// opened follows.
+    static LAST_WRAP: Cell<bool> = const { Cell::new(true) };
 }
 
 /// An SVG file: XML to edit, a picture to preview (David, 2026-10-20: "I

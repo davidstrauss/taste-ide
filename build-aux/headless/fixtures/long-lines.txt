@@ -1,0 +1,2 @@
+A text file with a line long enough that it has to wrap somewhere in a pane of ordinary width, which is the whole point of having a toggle for it at all, isn't it.
+A short line.
