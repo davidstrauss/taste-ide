@@ -1124,10 +1124,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // Chat: the selected conversation's agent. Backlog: a filed issue.
         // Commit: the index, with the message.
         let chats_for_send = chats.clone();
-        compose.set_on_chat(move |text, attachments| match chats_for_send.selected() {
-            Some(pane) => pane.send_from(text, attachments),
-            None => Err("no chat is selected".into()),
-        });
+        compose.set_on_chat(
+            move |text, attachments| match chats_for_send.chat_for_send() {
+                Some(pane) => pane.send_from(text, attachments),
+                None => Err("the environment on screen no longer exists".into()),
+            },
+        );
         let backlog = filetree.backlog().clone();
         compose.set_on_backlog(move |title, body, attachments| {
             let files = attachments
@@ -1141,7 +1143,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let filetree_for_commit = filetree.clone();
         compose.set_on_commit(move |message| filetree_for_commit.commit_staged(&message));
         let chats_for_probe = chats.clone();
-        compose.set_chat_available(move || chats_for_probe.selected().is_some());
+        compose.set_chat_available(move || chats_for_probe.readiness());
+        let compose_for_readiness = compose.clone();
+        chats.set_on_readiness(move || compose_for_readiness.resync());
         let compose_for_staged = compose.clone();
         filetree.set_on_commit_state(move |staged, blocked| {
             compose_for_staged.set_staged(staged, blocked);

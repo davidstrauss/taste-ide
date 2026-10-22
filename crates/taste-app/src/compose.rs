@@ -104,6 +104,19 @@ pub struct Draft {
     pub attachments: usize,
 }
 
+/// Whether a message typed now has a chat to go to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatReadiness {
+    /// The environment on screen exists, and its chat — or the one a send
+    /// starts there (`Chats::chat_for_send`) — has what it spends on.
+    Ready,
+    /// The environment on screen no longer exists.
+    Gone,
+    /// The agent behind the proxy, with no credential in this project:
+    /// a turn could only be refused (`ChatPane::unconfigured`).
+    NoCredential,
+}
+
 /// What the window is doing, in the terms a destination judges by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Surroundings {
@@ -111,7 +124,11 @@ pub struct Surroundings {
     /// The Staged view has files unchecked: a commit takes the whole
     /// index, so there is no committing a selection.
     pub commit_blocked: bool,
-    pub has_chat: bool,
+    /// Whether the chat can take a message. Whether the environment has
+    /// an agent yet does not matter: a send to one with none starts it
+    /// there (`Chats::chat_for_send`), which is what its empty state
+    /// invites.
+    pub chat: ChatReadiness,
 }
 
 /// Whether `destination` can take the draft now, or the reason it cannot —
@@ -125,8 +142,18 @@ pub fn availability(
 ) -> Result<(), &'static str> {
     match destination {
         Destination::Chat => {
-            if !surroundings.has_chat {
-                return Err("no chat is selected — pick an environment in the backlog");
+            match surroundings.chat {
+                ChatReadiness::Ready => {}
+                ChatReadiness::Gone => {
+                    return Err(
+                        "the environment on screen no longer exists — pick another in the backlog",
+                    )
+                }
+                ChatReadiness::NoCredential => {
+                    return Err(
+                        "this project has no Anthropic credential — add one in the chat's Settings",
+                    )
+                }
             }
             if !draft.has_text && draft.attachments == 0 {
                 return Err("nothing to send yet");
@@ -322,7 +349,7 @@ pub struct Compose {
     buttons: Vec<(Destination, gtk::Button)>,
     staged: Cell<usize>,
     commit_blocked: Cell<bool>,
-    chat_available: RefCell<Option<Box<dyn Fn() -> bool>>>,
+    chat_available: RefCell<Option<Box<dyn Fn() -> ChatReadiness>>>,
     on_chat: RefCell<Option<ChatHook>>,
     on_backlog: RefCell<Option<BacklogHook>>,
     on_commit: RefCell<Option<CommitHook>>,
@@ -514,9 +541,18 @@ impl Compose {
         *self.on_commit.borrow_mut() = Some(Box::new(hook));
     }
 
-    /// Whether there is a chat to send to right now.
-    pub fn set_chat_available(&self, probe: impl Fn() -> bool + 'static) {
+    /// Whether the chat on screen can take a message, asked at every
+    /// judging of the buttons.
+    pub fn set_chat_available(&self, probe: impl Fn() -> ChatReadiness + 'static) {
         *self.chat_available.borrow_mut() = Some(Box::new(probe));
+        self.sync();
+    }
+
+    /// Judge the buttons again: something they depend on changed outside
+    /// the box — an agent connected, a credential was saved, another
+    /// environment came on screen. Judged only on the box's own changes,
+    /// Send to Chat stayed dim over a draft until the next keystroke.
+    pub fn resync(&self) {
         self.sync();
     }
 
@@ -594,11 +630,11 @@ impl Compose {
         Surroundings {
             staged: self.staged.get(),
             commit_blocked: self.commit_blocked.get(),
-            has_chat: self
+            chat: self
                 .chat_available
                 .borrow()
                 .as_ref()
-                .is_none_or(|probe| probe()),
+                .map_or(ChatReadiness::Ready, |probe| probe()),
         }
     }
 
@@ -893,7 +929,7 @@ mod tests {
     const CALM: Surroundings = Surroundings {
         staged: 3,
         commit_blocked: false,
-        has_chat: true,
+        chat: ChatReadiness::Ready,
     };
 
     #[test]
@@ -939,15 +975,17 @@ mod tests {
             }
         )
         .is_err());
-        assert!(availability(
-            Destination::Chat,
-            words,
-            Surroundings {
-                has_chat: false,
-                ..CALM
-            }
-        )
-        .is_err());
+        for chat in [ChatReadiness::Gone, ChatReadiness::NoCredential] {
+            assert!(
+                availability(Destination::Chat, words, Surroundings { chat, ..CALM }).is_err(),
+                "{chat:?}"
+            );
+            // The other two destinations do not need a chat.
+            assert_eq!(
+                availability(Destination::Backlog, words, Surroundings { chat, ..CALM }),
+                Ok(())
+            );
+        }
     }
 
     #[test]

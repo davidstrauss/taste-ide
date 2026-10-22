@@ -6846,6 +6846,17 @@ impl ChatPane {
         self.refresh_plan_usage();
     }
 
+    /// The settings shade open on the credential form, the caret in its
+    /// Token row — the empty state's Add a Credential… lands here.
+    pub fn open_credential(self: &Rc<Self>) {
+        self.show_options(true);
+        self.sync_credential_form();
+        let token = self.credential_form.token.clone();
+        glib::idle_add_local_once(move || {
+            token.grab_focus();
+        });
+    }
+
     fn show_options(&self, open: bool) {
         if open {
             self.options_toggle.set_active(true);
@@ -6876,7 +6887,7 @@ impl ChatPane {
     /// and the gear went green over an agent that could not answer a
     /// prompt (David, 2026-10-08: "An unconfigured agent should not have a
     /// green badge on the gear").
-    fn unconfigured(&self) -> bool {
+    pub(crate) fn unconfigured(&self) -> bool {
         let spec = self.agent_spec();
         taste_acp::authproxy::proxies(&spec)
             && !spec.is_custom()

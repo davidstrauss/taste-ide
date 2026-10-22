@@ -120,6 +120,11 @@ pub struct Chats {
     /// The agent link's badge for the grafted Settings tab, forwarded the
     /// same way as the utilization glyph.
     on_link_state: RefCell<Option<UsageSeverityHook>>,
+    /// Who is told that what a send would meet may have changed — the
+    /// chat on screen connected, lost its agent, or had its credential
+    /// saved, or another environment came on screen — so the composer
+    /// judges Send to Chat again ([`Chats::readiness`]).
+    on_readiness: RefCell<Option<Rc<dyn Fn()>>>,
     /// Who opens a document a chat step showed in brief (window.rs → the
     /// editor), told which environment's chat is asking.
     on_open_document: RefCell<Option<OpenDocumentHook>>,
@@ -225,6 +230,7 @@ impl Chats {
             grafted: Cell::new(false),
             on_usage_severity: RefCell::new(None),
             on_link_state: RefCell::new(None),
+            on_readiness: RefCell::new(None),
             on_open_document: RefCell::new(None),
             on_focus_composer: RefCell::new(None),
             results,
@@ -237,7 +243,15 @@ impl Chats {
             start_button.connect_clicked(move |_| {
                 let Some(chats) = weak.upgrade() else { return };
                 let env = chats.current.borrow().clone();
-                chats.start_agent_in(&env);
+                // With no credential the button reads Add a Credential…:
+                // the form is in a conversation's settings, so the
+                // conversation is made and its settings opened on it.
+                let missing = taste_acp::authproxy::credential_missing();
+                if let Some(pane) = chats.start_agent_in(&env) {
+                    if missing {
+                        pane.open_credential();
+                    }
+                }
             });
         }
 
@@ -423,6 +437,7 @@ impl Chats {
 
     fn show_current(self: &Rc<Self>) {
         let env = self.current.borrow().clone();
+        self.readiness_changed();
         // The utilization and settings tabs are the SELECTED
         // conversation's, so a selection change moves them: the previous
         // pane gets its shades back and this one hands its own over. One
@@ -562,12 +577,18 @@ impl Chats {
 
     /// What the empty state says about the environment that has no chat.
     fn dress_empty(&self, env: &EnvironmentId) {
-        let (title, description) = empty_state(env, self.environments.get(env).is_some());
+        let exists = self.environments.get(env).is_some();
+        let missing = taste_acp::authproxy::credential_missing();
+        let (title, description) = empty_state(env, exists, missing);
         self.empty.set_title(&title);
         self.empty.set_description(Some(&description));
+        self.start_button.set_label(if missing {
+            "Add a Credential…"
+        } else {
+            "Start an Agent"
+        });
         // An environment that no longer exists cannot be given an agent.
-        self.start_button
-            .set_sensitive(self.environments.get(env).is_some());
+        self.start_button.set_sensitive(exists);
     }
 
     // --- the chats --------------------------------------------------------
@@ -596,6 +617,54 @@ impl Chats {
     /// The chat on screen, if the selected environment has one.
     pub fn selected(&self) -> Option<Rc<ChatPane>> {
         self.pane_for(&self.current.borrow())
+    }
+
+    /// Whether a message typed now has a chat to go to: the selected
+    /// environment exists — [`Chats::chat_for_send`] gives one with no
+    /// agent its agent — and that chat has what it spends on. A new chat
+    /// starts on Claude Code, behind the proxy, so with no pane it is the
+    /// project's credential that decides.
+    pub fn readiness(&self) -> crate::compose::ChatReadiness {
+        use crate::compose::ChatReadiness;
+        if self.environments.get(&self.current.borrow()).is_none() {
+            return ChatReadiness::Gone;
+        }
+        let unconfigured = match self.selected() {
+            Some(pane) => pane.unconfigured(),
+            None => taste_acp::authproxy::credential_missing(),
+        };
+        if unconfigured {
+            ChatReadiness::NoCredential
+        } else {
+            ChatReadiness::Ready
+        }
+    }
+
+    /// Who judges Send to Chat again when [`Chats::readiness`] may have
+    /// moved.
+    pub fn set_on_readiness(&self, hook: impl Fn() + 'static) {
+        *self.on_readiness.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    fn readiness_changed(&self) {
+        let hook = self.on_readiness.borrow().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// The chat a message typed now goes to: the selected environment's,
+    /// started there when it has none yet. A send into an environment
+    /// with no agent IS the gesture its empty state's Start an Agent is,
+    /// with the message already written — refusing it told the user in
+    /// Personal, with no project devcontainer, that no chat was selected
+    /// and to pick an environment, while one was on screen (2026-10-22).
+    pub fn chat_for_send(self: &Rc<Self>) -> Option<Rc<ChatPane>> {
+        if let Some(pane) = self.selected() {
+            return Some(pane);
+        }
+        let env = self.current.borrow().clone();
+        self.start_agent_in(&env)
     }
 
     /// Start an agent in an environment that has none, and show it.
@@ -631,6 +700,7 @@ impl Chats {
             }
         }
         self.persist();
+        self.readiness_changed();
         Some(pane)
     }
 
@@ -737,6 +807,11 @@ impl Chats {
                 let env = env.clone();
                 pane.set_on_link_state(move |icon, tooltip| {
                     let Some(chats) = weak.upgrade() else { return };
+                    // The badge moves with the link — connected, gone,
+                    // a credential saved — which is what a send meets.
+                    if *chats.current.borrow() == env {
+                        chats.readiness_changed();
+                    }
                     if chats.grafted_env.borrow().as_ref() != Some(&env) {
                         return;
                     }
@@ -1144,11 +1219,19 @@ fn nothing_here(text: &str) -> gtk::Widget {
         .upcast()
 }
 
-pub fn empty_state(env: &EnvironmentId, exists: bool) -> (String, String) {
+pub fn empty_state(env: &EnvironmentId, exists: bool, no_credential: bool) -> (String, String) {
     if !exists {
         return (
             "Environment Gone".to_string(),
             format!("{env} no longer exists. Pick another one from the panel below the files."),
+        );
+    }
+    if no_credential {
+        return (
+            "No Anthropic Credential".to_string(),
+            "Agents here spend this project's own Anthropic account, and it has none yet. \
+             Add a token, and the chat takes messages from then on."
+                .to_string(),
         );
     }
     if env.is_primary() {
@@ -1183,18 +1266,30 @@ mod tests {
     /// checkout than it does in a clone.
     #[test]
     fn the_empty_state_names_the_world_the_agent_would_work_in() {
-        let (title, description) = empty_state(&EnvironmentId::primary(), true);
+        let (title, description) = empty_state(&EnvironmentId::primary(), true, false);
         assert_eq!(title, "No Agent Here Yet");
         assert!(description.contains(PRIMARY_TITLE), "{description}");
         assert!(description.contains("your own checkout"), "{description}");
 
-        let (_, description) = empty_state(&env("calm-1"), true);
+        let (_, description) = empty_state(&env("calm-1"), true, false);
         assert!(description.contains("calm-1"), "{description}");
         assert!(description.contains("own clone"), "{description}");
         assert!(
             description.contains("Your files are untouched"),
             "an agent environment says what it will NOT touch: {description}"
         );
+    }
+
+    /// With no credential the empty state says that, not "start one":
+    /// an agent started then could only have its every turn refused.
+    #[test]
+    fn the_empty_state_asks_for_the_credential_a_chat_needs() {
+        let (title, description) = empty_state(&EnvironmentId::primary(), true, true);
+        assert_eq!(title, "No Anthropic Credential");
+        assert!(description.contains("Add a token"), "{description}");
+        // A gone environment is gone whatever the credential.
+        let (title, _) = empty_state(&env("calm-1"), false, true);
+        assert_eq!(title, "Environment Gone");
     }
 
     /// A chat's model choice as the pane holds it across spawns, which is
@@ -1298,7 +1393,7 @@ mod tests {
     /// to start an agent in a clone that is gone.
     #[test]
     fn a_destroyed_environment_offers_nothing() {
-        let (title, description) = empty_state(&env("calm-1"), false);
+        let (title, description) = empty_state(&env("calm-1"), false, false);
         assert_eq!(title, "Environment Gone");
         assert!(description.contains("no longer exists"), "{description}");
     }
