@@ -53,7 +53,7 @@ impl DocumentBase {
     /// Resolved like an image source, against the document's directory or
     /// the root for a leading slash.
     fn resolve_link(&self, href: &str) -> Option<(PathBuf, Option<taste_core::anchor::Anchor>)> {
-        if href.contains("://") || href.starts_with("mailto:") || href.starts_with("copy:") {
+        if href.contains("://") || href.starts_with("mailto:") {
             return None;
         }
         if href.starts_with(crate::issue_pill::SCHEME) || href.starts_with('#') {
@@ -514,11 +514,29 @@ fn layout(
                         continue;
                     }
                 }
+                // A URL written as code is the URL: a link to it, which a
+                // click opens and the label's menu copies as itself.
+                let bare = code.trim();
+                if (bare.starts_with("https://") || bare.starts_with("http://"))
+                    && !bare.contains(char::is_whitespace)
+                    && !in_link
+                {
+                    markup.push_str(&format!(
+                        "<a href=\"{0}\" title=\"{0}\"><tt>{1}</tt></a>",
+                        glib::markup_escape_text(bare),
+                        glib::markup_escape_text(&code)
+                    ));
+                    continue;
+                }
                 // Inline code: click to copy (rendered as a quiet link).
-                let index = spans.len();
+                // The link's address is the code itself, so the label's own
+                // "Copy Link Address" copies the code: an index there was
+                // what it copied, `copy:0` (2026-10-22). A click finds the
+                // address among the run's code spans ([`is_copy_span`]).
                 spans.push(code.to_string());
                 markup.push_str(&format!(
-                    "<a href=\"copy:{index}\" title=\"Click to copy\"><tt>{}</tt></a>",
+                    "<a href=\"{}\" title=\"Click to copy\"><tt>{}</tt></a>",
+                    glib::markup_escape_text(&code),
                     glib::markup_escape_text(&code)
                 ));
             }
@@ -629,17 +647,11 @@ fn build(item: &Item, context: &Context, readiness: Option<&Readiness>) -> Built
             {
                 let span_texts = span_texts.clone();
                 label.connect_activate_link(move |label, href| {
-                    if let Some(index) = href.strip_prefix("copy:") {
-                        let text = index
-                            .parse::<usize>()
-                            .ok()
-                            .and_then(|i| span_texts.borrow().get(i).cloned());
-                        if let Some(text) = text {
-                            label.clipboard().set_text(&text);
-                            if let Some(root) = label.root() {
-                                if let Some(overlay) = find_toast_overlay(root.upcast_ref()) {
-                                    overlay.add_toast(adw::Toast::new("Copied"));
-                                }
+                    if is_copy_span(&span_texts.borrow(), href) {
+                        label.clipboard().set_text(href);
+                        if let Some(root) = label.root() {
+                            if let Some(overlay) = find_toast_overlay(root.upcast_ref()) {
+                                overlay.add_toast(adw::Toast::new("Copied"));
                             }
                         }
                         return glib::Propagation::Stop;
@@ -1039,6 +1051,12 @@ fn table_card(alignments: &[pulldown_cmark::Alignment], rows: &[Vec<String>]) ->
     table.upcast()
 }
 
+/// Whether a link's address is one of its run's code spans, which a click
+/// copies: their address is their own text ([`layout`]).
+fn is_copy_span(spans: &[String], href: &str) -> bool {
+    spans.iter().any(|span| span == href)
+}
+
 fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverlay> {
     let mut child = widget.first_child();
     while let Some(current) = child {
@@ -1176,6 +1194,30 @@ mod tests {
     /// A heading, its paragraphs, and a list are ONE label, so a selection
     /// can run from the heading to the last bullet; a code block is a
     /// widget of its own and starts the next run.
+    /// Code spans link to their own text, so the label's "Copy Link
+    /// Address" copies the code — it copied `copy:0` — and a URL written as
+    /// code links to the URL itself.
+    #[test]
+    fn a_code_span_links_to_what_it_says() {
+        let items = layout(
+            "see `https://example.org/a?b=1` then `cargo test`",
+            None,
+            None,
+        );
+        let Some(Item::Run { markup, spans, .. }) = items.first() else {
+            panic!("a run: {items:?}");
+        };
+        assert!(
+            markup.contains("<a href=\"https://example.org/a?b=1\""),
+            "{markup}"
+        );
+        assert!(markup.contains("<a href=\"cargo test\""), "{markup}");
+        assert!(!markup.contains("copy:"), "{markup}");
+        assert_eq!(spans, &["cargo test".to_string()]);
+        assert!(is_copy_span(spans, "cargo test"));
+        assert!(!is_copy_span(spans, "https://example.org/a?b=1"));
+    }
+
     #[test]
     fn prose_runs_are_one_label_so_a_selection_can_cross_them() {
         crate::gtk_test::on_gtk_thread("markdown runs: no display — skipped", || {
@@ -1260,7 +1302,6 @@ mod tests {
         );
         assert_eq!(base().resolve_link("https://example.org/a.md"), None);
         assert_eq!(base().resolve_link("#heading"), None);
-        assert_eq!(base().resolve_link("copy:3"), None);
         assert_eq!(base().resolve_link("../../etc/passwd"), None);
     }
 
