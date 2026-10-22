@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 10;
+pub const GUIDANCE_REVISION: u32 = 11;
 
 /// When the user's folder last fetched: its `FETCH_HEAD`, which every
 /// fetch writes, as a person reads an age. `None` when it never has.
@@ -426,9 +426,12 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              execute one yourself, use ide_exec with the container's Jupyter tooling (for \
              example `jupyter nbconvert --to notebook --execute --inplace NAME.ipynb` when \
              nbconvert is installed).\n\n\
-             LINKS. To show the user a place in a file, link it in Markdown, its path \
-             relative to the checkout: `[the call](src/main.rs#L42)` a line, `[slide 3](deck/main.pdf#page=3)` \
-             a PDF's page. A click opens it there; ide_open_file opens it now.\n\n\
+             LINKS. Every place you name for the user to look at is a Markdown link to \
+             it, its path relative to the checkout: a line `[config.rs:40](src/config.rs#L40)`, \
+             a PDF's page `[slide 22](deck/deck.pdf#page=22)` (a deck's slide is the page \
+             of its built PDF), a file `[README](README.md)`. Link the mention itself, \
+             each time, in lists and questions too; a click opens it there. \
+             ide_open_file opens one now.\n\n\
              REPLIES. When a turn ends on a question or a choice for the user — confirm \
              this, pick one of these — call suggest_replies last, with the replies they \
              are likeliest to give, so they can answer with a click. Each reply names \
@@ -6204,8 +6207,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "d587b33bba2539273b4dcfc720480718d6f753bf61b65021db7d9b223fbf406a";
-        const AT_REVISION: u32 = 10;
+            "6addf985b5f32e806a5f276c99b68e22aba173bf7ec679189bd707c53d641f42";
+        const AT_REVISION: u32 = 11;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"
