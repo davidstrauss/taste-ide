@@ -404,9 +404,12 @@ impl ViewerPage {
                 glib::timeout_add_local_once(std::time::Duration::from_millis(2000), move || {
                     webkit6::prelude::WebViewExt::evaluate_javascript(
                         &view,
-                        "const before = window.tasteScroll(); \
-                         document.dispatchEvent(new KeyboardEvent('keydown', {key: 'PageDown', bubbles: true})); \
-                         'page down: ' + before + ' -> ' + window.tasteScroll()",
+                        "const seen = [window.tasteScroll()]; \
+                         for (let i = 0; i < 5; i++) { \
+                           document.dispatchEvent(new KeyboardEvent('keydown', {key: 'PageDown', bubbles: true})); \
+                           seen.push(window.tasteScroll()); \
+                         } \
+                         'page down: ' + seen.join(' -> ')",
                         None,
                         None,
                         None::<&gtk::gio::Cancellable>,
@@ -1500,11 +1503,33 @@ try {
       event.preventDefault();
       return;
     }
-    const by = {
-      PageDown: screen, PageUp: -screen, ArrowDown: line, ArrowUp: -line,
-      " ": event.shiftKey ? -screen : screen,
-    }[event.key];
-    if (by !== undefined) {
+    // Paging keeps to the pages: a screenful less a line drifted a page
+    // edge further down the view at every press (David, 2026-10-21: "PgUp/
+    // Down slowly drifts page by page"). The next page's top when it is on
+    // screen already, a screenful of a page taller than the screen but
+    // never past the next page's top, and the same upward.
+    const paging = { PageDown: 1, PageUp: -1, " ": event.shiftKey ? -1 : 1 }[event.key];
+    const by = { ArrowDown: line, ArrowUp: -line }[event.key];
+    if (paging !== undefined) {
+      const at = pane.scrollTop, gap = 6;
+      const base = pane.getBoundingClientRect().top - at;
+      const tops = [];
+      for (let i = 0; i < shown.viewer.pagesCount; i++) {
+        const div = shown.viewer.getPageView(i)?.div;
+        if (div) tops.push(div.getBoundingClientRect().top - base - gap);
+      }
+      let to;
+      if (paging > 0) {
+        const next = tops.find((top) => top > at + 1);
+        to = next === undefined ? at + screen
+          : next <= at + pane.clientHeight ? next : Math.min(at + screen, next);
+      } else {
+        const back = tops.filter((top) => top < at - 1).pop();
+        to = back === undefined ? 0
+          : at - back <= pane.clientHeight ? back : Math.max(at - screen, back);
+      }
+      pane.scrollTop = Math.max(to, 0);
+    } else if (by !== undefined) {
       pane.scrollBy({ top: by });
     } else if (event.key === "Home") {
       pane.scrollTop = 0;
