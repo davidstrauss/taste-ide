@@ -228,7 +228,10 @@ where every folder's New file… and New folder… rows are (pair it with
 `TASTE_PROBE_SELECTION=1` puts README.md in front, opens a folder above
 it, makes files above it and refreshes the tree in place, then lights a
 folder and takes the focus out of the tree, printing the lit row against
-the file in front at each step — the highlight maps to what is open;
+the file in front at each step — the highlight maps to what is open — and
+last puts an ignored file the tree does not list in front, closes the
+folder that opened looking for it, refreshes, and prints whether it
+opened again (it must not);
 `TASTE_PROBE_NAME_PROMPT=1` opens the New file dialog and prints where
 the keyboard is;
 `TASTE_PROBE_LINK=<path#fragment>` opens a reference as a clicked link

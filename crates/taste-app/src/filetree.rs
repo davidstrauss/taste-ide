@@ -641,6 +641,9 @@ pub struct FileTree {
     /// A selection that is not the file in front, on purpose: the New
     /// file… row while its name is asked for.
     selection_held: Cell<bool>,
+    /// The file in front lights its row only where it shows, opening no
+    /// folder ([`FileTree::hold_reveal`]): while a launch reopens its tabs.
+    reveal_held: Cell<bool>,
     /// A check of the selection against the file in front is queued.
     selection_check_queued: Cell<bool>,
     on_open_log: RefCell<Option<OpenLogCallback>>,
@@ -1976,6 +1979,7 @@ impl FileTree {
             files_hits: Cell::new(0),
             pending_select: RefCell::new(None),
             selection_held: Cell::new(false),
+            reveal_held: Cell::new(false),
             selection_check_queued: Cell::new(false),
             on_open_log: RefCell::new(None),
             on_open_port: RefCell::new(None),
@@ -3989,6 +3993,13 @@ impl FileTree {
         });
     }
 
+    /// While `held`, a file brought to the front lights its row only where
+    /// it already shows: a launch reopening its tabs brings each to the
+    /// front in turn, and each opened the folders above its file.
+    pub fn hold_reveal(&self, held: bool) {
+        self.reveal_held.set(held);
+    }
+
     fn select_file(self: &Rc<Self>, path: PathBuf) {
         if !path.starts_with(self.view_root()) {
             self.clear_tree_selection();
@@ -4028,9 +4039,28 @@ impl FileTree {
             }
         }
         match deepest_ancestor {
+            // Not shown, and not to be revealed now.
+            Some(_) if self.reveal_held.get() => {
+                *self.pending_select.borrow_mut() = None;
+                self.clear_tree_selection();
+            }
+            // Open, its listing in, and what comes next on the way to the
+            // file not in it: the file — or a folder above it — is not
+            // listed (an ignored file not shown, a `.render/`). The reveal
+            // ends here. Kept waiting, it ran again at every refresh and
+            // opened that chain of folders again, after the user had
+            // closed them, for as long as the tab stayed in front.
+            Some((row, _))
+                if row.is_expanded()
+                    && row
+                        .children()
+                        .is_some_and(|children| children.n_items() > 0) =>
+            {
+                *self.pending_select.borrow_mut() = None;
+                self.clear_tree_selection();
+            }
             Some((row, dir)) => {
-                // Its children are on their way (or filtered out, in which
-                // case the retry simply never finds it).
+                // Its children are on their way.
                 self.expanded_dirs.borrow_mut().insert(dir);
                 *self.pending_select.borrow_mut() = Some(path);
                 if !row.is_expanded() {
@@ -9268,6 +9298,63 @@ impl FileTree {
                                     .as_ref()
                                     .map(|p| p.display().to_string())
                             );
+                                    // An ignored file not shown, in front: its folder opened
+                                    // once to look for it, then closed, and the tree refreshed
+                                    // — the folder stays closed.
+                                    let root = tree.view_root();
+                                    let _ = std::fs::create_dir_all(root.join("hidden"));
+                                    let _ =
+                                        std::fs::write(root.join("hidden/.gitignore"), "*.log\n");
+                                    let _ = std::fs::write(root.join("hidden/x.log"), "x");
+                                    tree.refresh_tree();
+                                    let tree = tree.clone();
+                                    glib::timeout_add_local_once(
+                                        std::time::Duration::from_millis(1500),
+                                        move || {
+                                            let hidden = tree.view_root().join("hidden");
+                                            tree.select_for_editor(crate::editor::Focused::File(
+                                                hidden.join("x.log"),
+                                            ));
+                                            let open = move |tree: &Rc<FileTree>| {
+                                                tree.tree_selection().and_then(|(_, _, model)| {
+                                                    (0..model.n_items())
+                                                        .filter_map(|i| model.row(i))
+                                                        .find(|row| {
+                                                            row.item()
+                                                                .and_downcast::<BoxedAnyObject>()
+                                                                .is_some_and(|item| {
+                                                                    item.borrow::<FileNode>().path
+                                                                        == hidden
+                                                                })
+                                                        })
+                                                })
+                                            };
+                                            let tree = tree.clone();
+                                            glib::timeout_add_local_once(
+                                                std::time::Duration::from_millis(1500),
+                                                move || {
+                                                    if let Some(row) = open(&tree) {
+                                                        println!(
+                "selection probe: hidden file in front, its folder open {}",
+                row.is_expanded()
+            );
+                                                        row.set_expanded(false);
+                                                    }
+                                                    tree.refresh_tree();
+                                                    let tree = tree.clone();
+                                                    glib::timeout_add_local_once(
+                                                        std::time::Duration::from_millis(2000),
+                                                        move || {
+                                                            println!(
+                "selection probe: closed and refreshed, open again {:?}",
+                open(&tree).map(|row| row.is_expanded())
+            );
+                                                        },
+                                                    );
+                                                },
+                                            );
+                                        },
+                                    );
                                 },
                             );
                         },

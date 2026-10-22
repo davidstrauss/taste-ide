@@ -5017,6 +5017,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             wanted.push(active.clone());
         }
         let editor = editor.clone();
+        let tree = filetree.clone();
         glib::spawn_future_local(async move {
             let (present, missing) = crate::runtime::runtime()
                 .spawn_blocking(move || {
@@ -5026,9 +5027,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 })
                 .await
                 .unwrap_or_default();
-            for path in &present {
+            // Each tab comes to the front as it opens; only the last — the
+            // one that was in front — opens the folders above its file. The
+            // others lit their rows where they showed and opened nothing:
+            // every restored tab's folders opened on a fresh launch (David,
+            // 2026-10-21: "Directories seem to open … I didn't open these
+            // myself").
+            tree.hold_reveal(true);
+            for (index, path) in present.iter().enumerate() {
+                if index + 1 == present.len() {
+                    tree.hold_reveal(false);
+                }
                 editor.open_at(path, None);
             }
+            tree.hold_reveal(false);
             editor.sync_git_state();
             let in_checkout = |path: &PathBuf| {
                 path.strip_prefix(&base)
