@@ -1018,7 +1018,12 @@ no-op at every other width.
   them), and a PDF's Continuous and Single page (`Editor::show_view_modes`;
   David, 2026-10-20: "pack these now quite lean controls into the right
   side of the document tab bar area"). An SVG file is edited as XML and
-  previewed as a picture, drawn by the confined helper Mermaid uses. These tabs are *surfaces*, keyed outside the
+  previewed as a picture, drawn by the confined helper Mermaid uses. A place in a file is
+  named as a URI names one (`taste_core::anchor`): the reference's path
+  says which file and its fragment where, in that kind of file's own
+  convention — `#L42` a line, RFC 8118's `#page=3` a PDF's page — so a
+  Markdown link an agent writes, `[slide 3](deck/main.pdf#page=3)`, opens
+  the file there, and `ide_open_file` takes the same line or page. These tabs are *surfaces*, keyed outside the
   filesystem's namespace (`log:<env>/…`, `port:<env>/<port>`) the way
   review tabs are, so nothing that walks open files takes one for a file;
   they do stow and return with their environment's tab set. Their width

@@ -253,6 +253,8 @@ pub struct ViewerPage {
     pdf_tools: RefCell<Option<Rc<PdfTools>>>,
     /// An image's picture and its zoom, kept across a reload.
     image: RefCell<Option<Rc<ZoomImage>>>,
+    /// A page to turn to once the PDF's page has loaded ([`Self::go_to_page`]).
+    pending_page: Cell<Option<u32>>,
     /// The PDF's text, a string a page, once read ([`Self::read_text`]),
     /// for the universal find (David, 2026-10-06: "Universal find should
     /// work on open PDFs. You should even OCR if necessary"). A page drawn
@@ -299,6 +301,7 @@ impl ViewerPage {
             pdf_view: RefCell::new(None),
             pdf_tools: RefCell::new(None),
             image: RefCell::new(None),
+            pending_page: Cell::new(None),
             text: RefCell::new(None),
             text_generation: Cell::new(0),
             reading: Cell::new(false),
@@ -684,6 +687,9 @@ impl ViewerPage {
                         if let Some(page) = weak.upgrade() {
                             page.loaded.set(true);
                             page.read_text();
+                            if let Some(n) = page.pending_page.take() {
+                                page.go_to_page(n);
+                            }
                         }
                     }
                 });
@@ -693,6 +699,42 @@ impl ViewerPage {
         };
         shown.set_vexpand(true);
         self.content.append(&shown);
+    }
+
+    /// TASTE_PROBE_LINK only: the page in view, printed.
+    #[doc(hidden)]
+    pub fn say_page_for_probe(&self) {
+        if let Some(view) = self.pdf_view.borrow().as_ref() {
+            webkit6::prelude::WebViewExt::evaluate_javascript(
+                view,
+                "window.tasteCurrentPage()",
+                None,
+                None,
+                None::<&gtk::gio::Cancellable>,
+                |result| {
+                    if let Ok(value) = result {
+                        println!("link probe: page {} in view", value.to_int32());
+                    }
+                },
+            );
+        }
+    }
+
+    /// Turn the PDF to page `n` — a link's `#page=n` (`taste_core::anchor`)
+    /// — once its document is up: now when the page has loaded, else when
+    /// it does.
+    pub fn go_to_page(&self, n: u32) {
+        let Some(view) = self.pdf_view.borrow().clone() else {
+            return;
+        };
+        if !self.loaded.get() {
+            self.pending_page.set(Some(n));
+            return;
+        }
+        run_js(
+            &view,
+            &format!("window.tasteReady.then(() => window.tastePage({n}))"),
+        );
     }
 
     /// The controls the editor's view bar carries for this tab, on its
@@ -1132,6 +1174,9 @@ try {
       setTimeout(() => { view.scale = shown.viewer.currentScaleValue; report(); }, 0);
     });
   }
+  // A page asked for before the pages are laid out — a link's `#page=`,
+  // opening a tab — waits for them: set earlier, it was set on nothing.
+  let pagesReady = false, waitingPage = null;
   shown.eventBus.on("pagesinit", () => {
     layOut();
     shown.viewer.scrollMode = scrollModeOf(view.mode);
@@ -1139,6 +1184,8 @@ try {
     if (presenting) {
       shown.viewer.currentPageNumber = Math.max(parseInt(params.get("page") || "1", 10) || 1, 1);
     }
+    pagesReady = true;
+    if (waitingPage) shown.viewer.currentPageNumber = waitingPage;
     report();
   }, { once: true });
   // The page in view, which a presentation starts from.
@@ -1267,7 +1314,11 @@ try {
     if (old) old.destroy();
   };
   // For the probe: a page to turn to.
-  window.tastePage = (n) => { shown.viewer.currentPageNumber = n; return n; };
+  window.tastePage = (n) => {
+    if (!pagesReady) { waitingPage = n; return n; }
+    shown.viewer.currentPageNumber = n;
+    return n;
+  };
   // For the probe: the scroll of the pane on screen, and its page.
   window.tasteScroll = (top) => {
     if (top !== undefined) shown.container.scrollTop = top;

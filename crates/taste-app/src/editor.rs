@@ -2762,6 +2762,34 @@ impl Editor {
         self.open_with(path, line, false);
     }
 
+    /// TASTE_PROBE_LINK only: the page in view of the PDF in front, said
+    /// once its document is up.
+    #[doc(hidden)]
+    pub fn say_page_for_probe(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(4000), move || {
+            let Some(editor) = weak.upgrade() else { return };
+            let Some(surface) = editor.selected_surface() else {
+                println!("link probe: no viewer in front");
+                return;
+            };
+            if let SurfaceKind::View(page) = &surface.kind {
+                page.say_page_for_probe();
+            }
+        });
+    }
+
+    /// Open `path` at a place in it (`taste_core::anchor`): a line, or a
+    /// PDF's page, which its viewer turns to — what a link an agent wrote
+    /// opens (`[slide 3](deck/main.pdf#page=3)`).
+    pub fn open_anchored(self: &Rc<Self>, path: &Path, at: Option<taste_core::anchor::Anchor>) {
+        use taste_core::anchor::Anchor;
+        match (at, crate::viewer::kind_for(path)) {
+            (Some(Anchor::Page(page)), Some(kind)) => self.open_viewer(path, kind, Some(page)),
+            (at, _) => self.open_at(path, at.and_then(Anchor::line)),
+        }
+    }
+
     /// TASTE_PROBE_CHECK only: open a markdown file and put it on its
     /// preview face once it has loaded — the way to see the preview's
     /// rendering, images included, in a shot (`TASTE_PROBE_PREVIEW`).
@@ -2944,7 +2972,7 @@ impl Editor {
         // not contain valid UTF-8").
         if !changes {
             if let Some(kind) = crate::viewer::kind_for(path) {
-                self.open_viewer(path, kind);
+                self.open_viewer(path, kind, None);
                 return;
             }
         }
@@ -3052,12 +3080,15 @@ impl Editor {
     /// in. The read, and an image's decode, run on the blocking pool; the
     /// file's owner is found the way a text tab's is, so a viewer opens in
     /// its environment's tab set.
-    fn open_viewer(self: &Rc<Self>, path: &Path, kind: crate::viewer::ViewKind) {
+    fn open_viewer(self: &Rc<Self>, path: &Path, kind: crate::viewer::ViewKind, page: Option<u32>) {
         let key = viewer_key(path);
         let existing = self.surfaces.borrow().get(&key).cloned();
         if let Some(existing) = existing {
             self.follow_to(Some(existing.env.clone()));
             self.tabs.set_selected_page(&existing.tab);
+            if let (Some(n), SurfaceKind::View(view)) = (page, &existing.kind) {
+                view.go_to_page(n);
+            }
             return;
         }
         let checkouts = self.checkouts();
@@ -3086,6 +3117,7 @@ impl Editor {
                 editor.tabs.set_selected_page(&existing.tab);
                 return;
             }
+            let at_page = page;
             let page = match loaded {
                 Ok(loaded) => crate::viewer::ViewerPage::new(&path, kind, loaded),
                 Err(why) => {
@@ -3101,6 +3133,10 @@ impl Editor {
                     return;
                 }
             };
+            // The page a link named, once the document is up.
+            if let Some(n) = at_page {
+                page.go_to_page(n);
+            }
             // Its text answers the universal find, and OCR for the pages
             // without any runs where the file is.
             page.set_source(files.clone(), path.clone());
@@ -4722,8 +4758,8 @@ impl Editor {
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| page.origin_root.clone()),
                 root: page.origin_root.clone(),
-                open_file: std::rc::Rc::new(move |path, line| {
-                    open_events.publish(taste_core::Event::OpenFileRequested { path, line });
+                open_file: std::rc::Rc::new(move |path, at| {
+                    open_events.publish(taste_core::Event::OpenFileRequested { path, at });
                 }),
             };
             // Double-buffered: the next rendering is built beside the one

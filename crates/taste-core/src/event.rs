@@ -241,7 +241,11 @@ pub enum Event {
     /// stale and needs a rebuild.
     FileTreeChanged,
     /// An agent asked (over MCP) to show a file in the editor.
-    OpenFileRequested { path: PathBuf, line: Option<u32> },
+    OpenFileRequested {
+        path: PathBuf,
+        /// Where in it: a line, a PDF's page (`crate::anchor`).
+        at: Option<crate::anchor::Anchor>,
+    },
     /// Bring the console's Devcontainer log tab to the front.
     ShowDevcontainerLog,
     /// Open the primary's Virtual Machine log: the banner's View Log while

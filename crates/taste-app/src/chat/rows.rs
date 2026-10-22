@@ -554,8 +554,8 @@ impl ChatPane {
                 files: supervisor.files(),
                 dir: root.clone(),
                 root,
-                open_file: Rc::new(move |path, line| {
-                    events.publish(taste_core::Event::OpenFileRequested { path, line });
+                open_file: Rc::new(move |path, at| {
+                    events.publish(taste_core::Event::OpenFileRequested { path, at });
                 }),
             }
         })

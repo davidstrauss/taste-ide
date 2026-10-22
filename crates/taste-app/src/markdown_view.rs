@@ -41,37 +41,29 @@ pub struct DocumentBase {
     pub files: taste_core::files::Files,
     pub dir: PathBuf,
     pub root: PathBuf,
-    /// Open a file of this checkout in the editor, at a line when given.
-    pub open_file: Rc<dyn Fn(PathBuf, Option<u32>)>,
+    /// Open a file of this checkout in the editor, at a place when given:
+    /// a line, a PDF's page (`taste_core::anchor`).
+    pub open_file: Rc<dyn Fn(PathBuf, Option<taste_core::anchor::Anchor>)>,
 }
 
 impl DocumentBase {
-    /// A link's target as a file of this checkout and a line, when the
-    /// link is a path and not a URL: `path`, `path#L12`, `path#12`, or
-    /// `path:12`. Resolved like an image source, against the document's
-    /// directory or the root for a leading slash.
-    fn resolve_link(&self, href: &str) -> Option<(PathBuf, Option<u32>)> {
+    /// A link's target as a file of this checkout and a place in it, when
+    /// the link is a path and not a URL: `path`, `path#L12`, `path#12`,
+    /// `path:12`, or a PDF's `path#page=3` (`taste_core::anchor`).
+    /// Resolved like an image source, against the document's directory or
+    /// the root for a leading slash.
+    fn resolve_link(&self, href: &str) -> Option<(PathBuf, Option<taste_core::anchor::Anchor>)> {
         if href.contains("://") || href.starts_with("mailto:") || href.starts_with("copy:") {
             return None;
         }
         if href.starts_with(crate::issue_pill::SCHEME) || href.starts_with('#') {
             return None;
         }
-        let (path_part, line) = match href.split_once('#') {
-            Some((path, fragment)) => (path, fragment.trim_start_matches('L').parse::<u32>().ok()),
-            None => match href.rsplit_once(':') {
-                Some((path, digits))
-                    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) =>
-                {
-                    (path, digits.parse::<u32>().ok())
-                }
-                _ => (href, None),
-            },
-        };
+        let (path_part, at) = taste_core::anchor::split_reference(href);
         if path_part.is_empty() {
             return None;
         }
-        self.resolve(path_part).map(|path| (path, line))
+        self.resolve(path_part).map(|path| (path, at))
     }
 
     /// The file a markdown image source names, or `None` when it is not a
@@ -359,8 +351,8 @@ fn render_full(
             }
             // A path of this checkout: the file, in the editor.
             if let Some(base) = &base {
-                if let Some((path, line)) = base.resolve_link(href) {
-                    (base.open_file)(path, line);
+                if let Some((path, at)) = base.resolve_link(href) {
+                    (base.open_file)(path, at);
                 }
             }
             glib::Propagation::Stop // anything else goes nowhere
@@ -1027,16 +1019,27 @@ mod tests {
 
     #[test]
     fn a_path_link_names_a_file_and_maybe_a_line_and_a_url_does_not() {
+        use taste_core::anchor::Anchor;
         assert_eq!(
             base().resolve_link("../crates/taste-app/src/filetree.rs#L4136"),
             Some((
                 PathBuf::from("/checkout/crates/taste-app/src/filetree.rs"),
-                Some(4136)
+                Some(Anchor::Line(4136))
             ))
         );
         assert_eq!(
             base().resolve_link("ENVIRONMENTS.md:20"),
-            Some((PathBuf::from("/checkout/docs/ENVIRONMENTS.md"), Some(20)))
+            Some((
+                PathBuf::from("/checkout/docs/ENVIRONMENTS.md"),
+                Some(Anchor::Line(20))
+            ))
+        );
+        assert_eq!(
+            base().resolve_link("talk/slides.pdf#page=3"),
+            Some((
+                PathBuf::from("/checkout/docs/talk/slides.pdf"),
+                Some(Anchor::Page(3))
+            ))
         );
         assert_eq!(
             base().resolve_link("/README.md"),

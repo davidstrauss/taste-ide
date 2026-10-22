@@ -3347,6 +3347,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     let path = std::env::current_dir().unwrap_or_default().join(preview);
                     editor_for_probe.open_preview_for_probe(path);
                 }
+                // `TASTE_PROBE_LINK=<path#fragment>`: a reference opened as
+                // a clicked link opens it (`taste_core::anchor`), and for a
+                // PDF the page in view printed once it is up.
+                if let Ok(link) = std::env::var("TASTE_PROBE_LINK") {
+                    let (path, at) = taste_core::anchor::split_reference(&link);
+                    let path = std::env::current_dir().unwrap_or_default().join(path);
+                    editor_for_probe.open_anchored(&path, at);
+                    editor_for_probe.say_page_for_probe();
+                }
                 if view_for_open == "port" {
                     editor_for_probe.select_port_for_probe(
                         &taste_core::environment::EnvironmentId::primary(),
@@ -4258,8 +4267,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             semantic_keeper.schedule_refresh();
                         }
                     }
-                    Event::OpenFileRequested { path, line } => {
-                        editor.open_at(&path, line);
+                    Event::OpenFileRequested { path, at } => {
+                        editor.open_anchored(&path, at);
                     }
                     // The devcontainer events name their environment. The
                     // banner, the Containers tab and the file tree's

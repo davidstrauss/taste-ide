@@ -231,6 +231,9 @@ folder and takes the focus out of the tree, printing the lit row against
 the file in front at each step — the highlight maps to what is open;
 `TASTE_PROBE_NAME_PROMPT=1` opens the New file dialog and prints where
 the keyboard is;
+`TASTE_PROBE_LINK=<path#fragment>` opens a reference as a clicked link
+opens it (`taste_core::anchor`: `#L12` a line, a PDF's `#page=3`), and
+for a PDF prints the page in view once it is up;
 `TASTE_PROBE_FOCUS=1` (with `TASTE_PROBE_PREVIEW`) uses a control at the
 tab bar's end — the zoom menu opened and closed where the tab has one,
 else another mode's toggle — and prints where the keyboard is after,

@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 9;
+pub const GUIDANCE_REVISION: u32 = 10;
 
 /// When the user's folder last fetched: its `FETCH_HEAD`, which every
 /// fetch writes, as a person reads an age. `None` when it never has.
@@ -426,6 +426,9 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              execute one yourself, use ide_exec with the container's Jupyter tooling (for \
              example `jupyter nbconvert --to notebook --execute --inplace NAME.ipynb` when \
              nbconvert is installed).\n\n\
+             LINKS. To show the user a place in a file, link it in Markdown, its path \
+             relative to the checkout: `[the call](src/main.rs#L42)` a line, `[slide 3](deck/main.pdf#page=3)` \
+             a PDF's page. A click opens it there; ide_open_file opens it now.\n\n\
              REPLIES. When a turn ends on a question or a choice for the user — confirm \
              this, pick one of these — call suggest_replies last, with the replies they \
              are likeliest to give, so they can answer with a click. Each reply names \
@@ -1600,13 +1603,14 @@ impl McpServer {
                 ),
                 tool(
                     "ide_open_file",
-                    "Show a file in the user's editor, optionally at a line. Changes \
-                     nothing on disk.",
+                    "Show a file in the user's editor, optionally at a line, or a PDF at \
+                     a page. Changes nothing on disk.",
                     json!({
                         "type": "object",
                         "properties": {
                             "path": { "type": "string", "description": "workspace-relative or absolute path" },
-                            "line": { "type": "integer", "description": "1-based line to jump to" }
+                            "line": { "type": "integer", "description": "1-based line to jump to" },
+                            "page": { "type": "integer", "description": "a PDF's 1-based page to turn to" }
                         },
                         "required": ["path"]
                     }),
@@ -2257,12 +2261,16 @@ impl McpServer {
             }
             "ide_open_file" => {
                 let path = self.checkout_file(env, &args, "ide_open_file")?;
-                let line = args["line"].as_u64().map(|l| l as u32);
+                let at = match (args["page"].as_u64(), args["line"].as_u64()) {
+                    (Some(page), _) => Some(taste_core::anchor::Anchor::Page(page as u32)),
+                    (None, Some(line)) => Some(taste_core::anchor::Anchor::Line(line as u32)),
+                    (None, None) => None,
+                };
                 self.workspace
                     .events
                     .publish(taste_core::Event::OpenFileRequested {
                         path: path.clone(),
-                        line,
+                        at,
                     });
                 Ok(json!({ "opened": path.display().to_string() }))
             }
@@ -6196,8 +6204,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "77a935edaa12d245031cd2ee34924f9dd5e78dd3028cba5ec604864f57c15253";
-        const AT_REVISION: u32 = 9;
+            "d587b33bba2539273b4dcfc720480718d6f753bf61b65021db7d9b223fbf406a";
+        const AT_REVISION: u32 = 10;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"
@@ -8214,9 +8222,9 @@ mod tests {
         .await;
         assert!(opened["opened"].as_str().unwrap().ends_with("src/main.rs"));
         match events.recv().await.unwrap() {
-            taste_core::Event::OpenFileRequested { path, line } => {
+            taste_core::Event::OpenFileRequested { path, at } => {
                 assert!(path.ends_with("src/main.rs"));
-                assert_eq!(line, Some(12));
+                assert_eq!(at, Some(taste_core::anchor::Anchor::Line(12)));
             }
             other => panic!("unexpected event: {other:?}"),
         }

@@ -6,6 +6,7 @@
 
 pub mod activity;
 pub mod agentedit;
+pub mod anchor;
 pub mod app_log;
 pub mod capped;
 pub mod chatarchive;
