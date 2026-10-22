@@ -1044,12 +1044,16 @@ impl EnvironmentRegistry {
     /// — run at the top of every reconcile, before this workspace asks the
     /// host for room. When the host had no room for one more VM, the
     /// ones just stopped are waited for, up to a minute, so the bring-up
-    /// that follows finds the room they held. Said once, in a toast and
-    /// the app log, naming the projects by folder.
-    async fn stop_unowned_vms(&self, pool: &crate::pool::Pool) -> usize {
+    /// that follows finds the room they held. Said in the app log and on
+    /// the startup page's own step, which names the projects by folder
+    /// (`conclude_sweep`) — never in a toast as well, since the page
+    /// already draws the step (David, 2026-10-22: "I don't need a toast
+    /// for stopping other VMs when it's an explicit step in the spinup
+    /// panel"). Returns those folders' names.
+    async fn stop_unowned_vms(&self, pool: &crate::pool::Pool) -> Vec<String> {
         let unowned = match pool.unowned_vms().await {
             Ok(unowned) if !unowned.is_empty() => unowned,
-            _ => return 0,
+            _ => return Vec::new(),
         };
         // A step of the operation the banner's bar draws, ahead of the
         // VM's boot (David, 2026-09-22: "Shutting down unsupervised VMs
@@ -1068,11 +1072,18 @@ impl EnvironmentRegistry {
             }
         }
         if stopped.is_empty() {
-            return 0;
+            return Vec::new();
         }
-        let note = unowned_note(&stopped);
-        taste_core::app_log::push("info", "substrate", &note);
-        self.events.publish(Event::Toast(note));
+        let names = project_names(&stopped);
+        taste_core::app_log::push(
+            "info",
+            "substrate",
+            &format!(
+                "Stopped {} of other projects that had no IDE window open ({})",
+                vms_words(names.len()),
+                names.join(", ")
+            ),
+        );
         if full {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             for vm in &stopped {
@@ -1087,7 +1098,7 @@ impl EnvironmentRegistry {
                 }
             }
         }
-        stopped.len()
+        names
     }
 
     /// What a startup step came to, for the startup page's row: said once
@@ -1101,11 +1112,15 @@ impl EnvironmentRegistry {
 
     /// The sweep's conclusion: how many VMs it stopped, and the memory
     /// the room check now sees for this IDE's VMs.
-    async fn conclude_sweep(&self, pool: &crate::pool::Pool, stopped: usize) {
-        let stopped = match stopped {
+    async fn conclude_sweep(&self, pool: &crate::pool::Pool, stopped: &[String]) {
+        let stopped = match stopped.len() {
             0 => "No unused VMs were running.".to_string(),
-            1 => "Stopped 1 unused VM.".to_string(),
-            n => format!("Stopped {n} unused VMs."),
+            n => format!(
+                "Stopped {} unused {} ({}).",
+                n,
+                vms_noun(n),
+                stopped.join(", ")
+            ),
         };
         let summary = match pool.memory_room().await {
             Ok(room) => format!("{stopped} {}", room_words(&room)),
@@ -3067,7 +3082,7 @@ impl EnvironmentRegistry {
         // over a guest already booting when the order was the other way
         // (David, 2026-09-22).
         let stopped = self.stop_unowned_vms(&pool).await;
-        self.conclude_sweep(&pool, stopped).await;
+        self.conclude_sweep(&pool, &stopped).await;
         // The guest image is this machine's already: its step is done now,
         // before the VM boots on it.
         if !fetching {
@@ -3544,22 +3559,29 @@ impl EnvironmentRegistry {
 
 /// The sentence for the VMs stopped: which other projects' VMs were
 /// running with no window open, by the folder each VM's XML names.
-fn unowned_note(stopped: &[Vm]) -> String {
-    let names: Vec<String> = stopped
-        .iter()
+/// The projects VMs belong to, by folder name (the domain where a VM
+/// names no folder).
+fn project_names(vms: &[Vm]) -> Vec<String> {
+    vms.iter()
         .map(|vm| {
             vm.workspace_root
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| vm.domain.clone())
         })
-        .collect();
-    format!(
-        "Stopped {} VM{} of other projects that had no IDE window open ({})",
-        stopped.len(),
-        if stopped.len() == 1 { "" } else { "s" },
-        names.join(", ")
-    )
+        .collect()
+}
+
+fn vms_noun(n: usize) -> &'static str {
+    if n == 1 {
+        "VM"
+    } else {
+        "VMs"
+    }
+}
+
+fn vms_words(n: usize) -> String {
+    format!("{n} {}", vms_noun(n))
 }
 
 /// How many lines of a VM's story are kept. A CoreOS boot is several
