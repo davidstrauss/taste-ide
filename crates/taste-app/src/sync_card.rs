@@ -44,7 +44,40 @@ pub struct SyncCard {
     pub gesture: Option<String>,
     /// The commits the count counts, listed under the facts.
     pub commits: taste_git::CommitList,
+    /// What a push would not keep of the remote's change, file by file,
+    /// listed under the commits ([`taste_git::Carried`]); and how many
+    /// such files there are beyond those listed.
+    pub losses: Vec<taste_git::Loss>,
+    pub losses_more: usize,
 }
+
+/// What a row of a card stands for, opened beside the card when the
+/// pointer comes onto it.
+#[derive(Debug, Clone)]
+pub enum Detail {
+    Commit(taste_git::CommitLine),
+    Loss(taste_git::Loss),
+}
+
+impl Detail {
+    /// Which row's detail is up, so the same row does not open it again.
+    fn key(&self) -> String {
+        match self {
+            Detail::Commit(commit) => commit.id.clone(),
+            Detail::Loss(loss) => format!("loss:{}", loss.path),
+        }
+    }
+
+    fn widget(&self) -> gtk::Widget {
+        match self {
+            Detail::Commit(commit) => detail_widget(commit),
+            Detail::Loss(loss) => loss_widget(loss),
+        }
+    }
+}
+
+/// Told when the pointer comes onto a row (`Some`) or leaves it.
+type OnRow = Rc<dyn Fn(&gtk::Widget, Option<&Detail>)>;
 
 impl SyncCard {
     pub fn new(title: impl Into<String>) -> Self {
@@ -64,6 +97,24 @@ impl SyncCard {
         self
     }
 
+    /// Another warning under any already given, on a line of its own.
+    pub fn warn_also(mut self, warning: Option<String>) -> Self {
+        if let Some(warning) = warning {
+            self.warning = Some(match self.warning.take() {
+                Some(before) => format!("{before}\n{warning}"),
+                None => warning,
+            });
+        }
+        self
+    }
+
+    pub fn fact_if(self, name: impl Into<String>, value: Option<String>) -> Self {
+        match value {
+            Some(value) => self.fact(name, value),
+            None => self,
+        }
+    }
+
     pub fn warning_if(self, warning: Option<String>) -> Self {
         match warning {
             Some(warning) => self.warning(warning),
@@ -81,13 +132,17 @@ impl SyncCard {
         self
     }
 
+    pub fn losses(mut self, carried: &taste_git::Carried) -> Self {
+        self.losses = carried.details.clone();
+        self.losses_more =
+            (carried.missing.len() + carried.differing.len()).saturating_sub(carried.details.len());
+        self
+    }
+
     /// The card, built: a few labels in a grid on a tooltip's dark
     /// ground, made each time it shows, and the commits' rows, each of which
     /// calls `on_row` with its commit when the pointer comes onto it.
-    fn widget(
-        &self,
-        on_row: &Rc<dyn Fn(&gtk::Widget, Option<&taste_git::CommitLine>)>,
-    ) -> gtk::Widget {
+    fn widget(&self, on_row: &OnRow) -> gtk::Widget {
         let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
         card.add_css_class("osd");
         card.add_css_class("sync-card");
@@ -125,6 +180,9 @@ impl SyncCard {
         if let Some(list) = commit_rows(&self.commits, on_row) {
             card.append(&list);
         }
+        if let Some(section) = loss_rows(&self.losses, self.losses_more, on_row) {
+            card.append(&section);
+        }
         if let Some(warning) = &self.warning {
             card.append(
                 &gtk::Label::builder()
@@ -151,10 +209,7 @@ impl SyncCard {
 
 /// The commits' rows, in a list that scrolls past about ten of them, and
 /// a last line for any the list does not carry. `None` with none.
-fn commit_rows(
-    commits: &taste_git::CommitList,
-    on_row: &Rc<dyn Fn(&gtk::Widget, Option<&taste_git::CommitLine>)>,
-) -> Option<gtk::Widget> {
+fn commit_rows(commits: &taste_git::CommitList, on_row: &OnRow) -> Option<gtk::Widget> {
     if commits.commits.is_empty() {
         return None;
     }
@@ -182,26 +237,7 @@ fn commit_rows(
                 .css_classes(["caption", "dim-label", "numeric"])
                 .build(),
         );
-        let motion = gtk::EventControllerMotion::new();
-        // The row weakly: its own controller holding it would keep every
-        // card ever shown alive.
-        {
-            let (on_row, commit, row) = (on_row.clone(), commit.clone(), row.downgrade());
-            motion.connect_enter(move |_, _, _| {
-                if let Some(row) = row.upgrade() {
-                    on_row(row.upcast_ref(), Some(&commit));
-                }
-            });
-        }
-        {
-            let (on_row, row) = (on_row.clone(), row.downgrade());
-            motion.connect_leave(move |_| {
-                if let Some(row) = row.upgrade() {
-                    on_row(row.upcast_ref(), None);
-                }
-            });
-        }
-        row.add_controller(motion);
+        hover_opens(&row, Detail::Commit(commit.clone()), on_row);
         rows.append(&row);
     }
     if commits.more > 0 {
@@ -214,15 +250,236 @@ fn commit_rows(
                 .build(),
         );
     }
-    let scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
+    let list = scrolled_if_tall(&rows, LIST_HEIGHT, None);
+    list.add_css_class("commit-list");
+    Some(list)
+}
+
+/// `child` as it is, or in a scroller when it is taller than `height` —
+/// or, given a `width`, wider than that. A scroller's own minimum, its
+/// scrollbar's, is taller than a row or two, and stood a short list or a
+/// one-line diff in a band of empty space.
+fn scrolled_if_tall(child: &impl IsA<gtk::Widget>, height: i32, width: Option<i32>) -> gtk::Widget {
+    let (_, natural_h, _, _) = child.measure(gtk::Orientation::Vertical, -1);
+    let (_, natural_w, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+    let tall = natural_h > height;
+    let wide = width.is_some_and(|width| natural_w > width);
+    if !tall && !wide {
+        return child.clone().upcast();
+    }
+    let policy = |scrolls: bool| {
+        if scrolls {
+            gtk::PolicyType::Automatic
+        } else {
+            gtk::PolicyType::Never
+        }
+    };
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(policy(wide))
+        .vscrollbar_policy(policy(tall))
         .propagate_natural_width(true)
         .propagate_natural_height(true)
-        .max_content_height(LIST_HEIGHT)
-        .child(&rows)
+        .max_content_height(height)
+        .max_content_width(width.unwrap_or(-1))
+        .child(child)
+        .build()
+        .upcast()
+}
+
+/// The pointer on `row` opens `detail` beside the card, and off it lets it
+/// go. The row is held weakly: its own controller holding it would keep
+/// every card ever shown alive.
+fn hover_opens(row: &gtk::Box, detail: Detail, on_row: &OnRow) {
+    let motion = gtk::EventControllerMotion::new();
+    {
+        let (on_row, row) = (on_row.clone(), row.downgrade());
+        motion.connect_enter(move |_, _, _| {
+            if let Some(row) = row.upgrade() {
+                on_row(row.upcast_ref(), Some(&detail));
+            }
+        });
+    }
+    {
+        let (on_row, row) = (on_row.clone(), row.downgrade());
+        motion.connect_leave(move |_| {
+            if let Some(row) = row.upgrade() {
+                on_row(row.upcast_ref(), None);
+            }
+        });
+    }
+    row.add_controller(motion);
+}
+
+/// What a push would not keep, a section of its own: a dim heading, and a
+/// row a file — its path, and whether its change is not here or differs —
+/// in a list that scrolls past about eight, each opening its evidence
+/// beside the card (David, 2026-10-22: "its own scrollable, hoverable …
+/// section, file by file"). `None` with nothing lost.
+fn loss_rows(losses: &[taste_git::Loss], more: usize, on_row: &OnRow) -> Option<gtk::Widget> {
+    if losses.is_empty() {
+        return None;
+    }
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    section.append(
+        &gtk::Label::builder()
+            .label("What the push does not keep")
+            .xalign(0.0)
+            .css_classes(["caption-heading", "dim-label"])
+            .margin_top(4)
+            .build(),
+    );
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    for loss in losses {
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .css_classes(["commit-row", "loss-row"])
+            .build();
+        row.append(
+            &gtk::Label::builder()
+                .label(&loss.path)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::Start)
+                .max_width_chars(44)
+                .build(),
+        );
+        row.append(
+            &gtk::Label::builder()
+                .label(if loss.differing {
+                    "differs"
+                } else {
+                    "not here"
+                })
+                .xalign(1.0)
+                .css_classes(["caption", "warning"])
+                .build(),
+        );
+        hover_opens(&row, Detail::Loss(loss.clone()), on_row);
+        rows.append(&row);
+    }
+    if more > 0 {
+        rows.append(
+            &gtk::Label::builder()
+                .label(format!("and {} more", count(more, "file")))
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .margin_top(2)
+                .build(),
+        );
+    }
+    let list = scrolled_if_tall(&rows, LOSS_HEIGHT, None);
+    list.add_css_class("commit-list");
+    section.append(&list);
+    Some(section.upcast())
+}
+
+/// How tall the list of what a push does not keep grows before it
+/// scrolls: about eight rows.
+const LOSS_HEIGHT: i32 = 192;
+
+/// A file's evidence beside the card: its path as the heading, what the
+/// comparison found in a sentence, and the diff or the conflicting regions
+/// in a monospaced block coloured as a diff is, scrolling when long.
+fn loss_widget(loss: &taste_git::Loss) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    card.add_css_class("osd");
+    card.add_css_class("sync-card");
+    card.set_widget_name("loss-card");
+    card.append(
+        &gtk::Label::builder()
+            .label(&loss.path)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(60)
+            .css_classes(["heading"])
+            .build(),
+    );
+    card.append(
+        &gtk::Label::builder()
+            .label(if loss.differing {
+                "Changed in the same places here and there, differently. The push keeps \
+                 this branch's version and replaces theirs."
+            } else {
+                "The remote's change to this file is not in this branch. The push drops it; \
+                 this is the diff that would bring it back."
+            })
+            .xalign(0.0)
+            .wrap(true)
+            .max_width_chars(60)
+            .css_classes(["caption", "dim-label"])
+            .build(),
+    );
+    // Who changed it there: an author other than this branch's in amber,
+    // since that is someone else's work the push does not keep.
+    if !loss.changed_by.is_empty() {
+        let lines: Vec<String> = loss
+            .changed_by
+            .iter()
+            .map(|(summary, who, other)| {
+                let line = glib::markup_escape_text(&format!("{summary} — {who}")).to_string();
+                if *other {
+                    format!("<span foreground=\"#f8e45c\">{line}</span>")
+                } else {
+                    line
+                }
+            })
+            .collect();
+        card.append(
+            &gtk::Label::builder()
+                .use_markup(true)
+                .label(format!("Changed there by\n{}", lines.join("\n")))
+                .xalign(0.0)
+                .wrap(true)
+                .max_width_chars(60)
+                .css_classes(["caption"])
+                .build(),
+        );
+    }
+    let text = gtk::Label::builder()
+        .use_markup(true)
+        .label(diff_markup(&loss.detail))
+        .xalign(0.0)
+        .selectable(true)
+        .css_classes(["monospace", "caption"])
         .build();
-    scroller.add_css_class("commit-list");
-    Some(scroller.upcast())
+    card.append(&scrolled_if_tall(&text, DETAIL_HEIGHT, Some(LOSS_WIDTH)));
+    card.upcast()
+}
+
+/// How wide a file's evidence grows before it scrolls sideways.
+const LOSS_WIDTH: i32 = 560;
+
+/// A diff, or conflicting regions, as markup: added lines green, removed
+/// ones red, hunk headers dim, git's conflict markers amber — on a card
+/// that is always dark, so in colours that read on dark.
+fn diff_markup(detail: &str) -> String {
+    detail
+        .lines()
+        .map(|line| {
+            let text = glib::markup_escape_text(line);
+            let colour = if line.starts_with("<<<<<<<")
+                || line.starts_with("=======")
+                || line.starts_with(">>>>>>>")
+            {
+                Some("#f8e45c")
+            } else if line.starts_with('+') {
+                Some("#8ff0a4")
+            } else if line.starts_with('-') {
+                Some("#f66151")
+            } else if line.starts_with("@@") || line.starts_with('…') {
+                Some("#9a9996")
+            } else {
+                None
+            };
+            match colour {
+                Some(colour) => format!("<span foreground=\"{colour}\">{text}</span>"),
+                None => text.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// How tall the commit list grows before it scrolls: about ten rows.
@@ -275,15 +532,7 @@ fn detail_widget(commit: &taste_git::CommitLine) -> gtk::Widget {
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .max_width_chars(52)
             .build();
-        card.append(
-            &gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .propagate_natural_width(true)
-                .propagate_natural_height(true)
-                .max_content_height(DETAIL_HEIGHT)
-                .child(&body)
-                .build(),
-        );
+        card.append(&scrolled_if_tall(&body, DETAIL_HEIGHT, None));
     }
     let grid = gtk::Grid::builder()
         .column_spacing(12)
@@ -457,7 +706,7 @@ impl Layer {
         let Some(bounds) = target.compute_bounds(&self.layer) else {
             return false;
         };
-        let on_row: Rc<dyn Fn(&gtk::Widget, Option<&taste_git::CommitLine>)> = {
+        let on_row: OnRow = {
             let weak = Rc::downgrade(self);
             Rc::new(move |row, commit| {
                 if let Some(layer) = weak.upgrade() {
@@ -541,8 +790,8 @@ impl Layer {
     /// The pointer came onto a commit's row (`Some`), or left one: its
     /// detail opens beside the card, or goes after a linger unless the
     /// pointer reaches it.
-    fn on_row(self: &Rc<Self>, row: &gtk::Widget, commit: Option<&taste_git::CommitLine>) {
-        let Some(commit) = commit else {
+    fn on_row(self: &Rc<Self>, row: &gtk::Widget, detail: Option<&Detail>) {
+        let Some(detail) = detail else {
             self.release_detail();
             return;
         };
@@ -553,7 +802,7 @@ impl Layer {
             .detail
             .borrow()
             .as_ref()
-            .is_some_and(|(id, _, _)| *id == commit.id)
+            .is_some_and(|(key, _, _)| *key == detail.key())
         {
             return;
         }
@@ -564,7 +813,7 @@ impl Layer {
         let Some(row_bounds) = row.compute_bounds(&self.layer) else {
             return;
         };
-        let widget = detail_widget(commit);
+        let widget = detail.widget();
         let (w, h) = self.fit(&widget);
         let (layer_w, layer_h) = (
             f64::from(self.layer.width()),
@@ -585,7 +834,7 @@ impl Layer {
         self.layer.put(&widget, x, y);
         self.watch_pointer(&widget, true);
         row.add_css_class("lit");
-        *self.detail.borrow_mut() = Some((commit.id.clone(), widget, row.clone()));
+        *self.detail.borrow_mut() = Some((detail.key(), widget, row.clone()));
     }
 
     /// The detail goes after a linger, unless the pointer reaches it or
@@ -724,11 +973,20 @@ impl Layer {
         self.clear();
     }
 
-    /// TASTE_PROBE_CHECK only: the first commit's detail opened beside the
-    /// card up, as the pointer on its row opens it.
-    pub fn probe_first_detail(self: &Rc<Self>, card: &SyncCard) {
-        let Some(commit) = card.commits.commits.first() else {
-            return;
+    /// TASTE_PROBE_CHECK only: the first commit's detail — or with `loss`
+    /// the first file's evidence — opened beside the card up, as the
+    /// pointer on its row opens it.
+    pub fn probe_first_detail(self: &Rc<Self>, card: &SyncCard, loss: bool) {
+        let (class, detail) = if loss {
+            match card.losses.first() {
+                Some(first) => ("loss-row", Detail::Loss(first.clone())),
+                None => return,
+            }
+        } else {
+            match card.commits.commits.first() {
+                Some(first) => ("commit-row", Detail::Commit(first.clone())),
+                None => return,
+            }
         };
         let Some(widget) = self
             .card
@@ -740,8 +998,8 @@ impl Layer {
         };
         let mut stack = vec![widget];
         while let Some(widget) = stack.pop() {
-            if widget.has_css_class("commit-row") {
-                self.on_row(&widget, Some(commit));
+            if widget.has_css_class(class) && (loss || !widget.has_css_class("loss-row")) {
+                self.on_row(&widget, Some(&detail));
                 return;
             }
             let mut child = widget.last_child();

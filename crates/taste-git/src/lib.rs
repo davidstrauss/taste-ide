@@ -26,8 +26,8 @@ pub mod private;
 pub mod refs;
 mod relation;
 pub use relation::{
-    is_tracking_key, record_remote_tip, without_secret, Canonical, Carried, PullPlan, PushTarget,
-    SubmodulePush,
+    is_tracking_key, record_remote_tip, without_secret, Canonical, Carried, Loss, PullPlan,
+    PushTarget, SubmodulePush,
 };
 pub mod review;
 pub mod snapshot;
@@ -1067,6 +1067,11 @@ pub struct SyncStatus {
     pub sends: CommitList,
     /// The commits [`SyncStatus::own_behind`] counts: what ↓'s card lists.
     pub incoming: CommitList,
+    /// Who other than this branch's authors wrote the commits the push
+    /// target has that this branch lacks, and how many each, most first:
+    /// someone else's work, which a pull brings in and a push replacing
+    /// them overwrites.
+    pub others_there: Vec<(String, usize)>,
 }
 
 impl SyncStatus {
@@ -1087,6 +1092,7 @@ impl SyncStatus {
             push_by_url: false,
             sends: CommitList::default(),
             incoming: CommitList::default(),
+            others_there: Vec::new(),
         }
     }
 }
@@ -2083,6 +2089,19 @@ mod tests {
         let carried = ws.sync_status_of("topic").unwrap().rewritten.unwrap();
         assert_eq!(carried.missing, ["page.md"]);
         assert!(carried.differing.is_empty(), "{carried:?}");
+        // Its evidence: the diff that would bring the change back.
+        assert_eq!(carried.details.len(), 1);
+        assert!(!carried.details[0].differing);
+        assert!(
+            carried.details[0].detail.contains("+the form inside"),
+            "{}",
+            carried.details[0].detail
+        );
+        assert!(
+            carried.details[0].detail.starts_with("@@"),
+            "{}",
+            carried.details[0].detail
+        );
 
         // Changed differently here: form.ts says otherwise.
         write(&mine, "page.md", "the form inside\n");
@@ -2101,6 +2120,79 @@ mod tests {
         let carried = ws.sync_status_of("topic").unwrap().rewritten.unwrap();
         assert!(carried.missing.is_empty(), "{carried:?}");
         assert_eq!(carried.differing, ["form.ts"]);
+        // Its evidence: both versions — made on both sides, so this
+        // branch's against theirs, with no ancestor to mark a conflict by.
+        let detail = &carried.details[0].detail;
+        assert!(carried.details[0].differing);
+        for part in ["Made on both sides", "-password first", "+email first"] {
+            assert!(detail.contains(part), "{part}: {detail}");
+        }
+    }
+
+    /// Whose the commits there are is said: a change by someone else that
+    /// a rewrite here left out is named with its author, and the push
+    /// target's commits by anyone other than this branch's authors are
+    /// counted by author.
+    #[test]
+    fn someone_elses_work_there_is_named_by_author() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git_as = |who: &str, cwd: &Path, args: &[&str]| {
+            let email = format!("{}@example.com", who.to_lowercase());
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", who)
+                .env("GIT_AUTHOR_EMAIL", &email)
+                .env("GIT_COMMITTER_NAME", who)
+                .env("GIT_COMMITTER_EMAIL", &email)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let me = |cwd: &Path, args: &[&str]| git_as("Me", cwd, args);
+        let alice = |cwd: &Path, args: &[&str]| git_as("Alice", cwd, args);
+        me(root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        me(root, &["clone", "-q", "remote.git", "mine"]);
+        let mine = root.join("mine");
+        me(&mine, &["config", "user.email", "me@example.com"]);
+        std::fs::write(mine.join("a.txt"), "base\n").unwrap();
+        me(&mine, &["add", "a.txt"]);
+        me(&mine, &["commit", "-q", "-m", "base"]);
+        me(&mine, &["push", "-q", "origin", "HEAD:main"]);
+        me(&mine, &["switch", "-q", "-c", "topic"]);
+        std::fs::write(mine.join("form.ts"), "mine\n").unwrap();
+        me(&mine, &["add", "form.ts"]);
+        me(&mine, &["commit", "-q", "-m", "form"]);
+        me(&mine, &["push", "-q", "-u", "origin", "topic"]);
+        // Alice adds to the branch; this branch catches up with her.
+        me(root, &["clone", "-q", "-b", "topic", "remote.git", "alice"]);
+        let theirs = root.join("alice");
+        std::fs::write(theirs.join("page.md"), "alice's\n").unwrap();
+        alice(&theirs, &["add", "page.md"]);
+        alice(&theirs, &["commit", "-q", "-m", "page by alice"]);
+        alice(&theirs, &["push", "-q", "origin", "topic"]);
+        me(&mine, &["pull", "-q", "--ff-only"]);
+        // And then is rewritten here without her change.
+        me(&mine, &["reset", "-q", "--hard", "HEAD~1"]);
+        me(&mine, &["commit", "-q", "--amend", "-m", "form, reworded"]);
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        let sync = ws.sync_status_of("topic").unwrap();
+        assert_eq!(
+            sync.others_there,
+            [("Alice <alice@example.com>".to_string(), 1)],
+            "{sync:?}"
+        );
+        let carried = sync.rewritten.clone().unwrap();
+        assert_eq!(carried.missing, ["page.md"]);
+        assert_eq!(
+            carried.details[0].changed_by,
+            [("page by alice".to_string(), "Alice".to_string(), true)]
+        );
     }
 
     /// A branch pushed, then rewritten here — its first commit reworded,

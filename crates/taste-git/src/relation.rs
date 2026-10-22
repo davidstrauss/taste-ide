@@ -82,7 +82,39 @@ pub struct Carried {
     /// conflicts, so whether the remote's change is in this branch cannot
     /// be said. The push replaces the remote's version with this one.
     pub differing: Vec<String>,
+    /// Each of those files with its evidence, for the push card's section
+    /// on them: missing ones first, then differing, each by path; at most
+    /// [`LOSS_DETAILS`] of them.
+    pub details: Vec<Loss>,
 }
+
+/// One file a push would not keep, with what shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loss {
+    pub path: String,
+    /// Changed differently here and there (a conflict), rather than a
+    /// change this branch lacks.
+    pub differing: bool,
+    /// For a missing change, the unified diff merging it into this branch
+    /// would apply to the file; for a differing one, the conflicting
+    /// regions as git marks them, "this branch" against "there". At most
+    /// [`LOSS_LINES`] lines.
+    pub detail: String,
+    /// The commits there that changed this file, newest first, each as its
+    /// summary and its author's name, and whether that author is someone
+    /// other than this branch's (`SyncStatus::others_there`).
+    pub changed_by: Vec<(String, String, bool)>,
+}
+
+/// How many files a [`Carried`] carries the evidence of.
+pub const LOSS_DETAILS: usize = 40;
+
+/// How many of the replaced commits are read for which files they changed
+/// ([`Loss::changed_by`]).
+pub const ATTRIBUTED: usize = 200;
+
+/// How many lines of evidence a [`Loss`] carries.
+pub const LOSS_LINES: usize = 400;
 
 impl Carried {
     /// Everything the remote changed is in this branch: nothing is lost.
@@ -616,7 +648,7 @@ impl GitWorkspace {
         // someone's empty commit changes nothing, and so is "here". What
         // replacing them loses is judged by content, in aggregate.
         let own = held || self.unmatched(&theirs, &mine) == 0;
-        own.then(|| self.carried(tip, there))
+        own.then(|| self.carried(tip, there, &theirs, &mine))
     }
 
     /// What a push of `tip` over `there` would lose ([`Carried`]): `there`
@@ -626,7 +658,133 @@ impl GitWorkspace {
     /// deleted that `tip` keeps is missing too: its deletion is a change.
     /// With no common ancestor, or a merge that cannot be made, every file
     /// the remote has that `tip` does not have alike is differing.
-    fn carried(&self, tip: Oid, there: Oid) -> Carried {
+    fn carried(&self, tip: Oid, there: Oid, theirs: &[Oid], mine: &[Oid]) -> Carried {
+        // Asked at every refresh of the sync counts, several a second on a
+        // checkout in a VM, about the same two tips: a merge and its diffs
+        // once per pair.
+        thread_local! {
+            static KNOWN: std::cell::RefCell<HashMap<(Oid, Oid), Carried>> =
+                std::cell::RefCell::new(HashMap::new());
+        }
+        if let Some(known) = KNOWN.with(|known| known.borrow().get(&(tip, there)).cloned()) {
+            return known;
+        }
+        let mut carried = self.carried_now(tip, there);
+        self.attribute(&mut carried, theirs, mine);
+        KNOWN.with(|known| {
+            let mut known = known.borrow_mut();
+            if known.len() >= 16 {
+                known.clear();
+            }
+            known.insert((tip, there), carried.clone());
+        });
+        carried
+    }
+
+    /// A commit's author's email, lower-cased, and name, and its summary.
+    fn authored(&self, oid: Oid) -> Option<(String, String, String)> {
+        self.repo.find_commit(oid).ok().map(|commit| {
+            let author = commit.author();
+            (
+                author.email().unwrap_or_default().to_lowercase(),
+                author.name().unwrap_or_default().to_string(),
+                commit.summary().unwrap_or_default().to_string(),
+            )
+        })
+    }
+
+    /// This branch's authors: who wrote `mine`, and `user.email` here.
+    fn our_authors(&self, mine: &[Oid]) -> std::collections::HashSet<String> {
+        let mut ours: std::collections::HashSet<String> = mine
+            .iter()
+            .filter_map(|oid| self.authored(*oid))
+            .map(|(email, _, _)| email)
+            .collect();
+        if let Ok(email) = self.repo.config().and_then(|c| c.get_string("user.email")) {
+            ours.insert(email.to_lowercase());
+        }
+        ours
+    }
+
+    /// Who other than this branch's authors wrote the commits `there` has
+    /// that `tip` lacks, and how many each, most first: what a pull brings
+    /// from someone else, or a push replacing them overwrites (David,
+    /// 2026-10-22: "consider if new remote commits or content appears to
+    /// be from a different author"). Empty past [`DIVERGENCE_LIMIT`].
+    pub(crate) fn others_there(&self, tip: Oid, there: Oid) -> Vec<(String, usize)> {
+        let Some((theirs, mine)) = self.diverged(tip, there) else {
+            return Vec::new();
+        };
+        let ours = self.our_authors(&mine);
+        let mut others: std::collections::BTreeMap<String, usize> = Default::default();
+        for oid in &theirs {
+            if let Some((email, name, _)) = self.authored(*oid) {
+                if !ours.contains(&email) {
+                    *others.entry(format!("{name} <{email}>")).or_default() += 1;
+                }
+            }
+        }
+        let mut others: Vec<(String, usize)> = others.into_iter().collect();
+        others.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        others
+    }
+
+    /// For each file `carried` names, the commits of `theirs` that changed
+    /// it, and whether each is by someone other than this branch's authors
+    /// (`mine`'s, and `user.email`). At most [`ATTRIBUTED`] of `theirs`
+    /// are read.
+    fn attribute(&self, carried: &mut Carried, theirs: &[Oid], mine: &[Oid]) {
+        let ours = self.our_authors(mine);
+        let author = |oid: Oid| self.authored(oid);
+        if carried.details.is_empty() {
+            return;
+        }
+        let wanted: std::collections::HashSet<String> = carried
+            .details
+            .iter()
+            .map(|loss| loss.path.clone())
+            .collect();
+        let mut by_path: HashMap<String, Vec<(String, String, bool)>> = HashMap::new();
+        for oid in theirs.iter().take(ATTRIBUTED) {
+            let Ok(commit) = self.repo.find_commit(*oid) else {
+                continue;
+            };
+            if commit.parent_count() > 1 {
+                continue;
+            }
+            let Some((email, name, summary)) = author(*oid) else {
+                continue;
+            };
+            let parent = commit.parent(0).ok().and_then(|p| p.tree().ok());
+            let Ok(tree) = commit.tree() else { continue };
+            let Ok(diff) = self
+                .repo
+                .diff_tree_to_tree(parent.as_ref(), Some(&tree), None)
+            else {
+                continue;
+            };
+            for delta in diff.deltas() {
+                let path = delta
+                    .new_file()
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .map(|path| path.display().to_string());
+                if let Some(path) = path.filter(|path| wanted.contains(path)) {
+                    by_path.entry(path).or_default().push((
+                        summary.clone(),
+                        name.clone(),
+                        !ours.contains(&email),
+                    ));
+                }
+            }
+        }
+        for loss in &mut carried.details {
+            loss.changed_by = by_path.remove(&loss.path).unwrap_or_default();
+        }
+    }
+
+    /// [`Self::carried`], worked out.
+    fn carried_now(&self, tip: Oid, there: Oid) -> Carried {
         let tree = |oid: Oid| self.repo.find_commit(oid).ok().and_then(|c| c.tree().ok());
         let (Some(ours), Some(theirs)) = (tree(tip), tree(there)) else {
             return Carried::default();
@@ -645,18 +803,30 @@ impl GitWorkspace {
         };
         let mut carried = Carried::default();
         let mut conflicted = std::collections::BTreeSet::new();
+        let mut differing_details = Vec::new();
         if let Ok(conflicts) = merged.conflicts() {
             for conflict in conflicts.flatten() {
-                let path = [conflict.our, conflict.their, conflict.ancestor]
+                let path = [&conflict.our, &conflict.their, &conflict.ancestor]
                     .into_iter()
                     .flatten()
                     .map(|entry| String::from_utf8_lossy(&entry.path).to_string())
                     .next();
                 if let Some(path) = path {
+                    if differing_details.len() < LOSS_DETAILS {
+                        differing_details.push(Loss {
+                            detail: self.conflict_detail(&conflict),
+                            path: path.clone(),
+                            differing: true,
+                            changed_by: Vec::new(),
+                        });
+                    }
                     conflicted.insert(path);
                 }
             }
         }
+        // The merge's side of each missing file, for its diff: `None` for
+        // one the remote deleted.
+        let mut merged_ids: HashMap<String, Option<Oid>> = HashMap::new();
         // Every file the clean part of the merge leaves, against `tip`'s.
         let mut seen = std::collections::BTreeSet::new();
         for entry in merged.iter() {
@@ -669,6 +839,7 @@ impl GitWorkspace {
                 .is_ok_and(|ours| ours.id() == entry.id && ours.filemode() == entry.mode as i32);
             if !same {
                 carried.missing.push(path.clone());
+                merged_ids.insert(path.clone(), Some(entry.id));
             }
             seen.insert(path);
         }
@@ -687,7 +858,129 @@ impl GitWorkspace {
         });
         carried.missing.sort();
         carried.differing = conflicted.into_iter().collect();
+        for path in carried.missing.iter().take(LOSS_DETAILS) {
+            let theirs = merged_ids.get(path).copied().flatten();
+            carried.details.push(Loss {
+                detail: self.missing_detail(path, &ours, theirs),
+                path: path.clone(),
+                differing: false,
+                changed_by: Vec::new(),
+            });
+        }
+        differing_details.sort_by(|a, b| a.path.cmp(&b.path));
+        let room = LOSS_DETAILS.saturating_sub(carried.details.len());
         carried
+            .details
+            .extend(differing_details.into_iter().take(room));
+        carried
+    }
+
+    /// The diff merging the remote's change into `ours` would apply to
+    /// `path`, whose merged content is `theirs` (`None`: deleted there).
+    fn missing_detail(&self, path: &str, ours: &git2::Tree, theirs: Option<Oid>) -> String {
+        let old = ours.get_path(Path::new(path)).ok().map(|entry| entry.id());
+        self.blob_diff(path, old, theirs)
+    }
+
+    /// The unified diff from blob `old` to blob `new` of `path` (`None`:
+    /// no file), from its first hunk, capped.
+    fn blob_diff(&self, path: &str, old: Option<Oid>, new: Option<Oid>) -> String {
+        let blob = |oid: Oid| self.repo.find_blob(oid).ok();
+        let old = old.and_then(blob);
+        let new = new.and_then(blob);
+        let (old, new) = (
+            old.as_ref().map_or(&[][..], |b| b.content()),
+            new.as_ref().map_or(&[][..], |b| b.content()),
+        );
+        if old.contains(&0) || new.contains(&0) {
+            return "A binary file: its content differs.".to_string();
+        }
+        let mut options = git2::DiffOptions::new();
+        options.context_lines(3);
+        let patch = git2::Patch::from_buffers(
+            old,
+            Some(Path::new(path)),
+            new,
+            Some(Path::new(path)),
+            Some(&mut options),
+        );
+        let text = patch
+            .and_then(|mut patch| patch.to_buf())
+            .map(|buf| String::from_utf8_lossy(&buf).to_string())
+            .unwrap_or_default();
+        // From the first hunk: the headers repeat the path the row names.
+        let body = match text.find("\n@@") {
+            Some(at) => &text[at + 1..],
+            None => text.as_str(),
+        };
+        capped_lines(body)
+    }
+
+    /// The conflicting regions of a file both sides changed, as git marks
+    /// them, two lines either side, "this branch" against "there".
+    fn conflict_detail(&self, conflict: &git2::IndexConflict) -> String {
+        let (Some(ours), Some(theirs)) = (&conflict.our, &conflict.their) else {
+            return match (&conflict.our, &conflict.their) {
+                (None, _) => "Deleted in this branch, changed there.".to_string(),
+                _ => "Changed in this branch, deleted there.".to_string(),
+            };
+        };
+        let mut options = git2::MergeFileOptions::new();
+        options.our_label("this branch").their_label("there");
+        let merged = match &conflict.ancestor {
+            Some(ancestor) => {
+                self.repo
+                    .merge_file_from_index(ancestor, ours, theirs, Some(&mut options))
+            }
+            // Made on both sides, with nothing to merge from: this branch's
+            // version against theirs.
+            None => {
+                let path = String::from_utf8_lossy(&ours.path).to_string();
+                return format!(
+                    "Made on both sides; this branch's version against theirs:\n{}",
+                    self.blob_diff(&path, Some(ours.id), Some(theirs.id))
+                );
+            }
+        };
+        let Ok(merged) = merged else {
+            return "Changed differently here and there.".to_string();
+        };
+        let text = String::from_utf8_lossy(merged.content()).to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut keep = vec![false; lines.len()];
+        let mut inside = false;
+        for (at, line) in lines.iter().enumerate() {
+            if line.starts_with("<<<<<<<") {
+                inside = true;
+            }
+            if inside {
+                let end = (at + 3).min(lines.len());
+                for near in &mut keep[at.saturating_sub(2)..end] {
+                    *near = true;
+                }
+            }
+            if line.starts_with(">>>>>>>") {
+                inside = false;
+            }
+        }
+        let mut out = String::new();
+        let mut gap = false;
+        for (line, keep) in lines.iter().zip(keep) {
+            if keep {
+                if gap && !out.is_empty() {
+                    out.push_str("…\n");
+                }
+                out.push_str(line);
+                out.push('\n');
+                gap = false;
+            } else {
+                gap = true;
+            }
+        }
+        if out.is_empty() {
+            return "Changed differently here and there.".to_string();
+        }
+        capped_lines(&out)
     }
 
     /// The change a commit makes, to be found again after a rebase: its
@@ -918,6 +1211,11 @@ impl GitWorkspace {
         // 0 for.
         if let Some(there) = there.filter(|_| status.own_behind > 0) {
             status.incoming = self.commits_between(there, &[tip], status.own_behind);
+        }
+        // Whose the commits there are, whether a pull would bring them or a
+        // push replace them.
+        if let Some(there) = there.filter(|_| status.replaces.is_some()) {
+            status.others_there = self.others_there(tip, there);
         }
         Ok(status)
     }
@@ -1213,4 +1511,17 @@ fn differing_files(repo: &git2::Repository, ours: &git2::Tree, theirs: &git2::Tr
         }
     }
     paths.into_iter().collect()
+}
+
+/// `text` cut to [`LOSS_LINES`] lines, saying how many more there were.
+fn capped_lines(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= LOSS_LINES {
+        return text.trim_end().to_string();
+    }
+    format!(
+        "{}\n… {} more lines",
+        lines[..LOSS_LINES].join("\n"),
+        lines.len() - LOSS_LINES
+    )
 }

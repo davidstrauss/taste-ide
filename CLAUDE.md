@@ -249,8 +249,11 @@ scrolling list is what a long list once cut off);
 card once the counts land (`sync_card.rs`, drawn in the window, so the
 shot has it), since a shot has no pointer to hover with, and shoots the
 card whole as `window.sync-card` beside the pane it runs past (`push:detail`
-also opens its first commit's detail card beside it, `window.commit-card`;
-open a scratch clone whose remote is behind, or the list is empty);
+also opens its first commit's detail card beside it, `window.commit-card`,
+and `push:loss` the first file's evidence of what a push over a rewritten
+branch does not keep, `window.loss-card`; open a scratch clone whose
+remote is behind, or the list is empty — `target/probe/card-loss.sh`-style
+fixtures make one that has diverged, with another author's commit there);
 `TASTE_PROBE_SYNC=running` (or `conflict`, `failed`, `done`) poses the
 title bar's cloud — the folder's sync and the Google Cloud connection,
 one badge — in that state with its popover open;

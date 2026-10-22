@@ -3613,6 +3613,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             "filetree",
                             "window.sync-card",
                             "window.commit-card",
+                            "window.loss-card",
                         ]
                     } else if std::env::var("TASTE_PROBE_BRANCHES").is_ok() {
                         // The branch switcher, opened by the file tree once

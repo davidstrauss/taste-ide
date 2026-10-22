@@ -1410,6 +1410,56 @@ fn rewrite_verdict(replaced: usize, carried: &taste_git::Carried, upstream: &str
     )
 }
 
+/// Who else wrote the commits there, as a list: "Alice <a@x> (2), Bob
+/// <b@y>"; `None` when nobody else did.
+fn others_list(others: &[(String, usize)]) -> Option<String> {
+    (!others.is_empty()).then(|| {
+        others
+            .iter()
+            .map(|(who, n)| {
+                if *n == 1 {
+                    who.clone()
+                } else {
+                    format!("{who} ({n})")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
+/// A warning that commits there are someone else's, ending on `then` —
+/// what happens to them; `None` when they are all this branch's authors'.
+fn others_words(others: &[(String, usize)], then: &str) -> Option<String> {
+    let total: usize = others.iter().map(|(_, n)| n).sum();
+    others_list(others).map(|who| {
+        format!(
+            "{} there {} by someone else — {who}; {then}",
+            count(total, "commit"),
+            if total == 1 { "is" } else { "are" }
+        )
+    })
+}
+
+/// What the push card's warning says of what a push would not keep, its
+/// files listed in the section under it.
+fn loss_summary(carried: &taste_git::Carried) -> String {
+    let files = |n: usize| count(n, "file");
+    match (carried.missing.len(), carried.differing.len()) {
+        (0, differing) => format!(
+            "{} changed differently there and here; the push replaces their version",
+            files(differing)
+        ),
+        (missing, 0) => format!("The push drops the remote's changes to {}", files(missing)),
+        (missing, differing) => format!(
+            "The push drops the remote's changes to {}, and replaces {} changed \
+             differently there",
+            files(missing),
+            files(differing)
+        ),
+    }
+}
+
 /// What of the remote's change a push would not keep, by file: changes this
 /// branch does not have, which it drops, and files changed differently on
 /// each side, whose version there it replaces.
@@ -6012,70 +6062,70 @@ impl FileTree {
                                         "Hold {push_secs} s · refused if the remote moved since \
                                          the last fetch"
                                     );
-                                    *self.push_card.borrow_mut() = Some(match replacing {
-                                        Some(replaced) => {
-                                            let card = SyncCard::new(format!(
-                                                "Replace {upstream}{default_branch}"
-                                            ))
-                                            .fact("Sends", sends)
-                                            .fact("Replaces", count(replaced, "commit"));
-                                            match &sync.rewritten {
-                                                Some(carried) if carried.whole() => card.fact(
-                                                    "Their changes",
-                                                    "all in this branch; nothing is lost",
-                                                ),
-                                                Some(carried) => {
-                                                    let words = loss_words(carried);
-                                                    let mut first = words.chars();
-                                                    card.warning(match first.next() {
-                                                        Some(c) => {
-                                                            c.to_uppercase().chain(first).collect()
-                                                        }
-                                                        None => words,
-                                                    })
-                                                }
-                                                // A fork's branch rebased onto
-                                                // its base, as the IDE has no
-                                                // way to check: what is there
-                                                // matched nothing here, so it
-                                                // may be anyone's (review,
-                                                // 2026-10-20).
-                                                None => card.warning(format!(
-                                                    "{} there {} no match in this \
+                                    *self.push_card.borrow_mut() =
+                                        Some(match replacing {
+                                            Some(replaced) => {
+                                                let card = SyncCard::new(format!(
+                                                    "Replace {upstream}{default_branch}"
+                                                ))
+                                                .fact("Sends", sends)
+                                                .fact("Replaces", count(replaced, "commit"));
+                                                match &sync.rewritten {
+                                                    Some(carried) if carried.whole() => card.fact(
+                                                        "Their changes",
+                                                        "all in this branch; nothing is lost",
+                                                    ),
+                                                    // What is lost, file by file, in
+                                                    // a section of its own; the
+                                                    // warning only says so.
+                                                    Some(carried) => card
+                                                        .losses(carried)
+                                                        .warning(loss_summary(carried)),
+                                                    // A fork's branch rebased onto
+                                                    // its base, as the IDE has no
+                                                    // way to check: what is there
+                                                    // matched nothing here, so it
+                                                    // may be anyone's (review,
+                                                    // 2026-10-20).
+                                                    None => card.warning(format!(
+                                                        "{} there {} no match in this \
                                                          branch: from before a rebase onto \
                                                          the base, or someone else's",
-                                                    count(replaced, "commit"),
-                                                    if replaced == 1 { "has" } else { "have" },
-                                                )),
+                                                        count(replaced, "commit"),
+                                                        if replaced == 1 { "has" } else { "have" },
+                                                    )),
+                                                }
+                                                .warn_also(others_words(
+                                                    &sync.others_there,
+                                                    "the push \
+                                                replaces their work",
+                                                ))
+                                                .gesture(leased)
                                             }
-                                            .gesture(leased)
-                                        }
-                                        None if sync.push_unknown => {
-                                            SyncCard::new(format!("Push to {upstream}"))
-                                                .fact(
-                                                    "Sends",
-                                                    format!("up to {}", count(ahead, "commit")),
-                                                )
-                                                .fact("Remote tip", "not fetched yet")
-                                                .gesture("Click to push")
-                                        }
-                                        None if sync.new_branch => {
-                                            SyncCard::new(format!("Create {upstream}"))
-                                                .fact("Sends", sends)
-                                                .gesture("Click to push")
-                                        }
-                                        None => SyncCard::new(format!(
-                                            "Push to {upstream}{default_branch}"
-                                        ))
-                                        .fact("Sends", sends)
-                                        .gesture(
-                                            if sync.on_canonical {
+                                            None if sync.push_unknown => {
+                                                SyncCard::new(format!("Push to {upstream}"))
+                                                    .fact(
+                                                        "Sends",
+                                                        format!("up to {}", count(ahead, "commit")),
+                                                    )
+                                                    .fact("Remote tip", "not fetched yet")
+                                                    .gesture("Click to push")
+                                            }
+                                            None if sync.new_branch => {
+                                                SyncCard::new(format!("Create {upstream}"))
+                                                    .fact("Sends", sends)
+                                                    .gesture("Click to push")
+                                            }
+                                            None => SyncCard::new(format!(
+                                                "Push to {upstream}{default_branch}"
+                                            ))
+                                            .fact("Sends", sends)
+                                            .gesture(if sync.on_canonical {
                                                 format!("Hold {push_secs} s")
                                             } else {
                                                 "Click to push".to_string()
-                                            },
-                                        ),
-                                    });
+                                            }),
+                                        });
                                     if let Some(card) = self.push_card.borrow_mut().as_mut() {
                                         // What ↑ counts, listed under the
                                         // facts.
@@ -6155,10 +6205,21 @@ impl FileTree {
                                                     "it is a URL, not a remote; add it as a \
                                                      remote to pull from it",
                                                 )
+                                        } else if behind == 0 && !stale {
+                                            // Nothing to pull, and its button off: said as ⇊
+                                            // says it, with no gesture to a button that does
+                                            // nothing (David, 2026-10-22: "Both are disabled
+                                            // due to no changes to pull, but only one shows a
+                                            // guide to clicking").
+                                            SyncCard::new(format!("Up to date with {upstream}"))
                                         } else {
                                             let mut card =
                                                 SyncCard::new(format!("Catch up with {upstream}"))
                                                     .fact("New there", count(behind, "commit"))
+                                                    .fact_if(
+                                                        "By others",
+                                                        others_list(&sync.others_there),
+                                                    )
                                                     .commits(sync.incoming.clone());
                                             SubmoduleSync::tell_moves(
                                                 &snapshot.submodule_sync.own_moves,
@@ -9551,10 +9612,12 @@ impl FileTree {
         let Ok(which) = std::env::var("TASTE_PROBE_CARD") else {
             return;
         };
-        // `push:detail` also opens the first commit's detail card.
-        let (which, detail) = match which.split_once(':') {
-            Some((which, "detail")) => (which.to_string(), true),
-            _ => (which, false),
+        // `push:detail` also opens the first commit's detail card, and
+        // `push:loss` the first file's evidence of what the push loses.
+        let (which, detail, loss) = match which.split_once(':') {
+            Some((which, "detail")) => (which.to_string(), true, false),
+            Some((which, "loss")) => (which.to_string(), true, true),
+            _ => (which, false, false),
         };
         let card = match which.as_str() {
             "pull" => &self.pull_card,
@@ -9590,7 +9653,7 @@ impl FileTree {
                 if detail {
                     glib::timeout_add_local_once(
                         std::time::Duration::from_millis(300),
-                        move || layer.probe_first_detail(&card),
+                        move || layer.probe_first_detail(&card, loss),
                     );
                 }
             });
@@ -10776,6 +10839,7 @@ mod tests {
         let carried = taste_git::Carried {
             missing: vec!["page.md".into()],
             differing: ["a", "b", "c", "d"].map(String::from).to_vec(),
+            ..taste_git::Carried::default()
         };
         let lost = super::rewrite_verdict(2, &carried, "origin/topic");
         assert!(
