@@ -1,5 +1,5 @@
-//! GNotifications: the moments that need the user, and the rule for when
-//! they do.
+//! Desktop notifications: the moments that need the user, and the rule for
+//! when they do.
 //!
 //! ENVIRONMENTS.md → "Gadget mode": *glancing is ambient; action gets a
 //! notification.* The list is closed and short — a waiting permission
@@ -373,16 +373,242 @@ fn first_line(message: &str) -> &str {
     message.lines().next().unwrap_or(message).trim()
 }
 
-/// The gio half, and all of it: build the notification and hand it over.
+/// Hand a notice to the desktop.
 ///
-/// The default action is what makes a notification worth clicking. It goes
-/// to an application-level action (`app.surface`) because that is the only
-/// scope the desktop can activate when the app is not running — the window
-/// registers it, and routes the target to the surface that wanted the
-/// user. Where the platform will not raise a window on request (most
-/// Wayland compositors, without an activation token), the click still
-/// lands the IDE on the right surface for when the user gets there.
+/// **Through the desktop's notification server, by this process.** A
+/// GNotification's click is delivered to the application by its id on the
+/// session bus, and no IDE owns that name: each folder is a process of its
+/// own (`NON_UNIQUE`, in `main`), so none registers it, and a click on a
+/// turn's notification reached nothing at all (David, 2026-10-22: "clicking
+/// it doesn't take me to that IDE"). `org.freedesktop.Notifications`
+/// answers the connection that sent the notification — the window that
+/// wanted the user, whichever of several it is — with the click, and before
+/// it the activation token that lets that window raise itself on Wayland.
+/// Where no server answers, the notice goes as a GNotification, as before.
 pub fn send(app: &impl IsA<gtk::gio::Application>, notice: &Notice) {
+    let app = app.as_ref().clone();
+    let notice = notice.clone();
+    gtk::glib::spawn_future_local(async move {
+        if desktop::send(&app, &notice).await.is_err() {
+            send_gnotification(&app, &notice);
+        }
+    });
+}
+
+/// Take back the notice sent under `id`, whichever way it went.
+pub fn withdraw(app: &impl IsA<gtk::gio::Application>, id: &str) {
+    desktop::withdraw(id);
+    app.as_ref().withdraw_notification(id);
+}
+
+/// The desktop's notification server, spoken to directly
+/// (`org.freedesktop.Notifications`, the Desktop Notifications
+/// Specification): what this process sent, by the server's ids, and the
+/// clicks on them routed to the window's `app.surface` action.
+mod desktop {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+
+    use gtk::gio;
+    use gtk::glib;
+    use gtk::prelude::*;
+
+    use super::{Notice, ACTION};
+
+    const NAME: &str = "org.freedesktop.Notifications";
+    const PATH: &str = "/org/freedesktop/Notifications";
+
+    #[derive(Default)]
+    struct State {
+        bus: Option<gio::DBusConnection>,
+        _signals: Vec<gio::SignalSubscription>,
+        /// Notice id → the server's id for it, so a second send replaces.
+        sent: HashMap<String, u32>,
+        /// The server's id → the surface its click goes to.
+        targets: HashMap<u32, String>,
+        /// Activation tokens the server sent ahead of a click.
+        tokens: HashMap<u32, String>,
+        /// Withdrawn while their send was still on its way.
+        withdrawn: HashSet<String>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::default();
+    }
+
+    async fn bus(app: &gio::Application) -> Result<gio::DBusConnection, glib::Error> {
+        if let Some(bus) = STATE.with(|s| s.borrow().bus.clone()) {
+            return Ok(bus);
+        }
+        let bus = gio::bus_get_future(gio::BusType::Session).await?;
+        if STATE.with(|s| s.borrow().bus.is_some()) {
+            return Ok(bus);
+        }
+        let weak = app.downgrade();
+        // The server emits these to every client; each process acts on the
+        // ids it holds and no others.
+        let signal = bus.subscribe_to_signal(
+            Some(NAME),
+            Some(NAME),
+            None,
+            Some(PATH),
+            None,
+            gio::DBusSignalFlags::NONE,
+            move |signal| heard(&weak, signal.signal_name, signal.parameters),
+        );
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.bus = Some(bus.clone());
+            s._signals.push(signal);
+        });
+        Ok(bus)
+    }
+
+    fn heard(app: &glib::WeakRef<gio::Application>, member: &str, parameters: &glib::Variant) {
+        match member {
+            "ActivationToken" => {
+                if let Some((id, token)) = parameters.get::<(u32, String)>() {
+                    STATE.with(|s| s.borrow_mut().tokens.insert(id, token));
+                }
+            }
+            "ActionInvoked" => {
+                let Some((id, action)) = parameters.get::<(u32, String)>() else {
+                    return;
+                };
+                let (target, token) = STATE.with(|s| {
+                    let mut s = s.borrow_mut();
+                    (s.targets.get(&id).cloned(), s.tokens.remove(&id))
+                });
+                let (Some(target), Some(app), "default") = (target, app.upgrade(), action.as_str())
+                else {
+                    return;
+                };
+                // The token first: the surface's routing presents the window,
+                // and a compositor raises it only with one.
+                if let Some(token) = token {
+                    if let Some(window) = app
+                        .downcast_ref::<gtk::Application>()
+                        .and_then(|app| app.windows().into_iter().next())
+                    {
+                        window.set_startup_id(&token);
+                    }
+                }
+                app.activate_action(ACTION, Some(&target.to_variant()));
+            }
+            "NotificationClosed" => {
+                if let Some((id, _reason)) = parameters.get::<(u32, u32)>() {
+                    STATE.with(|s| {
+                        let mut s = s.borrow_mut();
+                        s.targets.remove(&id);
+                        s.tokens.remove(&id);
+                        s.sent.retain(|_, sent| *sent != id);
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) async fn send(app: &gio::Application, notice: &Notice) -> Result<(), glib::Error> {
+        let bus = bus(app).await?;
+        let replaces = STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.withdrawn.remove(&notice.id);
+            s.sent.get(&notice.id).copied().unwrap_or(0)
+        });
+        let app_id = app
+            .application_id()
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        let mut hints: HashMap<String, glib::Variant> = HashMap::new();
+        // The desktop file the notice is shown as coming from.
+        hints.insert("desktop-entry".into(), app_id.to_variant());
+        // What blocks the fleet stays on screen, as GNotification's HIGH
+        // did — but not over a screen being presented, where a critical
+        // notice shows to everyone watching.
+        let urgent = !notice.informational && !taste_core::presenting::presenting();
+        hints.insert(
+            "urgency".into(),
+            (if urgent { 2u8 } else { 1u8 }).to_variant(),
+        );
+        // A server that advertises `body-markup` reads the body as markup,
+        // and an agent's words are text: escaped, a `<` in them is a `<`.
+        let body = glib::markup_escape_text(&notice.body);
+        let parameters = (
+            "Taste",
+            replaces,
+            app_id.as_str(),
+            notice.title.as_str(),
+            body.as_str(),
+            vec!["default", "Open"],
+            hints,
+            -1i32,
+        )
+            .to_variant();
+        let reply = bus
+            .call_future(
+                Some(NAME),
+                PATH,
+                NAME,
+                "Notify",
+                Some(&parameters),
+                Some(glib::VariantTy::new("(u)").expect("a valid type")),
+                gio::DBusCallFlags::NONE,
+                5_000,
+            )
+            .await?;
+        let Some((id,)) = reply.get::<(u32,)>() else {
+            return Ok(());
+        };
+        let withdrawn = STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.targets.insert(id, notice.surface.target());
+            s.sent.insert(notice.id.clone(), id);
+            s.withdrawn.remove(&notice.id)
+        });
+        if withdrawn {
+            withdraw(&notice.id);
+        }
+        Ok(())
+    }
+
+    pub(super) fn withdraw(notice_id: &str) {
+        let (bus, id) = STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            let id = s.sent.remove(notice_id);
+            if id.is_none() {
+                s.withdrawn.insert(notice_id.to_string());
+            }
+            (s.bus.clone(), id)
+        });
+        let (Some(bus), Some(id)) = (bus, id) else {
+            return;
+        };
+        STATE.with(|s| s.borrow_mut().targets.remove(&id));
+        glib::spawn_future_local(async move {
+            let _ = bus
+                .call_future(
+                    Some(NAME),
+                    PATH,
+                    NAME,
+                    "CloseNotification",
+                    Some(&(id,).to_variant()),
+                    None,
+                    gio::DBusCallFlags::NONE,
+                    5_000,
+                )
+                .await;
+        });
+    }
+}
+
+/// The GNotification way: build the notification and hand it to gio.
+///
+/// The default action goes to an application-level action
+/// (`app.surface`), routed by the window to the surface that wanted the
+/// user — when the desktop can reach this process by the application's
+/// id, which a `NON_UNIQUE` one it cannot ([`send`]).
+fn send_gnotification(app: &gtk::gio::Application, notice: &Notice) {
     let notification = gtk::gio::Notification::new(&notice.title);
     notification.set_body(Some(&notice.body));
     notification.set_priority(if notice.informational {
@@ -397,8 +623,7 @@ pub fn send(app: &impl IsA<gtk::gio::Application>, notice: &Notice) {
         &format!("app.{ACTION}"),
         Some(&gtk::glib::Variant::from(notice.surface.target())),
     );
-    app.as_ref()
-        .send_notification(Some(&notice.id), &notification);
+    app.send_notification(Some(&notice.id), &notification);
 }
 
 #[cfg(test)]

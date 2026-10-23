@@ -10979,11 +10979,10 @@ impl ChatPane {
             .and_downcast::<gtk::Window>()
             .and_then(|w| w.application())
         {
-            app.withdraw_notification(&crate::notify::notification_id(
-                &self.notify_scope(),
-                kind,
-                &self.notify_key,
-            ));
+            crate::notify::withdraw(
+                &app,
+                &crate::notify::notification_id(&self.notify_scope(), kind, &self.notify_key),
+            );
         }
     }
 
