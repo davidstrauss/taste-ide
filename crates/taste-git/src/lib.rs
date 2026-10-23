@@ -2195,6 +2195,79 @@ mod tests {
         );
     }
 
+    /// A branch that took the remote's tip in a merge and was then
+    /// rewritten from its root with a file taken out of every commit, as
+    /// `sb` was (2026-10-22): no history in common, no patch that matches,
+    /// and the branch never pointed at the remote's tip — but had it, in
+    /// the merge. Its own rewrite: nothing to pull, a push that replaces,
+    /// and the file taken out what that push loses.
+    #[test]
+    fn a_branch_rewritten_from_its_root_after_a_merge_is_pushed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let write = |cwd: &Path, name: &str, text: &str| {
+            std::fs::write(cwd.join(name), text).unwrap();
+            git(cwd, &["add", name]);
+        };
+        git(root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(root, &["clone", "-q", "remote.git", "server"]);
+        let server = root.join("server");
+        write(&server, "app.php", "v1\n");
+        write(&server, "pii.log", "card numbers\n");
+        git(&server, &["commit", "-q", "-m", "import"]);
+        git(&server, &["push", "-q", "origin", "HEAD:main"]);
+        git(root, &["clone", "-q", "remote.git", "mine"]);
+        let mine = root.join("mine");
+        write(&mine, "devcontainer.json", "{}\n");
+        git(&mine, &["commit", "-q", "-m", "devcontainer"]);
+        write(&server, "app.php", "v2\n");
+        git(&server, &["commit", "-q", "-m", "cutoff"]);
+        git(&server, &["push", "-q", "origin", "HEAD:main"]);
+        git(
+            &mine,
+            &["pull", "-q", "--no-rebase", "--no-edit", "origin", "main"],
+        );
+
+        // Rewritten from the root, the log out of every commit.
+        git(&mine, &["switch", "-q", "--orphan", "clean"]);
+        write(&mine, "app.php", "v1\n");
+        git(&mine, &["commit", "-q", "-m", "import"]);
+        write(&mine, "devcontainer.json", "{}\n");
+        git(&mine, &["commit", "-q", "-m", "devcontainer"]);
+        write(&mine, "app.php", "v2\n");
+        git(&mine, &["commit", "-q", "-m", "cutoff"]);
+        git(&mine, &["switch", "-q", "main"]);
+        git(&mine, &["reset", "-q", "--hard", "clean"]);
+
+        let ws = GitWorkspace::discover(&mine).unwrap();
+        let sync = ws.sync_status_of("main").unwrap();
+        assert_eq!(
+            (sync.ahead, sync.behind, sync.own_behind),
+            (3, 0, 0),
+            "{sync:?}"
+        );
+        assert!(sync.replaces.is_some(), "{sync:?}");
+        let carried = sync.rewritten.expect("its own rewrite");
+        assert!(!carried.whole(), "{carried:?}");
+    }
+
     /// A branch pushed, then rewritten here — its first commit reworded,
     /// the rest replayed, as the agent did to `datum-call` (2026-10-19) —
     /// diverges from its push target only by its own old copies. Nothing

@@ -38,6 +38,10 @@ use crate::{GitWorkspace, SyncStatus};
 /// them change by change ([`GitWorkspace::diverged`]).
 const DIVERGENCE_LIMIT: usize = 1000;
 
+/// How far back a branch's reflog is read for a commit it held
+/// (`GitWorkspace::has_held`): a branch's last hundred moves.
+const HELD_LOOKBACK: usize = 100;
+
 /// What Pull would do ([`GitWorkspace::pull_plan_of`]). A click does the
 /// first two; the third is a rebase, which replays the branch's own
 /// commits, and so is held for (David, 2026-10-15).
@@ -617,9 +621,15 @@ impl GitWorkspace {
     ///   that `there` lacks (git's patch-id, as `git cherry` compares) —
     ///   a rebase, a reword, an amend that kept the change; merges are
     ///   passed over, having no change of their own to compare;
-    /// - `there` is a commit `branch` itself has pointed at (its reflog):
-    ///   everything there came through this branch, whatever was done to
-    ///   it since.
+    /// - `there` is a commit `branch` itself has held — pointed at, or had
+    ///   in its history (its reflog): everything there was in this branch,
+    ///   whatever was done to it since. Pointed at alone missed a branch
+    ///   that took the remote's tip in a merge and was then rewritten from
+    ///   its root, with files taken out of every commit: no patch matched,
+    ///   it never pointed at the tip, and the push replacing the remote's
+    ///   history was offered as an ordinary one, with a pull beside it
+    ///   (2026-10-22: "Why doesn't push show as a forced one, given the
+    ///   lack of common ancestry?").
     ///
     /// `None` when neither holds: someone else's commits, which are for a
     /// rebase to take. A rewrite the agent made in a checkout in a VM
@@ -630,14 +640,10 @@ impl GitWorkspace {
         if theirs.is_empty() || mine.is_empty() {
             return None;
         }
-        let held = self
-            .repo
-            .reflog(&format!("refs/heads/{branch}"))
-            .ok()
-            .is_some_and(|log| log.iter().any(|entry| entry.id_new() == there));
+        let held = self.has_held(branch, there);
         // A merge there is someone's — a host's "Update branch", a
         // maintainer's — and has no change of its own to find here, so
-        // only the branch having pointed at it makes it this branch's
+        // only the branch having held it makes it this branch's
         // (review, 2026-10-20: a merge alone read as "nothing is lost").
         if !held && theirs.iter().any(|oid| self.is_merge(*oid)) {
             return None;
@@ -649,6 +655,39 @@ impl GitWorkspace {
         // replacing them loses is judged by content, in aggregate.
         let own = held || self.unmatched(&theirs, &mine) == 0;
         own.then(|| self.carried(tip, there, &theirs, &mine))
+    }
+
+    /// Whether `branch` has ever held `there`: pointed at it, or at a
+    /// commit with it in its history, by the branch's reflog. Its newest
+    /// [`HELD_LOOKBACK`] entries, since this is asked at every refresh of
+    /// the sync counts; and a yes is kept, a reflog only gaining entries
+    /// until it is expired.
+    fn has_held(&self, branch: &str, there: Oid) -> bool {
+        thread_local! {
+            static HELD: std::cell::RefCell<
+                std::collections::HashSet<(std::path::PathBuf, String, Oid)>,
+            > = std::cell::RefCell::new(std::collections::HashSet::new());
+        }
+        let key = (self.repo.path().to_path_buf(), branch.to_string(), there);
+        if HELD.with(|held| held.borrow().contains(&key)) {
+            return true;
+        }
+        let held = self
+            .repo
+            .reflog(&format!("refs/heads/{branch}"))
+            .ok()
+            .is_some_and(|log| {
+                log.iter().take(HELD_LOOKBACK).any(|entry| {
+                    let at = entry.id_new();
+                    at == there
+                        || (!at.is_zero()
+                            && self.repo.graph_descendant_of(at, there).unwrap_or(false))
+                })
+            });
+        if held {
+            HELD.with(|cache| cache.borrow_mut().insert(key));
+        }
+        held
     }
 
     /// What a push of `tip` over `there` would lose ([`Carried`]): `there`
