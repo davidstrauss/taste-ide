@@ -182,7 +182,6 @@ pub struct PortPage {
     face: Cell<PortFace>,
     /// The browser face, made on first show: a WebKit web process is not
     /// free, and a tab opened for its REST face may never want one.
-    browser_holder: gtk::Box,
     browser: RefCell<Option<webkit6::WebView>>,
     /// The load that failed and is showing the IDE's own error page: its
     /// uri and the reason, kept so a theme change redraws the page in the
@@ -208,6 +207,77 @@ pub struct PortPage {
     on_new_tab: RefCell<Option<NewTabHook>>,
     /// Who is told the page's title, for its tab.
     on_title: RefCell<Option<Rc<dyn Fn(&str)>>>,
+    /// The width the page is laid out at, and the clamp that holds it
+    /// there; the toggles that choose it.
+    device: Cell<Device>,
+    device_clamp: adw::Clamp,
+    device_toggles: gtk::Box,
+}
+
+/// What a port's page is shown as: a phone's width, a tablet's, or the
+/// pane's (David, 2026-10-22: "a mobile/tablet/desktop toggle"). The
+/// width is what a responsive page answers to — its media queries read
+/// the viewport — and the user agent what a page that sniffs reads; a
+/// phone's touch is not something WebKitGTK can say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Device {
+    Phone,
+    Tablet,
+    Desktop,
+}
+
+impl Device {
+    const ALL: [Device; 3] = [Device::Phone, Device::Tablet, Device::Desktop];
+
+    fn icon(self) -> &'static str {
+        match self {
+            Device::Phone => "phone-symbolic",
+            Device::Tablet => "tablet-symbolic",
+            Device::Desktop => "computer-symbolic",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Device::Phone => "Show as a phone: 390 pixels wide",
+            Device::Tablet => "Show as a tablet: 820 pixels wide",
+            Device::Desktop => "Show as a desktop: as wide as the pane",
+        }
+    }
+
+    /// The viewport's width; `None`, the pane's.
+    fn width(self) -> Option<i32> {
+        match self {
+            Device::Phone => Some(390),
+            Device::Tablet => Some(820),
+            Device::Desktop => None,
+        }
+    }
+
+    /// What the page is told it runs in; `None`, WebKitGTK's own.
+    fn user_agent(self) -> Option<&'static str> {
+        match self {
+            Device::Phone => Some(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 \
+                 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+            ),
+            Device::Tablet => Some(
+                "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, \
+                 like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+            ),
+            Device::Desktop => None,
+        }
+    }
+
+    /// `TASTE_PROBE_PORT_DEVICE`'s word for it.
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "phone" | "mobile" => Some(Device::Phone),
+            "tablet" => Some(Device::Tablet),
+            "desktop" => Some(Device::Desktop),
+            _ => None,
+        }
+    }
 }
 
 /// Puts a port page in a tab of its own ([`PortPage::set_on_new_tab`]).
@@ -256,9 +326,17 @@ impl PortPage {
              load it again",
         );
         purge.widget.add_css_class("flat");
+        // The page's width, one of three, as the editor's tab bar offers a
+        // view's modes: linked toggles, one at a time.
+        let device_toggles = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .css_classes(["linked"])
+            .valign(gtk::Align::Center)
+            .build();
         let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         title_row.append(&gtk::Image::from_icon_name(PORT_ICON));
         title_row.append(&heading);
+        title_row.append(&device_toggles);
         title_row.append(&purge.widget);
         title_row.append(&copy_button);
         title_row.append(&open_button);
@@ -337,6 +415,15 @@ impl PortPage {
         browser_bar.append(&address);
         let browser_holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
         browser_holder.set_vexpand(true);
+        // The page held to its device's width, centred, without raising
+        // the pane's minimum as a width request on the view would: the
+        // clamp gives what it has when the pane is narrower.
+        let device_clamp = adw::Clamp::builder()
+            .maximum_size(i32::MAX)
+            .tightening_threshold(i32::MAX)
+            .vexpand(true)
+            .build();
+        browser_holder.append(&device_clamp);
         let browser_face = gtk::Box::new(gtk::Orientation::Vertical, 0);
         browser_face.append(&browser_bar);
         browser_face.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -368,7 +455,6 @@ impl PortPage {
             state_dot,
             stack,
             face: Cell::new(PortFace::Rest),
-            browser_holder,
             browser: RefCell::new(None),
             failed_page: RefCell::new(None),
             alternate_loading: Cell::new(false),
@@ -382,7 +468,11 @@ impl PortPage {
             spec: spec.clone(),
             on_new_tab: RefCell::new(None),
             on_title: RefCell::new(None),
+            device: Cell::new(Device::Desktop),
+            device_clamp,
+            device_toggles,
         });
+        page.build_device_toggles();
         {
             let weak = Rc::downgrade(&page);
             page.purge.set_on_confirm(move || {
@@ -466,6 +556,7 @@ impl PortPage {
     pub fn set_face(self: &Rc<Self>, face: PortFace) {
         self.face.set(face);
         self.purge.widget.set_visible(face == PortFace::Browser);
+        self.device_toggles.set_visible(face == PortFace::Browser);
         if face == PortFace::Browser {
             self.ensure_browser();
         }
@@ -573,6 +664,7 @@ impl PortPage {
             builder = builder.user_content_manager(&manager);
         }
         let view = builder.build();
+        page.set_device(self.device.get());
         page.install_view(&view);
         page.set_face(PortFace::Browser);
         page.set_on_new_tab(hook.clone());
@@ -754,8 +846,74 @@ impl PortPage {
                 }
             });
         }
-        self.browser_holder.append(&view);
+        self.device_clamp.set_child(Some(&view));
         *self.browser.borrow_mut() = Some(view);
+        self.apply_device(false);
+    }
+
+    /// The three toggles, the one for this page's device active.
+    fn build_device_toggles(self: &Rc<Self>) {
+        let mut first: Option<gtk::ToggleButton> = None;
+        for device in Device::ALL {
+            let button = gtk::ToggleButton::builder()
+                .icon_name(device.icon())
+                .tooltip_text(device.label())
+                .focus_on_click(false)
+                .active(device == self.device.get())
+                .build();
+            match &first {
+                Some(first) => button.set_group(Some(first)),
+                None => first = Some(button.clone()),
+            }
+            let weak = Rc::downgrade(self);
+            button.connect_toggled(move |button| {
+                // One of the group turning off as another turns on.
+                if !button.is_active() {
+                    return;
+                }
+                if let Some(page) = weak.upgrade() {
+                    page.set_device(device);
+                }
+            });
+            self.device_toggles.append(&button);
+        }
+    }
+
+    /// Show the page as `device`: its width, and, where the user agent
+    /// changes, the page loaded again, since a page reads that once.
+    pub fn set_device(&self, device: Device) {
+        if self.device.replace(device) == device {
+            return;
+        }
+        let mut toggle = self.device_toggles.first_child();
+        for each in Device::ALL {
+            if let Some(button) = toggle.clone().and_downcast::<gtk::ToggleButton>() {
+                if each == device && !button.is_active() {
+                    button.set_active(true);
+                }
+                toggle = button.next_sibling();
+            }
+        }
+        self.apply_device(true);
+    }
+
+    /// The clamp at the device's width and the view's user agent its, the
+    /// page loaded again when `reload` and the user agent changed.
+    fn apply_device(&self, reload: bool) {
+        let device = self.device.get();
+        let width = device.width().unwrap_or(i32::MAX);
+        self.device_clamp.set_maximum_size(width);
+        self.device_clamp.set_tightening_threshold(width);
+        let Some(view) = self.browser.borrow().clone() else {
+            return;
+        };
+        if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
+            let before = settings.user_agent();
+            settings.set_user_agent(device.user_agent());
+            if reload && settings.user_agent() != before {
+                view.reload();
+            }
+        }
     }
 
     /// Load the port's page once the network guard is in place, and not
@@ -928,6 +1086,13 @@ impl PortPage {
             ..PortFacts::default()
         });
         self.set_face(PortFace::Browser);
+        // `TASTE_PROBE_PORT_DEVICE=phone` (or `tablet`): shown as that.
+        if let Some(device) = std::env::var("TASTE_PROBE_PORT_DEVICE")
+            .ok()
+            .and_then(|word| Device::parse(&word))
+        {
+            self.set_device(device);
+        }
         // `TASTE_PROBE_PORT_NEWTAB=1`: the page opens a window, as a link
         // with a target does, and the window is a tab of its own.
         if std::env::var("TASTE_PROBE_PORT_NEWTAB").is_ok() {

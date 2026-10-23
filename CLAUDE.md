@@ -283,7 +283,9 @@ where the load fails for real and the IDE's error page names which of
 the two it is; otherwise it needs a container running a server bound
 the wrong way; `TASTE_PROBE_PORT_NEWTAB=1` with it has the posed page
 call `window.open`, as a link with a target does, and prints when the page
-lands in a tab of its own beside the port's (`PortPage::open_related`);
+lands in a tab of its own beside the port's (`PortPage::open_related`),
+and `TASTE_PROBE_PORT_DEVICE=phone` (or `tablet`) poses the page at that
+device's width (`portview::Device`);
 `TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
 safe-mode banner's running-baseline face;
 `TASTE_PROBE_STARTUP=vm` (or `image` — the guest image fetching inside
