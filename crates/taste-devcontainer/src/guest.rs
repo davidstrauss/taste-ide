@@ -122,8 +122,8 @@ impl GuestImage {
     }
 
     /// The decompressed qcow2 every VM's disk overlays — the **base
-    /// image**, beside the compressed download and named without the
-    /// `.xz`, exactly as `xz -d` would name it.
+    /// image**, named as `xz -d` would name the download, which is removed
+    /// once the base is verified.
     pub fn base_path(&self) -> PathBuf {
         images_dir().join(format!(
             "fedora-coreos-{}-qemu.{}.qcow2",
@@ -420,6 +420,9 @@ impl GuestImage {
         std::fs::rename(&part, &base).with_context(|| format!("installing {}", base.display()))?;
         std::fs::write(self.base_marker_path(), format!("{expected}\n"))
             .with_context(|| format!("marking {} verified", base.display()))?;
+        // The download has done its work: every VM is made from the base,
+        // and a base found damaged is fetched again ([`Self::ensure_base`]).
+        let _ = std::fs::remove_file(compressed);
         let size = std::fs::metadata(&base).map_or(unpacked, |meta| meta.len());
         self.report(&*report, GuestImagePhase::Ready, size, size);
         Ok(base)
@@ -734,6 +737,38 @@ pub fn prune_unused_bases() -> u64 {
     )
 }
 
+/// The downloads whose base image is here and verified, removed: a
+/// gigabyte each, kept by earlier IDEs after the unpack, for which nothing
+/// has a use (David, 2026-10-22: "As long as you can reuse the created base
+/// image, we don't need to keep the compressed one"). The bytes that freed.
+pub fn drop_unpacked_downloads() -> u64 {
+    drop_unpacked_in(&images_dir())
+}
+
+fn drop_unpacked_in(images: &Path) -> u64 {
+    let mut freed = 0;
+    for entry in std::fs::read_dir(images).into_iter().flatten().flatten() {
+        let download = entry.path();
+        let Some(base) = download
+            .to_str()
+            .and_then(|path| path.strip_suffix(".xz"))
+            .filter(|base| base.ends_with(".qcow2"))
+            .map(PathBuf::from)
+        else {
+            continue;
+        };
+        // Verified: the digest marker is written only once the hash matched.
+        if !(base.is_file() && base.with_extension("qcow2.sha256").is_file()) {
+            continue;
+        }
+        let size = entry.metadata().map_or(0, |m| m.len());
+        if std::fs::remove_file(&download).is_ok() {
+            freed += size;
+        }
+    }
+    freed
+}
+
 fn prune_bases_in(images: &Path, disks: &Path, current: &Path) -> u64 {
     let used: std::collections::HashSet<std::ffi::OsString> = std::fs::read_dir(disks)
         .into_iter()
@@ -962,6 +997,30 @@ mod tests {
         assert!(!old.with_extension("qcow2.sha256").exists());
         assert!(used.exists() && current.exists());
         assert!(current.with_extension("qcow2.xz").exists());
+    }
+
+    /// A download goes once its base is here and verified; one still being
+    /// unpacked, or whose base was never verified, stays.
+    #[test]
+    fn a_download_goes_once_its_base_is_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path();
+        let verified = images.join("fedora-coreos-44.1-qemu.x86_64.qcow2");
+        let unverified = images.join("fedora-coreos-44.2-qemu.x86_64.qcow2");
+        let unpacking = images.join("fedora-coreos-44.3-qemu.x86_64.qcow2");
+        for base in [&verified, &unverified, &unpacking] {
+            std::fs::write(base.with_extension("qcow2.xz"), "xz").unwrap();
+        }
+        fake_qcow2(&verified, None);
+        std::fs::write(verified.with_extension("qcow2.sha256"), "digest\n").unwrap();
+        fake_qcow2(&unverified, None);
+        fake_qcow2(&unpacking.with_extension("qcow2.part"), None);
+
+        assert_eq!(drop_unpacked_in(images), 2);
+        assert!(!verified.with_extension("qcow2.xz").exists());
+        assert!(verified.exists());
+        assert!(unverified.with_extension("qcow2.xz").exists());
+        assert!(unpacking.with_extension("qcow2.xz").exists());
     }
 
     #[test]

@@ -3225,6 +3225,41 @@ impl EnvironmentRegistry {
                 Ok(_) => {}
                 Err(e) => tracing::debug!("sweeping orphan VM disks: {e:#}"),
             }
+            // What is no longer wanted, though nothing is short of room yet:
+            // VMs long unused, and downloads whose base is unpacked.
+            let retired =
+                crate::disposable::retire_idle(pool.libvirt(), &self.workspace_root).await;
+            let dropped = tokio::task::spawn_blocking(crate::guest::drop_unpacked_downloads)
+                .await
+                .unwrap_or(0);
+            let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+            if !retired.is_empty() {
+                taste_core::app_log::push(
+                    "info",
+                    "substrate",
+                    &format!(
+                        "removed {} VM(s) unused for {} days, {:.1} GiB: {}",
+                        retired.len(),
+                        crate::disposable::IDLE_RETIREMENT.as_secs() / 86_400,
+                        gib(retired.iter().map(|(_, size)| size).sum()),
+                        retired
+                            .iter()
+                            .map(|(domain, _)| domain.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+            if dropped > 0 {
+                taste_core::app_log::push(
+                    "info",
+                    "substrate",
+                    &format!(
+                        "removed guest image downloads already unpacked: {:.1} GiB",
+                        gib(dropped)
+                    ),
+                );
+            }
         }
         let mut report = ReconcileReport {
             restored: self.restore_from_disk(),

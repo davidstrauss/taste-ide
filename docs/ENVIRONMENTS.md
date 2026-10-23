@@ -3303,6 +3303,15 @@ is shouted, but nothing runs either. The rows say what is missing, and
   running guest keeps current), until it does, then the base images no disk overlays any
   more; an unmarked disk is never touched, and the refusal names those
   kept by project, with what would mark them (opening and closing it).
+  Room alone was not enough: a host with a hundred gigabytes free never
+  ran short, so it kept every VM it had made (2026-10-22, 76 GiB of five
+  idle VMs; David: "How can we clean up the disk of junk and keep it
+  clean?"). So every launch also retires the VMs that may be cleared and
+  have not run for two weeks (`disposable::retire_idle`,
+  `IDLE_RETIREMENT`), never one of the workspace it is opening, and
+  removes a guest image's download once its base image is verified,
+  since a damaged base is fetched again rather than unpacked from a kept
+  copy (`guest::drop_unpacked_downloads`).
   `Pool::stale` still only reports a VM whose folder is gone: with no
   folder there is nothing to have held its work against.
 

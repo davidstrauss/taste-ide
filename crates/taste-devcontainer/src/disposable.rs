@@ -33,6 +33,10 @@
 //!   VMs that are shut off and whose owner is not open go, least recently
 //!   used first, until the new VM fits. An unmarked disk is never touched; the refusal
 //!   names it instead, with what would mark it.
+//! - **Retired when idle** ([`retire_idle`]): at any IDE's launch, a VM
+//!   that may be cleared and has not run for [`IDLE_RETIREMENT`] goes
+//!   whether or not the room is wanted, so disks do not pile up on a host
+//!   that never runs short.
 //!
 //! The marker is `<domain>.disposable` beside the disk, and it names the
 //! disk's inode, so a disk that was replaced under the same name does not
@@ -584,6 +588,60 @@ pub async fn clear_for_room(libvirt: &LibvirtSession, retiring: Option<&str>) ->
     }
 }
 
+/// How long a marked VM sits unused before any IDE's launch removes it,
+/// room or no room. Room alone never came: a host with a hundred gigabytes
+/// free kept every VM it had ever made, and the disk filled with machines
+/// nobody had booted in weeks (David, 2026-10-22: "How can we clean up the
+/// disk of junk and keep it clean?"). Two weeks keeps the warm boot for a
+/// project in use and costs a project picked up after a break one fresh VM.
+pub const IDLE_RETIREMENT: std::time::Duration = std::time::Duration::from_secs(14 * 86_400);
+
+/// Whether `vm` has gone unused past [`IDLE_RETIREMENT`] as of `now`.
+fn idle_past(
+    vm: &Vm,
+    now: std::time::SystemTime,
+    used: impl Fn(&Vm) -> std::time::SystemTime,
+) -> bool {
+    now.duration_since(used(vm))
+        .is_ok_and(|idle| idle >= IDLE_RETIREMENT)
+}
+
+/// A launch's sweep: the VMs that may go ([`may_clear`]) and have sat
+/// unused past [`IDLE_RETIREMENT`] are removed, and then the base images
+/// no disk is built on any more. `opening` is the workspace this IDE is
+/// bringing up, whose VMs it may be about to boot, so none of them goes.
+/// The removed VMs, each with what it freed.
+pub async fn retire_idle(libvirt: &LibvirtSession, opening: &Path) -> Vec<(String, u64)> {
+    let now = std::time::SystemTime::now();
+    let mut retired = Vec::new();
+    for vm in libvirt.list_all().await.unwrap_or_default() {
+        if vm.workspace_root == opening || !may_clear(&vm) || !idle_past(&vm, now, last_used) {
+            continue;
+        }
+        let size = allocated(&vm);
+        match libvirt.destroy(&vm).await {
+            Ok(()) => {
+                libvirt.say(
+                    &vm.domain,
+                    format!(
+                        "removed after {} days unused: {:.1} GiB, and nothing on it that this \
+                         machine lacks — its window marked it so when it closed ({})",
+                        IDLE_RETIREMENT.as_secs() / 86_400,
+                        gib(size),
+                        folder_name(&vm.workspace_root)
+                    ),
+                );
+                retired.push((vm.domain, size));
+            }
+            Err(e) => tracing::warn!("{}: could not be retired: {e:#}", vm.domain),
+        }
+    }
+    if !retired.is_empty() {
+        crate::guest::prune_unused_bases();
+    }
+    retired
+}
+
 fn folder_name(root: &Path) -> String {
     root.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -651,6 +709,23 @@ mod tests {
         });
         let order: Vec<&str> = vms.iter().map(|vm| vm.domain.as_str()).collect();
         assert_eq!(order, ["taste-a-month", "taste-a-week", "taste-a-day"]);
+    }
+
+    /// Retired at two weeks unused, and not a day before; a disk whose time
+    /// is ahead of the clock is not idle at all.
+    #[test]
+    fn a_vm_is_retired_only_past_its_idle_time() {
+        let vm = Vm {
+            domain: "taste-a".into(),
+            ssh_port: 40001,
+            workspace_root: "/work/proj".into(),
+            state: DomainState::ShutOff,
+            cloud: None,
+        };
+        let day = |n: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(n * 86_400);
+        assert!(!idle_past(&vm, day(20), |_| day(7)));
+        assert!(idle_past(&vm, day(21), |_| day(7)));
+        assert!(!idle_past(&vm, day(7), |_| day(8)));
     }
 
     #[test]
