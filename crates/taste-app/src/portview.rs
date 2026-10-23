@@ -196,6 +196,9 @@ pub struct PortPage {
     forward: gtk::Button,
     pub rest: Rc<crate::rest::RestClient>,
     facts: RefCell<PortFacts>,
+    /// Clear what the site has stored in this tab, held for two seconds:
+    /// shown on the browser face, beside the address it would reload.
+    purge: Rc<crate::holdbutton::HoldButton>,
 }
 
 impl PortPage {
@@ -221,9 +224,22 @@ impl PortPage {
             .css_classes(["flat"])
             .tooltip_text("Copy the address")
             .build();
+        // Everything the site stored in this tab — cache, cookies, local
+        // and session storage, IndexedDB, service workers — gone, and the
+        // page loaded again, as a site sees a first visit (David,
+        // 2026-10-22: "a button … to purge everything: cache, cookies,
+        // etc. Require holding it two seconds"). Left of the address's
+        // copy, and only while the site is what is shown.
+        let purge = crate::holdbutton::HoldButton::new(
+            "edit-clear-all-symbolic",
+            "Hold to clear everything this site stored here — cache, cookies, storage — and \
+             load it again",
+        );
+        purge.widget.add_css_class("flat");
         let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         title_row.append(&gtk::Image::from_icon_name(PORT_ICON));
         title_row.append(&heading);
+        title_row.append(&purge.widget);
         title_row.append(&copy_button);
         title_row.append(&open_button);
 
@@ -341,7 +357,22 @@ impl PortPage {
             forward,
             rest,
             facts: RefCell::new(PortFacts::default()),
+            purge,
         });
+        {
+            let weak = Rc::downgrade(&page);
+            page.purge.set_on_confirm(move || {
+                if let Some(page) = weak.upgrade() {
+                    page.purge_site();
+                }
+            });
+            let button = page.purge.widget.downgrade();
+            page.purge.set_on_early_release(move |note| {
+                if let Some(button) = button.upgrade() {
+                    toast(button.upcast_ref(), &note);
+                }
+            });
+        }
         page.set_facts(&facts);
         page.set_face(facts.default_face());
 
@@ -411,10 +442,51 @@ impl PortPage {
     /// Show one face. The browser is built on its first showing.
     pub fn set_face(self: &Rc<Self>, face: PortFace) {
         self.face.set(face);
+        self.purge.widget.set_visible(face == PortFace::Browser);
         if face == PortFace::Browser {
             self.ensure_browser();
         }
         self.stack.set_visible_child_name(face.stack_name());
+    }
+
+    /// Clear everything the site has stored in this tab's session, and load
+    /// the page again. The session is the tab's own and ephemeral, so this
+    /// reaches nothing of any other tab's or of the user's browser.
+    fn purge_site(&self) {
+        let Some(view) = self.browser.borrow().clone() else {
+            return;
+        };
+        let manager = webkit6::prelude::WebViewExt::network_session(&view)
+            .and_then(|session| session.website_data_manager());
+        let Some(manager) = manager else {
+            toast(
+                view.upcast_ref(),
+                "This tab's site data could not be reached",
+            );
+            return;
+        };
+        let weak = gtk::glib::SendWeakRef::from(view.downgrade());
+        manager.clear(
+            webkit6::WebsiteDataTypes::ALL,
+            gtk::glib::TimeSpan(0),
+            None::<&gtk::gio::Cancellable>,
+            move |result| {
+                let Some(view) = weak.upgrade() else { return };
+                match result {
+                    Ok(()) => {
+                        view.reload_bypass_cache();
+                        toast(
+                            view.upcast_ref(),
+                            "Cleared the site's cache, cookies, and storage",
+                        );
+                    }
+                    Err(e) => toast(
+                        view.upcast_ref(),
+                        &format!("The site's data was not cleared: {e}"),
+                    ),
+                }
+            },
+        );
     }
 
     fn ensure_browser(self: &Rc<Self>) {
@@ -1080,6 +1152,16 @@ pub fn process_from_ss(output: &str) -> Option<String> {
         Some(pid) => format!("{name} (pid {pid})"),
         None => name,
     })
+}
+
+/// A toast in the window `widget` is in.
+fn toast(widget: &gtk::Widget, text: &str) {
+    if let Some(overlay) = widget
+        .root()
+        .and_then(|root| crate::markdown_view::find_toast_overlay(root.upcast_ref()))
+    {
+        overlay.add_toast(adw::Toast::new(text));
+    }
 }
 
 #[cfg(test)]

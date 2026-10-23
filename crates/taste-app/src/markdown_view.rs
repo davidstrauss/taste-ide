@@ -1057,7 +1057,7 @@ fn is_copy_span(spans: &[String], href: &str) -> bool {
     spans.iter().any(|span| span == href)
 }
 
-fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverlay> {
+pub(crate) fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverlay> {
     let mut child = widget.first_child();
     while let Some(current) = child {
         if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
