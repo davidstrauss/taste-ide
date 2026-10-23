@@ -3284,7 +3284,10 @@ is shouted, but nothing runs either. The rows say what is missing, and
   running VM of the workspace is looked at as it runs: every checkout
   on it, and every submodule in those, must have its HEAD, every ref tip,
   and its working tree's tree (through a throwaway index, so nothing is
-  touched) in the folder's repository on this host. One that passes gets
+  touched) in the folder's repository on this host — or, for an agent
+  environment's checkout, in its peer here, where its commits and
+  snapshots are fetched (held to the folder alone, no VM with an agent
+  environment on it could be marked). One that passes gets
   `<domain>.disposable` beside its disk, naming the disk's inode, and a
   `<domain>.recheck` beside that. The look once stopped every container
   first, so nothing could write after it, and a relaunch inside the

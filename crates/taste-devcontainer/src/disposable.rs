@@ -22,7 +22,8 @@
 //!   project runs can write after the look, and the look is the last word
 //!   ([`mark_workspace_vms`]). A VM is marked when every checkout on it,
 //!   and every submodule in those, has its HEAD, every ref tip, and its
-//!   working tree's tree in the repository the folder holds on this host.
+//!   working tree's tree in the repository the folder holds on this host,
+//!   or, for an agent environment's checkout, in its peer here.
 //!   Ignored files, volumes, and images are not counted: they are
 //!   derived, and an environment IS its refs plus its config
 //!   (ENVIRONMENTS → "Uncommitted work, backups, and artifacts").
@@ -308,29 +309,62 @@ fn parse_report(text: &str) -> Result<Report> {
 
 /// What on a VM this host does not have, by checkout, in words; empty
 /// when nothing. A checkout's place is `<environment>[/<submodule path>]`,
-/// and the repository it is held to is the folder's — or, for a
-/// submodule, the folder's clone at the same path — since every
-/// environment's refs reach the folder.
-fn unique_content(report: &Report, workspace_root: &Path) -> Vec<String> {
+/// and the repository it is held to is `root`'s — or, for a submodule,
+/// the clone at the same path under it.
+fn unique_content(report: &Report, root: &Path) -> Vec<String> {
+    unique_in(report, |_| vec![root.to_path_buf()])
+}
+
+/// [`unique_content`] for a whole workspace's VM: an agent environment's
+/// checkout is held to its peer here as well as to the folder, since its
+/// commits and snapshots are fetched into the peer and the folder holds
+/// only the branches it publishes. Held to the folder alone, no VM with an
+/// agent environment on it could be marked unless its branch had been
+/// published (2026-10-22: both of a project's VMs kept for "1 commit not
+/// on this machine" and uncommitted changes, all of it in the peers, and
+/// 43 GiB marked once the peers were asked).
+fn unique_here(report: &Report, workspace_root: &Path) -> Vec<String> {
+    unique_in(report, |env| {
+        let mut roots = Vec::new();
+        if let Ok(id) = taste_core::environment::EnvironmentId::parse(env) {
+            if !id.is_primary() {
+                roots.push(taste_core::environment::env_dir(workspace_root, &id).join("repo"));
+            }
+        }
+        roots.push(workspace_root.to_path_buf());
+        roots
+    })
+}
+
+/// What on a VM is in none of the repositories `roots` names for a
+/// checkout's environment, in words: an object any one of them has is on
+/// this machine.
+fn unique_in(report: &Report, roots: impl Fn(&str) -> Vec<PathBuf>) -> Vec<String> {
     let mut reasons = report.failures.clone();
     for checkout in &report.checkouts {
-        let sub: PathBuf = checkout.place.split('/').skip(1).collect();
-        let host = workspace_root.join(&sub);
-        let repository = taste_git::GitWorkspace::discover(&host)
-            .filter(|git| git.workdir().canonicalize().ok() == host.canonicalize().ok());
-        let Some(git) = repository else {
+        let mut parts = checkout.place.split('/');
+        let env = parts.next().unwrap_or_default();
+        let sub: PathBuf = parts.collect();
+        let hosts: Vec<PathBuf> = roots(env).iter().map(|root| root.join(&sub)).collect();
+        let repositories: Vec<taste_git::GitWorkspace> = hosts
+            .iter()
+            .filter_map(|host| {
+                taste_git::GitWorkspace::discover(host)
+                    .filter(|git| git.workdir().canonicalize().ok() == host.canonicalize().ok())
+            })
+            .collect();
+        if repositories.is_empty() {
             reasons.push(format!(
                 "{}: no repository at {} on this machine",
                 checkout.place,
-                host.display()
+                hosts
+                    .last()
+                    .map_or_else(String::new, |h| h.display().to_string())
             ));
             continue;
-        };
-        let missing = checkout
-            .commits
-            .iter()
-            .filter(|oid| !git.has_object(oid))
-            .count();
+        }
+        let has = |oid: &str| repositories.iter().any(|git| git.has_object(oid));
+        let missing = checkout.commits.iter().filter(|oid| !has(oid)).count();
         if missing > 0 {
             reasons.push(format!(
                 "{}: {missing} commit{} not on this machine",
@@ -339,7 +373,7 @@ fn unique_content(report: &Report, workspace_root: &Path) -> Vec<String> {
             ));
         }
         match &checkout.tree {
-            Some(tree) if git.has_object(tree) => {}
+            Some(tree) if has(tree) => {}
             Some(_) => reasons.push(format!(
                 "{}: uncommitted changes not on this machine",
                 checkout.place
@@ -370,7 +404,7 @@ pub async fn look_and_mark(vm: &Vm, stop_containers: bool, recheck: bool) -> Res
             return Err(e);
         }
     };
-    let reasons = unique_content(&report, &vm.workspace_root);
+    let reasons = unique_here(&report, &vm.workspace_root);
     if reasons.is_empty() {
         let places: Vec<String> = report.checkouts.iter().map(|c| c.place.clone()).collect();
         let count = places.len();
@@ -783,6 +817,35 @@ mod tests {
             ..Report::default()
         };
         assert_eq!(unique_content(&failed, dir.path()).len(), 1);
+    }
+
+    /// An agent environment's commit in its peer and not in the folder is
+    /// on this machine; one in neither is not.
+    #[test]
+    fn an_agent_environment_is_held_to_its_peer_too() {
+        let folder = tempfile::tempdir().unwrap();
+        git2::Repository::init(folder.path()).unwrap();
+        let peer = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(peer.path()).unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let commit = repo
+            .commit(Some("HEAD"), &sig, &sig, "agent's", &tree, &[])
+            .unwrap();
+        let report = |commit: String| Report {
+            checkouts: vec![Checkout {
+                place: "i-0001".into(),
+                commits: vec![commit],
+                tree: Some(tree_id.to_string()),
+            }],
+            failures: vec![],
+        };
+        let roots = |_: &str| vec![peer.path().to_path_buf(), folder.path().to_path_buf()];
+        assert!(unique_in(&report(commit.to_string()), roots).is_empty());
+        let absent = "0123456789abcdef0123456789abcdef01234567".to_string();
+        assert_eq!(unique_in(&report(absent), roots).len(), 1);
+        assert!(!unique_content(&report(commit.to_string()), folder.path()).is_empty());
     }
 
     /// A submodule is held to the folder's clone at its path, and a path
