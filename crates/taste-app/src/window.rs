@@ -2172,6 +2172,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     })
                     .collect();
                 filetree.set_log_activity(&samples);
+                // ...and the Tasks rows': what each task's runs have said.
+                let task_samples = filetree
+                    .task_rows()
+                    .into_iter()
+                    .map(|row| {
+                        let samples = log_activity.task_samples(&env, &row.info.name);
+                        (row.info.name, samples)
+                    })
+                    .collect();
+                filetree.set_task_activity(task_samples);
                 let specs = environments
                     .get(&env)
                     .map(|supervisor| supervisor.ports())
@@ -4554,6 +4564,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         }
                     }
                     Event::TaskOutput { env, name, lines } => {
+                        log_activity.record_task(&env, &name, lines.len());
                         editor.append_task(&env, &name, &lines);
                     }
                     Event::TaskState { env, name } => {

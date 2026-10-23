@@ -713,6 +713,12 @@ pub struct FileTree {
     port_sparklines:
         RefCell<HashMap<u16, (crate::sparkline::Sparkline, crate::sparkline::Sparkline)>>,
     port_traffic_seed: RefCell<HashMap<u16, taste_devcontainer::PortTraffic>>,
+    /// Per task, by name, its row's sparkline — how much its runs have
+    /// said lately — for the tick to feed; and the last samples, so a row
+    /// drawn again starts from them.
+    task_sparklines: RefCell<HashMap<String, crate::sparkline::Sparkline>>,
+    task_activity:
+        RefCell<HashMap<String, [taste_core::activity::Count; taste_core::activity::BUCKETS]>>,
     /// The count banners (results.rs, title-only): one at the foot of the
     /// files, one under Ports, one under Logs. These panels answer a query
     /// by hiding rows, so they have nothing to list — but a panel that
@@ -2167,6 +2173,8 @@ impl FileTree {
             on_run_task: RefCell::new(None),
             port_sparklines: RefCell::new(HashMap::new()),
             port_traffic_seed: RefCell::new(HashMap::new()),
+            task_sparklines: RefCell::new(HashMap::new()),
+            task_activity: RefCell::new(HashMap::new()),
             files_results,
             ports_results,
             logs_results,
@@ -3592,6 +3600,7 @@ impl FileTree {
         while let Some(child) = self.tasks_list.first_child() {
             self.tasks_list.remove(&child);
         }
+        self.task_sparklines.borrow_mut().clear();
         let (rows, cannot_run, has_taskfile) = self.tasks.borrow().clone();
         let runnable = cannot_run.is_none();
         // The one query here as in Ports and Logs: a task's hits are the
@@ -3869,6 +3878,21 @@ impl FileTree {
         if hits > 0 {
             trailing.append(&crate::search::hit_badge(hits));
         }
+        // How much its runs have said lately, as a log's row says it: the
+        // same buckets, fed on the panel's tick (`set_task_activity`).
+        let sparkline = crate::sparkline::Sparkline::new();
+        sparkline.widget.set_can_target(true);
+        let samples = self
+            .task_activity
+            .borrow()
+            .get(&row.info.name)
+            .copied()
+            .unwrap_or([0; taste_core::activity::BUCKETS]);
+        Self::show_task_activity(&sparkline, &samples);
+        trailing.append(&sparkline.widget);
+        self.task_sparklines
+            .borrow_mut()
+            .insert(row.info.name.clone(), sparkline);
         trailing.append(&button);
         let item = section_row(
             fold.is_none().then(|| crate::tasks::dot(row.state)),
@@ -3979,6 +4003,30 @@ impl FileTree {
         }
         *self.task_hits.borrow_mut() = hits;
         self.render_tasks();
+    }
+
+    /// The Tasks rows' sparklines, by task name: the selected environment's
+    /// tasks' output, the last five minutes. Called on the panel's tick.
+    pub fn set_task_activity(
+        &self,
+        samples: HashMap<String, [taste_core::activity::Count; taste_core::activity::BUCKETS]>,
+    ) {
+        for (name, sparkline) in self.task_sparklines.borrow().iter() {
+            if let Some(series) = samples.get(name) {
+                Self::show_task_activity(sparkline, series);
+            }
+        }
+        *self.task_activity.borrow_mut() = samples;
+    }
+
+    fn show_task_activity(
+        sparkline: &crate::sparkline::Sparkline,
+        samples: &[taste_core::activity::Count; taste_core::activity::BUCKETS],
+    ) {
+        sparkline.set_samples(samples);
+        sparkline
+            .widget
+            .set_tooltip_text(Some(&crate::sparkline::Sparkline::describe(samples)));
     }
 
     /// The task rows as they are, for the window to count their hits.
@@ -4664,6 +4712,46 @@ impl FileTree {
             },
             state,
         };
+        // What their runs said: a build three minutes ago, a suite saying
+        // a little all along and more now, a seed that failed after a few
+        // lines; the rest nothing.
+        {
+            use taste_core::activity::BUCKETS;
+            let shape = |f: &dyn Fn(usize) -> u16| {
+                let mut samples = [0u16; BUCKETS];
+                for (index, slot) in samples.iter_mut().enumerate() {
+                    *slot = f(index);
+                }
+                samples
+            };
+            let mut activity = HashMap::new();
+            activity.insert(
+                "build".to_string(),
+                shape(&|i| match i {
+                    18..=30 => 30 + ((i * 13) % 40) as u16,
+                    _ => 0,
+                }),
+            );
+            activity.insert(
+                "test".to_string(),
+                shape(&|i| match i {
+                    0..=44 => (i % 4 == 0) as u16 * 5,
+                    _ => 12 + ((i * 7) % 20) as u16,
+                }),
+            );
+            activity.insert(
+                "ci:test".to_string(),
+                shape(&|i| (i >= 50) as u16 * (8 + ((i * 5) % 9) as u16)),
+            );
+            activity.insert(
+                "dev:init".to_string(),
+                shape(&|i| match i {
+                    36..=38 => 6,
+                    _ => 0,
+                }),
+            );
+            *self.task_activity.borrow_mut() = activity;
+        }
         self.set_tasks(
             vec![
                 // Folded, and every light under it: its arrow's badges.

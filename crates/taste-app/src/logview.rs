@@ -203,6 +203,15 @@ pub struct LogActivity {
             taste_core::activity::Series,
         >,
     >,
+    /// A task's runs are a log of their own (`LogPage::titled`), and its
+    /// row in the Tasks section carries the same line (David, 2026-10-22:
+    /// "Tasks should have activity sparklines like logs and ports").
+    tasks: RefCell<
+        std::collections::HashMap<
+            (taste_core::environment::EnvironmentId, String),
+            taste_core::activity::Series,
+        >,
+    >,
     epoch: std::cell::OnceCell<std::time::Instant>,
 }
 
@@ -244,6 +253,40 @@ impl LogActivity {
         self.series
             .borrow()
             .get(&(env.clone(), kind))
+            .map(|series| series.samples(bucket))
+            .unwrap_or([0; taste_core::activity::BUCKETS])
+    }
+
+    /// `lines` more lines of `env`'s task `name`'s output, now.
+    pub fn record_task(
+        &self,
+        env: &taste_core::environment::EnvironmentId,
+        name: &str,
+        lines: usize,
+    ) {
+        if lines == 0 {
+            return;
+        }
+        let bucket = self.bucket();
+        let mut tasks = self.tasks.borrow_mut();
+        let entry = tasks
+            .entry((env.clone(), name.to_string()))
+            .or_insert_with(|| taste_core::activity::Series::new(bucket));
+        for _ in 0..lines.min(u16::MAX as usize) {
+            entry.record(bucket);
+        }
+    }
+
+    /// The last five minutes of `env`'s task `name`'s output, oldest first.
+    pub fn task_samples(
+        &self,
+        env: &taste_core::environment::EnvironmentId,
+        name: &str,
+    ) -> [taste_core::activity::Count; taste_core::activity::BUCKETS] {
+        let bucket = self.bucket();
+        self.tasks
+            .borrow()
+            .get(&(env.clone(), name.to_string()))
             .map(|series| series.samples(bucket))
             .unwrap_or([0; taste_core::activity::BUCKETS])
     }
