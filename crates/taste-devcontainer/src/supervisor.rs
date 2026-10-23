@@ -675,6 +675,13 @@ pub struct Supervisor {
     /// A ref moved in the checkout in the VM — a commit, by whoever made
     /// it — and a snapshot is due once the writes settle.
     snapshot_pending: Arc<AtomicBool>,
+    /// The primary's changes on either side — its checkout's working tree
+    /// or refs, the folder's working tree — counted as the watchers see
+    /// them, and the count a snapshot and a sync that both succeeded had
+    /// seen when they began ([`Supervisor::folder_in_step`]). `u64::MAX`
+    /// until the first such pass: what came before it is not known.
+    folder_changes: Arc<AtomicU64>,
+    folder_settled: Arc<AtomicU64>,
     /// The ssh process forwarding a remote container's published ports to
     /// this host's loopback, while the container runs.
     tunnel: Mutex<Option<std::process::Child>>,
@@ -962,6 +969,8 @@ impl Supervisor {
             panes_watching: Arc::new(AtomicBool::new(env_is_primary)),
             recheck_pending: Arc::new(AtomicBool::new(false)),
             snapshot_pending: Arc::new(AtomicBool::new(false)),
+            folder_changes: Arc::new(AtomicU64::new(0)),
+            folder_settled: Arc::new(AtomicU64::new(u64::MAX)),
             tunnel: Mutex::new(None),
             advertised: Mutex::new(None),
             inside,
@@ -1257,6 +1266,7 @@ impl Supervisor {
         let weak = Arc::downgrade(self);
         let pending = self.recheck_pending.clone();
         let snapshot_pending = self.snapshot_pending.clone();
+        let folder_changes = self.folder_changes.clone();
         // When the working tree or a ref last changed: the snapshot waits
         // for the checkout to be quiet.
         let last_change = Arc::new(Mutex::new(std::time::Instant::now()));
@@ -1314,6 +1324,9 @@ impl Supervisor {
             }
             if ref_moved || worktree_changed {
                 *last_change.lock().unwrap() = std::time::Instant::now();
+                if primary {
+                    folder_changes.fetch_add(1, Ordering::SeqCst);
+                }
             }
             if (ref_moved || worktree_changed) && !snapshot_pending.swap(true, Ordering::SeqCst) {
                 let weak = weak.clone();
@@ -1340,6 +1353,7 @@ impl Supervisor {
                     }
                     snapshot_pending.store(false, Ordering::SeqCst);
                     if let Some(supervisor) = weak.upgrade() {
+                        let seen = supervisor.folder_changes.load(Ordering::SeqCst);
                         let mut snapshot = supervisor.snapshot_blocking();
                         if let Err(e) = &snapshot {
                             tracing::warn!("snapshot after a ref moved in the VM: {e:#}");
@@ -1353,6 +1367,9 @@ impl Supervisor {
                         // failed on: tried again before it is said.
                         if snapshot.is_err() && synced.is_ok() {
                             snapshot = supervisor.snapshot_blocking();
+                        }
+                        if primary && snapshot.is_ok() && synced.is_ok() {
+                            supervisor.folder_settled.store(seen, Ordering::SeqCst);
                         }
                         // Said where the user looks, not only in the log:
                         // without a snapshot the folder cannot follow, and
@@ -1921,6 +1938,7 @@ impl Supervisor {
         let root = folder.clone();
         let events = self.events.clone();
         let transfers = self.transfers.clone();
+        let folder_changes = self.folder_changes.clone();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else { return };
             if matches!(event.kind, notify::EventKind::Access(_)) {
@@ -1956,6 +1974,7 @@ impl Supervisor {
             if !relevant {
                 return;
             }
+            folder_changes.fetch_add(1, Ordering::SeqCst);
             *last.lock().unwrap() = std::time::Instant::now();
             if pending.swap(true, Ordering::SeqCst) {
                 return;
@@ -1975,8 +1994,13 @@ impl Supervisor {
                 }
                 pending.store(false, Ordering::SeqCst);
                 if let Some(supervisor) = weak.upgrade() {
-                    if let Err(e) = supervisor.sync_peer_blocking() {
-                        tracing::warn!("sync after a change in your folder: {e:#}");
+                    let seen = supervisor.folder_changes.load(Ordering::SeqCst);
+                    // The folder's change, sent into the checkout, is a
+                    // change there too: its watcher counts it, and the
+                    // snapshot that follows settles it.
+                    match supervisor.sync_peer_blocking() {
+                        Ok(()) => supervisor.folder_settled.store(seen, Ordering::SeqCst),
+                        Err(e) => tracing::warn!("sync after a change in your folder: {e:#}"),
                     }
                 }
             });
@@ -1992,6 +2016,17 @@ impl Supervisor {
             },
             Err(e) => tracing::warn!("watching {}: {e}", folder.display()),
         }
+    }
+
+    /// Whether Personal's checkout and the folder are known to be in step,
+    /// with a snapshot of the checkout as it stands: no change either
+    /// watcher saw since a snapshot and a sync that both succeeded began,
+    /// and no conflict between them waiting. What lets a close skip both
+    /// rather than make them again (David, 2026-10-22: "Exiting the IDE
+    /// should be basically instant if things are already synced").
+    pub fn folder_in_step(&self) -> bool {
+        self.folder_settled.load(Ordering::SeqCst) == self.folder_changes.load(Ordering::SeqCst)
+            && self.folder_conflicts().is_empty()
     }
 
     /// The paths the folder and the checkout both changed, differently,

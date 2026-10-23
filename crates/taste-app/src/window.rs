@@ -65,6 +65,10 @@ fn window_title(root: &Path) -> String {
     }
 }
 
+/// How long a close goes before its page takes over the window: one with
+/// nothing to do is done sooner, and never shows it.
+const CLOSE_PAGE_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// The longest a close waits for a move under way to finish.
 const MOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
@@ -5225,7 +5229,38 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 remote,
                 !moving.is_empty(),
             );
-            window.set_content(Some(&page.widget));
+            // The page only for a close that takes a while: one with
+            // nothing to do is over before it would have been read, and
+            // went by as a flash and a pause (David, 2026-10-22: "Exiting
+            // the IDE should be basically instant if things are already
+            // synced").
+            let shown = Rc::new(Cell::new(false));
+            {
+                let (shown, done, window, widget) = (
+                    shown.clone(),
+                    done.clone(),
+                    window.clone(),
+                    page.widget.clone(),
+                );
+                glib::timeout_add_local_once(CLOSE_PAGE_AFTER, move || {
+                    if !done.get() {
+                        window.set_content(Some(&widget));
+                        shown.set(true);
+                    }
+                });
+            }
+            // When each step took, said once at the end: a close that was
+            // slow says which step it was.
+            let started = std::time::Instant::now();
+            let timings: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+            let lap = {
+                let (timings, last) = (timings.clone(), Rc::new(Cell::new(started)));
+                move |step: &str| {
+                    let now = std::time::Instant::now();
+                    let took = now.duration_since(last.replace(now)).as_millis();
+                    timings.borrow_mut().push(format!("{step} {took} ms"));
+                }
+            };
             page.begin(crate::closing::Step::Save, None);
             page.begin(crate::closing::Step::StopVms, None);
             // "Close Now": what is still to do is skipped. The save is
@@ -5335,6 +5370,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
                 }
                 saved.set(true);
+                lap("save");
                 if !moving.is_empty() && !skip.get() {
                     let names = moving
                         .iter()
@@ -5360,8 +5396,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         }
                         glib::timeout_future(std::time::Duration::from_secs(1)).await;
                     }
+                    lap("move");
                 }
-                if remote && !skip.get() {
+                // In step already — no change on either side since a
+                // snapshot and a sync that both succeeded — the close makes
+                // neither again.
+                let in_step = remote && supervisor.folder_in_step();
+                if in_step && !skip.get() {
+                    page.finish(Step::Snapshot, "Already kept");
+                    page.finish(Step::Sync, "Already up to date");
+                    timings
+                        .borrow_mut()
+                        .push("snapshot and sync skipped, in step".into());
+                }
+                if remote && !skip.get() && !in_step {
                     // One budget for both, so a VM that does not answer
                     // cannot hold the window open longer than it did
                     // before these were two steps.
@@ -5375,7 +5423,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             tokio::task::spawn_blocking(move || snapshotting.snapshot_blocking());
                         tokio::time::timeout(left(), work).await
                     });
-                    match snapshot.await {
+                    let snapshot = snapshot.await;
+                    lap("snapshot");
+                    match snapshot {
                         Ok(Ok(Ok(Ok(Some(_))))) => {
                             page.finish(Step::Snapshot, "Kept as a snapshot of Personal")
                         }
@@ -5396,7 +5446,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             });
                             tokio::time::timeout(left(), work).await
                         });
-                        match sync.await {
+                        let sync = sync.await;
+                        lap("sync");
+                        match sync {
                             Ok(Ok(Ok(Ok(())))) => {
                                 page.finish(Step::Sync, "Your folder is up to date")
                             }
@@ -5415,13 +5467,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             }
                         }
                     }
-                    // Last, with the folder as up to date as it gets: each
-                    // VM is looked at with its containers stopped, and one
-                    // holding nothing this machine lacks is marked, so any
-                    // IDE short of disk may clear it rather than refuse a
-                    // VM (David, 2026-10-11). Its own budget; a VM not
-                    // looked at in it is simply left unmarked.
-                    if !skip.get() {
+                }
+                // Last, with the folder as up to date as it gets — in step
+                // already, or brought there above: each VM is looked at,
+                // and one holding nothing this machine lacks is marked, so
+                // any IDE short of disk may clear it rather than refuse a
+                // VM (David, 2026-10-11). Its own budget; a VM not looked
+                // at in it is simply left unmarked.
+                if remote && !skip.get() {
+                    {
                         page.begin(Step::Mark, None);
                         let root = root_for_mark.clone();
                         let marking = crate::runtime::runtime().spawn(async move {
@@ -5445,12 +5499,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                 "Did not finish in time — the VMs' disks are kept",
                             ),
                         }
+                        lap("mark");
                     }
                 }
+                taste_core::app_log::push(
+                    "info",
+                    "close",
+                    &format!(
+                        "closed in {} ms: {}",
+                        started.elapsed().as_millis(),
+                        timings.borrow().join(", ")
+                    ),
+                );
                 if !done.get() {
                     // A moment on the finished list, so the close is seen
-                    // to have finished rather than to have vanished.
-                    glib::timeout_future(std::time::Duration::from_millis(600)).await;
+                    // to have finished rather than to have vanished — when
+                    // it was seen at all.
+                    if shown.get() {
+                        glib::timeout_future(std::time::Duration::from_millis(600)).await;
+                    }
                     done.set(true);
                     window.close();
                 }
