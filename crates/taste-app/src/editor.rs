@@ -1452,7 +1452,19 @@ impl Editor {
                     selected.as_ref() == Some(&page),
                 );
                 pages.push((page, path));
-            } else if let Some((key, _)) = self.surface_by_tab(&page) {
+            } else if let Some((key, surface)) = self.surface_by_tab(&page) {
+                // The startup page is the window's, not the environment's:
+                // the window decides which start it shows and hides it
+                // (`show_startup`). Stowed with the environment left, it
+                // went out of the strip the moment a new environment's
+                // panes took over, every bring-forward after failed
+                // against a tab in no strip, and the close at the end
+                // failed too, leaving it pinned among Personal's tabs
+                // (2026-10-23: "a bunch of flickering in the center/top of
+                // the IDE when I start a non-personal env").
+                if matches!(surface.kind, SurfaceKind::Startup(_)) {
+                    continue;
+                }
                 // A log or a port goes with its environment's files; its
                 // own scroll is its own business (a following log is at
                 // its end whenever it is looked at).
@@ -2380,6 +2392,7 @@ impl Editor {
     /// view/editing panel/region, disabling but not hiding the tab bar").
     pub fn show_startup(self: &Rc<Self>, page: Rc<crate::startup::StartupPage>) {
         if let Some(tab) = self.startup_tab.borrow().clone() {
+            self.bring_into_strip(&tab);
             self.tabs.set_selected_page(&tab);
             return;
         }
@@ -2423,9 +2436,39 @@ impl Editor {
         self.surfaces
             .borrow_mut()
             .remove(&PathBuf::from(STARTUP_KEY));
+        self.bring_into_strip(&tab);
         self.tabs.set_page_pinned(&tab, false);
         self.tabs.close_page(&tab);
         self.sync_toggle_to_selection();
+    }
+
+    /// Whether `tab` is in the strip on screen, rather than stowed with an
+    /// environment or gone.
+    fn in_strip(&self, tab: &adw::TabPage) -> bool {
+        (0..self.tabs.n_pages()).any(|index| self.tabs.nth_page(index) == *tab)
+    }
+
+    /// Put `tab` back in the strip, first, from the environment it was
+    /// stowed with — a startup tab a build before `aim_at` passed it over
+    /// carried off — and out of that environment's record of its tabs.
+    fn bring_into_strip(&self, tab: &adw::TabPage) {
+        if self.in_strip(tab) {
+            return;
+        }
+        let key = self.surface_by_tab(tab).map(|(key, _)| key);
+        let mut stowed = self.stowed.borrow_mut();
+        for (holding, record) in stowed.values_mut() {
+            if (0..holding.n_pages()).any(|index| holding.nth_page(index) == *tab) {
+                holding.transfer_page(tab, &self.tabs, 0);
+                if let Some(key) = &key {
+                    record.order.retain(|path| path != key);
+                    if record.selected.as_ref() == Some(key) {
+                        record.selected = None;
+                    }
+                }
+                return;
+            }
+        }
     }
 
     pub fn open_log(
@@ -5383,6 +5426,32 @@ mod tests {
     /// A tab the folder could not hold — an ignored file, only in the
     /// checkout — opens once the checkout has arrived, and in front when
     /// it was; and one handed over after the checkout moved opens at once.
+    #[test]
+    fn the_startup_page_stays_in_the_strip_when_the_panes_move() {
+        crate::gtk_test::on_gtk_thread("startup strip: no display — skipped", || {
+            let dir = std::env::temp_dir().join(format!("taste-startup-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::languages::register();
+            let editor = super::Editor::new(taste_core::Workspace::open(dir.clone()));
+            let env = taste_core::environment::EnvironmentId::parse("i-start").unwrap();
+            // A new environment's start, in front, and then its panes.
+            editor.show_startup(crate::startup::StartupPage::new());
+            let tab = editor.startup_tab.borrow().clone().unwrap();
+            editor.aim_at(&env);
+            assert!(editor.in_strip(&tab), "the start went with Personal's tabs");
+            editor.show_startup(crate::startup::StartupPage::new());
+            assert_eq!(editor.tabs.selected_page().as_ref(), Some(&tab));
+            // Back to Personal, and the start over: gone from every strip.
+            editor.aim_at(&taste_core::environment::EnvironmentId::primary());
+            assert!(editor.in_strip(&tab));
+            editor.hide_startup();
+            assert!(!editor.in_strip(&tab));
+            assert!(editor.surfaces.borrow().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     #[test]
     fn a_tab_the_folder_lacks_opens_when_the_checkout_arrives() {
         crate::gtk_test::on_gtk_thread("await_checkout: no display — skipped", || {
