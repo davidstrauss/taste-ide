@@ -385,6 +385,52 @@ impl Model {
         }
     }
 
+    /// Answer `id` taken back out when it is the agent's own report of its
+    /// request to the API cut off — "API Error: Connection lost
+    /// mid-response…" — and what cut it was a rebuild: the environment mid-
+    /// rebuild as it arrived, or the step before it the rebuild call, which
+    /// is how a restored conversation reads the same moment. The agent's
+    /// container went with the rebuild, so its connection did too, and the
+    /// IDE's note says that (David, 2026-10-22: "This error shouldn't show
+    /// if it's expected from a container rebuild"). The timeline is
+    /// rejoined as it was before the answer came.
+    fn withdraw_lost_connection(&mut self, id: RowId, in_transition: bool) {
+        let Some(&at) = self.index.get(&id) else {
+            return;
+        };
+        let row = &self.rows[at];
+        let Kind::Answer(answer) = &row.kind else {
+            return;
+        };
+        let text = answer.text.trim_start();
+        if !(text.starts_with("API Error:") && text.to_ascii_lowercase().contains("connection")) {
+            return;
+        }
+        let rail = row.rail.unwrap_or_default();
+        let before = self.rows[..at].iter().rev().find(|row| row.rail.is_some());
+        let after_rebuild = matches!(
+            before.map(|row| &row.kind),
+            Some(Kind::Step(step))
+                if mcp_tool_name(&step.title).as_deref() == Some("devcontainer_reload")
+        );
+        if !(in_transition || after_rebuild) {
+            return;
+        }
+        let previous = before
+            .map(|row| row.id)
+            .filter(|_| rail.top && !rail.after_prompt);
+        self.remove(id);
+        self.answer = None;
+        self.after_prompt = rail.after_prompt;
+        if let Some(previous) = previous {
+            if let Some(rail) = self.row_mut(previous).and_then(|row| row.rail.as_mut()) {
+                rail.bottom = false;
+            }
+            self.changed(previous);
+            self.last_step = Some(previous);
+        }
+    }
+
     /// A row on the timeline: its line runs up from the step before, or
     /// across the gap from a prompt above, and the step before's runs down
     /// to it.
@@ -564,6 +610,7 @@ impl Model {
                         answer.text.push_str(&text);
                     }
                     self.changed(id);
+                    self.withdraw_lost_connection(id, in_transition);
                 }
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
@@ -1666,6 +1713,56 @@ mod tests {
         let mut call = ToolCall::new(id.to_string(), format!("Read {id}.rs"));
         call.status = ToolCallStatus::Completed;
         Record::update(SessionUpdate::ToolCall(call))
+    }
+
+    /// The agent's report of its API connection cut off goes when a
+    /// rebuild cut it — the call before it a rebuild, or the environment
+    /// mid-rebuild — and the rebuild's line ends at its dot again; the
+    /// same words anywhere else, and the agent's other words after a
+    /// rebuild, stay.
+    #[test]
+    fn a_connection_a_rebuild_cut_is_not_reported_as_an_error() {
+        const LOST: &str =
+            "API Error: Connection lost mid-response. The response above may be incomplete.";
+        let rebuild = || {
+            let mut call = ToolCall::new("r1", "mcp__taste-ide__devcontainer_reload");
+            call.status = ToolCallStatus::Completed;
+            SessionUpdate::ToolCall(call)
+        };
+        let answers = |model: &Model| {
+            model
+                .rows()
+                .iter()
+                .filter(|row| matches!(row.kind, Kind::Answer(_)))
+                .count()
+        };
+
+        let mut model = Model::default();
+        model.apply(rebuild(), false);
+        model.apply(SessionUpdate::AgentMessageChunk(text(LOST)), false);
+        assert_eq!(answers(&model), 0, "{:?}", shape(&model));
+        assert_eq!(model.rows()[0].rail.map(|rail| rail.bottom), Some(false));
+        model.note("the agent stopped with its container");
+        assert_eq!(model.rows()[0].rail.map(|rail| rail.bottom), Some(true));
+
+        let mut model = Model::default();
+        model.apply(rebuild(), false);
+        model.apply(
+            SessionUpdate::AgentMessageChunk(text("Rebuilding now.")),
+            false,
+        );
+        assert_eq!(answers(&model), 1);
+
+        let mut model = Model::default();
+        let Record::Update(read) = step("a1") else {
+            unreachable!()
+        };
+        model.apply(*read, false);
+        model.apply(SessionUpdate::AgentMessageChunk(text(LOST)), false);
+        assert_eq!(answers(&model), 1);
+        let mut model = Model::default();
+        model.apply(SessionUpdate::AgentMessageChunk(text(LOST)), true);
+        assert_eq!(answers(&model), 0);
     }
 
     fn taken(prompt: &str, waited: Option<&str>) -> Record {
