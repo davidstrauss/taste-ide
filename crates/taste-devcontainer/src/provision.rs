@@ -2124,6 +2124,28 @@ pub(crate) async fn register_connection(vm: &Vm, sandboxed: bool) -> Result<()> 
     }
     let podman = PodmanTarget::local(sandboxed);
 
+    // One already as it would be made is left alone. Replaced, it was gone
+    // between the remove and the add, and a build started in that moment
+    // was refused (`connection … not found`) and the project's config
+    // passed over for the baseline, on a VM that had been up for a minute
+    // (2026-10-22: a second wait on a running VM re-registering it).
+    let (program, args) = podman.argv(["system", "connection", "list", "--format", "json"]);
+    if let Ok(listed) = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        if connection_matches(
+            &listed.stdout,
+            &vm.domain,
+            &vm.podman_uri(),
+            &keys.identity(),
+        ) {
+            return Ok(());
+        }
+    }
+
     let (program, args) = podman.argv(["system", "connection", "remove", &vm.domain]);
     let _ = tokio::process::Command::new(program)
         .args(args)
@@ -2155,8 +2177,57 @@ pub(crate) async fn register_connection(vm: &Vm, sandboxed: bool) -> Result<()> 
     Ok(())
 }
 
+/// Whether `podman system connection list --format json` has `name` at
+/// `uri` with `identity` — the connection [`register_connection`] would
+/// make.
+fn connection_matches(listed: &[u8], name: &str, uri: &str, identity: &Path) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Connection {
+        name: String,
+        #[serde(rename = "URI")]
+        uri: String,
+        #[serde(default)]
+        identity: String,
+    }
+    serde_json::from_slice::<Vec<Connection>>(listed).is_ok_and(|connections| {
+        connections
+            .iter()
+            .any(|c| c.name == name && c.uri == uri && Path::new(&c.identity) == identity)
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    /// A connection already as it would be made is recognised; one at
+    /// another port, or with another key, is not.
+    #[test]
+    fn a_connection_already_right_is_recognised() {
+        let listed = br#"[{"Name":"taste-a-b","URI":"ssh://core@127.0.0.1:4000/run/user/1000/podman/podman.sock","Identity":"/k/id","Default":false,"ReadWrite":true}]"#;
+        let uri = "ssh://core@127.0.0.1:4000/run/user/1000/podman/podman.sock";
+        let key = std::path::Path::new("/k/id");
+        assert!(super::connection_matches(listed, "taste-a-b", uri, key));
+        assert!(!super::connection_matches(
+            listed,
+            "taste-a-b",
+            "ssh://core@127.0.0.1:4001/run/user/1000/podman/podman.sock",
+            key
+        ));
+        assert!(!super::connection_matches(
+            listed,
+            "taste-a-b",
+            uri,
+            std::path::Path::new("/k/other")
+        ));
+        assert!(!super::connection_matches(listed, "taste-a-c", uri, key));
+        assert!(!super::connection_matches(
+            b"not json",
+            "taste-a-b",
+            uri,
+            key
+        ));
+    }
+
     #[test]
     fn a_failed_command_says_what_and_why_on_one_line() {
         let args: Vec<String> = ["-c", "qemu:///session", "define", "/x.xml"]
