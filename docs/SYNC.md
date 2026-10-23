@@ -200,6 +200,22 @@ removals emptied stayed in the checkout until 096b680 (P11).
   directory at one path made a conflict instead (P12).
 - **Both directions in one pass.** The folder's changes no longer go out
   first in a pass of their own, with the checkout's waiting for the next.
+- **After a clean shutdown, the folder wins.** A VM brought back up while
+  shut off and still marked disposable — its window's close found nothing
+  on it this machine lacked, and the re-check just before it went down
+  found nothing moved since (`disposable`) — cannot have changed since the
+  two last agreed, so whatever differs was done on the folder's side: a
+  history rewritten, a fresh clone, a branch switched, files edited. Before
+  the first pass, Personal takes the folder whole — its branches (the
+  IDE's `agents/*` aside, and a branch the folder lacks deleted), HEAD and
+  its commit, and the working copy less what is ignored — with its old tip
+  kept at `refs/taste/kept/before-folder-*`
+  (`peer::give_checkout_the_folder`). The first pass then finds the two in
+  step. Without it, a folder cloned afresh had no archive to measure from,
+  and its rewritten history stood as a divergence for the person to settle
+  (David, 2026-10-22: "any changes since the VM's clean shutdown should
+  clearly win"). A VM that was still running, or went down without the
+  re-check, keeps the rules above.
 
 **What remains.** Between the second check and the rename is a window of
 a system call or two; a write landing in it is lost. Unison has the same

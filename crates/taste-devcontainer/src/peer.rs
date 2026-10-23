@@ -2325,6 +2325,207 @@ fn switch_checkout(
 /// the VM computing the same id over the same files means the two trees
 /// hold the same work. `None` for a folder git cannot read that way, which
 /// costs only the shortcut it feeds.
+/// Where the folder's branches land in the checkout while
+/// [`give_checkout_the_folder`] makes them Personal's; deleted after.
+const FOLDER_WINS_STAGING: &str = "refs/taste/folder-wins";
+
+/// Whether Personal already is the folder: on the same branch (or the same
+/// detached commit), at the same tip, with the same working tree. Exit 0
+/// when it is, 1 when it is not. Arguments: the branch (empty for a
+/// detached folder), the tip, and the folder's working-tree id.
+const SAME_AS_FOLDER_SCRIPT: &str = r#"set -u
+branch="$1"; tip="$2"; tree="$3"
+here=$(git symbolic-ref -q HEAD || true)
+[ "$here" = "${branch:+refs/heads/$branch}" ] || exit 1
+[ "$(git rev-parse -q --verify HEAD)" = "$tip" ] || exit 1
+index=$(mktemp "$(git rev-parse --git-dir)/taste-same-index.XXXXXX")
+GIT_INDEX_FILE="$index" git read-tree HEAD
+GIT_INDEX_FILE="$index" git add -A
+mine=$(GIT_INDEX_FILE="$index" git write-tree)
+rm -f "$index"
+[ "$mine" = "$tree" ]
+"#;
+
+/// Make Personal the folder's, whatever it was: the folder's branches at
+/// `$FOLDER_WINS_STAGING/heads/*` become its branches — every one but the
+/// IDE's own `agents/*`, which the environments publish, and a branch the
+/// folder does not have is deleted — and HEAD, the index, and the files
+/// go to the folder's branch (`$1`, or the detached commit `$2` when that
+/// is empty), with untracked files the folder's ignore rules do not keep
+/// removed. What Personal's HEAD was is kept at `$3`. A merge, rebase, or
+/// pick under way is the folder's to replace too.
+const FOLDER_WINS_SCRIPT: &str = r#"set -eu
+branch="$1"; tip="$2"; kept="$3"
+staged="refs/taste/folder-wins/heads"
+old=$(git rev-parse -q --verify HEAD || true)
+[ -z "$old" ] || git update-ref "$kept" "$old"
+gitdir=$(git rev-parse --git-dir)
+rm -rf "$gitdir/rebase-merge" "$gitdir/rebase-apply"
+rm -f "$gitdir/MERGE_HEAD" "$gitdir/MERGE_MSG" "$gitdir/CHERRY_PICK_HEAD" "$gitdir/REVERT_HEAD"
+if [ -n "$branch" ]; then
+  git checkout -q -f -B "$branch" "$staged/$branch"
+else
+  git checkout -q -f --detach "$tip"
+fi
+git clean -q -fd
+git for-each-ref --format='%(refname:strip=2)' refs/heads | while IFS= read -r b; do
+  case "$b" in agents/*) continue ;; esac
+  [ "$b" = "$branch" ] && continue
+  if git rev-parse -q --verify "$staged/$b" >/dev/null; then
+    git update-ref "refs/heads/$b" "$staged/$b"
+  else
+    git update-ref -d "refs/heads/$b"
+  fi
+done
+git for-each-ref --format='%(refname)' "$staged" | while IFS= read -r ref; do
+  b=${ref#"$staged/"}
+  git rev-parse -q --verify "refs/heads/$b" >/dev/null || git update-ref "refs/heads/$b" "$ref"
+  git update-ref -d "$ref"
+done
+"#;
+
+/// The folder, as it is now, made Personal's: what a VM that shut down
+/// cleanly finds on its return (`disposable::take_clean_return`). Its
+/// window's close found nothing on it this machine lacked, and the re-check
+/// before it went down found nothing moved since — so everything that
+/// differs now was done on this side, after: a history rewritten, a fresh
+/// clone, a branch switched, files edited. That wins outright, rather than
+/// standing as a divergence for the person to settle (David, 2026-10-22:
+/// "give strict preference to the local git and working copy if
+/// reconnecting to a VM that had a clean shutdown … any changes since the
+/// VM's clean shutdown should clearly win").
+///
+/// The branches, the checked-out one and its commit, and the working copy
+/// — less what is ignored, which is the checkout's own build output and
+/// stays. Personal's old tip is kept at `refs/taste/kept/before-folder-*`.
+/// `None` when Personal already is the folder, or the folder has no commit
+/// to give; otherwise what was done, in words.
+pub fn give_checkout_the_folder(
+    peer: &Path,
+    vm: &Vm,
+    keys: &Keys,
+    files: &Files,
+    path: &Path,
+    say: Say,
+) -> Result<Option<String>> {
+    use taste_git::mirror::Head;
+    let git = taste_git::GitWorkspace::discover(peer)
+        .with_context(|| format!("{} is not a git working tree", peer.display()))?;
+    let Some(head) = git.checked_out() else {
+        return Ok(None);
+    };
+    let (branch, tip) = match &head {
+        Head::Branch(branch) => {
+            let Some(tip) = git.read_ref(&format!("refs/heads/{branch}"))? else {
+                return Ok(None);
+            };
+            (branch.clone(), tip)
+        }
+        Head::Commit(oid) => (String::new(), *oid),
+    };
+    // A private repository's working tree is not compared (`working_tree_id`):
+    // the ordinary sync takes it.
+    let Some(tree) = working_tree_id(peer) else {
+        return Ok(None);
+    };
+    let run = |script: &str, args: &[&str]| {
+        let mut argv = vec![
+            "sh".to_string(),
+            "-c".into(),
+            script.to_string(),
+            "taste-folder-wins".into(),
+        ];
+        argv.extend(args.iter().map(|a| a.to_string()));
+        files.exec(path, &argv)
+    };
+    let tip_hex = tip.to_string();
+    let same = run(SAME_AS_FOLDER_SCRIPT, &[&branch, &tip_hex, &tree])?;
+    if same.success() {
+        return Ok(None);
+    }
+    say("this VM shut down cleanly; making Personal this folder's");
+    // The folder's uncommitted work travels as a snapshot, as a fresh
+    // placement's does; the snapshot it replaces is pinned first.
+    let snapshot_ref =
+        taste_git::snapshot_ref(taste_core::environment::EnvironmentId::primary().as_str());
+    let dirty = !git.status()?.is_empty();
+    if dirty {
+        if let Some(previous) = git.read_ref(&snapshot_ref)? {
+            git.set_ref(
+                &format!("refs/taste/kept/snapshot/primary-{}", now_secs()),
+                previous,
+            )?;
+        }
+        git.snapshot_worktree(&snapshot_ref)?;
+    }
+    let heads = format!("+refs/heads/*:{FOLDER_WINS_STAGING}/heads/*");
+    let detached = format!("+{tip_hex}:{FOLDER_WINS_STAGING}/head");
+    let snapshot = format!("+{snapshot_ref}:{snapshot_ref}");
+    let mut refspecs: Vec<&str> = vec![&heads];
+    if branch.is_empty() {
+        refspecs.push(&detached);
+    }
+    if dirty {
+        refspecs.push(&snapshot);
+    }
+    push_to_guest(peer, vm, keys, path, &refspecs)?;
+    let kept = format!("refs/taste/kept/before-folder-{}", now_secs());
+    let applied = run(FOLDER_WINS_SCRIPT, &[&branch, &tip_hex, &kept])?;
+    let _ = files.exec(
+        path,
+        &[
+            "git".into(),
+            "update-ref".into(),
+            "-d".into(),
+            format!("{FOLDER_WINS_STAGING}/head"),
+        ],
+    );
+    if !applied.success() {
+        bail!(
+            "making Personal this folder's: {}",
+            applied.stderr_utf8().trim()
+        );
+    }
+    // The folder's record of a branch Personal no longer has goes too: the
+    // fetch that follows does not prune, and the sync makes a branch for
+    // every one it finds, so the branch just deleted would come back here.
+    for (name, _) in git.refs_under(VM_BRANCH_NAMESPACE)? {
+        let branch = &name[VM_BRANCH_NAMESPACE.len()..];
+        if !branch.starts_with("agents/")
+            && git.read_ref(&format!("refs/heads/{branch}"))?.is_none()
+        {
+            git.delete_ref(&name)?;
+        }
+    }
+    if dirty {
+        let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;
+        let restored = files.exec(path, &["sh".into(), "-c".into(), restore])?;
+        if !restored.success() {
+            bail!(
+                "putting the folder's uncommitted work in Personal: {}",
+                restored.stderr_utf8().trim()
+            );
+        }
+    }
+    Ok(Some(format!(
+        "Personal was made this folder's — {} at {}{} — since the VM shut down cleanly; its \
+         old tip is kept at {kept}",
+        head.describe(),
+        &tip_hex[..tip_hex.len().min(8)],
+        if dirty {
+            ", with the folder's uncommitted work"
+        } else {
+            ""
+        }
+    )))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 fn working_tree_id(peer: &Path) -> Option<String> {
     if taste_git::private::find_private(peer).is_some() {
         return None;
@@ -2448,6 +2649,128 @@ fn push_ahead_into_checkout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After a clean shutdown the folder wins whole: a Personal on the old
+    /// history, with a branch the folder dropped, an edit, and an untracked
+    /// file, is made the folder's rewritten history — the IDE's `agents/*`
+    /// branch and the ignored build output left — and its old tip kept.
+    #[test]
+    fn the_folder_wins_whole_after_a_clean_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let sh = |cwd: &Path, script: &str, args: &[&str]| {
+            std::process::Command::new("sh")
+                .current_dir(cwd)
+                .arg("-c")
+                .arg(script)
+                .arg("taste-folder-wins")
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+        let personal = dir.path().join("personal");
+        let folder = dir.path().join("folder");
+        std::fs::create_dir_all(&personal).unwrap();
+        git(&personal, &["init", "-q", "-b", "main"]);
+        std::fs::write(personal.join(".gitignore"), "build/\n").unwrap();
+        std::fs::write(personal.join("app.php"), "v1\npii\n").unwrap();
+        git(&personal, &["add", "-A"]);
+        git(&personal, &["commit", "-q", "-m", "import"]);
+        git(&personal, &["branch", "old-only"]);
+        git(&personal, &["branch", "agents/i-1"]);
+        let old = git(&personal, &["rev-parse", "HEAD"]);
+
+        // The folder: the same project rewritten, and a branch of its own.
+        std::fs::create_dir_all(&folder).unwrap();
+        git(&folder, &["init", "-q", "-b", "main"]);
+        std::fs::write(folder.join(".gitignore"), "build/\n").unwrap();
+        std::fs::write(folder.join("app.php"), "v1\n").unwrap();
+        git(&folder, &["add", "-A"]);
+        git(&folder, &["commit", "-q", "-m", "import, cleaned"]);
+        git(&folder, &["branch", "feature"]);
+        let tip = git(&folder, &["rev-parse", "HEAD"]);
+
+        // Personal as a session left it: an edit, an untracked file, and
+        // build output the ignore rules keep.
+        std::fs::write(personal.join("app.php"), "edited\n").unwrap();
+        std::fs::write(personal.join("scratch.txt"), "untracked\n").unwrap();
+        std::fs::create_dir_all(personal.join("build")).unwrap();
+        std::fs::write(personal.join("build/out"), "built\n").unwrap();
+
+        let tree = git(&folder, &["rev-parse", "HEAD^{tree}"]);
+        assert!(
+            !sh(&personal, SAME_AS_FOLDER_SCRIPT, &["main", &tip, &tree])
+                .status
+                .success()
+        );
+
+        // The push, as `give_checkout_the_folder` makes it.
+        git(
+            &personal,
+            &[
+                "fetch",
+                "-q",
+                folder.to_str().unwrap(),
+                &format!("+refs/heads/*:{FOLDER_WINS_STAGING}/heads/*"),
+            ],
+        );
+        let applied = sh(
+            &personal,
+            FOLDER_WINS_SCRIPT,
+            &["main", &tip, "refs/taste/kept/before-folder-1"],
+        );
+        assert!(
+            applied.status.success(),
+            "{}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+
+        assert_eq!(git(&personal, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(git(&personal, &["rev-parse", "main"]), tip);
+        assert_eq!(git(&personal, &["rev-parse", "feature"]), tip);
+        assert_eq!(
+            git(&personal, &["rev-parse", "refs/taste/kept/before-folder-1"]),
+            old
+        );
+        let branches = git(&personal, &["branch", "--format=%(refname:short)"]);
+        assert!(!branches.contains("old-only"), "{branches}");
+        assert!(branches.contains("agents/i-1"), "{branches}");
+        assert_eq!(
+            git(&personal, &["for-each-ref", FOLDER_WINS_STAGING]),
+            "",
+            "the staging is cleared"
+        );
+        assert_eq!(
+            std::fs::read_to_string(personal.join("app.php")).unwrap(),
+            "v1\n"
+        );
+        assert!(!personal.join("scratch.txt").exists());
+        assert!(personal.join("build/out").exists(), "ignored output stays");
+        assert_eq!(git(&personal, &["status", "--porcelain"]), "");
+        assert!(sh(&personal, SAME_AS_FOLDER_SCRIPT, &["main", &tip, &tree])
+            .status
+            .success());
+    }
 
     /// A repository fresh from `git init` has nothing for the seed's
     /// patterns to match, and git refuses such a push outright; it is

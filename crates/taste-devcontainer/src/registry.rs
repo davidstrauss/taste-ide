@@ -1829,6 +1829,19 @@ impl EnvironmentRegistry {
             // Each phase, and git's progress through the slow ones, is the
             // step's detail while it runs.
             let say = |line: &str| self.progress_vm(&vm.domain, format!("syncing: {line}"));
+            // Back from a clean shutdown: what the folder holds now was
+            // done since, and Personal takes it whole before the ordinary
+            // sync, which then finds the two in step.
+            if crate::disposable::take_clean_return(&vm.domain) {
+                match crate::peer::give_checkout_the_folder(&peer, vm, &keys, &files, &path, &say) {
+                    Ok(Some(done)) => self.note_vm(&vm.domain, done),
+                    Ok(None) => {}
+                    Err(e) => self.note_vm(
+                        &vm.domain,
+                        format!("the folder could not be made Personal's: {e:#}"),
+                    ),
+                }
+            }
             let sync = crate::peer::sync_primary_peer(&peer, vm, &keys, &files, &path, &say)?;
             self.note_vm(
                 &vm.domain,
