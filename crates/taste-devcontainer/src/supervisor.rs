@@ -4574,6 +4574,7 @@ impl Supervisor {
     /// answer the IDE already knows. Never fatal: a container without
     /// git installed must still start.
     async fn inherit_git_identity(&self, name: &str, user: Option<&str>) {
+        self.carry_repo_identity(name, user).await;
         let Some(identity) = taste_git::host_identity() else {
             return; // nothing to inherit — the host is equally anonymous
         };
@@ -4608,6 +4609,62 @@ impl Supervisor {
         }
         self.log(format!(
             "git identity inherited from host: {} <{}>",
+            identity.name, identity.email
+        ));
+    }
+
+    /// The author the project's own repository sets — `user.name` and
+    /// `user.email` in the folder's `.git/config` — written into this
+    /// environment's checkout as its own, on every start. The primary's
+    /// checkout was given it when it was placed; an agent environment's
+    /// was made by a push into an empty repository, which carries no
+    /// config, so its commits fell to the container's global identity —
+    /// the host's — and went out under the user's name in a project that
+    /// commits under another (David, 2026-10-23: "The repo's configured git
+    /// author should carry into non-personal envs"). On every start rather
+    /// than at the clone, so environments made before this, and a change
+    /// to the folder's author since, are carried too. Never fatal.
+    async fn carry_repo_identity(&self, name: &str, user: Option<&str>) {
+        let Some(identity) = taste_git::repo_identity(self.workspace_root()) else {
+            return;
+        };
+        let checkout = self.checkout().path().display().to_string();
+        let exec = |tail: &[&str]| {
+            let mut args: Vec<String> = vec!["exec".into()];
+            if let Some(user) = user {
+                args.push("--user".into());
+                args.push(user.to_string());
+            }
+            args.push(name.to_string());
+            args.extend(["git".to_string(), "-C".into(), checkout.clone()]);
+            args.extend(tail.iter().map(|s| s.to_string()));
+            args
+        };
+        let current = (
+            self.run_captured(exec(&["config", "--local", "--get", "user.name"]))
+                .await
+                .unwrap_or_default(),
+            self.run_captured(exec(&["config", "--local", "--get", "user.email"]))
+                .await
+                .unwrap_or_default(),
+        );
+        if current.0.trim() == identity.name && current.1.trim() == identity.email {
+            return;
+        }
+        for (key, value) in [
+            ("user.name", &identity.name),
+            ("user.email", &identity.email),
+        ] {
+            if let Err(e) = self
+                .run_captured(exec(&["config", "--local", key, value]))
+                .await
+            {
+                self.log(format!("the project's git author not carried ({key}): {e}"));
+                return;
+            }
+        }
+        self.log(format!(
+            "the project's git author carried into the checkout: {} <{}>",
             identity.name, identity.email
         ));
     }

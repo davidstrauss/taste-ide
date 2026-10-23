@@ -83,6 +83,23 @@ pub fn starter_identity() -> String {
     format!("{who}@{host}")
 }
 
+/// The identity the repository at `root` sets for itself — `user.name` and
+/// `user.email` in its own config, not the user's global one — when it
+/// sets both: a project committed to under a name of its own.
+pub fn repo_identity(root: &Path) -> Option<GitIdentity> {
+    let repo = git2::Repository::open(root).ok()?;
+    let config = repo
+        .config()
+        .ok()?
+        .open_level(git2::ConfigLevel::Local)
+        .ok()?
+        .snapshot()
+        .ok()?;
+    let name = config.get_string("user.name").ok()?;
+    let email = config.get_string("user.email").ok()?;
+    (!name.trim().is_empty() && !email.trim().is_empty()).then_some(GitIdentity { name, email })
+}
+
 pub fn host_identity() -> Option<GitIdentity> {
     let config = git2::Config::open_default().ok()?.snapshot().ok()?;
     let name = config.get_string("user.name").ok()?;
@@ -93,6 +110,34 @@ pub fn host_identity() -> Option<GitIdentity> {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    /// The repository's own author, both halves of it, or nothing — never
+    /// the user's global one, which the container is given another way.
+    #[test]
+    fn a_repository_names_its_own_author() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut config = repo
+            .config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap();
+        assert_eq!(repo_identity(dir.path()), None);
+        config.set_str("user.name", "tellmeyourstories").unwrap();
+        assert_eq!(
+            repo_identity(dir.path()),
+            None,
+            "a name alone is not an author"
+        );
+        config.set_str("user.email", "t@example.org").unwrap();
+        assert_eq!(
+            repo_identity(dir.path()),
+            Some(GitIdentity {
+                name: "tellmeyourstories".into(),
+                email: "t@example.org".into()
+            })
+        );
+    }
 
     /// Ignored: rewrites HOME, which races parallel tests. Run alone:
     /// `cargo test -p taste-git -- --ignored`.
