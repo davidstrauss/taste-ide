@@ -2111,6 +2111,10 @@ impl EnvironmentRegistry {
         // VM").
         let baseline = crate::baseline::ensure_baseline_config()?;
         let building = !crate::image::image_exists(&substrate, &baseline);
+        // An earlier VM of this workspace left a copy of the image on this
+        // machine (`image::ensure_image_kept`): loaded, not built.
+        let key = environment::workspace_key(&self.workspace_root);
+        let loading = building && crate::image::has_kept_copy(&baseline, &key);
         // The primary's VM is the one the startup page is about.
         let primarys = self
             .substrate()
@@ -2118,16 +2122,31 @@ impl EnvironmentRegistry {
             .map(|v| v.domain.as_str() == vm.domain)
             == Some(true);
         if building && primarys {
-            self.primary()
-                .announce_preparing("building the files service image (once per VM)");
+            self.primary().announce_preparing(if loading {
+                "loading the files service image an earlier VM built"
+            } else {
+                "building the files service image (once per VM)"
+            });
         }
-        if building {
+        if loading {
+            self.note_vm(
+                &vm.domain,
+                "loading the files service image from this machine's copy, saved by an earlier VM \
+                 of this workspace",
+            );
+        } else if building {
             self.note_vm(
                 &vm.domain,
                 "building the files service image in the guest — once per VM, minutes the first time",
             );
         }
         let domain = vm.domain.clone();
+        if loading && primarys {
+            self.progress_vm(
+                &domain,
+                "Loading the copy an earlier VM of this project built, instead of building it",
+            );
+        }
         let started = std::time::Instant::now();
         // The build's progress on the startup page, not only in the log:
         // the step it is at and its latest line, and — through the quiet
@@ -2184,13 +2203,27 @@ impl EnvironmentRegistry {
             });
         built.store(true, std::sync::atomic::Ordering::SeqCst);
         let container = ensured?;
+        // A copy that would not load is removed, and the image built.
+        let loaded = loading && crate::image::has_kept_copy(&baseline, &key);
         if building {
-            self.note_vm(&vm.domain, "the files service image is built");
+            self.note_vm(
+                &vm.domain,
+                if loaded {
+                    "the files service image is loaded"
+                } else {
+                    "the files service image is built"
+                },
+            );
         }
         if primarys {
             self.conclude(
                 taste_core::StartupStage::ServiceImage,
-                if building {
+                if loaded {
+                    format!(
+                        "Loaded in {}, from the copy an earlier VM of this project built.",
+                        duration_words(started.elapsed())
+                    )
+                } else if building {
                     format!("Built in {}.", duration_words(started.elapsed()))
                 } else {
                     "Already built in this VM.".to_string()

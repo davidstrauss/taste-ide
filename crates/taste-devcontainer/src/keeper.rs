@@ -830,7 +830,7 @@ pub fn ensure_container(
 
     let config = crate::baseline::ensure_baseline_config()?;
     let key = taste_core::environment::workspace_key(workspace_root);
-    let image = crate::image::ensure_image_with(substrate, &config, &key, on_build_line)?;
+    let image = crate::image::ensure_image_kept(substrate, &config, &key, on_build_line)?;
     podman_capture(
         substrate,
         &[

@@ -4427,6 +4427,18 @@ free of a runtime. Every path is the checkout's own, in whichever world it
 is in — the container that mounts the checkout sees the same path, so
 nothing anywhere translates.
 
+The keeper's image is built in a VM the first time; a copy of it is then
+saved on this host, under the workspace's key
+(`$XDG_CACHE_HOME/taste-ide/images/<key>/`), and the workspace's next VM
+loads that in seconds rather than building it for a minute
+(`image::ensure_image_kept`, 2026-10-22). The copy is per workspace and
+never shared: it comes out of a VM, where agents run, and the keeper's
+image goes under every checkout in the VM that loads it, so one project's
+VM seeding another's would carry whatever was done to it across the line
+between projects. Sharing one across projects wants an image from a
+builder outside every VM — published and pinned by digest — which there
+is not yet.
+
 **Agent environments live in the VM** (as of 2026-09-20). Creating one
 clones the main checkout on this host as before — that clone is now the
 **peer** — then makes the checkout in the guest by git's own transport: an

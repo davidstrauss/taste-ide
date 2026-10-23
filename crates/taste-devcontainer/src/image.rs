@@ -154,6 +154,141 @@ pub fn ensure_image_with(
     Ok(tag)
 }
 
+/// [`ensure_image_with`], from this machine's copy of the image when there
+/// is one: what a VM of `workspace_key`'s built is saved here, and the
+/// workspace's next VM loads it rather than building it again — a second,
+/// not a minute of packages fetched and installed (David, 2026-10-22:
+/// "Could we optimize the files service to be at least cached as a
+/// build?"). A copy that will not load is removed and the image built.
+///
+/// **Per workspace, never shared.** The copy comes out of a VM, where
+/// agents run, and the image it is goes under every checkout in the VM
+/// that loads it: one VM's image seeding another project's would carry
+/// whatever was done to it across the line between projects' VMs. A
+/// workspace's own VMs are already one project's.
+pub fn ensure_image_kept(
+    substrate: &Substrate,
+    config: &DevcontainerConfig,
+    workspace_key: &str,
+    on_line: &dyn Fn(String),
+) -> Result<String> {
+    if config.dockerfile_path().is_none() {
+        return ensure_image_with(substrate, config, workspace_key, on_line);
+    }
+    let tag = taste_core::environment::env_image_tag(&crate::hash::build_hash(config)?);
+    let exists = |substrate: &Substrate| {
+        run(
+            substrate,
+            vec!["image".into(), "exists".into(), tag.clone()],
+        )
+        .is_ok()
+    };
+    let kept = kept_path(workspace_key, &tag);
+    if exists(substrate) {
+        // Built before copies were kept: one is made now, for the next VM.
+        if !kept.is_file() {
+            keep_in_background(substrate, &tag, kept);
+        }
+        return Ok(tag);
+    }
+    if kept.is_file() {
+        on_line(format!(
+            "loading {tag} from this machine's copy, saved by an earlier VM of this workspace"
+        ));
+        let loaded = run(
+            substrate,
+            vec![
+                "load".into(),
+                "-q".into(),
+                "-i".into(),
+                kept.display().to_string(),
+            ],
+        );
+        match loaded {
+            Ok(()) if exists(substrate) => return Ok(tag),
+            Ok(()) => on_line(format!("the copy did not hold {tag}; building it")),
+            Err(e) => on_line(format!("the copy would not load ({e:#}); building it")),
+        }
+        let _ = std::fs::remove_file(&kept);
+    }
+    let tag = ensure_image_with(substrate, config, workspace_key, on_line)?;
+    keep_in_background(substrate, &tag, kept);
+    Ok(tag)
+}
+
+/// Whether this machine has a copy of the image `config` builds, kept for
+/// `workspace_key` — what decides whether a VM without the image will load
+/// it in seconds or build it in minutes, and so how that is said.
+pub fn has_kept_copy(config: &DevcontainerConfig, workspace_key: &str) -> bool {
+    config.dockerfile_path().is_some()
+        && crate::hash::build_hash(config).is_ok_and(|hash| {
+            kept_path(
+                workspace_key,
+                &taste_core::environment::env_image_tag(&hash),
+            )
+            .is_file()
+        })
+}
+
+/// Save a copy of `tag` to `kept`, off the caller's thread: what the caller
+/// waited for is the image in the VM, and the copy is for the next one.
+fn keep_in_background(substrate: &Substrate, tag: &str, kept: std::path::PathBuf) {
+    let (substrate, tag) = (substrate.clone(), tag.to_string());
+    std::thread::spawn(move || {
+        if let Err(e) = keep(&substrate, &tag, &kept) {
+            tracing::warn!("keeping a copy of {tag}: {e:#}");
+        }
+    });
+}
+
+/// Where this machine keeps a workspace's copy of an image:
+/// `$XDG_CACHE_HOME/taste-ide/images/<workspace key>/<tag>.oci.tar`.
+fn kept_path(workspace_key: &str, tag: &str) -> std::path::PathBuf {
+    std::env::var("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            Path::new(&home).join(".cache")
+        })
+        .join("taste-ide")
+        .join("images")
+        .join(workspace_key)
+        .join(format!("{tag}.oci.tar"))
+}
+
+/// Save `tag` from `substrate` to `kept`, under a name of its own until it
+/// is whole, and remove the workspace's copies of any other image: one
+/// copy a workspace, the image it builds now.
+fn keep(substrate: &Substrate, tag: &str, kept: &Path) -> Result<()> {
+    let dir = kept.parent().context("a kept image has a directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let part = kept.with_extension(format!("part-{}", std::process::id()));
+    let saved = run(
+        substrate,
+        vec![
+            "save".into(),
+            "--format".into(),
+            "oci-archive".into(),
+            "-o".into(),
+            part.display().to_string(),
+            tag.to_string(),
+        ],
+    );
+    if let Err(e) = saved {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    std::fs::rename(&part, kept).with_context(|| format!("keeping {}", kept.display()))?;
+    // Other finished copies only: a `.part-` is another save under way.
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path != kept && path.extension().is_some_and(|x| x == "tar") {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
 /// `run`, with every line of the command's output handed on as it comes.
 /// Both streams: podman's build steps go to stdout and its complaints to
 /// stderr, and a reader wants them in one story.
@@ -240,6 +375,16 @@ fn run(substrate: &Substrate, args: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A workspace's copy of an image is its own: the same image for two
+    /// workspaces is two copies, never one that both load.
+    #[test]
+    fn a_kept_image_is_one_workspaces() {
+        let a = kept_path("aaaa", "taste-img-1");
+        let b = kept_path("bbbb", "taste-img-1");
+        assert_ne!(a, b);
+        assert!(a.ends_with("aaaa/taste-img-1.oci.tar"), "{}", a.display());
+    }
 
     /// The list carries the decisions; this pins them so a change is a
     /// change to one place and one test.
