@@ -2605,6 +2605,7 @@ impl Editor {
             return;
         }
         let page = crate::portview::PortPage::new(env.as_str(), spec.clone(), facts);
+        page.set_on_new_tab(self.port_new_tab_hook(env));
         let tab = self.tabs.append(&page.widget);
         tab.set_title(&if env.is_primary() {
             spec.title()
@@ -2613,6 +2614,64 @@ impl Editor {
         });
         tab.set_icon(Some(&gtk::gio::ThemedIcon::new(crate::portview::PORT_ICON)));
         tab.set_tooltip(&format!("{}\nForwarded from {env}", spec.url()));
+        self.surfaces.borrow_mut().insert(
+            key,
+            Rc::new(SurfaceEntry {
+                tab: tab.clone(),
+                env: env.clone(),
+                kind: SurfaceKind::Port(page),
+            }),
+        );
+        self.tabs.set_selected_page(&tab);
+        self.sync_toggle_to_selection();
+    }
+
+    /// What a port's browser calls to put a page it opened — a link to a
+    /// new window, a middle-click, a Ctrl+click — in a tab of its own.
+    fn port_new_tab_hook(
+        self: &Rc<Self>,
+        env: &taste_core::environment::EnvironmentId,
+    ) -> crate::portview::NewTabHook {
+        let weak = Rc::downgrade(self);
+        let env = env.clone();
+        Rc::new(move |page| {
+            if let Some(editor) = weak.upgrade() {
+                editor.open_port_page(&env, page);
+            }
+        })
+    }
+
+    /// A page a port's browser opened, in a tab beside the one it was
+    /// opened from, named by its page's title as it comes.
+    fn open_port_page(
+        self: &Rc<Self>,
+        env: &taste_core::environment::EnvironmentId,
+        page: Rc<crate::portview::PortPage>,
+    ) {
+        static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let key = port_key(env, page.port).join(format!("tab-{n}"));
+        let position = self
+            .tabs
+            .selected_page()
+            .map_or(self.tabs.n_pages(), |selected| {
+                self.tabs.page_position(&selected) + 1
+            });
+        let tab = self.tabs.insert(&page.widget, position);
+        tab.set_title(&page.title());
+        tab.set_icon(Some(&gtk::gio::ThemedIcon::new(crate::portview::PORT_ICON)));
+        tab.set_tooltip(&format!(
+            "A page of port {}, forwarded from {env}",
+            page.port
+        ));
+        {
+            let tab = tab.downgrade();
+            page.set_on_title(move |title| {
+                if let Some(tab) = tab.upgrade() {
+                    tab.set_title(title);
+                }
+            });
+        }
         self.surfaces.borrow_mut().insert(
             key,
             Rc::new(SurfaceEntry {
@@ -2719,9 +2778,12 @@ impl Editor {
         port: u16,
         facts: &crate::portview::PortFacts,
     ) {
-        if let Some(surface) = self.surfaces.borrow().get(&port_key(env, port)) {
+        // Every tab of the port: its own, and the pages opened from it.
+        for surface in self.surfaces.borrow().values() {
             if let SurfaceKind::Port(page) = &surface.kind {
-                page.set_facts(facts);
+                if surface.env == *env && page.port == port {
+                    page.set_facts(facts);
+                }
             }
         }
     }

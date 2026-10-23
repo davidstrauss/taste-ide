@@ -199,10 +199,30 @@ pub struct PortPage {
     /// Clear what the site has stored in this tab, held for two seconds:
     /// shown on the browser face, beside the address it would reload.
     purge: Rc<crate::holdbutton::HoldButton>,
+    /// What a new tab of this one is made from: the environment and the
+    /// port it shows.
+    environment: String,
+    spec: PortSpec,
+    /// Who puts a page this one opened — a link to a new window, a
+    /// middle-click, a Ctrl+click — in a tab of its own.
+    on_new_tab: RefCell<Option<NewTabHook>>,
+    /// Who is told the page's title, for its tab.
+    on_title: RefCell<Option<Rc<dyn Fn(&str)>>>,
 }
+
+/// Puts a port page in a tab of its own ([`PortPage::set_on_new_tab`]).
+pub type NewTabHook = Rc<dyn Fn(Rc<PortPage>)>;
 
 impl PortPage {
     pub fn new(environment: &str, spec: PortSpec, facts: PortFacts) -> Rc<Self> {
+        let page = Self::made(environment, spec, facts.clone());
+        page.set_face(facts.default_face());
+        page
+    }
+
+    /// The page, with no face shown yet: a new tab's adopts its browser
+    /// before it shows one, so none is made for it ([`Self::open_related`]).
+    fn made(environment: &str, spec: PortSpec, facts: PortFacts) -> Rc<Self> {
         let base_url = spec.url();
 
         // The header: what this is, and what is behind it.
@@ -358,6 +378,10 @@ impl PortPage {
             rest,
             facts: RefCell::new(PortFacts::default()),
             purge,
+            environment: environment.to_string(),
+            spec: spec.clone(),
+            on_new_tab: RefCell::new(None),
+            on_title: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&page);
@@ -374,7 +398,6 @@ impl PortPage {
             });
         }
         page.set_facts(&facts);
-        page.set_face(facts.default_face());
 
         {
             let url = base_url.clone();
@@ -507,6 +530,66 @@ impl PortPage {
             .vexpand(true)
             .hexpand(true)
             .build();
+        self.install_view(&view);
+        self.guard_then_load(&view);
+    }
+
+    /// Who puts a page this one opens in a tab of its own; passed on to
+    /// every page opened from it.
+    pub fn set_on_new_tab(&self, hook: NewTabHook) {
+        *self.on_new_tab.borrow_mut() = Some(hook);
+    }
+
+    /// What a tab of this port is called before its page says: the port.
+    pub fn title(&self) -> String {
+        self.spec.title()
+    }
+
+    /// Who is told the page's title as it changes.
+    pub fn set_on_title(&self, hook: impl Fn(&str) + 'static) {
+        *self.on_title.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// A page of this port in a tab of its own, its browser related to
+    /// this one's: the same session — the site's cookies and storage, so a
+    /// login holds across tabs — and the same content rules, so the network
+    /// guard is in force from the new page's first request, which a guard
+    /// compiled for it after would have missed. `uri` loads in it; without
+    /// one WebKit loads what the page asked a new window for. `None` when
+    /// nothing puts tabs, or this page has no browser.
+    fn open_related(self: &Rc<Self>, uri: Option<&str>) -> Option<webkit6::WebView> {
+        let hook = self.on_new_tab.borrow().clone()?;
+        let related = self.browser.borrow().clone()?;
+        let page = Self::made(
+            &self.environment,
+            self.spec.clone(),
+            self.facts.borrow().clone(),
+        );
+        let mut builder = webkit6::WebView::builder()
+            .related_view(&related)
+            .vexpand(true)
+            .hexpand(true);
+        if let Some(manager) = webkit6::prelude::WebViewExt::user_content_manager(&related) {
+            builder = builder.user_content_manager(&manager);
+        }
+        let view = builder.build();
+        page.install_view(&view);
+        page.set_face(PortFace::Browser);
+        page.set_on_new_tab(hook.clone());
+        if let Some(uri) = uri {
+            view.load_uri(uri);
+        }
+        if std::env::var("TASTE_PROBE_CHECK").is_ok() {
+            println!("port new tab: a page in a tab of its own ({uri:?})");
+        }
+        hook(page);
+        Some(view)
+    }
+
+    /// Everything a browser view of this page is given, whichever made it:
+    /// the face's own view, or one related to another tab's.
+    fn install_view(self: &Rc<Self>, view: &webkit6::WebView) {
+        let view = view.clone();
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
             settings.set_enable_developer_extras(true);
         }
@@ -617,7 +700,60 @@ impl PortPage {
                 page.forward.set_sensitive(view.can_go_forward());
             });
         }
-        self.guard_then_load(&view);
+        // Pages in tabs of their own (David, 2026-10-22: "Can we get tab
+        // support in the browser?"): what asks for a new window — a link
+        // with a target, `window.open` — and a link middle-clicked or
+        // Ctrl+clicked, as any browser opens them.
+        {
+            let weak = Rc::downgrade(self);
+            webkit6::prelude::WebViewExt::connect_create(&view, move |_, _| {
+                let page = weak.upgrade()?;
+                page.open_related(None).map(|view| view.upcast())
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            webkit6::prelude::WebViewExt::connect_decide_policy(&view, move |_, decision, kind| {
+                if kind != webkit6::PolicyDecisionType::NavigationAction {
+                    return false;
+                }
+                let Some(page) = weak.upgrade() else {
+                    return false;
+                };
+                let action = decision
+                    .downcast_ref::<webkit6::NavigationPolicyDecision>()
+                    .and_then(|decision| decision.navigation_action());
+                let Some(action) = action else {
+                    return false;
+                };
+                let control = action.modifiers() & gtk::gdk::ModifierType::CONTROL_MASK.bits() != 0;
+                let middle = action.mouse_button() == 2;
+                if !(control || middle)
+                    || action.navigation_type() != webkit6::NavigationType::LinkClicked
+                {
+                    return false;
+                }
+                let uri = action.request().and_then(|request| request.uri());
+                match uri {
+                    Some(uri) if page.open_related(Some(&uri)).is_some() => {
+                        decision.ignore();
+                        true
+                    }
+                    _ => false,
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            webkit6::prelude::WebViewExt::connect_title_notify(&view, move |view| {
+                let Some(page) = weak.upgrade() else { return };
+                let title = webkit6::prelude::WebViewExt::title(view).unwrap_or_default();
+                let hook = page.on_title.borrow().clone();
+                if let (Some(hook), false) = (hook, title.is_empty()) {
+                    hook(&title);
+                }
+            });
+        }
         self.browser_holder.append(&view);
         *self.browser.borrow_mut() = Some(view);
     }
@@ -792,6 +928,28 @@ impl PortPage {
             ..PortFacts::default()
         });
         self.set_face(PortFace::Browser);
+        // `TASTE_PROBE_PORT_NEWTAB=1`: the page opens a window, as a link
+        // with a target does, and the window is a tab of its own.
+        if std::env::var("TASTE_PROBE_PORT_NEWTAB").is_ok() {
+            let weak = Rc::downgrade(self);
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                let Some(page) = weak.upgrade() else { return };
+                let Some(view) = page.browser.borrow().clone() else {
+                    return;
+                };
+                if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
+                    settings.set_javascript_can_open_windows_automatically(true);
+                }
+                let url = format!("{}/second", page.base_url);
+                view.evaluate_javascript(
+                    &format!("window.open({url:?}, '_blank'); 'asked'"),
+                    None,
+                    None,
+                    gtk::gio::Cancellable::NONE,
+                    |result| println!("port new tab: window.open {:?}", result.map(|_| ())),
+                );
+            });
+        }
     }
 }
 
