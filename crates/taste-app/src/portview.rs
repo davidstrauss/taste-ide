@@ -510,6 +510,37 @@ impl PortPage {
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
             settings.set_enable_developer_extras(true);
         }
+        // The mouse's back and forward buttons — 8 and 9, the thumb
+        // buttons — go back and forward, as in any browser; WebKitGTK
+        // leaves them to the application (David, 2026-10-22: "Make mouse
+        // fwd/back buttons work in the browser"). Taken ahead of the page,
+        // which has no use for them.
+        {
+            let nav = gtk::GestureClick::builder()
+                .button(0)
+                .propagation_phase(gtk::PropagationPhase::Capture)
+                .build();
+            let weak = view.downgrade();
+            nav.connect_pressed(move |gesture, _, _, _| {
+                let Some(view) = weak.upgrade() else { return };
+                match gesture.current_button() {
+                    MOUSE_BACK => {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        if view.can_go_back() {
+                            view.go_back();
+                        }
+                    }
+                    MOUSE_FORWARD => {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        if view.can_go_forward() {
+                            view.go_forward();
+                        }
+                    }
+                    _ => {}
+                }
+            });
+            view.add_controller(nav);
+        }
         // The theme reaches the page two ways. WebKit reads the dark
         // preference libadwaita keeps on GtkSettings, so a page asking
         // `prefers-color-scheme` gets the answer; and the view's own
@@ -1153,6 +1184,10 @@ pub fn process_from_ss(output: &str) -> Option<String> {
         None => name,
     })
 }
+
+/// The mouse's thumb buttons, as GDK numbers them.
+const MOUSE_BACK: u32 = 8;
+const MOUSE_FORWARD: u32 = 9;
 
 /// A toast in the window `widget` is in.
 fn toast(widget: &gtk::Widget, text: &str) {
