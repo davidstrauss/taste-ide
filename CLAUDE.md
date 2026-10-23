@@ -72,7 +72,17 @@ quiet seconds; a bare `podman build` does not.
 `./bootstrap.sh` is that image build plus the first run on a fresh host,
 explained inline in the script and in README → Bootstrap; CI
 (`.github/workflows/ci.yml`) runs fmt, clippy and the tests inside the same
-image, so what passes there passes here.
+image, so what passes there passes here — **built from the same file, not
+the same bytes**: the base is pinned by digest but `dnf install rust …`
+takes whatever Fedora ships that day, and CI builds the image fresh on
+every run. A local image built weeks ago keeps an older toolchain, whose
+clippy passes what CI's newer one refuses — which is how CI failed on every
+push from 2026-10-20 to 2026-10-23 (Rust 1.99's
+`needless_borrows_for_generic_args`) while the local gate passed on 1.98.
+When CI fails on a lint the local gate did not, rebuild the image without
+the cache (`podman build --no-cache -t taste-ide-devcontainer
+.devcontainer`) before anything else, and check `rustc --version` in it
+against the version CI's log installs.
 
 Every config edit mints a `taste-img-<config-hash>` and nothing removes the
 one it replaced, so they accumulate — 50 tagged images against 6 in use,

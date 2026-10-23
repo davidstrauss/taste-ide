@@ -9424,7 +9424,7 @@ impl FileTree {
                     let x = |w: &gtk::Widget| w.compute_bounds(&pane).map(|b| b.x());
                     println!(
                         "align {name}: icon {:?} text {:?}",
-                        icon.as_ref().and_then(&x),
+                        icon.as_ref().and_then(x),
                         x(label.upcast_ref())
                     );
                 }
