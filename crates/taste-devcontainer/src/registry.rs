@@ -273,6 +273,29 @@ pub fn pinned_primary_vm(workspace_root: &Path) -> Option<String> {
     .map(|placement| placement.vm)
 }
 
+/// Which VM's story to follow for an environment: the VM its checkout is
+/// in (`placed`); for one not placed yet — the primary while the
+/// workspace's VM is still coming up, which is when the story is most
+/// wanted — the VM the workspace's containers have resolved onto
+/// (`resolved`), then the VM the primary is pinned to while this launch is
+/// telling that VM's story, then the one VM whose story is being told
+/// (`told`). A pin is where the checkout WAS: when its VM is gone and a new
+/// one is being made, the new one is the story, and a pin taken at its
+/// word sent the whole of it — the files service's build, its log — to a
+/// page waiting on a VM that no longer existed (2026-10-22: "Start files
+/// service in VM" a minute with no line under it).
+fn story_domain(
+    placed: Option<String>,
+    resolved: Option<String>,
+    pinned: Option<String>,
+    told: &[&str],
+) -> Option<String> {
+    placed
+        .or(resolved)
+        .or_else(|| pinned.filter(|pin| told.is_empty() || told.contains(&pin.as_str())))
+        .or_else(|| (told.len() == 1).then(|| told[0].to_string()))
+}
+
 /// What one VM has been doing over the last five minutes, in the
 /// sparkline's own buckets (`taste_core::activity`: sixty of five seconds),
 /// with the latest reading beside each series for the tooltip. CPU is a
@@ -967,26 +990,20 @@ impl EnvironmentRegistry {
             .unwrap_or_default()
     }
 
-    /// Which VM's story an environment's Virtual Machine log row shows:
-    /// the VM its checkout is in; for one not placed yet — the primary
-    /// while the workspace's VM is still coming up, which is when the
-    /// story is most wanted — the VM the primary is pinned to, else the
-    /// one VM whose story is being told.
+    /// Which VM's story an environment's Virtual Machine log row shows,
+    /// and whose progress its startup page hears ([`story_domain`]).
     pub fn vm_log_domain_for(&self, env: &EnvironmentId) -> Option<String> {
-        if let Some(domain) = self
+        let placed = self
             .get(env)
-            .and_then(|s| s.checkout().vm().map(str::to_string))
-        {
-            return Some(domain);
+            .and_then(|s| s.checkout().vm().map(str::to_string));
+        if placed.is_some() {
+            return placed;
         }
-        if let Some(pinned) = pinned_primary_vm(&self.workspace_root) {
-            return Some(pinned);
-        }
+        let resolved = self.substrate().vm_details().map(|vm| vm.domain.clone());
+        let pinned = pinned_primary_vm(&self.workspace_root);
         let logs = self.vm_logs.lock().unwrap();
-        if logs.len() == 1 {
-            return logs.keys().next().cloned();
-        }
-        None
+        let told: Vec<&str> = logs.keys().map(String::as_str).collect();
+        story_domain(None, resolved, pinned, &told)
     }
 
     /// Follow each VM's serial console into its story, once per domain:
@@ -5737,6 +5754,26 @@ mod tests {
     }
 
     use super::*;
+
+    /// A pin to a VM this launch is not telling the story of gives way to
+    /// the VM that is; the VM the containers resolved onto, and the one the
+    /// checkout is in, come first.
+    #[test]
+    fn the_story_followed_is_the_vm_being_brought_up() {
+        let s = |d: &str| Some(d.to_string());
+        // The pinned VM is gone; a new one is being made and logged.
+        assert_eq!(story_domain(None, None, s("old"), &["new"]), s("new"));
+        // The pinned VM is the one coming up.
+        assert_eq!(
+            story_domain(None, None, s("old"), &["old", "other"]),
+            s("old")
+        );
+        // Nothing told yet: the pin is all there is.
+        assert_eq!(story_domain(None, None, s("old"), &[]), s("old"));
+        assert_eq!(story_domain(None, s("new"), s("old"), &["old"]), s("new"));
+        assert_eq!(story_domain(s("here"), s("new"), s("old"), &[]), s("here"));
+        assert_eq!(story_domain(None, None, None, &["a", "b"]), None);
+    }
 
     /// A checkout's stashes cross a move: bundled out of the old checkout,
     /// fetched into the peer (where the old copy's look finds them), and
