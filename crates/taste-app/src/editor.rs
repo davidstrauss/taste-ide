@@ -276,6 +276,22 @@ fn port_key(env: &taste_core::environment::EnvironmentId, port: u16) -> PathBuf 
     PathBuf::from(format!("port:{env}")).join(port.to_string())
 }
 
+/// A tab bar for `view`, made once for it and never given another view
+/// (see `Editor::tab_bar`). Natural-width tabs: sized by their title, so
+/// opening another file never resizes the existing tabs. Reordering is
+/// TabBar's built-in drag behavior.
+fn tab_bar_for(view: &adw::TabView) -> adw::TabBar {
+    adw::TabBar::builder()
+        .view(view)
+        .autohide(false)
+        .hexpand(true)
+        .expand_tabs(false)
+        // The selected tab wears the blue the row that opened it wears
+        // (main.rs, "the blue").
+        .css_classes(["editor-strip"])
+        .build()
+}
+
 /// Which environment's tab set a file belongs in.
 ///
 /// The predicate is the file's own checkout, so a tab lands in the right
@@ -599,7 +615,16 @@ impl EditorPage {
 
 pub struct Editor {
     pub widget: gtk::Box,
-    tab_bar: adw::TabBar,
+    /// The tab bar on screen: the aimed environment's view's own
+    /// ([`Editor::tab_bar`]). Every view has a bar of its own, and a switch
+    /// shows another bar rather than handing one bar another view:
+    /// `AdwTabBar::set_view` frees its records of the old view's tabs while
+    /// a tab's close animation still runs, and the animation's end touched
+    /// one freed — a segfault, switching environments while the startup tab
+    /// closed (2026-10-24).
+    tab_bar: RefCell<adw::TabBar>,
+    bars: RefCell<HashMap<taste_core::environment::EnvironmentId, adw::TabBar>>,
+    bar_stack: gtk::Stack,
     workspace: taste_core::Workspace,
     /// The results listing at the pane's foot (results.rs), for content
     /// hits, definitions and commits — the pane whose content they are in.
@@ -737,18 +762,7 @@ impl Editor {
     pub fn new(workspace: taste_core::Workspace) -> Rc<Self> {
         let tabs = adw::TabView::new();
         tabs.set_vexpand(true);
-        // Natural-width tabs: sized by their title, so opening another
-        // file never resizes the existing tabs. Reordering is TabBar's
-        // built-in drag behavior.
-        let tab_bar = adw::TabBar::builder()
-            .view(&tabs)
-            .autohide(false)
-            .hexpand(true)
-            .expand_tabs(false)
-            // The selected tab wears the blue the row that opened it wears
-            // (main.rs, "the blue").
-            .css_classes(["editor-strip"])
-            .build();
+        let tab_bar = tab_bar_for(&tabs);
 
         // The selected tab's controls at the tab bar's right end: its own
         // tools (a PDF's or an image's zoom, GNOME's zoom menu) and its view
@@ -784,8 +798,13 @@ impl Editor {
             .sensitive(false)
             .build();
 
+        let bar_stack = gtk::Stack::builder()
+            .hexpand(true)
+            .transition_type(gtk::StackTransitionType::None)
+            .build();
+        bar_stack.add_child(&tab_bar);
         let top_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        top_row.append(&tab_bar);
+        top_row.append(&bar_stack);
 
         let empty = adw::StatusPage::builder()
             .icon_name("taste-empty-folder")
@@ -813,7 +832,12 @@ impl Editor {
 
         let editor = Rc::new(Self {
             widget,
-            tab_bar: tab_bar.clone(),
+            tab_bar: RefCell::new(tab_bar.clone()),
+            bars: RefCell::new(HashMap::from([(
+                taste_core::environment::EnvironmentId::primary(),
+                tab_bar.clone(),
+            )])),
+            bar_stack: bar_stack.clone(),
             workspace,
             results: results.clone(),
             tabs: RefCell::new(tabs.clone()),
@@ -890,8 +914,16 @@ impl Editor {
         view.set_vexpand(true);
         self.view_stack.add_child(&view);
         self.wire_view(&view);
+        let bar = tab_bar_for(&view);
+        self.bar_stack.add_child(&bar);
+        self.bars.borrow_mut().insert(env.clone(), bar);
         self.views.borrow_mut().insert(env.clone(), view.clone());
         view
+    }
+
+    /// The tab bar on screen.
+    fn tab_bar(&self) -> adw::TabBar {
+        self.tab_bar.borrow().clone()
     }
 
     /// The view on screen, or the empty page when it holds nothing.
@@ -1525,7 +1557,21 @@ impl Editor {
         }
         self.reordering.set(false);
         self.enforce_family_order();
-        self.tab_bar.set_view(Some(&arriving));
+        // The arriving view's own bar, shown: the bar furniture at its end
+        // and the startup lock's look go with the screen.
+        let arriving_bar = self.bars.borrow().get(env).cloned();
+        if let Some(bar) = arriving_bar {
+            let leaving_bar = self.tab_bar();
+            let locked = leaving_bar.has_css_class("startup-locked");
+            leaving_bar.remove_css_class("startup-locked");
+            leaving_bar.set_end_action_widget(gtk::Widget::NONE);
+            bar.set_end_action_widget(Some(&self.end_actions));
+            if locked {
+                bar.add_css_class("startup-locked");
+            }
+            self.bar_stack.set_visible_child(&bar);
+            *self.tab_bar.borrow_mut() = bar;
+        }
         self.show_view();
         if let Some(startup) = startup {
             arriving.set_selected_page(&startup);
@@ -1582,6 +1628,9 @@ impl Editor {
             view.close_page(tab);
         }
         self.view_stack.remove(&view);
+        if let Some(bar) = self.bars.borrow_mut().remove(env) {
+            self.bar_stack.remove(&bar);
+        }
     }
 
     /// TASTE_PROBE_CHECK only: answer `env` as the owner of every file
@@ -2458,7 +2507,7 @@ impl Editor {
             }),
         );
         *self.startup_tab.borrow_mut() = Some(tab.clone());
-        self.tab_bar.add_css_class("startup-locked");
+        self.tab_bar().add_css_class("startup-locked");
         self.tabs().set_selected_page(&tab);
         self.sync_toggle_to_selection();
     }
@@ -2468,7 +2517,7 @@ impl Editor {
         let Some(tab) = self.startup_tab.borrow_mut().take() else {
             return;
         };
-        self.tab_bar.remove_css_class("startup-locked");
+        self.tab_bar().remove_css_class("startup-locked");
         self.surfaces
             .borrow_mut()
             .remove(&PathBuf::from(STARTUP_KEY));
@@ -5536,6 +5585,55 @@ mod tests {
     /// A tab the folder could not hold — an ignored file, only in the
     /// checkout — opens once the checkout has arrived, and in front when
     /// it was; and one handed over after the checkout moved opens at once.
+    /// Switching environments while a tab's close animation runs — the
+    /// startup tab going as a new environment's panes take over — and
+    /// switching again before it ends, in a window that draws: no bar is
+    /// handed another view, so no animation ends on a tab its bar has
+    /// forgotten. With one bar whose view was swapped, this segfaulted in
+    /// libadwaita (2026-10-24).
+    #[test]
+    fn switching_while_a_tab_closes_is_safe() {
+        crate::gtk_test::on_gtk_thread("switch while closing: no display — skipped", || {
+            use gtk::prelude::*;
+            let dir = std::env::temp_dir().join(format!("taste-switch-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::languages::register();
+            let editor = super::Editor::new(taste_core::Workspace::open(dir.clone()));
+            let window = gtk::Window::builder()
+                .default_width(900)
+                .default_height(600)
+                .child(&editor.widget)
+                .build();
+            window.present();
+            let pump = |ms: u64| {
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+                while std::time::Instant::now() < until {
+                    gtk::glib::MainContext::default().iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+            pump(300);
+            let away = taste_core::environment::EnvironmentId::parse("i-away").unwrap();
+            let home = taste_core::environment::EnvironmentId::primary();
+            for _ in 0..4 {
+                editor.show_startup(crate::startup::StartupPage::new());
+                pump(100);
+                editor.hide_startup();
+                editor.aim_at(&away);
+                pump(20);
+                editor.aim_at(&home);
+                pump(20);
+                editor.aim_at(&away);
+            }
+            pump(1000);
+            editor.aim_at(&home);
+            pump(300);
+            window.close();
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     #[test]
     fn the_startup_page_stays_in_the_strip_when_the_panes_move() {
         crate::gtk_test::on_gtk_thread("startup strip: no display — skipped", || {
