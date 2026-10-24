@@ -39,6 +39,31 @@ pub const SERVICES: &str = "A task that runs something long-lived — a server, 
      block rebuilds nothing and is in force at once; any other edit to devcontainer.json still \
      needs devcontainer_reload.";
 
+/// Where data that must outlive a container goes, for an agent: a named
+/// volume, which taste-devcontainer gives each environment its own copy
+/// of, keeps across rebuilds, carries when the environment moves to
+/// another VM, and hands to the container's user while it is new and
+/// empty. A project's MariaDB kept its data in the image user's home and
+/// lost it with every container (2026-10-24).
+pub const STATE: &str = "Your environment's container is made again from its config each \
+     time the environment starts — after a stop, a reload, a rebuild, or the IDE closing — \
+     and everything written inside it is lost then, except the checkout and /home/agent. \
+     That includes the image user's own home (a task's $HOME), so a server keeping its data \
+     there starts empty every time. Data that must outlive the container — a database's data \
+     directory, uploaded files, a cache worth keeping — goes on a named volume in \
+     .devcontainer/devcontainer.json `mounts`, written as a string (the object form is \
+     refused):\n\n\
+     ```json\n\
+     \"mounts\": [\"source=mysql-data,target=/home/dev/mysql-data,type=volume\"]\n\
+     ```\n\n\
+     and the program pointed at its target (here, `mariadbd --datadir=/home/dev/mysql-data`). \
+     Each environment has its own copy of each volume, kept across stops, reloads, rebuilds, \
+     and moves to another VM, and removed only when the user removes it or the environment. \
+     A new, empty volume is given to the container's user, so a program running as that user \
+     can write it. A change to `mounts` takes effect with devcontainer_reload, and the volume \
+     starts empty: data already written inside the container is not moved into it, so dump it \
+     first (mariadb-dump, pg_dump) and load the dump once the volume is in place.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Convention {
     /// Absolute path where the file belongs in this workspace.
@@ -206,6 +231,19 @@ fn build_dockerfile(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state text names the home that is kept by the path it is kept
+    /// at, and shows a mount in the one form the IDE takes.
+    #[test]
+    fn the_state_text_names_the_kept_home_and_the_string_form() {
+        assert!(STATE.contains(crate::policy::AGENT_HOME_IN_DEVCONTAINER));
+        assert!(
+            STATE.contains(
+                "\"mounts\": [\"source=mysql-data,target=/home/dev/mysql-data,type=volume\"]"
+            ),
+            "{STATE}"
+        );
+    }
 
     #[test]
     fn the_services_text_shows_the_block() {

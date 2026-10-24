@@ -823,6 +823,8 @@ pub(crate) fn author_prompt() -> String {
     text.push_str(&taste_core::kernel_task::convention());
     text.push_str("\nIf the project runs servers, workers, or watchers as tasks: ");
     text.push_str(taste_core::conventions::SERVICES);
+    text.push_str("\nIf the project keeps data — a database, uploads, a cache worth keeping: ");
+    text.push_str(taste_core::conventions::STATE);
     text.push_str(
         "\n\
      If the project runs podman or docker itself (its build, tests, or tasks call it): \

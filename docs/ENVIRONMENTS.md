@@ -234,6 +234,24 @@ dimension:
 | Agent home volume | `taste-agent-home` (machine-global!) | `taste-env-<workspace-key>-<env>-home` |
 | Config named volumes | verbatim from devcontainer.json | `taste-env-<workspace-key>-<env>-cfg-<declared>` — namespaced at run time, so no repo-declared cache is shared by accident |
 
+**What outlives a container is a volume.** The container is removed on
+every stop, reload, and rebuild, and made again when the environment
+starts, so whatever was written in its own layer — the image user's home
+among it — is gone then; the checkout and the volumes are not. A config
+volume is kept across stops, reloads, rebuilds, and the IDE's restarts,
+and a move to another VM carries it with the agent's home
+(`EnvironmentRegistry::carry_and_place`), failing the move rather than
+arriving without it. It goes when the user removes it or the environment,
+or with a VM destroyed outright, since it lives on the VM's disk. Podman
+hands a new volume to the container's root when the image has nothing at
+its target, so on each start one that is still empty and still root's is
+given to the container's user before the lifecycle hooks run
+(`Supervisor::settle_new_volumes`); one with anything in it is never
+touched. Agents are told all of this, and the string form `mounts` must
+be written in, in `taste_core::conventions::STATE` (2026-10-24: a
+project's MariaDB kept its data in `~/mysql-data` and lost it with every
+container).
+
 The workspace key is 6 bytes of SHA-256 over the main checkout's path, hex
 — the same width the old scheme used, which is what lets the sweep
 recognise its leavings. All of it is derived in `taste_core::environment`
@@ -4047,7 +4065,8 @@ environment, migrate it."
   five minutes after the IDE is gone, which GCE takes as a stop.
 - **Moving is relocation.** `EnvironmentRegistry::move_to(env, host)` is
   `relocate_inner` aimed at the other kind: a fresh snapshot, the
-  container stopped, the agent's home volume carried, the checkout placed
+  container stopped, its volumes carried (the agent's home and every one
+  its config declares), the checkout placed
   from the peer and the snapshot, the old copy removed (and the old VM,
   once it holds nothing of the workspace), and the container started where
   it now is. The primary stays local: it is the folder you opened,
@@ -4136,7 +4155,8 @@ release_of`, which reads an older VM's off its disk's backing file). A VM
 behind the stream takes no new environments, and the ones in it move: an
 environment gets the newer guest the way it gets a new laptop or a new
 provisioner — a fresh snapshot, its container stopped, its agent's home
-volume exported and imported so the conversation comes along, its checkout
+volume and every volume its config declares exported and imported, so the
+conversation and the project's data come along, its checkout
 restored from its peer in a VM on the current release, the old copy
 removed, the old VM destroyed once nothing of the workspace is left in it,
 and the container started again.

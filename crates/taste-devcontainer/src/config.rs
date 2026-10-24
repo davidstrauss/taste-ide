@@ -522,6 +522,33 @@ impl DevcontainerConfig {
         volumes
     }
 
+    /// Where in the container each named volume of `mounts` is mounted,
+    /// as the config spells it — what a new volume's ownership is settled
+    /// at (`Supervisor::settle_new_volumes`). `workspaceMount` is not
+    /// among them: it is the checkout's, and its ownership is the
+    /// checkout's.
+    pub fn named_volume_targets(&self) -> Vec<String> {
+        let mut targets = Vec::new();
+        for mount in self.mounts.iter().filter_map(|m| m.as_str()) {
+            let mut target: Option<&str> = None;
+            let mut is_volume = false;
+            for part in mount.split(',') {
+                let mut kv = part.splitn(2, '=');
+                match (kv.next().map(str::trim), kv.next().map(str::trim)) {
+                    (Some("target" | "dst" | "destination"), Some(v)) => target = Some(v),
+                    (Some("type"), Some("volume")) => is_volume = true,
+                    _ => {}
+                }
+            }
+            if let (true, Some(target)) = (is_volume, target) {
+                targets.push(target.to_string());
+            }
+        }
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.image.is_none() && self.dockerfile_path().is_none() {
             bail!(
@@ -798,6 +825,8 @@ mod tests {
         .unwrap();
         let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
         assert_eq!(config.named_volumes(), vec!["build-cache", "ws-cache"]);
+        // The checkout's own mount is not one whose ownership is settled.
+        assert_eq!(config.named_volume_targets(), vec!["/cache", "/cache2"]);
     }
 
     #[test]

@@ -4384,6 +4384,8 @@ impl Supervisor {
         // hooks (which may themselves commit) — never the host's.
         self.settle_git_identity(&name, config.effective_user())
             .await;
+        // Before the hooks too: they are what writes a new volume first.
+        self.settle_new_volumes(&config, &name).await;
 
         // Lifecycle hooks, in spec order.
         for hook in [
@@ -4581,6 +4583,66 @@ impl Supervisor {
             .filter_map(|l| l.parse::<u32>().ok());
         let (uid, gid) = (ids.next()?, ids.next()?);
         keep_id_flag(&config.run_args, uid, gid)
+    }
+
+    /// A named volume the config declares is made by podman, owned by the
+    /// container's root, when the image has nothing at its target — and
+    /// the container's user, who runs the hooks, the tasks, and the
+    /// agent's shell, then cannot write it: a database pointed at it fails
+    /// on its first start. So a target that is still empty and still
+    /// root's is given to that user, before the hooks that would write it
+    /// first. Nothing else is: a volume with anything in it is as the
+    /// project left it (a Postgres data directory is the postgres user's on
+    /// purpose), nothing inside one is touched, and a container whose user
+    /// is root needs nothing. An empty volume has no owner to keep: podman
+    /// gives it to root again on every mount, which is why this runs on
+    /// every start. Never fatal.
+    async fn settle_new_volumes(&self, config: &DevcontainerConfig, name: &str) {
+        let targets = config.named_volume_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let mut ask: Vec<String> = vec!["exec".into()];
+        if let Some(user) = config.effective_user() {
+            ask.push("--user".into());
+            ask.push(user.to_string());
+        }
+        ask.extend([name.into(), "sh".into(), "-c".into(), "id -u; id -g".into()]);
+        let Ok(owner) = self.run_captured(ask).await else {
+            return;
+        };
+        let owner: Vec<&str> = owner.split_whitespace().collect();
+        let [uid, gid] = owner[..] else {
+            return;
+        };
+        if uid == "0" {
+            return;
+        }
+        let mut settle: Vec<String> = [
+            "exec",
+            "--user",
+            "root",
+            name,
+            "sh",
+            "-c",
+            NEW_VOLUME_OWNER,
+            "sh",
+            uid,
+            gid,
+        ]
+        .map(String::from)
+        .to_vec();
+        settle.extend(targets);
+        match self.run_captured(settle).await {
+            Ok(given) => {
+                for target in given.lines().filter(|line| !line.is_empty()) {
+                    self.log(format!(
+                        "the new volume at {target} is the container user's ({uid}:{gid})"
+                    ));
+                }
+            }
+            Err(e) => self.log(format!("the new volumes' owner could not be settled: {e}")),
+        }
     }
 
     /// The container's git identity is the project's and nobody else's.
@@ -5526,6 +5588,17 @@ fn churn_path(rel: &str) -> bool {
     const CHURN: [&str; 6] = ["target", "node_modules", ".cache", "dist", "build", ".venv"];
     rel.split('/').any(|part| CHURN.contains(&part))
 }
+
+/// Run as the container's root with the user's uid and gid and then the
+/// volumes' targets: each target that is a directory, root's, and empty
+/// is given to that uid and gid, and printed ([`Supervisor::settle_new_volumes`]).
+const NEW_VOLUME_OWNER: &str = r#"u=$1; g=$2; shift 2
+for t in "$@"; do
+  [ -d "$t" ] || continue
+  [ "$(stat -c %u "$t")" = 0 ] || continue
+  [ -z "$(ls -A "$t")" ] || continue
+  chown "$u:$g" "$t" && printf '%s\n' "$t"
+done"#;
 
 /// Nested podman, end to end and offline: a user namespace, then an image
 /// built FROM scratch and a container run on it — which mounts storage,

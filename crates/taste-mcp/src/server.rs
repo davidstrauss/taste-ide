@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 14;
+pub const GUIDANCE_REVISION: u32 = 15;
 
 /// The flag the tools that rebuild or move an environment take, said once.
 pub(crate) static WHILE_PRESENTING: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
@@ -428,6 +428,8 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              SERVICES. ",
         );
     text.push_str(taste_core::conventions::SERVICES);
+    text.push_str("\n\nSTATE. ");
+    text.push_str(taste_core::conventions::STATE);
     text.push_str(
         "\n\n\
              MARKDOWN. Your replies here and the editor's preview of a .md file are \
@@ -2420,7 +2422,9 @@ impl McpServer {
                     "conventions": "Devcontainer house style: base the image on a \
                         Containerfile in .devcontainer/; no --userns argument is needed, \
                         the IDE maps the user onto the image's user itself; \
-                        named volumes for caches (never bind mounts outside the workspace); \
+                        named volumes, in the string form, for caches and for data that \
+                        must outlive the container, such as a database's (never bind mounts \
+                        outside the workspace); \
                         forwardPorts for services (published on localhost only, ports ≥1024); \
                         for background services prefer systemd: a systemd-capable image \
                         with overrideCommand false (add runArgs [\"--privileged\"] only for \
@@ -6295,8 +6299,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "949e47de57b1d8387e65ab24a00e48fa2631303a9a0954017d2f5bb461dddd48";
-        const AT_REVISION: u32 = 14;
+            "2cb46e5a0ac37a0c0715ac94b361c9a8d975abc41faf557d56ae7fad39664147";
+        const AT_REVISION: u32 = 15;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

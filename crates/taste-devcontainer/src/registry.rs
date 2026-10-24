@@ -5114,17 +5114,38 @@ impl EnvironmentRegistry {
             .vm_details()
             .map(|vm| vm.domain.clone())
             .unwrap_or_default();
-        // The agent's home — its conversation — carried in a file on this
-        // host between the two VMs' podmans.
-        let volume = environment::env_home_volume(&self.workspace_root, env);
-        let tar = self.env_dir(env).join("home-volume.tar");
-        supervisor.move_step(&format!("{moving}: carrying its agent's home out"));
-        let exported = {
-            let (substrate, volume, tar) = (old_substrate.clone(), volume.clone(), tar.clone());
-            tokio::task::spawn_blocking(move || export_volume(&substrate, &volume, &tar))
-                .await
-                .context("exporting the home volume did not finish")??
+        // Everything the environment keeps in volumes, carried in files on
+        // this host between the two VMs' podmans: the agent's home, which
+        // is its conversation, and each volume its config declares, which
+        // is its data. Only the home was carried once, and a project's
+        // database stayed behind in the old VM with every release
+        // (2026-10-24). A volume that cannot be carried fails the move
+        // here, while it can still be undone, rather than arriving without
+        // its data; one never made (a declared volume no container has
+        // mounted yet) has nothing to carry.
+        let home = environment::env_home_volume(&self.workspace_root, env);
+        let declared_prefix = environment::env_config_volume(&self.workspace_root, env, "");
+        let what = |volume: &str| match volume.strip_prefix(&declared_prefix) {
+            _ if volume == home => "its agent's home".to_string(),
+            Some(declared) => format!("its volume {declared}"),
+            None => format!("volume {volume}"),
         };
+        let mut tars = CarriedFiles::default();
+        let mut carried: Vec<(String, PathBuf)> = Vec::new();
+        for (n, volume) in supervisor.env_volumes().into_iter().enumerate() {
+            let tar = self.env_dir(env).join(format!("volume-{n}.tar"));
+            tars.0.push(tar.clone());
+            supervisor.move_step(&format!("{moving}: carrying {} out", what(&volume)));
+            let exported = {
+                let (substrate, name, tar) = (old_substrate.clone(), volume.clone(), tar.clone());
+                tokio::task::spawn_blocking(move || export_volume(&substrate, &name, &tar))
+                    .await
+                    .with_context(|| format!("exporting volume {volume} did not finish"))??
+            };
+            if exported {
+                carried.push((volume, tar));
+            }
+        }
 
         supervisor.move_step(&format!("{moving}: bringing up the VM it moves to"));
         // The old VM goes once nothing of this workspace is left in it
@@ -5155,14 +5176,14 @@ impl EnvironmentRegistry {
             &target.domain,
             format!("{env}: moving in from VM {old_domain}"),
         );
-        if exported {
-            supervisor.move_step(&format!("{moving}: carrying its agent's home in"));
-            let (substrate, volume, from) = (target_substrate.clone(), volume.clone(), tar.clone());
-            tokio::task::spawn_blocking(move || import_volume(&substrate, &volume, &from))
+        for (volume, tar) in carried {
+            supervisor.move_step(&format!("{moving}: carrying {} in", what(&volume)));
+            let substrate = target_substrate.clone();
+            tokio::task::spawn_blocking(move || import_volume(&substrate, &volume, &tar))
                 .await
-                .context("importing the home volume did not finish")??;
+                .context("importing a volume did not finish")??;
         }
-        let _ = std::fs::remove_file(&tar);
+        drop(tars);
 
         supervisor.move_step(&format!("{moving}: placing its checkout"));
         if env.is_primary() {
@@ -5536,6 +5557,20 @@ fn now_secs() -> u64 {
 
 /// A podman volume out of `substrate` into a tar file on this host;
 /// `false` when there is no such volume to carry.
+/// The files a move carries volumes in, removed however the move ends:
+/// a database's volume is as large as the database, and a move that
+/// failed halfway left its exports on the host's disk.
+#[derive(Default)]
+struct CarriedFiles(Vec<PathBuf>);
+
+impl Drop for CarriedFiles {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
 fn export_volume(substrate: &Substrate, volume: &str, to: &Path) -> Result<bool> {
     // 1 is podman's "no such volume"; anything else but 0 is podman not
     // answering, which read as "nothing to carry" and the move went on
