@@ -1985,14 +1985,17 @@ NoConfig → ConfigDetected → Building → Starting → Running
   with `--userns=keep-id`, bind-mounting the workspace) implementing the
   core devcontainer spec: image/Containerfile/compose, mounts, env,
   runArgs, remoteUser, lifecycle hooks (onCreate/postCreate/postStart).
-  Before the hooks run, the container inherits the host's git identity
-  (`user.name`/`user.email` into its global config) unless it already has
-  one — a fresh container must commit as the user, not refuse with
-  "Author identity unknown". Identity is not a credential: the same pair
-  rides on every commit the user pushes. Agents get the same identity
-  through their `GIT_CONFIG_GLOBAL` policy file, which would otherwise
-  mask the global config entirely; the self-hosting bootstrap inherits it
-  in `bootstrap.sh` the same only-if-absent way.
+  Before the hooks run, the checkout is given the **project's** git
+  author — the `user.name`/`user.email` the folder's repository sets, which
+  the IDE also remembers in the workspace's state (`git-author`), so a
+  re-clone that takes `.git/config` away does not lose it
+  (`taste_git::project_identity`). Never the host's: `~/.gitconfig` is the
+  user's machine state, and a project that names no author commits as
+  nobody, with git's "Author identity unknown" saying so, until the user
+  copies an author in from the file tree's banner, which names the identity
+  it would copy and copies nothing unasked. (Earlier versions copied the
+  host's pair into every container and into the primary's checkout; a
+  start takes those copies back out.)
   Build output streams to the supervisor console tab and into a ring buffer
   the MCP server serves.
 - **Nuke is per environment, and honest about sharing**: it removes that

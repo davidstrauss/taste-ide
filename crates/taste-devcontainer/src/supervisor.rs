@@ -509,6 +509,9 @@ pub struct Supervisor {
     channel_services: Mutex<Option<Arc<dyn ChannelServices>>>,
     /// Hash of the config the running container was created from.
     running_hash: Mutex<Option<String>>,
+    /// The running container and the user git runs as in it, for carrying
+    /// the project's author in after the start ([`Self::carry_project_author`]).
+    git_exec: Mutex<Option<(String, Option<String>)>>,
     /// The forwarded ports of the config this environment last resolved —
     /// what the file tree's Ports section lists. Recorded by
     /// `resolve_config`, so it is never a filesystem read at render time.
@@ -938,6 +941,7 @@ impl Supervisor {
             channel: tokio::sync::Mutex::new(None),
             channel_services: Mutex::new(None),
             running_hash: Mutex::new(None),
+            git_exec: Mutex::new(None),
             declared_ports: Mutex::new(Vec::new()),
             declared_services: Mutex::new(std::collections::BTreeMap::new()),
             published_ports: Mutex::new(std::collections::HashMap::new()),
@@ -3449,6 +3453,10 @@ impl Supervisor {
         self.exec.set_container(name.clone(), workdir, authority);
         *self.authority.lock().unwrap() = authority;
         *self.running_hash.lock().unwrap() = Some(started_hash.clone());
+        *self.git_exec.lock().unwrap() = Some((
+            name.clone(),
+            resolved.config.effective_user().map(str::to_string),
+        ));
         let drift = config_hash(
             &resolved.config,
             &self.ide_mounts(&resolved.config, resolved.authority),
@@ -3514,6 +3522,7 @@ impl Supervisor {
             self.substrate().provider().describe()
         ));
         *self.running_hash.lock().unwrap() = None;
+        *self.git_exec.lock().unwrap() = None;
         self.exec.set_host();
         self.forget_agent_hosting();
         self.set_state(SupervisorState::Stopped);
@@ -4371,10 +4380,9 @@ impl Supervisor {
         })?;
         self.log(format!("container started: {container_id}"));
 
-        // Git identity: inherited from the host BEFORE the lifecycle hooks
-        // (which may themselves commit). A container that already has one —
-        // baked into the image or persisted in a home volume — keeps it.
-        self.inherit_git_identity(&name, config.effective_user())
+        // Git identity: the project's own, settled BEFORE the lifecycle
+        // hooks (which may themselves commit) — never the host's.
+        self.settle_git_identity(&name, config.effective_user())
             .await;
 
         // Lifecycle hooks, in spec order.
@@ -4575,65 +4583,106 @@ impl Supervisor {
         keep_id_flag(&config.run_args, uid, gid)
     }
 
-    /// Copy the host's `user.name`/`user.email` into the container's
-    /// global git config, unless the container already has an identity.
-    /// A fresh container otherwise refuses every commit — terminals,
-    /// hooks, agents — with "Author identity unknown", an error whose
-    /// answer the IDE already knows. Never fatal: a container without
-    /// git installed must still start.
-    async fn inherit_git_identity(&self, name: &str, user: Option<&str>) {
+    /// The container's git identity is the project's and nobody else's.
+    /// Earlier versions copied the host's `user.name`/`user.email` into
+    /// every container's global config, and placement copied it into the
+    /// primary's checkout, so a project that names no author committed as
+    /// the user — the user's machine state carried into a project, which
+    /// nothing may do (CLAUDE.md → "Credentials are the project's"). What
+    /// those copies left is taken back out here, on every start, wherever
+    /// it is exactly the host's pair: the container user's global config,
+    /// the agent home's, and the checkout's own. Then the project's author
+    /// is carried in, and a project that names none commits as nobody,
+    /// with git's "Author identity unknown" saying so. Never fatal: a
+    /// container without git installed must still start.
+    async fn settle_git_identity(&self, name: &str, user: Option<&str>) {
+        *self.git_exec.lock().unwrap() = Some((name.to_string(), user.map(str::to_string)));
+        if let Some(host) = taste_git::host_identity() {
+            let checkout = self.checkout().path().display().to_string();
+            let agent_home = Some(taste_core::policy::AGENT_HOME_IN_DEVCONTAINER);
+            // Where, the checkout (`git -C`) when it is the checkout's own
+            // config, the scope, and the HOME a global config is read under.
+            let places = [
+                ("the container's global config", None, "--global", None),
+                (
+                    "the agent home's global config",
+                    None,
+                    "--global",
+                    agent_home,
+                ),
+                (
+                    "the checkout's own config",
+                    Some(&checkout),
+                    "--local",
+                    None,
+                ),
+            ];
+            for (place, dir, scope, home) in places {
+                let exec = |tail: &[&str]| {
+                    let mut args: Vec<String> = vec!["exec".into()];
+                    if let Some(user) = user {
+                        args.push("--user".into());
+                        args.push(user.to_string());
+                    }
+                    if let Some(home) = home {
+                        args.push("--env".into());
+                        args.push(format!("HOME={home}"));
+                    }
+                    args.push(name.to_string());
+                    args.push("git".into());
+                    if let Some(dir) = dir {
+                        args.extend(["-C".to_string(), dir.clone()]);
+                    }
+                    args.extend(["config".to_string(), scope.to_string()]);
+                    args.extend(tail.iter().map(|s| s.to_string()));
+                    args
+                };
+                let get = |key: &'static str| self.run_captured(exec(&["--get", key]));
+                let (got_name, got_email) = (get("user.name").await, get("user.email").await);
+                let copied = matches!((&got_name, &got_email), (Ok(n), Ok(e))
+                    if n.trim() == host.name && e.trim() == host.email);
+                if !copied {
+                    continue;
+                }
+                for key in ["user.name", "user.email"] {
+                    if let Err(e) = self.run_captured(exec(&["--unset", key])).await {
+                        self.log(format!(
+                            "the host's git identity not removed from {place}: {e}"
+                        ));
+                    }
+                }
+                self.log(format!(
+                    "removed the host's git identity from {place}: an earlier version copied it \
+                     there, and a project commits only as its own author"
+                ));
+            }
+        }
         self.carry_repo_identity(name, user).await;
-        let Some(identity) = taste_git::host_identity() else {
-            return; // nothing to inherit — the host is equally anonymous
-        };
-        let exec = |tail: &[&str]| {
-            let mut args: Vec<String> = vec!["exec".into()];
-            if let Some(user) = user {
-                args.push("--user".into());
-                args.push(user.to_string());
-            }
-            args.push(name.to_string());
-            args.extend(tail.iter().map(|s| s.to_string()));
-            args
-        };
-        // An existing identity wins: `--get` exits non-zero when unset.
-        let existing = self
-            .run_captured(exec(&["git", "config", "--global", "--get", "user.email"]))
-            .await;
-        if existing.map(|out| !out.trim().is_empty()).unwrap_or(false) {
-            return;
-        }
-        for (key, value) in [
-            ("user.name", &identity.name),
-            ("user.email", &identity.email),
-        ] {
-            if let Err(e) = self
-                .run_captured(exec(&["git", "config", "--global", key, value]))
-                .await
-            {
-                self.log(format!("git identity not inherited ({key}): {e}"));
-                return;
-            }
-        }
-        self.log(format!(
-            "git identity inherited from host: {} <{}>",
-            identity.name, identity.email
-        ));
     }
 
-    /// The author the project's own repository sets — `user.name` and
-    /// `user.email` in the folder's `.git/config` — written into this
-    /// environment's checkout as its own, on every start. The primary's
-    /// checkout was given it when it was placed; an agent environment's
-    /// was made by a push into an empty repository, which carries no
-    /// config, so its commits fell to the container's global identity —
-    /// the host's — and went out under the user's name in a project that
-    /// commits under another (David, 2026-10-23: "The repo's configured git
-    /// author should carry into non-personal envs"). On every start rather
-    /// than at the clone, so environments made before this, and a change
-    /// to the folder's author since, are carried too. Never fatal.
+    /// The project's author carried into this environment's checkout now,
+    /// while its container runs — after the user gave the project one from
+    /// the file tree's banner, so a commit there need not wait for a
+    /// restart. Nothing when the container is not running.
+    pub async fn carry_project_author(&self) {
+        let running = self.git_exec.lock().unwrap().clone();
+        if let Some((name, user)) = running {
+            self.carry_repo_identity(&name, user.as_deref()).await;
+        }
+    }
+
+    /// The project's author ([`project_author`]) written into this
+    /// environment's checkout as its own, on every start, the primary's
+    /// included. An agent environment's checkout was made by a push into
+    /// an empty repository, which carries no config (David, 2026-10-23:
+    /// "The repo's configured git author should carry into non-personal
+    /// envs"). On every start rather than at the clone, so environments
+    /// made before this, and a change to the project's author since, are
+    /// carried too. Never fatal.
     async fn carry_repo_identity(&self, name: &str, user: Option<&str>) {
-        let Some(identity) = taste_git::repo_identity(self.workspace_root()) else {
+        let root = self.workspace_root().to_path_buf();
+        let Ok(Some(identity)) = tokio::task::spawn_blocking(move || project_author(&root)).await
+        else {
             return;
         };
         let checkout = self.checkout().path().display().to_string();
@@ -4722,6 +4771,7 @@ impl Supervisor {
             ])
             .await;
         *self.running_hash.lock().unwrap() = None;
+        *self.git_exec.lock().unwrap() = None;
         self.set_state(SupervisorState::Stopped);
         self.set_pending(false);
         Ok(())
@@ -4796,6 +4846,7 @@ impl Supervisor {
             }
         }
         *self.running_hash.lock().unwrap() = None;
+        *self.git_exec.lock().unwrap() = None;
         self.exec.set_host();
         // Whatever that container could host, it can host nothing now.
         self.forget_agent_hosting();
@@ -5121,6 +5172,18 @@ pub(crate) fn stage_build_context(source: &Path, name: &str) -> Result<PathBuf> 
         .with_context(|| format!("creating build staging dir {}", staged.display()))?;
     copy_context_into(source, &staged)?;
     Ok(staged)
+}
+
+/// The author this project's commits go out under, when it has one of its
+/// own: the folder's `user.name` and `user.email`, remembered in the
+/// workspace's state (`git-author`) so a re-clone of the folder does not
+/// hand every environment the host's identity
+/// (`taste_git::project_identity`). Blocking: file IO on both sides.
+pub fn project_author(workspace_root: &Path) -> Option<taste_git::GitIdentity> {
+    taste_git::project_identity(
+        workspace_root,
+        &taste_core::state::workspace_state_dir(workspace_root).join("git-author"),
+    )
 }
 
 fn staging_root() -> PathBuf {

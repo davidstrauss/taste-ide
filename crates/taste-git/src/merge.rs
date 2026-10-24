@@ -315,12 +315,9 @@ impl GitWorkspace {
             MergeStatus::FastForward
         } else {
             let tree = self.repo.find_tree(target_tree)?;
-            // The user's identity: this is the user's merge, in the user's
-            // repository, exactly like a commit from the composer.
-            let sig = self
-                .repo
-                .signature()
-                .context("git needs user.name and user.email to record a merge")?;
+            // The project's author: this is the user's merge, in the
+            // project's repository, exactly like a commit from the composer.
+            let sig = self.project_signature()?;
             self.repo
                 .commit(
                     Some(&head_ref),

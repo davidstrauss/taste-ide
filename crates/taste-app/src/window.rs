@@ -264,6 +264,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor = editor.clone();
         filetree.set_on_review_ended(move || editor.close_review_tabs());
     }
+    {
+        // An author the user just gave the project reaches the running
+        // environments' checkouts now, not at their next start.
+        let environments = environments.clone();
+        filetree.set_on_author_set(move || {
+            for supervisor in environments.list() {
+                crate::runtime::runtime().spawn(async move {
+                    supervisor.carry_project_author().await;
+                });
+            }
+        });
+    }
     // What the window knows about each forwarded port (the tick's connect
     // probe, a tab's deeper look), keyed by environment and port. The tree's
     // rows and the port tabs both read it; only the probes write it.
@@ -6042,7 +6054,7 @@ fn start_issue(
                         Some((agent, model)) => (Some(agent.as_str()), model.as_deref()),
                         None => (None, None),
                     };
-                    git.issue_start_with(&id, &taste_git::starter_identity(), agent, model)
+                    git.issue_start_with(&id, &git.starter_identity(), agent, model)
                         .map(|_| ())
                 });
                 glib::spawn_future_local(async move {

@@ -732,15 +732,16 @@ impl GitWorkspace {
         })
     }
 
-    /// This branch's authors: who wrote `mine`, and `user.email` here.
+    /// This branch's authors: who wrote `mine`, and the project's author
+    /// here — the repository's own `user.email`, never the host's.
     fn our_authors(&self, mine: &[Oid]) -> std::collections::HashSet<String> {
         let mut ours: std::collections::HashSet<String> = mine
             .iter()
             .filter_map(|oid| self.authored(*oid))
             .map(|(email, _, _)| email)
             .collect();
-        if let Ok(email) = self.repo.config().and_then(|c| c.get_string("user.email")) {
-            ours.insert(email.to_lowercase());
+        if let Some(identity) = crate::local_identity(&self.repo) {
+            ours.insert(identity.email.to_lowercase());
         }
         ours
     }

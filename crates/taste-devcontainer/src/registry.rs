@@ -1913,20 +1913,15 @@ impl EnvironmentRegistry {
                     "updateInstead",
                 ],
             )?;
-            // The user's identity for commits made over there, when the
-            // folder has one: git refuses to commit as nobody.
-            for key in ["user.name", "user.email"] {
-                let value = std::process::Command::new("git")
-                    .args(taste_git::private::cli_prefix(&peer))
-                    .args(["config", "--get", key])
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .filter(|v| !v.is_empty());
-                if let Some(value) = value {
-                    run(&staging, &["git", "config", key, &value])?;
-                }
+            // The project's own author, when it has one, and nothing
+            // otherwise: the container's global config carries the host's
+            // identity already, and a copy of it here — which `git config
+            // --get` over the folder's whole config chain once made — sits
+            // at the checkout's own level, above anything the project
+            // names later, and put every commit under the host's name.
+            if let Some(identity) = crate::supervisor::project_author(&peer) {
+                run(&staging, &["git", "config", "user.name", &identity.name])?;
+                run(&staging, &["git", "config", "user.email", &identity.email])?;
             }
             // Uncommitted work travels as a snapshot ref and is put back
             // over there as exactly what it was. Whose: the folder's, when

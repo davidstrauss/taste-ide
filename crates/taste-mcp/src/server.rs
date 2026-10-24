@@ -4429,12 +4429,7 @@ impl McpServer {
                 .clone()
                 .or_else(|| created.model_pending.clone());
             self.with_main_checkout(move |git| {
-                git.issue_start_with(
-                    &id,
-                    &taste_git::starter_identity(),
-                    Some(&agent),
-                    model.as_deref(),
-                )
+                git.issue_start_with(&id, &git.starter_identity(), Some(&agent), model.as_deref())
             })
             .await
             .with_context(|| {

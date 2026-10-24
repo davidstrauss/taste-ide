@@ -233,6 +233,9 @@ submodule banner (`submodule_bar.rs`) for those submodules (`clone`,
 tree's banner for a branch already in the default branch
 (`merged_bar.rs`, `taste_git::merged`), with its Switch to main, since the
 folder a probe opens is on its own branch;
+`TASTE_PROBE_AUTHOR=1` poses the file tree's banner for a project that
+names no git author (`author_bar.rs`), naming a made-up identity rather
+than the photographer's own;
 `TASTE_PROBE_ALIGN=1` prints where the file tree header's folder, branch,
 and All rows start their icon and text, which stand in one column;
 `TASTE_PROBE_TREE_END=1` scrolls the file tree to the end of its listing,
@@ -478,7 +481,15 @@ to.
   into a project (David, 2026-09-16: "Never offer to import system
   credentials into a project. Always require project-level creds"). The
   offer that once did is gone; do not bring it back as a toast, a card, a
-  setting, or a fallback.
+  setting, or a fallback. **The same holds for the git author**: commits,
+  containers, issue records, and anything else a project uses carry the
+  author the project's repository sets, and never the host's
+  `~/.gitconfig` — no `repo.signature()`, no `git config --get` over the
+  whole chain, no inheriting into a container (David, 2026-10-24: "YOU
+  HAVE BEEN EXPLICITLY TOLD TO NOT ACCESS USER MACHINE STATE TO PULL INTO
+  PROJECT USE"). The most the IDE does for a project that names nobody is
+  a banner that says so, names the user's identity, and copies it into the
+  repository's own config only when the user says to.
 - **Agent-facing text is designed for the smallest model that will read
   it, and never framed as coaching a lesser one.** Tool descriptions,
   tool results, the prompts the IDE composes, the errors it returns: short,

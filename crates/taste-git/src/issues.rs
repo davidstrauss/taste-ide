@@ -2481,13 +2481,16 @@ mod tests {
         assert_eq!(program, "git");
         assert_eq!(
             args,
-            vec![
-                "-C".to_string(),
-                ws.workdir().display().to_string(),
-                "fetch".to_string(),
-                "origin".to_string(),
-                format!("+{ISSUES_REF}:{ISSUES_TRACKING_REF}"),
+            [
+                vec!["-C".to_string(), ws.workdir().display().to_string()],
+                ws.identity_args(),
+                vec![
+                    "fetch".to_string(),
+                    "origin".to_string(),
+                    format!("+{ISSUES_REF}:{ISSUES_TRACKING_REF}"),
+                ],
             ]
+            .concat()
         );
     }
 

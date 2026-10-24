@@ -270,9 +270,9 @@ pub const BIG_FILE_THRESHOLD: &str = "32m";
 /// rendering, `taste-acp::sandbox`, is the outside-confined topology's.)
 ///
 /// Additive rather than replacing, unlike `GIT_CONFIG_GLOBAL`: the
-/// container's global config already carries the identity the supervisor
-/// inherited from the host at start, and this must not wipe it out — an
-/// agent whose commits die with "Author identity unknown" cannot publish.
+/// container's own config — the image's, and the checkout's, where the
+/// supervisor carries the project's author at start — must not be wiped
+/// out by it.
 pub fn agent_git_config_env() -> Vec<(String, String)> {
     let config = agent_git_config();
     let mut env: Vec<(String, String)> =
@@ -562,8 +562,8 @@ mod tests {
             assert_eq!(&lookup(&format!("GIT_CONFIG_KEY_{index}")), key);
             assert_eq!(&lookup(&format!("GIT_CONFIG_VALUE_{index}")), value);
         }
-        // Additive, not replacing: nothing here may clear the container's
-        // inherited git identity out from under the agent's commits.
+        // Additive, not replacing: nothing here may clear the project's
+        // author, carried into the checkout, out from under the agent.
         assert!(!env.iter().any(|(k, _)| k == "GIT_CONFIG_GLOBAL"));
     }
 }

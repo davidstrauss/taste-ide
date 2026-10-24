@@ -644,6 +644,12 @@ pub struct FileTree {
     /// The banner for a branch already in the default branch, with the
     /// switch back (`crate::merged_bar`).
     merged_bar: Rc<crate::merged_bar::MergedBar>,
+    /// The banner for a project that names no git author, which copies the
+    /// user's in only when asked (`crate::author_bar`).
+    author_bar: Rc<crate::author_bar::AuthorBar>,
+    /// Fired once the user has given the project an author from that
+    /// banner, so running environments carry it in without a restart.
+    on_author_set: RefCell<Option<Box<dyn Fn()>>>,
     submodule_busy: Cell<bool>,
     on_open: RefCell<Option<OpenCallback>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
@@ -953,6 +959,9 @@ struct StatusSnapshot {
     /// (`GitWorkspace::merged_into_default`), asked of the folder's refs
     /// as the sync status is.
     merged: Option<taste_git::merged::MergedInto>,
+    /// The user's identity, to be named on the author banner, when the
+    /// project names no author of its own (`author_bar.rs`).
+    author_offer: Option<taste_git::GitIdentity>,
     /// What syncs though git ignores it (`Worktree::sync_ignored`).
     sync_ignored: taste_devcontainer::worktree::SyncIgnored,
     /// What the sync counts' cards say of submodules.
@@ -2025,6 +2034,8 @@ impl FileTree {
         widget.append(&submodule_bar.widget);
         let merged_bar = crate::merged_bar::MergedBar::new(CHROME_INSET);
         widget.append(&merged_bar.widget);
+        let author_bar = crate::author_bar::AuthorBar::new(CHROME_INSET);
+        widget.append(&author_bar.widget);
         // The project folder itself: always the first row, never
         // collapsible; its context menu creates top-level items.
         let root_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -2151,6 +2162,8 @@ impl FileTree {
             review: RefCell::new(None),
             on_open_review_diff: RefCell::new(None),
             on_review_ended: RefCell::new(None),
+            author_bar,
+            on_author_set: RefCell::new(None),
             logs_list,
             log_sparklines,
             ports_list,
@@ -2349,6 +2362,48 @@ impl FileTree {
                         tree.run_branch_op(default, false);
                     }
                 }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&tree);
+            tree.author_bar.copy.connect_clicked(move |button| {
+                let Some(tree) = weak.upgrade() else { return };
+                let Some(identity) = tree.author_bar.offered() else {
+                    return;
+                };
+                button.set_sensitive(false);
+                let root = tree.workspace.root().to_path_buf();
+                let events = tree.workspace.events.clone();
+                let weak = Rc::downgrade(&tree);
+                let button = button.clone();
+                glib::spawn_future_local(async move {
+                    // Into the folder's own config, then remembered for the
+                    // project (`project_author`), so a re-clone keeps it.
+                    let handle = crate::runtime::runtime().spawn_blocking(move || {
+                        taste_git::set_repo_identity(&root, &identity)?;
+                        taste_devcontainer::supervisor::project_author(&root);
+                        anyhow::Ok(())
+                    });
+                    let result = handle.await;
+                    button.set_sensitive(true);
+                    match result {
+                        Ok(Ok(())) => {
+                            if let Some(tree) = weak.upgrade() {
+                                tree.author_bar.show(None);
+                                if let Some(hook) = tree.on_author_set.borrow().as_ref() {
+                                    hook();
+                                }
+                            }
+                            events.publish(Event::GitStatusChanged);
+                        }
+                        Ok(Err(e)) => events.publish(Event::Toast(format!(
+                            "The project's author was not set: {e:#}"
+                        ))),
+                        Err(e) => events.publish(Event::Toast(format!(
+                            "The project's author was not set: {e}"
+                        ))),
+                    }
+                });
             });
         }
         {
@@ -3546,6 +3601,10 @@ impl FileTree {
 
     /// What to do when the pane leaves a review — closing the tabs it
     /// opened.
+    pub fn set_on_author_set(&self, f: impl Fn() + 'static) {
+        *self.on_author_set.borrow_mut() = Some(Box::new(f));
+    }
+
     pub fn set_on_review_ended(&self, f: impl Fn() + 'static) {
         *self.on_review_ended.borrow_mut() = Some(Box::new(f));
     }
@@ -5812,6 +5871,7 @@ impl FileTree {
         let root = self.view_root();
         let worktree = self.worktree();
         let refs_root = self.refs_root();
+        let project_root = self.workspace.root().to_path_buf();
         // The answer belongs to the checkout it was asked about, and an
         // older answer must not be applied to a newer aim.
         let root_for_apply = root.clone();
@@ -5884,9 +5944,19 @@ impl FileTree {
                     (Some(git), Some(branch)) => SubmoduleSync::read(git, branch),
                     _ => SubmoduleSync::default(),
                 };
+                // The project's own author, or none — in which case the
+                // user's identity is read only to be NAMED on the banner
+                // that asks whether to copy it (`author_bar.rs`).
+                let author_offer = crate::author_bar::posed_for_probe().or_else(|| {
+                    taste_devcontainer::supervisor::project_author(&project_root)
+                        .is_none()
+                        .then(taste_git::host_identity)
+                        .flatten()
+                });
                 Ok(StatusSnapshot {
                     submodule_sync,
                     merged,
+                    author_offer,
                     submodules: worktree.submodule_heads(),
                     submodule_setup: crate::submodule_bar::posed_for_probe().unwrap_or_else(|| {
                         folder
@@ -6055,6 +6125,7 @@ impl FileTree {
                     .show(&snapshot.submodule_setup, self.submodule_busy.get());
                 *self.submodule_setup.borrow_mut() = snapshot.submodule_setup;
                 self.merged_bar.show(snapshot.merged.as_ref());
+                self.author_bar.show(snapshot.author_offer.as_ref());
                 self.ignore_rules.set(snapshot.ignore_rules);
                 self.sync_filter_counts();
                 *self.status_branch.borrow_mut() = snapshot.branch.clone();

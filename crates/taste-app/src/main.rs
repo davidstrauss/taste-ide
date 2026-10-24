@@ -13,6 +13,7 @@
 mod agent_fetch;
 mod ansi;
 mod askpass;
+mod author_bar;
 mod backlog;
 mod chat;
 mod chat_column;
@@ -512,6 +513,12 @@ fn main() -> glib::ExitCode {
                     a nudge, so the accent the bar has, with the submodule \
                     banner's edges. */\n\
                  .changed-bar.merged-branch { padding: 6px 0; }\n\
+                 /* The file tree's author banner (author_bar.rs): commits \
+                    fail without one, so the submodule banner's warning \
+                    colour and edges. */\n\
+                 .changed-bar.project-author { \
+                   background-color: alpha(@warning_bg_color, 0.22); \
+                   padding: 6px 0; }\n\
                  /* The environment's startup page (startup.rs): a card for \
                     the checklist over the construction stripes, the log in \
                     a card of its own below; the strip's other tabs dimmed \

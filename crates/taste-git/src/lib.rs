@@ -50,44 +50,26 @@ pub use review::{
 };
 pub use snapshot::{snapshot_ref, RestoreMode, Restored, Snapshot, SNAPSHOT_REF_PREFIX};
 
-/// The user's git identity from the host's config chain (global/system/
-/// XDG), for inheriting into containers. A fresh container has no
-/// `user.name`/`user.email`, so every commit in it — terminals, hooks,
-/// agents — fails with "Author identity unknown" until someone types the
-/// two `git config` commands; the IDE knows the answer and should supply
-/// it.
+/// A git author: `user.name` and `user.email`, both halves or nothing —
+/// half an identity still cannot commit, and supplying it would only mask
+/// which half is missing.
+///
+/// Always the PROJECT's: the one its repository sets for itself, or the one
+/// the IDE remembered for it ([`project_identity`]). Never the machine's —
+/// the host's `~/.gitconfig` is user machine state, and nothing of it goes
+/// into a project's commits, its containers, or anything pushed (David,
+/// 2026-10-24: "YOU HAVE BEEN EXPLICITLY TOLD TO NOT ACCESS USER MACHINE
+/// STATE TO PULL INTO PROJECT USE"). A project that names nobody commits as
+/// nobody, and git says so with "Author identity unknown".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitIdentity {
     pub name: String,
     pub email: String,
 }
 
-/// Both halves or nothing: half an identity still cannot commit, and
-/// injecting it would only mask which half is missing.
-/// Who started an issue, as the issue store records it: the committer's
-/// email from the host's git config, at this machine's hostname — the
-/// two facts that tell one person's two machines apart, which is what the
-/// record is for (a second machine starting the same issue is refused by
-/// name). Falls back honestly when either is unknown.
-pub fn starter_identity() -> String {
-    let who = host_identity()
-        .map(|id| id.email)
-        .filter(|email| !email.trim().is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    let host = std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|h| h.trim().to_string())
-        .filter(|h| !h.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "localhost".to_string());
-    format!("{who}@{host}")
-}
-
-/// The identity the repository at `root` sets for itself — `user.name` and
-/// `user.email` in its own config, not the user's global one — when it
-/// sets both: a project committed to under a name of its own.
-pub fn repo_identity(root: &Path) -> Option<GitIdentity> {
-    let repo = git2::Repository::open(root).ok()?;
+/// The identity `repo` sets in its own config — the local level only, so
+/// no global, XDG, or system file can answer for it.
+fn local_identity(repo: &git2::Repository) -> Option<GitIdentity> {
     let config = repo
         .config()
         .ok()?
@@ -100,6 +82,82 @@ pub fn repo_identity(root: &Path) -> Option<GitIdentity> {
     (!name.trim().is_empty() && !email.trim().is_empty()).then_some(GitIdentity { name, email })
 }
 
+/// The identity the repository at `root` sets for itself — `user.name` and
+/// `user.email` in its own config, not the user's global one — when it
+/// sets both: a project committed to under a name of its own.
+pub fn repo_identity(root: &Path) -> Option<GitIdentity> {
+    local_identity(&git2::Repository::open(root).ok()?)
+}
+
+/// Write `identity` into the repository at `root`'s own config as its
+/// author. Only ever on the user's say-so: the file tree's banner names the
+/// identity and asks before calling this (`taste-app`'s `author_bar.rs`).
+pub fn set_repo_identity(root: &Path, identity: &GitIdentity) -> Result<()> {
+    let repo = git2::Repository::open(root)?;
+    let mut config = repo.config()?.open_level(git2::ConfigLevel::Local)?;
+    config.set_str("user.name", &identity.name)?;
+    config.set_str("user.email", &identity.email)?;
+    Ok(())
+}
+
+/// The project's author: the one the folder's repository at `root` sets
+/// ([`repo_identity`]), remembered in `record` — a git config file in the
+/// IDE's state for the workspace — or, when the folder sets none, the one
+/// remembered there, written back into the folder's own config. A fresh
+/// clone takes nothing of `.git/config` with it, so without the record a
+/// project's author lasts exactly as long as the clone it was set in, and
+/// every commit after a re-clone goes out under the host's name (David,
+/// 2026-10-24, of `sb` re-cloned that morning). Never the host's identity:
+/// a folder and a record that both name nobody give `None`.
+pub fn project_identity(root: &Path, record: &Path) -> Option<GitIdentity> {
+    let remembered = || -> Option<GitIdentity> {
+        if !record.exists() {
+            return None;
+        }
+        let config = git2::Config::open(record).ok()?.snapshot().ok()?;
+        let name = config.get_string("user.name").ok()?;
+        let email = config.get_string("user.email").ok()?;
+        (!name.trim().is_empty() && !email.trim().is_empty()).then_some(GitIdentity { name, email })
+    };
+    let write = |config: &mut git2::Config, identity: &GitIdentity| {
+        config.set_str("user.name", &identity.name)?;
+        config.set_str("user.email", &identity.email)
+    };
+    if let Some(identity) = repo_identity(root) {
+        if remembered().as_ref() != Some(&identity) {
+            let kept = record
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .map_err(|e| git2::Error::from_str(&e.to_string()))
+                .and_then(|()| git2::Config::open(record))
+                .and_then(|mut config| write(&mut config, &identity));
+            if let Err(e) = kept {
+                tracing::warn!("the project's author not remembered: {e}");
+            }
+        }
+        return Some(identity);
+    }
+    let identity = remembered()?;
+    let restored = git2::Repository::open(root)
+        .and_then(|repo| repo.config())
+        .and_then(|config| config.open_level(git2::ConfigLevel::Local))
+        .and_then(|mut config| write(&mut config, &identity));
+    match restored {
+        Ok(()) => tracing::info!(
+            "the project's author restored to {}: {} <{}>",
+            root.display(),
+            identity.name,
+            identity.email
+        ),
+        Err(e) => tracing::warn!("the project's author not restored to the folder: {e}"),
+    }
+    Some(identity)
+}
+
+/// The host's own identity, from its global config chain. For one use
+/// only: recognizing, and taking back out, the copies of it that earlier
+/// versions of the IDE wrote into containers and checkouts. Nothing may
+/// supply it to a project.
 pub fn host_identity() -> Option<GitIdentity> {
     let config = git2::Config::open_default().ok()?.snapshot().ok()?;
     let name = config.get_string("user.name").ok()?;
@@ -136,6 +194,67 @@ mod identity_tests {
                 name: "tellmeyourstories".into(),
                 email: "t@example.org".into()
             })
+        );
+    }
+
+    /// The folder's author is remembered, survives a re-clone that takes
+    /// the folder's config away, and is put back into the folder; a change
+    /// to it in the folder replaces what was remembered.
+    #[test]
+    fn a_project_keeps_its_author_through_a_reclone() {
+        let state = tempfile::tempdir().unwrap();
+        let record = state.path().join("ws").join("git-author");
+        let author = |name: &str| GitIdentity {
+            name: name.into(),
+            email: format!("{name}@example.org"),
+        };
+        let set = |dir: &Path, who: &GitIdentity| {
+            let repo = git2::Repository::open(dir).unwrap();
+            let mut config = repo
+                .config()
+                .unwrap()
+                .open_level(git2::ConfigLevel::Local)
+                .unwrap();
+            config.set_str("user.name", &who.name).unwrap();
+            config.set_str("user.email", &who.email).unwrap();
+        };
+
+        let first = tempfile::tempdir().unwrap();
+        git2::Repository::init(first.path()).unwrap();
+        assert_eq!(
+            project_identity(first.path(), &record),
+            None,
+            "nobody named is nobody, never the host"
+        );
+        set(first.path(), &author("tellmeyourstories"));
+        assert_eq!(
+            project_identity(first.path(), &record),
+            Some(author("tellmeyourstories"))
+        );
+
+        // The re-clone: same project, a config with no author in it.
+        let again = tempfile::tempdir().unwrap();
+        git2::Repository::init(again.path()).unwrap();
+        assert_eq!(
+            project_identity(again.path(), &record),
+            Some(author("tellmeyourstories"))
+        );
+        assert_eq!(
+            repo_identity(again.path()),
+            Some(author("tellmeyourstories")),
+            "the folder has its author back"
+        );
+
+        set(again.path(), &author("someone-else"));
+        assert_eq!(
+            project_identity(again.path(), &record),
+            Some(author("someone-else"))
+        );
+        let third = tempfile::tempdir().unwrap();
+        git2::Repository::init(third.path()).unwrap();
+        assert_eq!(
+            project_identity(third.path(), &record),
+            Some(author("someone-else"))
         );
     }
 
@@ -511,19 +630,21 @@ impl GitWorkspace {
     /// argv for stashing a single file (the CLI, because libgit2's stash
     /// has no pathspec support).
     pub fn stash_file_command(&self, rel_path: &Path, message: &str) -> (String, Vec<String>) {
+        let mut argv = vec!["-C".into(), self.workdir.display().to_string()];
+        argv.extend(self.identity_args());
         (
             "git".into(),
-            vec![
-                "-C".into(),
-                self.workdir.display().to_string(),
-                "stash".into(),
-                "push".into(),
-                "--include-untracked".into(),
-                "-m".into(),
-                message.into(),
-                "--".into(),
-                rel_path.display().to_string(),
-            ],
+            argv.into_iter()
+                .chain([
+                    "stash".into(),
+                    "push".into(),
+                    "--include-untracked".into(),
+                    "-m".into(),
+                    message.into(),
+                    "--".into(),
+                    rel_path.display().to_string(),
+                ])
+                .collect(),
         )
     }
 
@@ -664,13 +785,40 @@ impl GitWorkspace {
         Ok(text)
     }
 
-    /// Commit the index with the given message, using the repo's configured
-    /// signature.
+    /// The project's author as a signature: the repository's own
+    /// `user.name` and `user.email`, never the host's (`GitIdentity`).
+    /// `repo.signature()` would fall through to `~/.gitconfig`, which is
+    /// how a project that names nobody got commits under the user's name.
+    pub(crate) fn project_signature(&self) -> Result<git2::Signature<'static>> {
+        let identity = local_identity(&self.repo).context(
+            "this project names no git author: set user.name and user.email in its \
+             repository (git config --local)",
+        )?;
+        Ok(git2::Signature::now(&identity.name, &identity.email)?)
+    }
+
+    /// Who started an issue, as the issue store records it: the project
+    /// author's email, at this machine's hostname — the two facts that
+    /// tell one person's two machines apart, which is what the record is
+    /// for (a second machine starting the same issue is refused by name).
+    /// "unknown" when the project names nobody: the record is pushed with
+    /// the issues, and the host's own email is not the project's to send.
+    pub fn starter_identity(&self) -> String {
+        let who = local_identity(&self.repo)
+            .map(|id| id.email)
+            .unwrap_or_else(|| "unknown".to_string());
+        let host = std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "localhost".to_string());
+        format!("{who}@{host}")
+    }
+
+    /// Commit the index with the given message, as the project's author.
     pub fn commit(&self, message: &str) -> Result<git2::Oid> {
-        let sig = self
-            .repo
-            .signature()
-            .context("git identity not configured (user.name / user.email)")?;
+        let sig = self.project_signature()?;
         let mut index = self.repo.index()?;
         let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
@@ -940,9 +1088,28 @@ impl GitWorkspace {
             "git".to_string(),
             private::cli_prefix(&self.workdir)
                 .into_iter()
+                .chain(self.identity_args())
                 .chain(args)
                 .collect(),
         )
+    }
+
+    /// `-c user.name=… -c user.email=…` for a git the IDE runs here: the
+    /// project's author, or the IDE's own name when the project names
+    /// nobody. On the command line because it outranks every config file —
+    /// left to itself, a rebase or a stash signs with `~/.gitconfig`, the
+    /// host's identity, and a rebased commit is pushed (`GitIdentity`).
+    fn identity_args(&self) -> Vec<String> {
+        let identity = local_identity(&self.repo).unwrap_or_else(|| GitIdentity {
+            name: "taste-ide".into(),
+            email: "taste-ide@localhost".into(),
+        });
+        vec![
+            "-c".into(),
+            format!("user.name={}", identity.name),
+            "-c".into(),
+            format!("user.email={}", identity.email),
+        ]
     }
 
     // --- sync with the remote tip (fetch + rebase, never merge) ----------
@@ -1692,19 +1859,21 @@ mod tests {
         let branch = ws.branch_name().unwrap();
         let wd = ws.workdir().display().to_string();
 
+        // Every argv opens on the checkout and the project's author.
+        let lead = |ws: &GitWorkspace, rest: &[&str]| -> Vec<String> {
+            [
+                vec!["-C".to_string(), wd.clone()],
+                ws.identity_args(),
+                rest.iter().map(|s| s.to_string()).collect(),
+            ]
+            .concat()
+        };
+
         // No extras: byte-for-byte the push the user always got.
         assert_eq!(ws.push_command_with(&[]), ws.push_command());
         assert_eq!(
             ws.push_command(),
-            (
-                "git".into(),
-                vec![
-                    "-C".into(),
-                    wd.clone(),
-                    "push".into(),
-                    PUSH_SUBMODULES.into()
-                ]
-            )
+            ("git".into(), lead(&ws, &["push", PUSH_SUBMODULES]))
         );
 
         // With extras and no upstream: origin, this branch, extras last.
@@ -1712,15 +1881,16 @@ mod tests {
         assert_eq!(program, "git");
         assert_eq!(
             args,
-            vec![
-                "-C".to_string(),
-                wd.clone(),
-                "push".into(),
-                PUSH_SUBMODULES.into(),
-                "origin".into(),
-                format!("HEAD:refs/heads/{branch}"),
-                "refs/taste/issues:refs/taste/issues".into(),
-            ]
+            lead(
+                &ws,
+                &[
+                    "push",
+                    PUSH_SUBMODULES,
+                    "origin",
+                    &format!("HEAD:refs/heads/{branch}"),
+                    "refs/taste/issues:refs/taste/issues",
+                ]
+            )
         );
 
         // With an upstream on a differently-named remote and branch, both
@@ -1741,18 +1911,20 @@ mod tests {
         let (_, args) = ws.push_command_with(&["refs/taste/issues:refs/taste/issues"]);
         // On the upstream's host, a submodule is pushed to in its scheme.
         let align = transport::align_args(Some("https://example.invalid/repo.git"));
-        assert_eq!(args[2..2 + align.len()], align);
+        let at = lead(&ws, &[]).len();
+        assert_eq!(args[at..at + align.len()], align);
         assert_eq!(
-            [&args[..2], &args[2 + align.len()..]].concat(),
-            vec![
-                "-C".to_string(),
-                wd,
-                "push".into(),
-                PUSH_SUBMODULES.into(),
-                "hub".into(),
-                "HEAD:refs/heads/trunk".into(),
-                "refs/taste/issues:refs/taste/issues".into(),
-            ]
+            [&args[..at], &args[at + align.len()..]].concat(),
+            lead(
+                &ws,
+                &[
+                    "push",
+                    PUSH_SUBMODULES,
+                    "hub",
+                    "HEAD:refs/heads/trunk",
+                    "refs/taste/issues:refs/taste/issues",
+                ]
+            )
         );
     }
 

@@ -544,13 +544,14 @@ impl GitWorkspace {
             .id())
     }
 
-    /// Signature for IDE bookkeeping commits. The user's configured identity
-    /// when there is one; otherwise the IDE signs as itself rather than
-    /// failing an issue write on a host with no `user.name` — unlike
-    /// [`GitWorkspace::commit`], nothing here is the user's authored work.
+    /// Signature for IDE bookkeeping commits. The project's author when it
+    /// names one; otherwise the IDE signs as itself rather than failing an
+    /// issue write — and never as the host's identity, since these commits
+    /// are pushed with the issues. Unlike [`GitWorkspace::commit`], nothing
+    /// here is the user's authored work.
     pub(crate) fn ref_signature(&self) -> Result<git2::Signature<'static>> {
-        match self.repo.signature() {
-            Ok(sig) => Ok(sig.to_owned()),
+        match self.project_signature() {
+            Ok(sig) => Ok(sig),
             Err(_) => git2::Signature::now("taste-ide", "taste-ide@localhost")
                 .context("building a signature"),
         }
