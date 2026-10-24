@@ -4284,6 +4284,15 @@ impl Supervisor {
         // forwardPorts: published on localhost only — services in the
         // container become reachable from the host without exposing them
         // to the network.
+        // A tunnel an earlier IDE left holds the ports it forwarded on this
+        // machine; gone first, or this container's land one above them.
+        if !self.checkout().is_local() {
+            let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+            if keys.reap_orphan_tunnels() > 0 {
+                // A moment for the kernel to let the ports go.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
         let taken = self.ports_taken_elsewhere().await;
         let published = self.publish_ports(&config, &taken);
         for (port, host) in &published {

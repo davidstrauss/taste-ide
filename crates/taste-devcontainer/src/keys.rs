@@ -308,7 +308,70 @@ impl Keys {
         args.push("-p".into());
         args.push(port.to_string());
         args.push(format!("{}@127.0.0.1", crate::provision::GUEST_USER));
-        taste_core::podman::host_argv(self.sandboxed, "ssh", args)
+        let (program, mut argv) = taste_core::podman::host_argv(self.sandboxed, "ssh", args);
+        // From the sandbox, the tunnel is the host's process, and goes when
+        // `flatpak-spawn` does — which is when the sandbox does — rather
+        // than holding the ports after the IDE has gone.
+        if self.sandboxed {
+            argv.insert(0, "--watch-bus".into());
+        }
+        (program, argv)
+    }
+
+    /// Tunnels to this workspace's VMs that no living IDE owns: a tunnel's
+    /// ssh whose parent is not this process, found by its own arguments
+    /// (this workspace's key, `ExitOnForwardFailure`). An IDE that was
+    /// killed or crashed left its tunnel holding the ports it forwarded —
+    /// the next launch found Personal's 8000, 5173 and 3306 taken and
+    /// published its container on 8001, 5174 and 3307, while localhost:8000
+    /// went to nothing (2026-10-24). Killed, so the ports are free again.
+    /// Outside a sandbox only: from inside one the host's processes are not
+    /// visible, and `--watch-bus` keeps the tunnel from outliving it.
+    pub fn reap_orphan_tunnels(&self) -> usize {
+        if self.sandboxed {
+            return 0;
+        }
+        let me = std::process::id();
+        let key = self.identity().display().to_string();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return 0;
+        };
+        let mut reaped = 0;
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let argv: Vec<String> = cmdline
+                .split(|b| *b == 0)
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect();
+            if !is_tunnel_of(&argv, &key) {
+                continue;
+            }
+            let parent = std::fs::read_to_string(entry.path().join("stat"))
+                .ok()
+                .and_then(|stat| {
+                    // `pid (comm) state ppid …`; comm may hold spaces.
+                    let after = stat.rsplit_once(')')?.1;
+                    after.split_whitespace().nth(1)?.parse::<u32>().ok()
+                });
+            if parent == Some(me) {
+                continue;
+            }
+            tracing::info!("ending ssh tunnel {pid}, left by an IDE that is gone");
+            // SAFETY: a plain kill(2) of a pid read just now from /proc.
+            if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+                reaped += 1;
+            }
+        }
+        reaped
     }
 
     /// The `GIT_SSH_COMMAND` for a git talking to this workspace's VMs:
@@ -382,8 +445,43 @@ fn private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("restricting {}", dir.display()))
 }
 
+/// Whether `argv` is a port tunnel with `key`: ssh, `ExitOnForwardFailure`,
+/// that key, and a forward — what [`Keys::ssh_tunnel_argv`] runs, and
+/// nothing a user's own ssh would be.
+fn is_tunnel_of(argv: &[String], key: &str) -> bool {
+    argv.first()
+        .is_some_and(|program| program == "ssh" || program.ends_with("/ssh"))
+        && argv.iter().any(|arg| arg == "ExitOnForwardFailure=yes")
+        && argv.iter().any(|arg| arg == key)
+        && argv.iter().any(|arg| arg == "-L")
+}
+
 #[cfg(test)]
 mod tests {
+    /// A tunnel is told by its own arguments: this workspace's key and a
+    /// forward, never a user's ssh, nor another workspace's tunnel.
+    #[test]
+    fn a_tunnel_is_told_by_its_key_and_forward() {
+        let keys = super::Keys::for_workspace(std::path::Path::new("/work/sb"));
+        let key = keys.identity().display().to_string();
+        let (program, argv) = keys.ssh_tunnel_argv(36091, &[8000]);
+        let mut full = vec![program];
+        full.extend(argv);
+        if full[0] == "ssh" {
+            assert!(super::is_tunnel_of(&full, &key), "{full:?}");
+        }
+        let other = super::Keys::for_workspace(std::path::Path::new("/work/other"));
+        assert!(!super::is_tunnel_of(
+            &full,
+            &other.identity().display().to_string()
+        ));
+        let mine: Vec<String> = ["ssh", "-L", "8000:localhost:8000", "host"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(!super::is_tunnel_of(&mine, &key));
+    }
+
     use super::*;
 
     fn keys_with_host_key(dir: &Path) -> Keys {
