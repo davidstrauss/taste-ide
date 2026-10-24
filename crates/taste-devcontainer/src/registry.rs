@@ -3118,8 +3118,9 @@ impl EnvironmentRegistry {
         // Where the containers live, before anything asks podman anything.
         // This is the first await of the workspace's life and the only
         // place a VM is allowed to cost a minute — or, once per machine,
-        // the guest image's download, which is said before it starts
-        // because a gigabyte with no explanation is a hang.
+        // the guest image's download, which is drawn as it runs (the
+        // backlog's header, the startup page) because a gigabyte with no
+        // explanation is a hang.
         // The stream first: what it names is what a VM made in this
         // reconcile is built from, and what every VM's release is judged
         // against (`crate::guest` → the stream, followed).
@@ -3160,8 +3161,11 @@ impl EnvironmentRegistry {
             } else {
                 "Fetching the guest image for this machine's VMs (about 1 GiB, once)"
             };
+            // The log only: the backlog's header draws the fetch as it runs
+            // and the startup page has it as a step, so a toast said it a
+            // third time (David, 2026-10-24: "I don't need a toast for
+            // this").
             taste_core::app_log::push("info", "substrate", notice);
-            self.events.publish(Event::Toast(notice.to_string()));
         }
         // The download drawn in the window as it runs: every phase change
         // and every few megabytes, never every chunk — the bus reaches the
