@@ -1525,11 +1525,22 @@ impl BacklogPanel {
                 if index < 0 {
                     return;
                 }
+                // An issue with no environment here is chosen too, as the
+                // environment it would be: the panes go there and say how
+                // to start it (David, 2026-10-24: "let an env be selected
+                // even when it's not running").
                 let env = panel
                     .listed
                     .borrow()
                     .get(index as usize)
-                    .and_then(|listed| listed.env.clone());
+                    .and_then(|listed| {
+                        listed.env.clone().or_else(|| {
+                            listed
+                                .issue
+                                .as_deref()
+                                .and_then(|id| crate::environments::for_issue(id).ok())
+                        })
+                    });
                 panel.sync_actions();
                 if let Some(env) = env {
                     panel.choose(&env);
@@ -3608,6 +3619,26 @@ impl BacklogPanel {
     }
 
     /// Whether File may act: a title, or something attached.
+    /// Whether `id` is an issue on the backlog.
+    pub fn has_issue(&self, id: &str) -> bool {
+        self.issues.borrow().iter().any(|issue| issue.id == id)
+    }
+
+    /// Start the issue `id` on `host`, as the bar's Start does: its
+    /// environment made, or started where it is. For a call to action that
+    /// is not the bar.
+    pub fn start_issue_by_id(&self, id: &str, host: taste_core::environment::Host) {
+        let found = self
+            .issues
+            .borrow()
+            .iter()
+            .find(|issue| issue.id == id)
+            .map(|issue| (issue.id.clone(), issue.title.clone(), issue.body.clone()));
+        if let Some((id, title, body)) = found {
+            self.start(id, title, body, host);
+        }
+    }
+
     /// Hand a written issue to the window to start.
     fn start(&self, id: String, title: String, body: String, host: taste_core::environment::Host) {
         if let Some(hook) = self.on_start.borrow().as_ref() {

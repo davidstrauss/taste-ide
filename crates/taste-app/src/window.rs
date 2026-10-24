@@ -599,7 +599,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // click on its row while it was being made did nothing at all.
     let aim_pending: Rc<RefCell<Option<taste_core::environment::EnvironmentId>>> =
         Rc::new(RefCell::new(None));
+    // The editor's empty page, as the aimed environment stands: its play
+    // while it is not running, "No Files Open" while it is.
+    let dress_call: Rc<dyn Fn(&taste_core::environment::EnvironmentId)> = {
+        let editor = editor.clone();
+        let environments = environments.clone();
+        let filetree = filetree.clone();
+        let events = workspace.events.clone();
+        Rc::new(move |env: &taste_core::environment::EnvironmentId| {
+            let call = call_to_action(env, &environments, &filetree, &events);
+            editor.set_call_to_action(call);
+        })
+    };
     let aim_panes: std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)> = {
+        let dress_call = dress_call.clone();
         let startup_follow = startup_follow.clone();
         let startup_wanted = startup_wanted.clone();
         let aim_pending = aim_pending.clone();
@@ -644,6 +657,34 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // the registry has a word for it.
                         let being_made = aim_pending.borrow().as_ref() == Some(&env)
                             || environments.creating().iter().any(|(made, _)| *made == env);
+                        let absent = !being_made
+                            && !env.is_primary()
+                            && filetree.backlog().has_issue(env.as_str());
+                        if absent {
+                            // An issue with no environment here: the panes
+                            // go to it all the same, and its play is where
+                            // its files would be.
+                            tracing::info!("panes: aimed at {env}, which has no environment");
+                            aim_pending.borrow_mut().take();
+                            watch_slot.borrow_mut().aim(None);
+                            for supervisor in environments.list() {
+                                supervisor.set_panes_watching(false);
+                            }
+                            filetree.aim_absent(
+                                env.clone(),
+                                &format!("{env} has no environment"),
+                                "Start, in the middle of the window, makes one on this machine.",
+                            );
+                            editor.aim_at(&env);
+                            console.note_watching(&env);
+                            chats.show(&env);
+                            dress_call(&env);
+                            let follow = startup_follow.borrow().clone();
+                            if let Some(follow) = follow {
+                                follow(&env);
+                            }
+                            return;
+                        }
                         if being_made {
                             // There at once, as far as anything can be: its
                             // own tabs with its start in front, its chat's
@@ -661,6 +702,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             editor.aim_at(&env);
                             console.note_watching(&env);
                             chats.show_being_made(&env);
+                            dress_call(&env);
                             let follow = startup_follow.borrow().clone();
                             if let Some(follow) = follow {
                                 follow(&env);
@@ -707,6 +749,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             if let Some(follow) = follow {
                 follow(&env);
             }
+            // ...and, while it is not running, how to start it.
+            dress_call(&env);
         })
     };
     {
@@ -1620,6 +1664,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // `TASTE_PROBE_PENDING=i-0901`: the panes gone to an environment still
     // being made, as Start sends them — its own tab set, its chat's page,
     // its row lit, the files area saying what is coming.
+    // `TASTE_PROBE_AIM=i-0002`: the panes aimed at that environment as a
+    // click on its row aims them — for an issue with no environment, or a
+    // stopped one, the play in the middle of the window.
+    if let Ok(env) = std::env::var("TASTE_PROBE_AIM") {
+        if let Ok(env) = taste_core::environment::EnvironmentId::parse(&env) {
+            let aim_panes = aim_panes.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(3000), move || {
+                aim_panes(Some(env));
+            });
+        }
+    }
     // After the view's own seeding, whose files would otherwise open over
     // it and take the panes home as a click on one would.
     if let Ok(env) = std::env::var("TASTE_PROBE_PENDING") {
@@ -4298,6 +4353,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let startup = startup.clone();
         let startup_for = startup_for.clone();
         let aim_pending_for_events = aim_pending.clone();
+        let dress_call_for_events = dress_call.clone();
         let startup_shown = startup_shown.clone();
         let startups_for_events = startups.clone();
         let editor = editor.clone();
@@ -4512,6 +4568,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // back out when it goes. This is the only
                         // subscriber here that is not primary-only.
                         chats.on_environment_state(&env, &state);
+                        // The empty page's play comes and goes with it.
+                        if filetree.aimed_environment() == env {
+                            dress_call_for_events(&env);
+                        }
                         let running = matches!(
                             state,
                             taste_core::event::DevcontainerStateEvent::Running { .. }
@@ -4972,6 +5032,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             .take_if(|wanted| *wanted == env);
                         if wanted.is_some() {
                             aim_panes(Some(env));
+                        } else if filetree.aimed_environment() == env {
+                            dress_call_for_events(&env);
                         }
                     }
                     // The whole forget fan-out, and the only copy of it.
@@ -6230,6 +6292,87 @@ fn start_issue(
 /// begin from one brief.
 fn issue_prompt(issue: &crate::backlog::StartedIssue) -> String {
     taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body)
+}
+
+/// The editor's call to action for `env` while it is not running: stopped,
+/// failed to start, not yet built, or not made here at all — what it is,
+/// and a play that starts it as the backlog's Start would. `None` while it
+/// runs, or while it is on its way up, which its startup page shows.
+fn call_to_action(
+    env: &taste_core::environment::EnvironmentId,
+    environments: &std::sync::Arc<taste_devcontainer::EnvironmentRegistry>,
+    filetree: &Rc<crate::filetree::FileTree>,
+    events: &taste_core::EventBus,
+) -> Option<crate::editor::CallToAction> {
+    use taste_devcontainer::supervisor::SupervisorState as S;
+    let name = if env.is_primary() {
+        "Personal".to_string()
+    } else {
+        env.to_string()
+    };
+    let start: Rc<dyn Fn()> = {
+        let env = env.clone();
+        let environments = environments.clone();
+        let backlog = filetree.backlog().clone();
+        let events = events.clone();
+        Rc::new(move || {
+            // An issue's environment starts as its Start does — made, or
+            // started where it is; Personal's container is brought up.
+            if !env.is_primary() && backlog.has_issue(env.as_str()) {
+                backlog.start_issue_by_id(env.as_str(), environments.host_of(&env));
+                return;
+            }
+            if let Some(supervisor) = environments.get(&env) {
+                let events = events.clone();
+                let env = env.clone();
+                crate::runtime::runtime().spawn(async move {
+                    if let Err(e) = supervisor.reload().await {
+                        events.publish(taste_core::Event::Toast(format!("{env}: {e:#}")));
+                    }
+                });
+            }
+        })
+    };
+    let (title, description, label) = match environments.get(env).map(|s| s.state()) {
+        Some(S::Running { .. } | S::Building | S::Starting | S::Preparing { .. }) => return None,
+        Some(S::Stopped) => (
+            format!("{name} Is Stopped"),
+            "Its checkout and its conversation are kept. Start brings its container back up."
+                .to_string(),
+            "Start",
+        ),
+        Some(S::Failed { message }) => (
+            format!("{name} Did Not Start"),
+            format!(
+                "{}\nStart tries again; the Environment Build log has the rest.",
+                message.lines().next().unwrap_or_default()
+            ),
+            "Start Again",
+        ),
+        Some(S::NoConfig | S::ConfigDetected) => (
+            format!("{name} Is Not Running"),
+            "Start builds its container and brings it up.".to_string(),
+            "Start",
+        ),
+        // Not here: being made, which its start shows, or an issue with no
+        // environment on this machine.
+        None if environments.creating().iter().any(|(made, _)| made == env) => return None,
+        None if !env.is_primary() && filetree.backlog().has_issue(env.as_str()) => (
+            format!("{name} Has No Environment"),
+            "Start makes one on this machine: a clone of the project, its own container, and \
+             an agent given the issue."
+                .to_string(),
+            "Start",
+        ),
+        None => return None,
+    };
+    Some(crate::editor::CallToAction {
+        title,
+        description,
+        label: label.to_string(),
+        tooltip: format!("Start {name}"),
+        act: start,
+    })
 }
 
 /// The ports an environment forwards, said in a refusal: `3000, 5173`,

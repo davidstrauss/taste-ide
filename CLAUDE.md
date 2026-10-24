@@ -323,6 +323,9 @@ under a running baseline; `=ask` poses git's
 question on the strip (a key's passphrase, hidden, with its send button and close) and
 `=touch` its notice (a security key waiting for a touch), which
 otherwise need a Pull over a remote that asks;
+`TASTE_PROBE_AIM=i-0002` aims the panes as a click on that row does — an
+issue with no environment, or a stopped one, poses the editor's play in
+the middle of the window (`Editor::set_call_to_action`);
 `TASTE_PROBE_PENDING=i-0901` aims the panes at an environment still being
 made, as Start does — its own tab set, its chat's page, its row lit, and
 the files area saying its files come with its checkout (`FileTree::

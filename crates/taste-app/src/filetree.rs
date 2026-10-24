@@ -482,6 +482,7 @@ pub struct FileTree {
     /// being made, which has no checkout to list yet ([`FileTree::aim_pending`]).
     files_face: gtk::Stack,
     pending_title: gtk::Label,
+    pending_note: gtk::Label,
     /// The environment the panes went to before it existed: aimed at, as
     /// far as everything else is concerned, until its checkout is placed
     /// and [`FileTree::aim_at`] aims at it for real.
@@ -2091,10 +2092,6 @@ impl FileTree {
             .css_classes(["heading"])
             .build();
         let pending_note = gtk::Label::builder()
-            .label(
-                "Its files appear here once its checkout is placed. Its start is in front, \
-                 step by step.",
-            )
             .xalign(0.0)
             .wrap(true)
             .css_classes(["dim-label", "caption"])
@@ -2150,6 +2147,7 @@ impl FileTree {
             list_holder,
             files_face,
             pending_title,
+            pending_note,
             pending: RefCell::new(None),
             intervention: intervention.clone(),
             branch_label,
@@ -4463,11 +4461,29 @@ impl FileTree {
     /// 2026-10-24: "I should be able to immediately focus an env as soon as
     /// I click start"). [`Self::aim_at`] takes over once it exists.
     pub fn aim_pending(self: &Rc<Self>, env: taste_core::environment::EnvironmentId) {
+        let title = format!("{env} is being made");
+        self.aim_absent(
+            env,
+            &title,
+            "Its files appear here once its checkout is placed. Its start is in front, step by \
+             step.",
+        );
+    }
+
+    /// Aim at an environment with no checkout here — being made, or not
+    /// made at all (an issue not started on this machine): where the panes
+    /// are, with `title` and `note` where its files would be.
+    pub fn aim_absent(
+        self: &Rc<Self>,
+        env: taste_core::environment::EnvironmentId,
+        title: &str,
+        note: &str,
+    ) {
         self.close_open_menu();
         self.close_intervention();
         self.selection.borrow_mut().clear();
-        self.pending_title
-            .set_label(&format!("{env} is being made"));
+        self.pending_title.set_label(title);
+        self.pending_note.set_label(note);
         self.files_face.set_visible_child_name("pending");
         // It has no ports or tasks yet: none of Personal's stand in.
         self.set_ports(Vec::new());

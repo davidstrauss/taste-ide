@@ -276,6 +276,21 @@ fn port_key(env: &taste_core::environment::EnvironmentId, port: u16) -> PathBuf 
     PathBuf::from(format!("port:{env}")).join(port.to_string())
 }
 
+/// What the empty page says with no files open.
+const NO_FILES_TITLE: &str = "No Files Open";
+const NO_FILES_DESCRIPTION: &str = "Open a file from the sidebar, or ask the agent.";
+
+/// The empty page's call to action for an environment that is not running
+/// ([`Editor::set_call_to_action`]): what it says, its play's label and
+/// tooltip, and what the play does.
+pub struct CallToAction {
+    pub title: String,
+    pub description: String,
+    pub label: String,
+    pub tooltip: String,
+    pub act: Rc<dyn Fn()>,
+}
+
 /// A tab bar for `view`, made once for it and never given another view
 /// (see `Editor::tab_bar`). Natural-width tabs: sized by their title, so
 /// opening another file never resizes the existing tabs. Reordering is
@@ -639,6 +654,12 @@ pub struct Editor {
     /// finishes opening after the panes moved lands where it belongs
     /// without moving them back.
     views: RefCell<HashMap<taste_core::environment::EnvironmentId, adw::TabView>>,
+    /// The page shown when the view on screen holds nothing, and the call
+    /// to action it carries when the aimed environment is not running.
+    empty_page: adw::StatusPage,
+    empty_action: gtk::Button,
+    empty_action_label: adw::ButtonContent,
+    on_empty_action: RefCell<Option<Rc<dyn Fn()>>>,
     /// Where the views are shown, beside the empty page. Homogeneous, as
     /// a stack is by default, so the strip is as wide as the widest
     /// environment's tabs need whichever is on screen: when only the one
@@ -808,9 +829,23 @@ impl Editor {
 
         let empty = adw::StatusPage::builder()
             .icon_name("taste-empty-folder")
-            .title("No Files Open")
-            .description("Open a file from the sidebar, or ask the agent.")
+            .title(NO_FILES_TITLE)
+            .description(NO_FILES_DESCRIPTION)
             .build();
+        // The call to action an environment that is not running puts on
+        // the empty page: its play, under what it would start
+        // (`Editor::set_call_to_action`).
+        let empty_action_label = adw::ButtonContent::builder()
+            .icon_name("media-playback-start-symbolic")
+            .label("Start")
+            .build();
+        let empty_action = gtk::Button::builder()
+            .child(&empty_action_label)
+            .halign(gtk::Align::Center)
+            .css_classes(["pill", "suggested-action"])
+            .visible(false)
+            .build();
+        empty.set_child(Some(&empty_action));
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
         stack.add_named(&empty, Some("empty"));
@@ -846,6 +881,10 @@ impl Editor {
                 tabs.clone(),
             )])),
             view_stack: stack.clone(),
+            empty_page: empty.clone(),
+            empty_action: empty_action.clone(),
+            empty_action_label: empty_action_label.clone(),
+            on_empty_action: RefCell::new(None),
             scrolls: RefCell::new(HashMap::new()),
             on_view_changed: RefCell::new(None),
             view_tools,
@@ -895,8 +934,46 @@ impl Editor {
 
         editor.wire_view(&tabs);
         editor.show_view();
+        {
+            let weak = Rc::downgrade(&editor);
+            empty_action.connect_clicked(move |_| {
+                let Some(editor) = weak.upgrade() else { return };
+                let action = editor.on_empty_action.borrow().clone();
+                if let Some(action) = action {
+                    action();
+                }
+            });
+        }
 
         editor
+    }
+
+    /// What the empty page says while the aimed environment is not running,
+    /// and the play that starts it — or, with `None`, that no files are
+    /// open (David, 2026-10-24: "show a call to action to start it in the
+    /// main docs area (with a play button to do so), not just that no files
+    /// are open"). The window keeps it in step with the environment.
+    pub fn set_call_to_action(&self, call: Option<CallToAction>) {
+        match call {
+            Some(call) => {
+                // What is wrong, not the play again: that is the button's.
+                self.empty_page
+                    .set_icon_name(Some("taste-container-off-symbolic"));
+                self.empty_page.set_title(&call.title);
+                self.empty_page.set_description(Some(&call.description));
+                self.empty_action_label.set_label(&call.label);
+                self.empty_action.set_tooltip_text(Some(&call.tooltip));
+                self.empty_action.set_visible(true);
+                *self.on_empty_action.borrow_mut() = Some(call.act);
+            }
+            None => {
+                self.empty_page.set_icon_name(Some("taste-empty-folder"));
+                self.empty_page.set_title(NO_FILES_TITLE);
+                self.empty_page.set_description(Some(NO_FILES_DESCRIPTION));
+                self.empty_action.set_visible(false);
+                self.on_empty_action.borrow_mut().take();
+            }
+        }
     }
 
     /// The tab view on screen: the aimed environment's.

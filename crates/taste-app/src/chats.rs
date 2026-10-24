@@ -621,10 +621,10 @@ impl Chats {
         } else {
             "Start an Agent"
         });
-        // An environment that no longer exists cannot be given an agent,
-        // and one being made has nothing to start yet.
+        // An environment that is not here — gone, not made, or being made —
+        // has nothing to give an agent yet; its Start is the editor's.
         self.start_button.set_sensitive(exists);
-        self.start_button.set_visible(!being_made);
+        self.start_button.set_visible(exists);
     }
 
     // --- the chats --------------------------------------------------------
@@ -1270,8 +1270,11 @@ fn credential_needed() -> bool {
 pub fn empty_state(env: &EnvironmentId, exists: bool, no_credential: bool) -> (String, String) {
     if !exists {
         return (
-            "Environment Gone".to_string(),
-            format!("{env} no longer exists. Pick another one from the panel below the files."),
+            "No Environment Here".to_string(),
+            format!(
+                "{env} has no environment on this machine. Its chat starts here once one is \
+                 made: Start, where its files would be."
+            ),
         );
     }
     if no_credential {
@@ -1340,7 +1343,7 @@ mod tests {
         assert!(description.contains("model server"), "{description}");
         // A gone environment is gone whatever the credential.
         let (title, _) = empty_state(&env("calm-1"), false, true);
-        assert_eq!(title, "Environment Gone");
+        assert_eq!(title, "No Environment Here");
     }
 
     /// A chat's model choice as the pane holds it across spawns, which is
@@ -1440,12 +1443,17 @@ mod tests {
         assert_eq!(again.refused(), None);
     }
 
-    /// An environment destroyed under the view says so, and does not offer
-    /// to start an agent in a clone that is gone.
+    /// An environment that is not here says so, and points at the Start
+    /// where its files would be, rather than offering to start an agent
+    /// in a clone that does not exist.
     #[test]
-    fn a_destroyed_environment_offers_nothing() {
+    fn an_environment_not_here_points_at_its_start() {
         let (title, description) = empty_state(&env("calm-1"), false, false);
-        assert_eq!(title, "Environment Gone");
-        assert!(description.contains("no longer exists"), "{description}");
+        assert_eq!(title, "No Environment Here");
+        assert!(
+            description.contains("no environment on this machine"),
+            "{description}"
+        );
+        assert!(description.contains("Start"), "{description}");
     }
 }
