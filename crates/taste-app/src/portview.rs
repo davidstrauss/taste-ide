@@ -416,13 +416,13 @@ impl PortPage {
         let back = gtk::Button::builder()
             .icon_name("go-previous-symbolic")
             .css_classes(["flat"])
-            .tooltip_text("Back")
+            .tooltip_text("Back (Alt+←)")
             .sensitive(false)
             .build();
         let forward = gtk::Button::builder()
             .icon_name("go-next-symbolic")
             .css_classes(["flat"])
-            .tooltip_text("Forward")
+            .tooltip_text("Forward (Alt+→)")
             .sensitive(false)
             .build();
         let reload = gtk::Button::builder()
@@ -583,6 +583,37 @@ impl PortPage {
                     }
                 }
             });
+        }
+        // Alt+Left and Alt+Right go back and forward, as in any browser;
+        // WebKitGTK leaves them to the application, as it does the mouse's
+        // buttons. On the whole face and ahead of the page, so they work
+        // from the address bar and from the page's own text fields alike,
+        // which is where a browser takes them too.
+        {
+            let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = Rc::downgrade(&page);
+            keys.connect_key_pressed(move |_, key, _, state| {
+                let alt_alone = state & gtk::accelerator_get_default_mod_mask()
+                    == gtk::gdk::ModifierType::ALT_MASK;
+                let back = match key {
+                    gtk::gdk::Key::Left | gtk::gdk::Key::KP_Left => true,
+                    gtk::gdk::Key::Right | gtk::gdk::Key::KP_Right => false,
+                    _ => return gtk::glib::Propagation::Proceed,
+                };
+                let Some(page) = weak.upgrade().filter(|_| alt_alone) else {
+                    return gtk::glib::Propagation::Proceed;
+                };
+                if let Some(view) = page.browser.borrow().as_ref() {
+                    if back && view.can_go_back() {
+                        view.go_back();
+                    } else if !back && view.can_go_forward() {
+                        view.go_forward();
+                    }
+                }
+                gtk::glib::Propagation::Stop
+            });
+            browser_face.add_controller(keys);
         }
         page
     }
@@ -923,6 +954,22 @@ impl PortPage {
                 }
                 page.back.set_sensitive(view.can_go_back());
                 page.forward.set_sensitive(view.can_go_forward());
+            });
+        }
+        // And whenever the history itself moves, which a page brought back
+        // from WebKit's page cache does only after its address is out: read
+        // at the address alone, a step forward left Back dim and Forward
+        // lit. The signal is not in the bindings (one argument is a bare
+        // pointer), so it is joined by name, and its arguments go unread.
+        if let Some(history) = webkit6::prelude::WebViewExt::back_forward_list(&view) {
+            let weak = Rc::downgrade(self);
+            let target = view.downgrade();
+            history.connect_local("changed", false, move |_| {
+                if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
+                    page.back.set_sensitive(view.can_go_back());
+                    page.forward.set_sensitive(view.can_go_forward());
+                }
+                None
             });
         }
         // Pages in tabs of their own (David, 2026-10-22: "Can we get tab
