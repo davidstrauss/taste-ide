@@ -459,15 +459,29 @@ fn ask_in_window(prompt: &str, kind: AskKind) -> glib::ExitCode {
 }
 
 /// The script git and ssh are pointed at: this binary, with the flag, in
-/// the workspace's own state directory. Rewritten on every call, so a
-/// binary that moved (a rebuild, an install) is followed. `None` when it
-/// cannot be written, and the caller falls back to asking nothing.
+/// the workspace's own state directory. Rewritten on every call, so each
+/// running IDE names its own. `None` when it cannot be written, and the
+/// caller falls back to asking nothing.
 pub fn helper_script(workspace_root: &Path) -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
     helper_script_in(
         &taste_core::state::workspace_state_dir(workspace_root),
-        &exe,
+        &running_binary()?,
     )
+}
+
+/// This process's binary as a path that runs it: `/proc/<pid>/exe`, which
+/// stays this binary after a rebuild replaces the file, where the path it
+/// was started from then names `… (deleted)`, which `current_exe` hands
+/// back verbatim. Such a script ran nothing, so a security key's "touch
+/// it" never reached the strip while ssh waited for the touch (2026-10-24).
+/// It is also the helper that speaks this IDE's protocol, which a newer
+/// build at the old path need not.
+fn running_binary() -> Option<PathBuf> {
+    let own = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+    if own.exists() {
+        return Some(own);
+    }
+    std::env::current_exe().ok()
 }
 
 /// [`helper_script`] with the directory and binary given — for the test.
@@ -582,6 +596,21 @@ mod tests {
         assert_eq!(
             kind_of("Username for 'https://github.com': ", None),
             AskKind::Text
+        );
+    }
+
+    /// The helper names the running binary by the path that outlives a
+    /// rebuild of it, never by the file name it was started from.
+    #[test]
+    fn the_helper_runs_this_binary_even_once_it_was_rebuilt() {
+        let binary = super::running_binary().unwrap();
+        assert_eq!(
+            binary,
+            std::path::PathBuf::from(format!("/proc/{}/exe", std::process::id()))
+        );
+        assert_eq!(
+            std::fs::canonicalize(&binary).unwrap(),
+            std::env::current_exe().unwrap()
         );
     }
 
