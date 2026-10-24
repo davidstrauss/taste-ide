@@ -798,7 +798,7 @@ async fn write_loop(mut stdin: tokio::process::ChildStdin, mut rx: mpsc::Receive
 /// Read frames off the helper's stdout, opening, feeding and closing
 /// connections as they arrive.
 async fn read_loop(
-    mut stdout: tokio::process::ChildStdout,
+    mut stdout: impl tokio::io::AsyncRead + Unpin,
     env: EnvironmentId,
     services: Arc<dyn ChannelServices>,
     writes: mpsc::Sender<Vec<u8>>,
@@ -853,12 +853,29 @@ async fn read_loop(
                     }
                 }
                 Frame::Close { channel } => {
-                    open.remove(&channel);
+                    if let Some(mut write_half) = open.remove(&channel) {
+                        hang_up(&mut write_half).await;
+                    }
                 }
             }
         }
     }
     alive.store(false, Ordering::SeqCst);
+    // The helper is gone — its container stopped, or it was killed — and
+    // every connection through it with it: each is hung up, so whatever
+    // the IDE serves on it ends, rather than waiting on a peer that is not
+    // there (a task run reported through it stood "running" after a
+    // rebuild had taken its container, 2026-10-24).
+    for (_, mut write_half) in open.drain() {
+        hang_up(&mut write_half).await;
+    }
+}
+
+/// End the container's half of a connection, so the IDE's server reading
+/// it sees the end: dropping the half alone ends nothing while the other
+/// half — `client_bound`'s, still reading what the server says — lives.
+async fn hang_up(write_half: &mut tokio::io::WriteHalf<ChannelStream>) {
+    let _ = write_half.shutdown().await;
 }
 
 /// One live connection's IDE→container direction: whatever the IDE's server
@@ -889,6 +906,72 @@ async fn client_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection the container closes, and every connection when the
+    /// helper goes, reaches the IDE's server as the end of its stream:
+    /// dropped without a hang-up, a reported task run waited on its peer
+    /// for ever and stood "running" after its container was gone.
+    #[test]
+    fn a_connection_ends_when_its_container_end_does() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Keep(Mutex<Vec<ChannelStream>>);
+        impl ChannelServices for Keep {
+            fn serves(&self, _: Service) -> bool {
+                true
+            }
+            fn accept(&self, _: &EnvironmentId, _: Service, stream: ChannelStream) {
+                self.0.lock().unwrap().push(stream);
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let kept = Arc::new(Keep(Mutex::new(Vec::new())));
+            let (mut helper, ide) = tokio::io::duplex(64 * 1024);
+            let (writes, _frames) = mpsc::channel::<Vec<u8>>(64);
+            let looping = tokio::spawn(read_loop(
+                ide,
+                EnvironmentId::primary(),
+                kept.clone(),
+                writes,
+                Arc::new(AtomicBool::new(true)),
+            ));
+            for channel in [1, 2] {
+                helper
+                    .write_all(
+                        &Frame::Open {
+                            channel,
+                            service: Service::Tasks,
+                        }
+                        .encode(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            helper
+                .write_all(&Frame::Close { channel: 1 }.encode())
+                .await
+                .unwrap();
+            let ends = |stream: ChannelStream| async move {
+                let mut stream = stream;
+                let mut byte = [0u8; 1];
+                tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+                    .await
+                    .map(|read| matches!(read, Ok(0)))
+                    .unwrap_or(false)
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let first = kept.0.lock().unwrap().remove(0);
+            assert!(ends(first).await, "closed in the container: ended here");
+            // The helper gone: the one still open ends too.
+            drop(helper);
+            looping.await.unwrap();
+            let second = kept.0.lock().unwrap().remove(0);
+            assert!(ends(second).await, "the helper gone: ended here");
+        });
+    }
 
     /// A run outlives the IDE it was reported to: its connection dropped —
     /// the IDE closed — it goes on, journaled; a listener at the same socket

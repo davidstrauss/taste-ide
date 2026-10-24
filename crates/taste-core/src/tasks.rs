@@ -682,7 +682,8 @@ impl TaskBoard {
             Some(code) => (RunState::Failed, format!("— failed: exit status {code} —")),
             None => (
                 RunState::Failed,
-                "— ended without saying how (the terminal or shell went away) —".to_string(),
+                "— ended without saying how (its terminal, shell, or container went away) —"
+                    .to_string(),
             ),
         };
         if let Some(run) = self.runs.lock().unwrap().get_mut(&key) {
