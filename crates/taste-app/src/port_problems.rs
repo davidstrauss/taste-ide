@@ -17,7 +17,10 @@
 //! Where the reason is the IDE's own — the network guard, a port not
 //! forwarded — or WebKit's — 0.0.0.0, which it refuses outright — the row
 //! says so. Everything else is the Web Inspector's to explain, and the
-//! popover opens it.
+//! popover opens it — as does the toggle beside the count, which shows and
+//! closes the inspector whether or not anything went wrong. Prompt Agent
+//! hands the list to the environment's agent, as a failed task's output is
+//! handed over (`tasks::repair_prompt`).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -83,11 +86,25 @@ struct Problem {
     text: String,
 }
 
+/// Where Prompt Agent sends what it composed: the prompt, and the list as
+/// its attachment's file name and text.
+pub type PromptHook = Rc<dyn Fn(String, (String, String))>;
+
 /// The browser's problem count and the list behind it, one per port page.
 pub struct Problems {
     pub button: gtk::MenuButton,
+    /// The Web Inspector, shown and closed: after the count on the bar.
+    pub inspect: gtk::ToggleButton,
+    /// Set while the toggle is being told what the inspector did, so the
+    /// telling is not taken for a press.
+    following_inspector: Cell<bool>,
     count: gtk::Label,
     rows: gtk::Box,
+    popover: gtk::Popover,
+    /// The port the page's server listens on, in its environment.
+    port: u16,
+    on_prompt: RefCell<Option<PromptHook>>,
+    prompt_agent: gtk::Button,
     /// The host ports the environment forwards, for saying why a file on
     /// one of this machine's ports was not let through.
     forwarded: Vec<u16>,
@@ -102,7 +119,7 @@ pub struct Problems {
 }
 
 impl Problems {
-    pub fn new(forwarded: Vec<u16>) -> Rc<Self> {
+    pub fn new(port: u16, forwarded: Vec<u16>) -> Rc<Self> {
         let count = gtk::Label::new(None);
         let face = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         face.append(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
@@ -114,10 +131,20 @@ impl Problems {
             .max_content_height(320)
             .child(&rows)
             .build();
-        let inspect = gtk::Button::builder()
-            .label("Open Web Inspector")
+        let inspect = gtk::Button::builder().label("Open Web Inspector").build();
+        let prompt_agent = gtk::Button::builder()
+            .label("Prompt Agent")
+            .tooltip_text("Hand this list to the environment's agent to fix")
+            // Shown once there is an agent to hand it to.
+            .visible(false)
+            .build();
+        let actions = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
             .halign(gtk::Align::End)
             .build();
+        actions.append(&inspect);
+        actions.append(&prompt_agent);
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -135,7 +162,7 @@ impl Problems {
                 .build(),
         );
         content.append(&scroller);
-        content.append(&inspect);
+        content.append(&actions);
         let popover = gtk::Popover::builder().child(&content).build();
         // A probe target of its own: `window.port-problems`.
         popover.set_widget_name("port-problems");
@@ -145,10 +172,21 @@ impl Problems {
             .css_classes(["flat", "warning"])
             .visible(false)
             .build();
+        let inspector_toggle = gtk::ToggleButton::builder()
+            .icon_name("taste-inspect-symbolic")
+            .css_classes(["flat"])
+            .tooltip_text("Web Inspector")
+            .build();
         let problems = Rc::new(Self {
             button,
+            inspect: inspector_toggle,
+            following_inspector: Cell::new(false),
             count,
             rows,
+            popover: popover.clone(),
+            port,
+            on_prompt: RefCell::new(None),
+            prompt_agent: prompt_agent.clone(),
             forwarded,
             found: RefCell::new(Vec::new()),
             status: Cell::new(None),
@@ -157,21 +195,77 @@ impl Problems {
         });
         {
             let weak = Rc::downgrade(&problems);
-            let popover = popover.downgrade();
             inspect.connect_clicked(move |_| {
                 let Some(problems) = weak.upgrade() else {
                     return;
                 };
-                if let Some(popover) = popover.upgrade() {
-                    popover.popdown();
+                problems.popover.popdown();
+                problems.inspect.set_active(true);
+            });
+        }
+        {
+            let weak = Rc::downgrade(&problems);
+            problems.inspect.connect_toggled(move |toggle| {
+                let Some(problems) = weak.upgrade() else {
+                    return;
+                };
+                if problems.following_inspector.get() {
+                    return;
                 }
                 let view = problems.view.borrow().as_ref().and_then(|v| v.upgrade());
                 if let Some(inspector) = view.and_then(|view| view.inspector()) {
-                    inspector.show();
+                    if toggle.is_active() {
+                        inspector.show();
+                    } else {
+                        inspector.close();
+                    }
                 }
             });
         }
+        {
+            let weak = Rc::downgrade(&problems);
+            prompt_agent.connect_clicked(move |_| {
+                let Some(problems) = weak.upgrade() else {
+                    return;
+                };
+                problems.popover.popdown();
+                problems.prompt();
+            });
+        }
         problems
+    }
+
+    /// Where Prompt Agent hands the list. Until it is set the button is not
+    /// shown: a list with nobody to give it to offers nothing.
+    pub fn set_on_prompt(&self, hook: PromptHook) {
+        *self.on_prompt.borrow_mut() = Some(hook);
+        self.prompt_agent.set_visible(true);
+    }
+
+    /// The toggle says what the inspector is doing, however it was opened
+    /// or closed — from here, from the list, or from the page's own
+    /// Inspect Element.
+    fn follow_inspector(&self, open: bool) {
+        self.following_inspector.set(true);
+        self.inspect.set_active(open);
+        self.following_inspector.set(false);
+    }
+
+    /// Prompt Agent: the list as it stands, with the page it is about.
+    fn prompt(&self) {
+        let Some(hook) = self.on_prompt.borrow().clone() else {
+            return;
+        };
+        let url = self
+            .view
+            .borrow()
+            .as_ref()
+            .and_then(|v| v.upgrade())
+            .and_then(|view| view.uri())
+            .map(|uri| uri.to_string())
+            .unwrap_or_default();
+        let (prompt, attachment) = repair_prompt(self.port, &url, &self.all());
+        hook(prompt, attachment);
     }
 
     /// Give a new content manager the watcher and its handler. Once per
@@ -195,6 +289,29 @@ impl Problems {
     /// finishes, and its list read whenever the watcher pings.
     pub fn watch(self: &Rc<Self>, view: &webkit6::WebView) {
         *self.view.borrow_mut() = Some(view.downgrade());
+        if let Some(inspector) = view.inspector() {
+            // Opened, docked or in a window of its own; and closed.
+            let weak = Rc::downgrade(self);
+            inspector.connect_attach(move |_| {
+                if let Some(problems) = weak.upgrade() {
+                    problems.follow_inspector(true);
+                }
+                false
+            });
+            let weak = Rc::downgrade(self);
+            inspector.connect_open_window(move |_| {
+                if let Some(problems) = weak.upgrade() {
+                    problems.follow_inspector(true);
+                }
+                false
+            });
+            let weak = Rc::downgrade(self);
+            inspector.connect_closed(move |_| {
+                if let Some(problems) = weak.upgrade() {
+                    problems.follow_inspector(false);
+                }
+            });
+        }
         {
             let weak = Rc::downgrade(self);
             view.connect_load_changed(move |view, event| {
@@ -261,7 +378,9 @@ impl Problems {
     }
 
     /// The count on the button, and the rows behind it.
-    fn show(&self) {
+    /// Every problem, the page's status first, each with what is known of
+    /// why — what the list shows and what Prompt Agent hands over.
+    fn all(&self) -> Vec<(Problem, String)> {
         let mut all: Vec<Problem> = Vec::new();
         if let Some(status) = self.status.get() {
             all.push(Problem {
@@ -270,6 +389,22 @@ impl Problems {
             });
         }
         all.extend(self.found.borrow().iter().cloned());
+        all.into_iter()
+            .map(|problem| {
+                let detail = match problem.kind {
+                    Kind::Resource => why(&problem.text, &self.forwarded).unwrap_or_else(|| {
+                        "Did not load — the Web Inspector's Network tab says why".into()
+                    }),
+                    Kind::Script => "A script error nothing caught".into(),
+                    Kind::Status => "The server's own answer, drawn as it sent it".into(),
+                };
+                (problem, detail)
+            })
+            .collect()
+    }
+
+    fn show(&self) {
+        let all = self.all();
         self.button.set_visible(!all.is_empty());
         self.count.set_label(&all.len().to_string());
         self.button.set_tooltip_text(Some(&match all.len() {
@@ -279,14 +414,7 @@ impl Problems {
         while let Some(row) = self.rows.first_child() {
             self.rows.remove(&row);
         }
-        for problem in &all {
-            let detail = match problem.kind {
-                Kind::Resource => why(&problem.text, &self.forwarded).unwrap_or_else(|| {
-                    "Did not load — the Web Inspector's Network tab says why".into()
-                }),
-                Kind::Script => "A script error nothing caught".into(),
-                Kind::Status => "The server's own answer, drawn as it sent it".into(),
-            };
+        for (problem, detail) in &all {
             let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
             row.append(
                 &gtk::Label::builder()
@@ -306,7 +434,7 @@ impl Problems {
             );
             row.append(
                 &gtk::Label::builder()
-                    .label(&detail)
+                    .label(detail)
                     .css_classes(["caption", "dim-label"])
                     .xalign(0.0)
                     .wrap(true)
@@ -323,6 +451,56 @@ impl Problems {
     pub fn open_for_probe(&self) {
         self.button.popup();
     }
+}
+
+/// What Prompt Agent sends: the page and its problems, the list attached
+/// with what the IDE knows of each one's cause.
+fn repair_prompt(
+    port: u16,
+    url: &str,
+    problems: &[(Problem, String)],
+) -> (String, (String, String)) {
+    let file = format!("port-{port}-problems.txt");
+    let list = problems
+        .iter()
+        .map(|(problem, why)| {
+            let kind = match problem.kind {
+                Kind::Resource => "did not load",
+                Kind::Script => "script error",
+                Kind::Status => "page status",
+            };
+            format!("- {kind}: {}\n  why: {why}", problem.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let page = if url.is_empty() {
+        format!("The page served on port {port}")
+    } else {
+        format!("The page {url}, served on port {port},")
+    };
+    let n = problems.len();
+    let prompt = format!(
+        "{page} had {n} problem{} loading in the IDE's browser.\n\n\
+         WHAT IS TRUE\n\
+         The server listens on port {port} in this environment. The problems are attached as \
+         {file}: files that did not load, script errors nothing caught, and the page's own \
+         error status, each with what the IDE knows of its cause.\n\n\
+         HOW TO WORK\n\
+         1. Read the attached list before changing anything.\n\
+         2. Where a cause is named (0.0.0.0, a port not forwarded, a host this browser cannot \
+         reach), fix the project's configuration: the address the server gives out, or \
+         forwardPorts in .devcontainer/devcontainer.json, then call devcontainer_reload.\n\
+         3. Otherwise reproduce it here: request the failing addresses with curl through \
+         ide_exec, and read the server's output with devcontainer_logs. You cannot see the \
+         browser's console or network log; ide_screenshot of the editor shows the page while \
+         its tab is in front.\n\
+         4. Fix the cause in the project, request each failing address again, and check it \
+         now loads.\n\
+         5. If the fix needs something only the user can give, stop and say exactly what.\n\
+         6. Finish with one short paragraph: the cause, and what you changed.",
+        if n == 1 { "" } else { "s" },
+    );
+    (prompt, (file, list))
 }
 
 /// The watcher's list, as JSON; anything else is no list.
@@ -401,6 +579,35 @@ fn why(url: &str, forwarded: &[u16]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prompt Agent names the page and its port, and attaches every
+    /// problem with its cause, under a name that says what it is.
+    #[test]
+    fn the_prompt_attaches_every_problem_with_its_cause() {
+        let problems = vec![
+            (
+                Problem {
+                    kind: Kind::Status,
+                    text: "The page answered HTTP 500".into(),
+                },
+                "The server's own answer, drawn as it sent it".into(),
+            ),
+            (
+                Problem {
+                    kind: Kind::Resource,
+                    text: "http://0.0.0.0:5173/resources/sass/app.scss".into(),
+                },
+                "This browser refuses 0.0.0.0.".into(),
+            ),
+        ];
+        let (prompt, (file, list)) = repair_prompt(8000, "http://localhost:41234/", &problems);
+        assert!(prompt
+            .starts_with("The page http://localhost:41234/, served on port 8000, had 2 problems"));
+        assert!(prompt.contains(&file));
+        assert_eq!(file, "port-8000-problems.txt");
+        assert!(list.contains("- page status: The page answered HTTP 500"));
+        assert!(list.contains("- did not load: http://0.0.0.0:5173/resources/sass/app.scss\n  why: This browser refuses 0.0.0.0."));
+    }
 
     /// The reason a row gives is the one the IDE or WebKit is behind, and
     /// none at all for what only the server could say.

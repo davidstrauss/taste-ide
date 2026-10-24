@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- </> — the page's own code: the port browser's Web Inspector toggle.
+     Filled outlines of 1.5px strokes rather than strokes: drawn with
+     stroke attributes, it came out as two solid triangles and no slash. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="#241f31">
+    <path d="M4.22 3.97 L0.19 8 L4.22 12.03 L5.28 10.97 L2.31 8 L5.28 5.03 Z"/>
+    <path d="M11.78 3.97 L15.81 8 L11.78 12.03 L10.72 10.97 L13.69 8 L10.72 5.03 Z"/>
+    <path d="M8.52 2.58 L9.98 2.92 L7.48 13.42 L6.02 13.08 Z"/>
+  </g>
+</svg>

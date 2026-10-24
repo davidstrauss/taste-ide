@@ -2676,6 +2676,19 @@ impl Editor {
         }
         let page = crate::portview::PortPage::new(env.as_str(), spec.clone(), forwarded, facts);
         page.set_on_new_tab(self.port_new_tab_hook(env));
+        {
+            // The problems list's Prompt Agent: to the agent of the
+            // environment the port is forwarded from, as a notebook's goes.
+            let weak = Rc::downgrade(self);
+            let env = env.clone();
+            page.set_on_prompt_agent(Rc::new(move |prompt, attachment| {
+                let Some(editor) = weak.upgrade() else { return };
+                let hook = editor.on_prompt_agent.borrow().clone();
+                if let Some(hook) = hook {
+                    hook(env.clone(), prompt, Some(attachment));
+                }
+            }));
+        }
         let tab = self.tabs().append(&page.widget);
         tab.set_title(&if env.is_primary() {
             spec.title()

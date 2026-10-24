@@ -217,6 +217,9 @@ pub struct PortPage {
     device_toggles: gtk::Box,
     /// What went wrong loading the page, counted at the address bar's end.
     problems: Rc<crate::port_problems::Problems>,
+    /// Where the problems' Prompt Agent goes; passed on to every page
+    /// opened from this one, as the new-tab hook is.
+    on_prompt: RefCell<Option<crate::port_problems::PromptHook>>,
 }
 
 /// Whether the page's own text colour is a light one: its root's computed
@@ -432,8 +435,9 @@ impl PortPage {
         browser_bar.append(&forward);
         browser_bar.append(&reload);
         browser_bar.append(&address);
-        let problems = crate::port_problems::Problems::new(forwarded.clone());
+        let problems = crate::port_problems::Problems::new(spec.port, forwarded.clone());
         browser_bar.append(&problems.button);
+        browser_bar.append(&problems.inspect);
         let browser_holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
         browser_holder.set_vexpand(true);
         // The page held to its device's width, centred, without raising
@@ -494,6 +498,7 @@ impl PortPage {
             device_clamp,
             device_toggles,
             problems,
+            on_prompt: RefCell::new(None),
         });
         page.build_device_toggles();
         {
@@ -657,6 +662,13 @@ impl PortPage {
         *self.on_new_tab.borrow_mut() = Some(hook);
     }
 
+    /// Where the problems list's Prompt Agent hands its prompt: the agent
+    /// of this page's environment.
+    pub fn set_on_prompt_agent(&self, hook: crate::port_problems::PromptHook) {
+        self.problems.set_on_prompt(hook.clone());
+        *self.on_prompt.borrow_mut() = Some(hook);
+    }
+
     /// What a tab of this port is called before its page says: the port.
     pub fn title(&self) -> String {
         self.spec.title()
@@ -695,6 +707,9 @@ impl PortPage {
         page.install_view(&view);
         page.set_face(PortFace::Browser);
         page.set_on_new_tab(hook.clone());
+        if let Some(prompt) = self.on_prompt.borrow().clone() {
+            page.set_on_prompt_agent(prompt);
+        }
         if let Some(uri) = uri {
             view.load_uri(uri);
         }
