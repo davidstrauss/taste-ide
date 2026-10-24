@@ -246,7 +246,7 @@ impl Chats {
                 // With no credential the button reads Add a Credential…:
                 // the form is in a conversation's settings, so the
                 // conversation is made and its settings opened on it.
-                let missing = taste_acp::authproxy::credential_missing();
+                let missing = credential_needed();
                 if let Some(pane) = chats.start_agent_in(&env) {
                     if missing {
                         pane.open_credential();
@@ -578,7 +578,7 @@ impl Chats {
     /// What the empty state says about the environment that has no chat.
     fn dress_empty(&self, env: &EnvironmentId) {
         let exists = self.environments.get(env).is_some();
-        let missing = taste_acp::authproxy::credential_missing();
+        let missing = credential_needed();
         let (title, description) = empty_state(env, exists, missing);
         self.empty.set_title(&title);
         self.empty.set_description(Some(&description));
@@ -621,9 +621,9 @@ impl Chats {
 
     /// Whether a message typed now has a chat to go to: the selected
     /// environment exists — [`Chats::chat_for_send`] gives one with no
-    /// agent its agent — and that chat has what it spends on. A new chat
-    /// starts on Claude Code, behind the proxy, so with no pane it is the
-    /// project's credential that decides.
+    /// agent its agent — and that chat has what it spends on. With no
+    /// pane it is the project's credentials that decide
+    /// ([`credential_needed`]).
     pub fn readiness(&self) -> crate::compose::ChatReadiness {
         use crate::compose::ChatReadiness;
         if self.environments.get(&self.current.borrow()).is_none() {
@@ -631,7 +631,7 @@ impl Chats {
         }
         let unconfigured = match self.selected() {
             Some(pane) => pane.unconfigured(),
-            None => taste_acp::authproxy::credential_missing(),
+            None => credential_needed(),
         };
         if unconfigured {
             ChatReadiness::NoCredential
@@ -688,6 +688,11 @@ impl Chats {
                 if !Rc::ptr_eq(&previous, &pane) {
                     pane.inherit_settings(&previous);
                 }
+            }
+            // A chat that would spend an Anthropic account the project
+            // does not have starts on the model server it does have.
+            if pane.unconfigured() && taste_acp::authproxy::custom_model().is_some() {
+                pane.set_agent_id(taste_acp::CLAUDE_CODE_CUSTOM);
             }
         }
         if *self.current.borrow() == *env {
@@ -1219,6 +1224,13 @@ fn nothing_here(text: &str) -> gtk::Widget {
         .upcast()
 }
 
+/// Whether a chat started now would have nothing to spend on: no
+/// Anthropic credential, and no model server of the project's own for
+/// [`Chats::start_agent_in`] to start it on instead.
+fn credential_needed() -> bool {
+    taste_acp::authproxy::credential_missing() && taste_acp::authproxy::custom_model().is_none()
+}
+
 pub fn empty_state(env: &EnvironmentId, exists: bool, no_credential: bool) -> (String, String) {
     if !exists {
         return (
@@ -1228,9 +1240,10 @@ pub fn empty_state(env: &EnvironmentId, exists: bool, no_credential: bool) -> (S
     }
     if no_credential {
         return (
-            "No Anthropic Credential".to_string(),
-            "Agents here spend this project's own Anthropic account, and it has none yet. \
-             Add a token, and the chat takes messages from then on."
+            "No Credential".to_string(),
+            "Agents here spend this project's own credential — an Anthropic account, or a \
+             model server of your own — and it has none yet. Add one, and the chat takes \
+             messages from then on."
                 .to_string(),
         );
     }
@@ -1285,8 +1298,10 @@ mod tests {
     #[test]
     fn the_empty_state_asks_for_the_credential_a_chat_needs() {
         let (title, description) = empty_state(&EnvironmentId::primary(), true, true);
-        assert_eq!(title, "No Anthropic Credential");
-        assert!(description.contains("Add a token"), "{description}");
+        assert_eq!(title, "No Credential");
+        assert!(description.contains("Add one"), "{description}");
+        // Not only an Anthropic account: a model server counts too.
+        assert!(description.contains("model server"), "{description}");
         // A gone environment is gone whatever the credential.
         let (title, _) = empty_state(&env("calm-1"), false, true);
         assert_eq!(title, "Environment Gone");

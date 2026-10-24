@@ -151,7 +151,8 @@ pub fn availability(
                 }
                 ChatReadiness::NoCredential => {
                     return Err(
-                        "this project has no Anthropic credential — add one in the chat's Settings",
+                        "this chat's agent has no credential in this project — add one in the \
+                         chat's Settings",
                     )
                 }
             }
