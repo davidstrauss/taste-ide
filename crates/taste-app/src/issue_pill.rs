@@ -34,7 +34,7 @@
 //! never sits on its capsule.
 //!
 //! The facts come from [`IssueIndex`], one per window, filled from the
-//! same read of `refs/taste/issues` that fills the backlog. A reference
+//! same read of `refs/issues/queue` that fills the backlog. A reference
 //! to an id the index does not have is still a pill, read as a reference
 //! to a **deleted** issue: ids are random and never reused, so an id the
 //! ref no longer holds was almost certainly one it once did (David,

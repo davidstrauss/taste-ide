@@ -2694,7 +2694,7 @@ privileged clone.
 
 ## Issues: a ref, not a service
 
-**Shipped.** Issue tracking lives at `refs/taste/issues` in the main
+**Shipped.** Issue tracking lives at `refs/issues/queue` in the main
 checkout — no database, no server, nothing in the working tree. One
 directory per issue: `issues/<id>/issue.md` (front-matter + markdown
 body) with comments as sibling files under `comments/`. Three storage
@@ -2768,7 +2768,7 @@ promote its own issue above the user's is exactly the one not to serve on
 a worker's socket.)
 
 Durability rides the user's own push: the IDE's push includes
-`refs/taste/issues:refs/taste/issues` when the ref exists, and is
+`refs/issues/queue:refs/issues/queue` when the ref exists, and is
 byte-identical to the old push until it does. Sync fetches the remote's
 ref into a tracking ref and fast-forwards the local one when that is
 clean; when both sides moved it says so in one line and changes nothing.
@@ -4964,7 +4964,7 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    live run has not been repeated since the simplification), the model
    calling what is now `issue_start` off the descriptions alone,
    and the task landing in a second agent's real ACP session.
-7. ~~**Issues**~~ — **shipped.** `refs/taste/issues` with one directory per
+7. ~~**Issues**~~ — **shipped.** `refs/issues/queue` with one directory per
    issue, comments as sibling files, and ids allocated inside the
    compare-and-swap; five tools on every socket with the caller's identity
    taken from it; the close gate enforced in `issue_update` against the

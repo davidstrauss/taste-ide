@@ -490,6 +490,14 @@ to.
   PROJECT USE"). The most the IDE does for a project that names nobody is
   a banner that says so, names the user's identity, and copies it into the
   repository's own config only when the user says to.
+- **Nothing pushed carries Taste's fingerprints.** No ref, signature, or
+  commit message that can reach a remote names the IDE: the issue queue is
+  `refs/issues/queue`, and what the IDE signs when a project names no
+  author is the generic `nobody <nobody@localhost>`
+  (`taste_git::NOBODY_NAME`), never `taste-ide` (David, 2026-10-24: "I
+  don't want fingerprints on what gets pushed with git"). What stays local
+  — `refs/taste/*` bookkeeping, reflog messages — and the names of VMs and
+  containers may say taste ("Naming VMs and containers taste is fine").
 - **Agent-facing text is designed for the smallest model that will read
   it, and never framed as coaching a lesser one.** Tool descriptions,
   tool results, the prompts the IDE composes, the errors it returns: short,

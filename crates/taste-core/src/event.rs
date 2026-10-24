@@ -203,7 +203,7 @@ pub enum Event {
     /// flagged for review, merged, rejected, or put back to work. The fleet
     /// view redraws on this rather than polling the board.
     EnvironmentReviewChanged { env: EnvironmentId },
-    /// An item was filed on the backlog (`refs/taste/issues`), by an agent
+    /// An item was filed on the backlog (`refs/issues/queue`), by an agent
     /// through `issue_create` or by the user in the IDE's own composer.
     ///
     /// `by` is who filed it: `None` is the user, the one filer that is not

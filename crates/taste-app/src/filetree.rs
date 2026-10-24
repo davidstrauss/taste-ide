@@ -3052,7 +3052,7 @@ impl FileTree {
 
     /// The workspace's issue queue, in the ref's own order. Read by the
     /// console (which is where the off-thread git passes live) and handed
-    /// here, so there is one read of `refs/taste/issues` per change and not
+    /// here, so there is one read of `refs/issues/queue` per change and not
     /// one per surface that renders it.
     pub fn set_issues(&self, issues: &[taste_git::Issue]) {
         self.backlog.set_issues(issues);
@@ -8164,7 +8164,7 @@ impl FileTree {
         // base it rebases onto and the fork it pushes to. What moves the
         // branch is the button's: ↓ its own copy on the remote, ⇊ the
         // canonical branch ([`PullFrom`]).
-        let Some((fetch, fetch_issues, move_command, remote, upstream)) =
+        let Some((fetch, (fetch_issues, fetch_legacy_issues), move_command, remote, upstream)) =
             self.git.borrow().as_ref().map(|git| {
                 let target = match (&branch, from) {
                     (Some(branch), PullFrom::Own) => git.own_target_of(branch),
@@ -8174,7 +8174,10 @@ impl FileTree {
                 let onto = target.as_deref().unwrap_or("@{upstream}");
                 (
                     git.fetch_all_command(),
-                    git.fetch_issues_command(),
+                    (
+                        git.fetch_issues_command(),
+                        git.fetch_legacy_issues_command(),
+                    ),
                     match mode {
                         Pull::Rebase => Some(git.rebase_onto_command(onto)),
                         Pull::FastForward => Some(git.fast_forward_onto_command(onto)),
@@ -8446,9 +8449,20 @@ impl FileTree {
             // seen an issue makes this fail, which is the normal case
             // before the first push, so its failure is silence rather than
             // a toast about something the user did not ask for.
-            let fetched = crate::runtime::runtime()
+            let mut fetched = crate::runtime::runtime()
                 .spawn(run_git_step(fetch_issues.0, fetch_issues.1, envs.clone()))
                 .await;
+            // Nothing under the queue's name: perhaps a remote an earlier
+            // version pushed it to under the old one, read the same way.
+            if !matches!(fetched, Ok(Ok(_))) {
+                fetched = crate::runtime::runtime()
+                    .spawn(run_git_step(
+                        fetch_legacy_issues.0,
+                        fetch_legacy_issues.1,
+                        envs.clone(),
+                    ))
+                    .await;
+            }
             if matches!(fetched, Ok(Ok(_))) {
                 // Adopted, fast-forwarded, or — when both machines moved
                 // it — the local issues rebased onto the remote's, quietly,

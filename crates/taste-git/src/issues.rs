@@ -1,6 +1,6 @@
 //! Issues: a ref, not a service.
 //!
-//! One file per issue on `refs/taste/issues` in the user's main checkout —
+//! One file per issue on `refs/issues/queue` in the user's main checkout —
 //! no database, no server, no daemon, and nothing in the working tree. The
 //! ref travels with the repository, so an issue queue survives a machine,
 //! and it reaches GitHub only when the *user* pushes (see
@@ -57,8 +57,12 @@ use crate::GitWorkspace;
 
 mod rebase;
 
-/// Where the queue lives. One ref, one name, everywhere.
-pub const ISSUES_REF: &str = "refs/taste/issues";
+/// Where the queue lives. One ref, one name, everywhere — and a name that
+/// says what it holds and nothing of the IDE that keeps it, since it is
+/// pushed beside the user's branches (David, 2026-10-24: "I don't want
+/// fingerprints on what gets pushed with git"). Until then it was
+/// `refs/taste/issues` ([`LEGACY_ISSUES_REF`]).
+pub const ISSUES_REF: &str = "refs/issues/queue";
 
 /// The backlog order, beside the issues on the same ref: one id per line,
 /// top of the queue first.
@@ -130,10 +134,21 @@ pub fn is_issue_id(id: &str) -> bool {
 /// Fetching straight onto [`ISSUES_REF`] would let the remote overwrite
 /// local issues that were never pushed; this is the tracking ref the
 /// reconcile step compares against.
-pub const ISSUES_TRACKING_REF: &str = "refs/taste/issues-remote";
+pub const ISSUES_TRACKING_REF: &str = "refs/issues/fetched";
 
 /// The refspec the user's push carries alongside their branch.
-pub const ISSUES_PUSH_REFSPEC: &str = "refs/taste/issues:refs/taste/issues";
+pub const ISSUES_PUSH_REFSPEC: &str = "refs/issues/queue:refs/issues/queue";
+
+/// Where the queue was kept before [`ISSUES_REF`], locally and on remotes
+/// pushed to by earlier versions: moved over locally
+/// ([`GitWorkspace::adopt_legacy_issue_queue`]), and read from a remote that
+/// has nothing under the new name ([`GitWorkspace::fetch_legacy_issues_command`]).
+/// Never written, never pushed.
+pub const LEGACY_ISSUES_REF: &str = "refs/taste/issues";
+
+/// The old name's tracking ref, deleted with the move: what it tracked is
+/// fetched again under [`ISSUES_TRACKING_REF`].
+const LEGACY_ISSUES_TRACKING_REF: &str = "refs/taste/issues-remote";
 
 /// How many times a write re-reads and retries when the ref moved under it.
 const CAS_ATTEMPTS: usize = 8;
@@ -1493,6 +1508,50 @@ impl GitWorkspace {
             self.push_remote(),
             format!("+{ISSUES_REF}:{ISSUES_TRACKING_REF}"),
         ])
+    }
+
+    /// [`Self::fetch_issues_command`] for a remote an earlier version pushed
+    /// the queue to under [`LEGACY_ISSUES_REF`]: tried when the new name
+    /// finds nothing, onto the same tracking ref, so a fresh clone adopts
+    /// the queue as it always did. The next push gives the remote the new
+    /// name; the old one stays there until the user deletes it.
+    pub fn fetch_legacy_issues_command(&self) -> (String, Vec<String>) {
+        self.git_command_owned(vec![
+            "fetch".to_string(),
+            self.push_remote(),
+            format!("+{LEGACY_ISSUES_REF}:{ISSUES_TRACKING_REF}"),
+        ])
+    }
+
+    /// A queue still under [`LEGACY_ISSUES_REF`] moved to [`ISSUES_REF`],
+    /// and the old tracking ref dropped. Idempotent, and cheap when there is
+    /// nothing to move: one ref looked up. When both names hold a queue and
+    /// the new one does not already contain the old, the old is left where
+    /// it is rather than either being thrown away.
+    pub fn adopt_legacy_issue_queue(&self) -> Result<()> {
+        if let Ok(mut tracking) = self.repo.find_reference(LEGACY_ISSUES_TRACKING_REF) {
+            tracking.delete()?;
+        }
+        let Some(legacy) = self.read_ref(LEGACY_ISSUES_REF)? else {
+            return Ok(());
+        };
+        match self.read_ref(ISSUES_REF)? {
+            None => {
+                self.repo
+                    .reference(ISSUES_REF, legacy, false, "issues: moved to a neutral name")
+                    .context("moving the issue queue")?;
+            }
+            Some(current)
+                if current == legacy || self.repo.graph_descendant_of(current, legacy)? => {}
+            Some(_) => {
+                tracing::warn!(
+                    "{LEGACY_ISSUES_REF} and {ISSUES_REF} have both moved; the old one is kept"
+                );
+                return Ok(());
+            }
+        }
+        self.repo.find_reference(LEGACY_ISSUES_REF)?.delete()?;
+        Ok(())
     }
 
     /// Reconcile the fetched tracking ref into the local issues ref.
@@ -3004,5 +3063,54 @@ mod tests {
         let issues = ws.issues().unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "good");
+    }
+
+    /// A queue under the old name is moved to the neutral one the moment the
+    /// repository is opened, its tracking ref dropped; one already moved,
+    /// whose new name contains the old, loses the leftover; and when both
+    /// names moved apart, the old is kept rather than either thrown away.
+    #[test]
+    fn the_queue_under_its_old_name_moves_to_the_neutral_one() {
+        let (dir, ws) = temp_repo();
+        let head = ws.repo.head().unwrap().target().unwrap();
+        ws.set_ref(LEGACY_ISSUES_REF, head).unwrap();
+        ws.set_ref(LEGACY_ISSUES_TRACKING_REF, head).unwrap();
+        let ws = GitWorkspace::discover(dir.path()).unwrap();
+        assert_eq!(ws.read_ref(ISSUES_REF).unwrap(), Some(head));
+        assert_eq!(ws.read_ref(LEGACY_ISSUES_REF).unwrap(), None);
+        assert_eq!(ws.read_ref(LEGACY_ISSUES_TRACKING_REF).unwrap(), None);
+
+        // Both moved apart: an unrelated commit on the old name stays.
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tree = ws.repo.find_commit(head).unwrap().tree().unwrap();
+        let other = ws
+            .repo
+            .commit(None, &sig, &sig, "elsewhere", &tree, &[])
+            .unwrap();
+        ws.set_ref(LEGACY_ISSUES_REF, other).unwrap();
+        let ws = GitWorkspace::discover(dir.path()).unwrap();
+        assert_eq!(ws.read_ref(ISSUES_REF).unwrap(), Some(head));
+        assert_eq!(ws.read_ref(LEGACY_ISSUES_REF).unwrap(), Some(other));
+
+        // The old name behind the new: the leftover goes.
+        ws.set_ref(LEGACY_ISSUES_REF, head).unwrap();
+        let ws = GitWorkspace::discover(dir.path()).unwrap();
+        assert_eq!(ws.read_ref(LEGACY_ISSUES_REF).unwrap(), None);
+        assert!(!ISSUES_REF.contains("taste") && !ISSUES_TRACKING_REF.contains("taste"));
+    }
+
+    /// The queue's commits, in a project that names no author, are signed
+    /// by the generic nobody: neither the host's identity nor the IDE's.
+    #[test]
+    fn a_project_with_no_author_signs_its_queue_as_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let ws = GitWorkspace::discover(dir.path()).unwrap();
+        let sig = ws.ref_signature().unwrap();
+        assert_eq!(sig.name(), Some(crate::NOBODY_NAME));
+        assert_eq!(sig.email(), Some(crate::NOBODY_EMAIL));
+        let args = ws.identity_args().join(" ");
+        assert!(args.contains("user.name=nobody"), "{args}");
+        assert!(!args.contains("taste"), "{args}");
     }
 }

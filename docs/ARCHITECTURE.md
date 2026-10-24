@@ -74,7 +74,7 @@ configuration:
 | The project's named commands | `Taskfile.yml` at the root ([taskfile.dev](https://taskfile.dev); any name `task` looks for) — listed under Tasks in the flank as `task --list-all --json` in the environment says them, read off the file when it cannot, and run in the environment's container; a task's output is a log tab |
 | User file templates | `~/.config/taste-ide/templates/<file-name>/<variant>` — one plain file per variant; the directory listing *is* the configuration |
 | An environment's branch | `agents/<env>` in the main checkout — one per environment, derived from its id (`taste_git::env_branch`), never chosen |
-| The issue queue and its backlog order | `refs/taste/issues`: `issues/<id>/issue.md`, comments beside it, and one `order` file of ids |
+| The issue queue and its backlog order | `refs/issues/queue`: `issues/<id>/issue.md`, comments beside it, and one `order` file of ids |
 | Repo-level IDE config | `.taste.yaml` at the root — currently nothing needs it (state is not config and lives in `$XDG_STATE_HOME`); any future project-level setting that survives the convention-over-configuration bar goes here and nowhere else |
 | The Anthropic credential | `$XDG_STATE_HOME/taste-ide/workspaces/<name>-<hash of the root>/anthropic.json` — **this project's** IDE state, keyed by the checkout's root and never inside it, and never another program's storage (`taste_authproxy::credentials`) |
 | The account's model listing | `…/<name>-<hash>/models.json` beside it — a cache of the documented Models API, discarded on a version mismatch. Per project because it caches what *that credential's* account can run (`taste_authproxy::models`) |
@@ -236,7 +236,7 @@ What that leaves genuinely enforced, in every mode:
   error, never the enforcement. Push is a deliberate, user-only action in
   the file tree header — and that one action is now what carries the issue
   queue to a remote as well: the push includes
-  `refs/taste/issues:refs/taste/issues` when the ref exists. Agents write
+  `refs/issues/queue:refs/issues/queue` when the ref exists. Agents write
   issues through IDE tools all day and still cannot publish one anywhere;
   a queue leaves this machine because a human pressed the button that
   already meant "send my work out".
@@ -1990,10 +1990,13 @@ NoConfig → ConfigDetected → Building → Starting → Running
   the IDE also remembers in the workspace's state (`git-author`), so a
   re-clone that takes `.git/config` away does not lose it
   (`taste_git::project_identity`). Never the host's: `~/.gitconfig` is the
-  user's machine state, and a project that names no author commits as
-  nobody, with git's "Author identity unknown" saying so, until the user
-  copies an author in from the file tree's banner, which names the identity
-  it would copy and copies nothing unasked. (Earlier versions copied the
+  user's machine state. In a project that names no author, the user's
+  commits refuse with git's "Author identity unknown" until the user copies
+  an author in from the file tree's banner, which names the identity it
+  would copy and copies nothing unasked; what the IDE must sign regardless
+  — the issue queue's commits, a rebase's committer, its own bookkeeping —
+  is signed `nobody <nobody@localhost>` (`taste_git::NOBODY_NAME`), never
+  with the IDE's name, since nothing pushed should carry its fingerprints. (Earlier versions copied the
   host's pair into every container and into the primary's checkout; a
   start takes those copies back out.)
   Build output streams to the supervisor console tab and into a ring buffer

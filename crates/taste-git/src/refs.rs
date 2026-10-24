@@ -3,7 +3,7 @@
 //! Two things live here, both plumbing for docs/ENVIRONMENTS.md:
 //!
 //! - **The `refs/taste/*` substrate.** Issue tracking is "a ref, not a
-//!   service": one file per issue on `refs/taste/issues` in the main
+//!   service": one file per issue on `refs/issues/queue` in the main
 //!   checkout. So the IDE must be able to commit a tree to a ref it chooses
 //!   **without touching HEAD, the index, or the working tree** — the user is
 //!   working in that checkout, and bookkeeping must be invisible to them.
@@ -545,16 +545,13 @@ impl GitWorkspace {
     }
 
     /// Signature for IDE bookkeeping commits. The project's author when it
-    /// names one; otherwise the IDE signs as itself rather than failing an
-    /// issue write — and never as the host's identity, since these commits
-    /// are pushed with the issues. Unlike [`GitWorkspace::commit`], nothing
-    /// here is the user's authored work.
+    /// names one; otherwise [`crate::NOBODY_NAME`] rather than failing an
+    /// issue write — never the host's identity or the IDE's name, since
+    /// these commits are pushed with the issues. Unlike
+    /// [`GitWorkspace::commit`], nothing here is the user's authored work.
     pub(crate) fn ref_signature(&self) -> Result<git2::Signature<'static>> {
-        match self.project_signature() {
-            Ok(sig) => Ok(sig),
-            Err(_) => git2::Signature::now("taste-ide", "taste-ide@localhost")
-                .context("building a signature"),
-        }
+        self.project_signature()
+            .or_else(|_| crate::nobody_signature())
     }
 }
 
@@ -633,7 +630,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    const ISSUES: &str = "refs/taste/issues";
+    const ISSUES: &str = "refs/issues/queue";
 
     fn temp_repo() -> (tempfile::TempDir, GitWorkspace) {
         let dir = tempfile::tempdir().unwrap();

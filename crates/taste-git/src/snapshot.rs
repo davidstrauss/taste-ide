@@ -430,10 +430,12 @@ pub fn script_avoiding(name: &str, avoid: Option<Oid>) -> Result<String> {
     }
     let synced = crate::sync_ignored::snapshot_lines();
     let avoid = avoid.map(|oid| oid.to_string()).unwrap_or_default();
+    // Shell-safe as they stand: a bare word and an address.
+    let (nobody, nobody_email) = (crate::NOBODY_NAME, crate::NOBODY_EMAIL);
     Ok(format!(
         r#"set -eu
-export GIT_AUTHOR_NAME=taste-ide GIT_AUTHOR_EMAIL=taste-ide@localhost
-export GIT_COMMITTER_NAME=taste-ide GIT_COMMITTER_EMAIL=taste-ide@localhost
+export GIT_AUTHOR_NAME={nobody} GIT_AUTHOR_EMAIL={nobody_email}
+export GIT_COMMITTER_NAME={nobody} GIT_COMMITTER_EMAIL={nobody_email}
 export GIT_OPTIONAL_LOCKS=0
 name='{name}'
 avoid='{avoid}'

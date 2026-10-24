@@ -150,7 +150,7 @@ pub fn ensure_repository(folder: &Path) -> Result<bool> {
         }
         index.write()?;
         let tree = repo.find_tree(index.write_tree()?)?;
-        let signature = git2::Signature::now("taste-ide", "taste-ide@localhost")?;
+        let signature = crate::nobody_signature()?;
         repo.commit(
             Some("HEAD"),
             &signature,

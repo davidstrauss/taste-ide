@@ -510,7 +510,7 @@ pub struct Console {
     /// holds a live VTE — the user's own terminal among them — so it is
     /// moved out of sight, never closed.
     stowed_shells: RefCell<HashMap<EnvironmentId, adw::TabView>>,
-    /// The workspace's issue queue, read off `refs/taste/issues` in the
+    /// The workspace's issue queue, read off `refs/issues/queue` in the
     /// main checkout, in the order the `order` file puts it in.
     ///
     /// **Read here, rendered elsewhere.** The console owns the read because
@@ -1519,7 +1519,7 @@ impl Console {
     /// fleet, so a subscriber here is woken by change and not by events.
     /// `published` rides along because the notification digest needs the
     /// branch names, not just the counts the rows carry.
-    /// Who draws the queue. Called on every read of `refs/taste/issues`,
+    /// Who draws the queue. Called on every read of `refs/issues/queue`,
     /// including the first.
     pub fn set_on_issues_changed(&self, hook: impl Fn(&[taste_git::Issue]) + 'static) {
         *self.on_issues_changed.borrow_mut() = Some(Box::new(hook));
@@ -1565,7 +1565,7 @@ impl Console {
             .count()
     }
 
-    /// Re-read `refs/taste/issues` from the user's main checkout, in the
+    /// Re-read `refs/issues/queue` from the user's main checkout, in the
     /// order the `order` file puts it in.
     ///
     /// Off the main thread, like every other git pass here: this is a tree

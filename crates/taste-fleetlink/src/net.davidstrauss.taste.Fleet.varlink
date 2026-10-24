@@ -187,7 +187,7 @@ method List() -> (
   flaggedForReview: int,
   # Every environment's spend, added up. The gauge's needle.
   spend: Spend,
-  # Open issues on the workspace's backlog (refs/taste/issues) — work the
+  # Open issues on the workspace's backlog (refs/issues/queue) — work the
   # user or an agent has written down and nobody has finished. Not a sum
   # over the rows: issues belong to the workspace, and an unclaimed one
   # belongs to no environment at all.

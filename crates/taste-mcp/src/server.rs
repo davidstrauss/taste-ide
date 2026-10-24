@@ -3663,7 +3663,7 @@ impl McpServer {
                 Ok(json!({
                     "environment": env.as_str(),
                     "issue": issue_json(&issue),
-                    "note": "filed on refs/taste/issues in the user's checkout and visible in \
+                    "note": "filed on refs/issues/queue in the user's checkout and visible in \
                              their fleet view. It reaches a remote only when the user pushes.",
                 }))
             }
@@ -4844,7 +4844,7 @@ impl McpServer {
             "environment": caller.as_str(),
             "deleted": issue.id,
             "title": issue.title,
-            "note": "gone from refs/taste/issues in the user's checkout, comments and \
+            "note": "gone from refs/issues/queue in the user's checkout, comments and \
                      queue position with it. Nothing else on the queue moved.",
         }))
     }

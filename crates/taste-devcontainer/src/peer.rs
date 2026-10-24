@@ -546,9 +546,8 @@ pub const VM_BRANCH_NAMESPACE: &str = "refs/taste/vm/";
 /// refs only Personal's snapshot, which is what the mirror reads
 /// ([`VM_SNAPSHOT_NAMESPACE`]).
 ///
-/// Nothing else of `refs/taste` comes from the VM, because nothing else of
-/// it is the checkout's: the backlog (`refs/taste/issues`) is filed in the
-/// folder, the other environments' snapshots come from their own VMs, and
+/// Nothing else comes from the VM, because nothing else is the
+/// checkout's: the backlog (`refs/issues/queue`) is filed in the folder, the other environments' snapshots come from their own VMs, and
 /// the mirror's baseline is the folder's alone. This fetched
 /// `+refs/taste/*` once, which put the checkout's seed-time copy of the
 /// backlog over the folder's on every sync — issues filed since, gone —

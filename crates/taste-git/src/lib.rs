@@ -40,6 +40,7 @@ pub use issues::{
     is_issue_id, random_issue_id, random_slug, Attachment, Claim, Comment, Issue, IssueChange,
     IssueLink, IssueMove, IssueState, IssueSync, LinkCheck, NewAttachment, Resolution,
     StartOutcome, ISSUES_ORDER_PATH, ISSUES_PUSH_REFSPEC, ISSUES_REF, ISSUES_TRACKING_REF,
+    LEGACY_ISSUES_REF,
 };
 pub use mediate::{PublishMode, PublishOutcome, PublishStatus, RefUpdate, HUB_UPDATE_REFSPECS};
 pub use merge::{MergeOutcome, MergePolicy, MergeStatus};
@@ -65,6 +66,21 @@ pub use snapshot::{snapshot_ref, RestoreMode, Restored, Snapshot, SNAPSHOT_REF_P
 pub struct GitIdentity {
     pub name: String,
     pub email: String,
+}
+
+/// The name git is given when the project names no author and something
+/// must still be signed: the issue queue's commits, a rebase's committer,
+/// the IDE's own bookkeeping. Generic on purpose — the Unix name for no
+/// one in particular — so neither the host's identity nor the IDE's name
+/// is left on anything a push can carry (David, 2026-10-24: "I don't want
+/// Taste's fingerprints on the data it works with").
+pub const NOBODY_NAME: &str = "nobody";
+/// [`NOBODY_NAME`]'s email.
+pub const NOBODY_EMAIL: &str = "nobody@localhost";
+
+/// [`NOBODY_NAME`] as a signature.
+pub fn nobody_signature() -> Result<git2::Signature<'static>> {
+    Ok(git2::Signature::now(NOBODY_NAME, NOBODY_EMAIL)?)
 }
 
 /// The identity `repo` sets in its own config — the local level only, so
@@ -544,7 +560,13 @@ impl GitWorkspace {
             .ok()
             .or_else(|| Repository::open(private::find_private(root)?).ok())?;
         let workdir = repo.workdir()?.to_path_buf();
-        Some(Self { repo, workdir })
+        let git = Self { repo, workdir };
+        // The issue queue under its old name moved to its neutral one, here
+        // where every reader and writer of it comes through.
+        if let Err(e) = git.adopt_legacy_issue_queue() {
+            tracing::warn!("the issue queue could not be moved to its new name: {e:#}");
+        }
+        Some(git)
     }
 
     pub fn workdir(&self) -> &Path {
@@ -1004,7 +1026,7 @@ impl GitWorkspace {
     }
 
     /// The user's push, carrying extra refspecs alongside the branch — e.g.
-    /// `refs/taste/issues:refs/taste/issues`, so the issues ref rides along
+    /// `refs/issues/queue:refs/issues/queue`, so the issues ref rides along
     /// on a push the human triggered (docs/ENVIRONMENTS.md, "Issues: a ref,
     /// not a service").
     ///
@@ -1095,14 +1117,14 @@ impl GitWorkspace {
     }
 
     /// `-c user.name=… -c user.email=…` for a git the IDE runs here: the
-    /// project's author, or the IDE's own name when the project names
-    /// nobody. On the command line because it outranks every config file —
+    /// project's author, or [`NOBODY_NAME`] when the project names none.
+    /// On the command line because it outranks every config file —
     /// left to itself, a rebase or a stash signs with `~/.gitconfig`, the
     /// host's identity, and a rebased commit is pushed (`GitIdentity`).
     fn identity_args(&self) -> Vec<String> {
         let identity = local_identity(&self.repo).unwrap_or_else(|| GitIdentity {
-            name: "taste-ide".into(),
-            email: "taste-ide@localhost".into(),
+            name: NOBODY_NAME.into(),
+            email: NOBODY_EMAIL.into(),
         });
         vec![
             "-c".into(),
@@ -1877,7 +1899,7 @@ mod tests {
         );
 
         // With extras and no upstream: origin, this branch, extras last.
-        let (program, args) = ws.push_command_with(&["refs/taste/issues:refs/taste/issues"]);
+        let (program, args) = ws.push_command_with(&["refs/issues/queue:refs/issues/queue"]);
         assert_eq!(program, "git");
         assert_eq!(
             args,
@@ -1888,7 +1910,7 @@ mod tests {
                     PUSH_SUBMODULES,
                     "origin",
                     &format!("HEAD:refs/heads/{branch}"),
-                    "refs/taste/issues:refs/taste/issues",
+                    "refs/issues/queue:refs/issues/queue",
                 ]
             )
         );
@@ -1908,7 +1930,7 @@ mod tests {
                 .unwrap();
         }
         let ws = GitWorkspace::discover(dir.path()).unwrap();
-        let (_, args) = ws.push_command_with(&["refs/taste/issues:refs/taste/issues"]);
+        let (_, args) = ws.push_command_with(&["refs/issues/queue:refs/issues/queue"]);
         // On the upstream's host, a submodule is pushed to in its scheme.
         let align = transport::align_args(Some("https://example.invalid/repo.git"));
         let at = lead(&ws, &[]).len();
@@ -1922,7 +1944,7 @@ mod tests {
                     PUSH_SUBMODULES,
                     "hub",
                     "HEAD:refs/heads/trunk",
-                    "refs/taste/issues:refs/taste/issues",
+                    "refs/issues/queue:refs/issues/queue",
                 ]
             )
         );

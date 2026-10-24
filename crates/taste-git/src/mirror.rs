@@ -682,7 +682,7 @@ impl GitWorkspace {
             }
         }
         let tree = self.repo.find_tree(tree)?;
-        let signature = git2::Signature::now("taste-ide", "taste-ide@localhost")?;
+        let signature = crate::nobody_signature()?;
         let commit = self
             .repo
             .commit(None, &signature, &signature, &message, &tree, &[])?;
@@ -872,7 +872,7 @@ impl GitWorkspace {
             }
         }
         let tree = self.repo.find_tree(tree)?;
-        let signature = git2::Signature::now("taste-ide", "taste-ide@localhost")?;
+        let signature = crate::nobody_signature()?;
         let commit = self
             .repo
             .commit(None, &signature, &signature, &message, &tree, &[])?;
@@ -1295,7 +1295,7 @@ mod tests {
         fs::write(dir.path().join("untracked.txt"), "loose\n").unwrap();
         let tree = ws.worktree_tree().unwrap();
         let tree = ws.repo.find_tree(tree).unwrap();
-        let signature = git2::Signature::now("taste-ide", "taste-ide@localhost").unwrap();
+        let signature = crate::nobody_signature().unwrap();
         let old = ws
             .repo
             .commit(

@@ -188,7 +188,7 @@ pub struct Row {
 pub struct Snapshot {
     /// The open workspace's directory name.
     pub workspace: String,
-    /// Open issues on `refs/taste/issues`.
+    /// Open issues on `refs/issues/queue`.
     ///
     /// The one number here that is *not* a sum over the rows, and it is
     /// stored rather than derived for a reason: issues belong to the

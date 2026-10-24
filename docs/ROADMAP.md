@@ -70,7 +70,7 @@ each with its own clone of the main checkout and its own devcontainer;
 mediated publish of agent branches into the main checkout for review;
 per-environment safe mode (the devcontainer repair loop applies to every
 environment); an orchestrator chat with fleet view; issues on
-`refs/taste/issues`. Hard invariant throughout: **agents never push to
+`refs/issues/queue`. Hard invariant throughout: **agents never push to
 the real remote (GitHub) — that is the user's act alone.**
 
 Phases (each lands green and independently useful):
