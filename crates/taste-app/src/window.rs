@@ -364,50 +364,37 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             board: task_runs.clone(),
         });
     }
+    // One listing at a time: a call while one is out is folded into a
+    // single listing after it. Every tree change asks, and each listing is
+    // a `podman exec` into the environment, so a Composer install that
+    // changed the tree four times a second had 235 of them waiting on a
+    // VM short of memory (2026-10-24).
     let refresh_tasks: Rc<dyn Fn()> = {
         let filetree = filetree.clone();
         let environments = environments.clone();
         let task_runs = task_runs.clone();
+        let listing_out = Rc::new(Cell::new(false));
+        let asked_again = Rc::new(Cell::new(false));
         Rc::new(move || {
-            let env = filetree.aimed_environment();
-            let Some(supervisor) = environments.get(&env) else {
+            if listing_out.get() {
+                asked_again.set(true);
                 return;
-            };
-            let exec = supervisor.exec().clone();
-            let files = supervisor.files();
-            let root = supervisor.checkout().path().to_path_buf();
+            }
+            listing_out.set(true);
             let filetree = filetree.clone();
+            let environments = environments.clone();
             let task_runs = task_runs.clone();
+            let listing_out = listing_out.clone();
+            let asked_again = asked_again.clone();
             glib::spawn_future_local(async move {
-                let listed = runtime()
-                    .spawn_blocking(move || crate::tasks::list(&exec, &files, &root))
-                    .await;
-                let Ok(listing) = listed else { return };
-                // The panes may have been aimed elsewhere while it listed.
-                if filetree.aimed_environment() != env {
-                    return;
-                }
-                // Whether it defines the notebooks' kernel task, for them.
-                crate::kernels::kernels().set_defined(
-                    &env,
-                    matches!(&listing, crate::tasks::Listing::Tasks { tasks, .. }
-                        if tasks.iter().any(|task| task.name == taste_core::kernel_task::TASK)),
-                );
-                match listing {
-                    crate::tasks::Listing::NoTaskfile => {
-                        filetree.set_tasks(Vec::new(), None, false)
-                    }
-                    crate::tasks::Listing::Tasks { tasks, cannot_run } => {
-                        let rows = tasks
-                            .into_iter()
-                            .map(|info| crate::filetree::TaskRow {
-                                state: task_runs.state(&env, &info.name),
-                                info,
-                            })
-                            .collect();
-                        filetree.set_tasks(rows, cannot_run, true);
+                loop {
+                    asked_again.set(false);
+                    list_tasks_once(&filetree, &environments, &task_runs).await;
+                    if !asked_again.get() {
+                        break;
                     }
                 }
+                listing_out.set(false);
             });
         })
     };
@@ -6238,6 +6225,49 @@ fn ask_folder_conflict(
 /// page that is drawing the next start.
 fn startup_state_now(startup: &crate::startup::StartupPage) -> Option<bool> {
     Some(startup.underway() && !startup.settled())
+}
+
+/// List the tasks of the environment the panes are aimed at and put them
+/// in the file tree — once; `refresh_tasks` decides how often.
+async fn list_tasks_once(
+    filetree: &Rc<FileTree>,
+    environments: &std::sync::Arc<EnvironmentRegistry>,
+    task_runs: &taste_core::tasks::TaskBoard,
+) {
+    let env = filetree.aimed_environment();
+    let Some(supervisor) = environments.get(&env) else {
+        return;
+    };
+    let exec = supervisor.exec().clone();
+    let files = supervisor.files();
+    let root = supervisor.checkout().path().to_path_buf();
+    let listed = runtime()
+        .spawn_blocking(move || crate::tasks::list(&exec, &files, &root))
+        .await;
+    let Ok(listing) = listed else { return };
+    // The panes may have been aimed elsewhere while it listed.
+    if filetree.aimed_environment() != env {
+        return;
+    }
+    // Whether it defines the notebooks' kernel task, for them.
+    crate::kernels::kernels().set_defined(
+        &env,
+        matches!(&listing, crate::tasks::Listing::Tasks { tasks, .. }
+            if tasks.iter().any(|task| task.name == taste_core::kernel_task::TASK)),
+    );
+    match listing {
+        crate::tasks::Listing::NoTaskfile => filetree.set_tasks(Vec::new(), None, false),
+        crate::tasks::Listing::Tasks { tasks, cannot_run } => {
+            let rows = tasks
+                .into_iter()
+                .map(|info| crate::filetree::TaskRow {
+                    state: task_runs.state(&env, &info.name),
+                    info,
+                })
+                .collect();
+            filetree.set_tasks(rows, cannot_run, true);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -833,7 +833,12 @@ impl TreeEvents {
                     }
                     let mut git = false;
                     let mut tree = false;
+                    // In the order heard, each once; the set is what makes
+                    // a burst of thirty thousand files a pass, not a
+                    // quadratic search (2026-10-24).
                     let mut changed: Vec<PathBuf> = Vec::new();
+                    let mut heard: std::collections::HashSet<PathBuf> =
+                        std::collections::HashSet::new();
                     for (event, name) in batch {
                         if name == ".git" || name.starts_with(".git/") {
                             git = true;
@@ -853,7 +858,7 @@ impl TreeEvents {
                             tree = true;
                         }
                         let path = root.join(&name);
-                        if !changed.contains(&path) {
+                        if heard.insert(path.clone()) {
                             changed.push(path);
                         }
                     }
@@ -4447,7 +4452,10 @@ impl Supervisor {
         self.exec.set_container(name, workdir, authority);
         // Answered before anyone can ask. A chat reacting to the Running
         // event decides its topology from this, and `Unknown` would cost it
-        // a spawn outside followed by a respawn inside.
+        // a spawn outside followed by a respawn inside. Said first, since
+        // the step's detail is the log's last line, and a wait here was
+        // read as the Taskfile check before it (2026-10-24).
+        self.log("asking the container for the agent's node and the IDE's Task");
         self.probe_container().await;
         self.set_state(SupervisorState::Running { container_id });
         Ok(())

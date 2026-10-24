@@ -37,8 +37,13 @@ use taste_core::{Event, EventBus, SyncFile};
 /// How long a path that moved is deaf to its own echo on the other side.
 const ECHO: Duration = Duration::from_secs(5);
 
-/// The longest between two publishes of the same set's progress; a path
-/// joining or leaving the set is published at once.
+/// The least between two publishes of the set, whatever moved in it: one
+/// change after a quiet spell is published at once, and what follows it
+/// within the pace goes out together at its end. Every publish is the
+/// whole set, and the bus holds each one until the GTK thread takes it,
+/// so publishing per file made a Composer install of thirty thousand files
+/// thirty thousand sets of up to thirty thousand entries — gigabytes
+/// queued, and a window that stopped answering (2026-10-24).
 const PACE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
@@ -61,6 +66,9 @@ struct Inner {
     /// Paths that moved, the direction they moved in, and when.
     landed: HashMap<PathBuf, (bool, Instant)>,
     published: Option<Instant>,
+    /// A publish is owed at the end of the pace: something moved since the
+    /// last, and a thread is waiting out the rest of it to send it.
+    owed: bool,
     /// The fetch under way: when it began, for its rate.
     fetch_since: Option<Instant>,
 }
@@ -132,14 +140,13 @@ impl Transfers {
                 shared: false,
             },
         );
-        self.publish(&mut inner, true);
+        self.publish(&mut inner);
     }
 
     /// `path` going up: `done` of its `total` bytes have gone.
     pub fn sending(&self, path: &Path, done: u64, total: u64) {
         let path = &self.scope.join(path);
         let mut inner = self.inner.lock().unwrap();
-        let joined = !inner.files.contains_key(path);
         let moving = inner
             .files
             .entry(path.to_path_buf())
@@ -160,7 +167,7 @@ impl Transfers {
         } else {
             done as f64 / total as f64
         });
-        self.publish(&mut inner, joined);
+        self.publish(&mut inner);
     }
 
     /// `path` has arrived, in the direction `up`.
@@ -171,7 +178,7 @@ impl Transfers {
         inner
             .landed
             .insert(path.to_path_buf(), (up, Instant::now()));
-        self.publish(&mut inner, true);
+        self.publish(&mut inner);
     }
 
     /// What is coming down, sized where it is before the fetch brings it:
@@ -224,7 +231,7 @@ impl Transfers {
             any = true;
         }
         if any {
-            self.publish(&mut inner, false);
+            self.publish(&mut inner);
         }
     }
 
@@ -244,13 +251,29 @@ impl Transfers {
         }
         inner.fetch_since = None;
         inner.landed.retain(|_, (_, at)| at.elapsed() < ECHO);
-        self.publish(&mut inner, true);
+        self.publish(&mut inner);
     }
 
-    fn publish(&self, inner: &mut Inner, now: bool) {
-        if !now && inner.published.is_some_and(|at| at.elapsed() < PACE) {
+    fn publish(&self, inner: &mut Inner) {
+        if let Some(at) = inner.published.filter(|at| at.elapsed() < PACE) {
+            if !inner.owed {
+                inner.owed = true;
+                let this = self.clone();
+                let wait = PACE.saturating_sub(at.elapsed());
+                std::thread::spawn(move || {
+                    std::thread::sleep(wait);
+                    let mut inner = this.inner.lock().unwrap();
+                    this.send(&mut inner);
+                });
+            }
             return;
         }
+        self.send(inner);
+    }
+
+    /// The set as it stands now, to the bus.
+    fn send(&self, inner: &mut Inner) {
+        inner.owed = false;
         inner.published = Some(Instant::now());
         let files = inner
             .files
@@ -313,6 +336,33 @@ mod tests {
         last.expect("a publish")
     }
 
+    /// The set once the pace has run out and what it owed has gone.
+    fn settled(rx: &async_channel::Receiver<Event>) -> BTreeMap<PathBuf, SyncFile> {
+        std::thread::sleep(PACE * 2);
+        last_set(rx)
+    }
+
+    /// A burst of changes is a handful of sets, not one per file, and the
+    /// last of them has every file in it.
+    #[test]
+    fn a_burst_is_published_at_the_pace_not_per_file() {
+        let events = EventBus::new();
+        let rx = events.subscribe();
+        let transfers = Transfers::new(events);
+        for n in 0..10_000 {
+            transfers.changed(&PathBuf::from(format!("vendor/{n}.php")), false);
+        }
+        std::thread::sleep(PACE * 2);
+        let sets: Vec<usize> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                Event::SyncFiles(files) => Some(files.len()),
+                _ => None,
+            })
+            .collect();
+        assert!(sets.len() <= 3, "{} sets for one burst", sets.len());
+        assert_eq!(sets.last(), Some(&10_000));
+    }
+
     /// A change is marked waiting, fills as it is sent, and is gone when it
     /// lands; the other side's echo of that write is not marked.
     #[test]
@@ -328,7 +378,7 @@ mod tests {
 
         transfers.sending(path, 0, 400);
         transfers.landed(path, true);
-        assert!(last_set(&rx).is_empty());
+        assert!(settled(&rx).is_empty());
 
         // The checkout's watcher hears the write the sync just made.
         transfers.changed(path, false);
@@ -355,11 +405,11 @@ mod tests {
         });
         std::thread::sleep(PACE);
         sub.fetching(Some(50), None);
-        let set = last_set(&rx);
+        let set = settled(&rx);
         assert_eq!(set[Path::new("ext/lib/src/x.rs")].fraction, Some(0.5));
         assert_eq!(set[Path::new("README.md")].fraction, None);
         sub.sending(Path::new("src/y.rs"), 1, 2);
-        assert!(last_set(&rx).contains_key(Path::new("ext/lib/src/y.rs")));
+        assert!(settled(&rx).contains_key(Path::new("ext/lib/src/y.rs")));
     }
 
     /// What comes down wears the fetch's progress, said to be shared, and
@@ -375,7 +425,7 @@ mod tests {
         transfers.fetching(Some(40), Some(4 << 20));
         std::thread::sleep(PACE);
         transfers.fetching(Some(50), Some(5 << 20));
-        let set = last_set(&rx);
+        let set = settled(&rx);
         for file in set.values() {
             assert!(file.shared && !file.up);
             assert_eq!(file.fraction, Some(0.5));
@@ -383,7 +433,7 @@ mod tests {
         // What is left of a file is its own size, as far as the fetch is.
         assert_eq!(set[Path::new("a.txt")].left, Some(4 << 20));
         transfers.settle();
-        assert!(last_set(&rx).is_empty());
+        assert!(settled(&rx).is_empty());
         assert_eq!(git_bytes("40.20 MiB"), Some(42_152_755));
         assert_eq!(git_bytes("512 bytes"), Some(512));
     }
