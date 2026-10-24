@@ -58,6 +58,7 @@ mod notebook;
 mod notify;
 mod orchestration;
 mod palette;
+mod port_problems;
 mod portview;
 mod power;
 mod presentation;

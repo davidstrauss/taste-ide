@@ -291,7 +291,11 @@ the wrong way; `TASTE_PROBE_PORT_NEWTAB=1` with it has the posed page
 call `window.open`, as a link with a target does, and prints when the page
 lands in a tab of its own beside the port's (`PortPage::open_related`),
 and `TASTE_PROBE_PORT_DEVICE=phone` (or `tablet`) poses the page at that
-device's width (`portview::Device`);
+device's width (`portview::Device`), and `TASTE_PROBE_PORT_PROBLEMS=1`
+opens the address bar's problem list four seconds in and shoots it as
+`window.port-problems` (`port_problems.rs`) — serve a page on 3000 that
+fails at something (a file on 5432 under `0.0.0.0`, one on a port the
+probe does not forward, a 404, a `throw`) for rows to read;
 `TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
 safe-mode banner's running-baseline face;
 `TASTE_PROBE_STARTUP=vm` (or `image` — the guest image fetching inside

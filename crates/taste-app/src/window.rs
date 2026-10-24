@@ -338,21 +338,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let environments = environments.clone();
         let port_facts = port_facts.clone();
         filetree.set_on_open_port(move |env, port| {
-            let spec = environments
+            let specs = environments
                 .get(&env)
-                .and_then(|supervisor| supervisor.ports().into_iter().find(|p| p.port == port))
-                .unwrap_or(taste_devcontainer::config::PortSpec {
+                .map(|supervisor| supervisor.ports())
+                .unwrap_or_default();
+            let forwarded = specs.iter().map(|p| p.host).collect();
+            let spec = specs.into_iter().find(|p| p.port == port).unwrap_or(
+                taste_devcontainer::config::PortSpec {
                     port,
                     host: port,
                     label: None,
                     protocol: None,
-                });
+                },
+            );
             let facts = port_facts
                 .borrow()
                 .get(&(env.clone(), port))
                 .cloned()
                 .unwrap_or_default();
-            editor.open_port(&env, spec.clone(), facts);
+            editor.open_port(&env, spec.clone(), forwarded, facts);
             probe_port(&editor, &environments, &port_facts, env, spec);
         });
     }
@@ -3168,6 +3172,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     label: Some("App".into()),
                     protocol: None,
                 },
+                // The two the Ports section is posed with
+                // (`FileTree::seed_ports_for_probe`).
+                vec![3000, 5432],
                 PortFacts::default(),
             );
             editor.seed_port_for_probe(&primary, 3000, port_state_for_probe());
@@ -3681,6 +3688,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // The branch switcher, opened by the file tree once
                         // its branches are read: a popover, its own surface.
                         &["window", "window.branch-menu"]
+                    } else if std::env::var("TASTE_PROBE_PORT_PROBLEMS").is_ok() {
+                        // The port browser's problem list: a popover, its
+                        // own surface.
+                        &["window", "window.port-problems"]
                     } else if std::env::var("TASTE_PROBE_PRESENTING").is_ok() {
                         // The popover is its own surface, shot beside the
                         // window.

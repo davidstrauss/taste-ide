@@ -2660,11 +2660,13 @@ impl Editor {
         }
     }
 
-    /// Open (or focus) a forwarded port as a tab.
+    /// Open (or focus) a forwarded port as a tab. `forwarded` is the host
+    /// ports of every port `env` forwards, which its page may reach.
     pub fn open_port(
         self: &Rc<Self>,
         env: &taste_core::environment::EnvironmentId,
         spec: taste_devcontainer::config::PortSpec,
+        forwarded: Vec<u16>,
         facts: crate::portview::PortFacts,
     ) {
         let key = port_key(env, spec.port);
@@ -2672,7 +2674,7 @@ impl Editor {
             self.tabs().set_selected_page(&existing.tab);
             return;
         }
-        let page = crate::portview::PortPage::new(env.as_str(), spec.clone(), facts);
+        let page = crate::portview::PortPage::new(env.as_str(), spec.clone(), forwarded, facts);
         page.set_on_new_tab(self.port_new_tab_hook(env));
         let tab = self.tabs().append(&page.widget);
         tab.set_title(&if env.is_primary() {

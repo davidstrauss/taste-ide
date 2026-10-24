@@ -202,6 +202,9 @@ pub struct PortPage {
     /// port it shows.
     environment: String,
     spec: PortSpec,
+    /// The host ports of every port this page's environment forwards, its
+    /// own among them: what the network guard lets the page reach.
+    forwarded: Vec<u16>,
     /// Who puts a page this one opened — a link to a new window, a
     /// middle-click, a Ctrl+click — in a tab of its own.
     on_new_tab: RefCell<Option<NewTabHook>>,
@@ -212,7 +215,18 @@ pub struct PortPage {
     device: Cell<Device>,
     device_clamp: adw::Clamp,
     device_toggles: gtk::Box,
+    /// What went wrong loading the page, counted at the address bar's end.
+    problems: Rc<crate::port_problems::Problems>,
 }
+
+/// Whether the page's own text colour is a light one: its root's computed
+/// `color`, which is `CanvasText` in whichever scheme the page is drawn in
+/// unless it chose one, so a page whose `color-scheme` lets it go dark
+/// answers yes under a dark IDE and a page that never said answers no.
+const LIGHT_TEXT: &str = r"(() => {
+  const c = (getComputedStyle(document.documentElement).color.match(/[\d.]+/g) || []).map(Number);
+  return c.length >= 3 && (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) / 255 > 0.5;
+})()";
 
 /// What a port's page is shown as: a phone's width, a tablet's, or the
 /// pane's (David, 2026-10-22: "a mobile/tablet/desktop toggle"). The
@@ -284,15 +298,20 @@ impl Device {
 pub type NewTabHook = Rc<dyn Fn(Rc<PortPage>)>;
 
 impl PortPage {
-    pub fn new(environment: &str, spec: PortSpec, facts: PortFacts) -> Rc<Self> {
-        let page = Self::made(environment, spec, facts.clone());
+    pub fn new(
+        environment: &str,
+        spec: PortSpec,
+        forwarded: Vec<u16>,
+        facts: PortFacts,
+    ) -> Rc<Self> {
+        let page = Self::made(environment, spec, forwarded, facts.clone());
         page.set_face(facts.default_face());
         page
     }
 
     /// The page, with no face shown yet: a new tab's adopts its browser
     /// before it shows one, so none is made for it ([`Self::open_related`]).
-    fn made(environment: &str, spec: PortSpec, facts: PortFacts) -> Rc<Self> {
+    fn made(environment: &str, spec: PortSpec, forwarded: Vec<u16>, facts: PortFacts) -> Rc<Self> {
         let base_url = spec.url();
 
         // The header: what this is, and what is behind it.
@@ -413,6 +432,8 @@ impl PortPage {
         browser_bar.append(&forward);
         browser_bar.append(&reload);
         browser_bar.append(&address);
+        let problems = crate::port_problems::Problems::new(forwarded.clone());
+        browser_bar.append(&problems.button);
         let browser_holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
         browser_holder.set_vexpand(true);
         // The page held to its device's width, centred, without raising
@@ -466,11 +487,13 @@ impl PortPage {
             purge,
             environment: environment.to_string(),
             spec: spec.clone(),
+            forwarded,
             on_new_tab: RefCell::new(None),
             on_title: RefCell::new(None),
             device: Cell::new(Device::Desktop),
             device_clamp,
             device_toggles,
+            problems,
         });
         page.build_device_toggles();
         {
@@ -621,6 +644,9 @@ impl PortPage {
             .vexpand(true)
             .hexpand(true)
             .build();
+        if let Some(manager) = webkit6::prelude::WebViewExt::user_content_manager(&view) {
+            crate::port_problems::Problems::install(&manager);
+        }
         self.install_view(&view);
         self.guard_then_load(&view);
     }
@@ -654,6 +680,7 @@ impl PortPage {
         let page = Self::made(
             &self.environment,
             self.spec.clone(),
+            self.forwarded.clone(),
             self.facts.borrow().clone(),
         );
         let mut builder = webkit6::WebView::builder()
@@ -720,9 +747,12 @@ impl PortPage {
         // preference libadwaita keeps on GtkSettings, so a page asking
         // `prefers-color-scheme` gets the answer; and the view's own
         // background — what shows before a page paints, and behind one that
-        // paints none — is the pane's rather than WebKit's white (David,
-        // 2026-09-16: "we should send the necessary dark/light cue into the
-        // browser context").
+        // paints none and is drawn dark — is the pane's rather than
+        // WebKit's white (David, 2026-09-16: "we should send the necessary
+        // dark/light cue into the browser context"). Behind a page drawn in
+        // dark text it is white, as in any browser ([`Self::fit_canvas`]):
+        // see-through, such a page drew its black text on the dark pane
+        // (2026-10-24).
         webkit6::prelude::WebViewExt::set_background_color(
             &view,
             &gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0),
@@ -767,10 +797,13 @@ impl PortPage {
         }
         {
             let weak = Rc::downgrade(self);
-            webkit6::prelude::WebViewExt::connect_load_changed(&view, move |_, event| {
+            webkit6::prelude::WebViewExt::connect_load_changed(&view, move |view, event| {
                 let Some(page) = weak.upgrade() else { return };
                 if event == webkit6::LoadEvent::Started && !page.alternate_loading.replace(false) {
                     page.failed_page.borrow_mut().take();
+                }
+                if event == webkit6::LoadEvent::Finished && page.failed_page.borrow().is_none() {
+                    page.fit_canvas(view);
                 }
             });
         }
@@ -779,6 +812,11 @@ impl PortPage {
             adw::StyleManager::default().connect_dark_notify(move |_| {
                 let Some(page) = weak.upgrade() else { return };
                 page.redraw_failed_page();
+                let view = page.browser.borrow().clone();
+                let failed = page.failed_page.borrow().is_some();
+                if let (Some(view), false) = (view, failed) {
+                    page.fit_canvas(&view);
+                }
             });
         }
         {
@@ -846,9 +884,37 @@ impl PortPage {
                 }
             });
         }
+        self.problems.watch(&view);
         self.device_clamp.set_child(Some(&view));
         *self.browser.borrow_mut() = Some(view);
         self.apply_device(false);
+    }
+
+    /// The view's background behind the page in it: white behind a page
+    /// drawn in dark text, the pane's behind one drawn in light, as the
+    /// page's own text colour says ([`LIGHT_TEXT`]). Asked once the page
+    /// has loaded and again when the theme changes, since a page that lets
+    /// its scheme follow the IDE's changes with it; until then, and when
+    /// the page cannot be asked, the background stays as it was.
+    fn fit_canvas(&self, view: &webkit6::WebView) {
+        let target = view.downgrade();
+        view.evaluate_javascript(
+            LIGHT_TEXT,
+            Some(crate::port_problems::WORLD),
+            None,
+            gtk::gio::Cancellable::NONE,
+            move |result| {
+                let (Some(view), Ok(light)) = (target.upgrade(), result) else {
+                    return;
+                };
+                let canvas = if light.to_boolean() {
+                    gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0)
+                } else {
+                    gtk::gdk::RGBA::WHITE
+                };
+                webkit6::prelude::WebViewExt::set_background_color(&view, &canvas);
+            },
+        );
     }
 
     /// The three toggles, the one for this page's device active.
@@ -941,11 +1007,22 @@ impl PortPage {
                 .join("taste-ide/content-filters")
                 .to_string_lossy(),
         );
-        let rules = gtk::glib::Bytes::from_owned(network_guard_rules(port).into_bytes());
+        let mut ports = self.forwarded.clone();
+        ports.push(port);
+        ports.sort_unstable();
+        ports.dedup();
+        let rules = gtk::glib::Bytes::from_owned(network_guard_rules(&ports).into_bytes());
         let weak = Rc::downgrade(self);
         let view = view.clone();
         store.save(
-            &format!("port-{port}"),
+            &format!(
+                "port-{}",
+                ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join("-")
+            ),
             &rules,
             None::<&gtk::gio::Cancellable>,
             move |filter| {
@@ -1093,6 +1170,16 @@ impl PortPage {
         {
             self.set_device(device);
         }
+        // `TASTE_PROBE_PORT_PROBLEMS=1`: the problem list open, once the
+        // page has had time to fail at what it fails at.
+        if std::env::var("TASTE_PROBE_PORT_PROBLEMS").is_ok() {
+            let weak = Rc::downgrade(self);
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
+                if let Some(page) = weak.upgrade() {
+                    page.problems.open_for_probe();
+                }
+            });
+        }
         // `TASTE_PROBE_PORT_NEWTAB=1`: the page opens a window, as a link
         // with a target does, and the window is a tab of its own.
         if std::env::var("TASTE_PROBE_PORT_NEWTAB").is_ok() {
@@ -1127,9 +1214,18 @@ impl PortPage {
 /// The port browser's network guard, as WebKit content-blocker rules:
 /// every load to a loopback, private, shared, or link-local address, an
 /// IPv6 literal, a single-label host, or a `.local`-style name is blocked,
-/// and then the port's own origin is let back through — on `localhost`,
-/// which is how the tab names it (`PortSpec::url`), and on 127.0.0.1 — any
-/// scheme, so the dev server's own WebSocket (hot reload) still connects.
+/// and then the ports the environment forwards are let back through, any
+/// scheme, so a dev server's own WebSocket (hot reload) still connects.
+/// Every one of them, not only the tab's: a Laravel page on 8000 takes its
+/// styles and scripts from Vite on 5173, and with only its own port let
+/// through it drew unstyled while the user's own browser drew it whole
+/// (2026-10-24). And on every name a page uses for this machine's
+/// loopback — `localhost`, which is how the tab names it (`PortSpec::url`),
+/// 127.0.0.1, `[::1]`, and 0.0.0.0, which is what Vite writes into
+/// Laravel's `public/hot` when its server is bound to it — since each one
+/// reaches the same forward and nothing else. A port forwarded from the
+/// environment is the environment's, so this reaches nothing of the
+/// host's that the page could not reach already.
 /// Public addresses are left alone: egress is a project's already
 /// (ENVIRONMENTS → "Isolation: the standard, and what meets it"), and a
 /// page's CDN fonts and scripts are how dev servers look. What a name
@@ -1138,7 +1234,7 @@ impl PortPage {
 ///
 /// The rule syntax has no alternation, which is why each range is a rule
 /// of its own.
-fn network_guard_rules(port: u16) -> String {
+fn network_guard_rules(ports: &[u16]) -> String {
     const BLOCKED: &[&str] = &[
         r"^[a-z]+://127\.",
         r"^[a-z]+://0\.",
@@ -1170,11 +1266,13 @@ fn network_guard_rules(port: u16) -> String {
             })
         })
         .collect();
-    for host in [r"localhost", r"127\.0\.0\.1"] {
-        rules.push(serde_json::json!({
-            "trigger": { "url-filter": format!(r"^[a-z]+://{host}:{port}/") },
-            "action": { "type": "ignore-previous-rules" },
-        }));
+    for port in ports {
+        for host in [r"localhost", r"127\.0\.0\.1", r"\[::1\]", r"0\.0\.0\.0"] {
+            rules.push(serde_json::json!({
+                "trigger": { "url-filter": format!(r"^[a-z]+://{host}:{port}/") },
+                "action": { "type": "ignore-previous-rules" },
+            }));
+        }
     }
     serde_json::Value::Array(rules).to_string()
 }
@@ -1554,34 +1652,56 @@ mod tests {
 
     use super::*;
 
+    /// Every port the environment forwards is let through on every name for
+    /// the loopback — a Laravel page on 8000 loads its styles from Vite on
+    /// 5173 as `0.0.0.0:5173` — and nothing else of the host's is.
     #[test]
-    fn the_network_guard_blocks_the_host_and_lets_the_port_through() {
-        let rules: serde_json::Value = serde_json::from_str(&network_guard_rules(3000)).unwrap();
+    fn the_network_guard_blocks_the_host_and_lets_the_forwarded_ports_through() {
+        let rules: serde_json::Value =
+            serde_json::from_str(&network_guard_rules(&[5173, 8000])).unwrap();
         let rules = rules.as_array().unwrap();
-        let allowed: Vec<&str> = rules[rules.len() - 2..]
+        let (blocked, allowed): (Vec<_>, Vec<_>) = rules
             .iter()
-            .inspect(|rule| assert_eq!(rule["action"]["type"], "ignore-previous-rules"))
-            .map(|rule| rule["trigger"]["url-filter"].as_str().unwrap())
-            .collect();
+            .partition(|rule| rule["action"]["type"] == "block");
+        let filter = |rule: &&serde_json::Value| -> String {
+            rule["trigger"]["url-filter"].as_str().unwrap().to_string()
+        };
+        let allowed: Vec<String> = allowed.iter().map(filter).collect();
+        let blocked: Vec<String> = blocked.iter().map(filter).collect();
+        assert!(
+            rules[..blocked.len()]
+                .iter()
+                .all(|rule| rule["action"]["type"] == "block"),
+            "the ports are let back through after everything is blocked"
+        );
         assert_eq!(
             allowed,
             [
-                r"^[a-z]+://localhost:3000/",
-                r"^[a-z]+://127\.0\.0\.1:3000/"
+                r"^[a-z]+://localhost:5173/",
+                r"^[a-z]+://127\.0\.0\.1:5173/",
+                r"^[a-z]+://\[::1\]:5173/",
+                r"^[a-z]+://0\.0\.0\.0:5173/",
+                r"^[a-z]+://localhost:8000/",
+                r"^[a-z]+://127\.0\.0\.1:8000/",
+                r"^[a-z]+://\[::1\]:8000/",
+                r"^[a-z]+://0\.0\.0\.0:8000/",
             ]
         );
-        let blocked: Vec<&str> = rules[..rules.len() - 2]
-            .iter()
-            .map(|rule| rule["trigger"]["url-filter"].as_str().unwrap())
-            .collect();
-        for filter in &blocked {
+        for filter in blocked.iter().chain(&allowed) {
             assert!(
                 !filter.contains('|'),
                 "no alternation in this syntax: {filter}"
             );
         }
-        assert!(blocked.contains(&r"^[a-z]+://127\."));
-        assert!(blocked.contains(&r"^[a-z]+://192\.168\."));
+        for filter in [
+            r"^[a-z]+://127\.",
+            r"^[a-z]+://0\.",
+            r"^[a-z]+://\[",
+            r"^[a-z]+://[a-z0-9-]+[:/]",
+            r"^[a-z]+://192\.168\.",
+        ] {
+            assert!(blocked.iter().any(|f| f == filter), "{filter}");
+        }
     }
 
     #[test]
