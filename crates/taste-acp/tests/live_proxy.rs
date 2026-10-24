@@ -92,6 +92,7 @@ fn describe(event: &SessionEvent) -> String {
         SessionEvent::Update(_) => "Update".into(),
         SessionEvent::TurnEnded { .. } => "TurnEnded".into(),
         SessionEvent::QueuedJoined { count } => format!("QueuedJoined({count})"),
+        SessionEvent::QueuedDropped { count } => format!("QueuedDropped({count})"),
         SessionEvent::Permission { .. } => "Permission".into(),
         SessionEvent::Elicitation { .. } => "Elicitation".into(),
         SessionEvent::ModeChangeFailed { message, .. } => format!("ModeChangeFailed({message})"),

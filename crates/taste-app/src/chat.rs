@@ -2906,7 +2906,9 @@ impl ChatPane {
         // fighting for width. Round, not square — see `send`.
         let stop_button = gtk::Button::builder()
             .icon_name("media-playback-stop-symbolic")
-            .tooltip_text("Stop this turn")
+            .tooltip_text(
+                "Stop this turn\nCtrl+click: stop, and drop the messages waiting behind it",
+            )
             .css_classes(["pill-action"])
             .visible(false)
             .build();
@@ -4027,9 +4029,25 @@ impl ChatPane {
             pane.set_status("new session on next prompt");
         });
         let weak = Rc::downgrade(&pane);
-        stop_button.connect_clicked(move |_| {
+        stop_button.connect_clicked(move |button| {
             let Some(pane) = weak.upgrade() else { return };
+            // Ctrl+click: the messages waiting behind the turn go as well,
+            // never sent — those queued for the agent, and those held for
+            // its environment to come up.
+            let everything = button
+                .display()
+                .default_seat()
+                .and_then(|seat| seat.keyboard())
+                .is_some_and(|keyboard| {
+                    keyboard
+                        .modifier_state()
+                        .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                });
+            if everything {
+                pane.withdraw_held();
+            }
             let result = match pane.client.borrow().as_ref() {
+                Some(client) if everything => client.cancel_all(),
                 Some(client) => client.cancel(),
                 None => Ok(()),
             };
@@ -7165,6 +7183,50 @@ impl ChatPane {
         }));
     }
 
+    /// What a message dropped by Ctrl+Stop says on its card.
+    const WITHDRAWN: &'static str = "Ctrl+Stop dropped it before the agent took it";
+
+    /// The last `count` messages waiting behind the turn, dropped by the
+    /// session on Ctrl+Stop: they stay where they were sent, marked never
+    /// sent, and are no longer waited on.
+    fn withdraw_queued(&self, count: usize) {
+        let mut withdrawn = Vec::new();
+        {
+            let mut pending = self.pending_prompts.borrow_mut();
+            while withdrawn.len() < count {
+                let Some(at) = pending.iter().rposition(|p| !p.taken && !p.joined) else {
+                    break;
+                };
+                // Never the one the turn is about: it ends as cancelled.
+                if at == 0 {
+                    break;
+                }
+                if let Some(prompt) = pending.remove(at) {
+                    withdrawn.push(prompt.prompt);
+                }
+            }
+        }
+        for prompt in withdrawn {
+            if self.nudged_prompt.borrow().as_ref() == Some(&prompt) {
+                self.end_nudge();
+            }
+            self.deliver(&prompt, model::Delivery::NotSent(Self::WITHDRAWN.into()));
+        }
+    }
+
+    /// The messages held for this chat's agent or its environment to come
+    /// up, dropped by Ctrl+Stop: marked never sent, and not sent when it is.
+    fn withdraw_held(&self) {
+        let held: Vec<QueuedSend> = self.revive_queue.borrow_mut().drain(..).collect();
+        for send in held {
+            self.deliver(
+                &send.prompt,
+                model::Delivery::NotSent(Self::WITHDRAWN.into()),
+            );
+        }
+        self.sync_revive_bar();
+    }
+
     /// Prompt `prompt` has got to `delivery`, in the transcript and the
     /// record.
     fn deliver(&self, prompt: &str, delivery: model::Delivery) {
@@ -8840,6 +8902,7 @@ impl ChatPane {
             }
             SessionEvent::Permission { request, reply } => self.on_permission(request, reply),
             SessionEvent::Elicitation { request, reply } => self.on_questions(request, reply),
+            SessionEvent::QueuedDropped { count } => self.withdraw_queued(count),
             SessionEvent::QueuedJoined { count } => {
                 // The prompt that just went out carries the next `count`
                 // messages too: each is taken where the first was, in order.
@@ -15936,6 +15999,7 @@ fn session_event_label(event: &SessionEvent) -> String {
         }
         SessionEvent::TurnEnded { .. } => "the turn's end".into(),
         SessionEvent::QueuedJoined { count } => format!("{count} queued messages joined"),
+        SessionEvent::QueuedDropped { count } => format!("{count} queued messages dropped"),
         SessionEvent::Permission { .. } => "a permission request".into(),
         SessionEvent::Elicitation { .. } => "questions".into(),
         SessionEvent::PromptFailed { .. } => "a failed prompt".into(),

@@ -53,6 +53,9 @@ pub enum Command {
     },
     /// Cancel the in-flight turn.
     Cancel,
+    /// Cancel the in-flight turn and drop the prompts waiting behind it,
+    /// which never reach the agent ([`SessionEvent::QueuedDropped`]).
+    CancelAll,
     Authenticate(AuthMethodId),
     SetMode(SessionModeId),
     SetConfigOption(SessionConfigId, SessionConfigValueId),
@@ -106,6 +109,9 @@ pub enum SessionEvent {
     /// that waited behind the last turn, after its own (`join_waiting`):
     /// one turn for all of them, so a later turn ends after them all.
     QueuedJoined { count: usize },
+    /// The last `count` prompts waiting behind the turn were dropped by a
+    /// [`Command::CancelAll`], and will never be sent.
+    QueuedDropped { count: usize },
     /// A turn finished, with the agent's session-cumulative token usage
     /// when it reports one.
     TurnEnded {
@@ -221,6 +227,12 @@ impl AgentClient {
     /// Cancel the in-flight turn (no-op when idle).
     pub fn cancel(&self) -> Result<()> {
         self.send(Command::Cancel)
+    }
+
+    /// Cancel the in-flight turn, and drop the prompts queued behind it
+    /// before the agent sees them.
+    pub fn cancel_all(&self) -> Result<()> {
+        self.send(Command::CancelAll)
     }
 
     /// Authenticate with one of the methods from [`SessionEvent::AuthRequired`].
@@ -1343,6 +1355,21 @@ async fn serve_commands(
                                     CancelNotification::new(session_id.clone()),
                                 )?;
                             }
+                            Ok(Command::CancelAll) => {
+                                connection.send_notification(
+                                    CancelNotification::new(session_id.clone()),
+                                )?;
+                                // What waits behind the turn goes too; a
+                                // mode or a setting changed meanwhile stays.
+                                let before = queued.len();
+                                queued.retain(|command| !matches!(command, Command::Prompt { .. }));
+                                let count = before - queued.len();
+                                if count > 0 {
+                                    let _ = event_tx
+                                        .send(SessionEvent::QueuedDropped { count })
+                                        .await;
+                                }
+                            }
                             Ok(other) => queued.push_back(other),
                             Err(_) => return Ok(()), // UI dropped the client
                         },
@@ -1358,7 +1385,7 @@ async fn serve_commands(
                     })
                     .await;
             }
-            Command::Cancel => {} // nothing in flight
+            Command::Cancel | Command::CancelAll => {} // nothing in flight
             // Control commands are never fatal: a rejected mode or config
             // change must not tear down a healthy conversation.
             Command::SetMode(mode) => {
