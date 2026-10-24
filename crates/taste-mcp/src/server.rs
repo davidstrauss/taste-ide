@@ -3848,9 +3848,14 @@ impl McpServer {
                     .to_string();
                 let wait = args["wait_seconds"].as_u64().unwrap_or(60).min(600);
                 let supervisor = self.supervisor(env)?;
+                // Through the environment's `task` wrapper while its channel
+                // is up, so the run outlives the IDE (`TaskBoard::start`).
+                let wrapper = supervisor
+                    .channel_paths()
+                    .map(|paths| paths.task_wrapper.join("task"));
                 self.workspace
                     .tasks
-                    .start(env, &name, supervisor.exec(), true)
+                    .start(env, &name, supervisor.exec(), true, wrapper.as_deref())
                     .map_err(|why| anyhow::anyhow!("{name} was not run: {why}"))?;
                 let board = &self.workspace.tasks;
                 let woke = self

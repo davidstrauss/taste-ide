@@ -91,6 +91,13 @@ pub const IDE_TASK_SHA256_ARM64: &str =
 /// Where the IDE's runtime directory is in a container.
 pub const IDE_TASK_DIR: &str = "/opt/taste-agent";
 
+/// Where the IDE's `task` wrapper journals each run in a container: what
+/// was run, its output, and how it ended, a directory a run. The run goes
+/// on when the IDE closes, and a reopened one finds it here — still
+/// running, or how it ended (`taste_devcontainer::channel`'s reporter).
+/// The container's own, so it lasts as long as what it records can.
+pub const JOURNAL_DIR: &str = "/tmp/taste-tasks";
+
 /// A shell line setting `t` to the Task to run: the image's own, under
 /// either of its names, first — a project that installs Task chose its
 /// version — and the IDE's otherwise (David, 2026-10-04: "Can I have tasks
@@ -384,6 +391,11 @@ struct Run {
     lines: Vec<String>,
     state: RunState,
     stop: Option<Arc<tokio::sync::Notify>>,
+    /// Started by the board through the environment's `task` wrapper, and
+    /// not yet reported by it: its stop is held for the wrapper's report,
+    /// and goes to the container directly too, through `stopper`.
+    pending: bool,
+    stopper: Option<crate::exec::Stopper>,
 }
 
 /// Every task run in the workspace, by environment and name — the user's
@@ -422,14 +434,33 @@ impl TaskBoard {
 
     /// Stop a running task: the process running it killed.
     pub fn stop(&self, env: &EnvironmentId, name: &str) {
-        let stop = self
+        let (stop, stopper) = self
             .runs
             .lock()
             .unwrap()
             .get(&(env.clone(), name.to_string()))
-            .and_then(|run| run.stop.clone());
+            .map_or((None, None), |run| {
+                (
+                    run.stop.clone(),
+                    run.pending.then(|| run.stopper.clone()).flatten(),
+                )
+            });
+        // Held when nothing is waiting on it yet: the wrapper's report,
+        // when it comes, picks it up and stops the run.
         if let Some(stop) = stop {
             stop.notify_one();
+        }
+        // A run its wrapper has not reported is stopped where it runs as
+        // well, by its mark, as a direct run is.
+        if let Some(stopper) = stopper {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let _in = runtime.enter();
+                stopper.interrupt();
+                runtime.spawn(async move {
+                    tokio::time::sleep(crate::exec::Stopper::GRACE).await;
+                    stopper.kill();
+                });
+            }
         }
     }
 
@@ -438,12 +469,20 @@ impl TaskBoard {
     /// never run on the host, when there is no container to run it in, and
     /// while a run of it is under way. Runs on the tokio runtime the caller
     /// is in (the GTK side enters the app's for the call).
+    ///
+    /// With `wrapper` — the environment's own `task` wrapper, there while
+    /// its channel is up — the run is started through it and detached from
+    /// the IDE: it journals itself in the container and reports back as a
+    /// terminal's run does, so it goes on when the IDE closes and a
+    /// reopened IDE finds it (`begin_external`). Without one it runs as a
+    /// child of the IDE and ends with it.
     pub fn start(
         &self,
         env: &EnvironmentId,
         name: &str,
         exec: &ExecContext,
         by_agent: bool,
+        wrapper: Option<&std::path::Path>,
     ) -> Result<(), String> {
         if !exec.has_exec_target() {
             return Err("no container is running to run it in".to_string());
@@ -453,6 +492,9 @@ impl TaskBoard {
         let key = (env.clone(), name.to_string());
         if self.state(env, name) == RunState::Running {
             return Err(format!("{name} is already running"));
+        }
+        if let Some(wrapper) = wrapper {
+            return self.start_detached(&runtime, key, exec, by_agent, wrapper);
         }
         let (program, argv) = task_command(&[name]);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -483,6 +525,8 @@ impl TaskBoard {
                 lines: Vec::new(),
                 state: RunState::Running,
                 stop: Some(stop.clone()),
+                pending: false,
+                stopper: None,
             },
         );
         self.publish_lines(&key, vec![first]);
@@ -592,6 +636,18 @@ impl TaskBoard {
         header: String,
     ) -> Arc<tokio::sync::Notify> {
         let key = (env.clone(), name.to_string());
+        // The board's own run, reported by the wrapper it was started
+        // through: the same run, its stop — pressed already, maybe — kept.
+        {
+            let mut runs = self.runs.lock().unwrap();
+            if let Some(run) = runs.get_mut(&key).filter(|run| run.pending) {
+                run.pending = false;
+                run.stopper = None;
+                if let Some(stop) = run.stop.clone() {
+                    return stop;
+                }
+            }
+        }
         let stop = Arc::new(tokio::sync::Notify::new());
         self.runs.lock().unwrap().insert(
             key.clone(),
@@ -599,6 +655,8 @@ impl TaskBoard {
                 lines: Vec::new(),
                 state: RunState::Running,
                 stop: Some(stop.clone()),
+                pending: false,
+                stopper: None,
             },
         );
         self.publish_lines(&key, vec![header]);
@@ -632,6 +690,120 @@ impl TaskBoard {
             run.stop = None;
         }
         self.publish_lines(&key, vec![last]);
+        self.events.publish(Event::TaskState {
+            env: env.clone(),
+            name: name.to_string(),
+        });
+    }
+
+    /// [`Self::start`] through the environment's `task` wrapper, detached
+    /// from the IDE: `podman exec -d`, the wrapper told whose run it is,
+    /// and the run waiting for the wrapper's report to take it over.
+    fn start_detached(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        key: (EnvironmentId, String),
+        exec: &ExecContext,
+        by_agent: bool,
+        wrapper: &std::path::Path,
+    ) -> Result<(), String> {
+        let origin = if by_agent { "agent" } else { "board" };
+        let wrapper = wrapper.display().to_string();
+        let spec = exec.resolve_detached(
+            &wrapper,
+            &[key.1.as_str()],
+            by_agent,
+            &[("TASTE_TASK_ORIGIN".to_string(), origin.to_string())],
+        );
+        let child = {
+            let _in = runtime.enter();
+            tokio::process::Command::new(&spec.program)
+                .args(&spec.args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("could not run task: {e}"))?
+        };
+        self.runs.lock().unwrap().insert(
+            key.clone(),
+            Run {
+                lines: Vec::new(),
+                state: RunState::Running,
+                stop: Some(Arc::new(tokio::sync::Notify::new())),
+                pending: true,
+                stopper: spec.stopper.clone(),
+            },
+        );
+        self.publish_lines(&key, vec![format!("$ task {}", key.1)]);
+        self.events.publish(Event::TaskState {
+            env: key.0.clone(),
+            name: key.1.clone(),
+        });
+        // `podman exec -d` returns once the run has started; one that could
+        // not start says so here, and the run ends with what it said.
+        let board = self.clone();
+        runtime.spawn(async move {
+            let Ok(out) = child.wait_with_output().await else {
+                return;
+            };
+            if out.status.success() {
+                return;
+            }
+            let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let still_pending = board
+                .runs
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|run| run.pending);
+            if still_pending {
+                board.end_external(&key.0, &key.1, Some(out.status.code().unwrap_or(1)));
+                if !said.is_empty() {
+                    board.publish_lines(&key, vec![format!("— could not start: {said} —")]);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// A run that ended while no IDE was listening, as the wrapper's journal
+    /// in its container kept it: shown as its last run, unless the board
+    /// already has a run of that task — anything the board knows is newer.
+    pub fn record_ended(
+        &self,
+        env: &EnvironmentId,
+        name: &str,
+        header: String,
+        lines: &[String],
+        code: Option<i32>,
+    ) {
+        let key = (env.clone(), name.to_string());
+        let (state, last) = match code {
+            Some(0) => (RunState::Succeeded, "— done —".to_string()),
+            Some(code) => (RunState::Failed, format!("— failed: exit status {code} —")),
+            None => (RunState::Failed, "— ended by a signal —".to_string()),
+        };
+        {
+            let mut runs = self.runs.lock().unwrap();
+            if runs.contains_key(&key) {
+                return;
+            }
+            runs.insert(
+                key.clone(),
+                Run {
+                    lines: Vec::new(),
+                    state,
+                    stop: None,
+                    pending: false,
+                    stopper: None,
+                },
+            );
+        }
+        let mut all = vec![header];
+        all.extend(lines.iter().map(|line| terminal_line(line)));
+        all.push(last);
+        self.publish_lines(&key, all);
         self.events.publish(Event::TaskState {
             env: env.clone(),
             name: name.to_string(),

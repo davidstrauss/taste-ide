@@ -204,7 +204,9 @@ impl Kernels {
             return Ok(());
         }
         let _in = crate::runtime::runtime().enter();
-        hooks.board.start(env, TASK, exec, false)
+        // Directly, as the IDE's child: a notebook's kernel lives as long
+        // as the window that talks to it, and is not left behind with it.
+        hooks.board.start(env, TASK, exec, false, None)
     }
 
     /// Restart `env`'s kernel: its task stopped, and started again once it

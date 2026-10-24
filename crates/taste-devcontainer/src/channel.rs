@@ -290,7 +290,9 @@ c.on('close',gone);c.on('error',gone)});\
 srv.on('error',e=>{console.error('taste-ide channel: '+p+': '+e.message);process.exit(1)});\
 srv.listen(p,()=>{fs.chmodSync(p,0o600)});\
 return new Promise(r=>srv.on('listening',r))};\
-Promise.all(specs.map(listen)).then(()=>console.error('taste-ide channel ready'));\
+Promise.all(specs.map(listen)).then(()=>{console.error('taste-ide channel ready');\
+const r=path.join(dir,'task-report.js');if(fs.existsSync(r))require('child_process').spawn(\
+process.execPath,[r,path.join(dir,'tasks.sock'),'--taste-announce'],{stdio:'ignore'})});\
 let buf=Buffer.alloc(0);\
 process.stdin.on('data',d=>{\
 buf=Buffer.concat([buf,d]);\
@@ -391,8 +393,17 @@ exec \"@NODE@\" \"@DIR@/task-report.js\" \"@DIR@/tasks.sock\" \"$@\"\n";
 /// straight through unreported. Nothing it says to the IDE decides how the
 /// task runs: with the IDE gone, the task runs the same. The IDE's stop is
 /// a `stop` line back, and the task is sent SIGTERM.
+///
+/// Each run is journaled in the container (`taste_core::tasks::JOURNAL_DIR`):
+/// what it was, its output, and how it ended. A connection that drops — the
+/// IDE closed, its channel restarted — is tried again every two seconds, and
+/// the run comes back as `resume` with the end of its output, so a reopened
+/// IDE finds it still running, and can stop it. With `--taste-announce` it
+/// is the channel helper's, at its start: each task's last run that ended
+/// while no IDE was listening, as `ended`.
 fn task_reporter() -> String {
     TASK_REPORTER
+        .replace("@JOURNAL@", taste_core::tasks::JOURNAL_DIR)
         .replace("@TASKDIR@", taste_core::tasks::IDE_TASK_DIR)
         .replace("@TASKVERSION@", taste_core::tasks::IDE_TASK_VERSION)
 }
@@ -402,6 +413,61 @@ const net = require('net'), fs = require('fs'), path = require('path');
 const { spawn } = require('child_process');
 const { StringDecoder } = require('string_decoder');
 const [sock, ...args] = process.argv.slice(2);
+// The journal: each run kept where it runs, so an IDE that closes and
+// comes back finds it — still running, or how it ended.
+const JOURNAL = process.env.TASTE_TASK_JOURNAL || '@JOURNAL@';
+// How much of a run's output a resume or an announcement carries.
+const TAIL = 64 * 1024;
+// Past this the journal's output starts again, the last part kept as out.1.
+const ROTATE = 4 * 1024 * 1024;
+const tailOf = (dir) => {
+  let text = '';
+  for (const f of ['out', 'out.1']) {
+    if (text.length >= TAIL) break;
+    try {
+      const p = path.join(dir, f);
+      const size = fs.statSync(p).size;
+      const want = Math.min(size, TAIL - text.length);
+      const b = Buffer.alloc(want);
+      const fd = fs.openSync(p, 'r');
+      fs.readSync(fd, b, 0, want, size - want);
+      fs.closeSync(fd);
+      text = b.toString('utf8') + text;
+    } catch (e) {}
+  }
+  // Cut at a line: the first one is likely half of one.
+  if (text.length >= TAIL) text = text.slice(text.indexOf('\n') + 1);
+  return text;
+};
+const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return null; } };
+// `--taste-announce`: the channel's helper, at its start, telling a newly
+// opened IDE how each task's last run ended while it was away.
+if (args[0] === '--taste-announce') {
+  const latest = new Map();
+  let entries = [];
+  try { entries = fs.readdirSync(JOURNAL); } catch (e) {}
+  for (const e of entries) {
+    const dir = path.join(JOURNAL, e);
+    const meta = readJson(path.join(dir, 'meta.json'));
+    const exit = readJson(path.join(dir, 'exit'));
+    if (!meta || !exit || typeof meta.name !== 'string') continue;
+    const had = latest.get(meta.name);
+    if (!had || had.meta.started < meta.started) latest.set(meta.name, { dir, meta, exit });
+  }
+  const runs = [...latest.values()];
+  const one = () => {
+    const run = runs.shift();
+    if (!run) return;
+    const c = net.connect(sock);
+    c.on('error', () => {});
+    c.on('close', one);
+    c.end(JSON.stringify({ ev: 'ended', name: run.meta.name, args: run.meta.args,
+      origin: run.meta.origin, started: run.meta.started, code: run.exit.code,
+      text: tailOf(run.dir) }) + '\n');
+  };
+  one();
+  return;
+}
 const own = path.resolve(path.dirname(sock), 'bin');
 const runs = (p) => { try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch (e) { return false; } };
 const find = (name) => {
@@ -441,7 +507,7 @@ if (name === null) {
   plain.on('close', (code, signal) => process.exit(code == null ? 1 : code));
   return;
 }
-let conn = null, child = null;
+let conn = null, child = null, ended = false;
 // The run's mark, which everything the task starts inherits: the board's
 // Stop is Ctrl+C to every process carrying it and SIGKILL to what is left
 // five seconds on, because a signal to the task alone left what it started
@@ -459,41 +525,94 @@ const signalMarked = (sig) => {
     } catch (e) {}
   }
 };
-let stopping = false;
+// Who asked: the IDE's own board or an agent's task_run say so, and a
+// terminal or a shell is told apart by its input.
+const interactive = !!process.stdin.isTTY;
+const origin = process.env.TASTE_TASK_ORIGIN || (interactive ? 'terminal' : 'shell');
+const started = Date.now();
+const dir = path.join(JOURNAL, mark);
+let journal = null, written = 0;
 try {
-  conn = net.connect(sock);
-  conn.on('error', () => { conn = null; });
-  conn.on('data', (d) => {
+  fs.mkdirSync(dir, { recursive: true });
+  // One run kept per task: its earlier ones that have ended go.
+  for (const e of fs.readdirSync(JOURNAL)) {
+    if (e === mark) continue;
+    const d = path.join(JOURNAL, e);
+    const m = readJson(path.join(d, 'meta.json'));
+    if (m && m.name === name && fs.existsSync(path.join(d, 'exit'))) {
+      try { fs.rmSync(d, { recursive: true, force: true }); } catch (e) {}
+    }
+  }
+  fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ name, args, origin, started }));
+  journal = fs.openSync(path.join(dir, 'out'), 'a');
+} catch (e) { journal = null; }
+const keep = (d) => {
+  if (journal === null) return;
+  try {
+    fs.writeSync(journal, d);
+    written += d.length;
+    if (written > ROTATE) {
+      fs.closeSync(journal);
+      fs.renameSync(path.join(dir, 'out'), path.join(dir, 'out.1'));
+      journal = fs.openSync(path.join(dir, 'out'), 'a');
+      written = 0;
+    }
+  } catch (e) {}
+};
+const send = (o) => { if (conn) { try { conn.write(JSON.stringify(o) + '\n'); } catch (e) {} } };
+// The IDE's end of the run, kept or found again: a connection dropped —
+// the IDE closed, its channel restarted — is tried again every two
+// seconds, and the run says it is still going, with the end of what it
+// has printed, when one answers.
+const connect = (hello) => {
+  let c;
+  try { c = net.connect(sock); } catch (e) { c = null; }
+  if (!c) return;
+  conn = c;
+  send(hello);
+  c.on('error', () => {});
+  c.on('close', () => {
+    if (conn === c) conn = null;
+    if (!ended) setTimeout(() => connect({ ev: 'resume', name, args, origin, started,
+      text: tailOf(dir) }), 2000).unref();
+  });
+  c.on('data', (d) => {
     if (!child || stopping || !d.toString().includes('stop')) return;
     stopping = true;
     signalMarked('SIGINT');
     setTimeout(() => signalMarked('SIGKILL'), 5000).unref();
   });
-} catch (e) { conn = null; }
-const send = (o) => { if (conn) { try { conn.write(JSON.stringify(o) + '\n'); } catch (e) {} } };
-const interactive = !!process.stdin.isTTY;
-send({ ev: 'start', name, args, origin: interactive ? 'terminal' : 'shell' });
+};
+let stopping = false;
+connect({ ev: 'start', name, args, origin });
 const env = Object.assign({}, process.env, { TASTE_TASK_RUN: mark });
-if (process.stdout.isTTY) {
+// Colour when there is a terminal to show it, and when the IDE is the one
+// showing the output: its task tab draws it.
+if (process.stdout.isTTY || origin === 'board' || origin === 'agent') {
   env.FORCE_COLOR = env.FORCE_COLOR || '1';
   env.CLICOLOR_FORCE = env.CLICOLOR_FORCE || '1';
 }
 child = spawn(real, args, { stdio: ['inherit', 'pipe', 'pipe'], env });
 for (const [from, to] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
   const text = new StringDecoder('utf8');
-  from.on('data', (d) => { to.write(d); send({ ev: 'out', text: text.write(d) }); });
+  from.on('data', (d) => { to.write(d); keep(d); send({ ev: 'out', text: text.write(d) }); });
 }
 // A terminal's Ctrl+C reaches the task itself; a signal sent to this
 // process alone is passed on.
 process.on('SIGINT', () => { if (!interactive) child.kill('SIGINT'); });
 for (const sig of ['SIGTERM', 'SIGHUP']) process.on(sig, () => child.kill(sig));
+const finish = (code) => {
+  ended = true;
+  try { fs.writeFileSync(path.join(dir, 'exit'), JSON.stringify({ code, ended: Date.now() })); } catch (e) {}
+  send({ ev: 'exit', code });
+};
 child.on('error', (e) => {
   process.stderr.write('task: ' + e.message + '\n');
-  send({ ev: 'exit', code: 127 });
+  finish(127);
   process.exit(127);
 });
 child.on('close', (code, signal) => {
-  send({ ev: 'exit', code: code == null ? null : code });
+  finish(code == null ? null : code);
   const done = () => process.exit(code == null ? 128 + (require('os').constants.signals[signal] || 1) : code);
   if (conn) conn.end(done); else done();
 });
@@ -758,6 +877,110 @@ async fn client_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run outlives the IDE it was reported to: its connection dropped —
+    /// the IDE closed — it goes on, journaled; a listener at the same socket
+    /// again — the IDE reopened — hears it come back as `resume` with what
+    /// it printed meanwhile, and its exit; and the helper's announcement at
+    /// a later start tells how it ended. With node where the tests run.
+    #[test]
+    fn a_run_comes_back_after_the_ide_was_gone() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            println!("no node here — skipped");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal");
+        let sock = dir.path().join("tasks.sock");
+        let reporter = dir.path().join("task-report.js");
+        std::fs::write(&reporter, task_reporter()).unwrap();
+        let fake = dir.path().join("fake");
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::write(
+            fake.join("task"),
+            "#!/bin/sh\necho one\nsleep 3\necho two\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            fake.join("task"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let wrapper = |args: &[&str]| {
+            let mut command = std::process::Command::new("node");
+            command
+                .arg(&reporter)
+                .arg(&sock)
+                .args(args)
+                .env("TASTE_TASK_JOURNAL", &journal)
+                .env("TASTE_TASK_ORIGIN", "board")
+                .env("PATH", format!("{}:/usr/bin:/bin", fake.display()))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command
+        };
+        let read_event = |reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>| {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap_or(serde_json::Value::Null)
+        };
+        let accept = |listener: &UnixListener| {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            std::io::BufReader::new(stream)
+        };
+
+        // The IDE there when it starts.
+        let first = UnixListener::bind(&sock).unwrap();
+        let mut run = wrapper(&["dev"]).spawn().unwrap();
+        let mut conn = accept(&first);
+        let start = read_event(&mut conn);
+        assert_eq!(start["ev"], "start");
+        assert_eq!(start["origin"], "board");
+        // ...and gone, while the task is still printing.
+        drop(conn);
+        drop(first);
+        std::fs::remove_file(&sock).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Back: the run says it is still going, with what it printed.
+        let second = UnixListener::bind(&sock).unwrap();
+        let mut conn = accept(&second);
+        let resume = read_event(&mut conn);
+        assert_eq!(resume["ev"], "resume", "{resume}");
+        assert_eq!(resume["name"], "dev");
+        assert!(resume["text"].as_str().unwrap().contains("one"), "{resume}");
+        let mut exit = read_event(&mut conn);
+        while exit["ev"] == "out" {
+            exit = read_event(&mut conn);
+        }
+        assert_eq!(exit["ev"], "exit", "{exit}");
+        assert_eq!(exit["code"], 0);
+        assert!(run.wait().unwrap().success());
+        drop(conn);
+
+        // A later start of the channel: how its last run ended.
+        let mut announce = wrapper(&["--taste-announce"]).spawn().unwrap();
+        let mut conn = accept(&second);
+        let ended = read_event(&mut conn);
+        assert_eq!(ended["ev"], "ended", "{ended}");
+        assert_eq!(ended["name"], "dev");
+        assert_eq!(ended["code"], 0);
+        let text = ended["text"].as_str().unwrap();
+        assert!(text.contains("one") && text.contains("two"), "{text}");
+        let _ = conn.get_mut().write_all(b"");
+        drop(conn);
+        assert!(announce.wait().unwrap().success());
+    }
 
     /// The whole in-container path of a reported run, with node where the
     /// tests run (skipped where it is not): the helper, as the IDE starts it,

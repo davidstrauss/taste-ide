@@ -41,6 +41,11 @@ const MAX_TASK_NAME: usize = 200;
 /// `start`, its output as `out`, and `exit`, as JSON lines; the board's
 /// stop goes back as a `stop` line. The run is the environment's whose
 /// channel it came on — nothing in the report says otherwise.
+///
+/// A run the wrapper went on with while no IDE was listening comes back as
+/// `resume`, with the end of its output, and carries on as a `start` does;
+/// one that ended meanwhile is a single `ended`, from the channel helper at
+/// its start, with the end of its output and its exit code.
 async fn serve_task_report(
     board: taste_core::tasks::TaskBoard,
     env: EnvironmentId,
@@ -75,32 +80,30 @@ async fn serve_task_report(
         let Ok(message) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
-        match (message["ev"].as_str(), &run) {
-            (Some("start"), None) => {
+        let event = message["ev"].as_str();
+        match (event, &run) {
+            (Some("start" | "resume" | "ended"), None) => {
                 let Some(name) = message["name"].as_str().filter(|n| {
                     !n.is_empty() && n.len() <= MAX_TASK_NAME && !n.chars().any(char::is_control)
                 }) else {
                     break;
                 };
-                let args: Vec<String> = message["args"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|a| a.as_str())
-                    .map(|a| {
-                        if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '\'') {
-                            format!("'{}'", a.replace('\'', "'\\''"))
-                        } else {
-                            a.to_string()
-                        }
-                    })
+                let header = report_header(&message, event == Some("start"));
+                let earlier: Vec<String> = message["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_string)
                     .collect();
-                let from = match message["origin"].as_str() {
-                    Some("terminal") => "from a terminal",
-                    _ => "from a shell (an agent's, or a script's)",
-                };
-                let header = format!("$ task {} — {from}", args.join(" "));
+                if event == Some("ended") {
+                    let code = message["code"].as_i64().map(|c| c as i32);
+                    board.record_ended(&env, name, header, &earlier, code);
+                    return;
+                }
                 stop = Some(board.begin_external(&env, name, header));
+                if !earlier.is_empty() {
+                    board.external_lines(&env, name, &earlier);
+                }
                 run = Some(name.to_string());
             }
             (Some("out"), Some(name)) => {
@@ -130,6 +133,41 @@ async fn serve_task_report(
         }
         board.end_external(&env, &name, None);
     }
+}
+
+/// A reported run's first line: the command, and who ran it — and, for one
+/// found again rather than started, that it was going before this IDE was.
+fn report_header(message: &serde_json::Value, fresh: bool) -> String {
+    let args: Vec<String> = message["args"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a.as_str())
+        .map(|a| {
+            if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '\'') {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            } else {
+                a.to_string()
+            }
+        })
+        .collect();
+    let from = match message["origin"].as_str() {
+        Some("terminal") => Some("from a terminal"),
+        Some("board") => None,
+        Some("agent") => Some("by the agent"),
+        _ => Some("from a shell (an agent's, or a script's)"),
+    };
+    let found = match message["ev"].as_str() {
+        _ if fresh => None,
+        Some("ended") => Some("its last run, which ended while the IDE was closed"),
+        _ => Some("still running from before the IDE opened; the start of its output may be gone"),
+    };
+    let mut header = format!("$ task {}", args.join(" "));
+    for part in [from, found].into_iter().flatten() {
+        header.push_str(" — ");
+        header.push_str(part);
+    }
+    header
 }
 
 impl ChannelServices for IdeChannelServices {
@@ -235,6 +273,60 @@ mod tests {
             serving.await.unwrap();
             assert_eq!(board.state(&env, "index"), RunState::Failed);
             assert!(board.lines(&env, "index").last().unwrap().contains("went away"));
+        });
+    }
+
+    /// A run found again after the IDE was away comes back running, with
+    /// the end of what it printed meanwhile, and says it is one found.
+    #[test]
+    fn a_resumed_run_is_running_with_what_it_printed() {
+        crate::runtime::runtime().block_on(async {
+            let board = TaskBoard::new(taste_core::EventBus::new());
+            let env = EnvironmentId::primary();
+            let (ide, mut wrapper) = tokio::io::duplex(4096);
+            let serving = tokio::spawn(serve_task_report(board.clone(), env.clone(), ide));
+            wrapper
+                .write_all(b"{\"ev\":\"resume\",\"name\":\"dev\",\"args\":[\"dev\"],\"origin\":\"board\",\"text\":\"listening on 5173\\nready\\n\"}\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(board.state(&env, "dev"), RunState::Running);
+            let lines = board.lines(&env, "dev");
+            assert!(lines[0].starts_with("$ task dev — still running"), "{lines:?}");
+            assert_eq!(&lines[1..], ["listening on 5173", "ready"]);
+            wrapper.write_all(b"{\"ev\":\"exit\",\"code\":0}\n").await.unwrap();
+            serving.await.unwrap();
+            assert_eq!(board.state(&env, "dev"), RunState::Succeeded);
+        });
+    }
+
+    /// A run that ended while the IDE was away is shown as the task's last
+    /// run — but never over a run the board already has, which is newer.
+    #[test]
+    fn an_ended_run_is_shown_unless_the_board_knows_better() {
+        crate::runtime::runtime().block_on(async {
+            let board = TaskBoard::new(taste_core::EventBus::new());
+            let env = EnvironmentId::primary();
+            let report = |name: &str, code: i32| {
+                format!(
+                    "{{\"ev\":\"ended\",\"name\":\"{name}\",\"args\":[\"{name}\"],\"origin\":\"terminal\",\"code\":{code},\"text\":\"error: oops\\n\"}}\n"
+                )
+            };
+            let (ide, mut wrapper) = tokio::io::duplex(4096);
+            let serving = tokio::spawn(serve_task_report(board.clone(), env.clone(), ide));
+            wrapper.write_all(report("build", 2).as_bytes()).await.unwrap();
+            serving.await.unwrap();
+            assert_eq!(board.state(&env, "build"), RunState::Failed);
+            let lines = board.lines(&env, "build");
+            assert!(lines[0].contains("ended while the IDE was closed"), "{lines:?}");
+            assert_eq!(lines[1], "error: oops");
+
+            // Again, saying it succeeded: the board's own record stands.
+            let (ide, mut wrapper) = tokio::io::duplex(4096);
+            let serving = tokio::spawn(serve_task_report(board.clone(), env.clone(), ide));
+            wrapper.write_all(report("build", 0).as_bytes()).await.unwrap();
+            serving.await.unwrap();
+            assert_eq!(board.state(&env, "build"), RunState::Failed);
         });
     }
 }

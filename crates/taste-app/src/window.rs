@@ -455,7 +455,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // same way an agent's run of it does.
             editor.open_task(&env, &name, Vec::new());
             let _in = runtime().enter();
-            if let Err(why) = task_runs.start(&env, &name, supervisor.exec(), false) {
+            // Through the environment's `task` wrapper while its channel is
+            // up, so the run outlives this window (`TaskBoard::start`).
+            let wrapper = supervisor
+                .channel_paths()
+                .map(|paths| paths.task_wrapper.join("task"));
+            if let Err(why) =
+                task_runs.start(&env, &name, supervisor.exec(), false, wrapper.as_deref())
+            {
                 events.publish(Event::Toast(format!("{name} was not run: {why}")));
             }
         });

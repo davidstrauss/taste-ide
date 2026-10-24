@@ -446,6 +446,37 @@ impl ExecContext {
         }
     }
 
+    /// [`Self::resolve`], detached: `podman exec -d`, which returns once
+    /// the command has started and leaves it running in the container
+    /// whatever becomes of this process — a task the IDE starts through its
+    /// wrapper, which outlives the IDE (`tasks::TaskBoard::start`). As an
+    /// agent's when `for_agent` (its git policy), with `extra_env` besides.
+    /// A host target has no container to leave it in, and is refused by
+    /// every caller before it gets here.
+    pub fn resolve_detached(
+        &self,
+        program: &str,
+        args: &[&str],
+        for_agent: bool,
+        extra_env: &[(String, String)],
+    ) -> CommandSpec {
+        let mut env: Vec<(String, String)> = extra_env.to_vec();
+        if for_agent {
+            env.extend(crate::policy::agent_git_config_env());
+        }
+        match &*self.target.read().unwrap() {
+            Target::Container { .. } => {
+                let mut flags: Vec<String> = vec!["-d".into()];
+                for (key, value) in &env {
+                    flags.push("--env".into());
+                    flags.push(format!("{key}={value}"));
+                }
+                self.resolve_with_exec_flags(&flags, None, program, args)
+            }
+            Target::Host => self.host_spec(program, args),
+        }
+    }
+
     /// [`Self::resolve_for_agent`], in a terminal ([`Self::resolve_in_terminal`]).
     pub fn resolve_for_agent_in_terminal(&self, program: &str, args: &[&str]) -> CommandSpec {
         self.resolve_for_agent_with(true, None, &[], program, args)
