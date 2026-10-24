@@ -770,6 +770,8 @@ impl TaskBoard {
     /// A run that ended while no IDE was listening, as the wrapper's journal
     /// in its container kept it: shown as its last run, unless the board
     /// already has a run of that task — anything the board knows is newer.
+    /// `cut` is a run whose journal has no end, its wrapper gone: the
+    /// container stopped under it.
     pub fn record_ended(
         &self,
         env: &EnvironmentId,
@@ -777,9 +779,14 @@ impl TaskBoard {
         header: String,
         lines: &[String],
         code: Option<i32>,
+        cut: bool,
     ) {
         let key = (env.clone(), name.to_string());
         let (state, last) = match code {
+            _ if cut => (
+                RunState::Failed,
+                "— cut off: its container stopped while it ran —".to_string(),
+            ),
             Some(0) => (RunState::Succeeded, "— done —".to_string()),
             Some(code) => (RunState::Failed, format!("— failed: exit status {code} —")),
             None => (RunState::Failed, "— ended by a signal —".to_string()),

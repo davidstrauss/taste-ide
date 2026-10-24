@@ -97,7 +97,8 @@ async fn serve_task_report(
                     .collect();
                 if event == Some("ended") {
                     let code = message["code"].as_i64().map(|c| c as i32);
-                    board.record_ended(&env, name, header, &earlier, code);
+                    let cut = message["cut"].as_bool().unwrap_or(false);
+                    board.record_ended(&env, name, header, &earlier, code, cut);
                     return;
                 }
                 stop = Some(board.begin_external(&env, name, header));
@@ -159,6 +160,9 @@ fn report_header(message: &serde_json::Value, fresh: bool) -> String {
     };
     let found = match message["ev"].as_str() {
         _ if fresh => None,
+        Some("ended") if message["cut"].as_bool() == Some(true) => {
+            Some("its last run, cut off while the IDE was closed")
+        }
         Some("ended") => Some("its last run, which ended while the IDE was closed"),
         _ => Some("still running from before the IDE opened; the start of its output may be gone"),
     };

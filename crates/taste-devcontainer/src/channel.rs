@@ -446,11 +446,23 @@ if (args[0] === '--taste-announce') {
   const latest = new Map();
   let entries = [];
   try { entries = fs.readdirSync(JOURNAL); } catch (e) {}
+  // A run with no exit whose wrapper is gone was cut off — its container
+  // stopped under it — and is told as that; one whose wrapper is alive is
+  // still going, and says so itself when it reconnects.
+  const alive = (mark) => {
+    try {
+      return fs.readFileSync('/proc/' + mark.split('-')[0] + '/cmdline', 'latin1').includes('task-report');
+    } catch (e) { return false; }
+  };
   for (const e of entries) {
     const dir = path.join(JOURNAL, e);
     const meta = readJson(path.join(dir, 'meta.json'));
-    const exit = readJson(path.join(dir, 'exit'));
-    if (!meta || !exit || typeof meta.name !== 'string') continue;
+    let exit = readJson(path.join(dir, 'exit'));
+    if (!meta || typeof meta.name !== 'string') continue;
+    if (!exit) {
+      if (alive(e)) continue;
+      exit = { code: null, cut: true };
+    }
     const had = latest.get(meta.name);
     if (!had || had.meta.started < meta.started) latest.set(meta.name, { dir, meta, exit });
   }
@@ -463,7 +475,7 @@ if (args[0] === '--taste-announce') {
     c.on('close', one);
     c.end(JSON.stringify({ ev: 'ended', name: run.meta.name, args: run.meta.args,
       origin: run.meta.origin, started: run.meta.started, code: run.exit.code,
-      text: tailOf(run.dir) }) + '\n');
+      cut: !!run.exit.cut, text: tailOf(run.dir) }) + '\n');
   };
   one();
   return;
@@ -980,6 +992,27 @@ mod tests {
         let _ = conn.get_mut().write_all(b"");
         drop(conn);
         assert!(announce.wait().unwrap().success());
+
+        // A run whose container stopped under it: a journal with no end,
+        // its wrapper gone. Told as cut off.
+        let cut = journal.join("999999-1");
+        std::fs::create_dir_all(&cut).unwrap();
+        std::fs::write(
+            cut.join("meta.json"),
+            r#"{"name":"serve","args":["serve"],"origin":"terminal","started":1}"#,
+        )
+        .unwrap();
+        std::fs::write(cut.join("out"), "listening\n").unwrap();
+        let mut announce = wrapper(&["--taste-announce"]).spawn().unwrap();
+        let mut told = Vec::new();
+        for _ in 0..2 {
+            let mut conn = accept(&second);
+            told.push(read_event(&mut conn));
+        }
+        assert!(announce.wait().unwrap().success());
+        let serve = told.iter().find(|t| t["name"] == "serve").unwrap();
+        assert_eq!(serve["cut"], true, "{serve}");
+        assert_eq!(serve["text"], "listening\n");
     }
 
     /// The whole in-container path of a reported run, with node where the
