@@ -133,7 +133,10 @@ finished with its report one click away and one failed, which is what
 Claude Code's `<task-notification>` messages are drawn as —, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,
 `permission-edit`, `permission-standing`, `standing`,
-`none` — no chat seeded at all —,
+`none` — no chat seeded at all —, and with any of them
+`TASTE_PROBE_THOUGHT=open` opens the transcript's thoughts 1.5s in, as a
+click does (`top` and a tall `TASTE_PROBE_HEIGHT` bring the seeded one into
+the frame; an opened thought once stood a screen tall, `rows::thought_body`),
 `stash` — the conversation this machine kept for an environment whose
 agent has none, which is where a workspace restored from its archive
 lands: a transcript long enough to be scrolled to the bottom, the line

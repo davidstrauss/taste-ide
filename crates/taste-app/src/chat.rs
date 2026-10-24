@@ -11637,6 +11637,26 @@ impl ChatPane {
         // working line is in, since it steps aside for a card.
         self.stop_button.set_visible(true);
         self.set_busy(true);
+        // `TASTE_PROBE_THOUGHT=open`: the thought opened, as a
+        // click opens it — its expander is the row's own, not the
+        // model's, so it is opened in the drawn rows. The opened
+        // thought once stood a screen tall (`rows::thought_body`).
+        if std::env::var("TASTE_PROBE_THOUGHT").as_deref() == Ok("open") {
+            let list = self.list.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                fn open_all(widget: &gtk::Widget) {
+                    if let Some(expander) = widget.downcast_ref::<gtk::Expander>() {
+                        expander.set_expanded(true);
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(next) = child {
+                        open_all(&next);
+                        child = next.next_sibling();
+                    }
+                }
+                open_all(list.upcast_ref());
+            });
+        }
         match std::env::var("TASTE_PROBE_CHAT").as_deref() {
             Ok("busy") => self.set_activity("cargo test -p taste-app filetree"),
             // `queued`: the same turn, with a message sent during it waiting

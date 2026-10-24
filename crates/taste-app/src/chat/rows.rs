@@ -626,13 +626,7 @@ impl ChatPane {
     /// A thought: an aside, folded under a dim header that says how long it
     /// took and what it opened with.
     fn thought_widget(&self, row: &Row, thought: &Thought) -> Railed {
-        let view = gtk::TextView::builder()
-            .editable(false)
-            .cursor_visible(false)
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .css_classes(["dim-label"])
-            .build();
-        view.buffer().set_text(&thought.text);
+        let view = thought_body(&thought.text);
         let header = gtk::Label::builder()
             .label(thought.header.as_deref().unwrap_or("Thinking…"))
             .css_classes(["dim-label", "caption"])
@@ -1097,6 +1091,32 @@ impl ChatPane {
     }
 }
 
+/// A thought's text, as it shows opened: a label, not a text view. A
+/// `GtkTextView` reports the height of its last layout, and a thought's has
+/// never been laid out when its expander first opens — so it answered at
+/// its narrowest, wrapped a few characters a line, and the row stood a
+/// screen of blank under the text until it was closed and opened again,
+/// by which time the view had been laid out at its real width (David,
+/// 2026-10-24: "expanding some boxes in chat creates a huge, vertical
+/// blank area"). A label measures height for width honestly, as the OUT
+/// block learned (`chatdoc::ansi_label`).
+fn thought_body(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .attributes(&no_hyphens())
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        // Its natural width is a line's, not the whole thought's: the
+        // column decides how wide it is.
+        .max_width_chars(40)
+        .xalign(0.0)
+        .hexpand(true)
+        .selectable(true)
+        .focusable(false)
+        .css_classes(["dim-label"])
+        .build()
+}
+
 /// What a command's step printed: its content's text, the adapter's
 /// terminal capture when the content is only the terminal, and for the
 /// IDE's own command tools what the command printed rather than the JSON
@@ -1134,4 +1154,28 @@ fn step_has_content(step: &Step) -> bool {
         ToolCallContent::Content(block) => content_text(&block.content).is_some(),
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use gtk::prelude::*;
+
+    /// A thought's body is as tall as its text at the width it is given,
+    /// before it has ever been laid out: at a chat column's width, a
+    /// fraction of what it needs a few characters wide. A text view gave
+    /// the same tall answer at any width until it had been allocated.
+    #[test]
+    fn a_thought_measures_its_height_at_the_width_it_is_given() {
+        crate::gtk_test::on_gtk_thread("thought height: no display — skipped", || {
+            let text = "The row stood a screen of blank under the text. ".repeat(40);
+            let body = super::thought_body(&text);
+            let (narrow, _, _, _) = body.measure(gtk::Orientation::Vertical, 60);
+            let (column, _, _, _) = body.measure(gtk::Orientation::Vertical, 360);
+            assert!(column > 0);
+            assert!(
+                column * 4 < narrow,
+                "{column}px at 360 wide against {narrow}px at 60: the width is not honoured"
+            );
+        });
+    }
 }
