@@ -841,6 +841,9 @@ pub struct ChatPane {
     composer: Rc<crate::composer::Composer>,
     send_button: gtk::Button,
     stop_button: gtk::Button,
+    /// Stop's hold: two seconds held is Ctrl+click's stop — the messages
+    /// waiting behind the turn dropped too. Kept here, alive with the pane.
+    stop_hold: RefCell<Option<Rc<crate::holdbutton::HoldButton>>>,
     usage_bar: gtk::LevelBar,
     /// The subscription gauge beside it, and the box that carries its mark,
     /// its tooltip, and its visibility together (see `new`).
@@ -2904,10 +2907,23 @@ impl ChatPane {
         // Send are both live at once, and the row should read as one
         // affordance (Send) with two small controls, not three buttons
         // fighting for width. Round, not square — see `send`.
+        // Its face in a stack, the icon at rest: a hold puts the filling
+        // ring in its place (`holdbutton`).
+        let stop_faces = gtk::Stack::builder()
+            .hhomogeneous(true)
+            .vhomogeneous(true)
+            .transition_type(gtk::StackTransitionType::None)
+            .build();
+        stop_faces.add_named(
+            &gtk::Image::from_icon_name("media-playback-stop-symbolic"),
+            Some("icon"),
+        );
+        stop_faces.set_visible_child_name("icon");
         let stop_button = gtk::Button::builder()
-            .icon_name("media-playback-stop-symbolic")
+            .child(&stop_faces)
             .tooltip_text(
-                "Stop this turn\nCtrl+click: stop, and drop the messages waiting behind it",
+                "Stop this turn\nCtrl+click, or hold for two seconds: stop, and drop the \
+                 messages waiting behind it",
             )
             .css_classes(["pill-action"])
             .visible(false)
@@ -3532,6 +3548,7 @@ impl ChatPane {
             composer: composer.clone(),
             send_button: send.clone(),
             stop_button: stop_button.clone(),
+            stop_hold: RefCell::new(None),
             usage_bar,
             quota_box: quota_box.clone(),
             quota_label: quota_label.clone(),
@@ -4028,42 +4045,34 @@ impl ChatPane {
             pane.notify_persist();
             pane.set_status("new session on next prompt");
         });
-        let weak = Rc::downgrade(&pane);
-        stop_button.connect_clicked(move |button| {
-            let Some(pane) = weak.upgrade() else { return };
-            // Ctrl+click: the messages waiting behind the turn go as well,
-            // never sent — those queued for the agent, and those held for
-            // its environment to come up.
-            let everything = button
-                .display()
-                .default_seat()
-                .and_then(|seat| seat.keyboard())
-                .is_some_and(|keyboard| {
-                    keyboard
-                        .modifier_state()
-                        .contains(gtk::gdk::ModifierType::CONTROL_MASK)
-                });
-            if everything {
-                pane.withdraw_held();
-            }
-            let result = match pane.client.borrow().as_ref() {
-                Some(client) if everything => client.cancel_all(),
-                Some(client) => client.cancel(),
-                None => Ok(()),
-            };
-            if let Err(e) = result {
-                tracing::warn!("cancel failed: {e}");
-            } else {
-                // The agent will see Cancelled everywhere this turn; the
-                // log keeps the fact that it was a Stop, not a refusal.
-                pane.workspace.ide.record_permission(
-                    "(the in-flight turn)",
-                    "cancelled",
-                    "the user pressed Stop; the turn and any tool calls in \
-                     it resolve as cancelled, not as refusals",
-                );
-            }
-        });
+        {
+            // A click stops the turn — with Ctrl held, everything waiting
+            // behind it too; a two-second hold is the same as Ctrl+click,
+            // for a hand that is not on the keyboard.
+            let hold = crate::holdbutton::HoldButton::around(&stop_button, &stop_faces, "icon");
+            let weak = Rc::downgrade(&pane);
+            let button = stop_button.clone();
+            hold.set_on_click(move || {
+                let Some(pane) = weak.upgrade() else { return };
+                let everything = button
+                    .display()
+                    .default_seat()
+                    .and_then(|seat| seat.keyboard())
+                    .is_some_and(|keyboard| {
+                        keyboard
+                            .modifier_state()
+                            .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                    });
+                pane.stop_turn(everything);
+            });
+            let weak = Rc::downgrade(&pane);
+            hold.set_on_confirm(move || {
+                if let Some(pane) = weak.upgrade() {
+                    pane.stop_turn(true);
+                }
+            });
+            *pane.stop_hold.borrow_mut() = Some(hold);
+        }
 
         // The composer's own chips change what Send may do, and its notices
         // (an unreadable attachment, the speech model downloading) go on the
@@ -7183,8 +7192,34 @@ impl ChatPane {
         }));
     }
 
-    /// What a message dropped by Ctrl+Stop says on its card.
-    const WITHDRAWN: &'static str = "Ctrl+Stop dropped it before the agent took it";
+    /// Stop: the turn cancelled, and — `everything` — the messages waiting
+    /// behind it dropped as well, those queued for the agent and those held
+    /// for its environment, never sent (Ctrl+click, or a hold).
+    fn stop_turn(&self, everything: bool) {
+        if everything {
+            self.withdraw_held();
+        }
+        let result = match self.client.borrow().as_ref() {
+            Some(client) if everything => client.cancel_all(),
+            Some(client) => client.cancel(),
+            None => Ok(()),
+        };
+        if let Err(e) = result {
+            tracing::warn!("cancel failed: {e}");
+        } else {
+            // The agent will see Cancelled everywhere this turn; the log
+            // keeps the fact that it was a Stop, not a refusal.
+            self.workspace.ide.record_permission(
+                "(the in-flight turn)",
+                "cancelled",
+                "the user pressed Stop; the turn and any tool calls in it resolve as \
+                 cancelled, not as refusals",
+            );
+        }
+    }
+
+    /// What a message dropped by Ctrl+Stop, or Stop held, says on its card.
+    const WITHDRAWN: &'static str = "Stop dropped it before the agent took it";
 
     /// The last `count` messages waiting behind the turn, dropped by the
     /// session on Ctrl+Stop: they stay where they were sent, marked never
@@ -11700,6 +11735,16 @@ impl ChatPane {
         // working line is in, since it steps aside for a card.
         self.stop_button.set_visible(true);
         self.set_busy(true);
+        // `TASTE_PROBE_HOLD=0.65`: Stop held that far towards dropping
+        // what waits behind the turn too, its ring in the icon's place.
+        if let Some(progress) = std::env::var("TASTE_PROBE_HOLD")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+        {
+            if let Some(hold) = self.stop_hold.borrow().as_ref() {
+                hold.pose_for_probe(progress);
+            }
+        }
         // `TASTE_PROBE_THOUGHT=open`: the thought opened, as a
         // click opens it — its expander is the row's own, not the
         // model's, so it is opened in the drawn rows. The opened

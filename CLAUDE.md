@@ -202,7 +202,9 @@ intervention bar — checking is a hover gesture and a shot has no pointer,
 so what gets posed is the state it leaves: boxes in the slots the status
 glyphs came out of, and the bar naming how many;
 `TASTE_PROBE_HOLD=0.65` poses the bar's trash held that far towards
-confirming — the completion ring in place of its icon;
+confirming — the completion ring in place of its icon — and, with a chat
+pose that shows Stop (`busy`), Stop held that far towards dropping the
+messages waiting behind the turn;
 `TASTE_PROBE_GUEST_FETCH=612/976` poses the backlog header's guest image
 indicator that far into a fetch (MiB), rate and time left in its tooltip
 — a download is a minute of a machine's life and a shot has none of it;
