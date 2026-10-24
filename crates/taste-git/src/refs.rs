@@ -251,7 +251,19 @@ impl GitWorkspace {
             .repo
             .commit(None, &signature, &signature, message, tree, &parents)
             .with_context(|| format!("committing to {name}"))?;
+        self.swap_ref(name, expected, commit, message)?;
+        Ok(commit)
+    }
 
+    /// Move `name` from `expected` to `commit`, or fail without moving it.
+    /// `commit` must already be in the object database.
+    pub(crate) fn swap_ref(
+        &self,
+        name: &str,
+        expected: Option<Oid>,
+        commit: Oid,
+        message: &str,
+    ) -> Result<()> {
         // The compare-and-swap, under the ref's own lock.
         //
         // Two things here are load-bearing, and both were learned the hard
@@ -289,7 +301,7 @@ impl GitWorkspace {
         tx.set_target(name, commit, None, message)
             .with_context(|| format!("writing {name}"))?;
         tx.commit().with_context(|| format!("committing {name}"))?;
-        Ok(commit)
+        Ok(())
     }
 
     /// The file listing at a ref, or `None` when the ref does not exist.
@@ -536,7 +548,7 @@ impl GitWorkspace {
     /// when there is one; otherwise the IDE signs as itself rather than
     /// failing an issue write on a host with no `user.name` — unlike
     /// [`GitWorkspace::commit`], nothing here is the user's authored work.
-    fn ref_signature(&self) -> Result<git2::Signature<'static>> {
+    pub(crate) fn ref_signature(&self) -> Result<git2::Signature<'static>> {
         match self.repo.signature() {
             Ok(sig) => Ok(sig.to_owned()),
             Err(_) => git2::Signature::now("taste-ide", "taste-ide@localhost")

@@ -55,6 +55,8 @@ use crate::refs::RefFile;
 use crate::review::ENV_BRANCH_PREFIX;
 use crate::GitWorkspace;
 
+mod rebase;
+
 /// Where the queue lives. One ref, one name, everywhere.
 pub const ISSUES_REF: &str = "refs/taste/issues";
 
@@ -662,20 +664,26 @@ pub enum IssueSync {
     /// Local has everything the remote does, and more. The user's push
     /// carries it.
     LocalAhead { ahead: usize },
-    /// Both moved. Nothing was changed — this is the compare-and-swap
-    /// problem across two machines, and the alpha answer is to say so
-    /// rather than to invent a merge.
-    Diverged { ahead: usize, behind: usize },
+    /// Both moved, the histories related or not: the local commits were
+    /// replayed on top of the remote's (`rebase.rs`), so the user's push
+    /// carries them as a fast-forward. `dropped` counts the local changes
+    /// to issues the remote had deleted, which had nowhere to go.
+    Rebased {
+        replayed: usize,
+        gained: usize,
+        dropped: usize,
+    },
 }
 
 impl IssueSync {
     /// The one line the UI shows, or `None` when there is no news.
     pub fn warning(&self) -> Option<String> {
         match self {
-            IssueSync::Diverged { ahead, behind } => Some(format!(
-                "Issues diverged from the remote ({ahead} local, {behind} remote): your \
-                 local queue was kept, and pushing it will be refused until one side is \
-                 rebuilt on the other."
+            IssueSync::Rebased { dropped, .. } if *dropped > 0 => Some(format!(
+                "Issues were rebased onto the remote's, and {dropped} local change{} to \
+                 issues deleted there {} dropped",
+                if *dropped == 1 { "" } else { "s" },
+                if *dropped == 1 { "was" } else { "were" },
             )),
             _ => None,
         }
@@ -1489,10 +1497,8 @@ impl GitWorkspace {
 
     /// Reconcile the fetched tracking ref into the local issues ref.
     ///
-    /// Fast-forward or nothing. Two machines that both moved the ref are
-    /// the compare-and-swap problem writ large, and the honest alpha answer
-    /// is a sentence, not a merge UI: the local queue is kept, and the push
-    /// that would overwrite the remote's is refused by git itself.
+    /// Adopt, fast-forward, or — when both sides moved — rebase the local
+    /// commits onto the remote's, so the queue is always ready to push.
     pub fn reconcile_issues(&self) -> Result<IssueSync> {
         let Some(remote) = self.read_ref(ISSUES_TRACKING_REF)? else {
             return Ok(IssueSync::NoRemote);
@@ -1525,7 +1531,14 @@ impl GitWorkspace {
                 Ok(IssueSync::FastForwarded { gained })
             }
             (ahead, 0) => Ok(IssueSync::LocalAhead { ahead }),
-            (ahead, behind) => Ok(IssueSync::Diverged { ahead, behind }),
+            (_, gained) => {
+                let (replayed, dropped) = self.rebase_issues(remote)?;
+                Ok(IssueSync::Rebased {
+                    replayed,
+                    gained,
+                    dropped,
+                })
+            }
         }
     }
 
@@ -2280,7 +2293,7 @@ mod tests {
             IssueSync::LocalAhead { ahead: 1 }
         );
 
-        // Both moved: kept, warned about, never merged.
+        // Both moved: the local issue is replayed on top of the remote's.
         let local = ws.read_ref(ISSUES_REF).unwrap().unwrap();
         ws.set_ref_for_test(ISSUES_REF, ahead);
         ws.issue_create("added remotely again", "", &[], "primary")
@@ -2291,16 +2304,173 @@ mod tests {
         let sync = ws.reconcile_issues().unwrap();
         assert_eq!(
             sync,
-            IssueSync::Diverged {
-                ahead: 1,
-                behind: 1
+            IssueSync::Rebased {
+                replayed: 1,
+                gained: 1,
+                dropped: 0
             }
         );
-        assert!(sync.warning().unwrap().contains("diverged"));
+        assert_eq!(sync.warning(), None, "a clean rebase is not news");
         assert_eq!(
-            ws.read_ref(ISSUES_REF).unwrap(),
-            Some(local),
-            "divergence changes nothing locally"
+            ws.ahead_behind(ISSUES_REF, ISSUES_TRACKING_REF).unwrap(),
+            (1, 0),
+            "ready to push as a fast-forward"
+        );
+        let mut titles: Vec<String> = ws.issues().unwrap().into_iter().map(|i| i.title).collect();
+        titles.sort();
+        assert_eq!(
+            titles,
+            [
+                "added locally",
+                "added remotely",
+                "added remotely again",
+                "from the remote"
+            ]
+        );
+        assert_eq!(
+            ws.reconcile_issues().unwrap(),
+            IssueSync::LocalAhead { ahead: 1 }
+        );
+    }
+
+    /// Two machines that each started a queue of their own share no
+    /// history at all; the local one goes on top of the remote's.
+    #[test]
+    fn an_unrelated_local_queue_is_replayed_onto_the_remote() {
+        let (_dir, ws) = temp_repo();
+        let theirs = ws
+            .issue_create("filed elsewhere", "", &[], "primary")
+            .unwrap();
+        ws.issue_update(
+            &theirs.id,
+            &IssueChange {
+                comment: Some("from there".into()),
+                ..Default::default()
+            },
+            "HEAD",
+            "primary",
+        )
+        .unwrap();
+        let remote = ws.read_ref(ISSUES_REF).unwrap().unwrap();
+        ws.delete_ref(ISSUES_REF).unwrap();
+        ws.set_ref_for_test(ISSUES_TRACKING_REF, remote);
+        let ours = ws.issue_create("filed here", "", &[], "primary").unwrap();
+        assert_eq!(
+            ws.merge_base(ISSUES_REF, ISSUES_TRACKING_REF).unwrap(),
+            None
+        );
+
+        assert_eq!(
+            ws.reconcile_issues().unwrap(),
+            IssueSync::Rebased {
+                replayed: 1,
+                gained: 2,
+                dropped: 0
+            }
+        );
+        let tip = ws.read_ref(ISSUES_REF).unwrap().unwrap();
+        assert_eq!(ws.first_parent(tip).unwrap(), Some(remote));
+        assert!(ws.issue(&theirs.id).unwrap().unwrap().comments.len() == 1);
+        assert_eq!(ws.issue(&ours.id).unwrap().unwrap().title, "filed here");
+    }
+
+    /// The places two machines can touch the same file: one issue edited on
+    /// both, a comment and an attachment numbered the same, an issue one
+    /// side deleted while the other kept working on it.
+    #[test]
+    fn a_rebase_merges_one_issue_and_lets_deletions_win() {
+        let (_dir, ws) = temp_repo();
+        let file = |title: &str| ws.issue_create(title, "", &[], "primary").unwrap().id;
+        let (a, b, c) = (file("a"), file("b"), file("c"));
+        let base = ws.read_ref(ISSUES_REF).unwrap().unwrap();
+        let update = |id: &str, change: IssueChange| {
+            ws.issue_update(id, &change, "HEAD", "primary").unwrap();
+        };
+        let attach = |name: &str| {
+            vec![NewAttachment {
+                name: name.into(),
+                bytes: name.as_bytes().to_vec(),
+            }]
+        };
+
+        // There: a labelled, commented, and given a screenshot; b deleted;
+        // c commented on.
+        update(
+            &a,
+            IssueChange {
+                labels: Some(vec!["remote".into()]),
+                comment: Some("theirs".into()),
+                attach: attach("shot.png"),
+                ..Default::default()
+            },
+        );
+        ws.issue_delete(&b).unwrap();
+        let comment = |text: &str| IssueChange {
+            comment: Some(text.into()),
+            ..Default::default()
+        };
+        update(&c, comment("late"));
+        let remote = ws.read_ref(ISSUES_REF).unwrap().unwrap();
+        ws.set_ref_for_test(ISSUES_TRACKING_REF, remote);
+        ws.set_ref_for_test(ISSUES_REF, base);
+
+        // Here: a retitled, commented, and given a file; b commented on; c
+        // deleted.
+        update(
+            &a,
+            IssueChange {
+                title: Some("a, retitled".into()),
+                comment: Some("ours".into()),
+                attach: attach("notes.txt"),
+                ..Default::default()
+            },
+        );
+        update(&b, comment("lost"));
+        ws.issue_delete(&c).unwrap();
+
+        let sync = ws.reconcile_issues().unwrap();
+        assert_eq!(
+            sync,
+            IssueSync::Rebased {
+                replayed: 2,
+                gained: 3,
+                dropped: 1
+            }
+        );
+        assert!(sync.warning().unwrap().contains("1 local change"));
+
+        let merged = ws.issue(&a).unwrap().unwrap();
+        assert_eq!(merged.title, "a, retitled", "ours changed it");
+        assert_eq!(merged.labels, ["remote"], "theirs changed it");
+        let comments: Vec<(u32, &str)> = merged
+            .comments
+            .iter()
+            .map(|c| (c.seq, c.body.as_str()))
+            .collect();
+        assert_eq!(comments, [(1, "theirs"), (2, "ours")]);
+        let files: Vec<&str> = merged.attachments.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(
+            files,
+            [
+                format!("issues/{a}/attachments/0001-shot.png"),
+                format!("issues/{a}/attachments/0002-notes.txt"),
+            ]
+        );
+        assert!(
+            merged.body.contains("](attachments/0002-notes.txt)"),
+            "{}",
+            merged.body
+        );
+        assert_eq!(ws.issue(&b).unwrap(), None, "deleted there, stays deleted");
+        assert_eq!(
+            ws.issue(&c).unwrap(),
+            None,
+            "deleted here, with its late comment"
+        );
+        let tree = ws.read_tree_at_ref(ISSUES_REF).unwrap().unwrap();
+        assert!(
+            !tree.paths().any(|p| p.starts_with(&format!("issues/{c}/"))),
+            "nothing of c is left behind"
         );
     }
 

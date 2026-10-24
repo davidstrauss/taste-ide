@@ -8379,19 +8379,25 @@ impl FileTree {
                 .spawn(run_git_step(fetch_issues.0, fetch_issues.1, envs.clone()))
                 .await;
             if matches!(fetched, Ok(Ok(_))) {
-                // Fast-forward or nothing: two machines that both moved the
-                // ref get a sentence, not a merge UI.
+                // Adopted, fast-forwarded, or — when both machines moved
+                // it — the local issues rebased onto the remote's, quietly,
+                // so the next push is a fast-forward. Said only when a
+                // local change had nowhere to go, or the rebase failed.
                 let handle = crate::runtime::runtime().spawn_blocking(move || {
                     taste_git::GitWorkspace::discover(&root)
                         .map(|git| git.reconcile_issues())
                         .transpose()
-                        .ok()
-                        .flatten()
                 });
-                if let Ok(Some(sync)) = handle.await {
-                    if let Some(warning) = sync.warning() {
-                        events.publish(Event::Toast(warning));
+                match handle.await {
+                    Ok(Ok(Some(sync))) => {
+                        if let Some(warning) = sync.warning() {
+                            events.publish(Event::Toast(warning));
+                        }
                     }
+                    Ok(Err(e)) => events.publish(Event::Toast(format!(
+                        "Issues could not be rebased onto the remote's: {e:#}"
+                    ))),
+                    _ => {}
                 }
             }
             if let Some(tree) = weak.upgrade() {
