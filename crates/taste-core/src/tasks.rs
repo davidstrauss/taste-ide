@@ -386,6 +386,12 @@ pub fn outline(names: &[String]) -> Vec<OutlineEntry> {
     out
 }
 
+/// How long a run started through the environment's `task` wrapper may go
+/// unreported before it is taken to have never started
+/// ([`TaskBoard::give_up_unreported`]). The wrapper reports within a
+/// second of starting; this is that with room for a loaded container.
+const REPORT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// One run's record: what it said, how it ended, and how to stop it.
 struct Run {
     lines: Vec<String>,
@@ -749,6 +755,8 @@ impl TaskBoard {
                 return;
             };
             if out.status.success() {
+                tokio::time::sleep(REPORT_GRACE).await;
+                board.give_up_unreported(&key);
                 return;
             }
             let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -766,6 +774,41 @@ impl TaskBoard {
             }
         });
         Ok(())
+    }
+
+    /// A run started through the wrapper that the wrapper has not reported
+    /// by now ([`REPORT_GRACE`]): ended, saying so. `podman exec -d`
+    /// succeeds once the wrapper's process starts, so a wrapper that exits
+    /// before it reaches the IDE — no Task in the container, a container
+    /// that went first — left its row running for good, with nothing
+    /// behind it and its play refused as "already running" (2026-10-24).
+    /// A wrapper that reports after all is shown running again, as any run
+    /// it reports is ([`Self::begin_external`]).
+    fn give_up_unreported(&self, key: &(EnvironmentId, String)) {
+        let gave_up = match self.runs.lock().unwrap().get_mut(key) {
+            Some(run) if run.pending => {
+                run.pending = false;
+                run.stopper = None;
+                run.stop = None;
+                run.state = RunState::Failed;
+                true
+            }
+            _ => false,
+        };
+        if gave_up {
+            self.events.publish(Event::TaskState {
+                env: key.0.clone(),
+                name: key.1.clone(),
+            });
+            self.publish_lines(
+                key,
+                vec![format!(
+                    "— its wrapper in the container did not report it within {} seconds: it \
+                     did not start, or could not reach the IDE —",
+                    REPORT_GRACE.as_secs()
+                )],
+            );
+        }
     }
 
     /// A run that ended while no IDE was listening, as the wrapper's journal
@@ -837,6 +880,48 @@ impl TaskBoard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run its wrapper never reports ends instead of standing running,
+    /// one the wrapper did report is left alone, and a report that comes
+    /// late shows the run running again.
+    #[test]
+    fn a_run_its_wrapper_never_reports_ends() {
+        let board = TaskBoard::new(EventBus::new());
+        let env = EnvironmentId::primary();
+        let pending = |name: &str| {
+            board.runs.lock().unwrap().insert(
+                (env.clone(), name.to_string()),
+                Run {
+                    lines: vec![format!("$ task {name}")],
+                    state: RunState::Running,
+                    stop: Some(Arc::new(tokio::sync::Notify::new())),
+                    pending: true,
+                    stopper: None,
+                },
+            );
+        };
+        pending("dev");
+        pending("vite");
+        board.begin_external(&env, "vite", "$ task vite".into());
+
+        for name in ["dev", "vite"] {
+            board.give_up_unreported(&(env.clone(), name.to_string()));
+        }
+        assert_eq!(board.state(&env, "dev"), RunState::Failed);
+        assert!(
+            board
+                .lines(&env, "dev")
+                .last()
+                .unwrap()
+                .contains("did not report it"),
+            "{:?}",
+            board.lines(&env, "dev")
+        );
+        assert_eq!(board.state(&env, "vite"), RunState::Running);
+
+        board.begin_external(&env, "dev", "$ task dev (late)".into());
+        assert_eq!(board.state(&env, "dev"), RunState::Running);
+    }
 
     /// A terminal's `task` resolves as the GUI's runs do: the image's
     /// `task`, then its `go-task`, then the IDE's pinned one — and the
