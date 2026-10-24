@@ -323,6 +323,10 @@ under a running baseline; `=ask` poses git's
 question on the strip (a key's passphrase, hidden, with its send button and close) and
 `=touch` its notice (a security key waiting for a touch), which
 otherwise need a Pull over a remote that asks;
+`TASTE_PROBE_PENDING=i-0901` aims the panes at an environment still being
+made, as Start does — its own tab set, its chat's page, its row lit, and
+the files area saying its files come with its checkout (`FileTree::
+aim_pending`) — pair it with `TASTE_PROBE_STARTUP=vm` for its start in front;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;

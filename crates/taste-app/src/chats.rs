@@ -84,6 +84,9 @@ pub struct Chats {
     /// The environment on screen. One selection, owned by the window and
     /// handed down — never a second copy this pane could drift from.
     current: RefCell<EnvironmentId>,
+    /// The environment the panes went to while it was being made
+    /// ([`Chats::show_being_made`]).
+    being_made: RefCell<Option<EnvironmentId>>,
     /// Off until [`Chats::start`]: while restoring (and forever, in a probe
     /// instance) chats neither connect nor persist.
     live: Cell<bool>,
@@ -220,6 +223,7 @@ impl Chats {
             chats: RefCell::new(Vec::new()),
             pool: RefCell::new(crate::fleet::PoolFacts::default()),
             current: RefCell::new(EnvironmentId::primary()),
+            being_made: RefCell::new(None),
             live: Cell::new(false),
             on_activity: RefCell::new(None),
             usage_slot,
@@ -267,8 +271,21 @@ impl Chats {
     /// Cheap by construction: the pane already exists (or does not), so a
     /// switch is a stack page change and a first-activation, never a
     /// rebuild.
+    /// Show `env`, which is still being made — asked for by Start a moment
+    /// before the registry has a word for it: its page says so, not that it
+    /// is gone.
+    pub fn show_being_made(self: &Rc<Self>, env: &EnvironmentId) {
+        *self.being_made.borrow_mut() = Some(env.clone());
+        self.show(env);
+    }
+
     pub fn show(self: &Rc<Self>, env: &EnvironmentId) {
         if *self.current.borrow() == *env {
+            // Still its empty page: what it says may have moved — an
+            // environment shown while it was being made exists now.
+            if self.pane_for(env).is_none() {
+                self.show_current();
+            }
             return;
         }
         *self.current.borrow_mut() = env.clone();
@@ -579,7 +596,24 @@ impl Chats {
     fn dress_empty(&self, env: &EnvironmentId) {
         let exists = self.environments.get(env).is_some();
         let missing = credential_needed();
-        let (title, description) = empty_state(env, exists, missing);
+        // Chosen while it is being made: its chat comes once it exists.
+        let being_made = !exists
+            && (self.being_made.borrow().as_ref() == Some(env)
+                || self
+                    .environments
+                    .creating()
+                    .iter()
+                    .any(|(made, _)| made == env));
+        let (title, description) = if being_made {
+            (
+                format!("{env} Is Being Made"),
+                "Its chat starts here once its checkout is placed and its container \
+                 is up."
+                    .to_string(),
+            )
+        } else {
+            empty_state(env, exists, missing)
+        };
         self.empty.set_title(&title);
         self.empty.set_description(Some(&description));
         self.start_button.set_label(if missing {
@@ -587,8 +621,10 @@ impl Chats {
         } else {
             "Start an Agent"
         });
-        // An environment that no longer exists cannot be given an agent.
+        // An environment that no longer exists cannot be given an agent,
+        // and one being made has nothing to start yet.
         self.start_button.set_sensitive(exists);
+        self.start_button.set_visible(!being_made);
     }
 
     // --- the chats --------------------------------------------------------

@@ -640,12 +640,27 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // start comes forward now, as Start brings it forward,
                     // and the panes follow once it exists.
                     None => {
-                        if environments.creating().iter().any(|(made, _)| *made == env) {
-                            tracing::info!(
-                                "panes: {env} is still being made; they go there once it exists"
-                            );
+                        // Being made — or just asked for by Start, before
+                        // the registry has a word for it.
+                        let being_made = aim_pending.borrow().as_ref() == Some(&env)
+                            || environments.creating().iter().any(|(made, _)| *made == env);
+                        if being_made {
+                            // There at once, as far as anything can be: its
+                            // own tabs with its start in front, its chat's
+                            // page, its row lit, and the files area saying
+                            // what is coming. The rest follows when it
+                            // exists (`Event::EnvironmentCreated`).
+                            tracing::info!("panes: aimed at {env}, still being made");
                             *aim_pending.borrow_mut() = Some(env.clone());
                             *startup_wanted.borrow_mut() = Some(env.clone());
+                            watch_slot.borrow_mut().aim(None);
+                            for supervisor in environments.list() {
+                                supervisor.set_panes_watching(false);
+                            }
+                            filetree.aim_pending(env.clone());
+                            editor.aim_at(&env);
+                            console.note_watching(&env);
+                            chats.show_being_made(&env);
                             let follow = startup_follow.borrow().clone();
                             if let Some(follow) = follow {
                                 follow(&env);
@@ -1601,6 +1616,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     if let Ok(kind) = std::env::var("TASTE_PROBE_STARTUP") {
         startup.pose_for_probe(&kind);
         editor.show_startup(startup.clone());
+    }
+    // `TASTE_PROBE_PENDING=i-0901`: the panes gone to an environment still
+    // being made, as Start sends them — its own tab set, its chat's page,
+    // its row lit, the files area saying what is coming.
+    // After the view's own seeding, whose files would otherwise open over
+    // it and take the panes home as a click on one would.
+    if let Ok(env) = std::env::var("TASTE_PROBE_PENDING") {
+        if let Ok(env) = taste_core::environment::EnvironmentId::parse(&env) {
+            let aim_pending = aim_pending.clone();
+            let aim_panes = aim_panes.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(3000), move || {
+                *aim_pending.borrow_mut() = Some(env.clone());
+                aim_panes(Some(env));
+            });
+        }
     }
     // Where git's and ssh's askpass reaches this window, for a Pull or
     // Push the user pressed: the question lands on the banner's strip.
@@ -5216,7 +5246,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if index + 1 == present.len() {
                     tree.hold_reveal(false);
                 }
-                editor.open_at(path, None);
+                // Into Personal's own tabs, wherever the panes are by now:
+                // the user may have gone to another environment while
+                // these were looked for, and a restore is not a reason to
+                // take them back (`Editor::open_in_background`).
+                editor.open_in_background(path, None);
             }
             tree.hold_reveal(false);
             editor.sync_git_state();
@@ -6073,7 +6107,12 @@ fn start_issue(
     // ...and the panes follow once it exists, unless the user has gone
     // somewhere else by then (`aim_pending`).
     *aim_pending.borrow_mut() = Some(env.clone());
+    // There now: Start is the act of going to it (David, 2026-10-24: "I
+    // should be able to immediately focus an env as soon as I click
+    // start").
+    aim_panes(Some(env.clone()));
     let pending = aim_pending.clone();
+    let started = env.clone();
     let wanted = startup_wanted.clone();
     if issue.host == taste_core::environment::Host::Cloud {
         workspace.events.publish(taste_core::Event::Toast(format!(
@@ -6091,6 +6130,16 @@ fn start_issue(
                 Ok(env) => env,
                 Err(e) => {
                     events.publish(taste_core::Event::Toast(e));
+                    // Its making failed: panes that went to it before it
+                    // existed come home, rather than stay on a page saying
+                    // it is being made.
+                    let still_there = pending
+                        .borrow_mut()
+                        .take_if(|wanted| *wanted == started)
+                        .is_some();
+                    if still_there {
+                        aim_panes(None);
+                    }
                     return;
                 }
             };

@@ -478,6 +478,14 @@ pub struct FileTree {
     note_agent: RefCell<Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>>,
     status: Rc<RefCell<HashMap<PathBuf, FileState>>>,
     list_holder: gtk::ScrolledWindow,
+    /// The files area's two faces: the listing, and an environment still
+    /// being made, which has no checkout to list yet ([`FileTree::aim_pending`]).
+    files_face: gtk::Stack,
+    pending_title: gtk::Label,
+    /// The environment the panes went to before it existed: aimed at, as
+    /// far as everything else is concerned, until its checkout is placed
+    /// and [`FileTree::aim_at`] aims at it for real.
+    pending: RefCell<Option<taste_core::environment::EnvironmentId>>,
     branch_label: gtk::MenuButton,
     /// The label inside it: ellipsizing, so a long branch name cannot
     /// widen this pane (see the construction site).
@@ -2075,7 +2083,40 @@ impl FileTree {
         // its counts, then the filters.
         root_row.append(&sync_button);
         header.prepend(&root_row);
-        widget.append(&list_holder);
+        // A few lines at the top, not a status page: the files area can be
+        // a handful of rows tall, and a page's icon alone filled it.
+        let pending_title = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["heading"])
+            .build();
+        let pending_note = gtk::Label::builder()
+            .label(
+                "Its files appear here once its checkout is placed. Its start is in front, \
+                 step by step.",
+            )
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let pending_page = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .valign(gtk::Align::Start)
+            .margin_top(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        pending_page.append(&pending_title);
+        pending_page.append(&pending_note);
+        let files_face = gtk::Stack::builder()
+            .vexpand(true)
+            .transition_type(gtk::StackTransitionType::None)
+            .build();
+        files_face.add_named(&list_holder, Some("files"));
+        files_face.add_named(&pending_page, Some("pending"));
+        files_face.set_visible_child_name("files");
+        widget.append(&files_face);
         widget.append(&files_results.widget);
         // The files' intervention panel opens from the bottom of the file
         // list — directly under the rows it asks about, not under the
@@ -2107,6 +2148,9 @@ impl FileTree {
             note_agent: RefCell::new(None),
             status: Rc::new(RefCell::new(HashMap::new())),
             list_holder,
+            files_face,
+            pending_title,
+            pending: RefCell::new(None),
             intervention: intervention.clone(),
             branch_label,
             branch_child,
@@ -2793,7 +2837,12 @@ impl FileTree {
     /// search, the selections and any open panel do go — they were about
     /// the other checkout.
     pub fn aim_at(self: &Rc<Self>, target: Option<Aim>) {
+        let was_pending = self.pending.borrow_mut().take().is_some();
+        self.files_face.set_visible_child_name("files");
         if *self.watching.borrow() == target {
+            if was_pending {
+                self.backlog.set_current(self.watching());
+            }
             return;
         }
         self.close_open_menu();
@@ -4400,8 +4449,31 @@ impl FileTree {
     /// The environment the tree is aimed at, as an id: the primary when
     /// it is home.
     pub fn aimed_environment(&self) -> taste_core::environment::EnvironmentId {
+        if let Some(pending) = self.pending.borrow().clone() {
+            return pending;
+        }
         self.watching()
             .unwrap_or_else(taste_core::environment::EnvironmentId::primary)
+    }
+
+    /// Aim at an environment still being made: it is where the panes are
+    /// from the moment it is chosen — its row lit, its start in front —
+    /// and the files area says its files come when its checkout is placed,
+    /// rather than the panes staying behind until it exists (David,
+    /// 2026-10-24: "I should be able to immediately focus an env as soon as
+    /// I click start"). [`Self::aim_at`] takes over once it exists.
+    pub fn aim_pending(self: &Rc<Self>, env: taste_core::environment::EnvironmentId) {
+        self.close_open_menu();
+        self.close_intervention();
+        self.selection.borrow_mut().clear();
+        self.pending_title
+            .set_label(&format!("{env} is being made"));
+        self.files_face.set_visible_child_name("pending");
+        // It has no ports or tasks yet: none of Personal's stand in.
+        self.set_ports(Vec::new());
+        self.set_tasks(Vec::new(), None, false);
+        self.backlog.set_current(Some(env.clone()));
+        *self.pending.borrow_mut() = Some(env);
     }
 
     /// The Ports section's rows: the selected environment's forwarded
