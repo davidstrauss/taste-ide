@@ -570,8 +570,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // I've requested startup").
     let startup_wanted: Rc<RefCell<Option<taste_core::environment::EnvironmentId>>> =
         Rc::new(RefCell::new(None));
+    // An environment the user chose while it was still being made: the
+    // panes go there the moment it exists (`Event::EnvironmentCreated`),
+    // unless the user has chosen somewhere else since. Until 2026-10-24 a
+    // click on its row while it was being made did nothing at all.
+    let aim_pending: Rc<RefCell<Option<taste_core::environment::EnvironmentId>>> =
+        Rc::new(RefCell::new(None));
     let aim_panes: std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)> = {
         let startup_follow = startup_follow.clone();
+        let startup_wanted = startup_wanted.clone();
+        let aim_pending = aim_pending.clone();
         let filetree = filetree.clone();
         let editor = editor.clone();
         let console = console.clone();
@@ -604,9 +612,32 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // home when the environment being watched is DESTROYED is
                     // a different act, and `EnvironmentRemoved` asks for it
                     // by name.
-                    None => return,
+                    //
+                    // One still being made is not refused but deferred: its
+                    // start comes forward now, as Start brings it forward,
+                    // and the panes follow once it exists.
+                    None => {
+                        if environments.creating().iter().any(|(made, _)| *made == env) {
+                            tracing::info!(
+                                "panes: {env} is still being made; they go there once it exists"
+                            );
+                            *aim_pending.borrow_mut() = Some(env.clone());
+                            *startup_wanted.borrow_mut() = Some(env.clone());
+                            let follow = startup_follow.borrow().clone();
+                            if let Some(follow) = follow {
+                                follow(&env);
+                            }
+                        }
+                        return;
+                    }
                 }
             };
+            // Any aim that lands settles what was waiting: the user has
+            // chosen where to be.
+            aim_pending.borrow_mut().take();
+            // Said, because a report of the panes moving on their own is
+            // otherwise unanswerable from the log.
+            tracing::info!("panes: aimed at {env}");
             // The clone gets a watcher WHILE it is watched and not a moment
             // longer: agent edits reload clean buffers, restyle the tree and
             // refresh git state, exactly as the user's own do — and going
@@ -705,6 +736,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor_for_docs = editor.clone();
         chats.set_on_open_document(move |env, key, doc| {
             editor_for_docs.open_document(env, key, doc);
+        });
+    }
+    {
+        // Each environment has its own tab view, and a switch brings
+        // another on screen. At the consolidated rung the console's pages
+        // ride in it, and its terminals are added to whichever view is
+        // holding them, so it is told before `note_watching` moves them.
+        let console = console.clone();
+        let editor_weak = std::rc::Rc::downgrade(&editor);
+        editor.set_on_view_changed(move |view| {
+            let Some(editor) = editor_weak.upgrade() else {
+                return;
+            };
+            if editor.holds_family(Family::Console) {
+                console.set_host(view);
+            }
         });
     }
     {
@@ -1016,6 +1063,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let aim_panes = aim_panes.clone();
         let console = console.clone();
         let startup_wanted = startup_wanted.clone();
+        let aim_pending = aim_pending.clone();
         filetree.set_on_start_issue(move |issue| {
             start_issue(
                 &environments,
@@ -1024,6 +1072,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 &aim_panes,
                 &console,
                 &startup_wanted,
+                &aim_pending,
                 issue,
             )
         });
@@ -1754,7 +1803,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 let from = console.own_view();
                 center.set_end_child(gtk::Widget::NONE);
                 editor.graft_pages(Family::Console, &from, &pages);
-                console.set_host(editor.tab_view());
+                console.set_host(&editor.tab_view());
                 // The pages moved; the BAR FURNITURE did not, because it
                 // cannot — an `AdwTabBar` action widget belongs to the bar,
                 // and the console's bar stays behind with the pane. So New
@@ -4127,6 +4176,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let banner = banner.clone();
         let startup = startup.clone();
         let startup_for = startup_for.clone();
+        let aim_pending_for_events = aim_pending.clone();
         let startup_shown = startup_shown.clone();
         let startups_for_events = startups.clone();
         let editor = editor.clone();
@@ -4795,6 +4845,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::EnvironmentCreated { env } => {
                         tracing::info!("environment {env} is available");
                         console.refresh_environment_data(false);
+                        // Chosen while it was being made, and still chosen.
+                        let wanted = aim_pending_for_events
+                            .borrow_mut()
+                            .take_if(|wanted| *wanted == env);
+                        if wanted.is_some() {
+                            aim_panes(Some(env));
+                        }
                     }
                     // The whole forget fan-out, and the only copy of it.
                     // The user's Destroy button and the coordinator's
@@ -5865,6 +5922,7 @@ fn start_url_bridge(window: &adw::ApplicationWindow, root: &std::path::Path) {
 }
 
 /// The user's Start on an issue (see the wiring in `build_window`).
+#[allow(clippy::too_many_arguments)]
 fn start_issue(
     environments: &std::sync::Arc<taste_devcontainer::EnvironmentRegistry>,
     chats: &std::rc::Rc<crate::chats::Chats>,
@@ -5874,6 +5932,7 @@ fn start_issue(
     startup_wanted: &std::rc::Rc<
         std::cell::RefCell<Option<taste_core::environment::EnvironmentId>>,
     >,
+    aim_pending: &std::rc::Rc<std::cell::RefCell<Option<taste_core::environment::EnvironmentId>>>,
     issue: crate::backlog::StartedIssue,
 ) {
     let env = match crate::environments::for_issue(&issue.id) {
@@ -5920,6 +5979,10 @@ fn start_issue(
     // Its page comes forward at its first stage (`startup_wanted`), and
     // the panes take over once it exists.
     *startup_wanted.borrow_mut() = Some(env.clone());
+    // ...and the panes follow once it exists, unless the user has gone
+    // somewhere else by then (`aim_pending`).
+    *aim_pending.borrow_mut() = Some(env.clone());
+    let pending = aim_pending.clone();
     let wanted = startup_wanted.clone();
     if issue.host == taste_core::environment::Host::Cloud {
         workspace.events.publish(taste_core::Event::Toast(format!(
@@ -6004,7 +6067,15 @@ fn start_issue(
                     }
                 }));
             }
-            aim_panes(Some(env.clone()));
+            // Unless the user went somewhere else while it was being made,
+            // or the created event got there first.
+            if pending
+                .borrow_mut()
+                .take_if(|wanted| *wanted == env)
+                .is_some()
+            {
+                aim_panes(Some(env.clone()));
+            }
             console.refresh_environment_data(false);
             events.publish(taste_core::Event::Toast(format!(
                 "Started {} — {}",

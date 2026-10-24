@@ -276,39 +276,6 @@ fn port_key(env: &taste_core::environment::EnvironmentId, port: u16) -> PathBuf 
     PathBuf::from(format!("port:{env}")).join(port.to_string())
 }
 
-/// One environment's editor tabs while they are off screen: which files,
-/// in which order, which was selected, and where each was scrolled to.
-///
-/// Pure, and the whole of what a switch has to remember — the buffers
-/// themselves are never touched, because the widgets holding them are
-/// stowed rather than rebuilt. What could be lost in a switch is exactly
-/// this bookkeeping, so this is what is worth testing.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct StowedTabs {
-    /// Left to right, as the strip had them.
-    pub order: Vec<PathBuf>,
-    /// The tab that was on screen.
-    pub selected: Option<PathBuf>,
-    /// Scroll offset per file.
-    pub scroll: HashMap<PathBuf, f64>,
-}
-
-impl StowedTabs {
-    /// Record one tab, in strip order.
-    pub fn push(&mut self, path: PathBuf, scroll: f64, selected: bool) {
-        if selected {
-            self.selected = Some(path.clone());
-        }
-        self.scroll.insert(path.clone(), scroll);
-        self.order.push(path);
-    }
-
-    /// Where this file was scrolled to, if this set knows.
-    pub fn scroll_of(&self, path: &Path) -> Option<f64> {
-        self.scroll.get(path).copied()
-    }
-}
-
 /// Which environment's tab set a file belongs in.
 ///
 /// The predicate is the file's own checkout, so a tab lands in the right
@@ -637,7 +604,29 @@ pub struct Editor {
     /// The results listing at the pane's foot (results.rs), for content
     /// hits, definitions and commits — the pane whose content they are in.
     results: Rc<crate::results::ResultsPanel>,
-    tabs: adw::TabView,
+    /// The tab view on screen: the aimed environment's ([`Editor::tabs`]).
+    tabs: RefCell<adw::TabView>,
+    /// Every environment's own tab view. A switch shows another one rather
+    /// than moving every tab out of one view and the next set in: libadwaita
+    /// animates each tab that leaves or joins a strip, and a dozen of them
+    /// at once, twice, was the strip flickering on every switch
+    /// (2026-10-24). A file's tab is made in its owner's view, so one that
+    /// finishes opening after the panes moved lands where it belongs
+    /// without moving them back.
+    views: RefCell<HashMap<taste_core::environment::EnvironmentId, adw::TabView>>,
+    /// Where the views are shown, beside the empty page. Homogeneous, as
+    /// a stack is by default, so the strip is as wide as the widest
+    /// environment's tabs need whichever is on screen: when only the one
+    /// on screen was measured, a switch moved the window's responsive
+    /// thresholds with it (960 and 993 px, by the log), and a window
+    /// between the two changed layout on every switch (2026-10-24).
+    view_stack: gtk::Stack,
+    /// Where each file was scrolled to when its view went off screen: a
+    /// widget that spends time unmapped is allowed to forget.
+    scrolls: RefCell<HashMap<PathBuf, f64>>,
+    /// Told when another view comes on screen: the console, whose pages
+    /// ride in it at the consolidated rung, has to follow.
+    on_view_changed: RefCell<Option<Rc<dyn Fn(&adw::TabView)>>>,
     /// The selected tab's own controls at the tab bar's end: a PDF's or an
     /// image's zoom ([`Editor::show_view_modes`]).
     view_tools: gtk::Box,
@@ -698,10 +687,6 @@ pub struct Editor {
     /// here because the editor has to know which set a new tab joins —
     /// never decided here.
     aimed: RefCell<taste_core::environment::EnvironmentId>,
-    /// The other environments' tab sets. The TabViews are real and
-    /// unparented: pages transfer between them, so a stowed tab is the same
-    /// widget with the same buffer, waiting.
-    stowed: RefCell<HashMap<taste_core::environment::EnvironmentId, (adw::TabView, StowedTabs)>>,
     /// The pages other panes have grafted onto the end of this strip while
     /// the window is too narrow for them to be columns, and whose family
     /// each belongs to. Empty at full width, which is the resting state.
@@ -810,13 +795,7 @@ impl Editor {
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
         stack.add_named(&empty, Some("empty"));
-        stack.add_named(&tabs, Some("tabs"));
-        {
-            let stack = stack.clone();
-            tabs.connect_n_pages_notify(move |tabs| {
-                stack.set_visible_child_name(if tabs.n_pages() == 0 { "empty" } else { "tabs" });
-            });
-        }
+        stack.add_child(&tabs);
 
         // No slot for a grafted family's header, because no pane hands one
         // over any more. The console briefly did: its header named the
@@ -837,7 +816,14 @@ impl Editor {
             tab_bar: tab_bar.clone(),
             workspace,
             results: results.clone(),
-            tabs,
+            tabs: RefCell::new(tabs.clone()),
+            views: RefCell::new(HashMap::from([(
+                taste_core::environment::EnvironmentId::primary(),
+                tabs.clone(),
+            )])),
+            view_stack: stack.clone(),
+            scrolls: RefCell::new(HashMap::new()),
+            on_view_changed: RefCell::new(None),
             view_tools,
             view_modes,
             doc_source: Cell::new(false),
@@ -856,7 +842,6 @@ impl Editor {
             nav_pos: Cell::new(0),
             probe_owner: RefCell::new(None),
             aimed: RefCell::new(taste_core::environment::EnvironmentId::primary()),
-            stowed: RefCell::new(HashMap::new()),
             grafted: RefCell::new(Vec::new()),
             reordering: Cell::new(false),
             end_actions: end_actions.clone(),
@@ -884,11 +869,81 @@ impl Editor {
             }
         });
 
+        editor.wire_view(&tabs);
+        editor.show_view();
+
+        editor
+    }
+
+    /// The tab view on screen: the aimed environment's.
+    fn tabs(&self) -> adw::TabView {
+        self.tabs.borrow().clone()
+    }
+
+    /// `env`'s own tab view, made — and wired, and given a place in the
+    /// stack — the first time it is asked for.
+    fn view_for(self: &Rc<Self>, env: &taste_core::environment::EnvironmentId) -> adw::TabView {
+        if let Some(view) = self.views.borrow().get(env) {
+            return view.clone();
+        }
+        let view = adw::TabView::new();
+        view.set_vexpand(true);
+        self.view_stack.add_child(&view);
+        self.wire_view(&view);
+        self.views.borrow_mut().insert(env.clone(), view.clone());
+        view
+    }
+
+    /// The view on screen, or the empty page when it holds nothing.
+    fn show_view(&self) {
+        let view = self.tabs();
+        if view.n_pages() == 0 {
+            self.view_stack.set_visible_child_name("empty");
+        } else {
+            self.view_stack.set_visible_child(&view);
+        }
+    }
+
+    /// The view `tab` is in, whichever environment's it is.
+    fn view_of(&self, tab: &adw::TabPage) -> Option<adw::TabView> {
+        self.views
+            .borrow()
+            .values()
+            .find(|view| (0..view.n_pages()).any(|index| view.nth_page(index) == *tab))
+            .cloned()
+    }
+
+    /// Select `tab` in its own view, on screen or not.
+    fn select_tab(&self, tab: &adw::TabPage) {
+        match self.view_of(tab) {
+            Some(view) => view.set_selected_page(tab),
+            None => self.tabs().set_selected_page(tab),
+        }
+    }
+
+    /// The handlers every environment's view answers with. What reacts to
+    /// the selection reacts only for the view on screen: a tab made in a
+    /// view off screen is not a visit, and has no toggles to show.
+    fn wire_view(self: &Rc<Self>, view: &adw::TabView) {
+        let editor = self;
+        {
+            let weak = Rc::downgrade(editor);
+            view.connect_n_pages_notify(move |view| {
+                let Some(editor) = weak.upgrade() else { return };
+                if *view == editor.tabs() {
+                    editor.show_view();
+                }
+            });
+        }
+
         // Keep the toggles reflecting the selected page; every selection
         // is a visit for back/forward.
-        let weak = Rc::downgrade(&editor);
-        editor.tabs.connect_selected_page_notify(move |tabs| {
+        let weak = Rc::downgrade(editor);
+        view.connect_selected_page_notify(move |tabs| {
             let Some(editor) = weak.upgrade() else { return };
+            if *tabs != editor.tabs() {
+                return;
+            }
             // A change that landed while the tab was elsewhere has been
             // seen now (`note_unseen_change`).
             if let Some(page) = tabs.selected_page() {
@@ -919,27 +974,27 @@ impl Editor {
 
         // The terminals stay behind the files, whatever the user drags
         // where; the panes are pinned and libadwaita holds their section.
-        let weak = Rc::downgrade(&editor);
-        editor.tabs.connect_page_reordered(move |_, _, _| {
+        let weak = Rc::downgrade(editor);
+        view.connect_page_reordered(move |_, _, _| {
             if let Some(editor) = weak.upgrade() {
                 editor.enforce_family_order();
             }
         });
-        let weak = Rc::downgrade(&editor);
-        editor.tabs.connect_page_attached(move |_, _, _| {
+        let weak = Rc::downgrade(editor);
+        view.connect_page_attached(move |_, _, _| {
             if let Some(editor) = weak.upgrade() {
                 editor.enforce_family_order();
             }
         });
 
         // Dirty tabs ask before closing; that is the whole point of tabs.
-        let weak = Rc::downgrade(&editor);
+        let weak = Rc::downgrade(editor);
         // A tab's indicator, clicked: the git dot opens the file's changes;
         // the warning, which says what the bar above the file says, brings
         // the file to the front where that bar is.
         {
-            let weak = Rc::downgrade(&editor);
-            editor.tabs.connect_indicator_activated(move |tabs, tab| {
+            let weak = Rc::downgrade(editor);
+            view.connect_indicator_activated(move |tabs, tab| {
                 let Some(editor) = weak.upgrade() else { return };
                 let Some((path, page)) = editor.page_by_tab(tab) else {
                     return;
@@ -950,7 +1005,7 @@ impl Editor {
                 }
             });
         }
-        editor.tabs.connect_close_page(move |tabs, page| {
+        view.connect_close_page(move |tabs, page| {
             let Some(editor) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
@@ -1045,8 +1100,6 @@ impl Editor {
             dialog.present(Some(&editor.widget));
             glib::Propagation::Stop
         });
-
-        editor
     }
 
     /// Tell the editor about the workspace's environments, so it can tell
@@ -1178,7 +1231,7 @@ impl Editor {
         // in front of the user's files, one at a time, in reverse.
         self.reordering.set(true);
         for tab in tabs {
-            let page = self.tabs.append(&tab.widget);
+            let page = self.tabs().append(&tab.widget);
             page.set_title(&tab.title);
             page.set_icon(Some(&gtk::gio::ThemedIcon::new(&tab.icon)));
             page.set_tooltip(&tab.tooltip);
@@ -1187,7 +1240,7 @@ impl Editor {
             // is the order they are pinned in, and the selection can walk
             // to a neighbour on the way (the console has the long version).
             // The selection is set below, after they are all in.
-            self.tabs.set_page_pinned(&page, true);
+            self.tabs().set_page_pinned(&page, true);
             first.get_or_insert(page.clone());
             self.grafted.borrow_mut().push((page, family));
         }
@@ -1198,7 +1251,7 @@ impl Editor {
         // console's tabs arriving must not steal the strip from it.
         if family == Family::Chat {
             if let Some(page) = first {
-                self.tabs.set_selected_page(&page);
+                self.tabs().set_selected_page(&page);
             }
         }
     }
@@ -1227,7 +1280,7 @@ impl Editor {
         }
         self.reordering.set(true);
         for page in pages {
-            from.transfer_page(page, &self.tabs, self.tabs.n_pages());
+            from.transfer_page(page, &self.tabs(), self.tabs().n_pages());
         }
         self.reordering.set(false);
         self.enforce_family_order();
@@ -1246,9 +1299,9 @@ impl Editor {
                 // Unpinned first: the pin is this strip's rendering of a
                 // guest, and a page leaving should not be carrying one of
                 // our decisions out of the door.
-                self.tabs.set_page_pinned(&page, false);
+                self.tabs().set_page_pinned(&page, false);
                 let child = page.child();
-                self.tabs.close_page(&page);
+                self.tabs().close_page(&page);
                 child
             })
             .collect()
@@ -1259,7 +1312,7 @@ impl Editor {
         let leaving = self.pages_of(family);
         self.grafted.borrow_mut().retain(|(_, f)| *f != family);
         for page in leaving {
-            self.tabs.transfer_page(&page, to, to.n_pages());
+            self.tabs().transfer_page(&page, to, to.n_pages());
         }
     }
 
@@ -1285,8 +1338,8 @@ impl Editor {
     /// This strip's view, for a pane that has to know where its pages
     /// went — the console's terminals are added to whichever view is
     /// holding them.
-    pub fn tab_view(&self) -> &adw::TabView {
-        &self.tabs
+    pub fn tab_view(&self) -> adw::TabView {
+        self.tabs()
     }
 
     pub fn holds_family(&self, family: Family) -> bool {
@@ -1338,9 +1391,9 @@ impl Editor {
         // everything, in the order they arrived. What is left to keep
         // straight is what the user can actually drag: their files, and the
         // terminals that must not end up mixed in among them.
-        let pinned = self.tabs.n_pinned_pages();
-        let pages: Vec<adw::TabPage> = (pinned..self.tabs.n_pages())
-            .map(|index| self.tabs.nth_page(index))
+        let pinned = self.tabs().n_pinned_pages();
+        let pages: Vec<adw::TabPage> = (pinned..self.tabs().n_pages())
+            .map(|index| self.tabs().nth_page(index))
             .collect();
         let families: Vec<Family> = pages.iter().map(|page| self.family_of(page)).collect();
         if crate::tabfamily::is_settled(&families) {
@@ -1351,7 +1404,7 @@ impl Editor {
             .into_iter()
             .enumerate()
         {
-            self.tabs
+            self.tabs()
                 .reorder_page(&pages[source], pinned + target as i32);
         }
         self.reordering.set(false);
@@ -1375,7 +1428,7 @@ impl Editor {
         let Some(page) = self.pages_of(Family::Chat).first().cloned() else {
             return false;
         };
-        self.tabs.set_selected_page(&page);
+        self.tabs().set_selected_page(&page);
         true
     }
 
@@ -1385,7 +1438,7 @@ impl Editor {
         let Some(page) = self.pages_of(Family::Console).get(offset).cloned() else {
             return false;
         };
-        self.tabs.set_selected_page(&page);
+        self.tabs().set_selected_page(&page);
         true
     }
 
@@ -1426,126 +1479,109 @@ impl Editor {
         }
     }
 
-    /// Show this environment's tab set.
+    /// Show this environment's tab set: its own view, brought on screen.
     ///
-    /// O(tabs in the two sets), and no widget is built or destroyed: the
-    /// pages move between this view and the stowed one for their
-    /// environment, carrying their buffers, their undo history and their
-    /// unsaved edits with them because they *are* the same pages. Only the
-    /// scroll offset is written down and put back, since a widget that
-    /// spends time unmapped is allowed to forget where it was.
+    /// No document tab moves and no widget is built or destroyed — buffers,
+    /// undo history and unsaved edits stay exactly where they are, in their
+    /// environment's view. What moves is the window's own: a grafted pane's
+    /// faces and the startup page. The scroll offsets are written down and
+    /// put back, since a widget that spends time unmapped is allowed to
+    /// forget where it was.
     pub fn aim_at(self: &Rc<Self>, env: &taste_core::environment::EnvironmentId) {
         if *self.aimed.borrow() == *env {
             return;
         }
-        let leaving = self.aimed.borrow().clone();
-        // Stow what is on screen, in strip order.
-        let selected = self.tabs.selected_page();
-        let mut record = StowedTabs::default();
-        let mut pages: Vec<(adw::TabPage, PathBuf)> = Vec::new();
-        for index in 0..self.tabs.n_pages() {
-            let page = self.tabs.nth_page(index);
-            if let Some((path, entry)) = self.page_by_tab(&page) {
-                record.push(
-                    path.clone(),
-                    entry.scroller.vadjustment().value(),
-                    selected.as_ref() == Some(&page),
-                );
-                pages.push((page, path));
-            } else if let Some((key, surface)) = self.surface_by_tab(&page) {
-                // The startup page is the window's, not the environment's:
-                // the window decides which start it shows and hides it
-                // (`show_startup`). Stowed with the environment left, it
-                // went out of the strip the moment a new environment's
-                // panes took over, every bring-forward after failed
-                // against a tab in no strip, and the close at the end
-                // failed too, leaving it pinned among Personal's tabs
-                // (2026-10-23: "a bunch of flickering in the center/top of
-                // the IDE when I start a non-personal env").
-                if matches!(surface.kind, SurfaceKind::Startup(_)) {
-                    continue;
-                }
-                // A log or a port goes with its environment's files; its
-                // own scroll is its own business (a following log is at
-                // its end whenever it is looked at).
-                record.push(key.clone(), 0.0, selected.as_ref() == Some(&page));
-                pages.push((page, key));
+        let leaving = self.tabs();
+        let arriving = self.view_for(env);
+        // Where the files going off screen were scrolled to.
+        for index in 0..leaving.n_pages() {
+            if let Some((path, entry)) = self.page_by_tab(&leaving.nth_page(index)) {
+                self.scrolls
+                    .borrow_mut()
+                    .insert(path, entry.scroller.vadjustment().value());
             }
         }
-        let holding = self.holding_view(&leaving);
-        for (page, _) in pages {
-            self.tabs.transfer_page(&page, &holding, holding.n_pages());
-        }
-        self.stowed.borrow_mut().insert(leaving, (holding, record));
-
+        // The window's own tabs go with the screen: a grafted pane's faces
+        // and the startup page are not any environment's.
+        let startup = self.startup_tab.borrow().clone();
+        let carried: Vec<adw::TabPage> = (0..leaving.n_pages())
+            .map(|index| leaving.nth_page(index))
+            .filter(|page| {
+                self.family_of(page) != Family::Document || startup.as_ref() == Some(page)
+            })
+            .collect();
         *self.aimed.borrow_mut() = env.clone();
-
-        // ...and bring back what this environment had.
-        let restored = self.stowed.borrow_mut().remove(env);
-        let Some((holding, record)) = restored else {
-            self.sync_toggle_to_selection();
-            self.publish_state();
-            return;
-        };
-        let mut selected_page: Option<adw::TabPage> = None;
-        for path in &record.order {
-            let surface = self.surfaces.borrow().get(path).cloned();
-            if let Some(surface) = surface {
-                holding.transfer_page(&surface.tab, &self.tabs, self.tabs.n_pages());
-                if record.selected.as_ref() == Some(path) {
-                    selected_page = Some(surface.tab.clone());
-                }
-                continue;
-            }
-            let Some(entry) = self.pages.borrow().get(path).cloned() else {
-                continue;
+        *self.tabs.borrow_mut() = arriving.clone();
+        self.reordering.set(true);
+        for page in &carried {
+            // A pinned page goes among the pinned, which is the only place
+            // libadwaita takes one.
+            let at = if page.is_pinned() {
+                arriving.n_pinned_pages()
+            } else {
+                arriving.n_pages()
             };
-            holding.transfer_page(&entry.page, &self.tabs, self.tabs.n_pages());
-            if record.selected.as_ref() == Some(path) {
-                selected_page = Some(entry.page.clone());
-            }
-            // The scroll goes back after the page has been allocated:
-            // setting an adjustment on a widget that has not been sized yet
-            // is a value the next allocation clamps to zero.
-            if let Some(offset) = record.scroll_of(path) {
-                let scroller = entry.scroller.clone();
-                glib::idle_add_local_once(move || {
-                    scroller.vadjustment().set_value(offset);
-                });
+            leaving.transfer_page(page, &arriving, at);
+        }
+        self.reordering.set(false);
+        self.enforce_family_order();
+        self.tab_bar.set_view(Some(&arriving));
+        self.show_view();
+        if let Some(startup) = startup {
+            arriving.set_selected_page(&startup);
+        }
+        // The scrolls go back after the pages have been allocated: setting
+        // an adjustment on a widget that has not been sized yet is a value
+        // the next allocation clamps to zero.
+        for index in 0..arriving.n_pages() {
+            if let Some((path, entry)) = self.page_by_tab(&arriving.nth_page(index)) {
+                if let Some(offset) = self.scrolls.borrow().get(&path).copied() {
+                    let scroller = entry.scroller.clone();
+                    glib::idle_add_local_once(move || {
+                        scroller.vadjustment().set_value(offset);
+                    });
+                }
             }
         }
-        if let Some(page) = selected_page {
-            self.tabs.set_selected_page(&page);
+        let hook = self.on_view_changed.borrow().clone();
+        if let Some(hook) = hook {
+            hook(&arriving);
         }
         self.sync_toggle_to_selection();
         self.publish_state();
     }
 
-    /// An environment was destroyed: drop the tabs it had stowed. They are
+    /// Who follows the view on screen when it changes: the console, while
+    /// its pages ride in this strip.
+    pub fn set_on_view_changed(&self, hook: impl Fn(&adw::TabView) + 'static) {
+        *self.on_view_changed.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// An environment was destroyed: drop its view and the tabs in it. They are
     /// views onto a checkout that has been deleted, and every one of them
     /// would fail on its next read.
     pub fn forget_environment(self: &Rc<Self>, env: &taste_core::environment::EnvironmentId) {
-        let Some((holding, record)) = self.stowed.borrow_mut().remove(env) else {
+        if env.is_primary() || *self.aimed.borrow() == *env {
+            return;
+        }
+        let Some(view) = self.views.borrow_mut().remove(env) else {
             return;
         };
-        for path in &record.order {
-            if let Some(entry) = self.pages.borrow_mut().remove(path) {
-                holding.close_page(&entry.page);
+        let tabs: Vec<adw::TabPage> = (0..view.n_pages()).map(|i| view.nth_page(i)).collect();
+        for tab in &tabs {
+            // Out of the maps first, so the close asks nothing: there is
+            // no checkout left to save into.
+            if let Some((path, _)) = self.page_by_tab(tab) {
+                self.pages.borrow_mut().remove(&path);
+                self.scrolls.borrow_mut().remove(&path);
             }
-            if let Some(surface) = self.surfaces.borrow_mut().remove(path) {
-                holding.close_page(&surface.tab);
+            if let Some((key, _)) = self.surface_by_tab(tab) {
+                self.surfaces.borrow_mut().remove(&key);
+                self.task_prompts.borrow_mut().remove(&key);
             }
-            self.task_prompts.borrow_mut().remove(path);
+            view.close_page(tab);
         }
-    }
-
-    /// The unparented TabView that holds an environment's stowed tabs,
-    /// making it if this is the first time that environment has been left.
-    fn holding_view(&self, env: &taste_core::environment::EnvironmentId) -> adw::TabView {
-        if let Some((view, _)) = self.stowed.borrow().get(env) {
-            return view.clone();
-        }
-        adw::TabView::new()
+        self.view_stack.remove(&view);
     }
 
     /// TASTE_PROBE_CHECK only: answer `env` as the owner of every file
@@ -1666,13 +1702,13 @@ impl Editor {
 
     /// Close the focused tab (Ctrl+W); the dirty-close dialog applies.
     pub fn close_current(self: &Rc<Self>) {
-        if let Some(page) = self.tabs.selected_page() {
-            self.tabs.close_page(&page);
+        if let Some(page) = self.tabs().selected_page() {
+            self.tabs().close_page(&page);
         }
     }
 
     fn selected(&self) -> Option<(PathBuf, Rc<EditorPage>)> {
-        let selected = self.tabs.selected_page()?;
+        let selected = self.tabs().selected_page()?;
         self.page_by_tab(&selected)
     }
 
@@ -1814,7 +1850,7 @@ impl Editor {
             }
             return;
         }
-        let Some(tab) = self.tabs.selected_page() else {
+        let Some(tab) = self.tabs().selected_page() else {
             self.results.hide();
             report(0);
             return;
@@ -2000,8 +2036,8 @@ impl Editor {
                     self.open_at(path, Some(*line));
                     return;
                 };
-                if self.tabs.selected_page().as_ref() != Some(&page.page) {
-                    self.tabs.set_selected_page(&page.page);
+                if self.tabs().selected_page().as_ref() != Some(&page.page) {
+                    self.tabs().set_selected_page(&page.page);
                 }
                 let buffer = &page.buffer;
                 let Some(mut start) = buffer.iter_at_line(line.saturating_sub(1) as i32) else {
@@ -2050,7 +2086,7 @@ impl Editor {
     /// next hit and say so; otherwise say no, and the caller opens it.
     pub fn step_in(&self, path: &Path) -> bool {
         let on_screen = self
-            .tabs
+            .tabs()
             .selected_page()
             .and_then(|tab| self.page_by_tab(&tab))
             .is_some_and(|(selected, _)| selected == path);
@@ -2059,7 +2095,7 @@ impl Editor {
 
     /// What the selected tab is (see [`Focused`]).
     pub fn focused(&self) -> Focused {
-        match self.tabs.selected_page() {
+        match self.tabs().selected_page() {
             None => Focused::Other,
             Some(tab) => {
                 if let Some((path, _)) = self.page_by_tab(&tab) {
@@ -2377,7 +2413,7 @@ impl Editor {
     }
 
     fn selected_surface(&self) -> Option<Rc<SurfaceEntry>> {
-        let selected = self.tabs.selected_page()?;
+        let selected = self.tabs().selected_page()?;
         self.surface_by_tab(&selected).map(|(_, s)| s)
     }
 
@@ -2393,15 +2429,15 @@ impl Editor {
     pub fn show_startup(self: &Rc<Self>, page: Rc<crate::startup::StartupPage>) {
         if let Some(tab) = self.startup_tab.borrow().clone() {
             self.bring_into_strip(&tab);
-            self.tabs.set_selected_page(&tab);
+            self.tabs().set_selected_page(&tab);
             return;
         }
-        let tab = self.tabs.append(&page.widget);
+        let tab = self.tabs().append(&page.widget);
         tab.set_title("Environment");
         tab.set_icon(Some(&gtk::gio::ThemedIcon::new(STARTUP_ICON)));
         tab.set_tooltip("The environment's startup: what is done and what is still to do");
-        self.tabs.set_page_pinned(&tab, true);
-        self.tabs.reorder_first(&tab);
+        self.tabs().set_page_pinned(&tab, true);
+        self.tabs().reorder_first(&tab);
         {
             let (vm_log, build_log) = page.logs();
             for log in [vm_log, build_log] {
@@ -2423,7 +2459,7 @@ impl Editor {
         );
         *self.startup_tab.borrow_mut() = Some(tab.clone());
         self.tab_bar.add_css_class("startup-locked");
-        self.tabs.set_selected_page(&tab);
+        self.tabs().set_selected_page(&tab);
         self.sync_toggle_to_selection();
     }
 
@@ -2437,15 +2473,15 @@ impl Editor {
             .borrow_mut()
             .remove(&PathBuf::from(STARTUP_KEY));
         self.bring_into_strip(&tab);
-        self.tabs.set_page_pinned(&tab, false);
-        self.tabs.close_page(&tab);
+        self.tabs().set_page_pinned(&tab, false);
+        self.tabs().close_page(&tab);
         self.sync_toggle_to_selection();
     }
 
     /// Whether `tab` is in the strip on screen, rather than stowed with an
     /// environment or gone.
     fn in_strip(&self, tab: &adw::TabPage) -> bool {
-        (0..self.tabs.n_pages()).any(|index| self.tabs.nth_page(index) == *tab)
+        (0..self.tabs().n_pages()).any(|index| self.tabs().nth_page(index) == *tab)
     }
 
     /// Put `tab` back in the strip, first, from the environment it was
@@ -2455,19 +2491,8 @@ impl Editor {
         if self.in_strip(tab) {
             return;
         }
-        let key = self.surface_by_tab(tab).map(|(key, _)| key);
-        let mut stowed = self.stowed.borrow_mut();
-        for (holding, record) in stowed.values_mut() {
-            if (0..holding.n_pages()).any(|index| holding.nth_page(index) == *tab) {
-                holding.transfer_page(tab, &self.tabs, 0);
-                if let Some(key) = &key {
-                    record.order.retain(|path| path != key);
-                    if record.selected.as_ref() == Some(key) {
-                        record.selected = None;
-                    }
-                }
-                return;
-            }
+        if let Some(view) = self.view_of(tab) {
+            view.transfer_page(tab, &self.tabs(), 0);
         }
     }
 
@@ -2479,11 +2504,11 @@ impl Editor {
     ) {
         let key = log_key(env, kind);
         if let Some(existing) = self.surfaces.borrow().get(&key) {
-            self.tabs.set_selected_page(&existing.tab);
+            self.tabs().set_selected_page(&existing.tab);
             return;
         }
         let page = crate::logview::LogPage::new(kind, env.as_str(), &seed);
-        let tab = self.tabs.append(&page.widget);
+        let tab = self.tabs().append(&page.widget);
         tab.set_title(&if kind.per_environment() && !env.is_primary() {
             format!("{} log · {env}", kind.title())
         } else {
@@ -2508,7 +2533,7 @@ impl Editor {
                 kind: SurfaceKind::Log(page, kind),
             }),
         );
-        self.tabs.set_selected_page(&tab);
+        self.tabs().set_selected_page(&tab);
         self.sync_toggle_to_selection();
     }
 
@@ -2522,7 +2547,7 @@ impl Editor {
     ) {
         let key = task_key(env, name);
         if let Some(existing) = self.surfaces.borrow().get(&key) {
-            self.tabs.set_selected_page(&existing.tab);
+            self.tabs().set_selected_page(&existing.tab);
             return;
         }
         let what = if env.is_primary() {
@@ -2551,7 +2576,7 @@ impl Editor {
                 }
             });
         }
-        let tab = self.tabs.append(&page.widget);
+        let tab = self.tabs().append(&page.widget);
         tab.set_title(&if env.is_primary() {
             name.to_string()
         } else {
@@ -2580,7 +2605,7 @@ impl Editor {
         self.task_prompts
             .borrow_mut()
             .insert(task_key(env, name), prompt);
-        self.tabs.set_selected_page(&tab);
+        self.tabs().set_selected_page(&tab);
         self.sync_toggle_to_selection();
     }
 
@@ -2644,12 +2669,12 @@ impl Editor {
     ) {
         let key = port_key(env, spec.port);
         if let Some(existing) = self.surfaces.borrow().get(&key) {
-            self.tabs.set_selected_page(&existing.tab);
+            self.tabs().set_selected_page(&existing.tab);
             return;
         }
         let page = crate::portview::PortPage::new(env.as_str(), spec.clone(), facts);
         page.set_on_new_tab(self.port_new_tab_hook(env));
-        let tab = self.tabs.append(&page.widget);
+        let tab = self.tabs().append(&page.widget);
         tab.set_title(&if env.is_primary() {
             spec.title()
         } else {
@@ -2665,7 +2690,7 @@ impl Editor {
                 kind: SurfaceKind::Port(page),
             }),
         );
-        self.tabs.set_selected_page(&tab);
+        self.tabs().set_selected_page(&tab);
         self.sync_toggle_to_selection();
     }
 
@@ -2695,12 +2720,12 @@ impl Editor {
         let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let key = port_key(env, page.port).join(format!("tab-{n}"));
         let position = self
-            .tabs
+            .tabs()
             .selected_page()
-            .map_or(self.tabs.n_pages(), |selected| {
-                self.tabs.page_position(&selected) + 1
+            .map_or(self.tabs().n_pages(), |selected| {
+                self.tabs().page_position(&selected) + 1
             });
-        let tab = self.tabs.insert(&page.widget, position);
+        let tab = self.tabs().insert(&page.widget, position);
         tab.set_title(&page.title());
         tab.set_icon(Some(&gtk::gio::ThemedIcon::new(crate::portview::PORT_ICON)));
         tab.set_tooltip(&format!(
@@ -2723,7 +2748,7 @@ impl Editor {
                 kind: SurfaceKind::Port(page),
             }),
         );
-        self.tabs.set_selected_page(&tab);
+        self.tabs().set_selected_page(&tab);
         self.sync_toggle_to_selection();
     }
 
@@ -2747,7 +2772,7 @@ impl Editor {
         let step_key = key.to_string();
         let key = PathBuf::from(format!("doc:{env}")).join(key);
         if let Some(existing) = self.surfaces.borrow().get(&key) {
-            self.tabs.set_selected_page(&existing.tab);
+            self.tabs().set_selected_page(&existing.tab);
             return;
         }
         let events = self.workspace.events.clone();
@@ -2756,7 +2781,7 @@ impl Editor {
         });
         let page = crate::chatdoc::DocPage::new(&doc, on_link);
         page.show_source(self.doc_source.get());
-        let tab = self.tabs.append(&page.widget);
+        let tab = self.tabs().append(&page.widget);
         tab.set_title(&if env.is_primary() {
             doc.title()
         } else {
@@ -2772,7 +2797,7 @@ impl Editor {
                 kind: SurfaceKind::Doc(page, step_key),
             }),
         );
-        self.tabs.set_selected_page(&tab);
+        self.tabs().set_selected_page(&tab);
         self.sync_toggle_to_selection();
     }
 
@@ -2861,7 +2886,7 @@ impl Editor {
         port: u16,
     ) {
         if let Some(surface) = self.surfaces.borrow().get(&port_key(env, port)) {
-            self.tabs.set_selected_page(&surface.tab);
+            self.tabs().set_selected_page(&surface.tab);
         }
         self.sync_toggle_to_selection();
     }
@@ -2870,7 +2895,28 @@ impl Editor {
     /// discards anything: each file keeps its own buffer until its tab is
     /// explicitly closed.
     pub fn open_at(self: &Rc<Self>, path: &Path, line: Option<u32>) {
-        self.open_with(path, line, false);
+        self.open_with(path, line, false, false);
+    }
+
+    /// Open `path` in its own environment's tab set without moving the
+    /// panes: what a restart restores, which nobody is waiting to look at.
+    /// Restored tabs that finished opening after the user had gone to
+    /// another environment took them back to Personal, once per tab still
+    /// on its way (2026-10-24).
+    pub fn open_in_background(self: &Rc<Self>, path: &Path, line: Option<u32>) {
+        self.open_with(path, line, false, true);
+    }
+
+    /// Whether an open the user asked for from `asked_on` still takes the
+    /// panes to the file's environment: it does while they are where they
+    /// were when it was asked for. One that finished after the user moved
+    /// is no longer what they are looking for.
+    fn still_wanted(
+        &self,
+        asked_on: &taste_core::environment::EnvironmentId,
+        background: bool,
+    ) -> bool {
+        !background && *self.aimed.borrow() == *asked_on
     }
 
     /// TASTE_PROBE_LINK only: the page in view of the PDF in front, said
@@ -2896,7 +2942,9 @@ impl Editor {
     pub fn open_anchored(self: &Rc<Self>, path: &Path, at: Option<taste_core::anchor::Anchor>) {
         use taste_core::anchor::Anchor;
         match (at, crate::viewer::kind_for(path)) {
-            (Some(Anchor::Page(page)), Some(kind)) => self.open_viewer(path, kind, Some(page)),
+            (Some(Anchor::Page(page)), Some(kind)) => {
+                self.open_viewer(path, kind, Some(page), false)
+            }
             (at, _) => self.open_at(path, at.and_then(Anchor::line)),
         }
     }
@@ -2925,7 +2973,7 @@ impl Editor {
                                 .as_ref()
                                 .map(|w| w.type_().name().to_string())
                                 .unwrap_or_else(|| "nothing".into()),
-                            focus.is_some_and(|w| w.is_ancestor(&editor.tabs))
+                            focus.is_some_and(|w| w.is_ancestor(&editor.tabs()))
                         );
                     };
                     let mut walk = editor.view_tools.first_child();
@@ -3074,16 +3122,16 @@ impl Editor {
     /// Open (or focus) a file with its Changes face showing: the
     /// changed-files list opens diffs, not buffers.
     pub fn open_changes(self: &Rc<Self>, path: &Path) {
-        self.open_with(path, None, true);
+        self.open_with(path, None, true, false);
     }
 
-    fn open_with(self: &Rc<Self>, path: &Path, line: Option<u32>, changes: bool) {
+    fn open_with(self: &Rc<Self>, path: &Path, line: Option<u32>, changes: bool, background: bool) {
         // A file shown rather than edited opens in its viewer: not read as
         // text, which it is not (a PDF opened as "Cannot open …: stream did
         // not contain valid UTF-8").
         if !changes {
             if let Some(kind) = crate::viewer::kind_for(path) {
-                self.open_viewer(path, kind, None);
+                self.open_viewer(path, kind, None, background);
                 return;
             }
         }
@@ -3097,8 +3145,11 @@ impl Editor {
             // not the one on screen, the selection follows the file. A tab
             // the user cannot see is not an open file, and the panel says
             // where they now are.
+            if background {
+                return;
+            }
             self.follow_to(existing.foreign_env.clone());
-            self.tabs.set_selected_page(&existing.page);
+            self.select_tab(&existing.page);
             if let Some(line) = line {
                 jump_to_line(&existing.view, &existing.buffer, line);
             }
@@ -3117,6 +3168,7 @@ impl Editor {
         // values cross over.
         let checkouts = self.checkouts();
         let access = self.access();
+        let asked_on = self.aimed.borrow().clone();
         let editor_events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
         let path = path.to_path_buf();
@@ -3164,13 +3216,16 @@ impl Editor {
             let Some(editor) = weak.upgrade() else { return };
             // The aim moves now rather than before the read: the tab and the
             // selection arrive together, and an open that failed never moved
-            // anything.
-            editor.follow_to(prepared.owner.as_ref().map(|(env, _, _)| env.clone()));
+            // anything. Only for an open still wanted (`still_wanted`); any
+            // other lands in its own environment's view.
+            if editor.still_wanted(&asked_on, background) {
+                editor.follow_to(prepared.owner.as_ref().map(|(env, _, _)| env.clone()));
+            }
             // Re-check: another path may have opened it while we read.
             let already = editor.pages.borrow().get(&path).cloned();
             match already {
                 Some(existing) => {
-                    editor.tabs.set_selected_page(&existing.page);
+                    editor.select_tab(&existing.page);
                     if let Some(line) = line {
                         jump_to_line(&existing.view, &existing.buffer, line);
                     }
@@ -3191,12 +3246,21 @@ impl Editor {
     /// in. The read, and an image's decode, run on the blocking pool; the
     /// file's owner is found the way a text tab's is, so a viewer opens in
     /// its environment's tab set.
-    fn open_viewer(self: &Rc<Self>, path: &Path, kind: crate::viewer::ViewKind, page: Option<u32>) {
+    fn open_viewer(
+        self: &Rc<Self>,
+        path: &Path,
+        kind: crate::viewer::ViewKind,
+        page: Option<u32>,
+        background: bool,
+    ) {
         let key = viewer_key(path);
         let existing = self.surfaces.borrow().get(&key).cloned();
         if let Some(existing) = existing {
+            if background {
+                return;
+            }
             self.follow_to(Some(existing.env.clone()));
-            self.tabs.set_selected_page(&existing.tab);
+            self.select_tab(&existing.tab);
             if let (Some(n), SurfaceKind::View(view)) = (page, &existing.kind) {
                 view.go_to_page(n);
             }
@@ -3204,6 +3268,7 @@ impl Editor {
         }
         let checkouts = self.checkouts();
         let access = self.access();
+        let asked_on = self.aimed.borrow().clone();
         let weak = Rc::downgrade(self);
         let path = path.to_path_buf();
         glib::spawn_future_local(async move {
@@ -3223,9 +3288,11 @@ impl Editor {
             let env = owner
                 .map(|(env, _, _)| env)
                 .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
-            editor.follow_to(Some(env.clone()));
+            if editor.still_wanted(&asked_on, background) {
+                editor.follow_to(Some(env.clone()));
+            }
             if let Some(existing) = editor.surfaces.borrow().get(&key).cloned() {
-                editor.tabs.set_selected_page(&existing.tab);
+                editor.select_tab(&existing.tab);
                 return;
             }
             let at_page = page;
@@ -3290,7 +3357,13 @@ impl Editor {
                     });
                 }));
             }
-            let tab = editor.tabs.append(&page.widget);
+            // In its owner's view, as a text tab is (`create_page`).
+            let set = if editor.probe_owner.borrow().is_some() {
+                editor.tabs()
+            } else {
+                editor.view_for(&env)
+            };
+            let tab = set.append(&page.widget);
             tab.set_title(
                 &path
                     .file_name()
@@ -3307,7 +3380,7 @@ impl Editor {
                     kind: SurfaceKind::View(page),
                 }),
             );
-            editor.tabs.set_selected_page(&tab);
+            set.set_selected_page(&tab);
             editor.sync_toggle_to_selection();
             if let Ok(variant) = std::env::var("TASTE_PROBE_CHANGED") {
                 if std::env::var_os("TASTE_PROBE_CHECK").is_some() {
@@ -3345,7 +3418,7 @@ impl Editor {
     pub fn open_unsaved(self: &Rc<Self>, path: &Path, content: String) {
         self.follow_to_owner(path);
         if let Some(existing) = self.pages.borrow().get(path) {
-            self.tabs.set_selected_page(&existing.page);
+            self.tabs().set_selected_page(&existing.page);
             return;
         }
         self.create_page(path, content, None, None, None);
@@ -3674,7 +3747,20 @@ impl Editor {
         let notice = gtk::Box::new(gtk::Orientation::Vertical, 0);
         page_box.append(&notice);
         page_box.append(&stack);
-        let tab = self.tabs.append(&page_box);
+        // In its owner's own view, whether or not that is the one on
+        // screen: a tab that finishes opening after the panes moved lands
+        // where it belongs, and moves nothing. A probe's fabricated owner
+        // has no view to be shown in, so its tab stays where the shot is.
+        let set = if self.probe_owner.borrow().is_some() {
+            self.tabs()
+        } else {
+            let home = owner
+                .as_ref()
+                .map(|(env, _, _)| env.clone())
+                .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+            self.view_for(&home)
+        };
+        let tab = set.append(&page_box);
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -3860,7 +3946,7 @@ impl Editor {
         self.refresh_markdown_mode(path, &page);
         page.buffer.set_text(&content);
         page.buffer.set_modified(false);
-        self.tabs.set_selected_page(&tab);
+        set.set_selected_page(&tab);
         self.sync_toggle_to_selection();
         if let Some(line) = line {
             jump_to_line(&page.view, &page.buffer, line);
@@ -3920,11 +4006,13 @@ impl Editor {
                 .await
                 .unwrap_or_default();
             let Some(editor) = weak.upgrade() else { return };
+            // In Personal's own view, wherever the panes are: the user may
+            // have gone to another environment while the checkout came up.
             for path in present.iter().filter(|p| Some(*p) != active.as_ref()) {
-                editor.open_at(path, None);
+                editor.open_in_background(path, None);
             }
             if let Some(active) = active.filter(|a| present.contains(a)) {
-                editor.open_at(&active, None);
+                editor.open_in_background(&active, None);
             }
             editor.sync_git_state();
         });
@@ -3937,8 +4025,12 @@ impl Editor {
         // the VM is placed, and a preview reopened as text was the mode
         // lost (2026-10-17: "They were in preview. They didn't come back in
         // preview").
-        let moves: Vec<(PathBuf, PathBuf, Option<u32>, Rc<EditorPage>)> = (0..self.tabs.n_pages())
-            .filter_map(|index| self.page_by_tab(&self.tabs.nth_page(index)))
+        // Personal's own view, wherever the panes are aimed: walking the
+        // view on screen missed every one of these tabs whenever the
+        // checkout was placed while the user was in another environment.
+        let home = self.view_for(&taste_core::environment::EnvironmentId::primary());
+        let moves: Vec<(PathBuf, PathBuf, Option<u32>, Rc<EditorPage>)> = (0..home.n_pages())
+            .filter_map(|index| self.page_by_tab(&home.nth_page(index)))
             .filter(|(_, page)| page.review.is_none() && page.foreign_env.is_none())
             .filter(|(_, page)| !page.buffer.is_modified())
             .filter_map(|(path, page)| {
@@ -3967,15 +4059,18 @@ impl Editor {
                 restore.insert(new.clone(), self.tab_mode(old, page));
             }
         }
-        let selected = self.selected().map(|(path, _)| path);
+        let selected = home
+            .selected_page()
+            .and_then(|tab| self.page_by_tab(&tab))
+            .map(|(path, _)| path);
         for (old, new, line, page) in &moves {
-            self.tabs.close_page(&page.page);
+            home.close_page(&page.page);
             self.pages.borrow_mut().remove(old);
-            self.open_at(new, *line);
+            self.open_in_background(new, *line);
         }
         if let Some(selected) = selected {
             if let Some((_, new, _, _)) = moves.iter().find(|(old, _, _, _)| *old == selected) {
-                self.open_at(new, None);
+                self.open_in_background(new, None);
             }
         }
         // The last session's tabs the folder could not hold, where the
@@ -4161,7 +4256,7 @@ impl Editor {
         // the selection never has to move to show one.
         self.follow_to_owner(&key);
         if let Some(existing) = self.pages.borrow().get(&key).cloned() {
-            self.tabs.set_selected_page(&existing.page);
+            self.tabs().set_selected_page(&existing.page);
             self.set_changes_view(&key, &existing, true);
             self.sync_toggle_to_selection();
             return;
@@ -4194,11 +4289,11 @@ impl Editor {
             let Some(page) = self.pages.borrow_mut().remove(&key) else {
                 continue;
             };
-            // A review page may be stowed in another environment's holder
-            // rather than on screen; close it wherever it actually is.
-            match page.page.child().parent().and_downcast::<adw::TabView>() {
+            // A review page may be in another environment's view rather
+            // than on screen; close it wherever it actually is.
+            match self.view_of(&page.page) {
                 Some(view) => view.close_page(&page.page),
-                None => self.tabs.close_page(&page.page),
+                None => self.tabs().close_page(&page.page),
             }
         }
         self.publish_state();
@@ -4437,14 +4532,14 @@ impl Editor {
     /// them in.
     fn publish_state(&self) {
         let active = self
-            .tabs
+            .tabs()
             .selected_page()
             .and_then(|tab| self.page_by_tab(&tab).map(|(path, _)| path));
         // What the user has open is what is on screen: another
         // environment's stowed tabs are that environment's, and reporting
         // them here would describe an editor nobody is looking at.
-        let files = (0..self.tabs.n_pages())
-            .filter_map(|index| self.page_by_tab(&self.tabs.nth_page(index)))
+        let files = (0..self.tabs().n_pages())
+            .filter_map(|index| self.page_by_tab(&self.tabs().nth_page(index)))
             .map(|(path, page)| taste_core::ide_state::OpenFile {
                 mode: self.tab_mode(&path, &page),
                 dirty: page.buffer.is_modified(),
@@ -4638,7 +4733,7 @@ impl Editor {
     /// IDE or (2) where the IDE has auto-reloaded the file but it hasn't
     /// been viewed yet should have some sort of indicator or badge").
     fn note_unseen_change(&self, tab: &adw::TabPage) {
-        if self.tabs.selected_page().as_ref() != Some(tab) {
+        if self.tabs().selected_page().as_ref() != Some(tab) {
             tab.set_needs_attention(true);
         }
     }
@@ -5441,13 +5536,76 @@ mod tests {
             editor.aim_at(&env);
             assert!(editor.in_strip(&tab), "the start went with Personal's tabs");
             editor.show_startup(crate::startup::StartupPage::new());
-            assert_eq!(editor.tabs.selected_page().as_ref(), Some(&tab));
+            assert_eq!(editor.tabs().selected_page().as_ref(), Some(&tab));
             // Back to Personal, and the start over: gone from every strip.
             editor.aim_at(&taste_core::environment::EnvironmentId::primary());
             assert!(editor.in_strip(&tab));
             editor.hide_startup();
             assert!(!editor.in_strip(&tab));
             assert!(editor.surfaces.borrow().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// An open that finishes after the user has gone to another
+    /// environment, or one made in the background, lands in its own
+    /// environment's view and moves nothing; the tab is there when the
+    /// user goes back. Restored tabs finishing late took the panes back to
+    /// Personal (2026-10-24).
+    #[test]
+    fn an_open_that_lands_late_does_not_move_the_panes() {
+        crate::gtk_test::on_gtk_thread("late open: no display — skipped", || {
+            let dir = std::env::temp_dir().join(format!("taste-late-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("restored.md"), "restored\n").unwrap();
+            std::fs::write(dir.join("asked.md"), "asked\n").unwrap();
+            crate::languages::register();
+            let editor = super::Editor::new(taste_core::Workspace::open(dir.clone()));
+            let moved = std::rc::Rc::new(std::cell::Cell::new(0));
+            {
+                let moved = moved.clone();
+                editor.set_on_open_environment(move |_| moved.set(moved.get() + 1));
+            }
+            let wait_for = |path: &std::path::Path| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !editor.pages.borrow().contains_key(path)
+                    && std::time::Instant::now() < deadline
+                {
+                    gtk::glib::MainContext::default().iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                editor
+                    .pages
+                    .borrow()
+                    .get(path)
+                    .map(|page| page.page.clone())
+            };
+            let away = taste_core::environment::EnvironmentId::parse("i-away").unwrap();
+            let home = taste_core::environment::EnvironmentId::primary();
+
+            // Restored while the user is elsewhere.
+            editor.aim_at(&away);
+            editor.open_in_background(&dir.join("restored.md"), None);
+            let restored = wait_for(&dir.join("restored.md")).expect("it opens");
+            assert_eq!(
+                *editor.aimed.borrow(),
+                away,
+                "the panes stay where they are"
+            );
+            assert!(!editor.in_strip(&restored), "not in the strip on screen");
+
+            // Asked for at home, and the user left before it was read.
+            editor.aim_at(&home);
+            assert!(editor.in_strip(&restored), "home has it");
+            editor.open_at(&dir.join("asked.md"), None);
+            editor.aim_at(&away);
+            let asked = wait_for(&dir.join("asked.md")).expect("it opens");
+            assert_eq!(*editor.aimed.borrow(), away);
+            assert_eq!(moved.get(), 0, "nothing asked the window to move");
+            editor.aim_at(&home);
+            assert!(editor.in_strip(&asked));
+            assert_eq!(editor.tabs().selected_page().as_ref(), Some(&asked));
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -5917,7 +6075,7 @@ mod tests {
     }
 
     mod tab_sets {
-        use super::super::{tab_set_of, StowedTabs};
+        use super::super::tab_set_of;
         use std::path::{Path, PathBuf};
         use taste_core::environment::EnvironmentId;
 
@@ -5970,40 +6128,6 @@ mod tests {
             reordered.reverse();
             assert_eq!(first, tab_set_of(path, &reordered));
             assert_eq!(first, env("calm-1"));
-        }
-
-        /// Stow and restore is order, selection and scroll — the whole of
-        /// what a switch has to carry, since the buffers themselves are
-        /// never taken apart. A round trip returns every one of them.
-        #[test]
-        fn a_stow_round_trip_keeps_the_order_the_selection_and_the_scroll() {
-            let a = PathBuf::from("/work/project/a.rs");
-            let b = PathBuf::from("/work/project/b.rs");
-            let c = PathBuf::from("/work/project/c.rs");
-            let mut stowed = StowedTabs::default();
-            stowed.push(a.clone(), 0.0, false);
-            stowed.push(b.clone(), 1280.5, true);
-            stowed.push(c.clone(), 42.0, false);
-
-            assert_eq!(stowed.order, vec![a.clone(), b.clone(), c.clone()]);
-            assert_eq!(stowed.selected.as_ref(), Some(&b));
-            assert_eq!(stowed.scroll_of(&b), Some(1280.5));
-            assert_eq!(stowed.scroll_of(&a), Some(0.0));
-            // A file this set never held has no remembered position, which
-            // is different from having been at the top.
-            assert_eq!(stowed.scroll_of(Path::new("/work/project/d.rs")), None);
-            // The round trip is the identity: what went in is what a
-            // restore walks, left to right.
-            assert_eq!(stowed.clone(), stowed);
-        }
-
-        /// An environment nobody selected a tab in comes back with nothing
-        /// selected rather than with the first tab pre-chosen.
-        #[test]
-        fn a_set_with_nothing_selected_says_so() {
-            let mut stowed = StowedTabs::default();
-            stowed.push(PathBuf::from("/work/project/a.rs"), 0.0, false);
-            assert!(stowed.selected.is_none());
         }
     }
 }
