@@ -296,6 +296,11 @@ opens the address bar's problem list four seconds in and shoots it as
 `window.port-problems` (`port_problems.rs`) — serve a page on 3000 that
 fails at something (a file on 5432 under `0.0.0.0`, one on a port the
 probe does not forward, a 404, a `throw`) for rows to read;
+`TASTE_PROBE_PORT_CHECK=3000` (or `3000/login`) prints what
+`ide_port_check` answers for that port and path — the page loaded unseen,
+its failed requests, error statuses and script errors — on a spec of its
+own, since the tool reads ports from a resolved config a probe never has
+(`PortPage::check`; serve something on the port first);
 `TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
 safe-mode banner's running-baseline face;
 `TASTE_PROBE_STARTUP=vm` (or `image` — the guest image fetching inside

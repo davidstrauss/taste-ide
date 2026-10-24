@@ -36,6 +36,13 @@ use webkit6::prelude::*;
 /// The glyph every port surface wears: the tree section, the rows, the tab.
 pub const PORT_ICON: &str = "network-server-symbolic";
 
+/// How long `ide_port_check` waits for its page to finish loading, and
+/// then for what the page does once it has: scripts that fail after the
+/// load, and the requests they make. Inside the MCP server's ten seconds
+/// for an answer from the window.
+const CHECK_LOAD: std::time::Duration = std::time::Duration::from_secs(6);
+const CHECK_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Where a forwarded port stands, asked of the container rather than of
 /// the host.
 ///
@@ -220,6 +227,9 @@ pub struct PortPage {
     /// Where the problems' Prompt Agent goes; passed on to every page
     /// opened from this one, as the new-tab hook is.
     on_prompt: RefCell<Option<crate::port_problems::PromptHook>>,
+    /// The address the first load asks for, when it is not the port's own
+    /// (`PortPage::check`, for a path on it).
+    first_load: RefCell<Option<String>>,
 }
 
 /// Whether the page's own text colour is a light one: its root's computed
@@ -499,6 +509,7 @@ impl PortPage {
             device_toggles,
             problems,
             on_prompt: RefCell::new(None),
+            first_load: RefCell::new(None),
         });
         page.build_device_toggles();
         {
@@ -667,6 +678,75 @@ impl PortPage {
     pub fn set_on_prompt_agent(&self, hook: crate::port_problems::PromptHook) {
         self.problems.set_on_prompt(hook.clone());
         *self.on_prompt.borrow_mut() = Some(hook);
+    }
+
+    /// `ide_port_check`: load `path` on the port in a page of the IDE's
+    /// browser that no tab shows — its network guard, its problem watcher
+    /// and WebKit's word on every request, as a tab has them — and say what
+    /// went wrong. Nothing on screen moves, and the page and its web
+    /// process go when the answer is in.
+    pub async fn check(
+        environment: &str,
+        spec: PortSpec,
+        forwarded: Vec<u16>,
+        path: &str,
+    ) -> Result<serde_json::Value, String> {
+        let path = path.trim();
+        if path.contains("://") || path.starts_with("//") {
+            return Err(format!(
+                "`path` is a path on port {}, like /login, not an address",
+                spec.port
+            ));
+        }
+        let page = Self::made(environment, spec, forwarded, PortFacts::default());
+        let url = format!(
+            "{}{}{}",
+            page.base_url.trim_end_matches('/'),
+            if path.starts_with('/') { "" } else { "/" },
+            path
+        );
+        *page.first_load.borrow_mut() = Some(url.clone());
+        page.set_face(PortFace::Browser);
+        let started = std::time::Instant::now();
+        while started.elapsed() < CHECK_LOAD
+            && page.failed_page.borrow().is_none()
+            && !page.problems.finished()
+        {
+            gtk::glib::timeout_future(std::time::Duration::from_millis(100)).await;
+        }
+        let failed = page.failed_page.borrow().clone();
+        let answer = if let Some((_, reason)) = failed {
+            serde_json::json!({
+                "url": url,
+                "loaded": false,
+                "reason": reason,
+                "problems": [],
+            })
+        } else if !page.problems.finished() {
+            serde_json::json!({
+                "url": url,
+                "loaded": false,
+                "reason": format!(
+                    "still loading after {}s; the server may be slow or waiting on something",
+                    CHECK_LOAD.as_secs()
+                ),
+                "problems": page.problems.report(),
+            })
+        } else {
+            gtk::glib::timeout_future(CHECK_SETTLE).await;
+            let problems = page.problems.report();
+            serde_json::json!({
+                "url": url,
+                "loaded": true,
+                "error_status": page.problems.status(),
+                "clean": problems.is_empty(),
+                "problems": problems,
+            })
+        };
+        if let Some(view) = page.browser.borrow().clone() {
+            view.terminate_web_process();
+        }
+        Ok(answer)
     }
 
     /// What a tab of this port is called before its page says: the port.
@@ -1046,7 +1126,8 @@ impl PortPage {
                 match (filter, manager) {
                     (Ok(filter), Some(manager)) => {
                         manager.add_filter(&filter);
-                        view.load_uri(&page.base_url);
+                        let first = page.first_load.borrow_mut().take();
+                        view.load_uri(first.as_deref().unwrap_or(&page.base_url));
                     }
                     (Ok(_), None) => {
                         page.refuse_load(&view, "the browser has no content manager to guard it")

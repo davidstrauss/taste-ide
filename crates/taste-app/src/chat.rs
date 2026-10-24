@@ -14816,6 +14816,16 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "ide_write_policy" => "Check what it may write".into(),
         "ide_screenshot" => "Photograph a pane".into(),
         "ide_widget_geometry" => "Measure a pane".into(),
+        "ide_port_check" => {
+            let port = input
+                .and_then(|v| v.get("port"))
+                .and_then(serde_json::Value::as_u64);
+            match (port, text("path").filter(|path| *path != "/")) {
+                (Some(port), Some(path)) => format!("Check {path} on port {port}"),
+                (Some(port), None) => format!("Check port {port}'s page"),
+                (None, _) => "Check a port's page".into(),
+            }
+        }
         "issue_list" => "Read the backlog".into(),
         "issue_status" => about("Read issue", "Read an issue", "issue"),
         "issue_link" => about("Link issue", "Link two issues", "issue"),

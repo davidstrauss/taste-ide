@@ -47,6 +47,18 @@ pub type BufferEditor = std::rc::Rc<
     dyn Fn(&std::path::Path, &str, &str, bool) -> Result<taste_core::agentedit::Replaced, String>,
 >;
 
+/// The port page check (`ide_port_check`): an environment, a port, and a
+/// path on it, to what loading it found. Asynchronous — a page has to load.
+pub type PortChecker = std::rc::Rc<
+    dyn Fn(
+        String,
+        u16,
+        String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>>>,
+    >,
+>;
+
 /// Start answering probe requests on the main thread. `registry` maps the
 /// stable pane names to their root widgets.
 pub fn attach(
@@ -55,6 +67,7 @@ pub fn attach(
     buffer_text: BufferLookup,
     buffer_write: BufferWriter,
     buffer_edit: BufferEditor,
+    port_check: PortChecker,
 ) {
     let requests = workspace.ui.requests();
     glib::spawn_future_local(async move {
@@ -77,6 +90,15 @@ pub fn attach(
                 );
                 continue;
             }
+            // A page check waits on a page loading, so it too is answered
+            // off this loop.
+            if let UiRequest::PortCheck { env, port, path } = &request {
+                let check = port_check(env.clone(), *port, path.clone());
+                glib::spawn_future_local(async move {
+                    let _ = reply.send(UiReply::PortCheck(check.await)).await;
+                });
+                continue;
+            }
             let response = match &request {
                 UiRequest::Screenshot { target } => screenshot(&registry, target),
                 UiRequest::Geometry { target } => geometry(&registry, target),
@@ -92,6 +114,7 @@ pub fn attach(
                 } => Ok(UiReply::BufferEdit(buffer_edit(path, old, new, *all))),
                 // Taken by the branch above, which answers off this loop.
                 UiRequest::Confirm { .. } => unreachable!("confirmations are spawned"),
+                UiRequest::PortCheck { .. } => unreachable!("page checks are spawned"),
             };
             let _ = reply.send(response.unwrap_or_else(UiReply::Error)).await;
         }

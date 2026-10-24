@@ -4151,7 +4151,68 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 },
             )
         },
+        {
+            // `ide_port_check`: the caller's own environment's port, as its
+            // tab would load it.
+            let environments = environments.clone();
+            std::rc::Rc::new(move |env: String, port: u16, path: String| {
+                let environments = environments.clone();
+                Box::pin(async move {
+                    let id = taste_core::environment::EnvironmentId::parse(&env)
+                        .map_err(|e| format!("{e:#}"))?;
+                    let supervisor = environments
+                        .get(&id)
+                        .ok_or_else(|| format!("environment {env} does not exist"))?;
+                    let specs = supervisor.ports();
+                    let forwarded: Vec<u16> = specs.iter().map(|p| p.host).collect();
+                    let Some(spec) = specs.into_iter().find(|p| p.port == port) else {
+                        let listed = forwarded_list(&supervisor.ports());
+                        return Err(format!(
+                            "port {port} is not forwarded from {env}; it forwards {listed}. \
+                             Add it to forwardPorts in .devcontainer/devcontainer.json"
+                        ));
+                    };
+                    crate::portview::PortPage::check(env.as_str(), spec, forwarded, &path).await
+                })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>>>,
+                    >
+            })
+        },
     );
+
+    // `TASTE_PROBE_PORT_CHECK=3000` (or `3000/login`): what `ide_port_check`
+    // answers for that port and path, printed. The tool reads the ports an
+    // environment's resolved config forwards, which a probe never has; this
+    // runs the same check on a spec of its own, which is the half with a
+    // browser in it. Serve something on the port first.
+    if let Ok(target) = std::env::var("TASTE_PROBE_PORT_CHECK") {
+        let (port, path) = match target.split_once('/') {
+            Some((port, path)) => (port.to_string(), format!("/{path}")),
+            None => (target.clone(), "/".to_string()),
+        };
+        if let Ok(port) = port.parse::<u16>() {
+            glib::spawn_future_local(async move {
+                let spec = taste_devcontainer::config::PortSpec {
+                    port,
+                    host: port,
+                    label: None,
+                    protocol: None,
+                };
+                let started = std::time::Instant::now();
+                let answer =
+                    crate::portview::PortPage::check("primary", spec, vec![port], &path).await;
+                println!(
+                    "port check {port}{path} ({:.1}s): {}",
+                    started.elapsed().as_secs_f64(),
+                    match answer {
+                        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_default(),
+                        Err(e) => format!("refused: {e}"),
+                    }
+                );
+            });
+        }
+    }
 
     // Agent URL bridge: sandboxed sign-in flows (e.g. Claude Code's OAuth)
     // can't open a browser themselves; their $BROWSER helper drops URLs
@@ -6113,6 +6174,19 @@ fn start_issue(
 /// begin from one brief.
 fn issue_prompt(issue: &crate::backlog::StartedIssue) -> String {
     taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body)
+}
+
+/// The ports an environment forwards, said in a refusal: `3000, 5173`,
+/// or `none`.
+fn forwarded_list(specs: &[taste_devcontainer::config::PortSpec]) -> String {
+    if specs.is_empty() {
+        return "none".to_string();
+    }
+    specs
+        .iter()
+        .map(|spec| spec.port.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// TASTE_PROBE_PORT: which state the `port` view's tab is posed in.

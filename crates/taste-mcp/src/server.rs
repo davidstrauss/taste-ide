@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 13;
+pub const GUIDANCE_REVISION: u32 = 14;
 
 /// The flag the tools that rebuild or move an environment take, said once.
 pub(crate) static WHILE_PRESENTING: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
@@ -390,7 +390,9 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              $XDG_RUNTIME_DIR/taste-ide/ports/<workspace>.json, which is how their \
              tools find them; the environment tool's `ports` gives each port's address \
              on their machine. A change to forwardPorts takes effect with \
-             devcontainer_reload.\n\n\
+             devcontainer_reload. To check a page a forwarded port serves, call \
+             ide_port_check: it loads the page in the IDE's browser and lists what \
+             failed.\n\n\
              SYNC. The user's folder on their machine and Personal's checkout mirror each \
              other: a file changed on one side is written on the other, and a path both \
              sides changed is asked about, never overwritten. Ignored files stay where \
@@ -1588,6 +1590,22 @@ impl McpServer {
                     "required": ["symbol"]
                 }),
             ),
+            tool(
+                "ide_port_check",
+                "Load a page of one of your forwarded ports in the IDE's browser, \
+                 unseen, and list what went wrong: requests that failed or got an error \
+                 status, uncaught script errors, the page's own status, each with its \
+                 cause where the IDE knows it. Check a web fix with it; clean is true when \
+                 nothing did. It cannot read console messages.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "port": { "type": "integer", "description": "the port the server listens on in your container, as forwardPorts names it" },
+                        "path": { "type": "string", "description": "path on that port (default /)" }
+                    },
+                    "required": ["port"]
+                }),
+            ),
         ];
         if env.is_primary() {
             // What the user is looking at, and the IDE's own rendering,
@@ -2427,6 +2445,29 @@ impl McpServer {
                          expecting host access."
                     },
                 }))
+            }
+            "ide_port_check" => {
+                let port = args["port"]
+                    .as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .context("ide_port_check needs `port`: the port your server listens on, as forwardPorts names it")?;
+                let path = args["path"].as_str().unwrap_or("/").to_string();
+                match self
+                    .probe(taste_core::ui_probe::UiRequest::PortCheck {
+                        env: env.as_str().to_string(),
+                        port,
+                        path,
+                    })
+                    .await?
+                {
+                    taste_core::ui_probe::UiReply::PortCheck(Ok(value)) => Ok(value),
+                    taste_core::ui_probe::UiReply::PortCheck(Err(e)) => anyhow::bail!(e),
+                    taste_core::ui_probe::UiReply::Error(e) => anyhow::bail!(e),
+                    _ => anyhow::bail!(
+                        "the IDE window answered with something else; call this again, and \
+                         tell the user if it repeats"
+                    ),
+                }
             }
             "ide_widget_geometry" => {
                 let target = arg(&args, &["target", "pane"])
@@ -6254,8 +6295,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "d9f129d1af86990f8a319c3f589912de51a45e204e5e6f26898972dee4e2ca9c";
-        const AT_REVISION: u32 = 13;
+            "949e47de57b1d8387e65ab24a00e48fa2631303a9a0954017d2f5bb461dddd48";
+        const AT_REVISION: u32 = 14;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

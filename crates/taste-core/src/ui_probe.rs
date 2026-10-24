@@ -64,6 +64,15 @@ pub enum UiRequest {
         body: String,
         confirm_label: String,
     },
+    /// Load `path` on one of `env`'s forwarded ports in the IDE's browser,
+    /// in a page no tab shows, and say what went wrong loading it: the
+    /// list a port tab counts at its address bar's end. Serves
+    /// `ide_port_check`.
+    PortCheck {
+        env: String,
+        port: u16,
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +94,8 @@ pub enum UiReply {
     BufferEdit(Result<crate::agentedit::Replaced, String>),
     /// The user answer. False covers denied, dismissed, and never asked.
     Confirm(bool),
+    /// What the page check found, or why there was no page to check.
+    PortCheck(Result<serde_json::Value, String>),
     /// The UI could not answer (unknown target, widget not rendered).
     Error(String),
 }

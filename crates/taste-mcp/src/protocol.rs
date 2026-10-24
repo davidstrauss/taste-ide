@@ -149,6 +149,10 @@ pub fn effect(tool: &str) -> Effect {
         | "chat_transcript_tail"
         | "review_list" => Effect::Read,
 
+        // GET requests to the environment's own server, in a page nobody
+        // sees: what a reload of its tab would do, and nothing else.
+        "ide_port_check" => Effect::Read,
+
         // Moves a VIEW, not data: it brings a file to the front of the
         // user's editor and touches nothing on disk. The one judgement
         // call in this list, and it goes with reads because what

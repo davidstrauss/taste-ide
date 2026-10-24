@@ -14,6 +14,11 @@
 //! because a tab opened from another shares that one's content manager and
 //! a message cannot say which view sent it.
 //!
+//! What the page cannot see, WebKit tells: every request the page makes,
+//! a `fetch` or an XHR as much as an image, reports whether it failed and
+//! with what status it finished, so a request refused or answered with an
+//! error is listed with WebKit's own reason or the server's status.
+//!
 //! Where the reason is the IDE's own — the network guard, a port not
 //! forwarded — or WebKit's — 0.0.0.0, which it refuses outright — the row
 //! says so. Everything else is the Web Inspector's to explain, and the
@@ -78,6 +83,23 @@ enum Kind {
     Script,
     /// The page itself answered with an error status.
     Status,
+    /// A request the page made that failed, with WebKit's reason.
+    Failed(String),
+    /// A request the page made that the server answered with an error
+    /// status.
+    Answered(u32),
+}
+
+impl Kind {
+    /// What the prompt and the tool call it.
+    fn word(&self) -> &'static str {
+        match self {
+            Kind::Resource | Kind::Failed(_) => "did not load",
+            Kind::Script => "script error",
+            Kind::Status => "page status",
+            Kind::Answered(_) => "error status",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +134,11 @@ pub struct Problems {
     /// error; both cleared when a page starts loading.
     found: RefCell<Vec<Problem>>,
     status: Cell<Option<u32>>,
+    /// What WebKit reported of the page's requests: failed, or answered
+    /// with an error status. Cleared with the rest.
+    requests: RefCell<Vec<Problem>>,
+    /// Whether the page has finished loading since it last started.
+    finished: Cell<bool>,
     /// A read already asked for: a page whose fifty images fail pings
     /// fifty times, and one read answers them all.
     reading: Cell<bool>,
@@ -190,6 +217,8 @@ impl Problems {
             forwarded,
             found: RefCell::new(Vec::new()),
             status: Cell::new(None),
+            requests: RefCell::new(Vec::new()),
+            finished: Cell::new(false),
             reading: Cell::new(false),
             view: RefCell::new(None),
         });
@@ -321,10 +350,13 @@ impl Problems {
                 match event {
                     webkit6::LoadEvent::Started => {
                         problems.found.borrow_mut().clear();
+                        problems.requests.borrow_mut().clear();
                         problems.status.set(None);
+                        problems.finished.set(false);
                         problems.show();
                     }
                     webkit6::LoadEvent::Finished => {
+                        problems.finished.set(true);
                         let status = view
                             .main_resource()
                             .and_then(|resource| resource.response())
@@ -337,6 +369,45 @@ impl Problems {
                 }
             });
         }
+        {
+            // Every request the page makes, the page itself apart: its own
+            // failure is the IDE's error page, and its status is `status`.
+            let weak = Rc::downgrade(self);
+            view.connect_resource_load_started(move |view, resource, _| {
+                let main = view.main_resource();
+                if main.as_ref() == Some(resource) {
+                    return;
+                }
+                let failed = weak.clone();
+                resource.connect_failed(move |resource, error| {
+                    // A load cut short by the page moving on is no problem.
+                    if error.matches(webkit6::NetworkError::Cancelled) {
+                        return;
+                    }
+                    if let (Some(problems), Some(uri)) = (failed.upgrade(), resource.uri()) {
+                        problems.note_request(Problem {
+                            kind: Kind::Failed(error.message().to_string()),
+                            text: uri.to_string(),
+                        });
+                    }
+                });
+                let finished = weak.clone();
+                resource.connect_finished(move |resource| {
+                    let status = resource
+                        .response()
+                        .map(|response| response.status_code())
+                        .filter(|status| *status >= 400);
+                    if let (Some(problems), Some(status), Some(uri)) =
+                        (finished.upgrade(), status, resource.uri())
+                    {
+                        problems.note_request(Problem {
+                            kind: Kind::Answered(status),
+                            text: uri.to_string(),
+                        });
+                    }
+                });
+            });
+        }
         if let Some(manager) = view.user_content_manager() {
             let weak = Rc::downgrade(self);
             manager.connect_script_message_received(Some(HANDLER), move |_, _| {
@@ -345,6 +416,43 @@ impl Problems {
                 }
             });
         }
+    }
+
+    /// A request WebKit reported, once.
+    fn note_request(&self, problem: Problem) {
+        {
+            let mut requests = self.requests.borrow_mut();
+            if requests.len() >= KEPT || requests.contains(&problem) {
+                return;
+            }
+            requests.push(problem);
+        }
+        self.show();
+    }
+
+    /// Whether the page has finished loading since it last started.
+    pub fn finished(&self) -> bool {
+        self.finished.get()
+    }
+
+    /// The page's status when it was an error, for the tool's answer.
+    pub fn status(&self) -> Option<u32> {
+        self.status.get()
+    }
+
+    /// The list as the tool hands it to an agent: each problem's kind, what
+    /// it is about, and what is known of why.
+    pub fn report(&self) -> Vec<serde_json::Value> {
+        self.all()
+            .iter()
+            .map(|(problem, why)| {
+                serde_json::json!({
+                    "kind": problem.kind.word(),
+                    "what": problem.text,
+                    "why": why,
+                })
+            })
+            .collect()
     }
 
     /// Read the watcher's list from this page's own view.
@@ -388,13 +496,30 @@ impl Problems {
                 text: format!("The page answered HTTP {status}"),
             });
         }
-        all.extend(self.found.borrow().iter().cloned());
+        // WebKit's word on a request is better than the watcher's on the
+        // element that made it: the watcher's goes when both have it.
+        let requests = self.requests.borrow();
+        all.extend(
+            self.found
+                .borrow()
+                .iter()
+                .filter(|found| {
+                    found.kind != Kind::Resource
+                        || !requests.iter().any(|request| request.text == found.text)
+                })
+                .cloned(),
+        );
+        all.extend(requests.iter().cloned());
+        drop(requests);
         all.into_iter()
             .map(|problem| {
-                let detail = match problem.kind {
+                let detail = match &problem.kind {
                     Kind::Resource => why(&problem.text, &self.forwarded).unwrap_or_else(|| {
                         "Did not load — the Web Inspector's Network tab says why".into()
                     }),
+                    Kind::Failed(error) => why(&problem.text, &self.forwarded)
+                        .unwrap_or_else(|| format!("Did not load: {error}")),
+                    Kind::Answered(status) => format!("The server answered HTTP {status}"),
                     Kind::Script => "A script error nothing caught".into(),
                     Kind::Status => "The server's own answer, drawn as it sent it".into(),
                 };
@@ -463,14 +588,7 @@ fn repair_prompt(
     let file = format!("port-{port}-problems.txt");
     let list = problems
         .iter()
-        .map(|(problem, why)| {
-            let kind = match problem.kind {
-                Kind::Resource => "did not load",
-                Kind::Script => "script error",
-                Kind::Status => "page status",
-            };
-            format!("- {kind}: {}\n  why: {why}", problem.text)
-        })
+        .map(|(problem, why)| format!("- {}: {}\n  why: {why}", problem.kind.word(), problem.text))
         .collect::<Vec<_>>()
         .join("\n");
     let page = if url.is_empty() {
@@ -483,19 +601,18 @@ fn repair_prompt(
         "{page} had {n} problem{} loading in the IDE's browser.\n\n\
          WHAT IS TRUE\n\
          The server listens on port {port} in this environment. The problems are attached as \
-         {file}: files that did not load, script errors nothing caught, and the page's own \
-         error status, each with what the IDE knows of its cause.\n\n\
+         {file}: requests that failed or were answered with an error status, script \
+         errors nothing caught, and the page's own error status, each with what the IDE \
+         knows of its cause.\n\n\
          HOW TO WORK\n\
          1. Read the attached list before changing anything.\n\
          2. Where a cause is named (0.0.0.0, a port not forwarded, a host this browser cannot \
          reach), fix the project's configuration: the address the server gives out, or \
          forwardPorts in .devcontainer/devcontainer.json, then call devcontainer_reload.\n\
          3. Otherwise reproduce it here: request the failing addresses with curl through \
-         ide_exec, and read the server's output with devcontainer_logs. You cannot see the \
-         browser's console or network log; ide_screenshot of the editor shows the page while \
-         its tab is in front.\n\
-         4. Fix the cause in the project, request each failing address again, and check it \
-         now loads.\n\
+         ide_exec, and read the server's output with devcontainer_logs.\n\
+         4. Fix the cause in the project, then call ide_port_check with port {port}: it loads \
+         the page in the IDE's browser and returns this same list. Done when it is empty.\n\
          5. If the fix needs something only the user can give, stop and say exactly what.\n\
          6. Finish with one short paragraph: the cause, and what you changed.",
         if n == 1 { "" } else { "s" },
