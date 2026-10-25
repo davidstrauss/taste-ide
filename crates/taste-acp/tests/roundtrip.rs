@@ -180,7 +180,7 @@ async fn agent_file_writes_go_through_the_client() {
     let requests = probe.requests();
     let responder = std::thread::spawn(move || {
         while let Ok((request, reply)) = requests.recv_blocking() {
-            let UiRequest::BufferWrite { path, content } = request else {
+            let UiRequest::BufferWrite { path, content, .. } = request else {
                 let _ = reply.send_blocking(UiReply::Error("unexpected request".into()));
                 continue;
             };

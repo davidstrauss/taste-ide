@@ -38,6 +38,9 @@ pub enum UiRequest {
     BufferWrite {
         path: std::path::PathBuf,
         content: String,
+        /// Saved as sent ([`crate::textfile::FileFormat::literal`]) rather
+        /// than as the user's editor saves it, `.editorconfig` applied.
+        literal: bool,
     },
     /// Replace one exact string in a file *through the editor*
     /// ([`crate::agentedit::replace`]): in the buffer when the file is
@@ -50,6 +53,8 @@ pub enum UiRequest {
         old: String,
         new: String,
         all: bool,
+        /// As for [`Self::BufferWrite`].
+        literal: bool,
     },
     /// Ask the user to approve something an agent set in motion.
     ///

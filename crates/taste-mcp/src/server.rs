@@ -1381,14 +1381,16 @@ impl McpServer {
                 "Replace exact text in a file, in the user's open editor buffer when it is \
                  open, and save. old_string must occur once (add surrounding lines to make \
                  it unique) unless replace_all is true. Copy it from ide_read_file without \
-                 the line numbers.",
+                 the line numbers. The file is saved exactly as edited: trailing spaces \
+                 and blank lines are kept.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "workspace-relative or absolute path" },
                         "old_string": { "type": "string", "description": "the exact text to replace" },
                         "new_string": { "type": "string", "description": "the text to put in its place" },
-                        "replace_all": { "type": "boolean", "description": "replace every occurrence (default false)" }
+                        "replace_all": { "type": "boolean", "description": "replace every occurrence (default false)" },
+                        "apply_editorconfig": { "type": "boolean", "description": "save as the user's editor saves: .editorconfig's trailing-whitespace trim and final newline (default false: the text exactly as sent, in the file's line endings)" }
                     },
                     "required": ["path", "old_string", "new_string"]
                 }),
@@ -1396,13 +1398,15 @@ impl McpServer {
             tool(
                 "ide_write_file",
                 "Write a whole file — create it, or replace all of its text — in the \
-                 user's open editor buffer when it is open, and save. For a change to part \
-                 of a file, use ide_edit_file.",
+                 user's open editor buffer when it is open, and save. The file gets exactly \
+                 your text: trailing spaces and blank lines are kept, and no final newline \
+                 is added. For a change to part of a file, use ide_edit_file.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "workspace-relative or absolute path" },
-                        "content": { "type": "string", "description": "the file's whole new text" }
+                        "content": { "type": "string", "description": "the file's whole new text" },
+                        "apply_editorconfig": { "type": "boolean", "description": "save as the user's editor saves: .editorconfig's trailing-whitespace trim and final newline (default false: the text exactly as sent, in the file's line endings)" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -5308,6 +5312,8 @@ impl McpServer {
         } else {
             None
         };
+        // As sent, unless the call asks for the user's editor's save.
+        let literal = !args["apply_editorconfig"].as_bool().unwrap_or(false);
         let content = match &edit {
             Some(_) => String::new(),
             None => args["content"]
@@ -5322,10 +5328,12 @@ impl McpServer {
                     old: old.clone(),
                     new: new.clone(),
                     all: *all,
+                    literal,
                 },
                 None => UiRequest::BufferWrite {
                     path: path.clone(),
                     content: content.clone(),
+                    literal,
                 },
             };
             // No second try on the disk after a timeout: the editor may
@@ -5360,6 +5368,7 @@ impl McpServer {
                     }
                     None => (content, None),
                 };
+                let format = if literal { format.literal() } else { format };
                 taste_core::textfile::save_via(&files, &root, safe_mode, &path, &next, &format)
                     .map(|_| done)
             })
@@ -8344,6 +8353,51 @@ mod tests {
             std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
             "fn main() {}\n"
         );
+    }
+
+    /// An agent's write is saved as it sent it, whatever the project's
+    /// `.editorconfig` would trim: the trailing double space and the blank
+    /// lines at the end stay. Asked for, the editor's save is applied.
+    #[tokio::test]
+    async fn an_agents_write_is_saved_as_sent_unless_it_asks_for_the_editors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".editorconfig"),
+            "root = true\n[*]\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".devcontainer")).unwrap();
+        let (socket, _workspace) = start_test_server(dir.path()).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let file = dir.path().join(".devcontainer/notes.md");
+        let text = "**Star pitch**  \nbody\n\n\n";
+
+        call_tool(
+            &mut stream,
+            "ide_write_file",
+            json!({"path": ".devcontainer/notes.md", "content": text}),
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+
+        call_tool(
+            &mut stream,
+            "ide_edit_file",
+            json!({"path": ".devcontainer/notes.md", "old_string": "body", "new_string": "body  "}),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "**Star pitch**  \nbody  \n\n\n"
+        );
+
+        call_tool(
+            &mut stream,
+            "ide_write_file",
+            json!({"path": ".devcontainer/notes.md", "content": "a  \nb", "apply_editorconfig": true}),
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\n");
     }
 
     #[tokio::test]

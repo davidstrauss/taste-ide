@@ -41,6 +41,25 @@ impl Default for FileFormat {
 }
 
 impl FileFormat {
+    /// How an agent's write is saved unless it asks for the editor's save:
+    /// its text as sent, with no trailing whitespace trimmed and no final
+    /// newline added, in the file's own line endings and BOM. Those two are
+    /// how the file is stored rather than what it says, and an agent reads
+    /// a CRLF file as LF, so writing its text back as LF would change every
+    /// line. The trimming is the user's editor's habit, and an agent's
+    /// trailing double space (a Markdown line break, a fixture) or blank
+    /// lines at the end are what it meant (David, 2026-10-24: "allow an
+    /// option for the agent to save a buffer literally … it should be the
+    /// default").
+    pub fn literal(&self) -> FileFormat {
+        FileFormat {
+            trim_trailing_ws: false,
+            final_newline: false,
+            eol_override: None,
+            ..self.clone()
+        }
+    }
+
     /// Fold `.editorconfig`'s save-time properties in. Indentation and the
     /// right-margin guide are the editor's business and stay there; these
     /// are the ones that change the bytes.
@@ -267,8 +286,11 @@ pub fn save_via(
 
 /// The exact bytes a save should write for `text`.
 pub fn render(text: &str, format: &FileFormat) -> String {
+    // Split on the newlines rather than by `lines()`, which drops the last
+    // one: trimming took a file's final newline with it, and with
+    // `insert_final_newline` off nothing put it back.
     let mut out = if format.trim_trailing_ws {
-        text.lines()
+        text.split('\n')
             .map(str::trim_end)
             .collect::<Vec<_>>()
             .join("\n")
@@ -328,6 +350,41 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Trimming takes the spaces at the ends of lines and nothing else: the
+    /// final newline and the blank lines before it stay.
+    #[test]
+    fn trimming_keeps_the_final_newline_and_the_blank_lines() {
+        let trim = FileFormat {
+            trim_trailing_ws: true,
+            final_newline: false,
+            ..FileFormat::default()
+        };
+        assert_eq!(render("a  \nb\t\n\n\n", &trim), "a\nb\n\n\n");
+        assert_eq!(render("a  ", &trim), "a");
+    }
+
+    /// A literal save writes the text as sent, in the file's own line
+    /// endings and BOM, whatever `.editorconfig` would trim or add.
+    #[test]
+    fn a_literal_save_is_the_text_as_sent() {
+        let editor = FileFormat {
+            crlf: true,
+            bom: false,
+            trim_trailing_ws: true,
+            final_newline: true,
+            eol_override: Some(false),
+        };
+        let text = "**Star pitch**  \nline\n\n\n";
+        assert_eq!(render(text, &editor), "**Star pitch**\nline\n\n\n");
+        assert_eq!(
+            render(text, &editor.literal()),
+            "**Star pitch**  \r\nline\r\n\r\n\r\n"
+        );
+        let lf = FileFormat::default();
+        assert_eq!(render("no newline", &lf.literal()), "no newline");
+        assert_eq!(render("no newline", &lf), "no newline\n");
+    }
 
     /// A files service that is not this host's, over a temporary directory:
     /// what a checkout in a VM looks like to the editor.

@@ -1622,8 +1622,15 @@ async fn write_text_file(
         return tokio::task::spawn_blocking(move || {
             let (_, format) = taste_core::textfile::load_via(&files, &path)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
-            taste_core::textfile::save_via(&files, &root, safe_mode, &path, &content, &format)
-                .map(|_| ())
+            taste_core::textfile::save_via(
+                &files,
+                &root,
+                safe_mode,
+                &path,
+                &content,
+                &format.literal(),
+            )
+            .map(|_| ())
         })
         .await
         .map_err(|e| format!("write task failed: {e}"))?;
@@ -1635,9 +1642,12 @@ async fn write_text_file(
     // carries whole file contents, so a retry is idempotent.
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
+        // `fs/write_text_file` is "write this content": as sent, not as the
+        // user's editor would tidy it.
         probe.request(taste_core::ui_probe::UiRequest::BufferWrite {
             path: path.to_path_buf(),
             content: content.to_string(),
+            literal: true,
         }),
     )
     .await
@@ -2294,7 +2304,8 @@ mod tests {
         let recorder = seen.clone();
         tokio::spawn(async move {
             while let Ok((request, reply)) = requests.recv().await {
-                let taste_core::ui_probe::UiRequest::BufferWrite { path, content } = request else {
+                let taste_core::ui_probe::UiRequest::BufferWrite { path, content, .. } = request
+                else {
                     continue;
                 };
                 recorder.lock().unwrap().push((path, content.clone()));

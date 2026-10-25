@@ -37,14 +37,21 @@ const MAX_NODES: usize = 1200;
 pub type BufferLookup = std::rc::Rc<dyn Fn(&std::path::Path) -> Option<String>>;
 
 /// The editor's write path (the ACP fs/write_text_file path). Applies the
-/// text and saves, through the user's own buffer when they have one open.
-pub type BufferWriter = std::rc::Rc<dyn Fn(&std::path::Path, &str) -> Result<(), String>>;
+/// text and saves, through the user's own buffer when they have one open:
+/// as sent when the flag says literal, else as the user's editor saves.
+pub type BufferWriter = std::rc::Rc<dyn Fn(&std::path::Path, &str, bool) -> Result<(), String>>;
 
 /// The editor's exact-replacement path (`ide_edit_file`): `old` for `new`,
-/// every occurrence when the flag says so, through the user's own buffer
-/// when they have one open.
+/// every occurrence when the first flag says so, through the user's own
+/// buffer when they have one open, saved literally when the second does.
 pub type BufferEditor = std::rc::Rc<
-    dyn Fn(&std::path::Path, &str, &str, bool) -> Result<taste_core::agentedit::Replaced, String>,
+    dyn Fn(
+        &std::path::Path,
+        &str,
+        &str,
+        bool,
+        bool,
+    ) -> Result<taste_core::agentedit::Replaced, String>,
 >;
 
 /// The port page check (`ide_port_check`): an environment, a port, and a
@@ -103,15 +110,20 @@ pub fn attach(
                 UiRequest::Screenshot { target } => screenshot(&registry, target),
                 UiRequest::Geometry { target } => geometry(&registry, target),
                 UiRequest::BufferText { path } => Ok(UiReply::BufferText(buffer_text(path))),
-                UiRequest::BufferWrite { path, content } => {
-                    Ok(UiReply::BufferWrite(buffer_write(path, content)))
-                }
+                UiRequest::BufferWrite {
+                    path,
+                    content,
+                    literal,
+                } => Ok(UiReply::BufferWrite(buffer_write(path, content, *literal))),
                 UiRequest::BufferEdit {
                     path,
                     old,
                     new,
                     all,
-                } => Ok(UiReply::BufferEdit(buffer_edit(path, old, new, *all))),
+                    literal,
+                } => Ok(UiReply::BufferEdit(buffer_edit(
+                    path, old, new, *all, *literal,
+                ))),
                 // Taken by the branch above, which answers off this loop.
                 UiRequest::Confirm { .. } => unreachable!("confirmations are spawned"),
                 UiRequest::PortCheck { .. } => unreachable!("page checks are spawned"),

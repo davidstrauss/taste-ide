@@ -4567,7 +4567,14 @@ impl Editor {
     /// is how VS Code's own agent edits, and the choice David made
     /// (2026-10-05). Until then an open, unsaved file had its DISK written
     /// behind it, and the conflict bar asked the user to choose.
-    pub fn buffer_write(self: &Rc<Self>, path: &Path, text: &str) -> Result<(), String> {
+    /// `literal`: saved as sent ([`FileFormat::literal`]) rather than as
+    /// the user's own save of it would be, `.editorconfig` applied.
+    pub fn buffer_write(
+        self: &Rc<Self>,
+        path: &Path,
+        text: &str,
+        literal: bool,
+    ) -> Result<(), String> {
         if let Some(page) = self.pages.borrow().get(path).cloned() {
             let (start, end) = page.buffer.bounds();
             let current = page.buffer.text(&start, &end, true).to_string();
@@ -4577,9 +4584,9 @@ impl Editor {
             // watching, and the read-only rule is about the second. The
             // agent's authority was already checked against its own
             // environment before this request was made.
-            return self.persist_page(path, &page);
+            return self.persist_page_as(path, &page, agent_format(&page.file_format(), literal));
         }
-        self.write_headless(path, |buffer| {
+        self.write_headless(path, literal, |buffer| {
             buffer.text = text.to_string();
             Ok(())
         })
@@ -4596,17 +4603,18 @@ impl Editor {
         old: &str,
         new: &str,
         all: bool,
+        literal: bool,
     ) -> Result<taste_core::agentedit::Replaced, String> {
         if let Some(page) = self.pages.borrow().get(path).cloned() {
             let (start, end) = page.buffer.bounds();
             let current = page.buffer.text(&start, &end, true).to_string();
             let done = taste_core::agentedit::replace(&current, old, new, all)?;
             apply_minimal(&page.buffer, &current, &done.text);
-            self.persist_page(path, &page)?;
+            self.persist_page_as(path, &page, agent_format(&page.file_format(), literal))?;
             return Ok(done);
         }
         let mut outcome = None;
-        self.write_headless(path, |buffer| {
+        self.write_headless(path, literal, |buffer| {
             let done = taste_core::agentedit::replace(&buffer.text, old, new, all)?;
             buffer.text = done.text.clone();
             outcome = Some(done);
@@ -4645,6 +4653,7 @@ impl Editor {
     fn write_headless(
         &self,
         path: &Path,
+        literal: bool,
         edit: impl FnOnce(&mut HeadlessBuffer) -> Result<(), String>,
     ) -> Result<(), String> {
         let files = files_among(path, &self.access());
@@ -4664,7 +4673,8 @@ impl Editor {
                 !self.workspace.exec.is_container(),
             ),
         };
-        textfile::save_via(&files, &root, safe_mode, path, &buffer.text, &buffer.format)?;
+        let format = agent_format(&buffer.format, literal);
+        textfile::save_via(&files, &root, safe_mode, path, &buffer.text, &format)?;
         // Own changes are announced, not just watched for.
         self.workspace
             .events
@@ -4932,6 +4942,17 @@ impl Editor {
     /// workspace. The write policy still applies — it is simply the
     /// policy of the environment that owns the file.
     fn persist_page(&self, path: &Path, page: &EditorPage) -> Result<(), String> {
+        self.persist_page_as(path, page, page.file_format())
+    }
+
+    /// [`Self::persist_page`] in `format`: an agent's literal write is the
+    /// one save of an open page that is not in the page's own.
+    fn persist_page_as(
+        &self,
+        path: &Path,
+        page: &EditorPage,
+        format: FileFormat,
+    ) -> Result<(), String> {
         let (start, end) = page.buffer.bounds();
         let text = page.buffer.text(&start, &end, true).to_string();
         // Rendering the bytes, and refusing what the write policy refuses,
@@ -4943,7 +4964,7 @@ impl Editor {
             self.safe_mode_of(page),
             path,
             &text,
-            &page.file_format(),
+            &format,
         ) {
             Ok(hash) => {
                 page.buffer.set_modified(false);
@@ -4987,6 +5008,16 @@ impl Editor {
     /// — means nothing on this machine.
     pub(crate) fn shown_path(&self, path: impl AsRef<Path>) -> String {
         shown_path_in(self.workspace.root(), path.as_ref())
+    }
+}
+
+/// The format an agent's write of a file in `format` is saved in: as sent
+/// when `literal`, else the file's own, as the user's save would be.
+fn agent_format(format: &FileFormat, literal: bool) -> FileFormat {
+    if literal {
+        format.literal()
+    } else {
+        format.clone()
     }
 }
 
@@ -5932,7 +5963,7 @@ mod tests {
             std::fs::write(&notes, "one\n").unwrap();
             crate::languages::register();
             let editor = super::Editor::new(taste_core::Workspace::open(dir.clone()));
-            editor.buffer_write(&notes, "two\n").unwrap();
+            editor.buffer_write(&notes, "two\n", true).unwrap();
             assert_eq!(std::fs::read_to_string(&notes).unwrap(), "two\n");
             // The renumbering script, in the agent's shell.
             std::fs::write(&notes, "three\n").unwrap();
@@ -5941,7 +5972,9 @@ mod tests {
                 None,
                 "an unopened file is read from the disk"
             );
-            editor.buffer_edit(&notes, "three", "four", false).unwrap();
+            editor
+                .buffer_edit(&notes, "three", "four", false, true)
+                .unwrap();
             assert_eq!(std::fs::read_to_string(&notes).unwrap(), "four\n");
             let _ = std::fs::remove_dir_all(&dir);
         });
