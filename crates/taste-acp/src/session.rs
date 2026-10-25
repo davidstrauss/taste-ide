@@ -50,9 +50,20 @@ pub enum Command {
     Prompt {
         blocks: Vec<ContentBlock>,
         queued: Option<taste_core::queued::Queued>,
+        /// The chat's id for it, by which [`Command::Withdraw`] and
+        /// [`Command::Expedite`] name it while it waits.
+        id: Option<String>,
     },
     /// Cancel the in-flight turn.
     Cancel,
+    /// Drop the prompt with this id while it waits behind the turn, before
+    /// the agent sees it ([`SessionEvent::QueuedWithdrawn`]); nothing once
+    /// it has gone.
+    Withdraw(String),
+    /// Stop the in-flight turn and send the prompt with this id next,
+    /// dropping every other prompt waiting behind the turn
+    /// ([`SessionEvent::QueuedWithdrawn`]); nothing once it has gone.
+    Expedite(String),
     /// Cancel the in-flight turn and drop the prompts waiting behind it,
     /// which never reach the agent ([`SessionEvent::QueuedDropped`]).
     CancelAll,
@@ -112,6 +123,10 @@ pub enum SessionEvent {
     /// The last `count` prompts waiting behind the turn were dropped by a
     /// [`Command::CancelAll`], and will never be sent.
     QueuedDropped { count: usize },
+    /// These prompts, by their ids, were dropped from behind the turn by a
+    /// [`Command::Withdraw`] or a [`Command::Expedite`], and will never be
+    /// sent.
+    QueuedWithdrawn { ids: Vec<String> },
     /// A turn finished, with the agent's session-cumulative token usage
     /// when it reports one.
     TurnEnded {
@@ -207,21 +222,37 @@ impl AgentClient {
         self.send(Command::Prompt {
             blocks,
             queued: None,
+            id: None,
         })
     }
 
     /// [`Self::prompt_blocks`] for a prompt written while a turn runs: if
     /// it waits behind that turn, it goes out after a note saying how long
     /// and where in the conversation it was written.
+    /// `id` names it to [`Self::withdraw`] and [`Self::expedite`] while it
+    /// waits.
     pub fn prompt_blocks_queued(
         &self,
         blocks: Vec<ContentBlock>,
         queued: taste_core::queued::Queued,
+        id: Option<String>,
     ) -> Result<()> {
         self.send(Command::Prompt {
             blocks,
             queued: Some(queued),
+            id,
         })
+    }
+
+    /// Drop the prompt `id` from behind the turn, if it is still waiting.
+    pub fn withdraw(&self, id: &str) -> Result<()> {
+        self.send(Command::Withdraw(id.to_string()))
+    }
+
+    /// Stop the turn and send the prompt `id` next, dropping the others
+    /// waiting behind it — if it is still waiting.
+    pub fn expedite(&self, id: &str) -> Result<()> {
+        self.send(Command::Expedite(id.to_string()))
     }
 
     /// Cancel the in-flight turn (no-op when idle).
@@ -1269,6 +1300,7 @@ fn join_waiting(
         let Some(Command::Prompt {
             blocks,
             queued: Some(written),
+            ..
         }) = queued.pop_front()
         else {
             break;
@@ -1278,6 +1310,11 @@ fn join_waiting(
         count += 1;
     }
     (out, count)
+}
+
+/// Whether `command` is the prompt the chat calls `id`.
+fn is_prompt(command: &Command, id: &str) -> bool {
+    matches!(command, Command::Prompt { id: Some(own), .. } if own == id)
 }
 
 /// The post-setup command loop, shared by fresh and restored sessions.
@@ -1307,6 +1344,7 @@ async fn serve_commands(
             Command::Prompt {
                 mut blocks,
                 queued: written,
+                ..
             } => {
                 if let (true, Some(written)) = (waited, written) {
                     let (joined, count) = join_waiting(blocks, &written, &mut queued);
@@ -1370,6 +1408,41 @@ async fn serve_commands(
                                         .await;
                                 }
                             }
+                            Ok(Command::Withdraw(id)) => {
+                                let before = queued.len();
+                                queued.retain(|command| !is_prompt(command, &id));
+                                if queued.len() < before {
+                                    let _ = event_tx
+                                        .send(SessionEvent::QueuedWithdrawn { ids: vec![id] })
+                                        .await;
+                                }
+                            }
+                            Ok(Command::Expedite(id)) => {
+                                // Still waiting, or nothing: once it has gone
+                                // there is no turn of its to bring forward.
+                                if let Some(at) = queued.iter().position(|c| is_prompt(c, &id)) {
+                                    let kept = queued.remove(at);
+                                    let mut dropped = Vec::new();
+                                    queued.retain(|command| match command {
+                                        Command::Prompt { id, .. } => {
+                                            dropped.push(id.clone().unwrap_or_default());
+                                            false
+                                        }
+                                        _ => true,
+                                    });
+                                    if let Some(kept) = kept {
+                                        queued.push_front(kept);
+                                    }
+                                    connection.send_notification(CancelNotification::new(
+                                        session_id.clone(),
+                                    ))?;
+                                    if !dropped.is_empty() {
+                                        let _ = event_tx
+                                            .send(SessionEvent::QueuedWithdrawn { ids: dropped })
+                                            .await;
+                                    }
+                                }
+                            }
                             Ok(other) => queued.push_back(other),
                             Err(_) => return Ok(()), // UI dropped the client
                         },
@@ -1385,7 +1458,8 @@ async fn serve_commands(
                     })
                     .await;
             }
-            Command::Cancel | Command::CancelAll => {} // nothing in flight
+            // Nothing in flight, so nothing waits behind it either.
+            Command::Cancel | Command::CancelAll | Command::Withdraw(_) | Command::Expedite(_) => {}
             // Control commands are never fatal: a rejected mode or config
             // change must not tear down a healthy conversation.
             Command::SetMode(mode) => {
@@ -1890,6 +1964,7 @@ mod tests {
         let prompt = |t: &str, waited: bool| Command::Prompt {
             blocks: vec![text(t)],
             queued: waited.then(|| written.clone()),
+            id: None,
         };
         let mut queued: std::collections::VecDeque<Command> = [
             prompt("second", true),

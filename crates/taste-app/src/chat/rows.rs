@@ -228,30 +228,62 @@ impl ChatPane {
             badge.remove_css_class("dim-label");
             badge.add_css_class("error");
         }
-        // Ask for a Turn at the end of a queued message's badge: the agent
-        // is asked, at its next use of the IDE's tools, to finish its step
-        // and end the turn (`taste_core::nudge`), which sends the message
-        // without stopping anything.
-        if let (Delivery::Queued, Some(prompt)) = (&user.delivery, &user.prompt) {
-            let button = gtk::Button::builder()
-                .label("Ask for a Turn")
-                .css_classes(["flat", "caption"])
+        // A queued message's two controls at the badge's end. Fast-forward:
+        // a click asks the agent, at its next use of the IDE's tools, to
+        // finish its step and end the turn (`taste_core::nudge`), which
+        // sends the message without stopping anything; held two seconds,
+        // it stops the turn now, drops the other queued messages, and
+        // sends this one next. Stop: the message is dropped before the
+        // agent takes it (David, 2026-10-24).
+        if let (Delivery::Queued | Delivery::Asking { .. }, Some(prompt)) =
+            (&user.delivery, &user.prompt)
+        {
+            let forward = crate::holdbutton::HoldButton::new(
+                "media-seek-forward-symbolic",
+                "Ask the agent to finish the step it is on and take this next. Hold for two \
+                 seconds to stop it now and send only this, dropping the other queued messages",
+            );
+            forward.widget.add_css_class("flat");
+            forward.widget.set_valign(gtk::Align::Center);
+            {
+                let weak = self.weak_self.borrow().clone();
+                let prompt = prompt.clone();
+                forward.set_on_click(move || {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.ask_for_turn(&prompt);
+                    }
+                });
+            }
+            {
+                let weak = self.weak_self.borrow().clone();
+                let prompt = prompt.clone();
+                forward.set_on_confirm(move || {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.expedite_prompt(&prompt);
+                    }
+                });
+            }
+            let stop = gtk::Button::builder()
+                .icon_name("media-playback-stop-symbolic")
+                .css_classes(["flat"])
                 .valign(gtk::Align::Center)
                 .margin_end(CARD_INSET)
-                .tooltip_text(
-                    "Ask the agent to finish the step it is on and end its turn, so this \
-                     message goes",
-                )
+                .tooltip_text("Cancel this message: it is not sent")
                 .build();
-            let weak = self.weak_self.borrow().clone();
-            let prompt = prompt.clone();
-            button.connect_clicked(move |button| {
-                button.set_sensitive(false);
-                if let Some(pane) = weak.upgrade() {
-                    pane.ask_for_turn(&prompt);
-                }
-            });
-            line.append(&button);
+            {
+                let weak = self.weak_self.borrow().clone();
+                let prompt = prompt.clone();
+                stop.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    if let Some(pane) = weak.upgrade() {
+                        pane.withdraw_prompt(&prompt);
+                    }
+                });
+            }
+            line.append(&forward.widget);
+            line.append(&stop);
+            // Held by the pane: a hold button keeps itself only weakly.
+            self.keep_card_hold(prompt, forward);
         }
         card.append(&line);
         card

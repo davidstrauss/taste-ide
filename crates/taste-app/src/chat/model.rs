@@ -45,16 +45,17 @@ pub(super) type PromptId = String;
 pub(super) const PROMPT_PREFIX: &str = "taste-prompt-";
 
 /// Where a prompt the IDE sent has got to: data on its row, which its card
-/// is drawn from — the badge, Ask for a Turn, and the refusal.
+/// is drawn from — the badge, the fast-forward and stop, and the refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Delivery {
     /// In the agent's history, as everything a replay brings back is.
     Delivered,
     /// Gone to the agent, which has not started on it yet.
     Sent,
-    /// Waiting behind the turn under way: Ask for a Turn is offered.
+    /// Waiting behind the turn under way: fast-forward and stop are offered.
     Queued,
-    /// Ask for a Turn pressed; `told` once the agent has been told.
+    /// Fast-forward clicked (a turn asked for); `told` once the agent has
+    /// been told.
     Asking { told: bool },
     /// Held for the agent or its environment to come up: what it is
     /// waiting for, in words.

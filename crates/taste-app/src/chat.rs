@@ -1140,10 +1140,18 @@ pub struct ChatPane {
     /// (restore-text, transcript card, "queued" badge). A failed or dead
     /// prompt leaves the transcript and returns to the composer.
     pending_prompts: RefCell<std::collections::VecDeque<PendingPrompt>>,
-    /// The queued message whose Ask for a Turn was pressed, until its turn
+    /// The queued message whose fast-forward was clicked, until its turn
     /// comes: its badge says when the agent has been told
     /// (`taste_core::nudge`).
     nudged_prompt: RefCell<Option<model::PromptId>>,
+    /// The queued message a held fast-forward is sending next, until the
+    /// others it drops are reported: what their cards say they were
+    /// dropped for.
+    expedited: RefCell<Option<model::PromptId>>,
+    /// Each queued card's fast-forward, by its message: a hold button keeps
+    /// itself only weakly, so the card's would stop answering as soon as
+    /// it was drawn. Let go when the message is taken or given up on.
+    card_holds: RefCell<HashMap<model::PromptId, Rc<crate::holdbutton::HoldButton>>>,
     /// One-shot capture of the next agent reply (commit-message suggestions
     /// and similar utility prompts). The exchange still renders in the
     /// transcript — the IDE never talks to the agent behind the user's back.
@@ -3661,6 +3669,8 @@ impl ChatPane {
             mode_revert: RefCell::new(None),
             pending_prompts: RefCell::new(std::collections::VecDeque::new()),
             nudged_prompt: RefCell::new(None),
+            expedited: RefCell::new(None),
+            card_holds: RefCell::new(HashMap::new()),
             capture: RefCell::new(None),
             relocated: Cell::new(false),
             hosting_refusal: RefCell::new(None),
@@ -7152,7 +7162,7 @@ impl ChatPane {
         Reference::TurnStart
     }
 
-    /// A queued message's card offers Ask for a Turn (`rows.rs`): the agent
+    /// A queued message's card offers fast-forward (`rows.rs`): the agent
     /// is asked, at its next use of the IDE's tools, to finish its step and
     /// end the turn (`taste_core::nudge`), which sends the message without
     /// stopping anything.
@@ -7162,7 +7172,7 @@ impl ChatPane {
         self.workspace.nudges.message_waiting(&self.environment);
     }
 
-    /// Ask for a Turn, pressed on `prompt`'s card.
+    /// Fast-forward, clicked on `prompt`'s card: a turn asked for.
     pub(super) fn ask_for_turn(&self, prompt: &str) {
         self.workspace.nudges.ask(&self.environment);
         *self.nudged_prompt.borrow_mut() = Some(prompt.to_string());
@@ -7230,7 +7240,9 @@ impl ChatPane {
             self.record(record);
         }
         let sent = match (self.client.borrow().as_ref(), written) {
-            (Some(client), Some(written)) => client.prompt_blocks_queued(blocks, written),
+            (Some(client), Some(written)) => {
+                client.prompt_blocks_queued(blocks, written, Some(prompt.to_string()))
+            }
             (Some(client), None) => client.prompt_blocks(blocks),
             (None, _) => Err(anyhow::anyhow!("no agent to send to")),
         };
@@ -7317,6 +7329,55 @@ impl ChatPane {
         }
     }
 
+    /// These queued messages were dropped from behind the turn, by a Stop or
+    /// a held fast-forward on a card (`Command::Withdraw`,
+    /// `Command::Expedite`): marked never sent. Never the turn's own.
+    fn withdraw_prompts(&self, ids: &[String]) {
+        let withdrawn: Vec<model::PromptId> = {
+            let mut pending = self.pending_prompts.borrow_mut();
+            ids.iter()
+                .filter_map(|id| {
+                    let at = pending
+                        .iter()
+                        .position(|p| p.prompt == *id && !p.taken && !p.joined)
+                        .filter(|at| *at > 0)?;
+                    pending.remove(at).map(|prompt| prompt.prompt)
+                })
+                .collect()
+        };
+        let reason = if self.expedited.borrow_mut().take().is_some() {
+            "dropped when another message was fast-forwarded past it"
+        } else {
+            "withdrawn before the agent took it"
+        };
+        for prompt in withdrawn {
+            if self.nudged_prompt.borrow().as_ref() == Some(&prompt) {
+                self.end_nudge();
+            }
+            self.deliver(&prompt, model::Delivery::NotSent(reason.into()));
+        }
+    }
+
+    /// Stop, pressed on a queued message's card: it is dropped from behind
+    /// the turn and never sent, if it has not gone already.
+    pub(super) fn withdraw_prompt(&self, prompt: &str) {
+        if let Some(client) = self.client.borrow().as_ref() {
+            let _ = client.withdraw(prompt);
+        }
+    }
+
+    /// Fast-forward held on a queued message's card: the turn is stopped
+    /// now, every other queued message is dropped, and this one goes next,
+    /// for the agent to take up at once.
+    pub(super) fn expedite_prompt(&self, prompt: &str) {
+        if let Some(client) = self.client.borrow().as_ref() {
+            *self.expedited.borrow_mut() = Some(prompt.to_string());
+            if client.expedite(prompt).is_err() {
+                self.expedited.borrow_mut().take();
+            }
+        }
+    }
+
     /// The messages held for this chat's agent or its environment to come
     /// up, dropped by Ctrl+Stop: marked never sent, and not sent when it is.
     fn withdraw_held(&self) {
@@ -7332,7 +7393,17 @@ impl ChatPane {
 
     /// Prompt `prompt` has got to `delivery`, in the transcript and the
     /// record.
+    /// Keep `prompt`'s card's fast-forward while the card offers it.
+    pub(super) fn keep_card_hold(&self, prompt: &str, hold: Rc<crate::holdbutton::HoldButton>) {
+        self.card_holds
+            .borrow_mut()
+            .insert(prompt.to_string(), hold);
+    }
+
     fn deliver(&self, prompt: &str, delivery: model::Delivery) {
+        if !delivery.in_flight() {
+            self.card_holds.borrow_mut().remove(prompt);
+        }
         match &delivery {
             model::Delivery::Refused(why) => self.record_delivery(prompt, "refused", Some(why)),
             model::Delivery::NotSent(why) => self.record_delivery(prompt, "notSent", Some(why)),
@@ -7365,6 +7436,7 @@ impl ChatPane {
     /// with `waited` the note it went out after: recorded where it was
     /// taken, and its card moved there.
     fn take_prompt(&self, prompt: &str, waited: Option<String>) {
+        self.card_holds.borrow_mut().remove(prompt);
         self.record_delivery(prompt, "taken", waited.as_deref());
         self.update_model(|model| model.prompt_taken(prompt, waited));
     }
@@ -9109,6 +9181,7 @@ impl ChatPane {
             SessionEvent::Permission { request, reply } => self.on_permission(request, reply),
             SessionEvent::Elicitation { request, reply } => self.on_questions(request, reply),
             SessionEvent::QueuedDropped { count } => self.withdraw_queued(count),
+            SessionEvent::QueuedWithdrawn { ids } => self.withdraw_prompts(&ids),
             SessionEvent::QueuedJoined { count } => {
                 // The prompt that just went out carries the next `count`
                 // messages too: each is taken where the first was, in order.
@@ -9174,6 +9247,9 @@ impl ChatPane {
             SessionEvent::TurnEnded { reason, usage } => {
                 use agent_client_protocol::schema::v1::StopReason;
                 let said = std::mem::take(&mut *self.turn_text.borrow_mut());
+                // What a fast-forward dropped was reported before its turn
+                // ended, if there was anything to drop.
+                self.expedited.borrow_mut().take();
                 if taste_core::imageless::refuses_images(&said) {
                     self.images_refused_later(said, self.turn_prompt());
                 }
@@ -11957,7 +12033,7 @@ impl ChatPane {
         match std::env::var("TASTE_PROBE_CHAT").as_deref() {
             Ok("busy") => self.set_activity("cargo test -p taste-app filetree"),
             // `queued`: the same turn, with a message sent during it waiting
-            // behind it — its badge, and Ask for a Turn at the badge's end
+            // behind it — its badge, and fast-forward and stop at the badge's end
             // (`taste_core::nudge`).
             Ok("queued") => {
                 self.set_activity("cargo test -p taste-app filetree");
@@ -16239,6 +16315,9 @@ fn session_event_label(event: &SessionEvent) -> String {
         SessionEvent::TurnEnded { .. } => "the turn's end".into(),
         SessionEvent::QueuedJoined { count } => format!("{count} queued messages joined"),
         SessionEvent::QueuedDropped { count } => format!("{count} queued messages dropped"),
+        SessionEvent::QueuedWithdrawn { ids } => {
+            format!("{} queued messages withdrawn", ids.len())
+        }
         SessionEvent::Permission { .. } => "a permission request".into(),
         SessionEvent::Elicitation { .. } => "questions".into(),
         SessionEvent::PromptFailed { .. } => "a failed prompt".into(),

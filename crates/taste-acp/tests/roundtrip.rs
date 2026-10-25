@@ -38,6 +38,7 @@ async fn full_session_roundtrip() {
             SessionEvent::TurnEnded { .. } => "TurnEnded".to_string(),
             SessionEvent::QueuedJoined { count } => format!("QueuedJoined({count})"),
             SessionEvent::QueuedDropped { count } => format!("QueuedDropped({count})"),
+            SessionEvent::QueuedWithdrawn { ids } => format!("QueuedWithdrawn({ids:?})"),
             SessionEvent::Ready { .. } => unreachable!(),
             SessionEvent::Permission { .. } => "Permission".to_string(),
             SessionEvent::Elicitation { .. } => "Elicitation".to_string(),
@@ -481,10 +482,15 @@ async fn a_prompt_sent_during_a_turn_goes_after_it_with_a_note() {
         .prompt_blocks_queued(
             text("look at the tests first"),
             written("Moving the cache next."),
+            None,
         )
         .unwrap();
     client
-        .prompt_blocks_queued(text("and then the docs"), written("Moving the cache next."))
+        .prompt_blocks_queued(
+            text("and then the docs"),
+            written("Moving the cache next."),
+            None,
+        )
         .unwrap();
     // Both waited behind the slow turn, so they go out together, in one
     // turn: each after its own note, in the order written.
@@ -507,7 +513,62 @@ async fn a_prompt_sent_during_a_turn_goes_after_it_with_a_note() {
 
     // Idle: nothing to wait behind, so no note.
     client
-        .prompt_blocks_queued(text("/echo plain"), written("slow done"))
+        .prompt_blocks_queued(text("/echo plain"), written("slow done"), None)
         .unwrap();
     assert_eq!(replies(&client, 1).await, ["echo /echo plain"]);
+}
+
+/// A prompt waiting behind a turn can be withdrawn before the agent sees
+/// it, or sent next on its own, every other waiting prompt dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_prompt_is_withdrawn_or_sent_next_alone() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client =
+        AgentClient::spawn_unconfined_for_tests(fake_agent_spec(), workspace.path().to_path_buf());
+    assert!(matches!(
+        next_event(&client).await,
+        SessionEvent::Ready { .. }
+    ));
+    let written = taste_core::queued::Queued::new(
+        taste_core::queued::Reference::Message("slow".into()),
+        &Default::default(),
+    );
+    let text = |t: &str| {
+        vec![ContentBlock::Text(
+            agent_client_protocol::schema::v1::TextContent::new(t.to_string()),
+        )]
+    };
+    client.prompt("/slow 1.2").unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for (id, words) in [("a", "first"), ("b", "second"), ("c", "third")] {
+        client
+            .prompt_blocks_queued(text(words), written.clone(), Some(id.to_string()))
+            .unwrap();
+    }
+    client.withdraw("b").unwrap();
+    client.expedite("c").unwrap();
+
+    let mut withdrawn: Vec<String> = Vec::new();
+    let mut said: Vec<String> = Vec::new();
+    let mut ended = 0;
+    while ended < 2 {
+        match next_event(&client).await {
+            SessionEvent::QueuedWithdrawn { ids } => withdrawn.extend(ids),
+            SessionEvent::Update(SessionUpdate::AgentMessageChunk(chunk)) => {
+                if let ContentBlock::Text(text) = chunk.content {
+                    said.push(text.text);
+                }
+            }
+            SessionEvent::TurnEnded { .. } => ended += 1,
+            SessionEvent::Closed(error) => panic!("closed: {error:?}"),
+            _ => {}
+        }
+    }
+    assert_eq!(withdrawn, ["b", "a"]);
+    assert_eq!(said[0], "slow done");
+    assert!(said[1].contains("third"), "{said:?}");
+    assert!(
+        !said[1].contains("first") && !said[1].contains("second"),
+        "{said:?}"
+    );
 }

@@ -93,6 +93,7 @@ fn describe(event: &SessionEvent) -> String {
         SessionEvent::TurnEnded { .. } => "TurnEnded".into(),
         SessionEvent::QueuedJoined { count } => format!("QueuedJoined({count})"),
         SessionEvent::QueuedDropped { count } => format!("QueuedDropped({count})"),
+        SessionEvent::QueuedWithdrawn { ids } => format!("QueuedWithdrawn({ids:?})"),
         SessionEvent::Permission { .. } => "Permission".into(),
         SessionEvent::Elicitation { .. } => "Elicitation".into(),
         SessionEvent::ModeChangeFailed { message, .. } => format!("ModeChangeFailed({message})"),
