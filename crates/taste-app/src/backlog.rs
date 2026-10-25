@@ -2037,15 +2037,25 @@ impl BacklogPanel {
             toggle.set_label(&format!("{} {count}", filter.label()));
         }
 
+        // A rebuild puts the selection on the row the panes are aimed at,
+        // else back on the row the user had. Asked before the rows go:
+        // asked after, it was always none, and a rebuild whose aimed row
+        // was not marked as one — an issue with no environment — left
+        // nothing selected, and GTK then selected the first row, Personal's,
+        // on its own, so choosing such an issue went straight home
+        // (2026-10-24).
+        let selected = self.selected_issue();
+        let aimed = self.current.borrow().clone();
+        // The whole rebuild is the panel's own selecting, not only the
+        // `select_row` that ends it.
+        self.selecting.set(true);
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
         let mut listed: Vec<Listed> = Vec::new();
         let mut current_row: Option<gtk::ListBoxRow> = None;
+        let mut kept_row: Option<gtk::ListBoxRow> = None;
         let mut reveal_row: Option<gtk::ListBoxRow> = None;
-        // The selection follows the user; a rebuild puts it back on the row
-        // they had, else on the row the panes are aimed at.
-        let selected = self.selected_issue();
         // What the banner counts: the word in the rows' own text, and —
         // said apart, because they are the environments' — the hits inside
         // their chats and terminals, which land as the scans finish. The
@@ -2088,13 +2098,21 @@ impl BacklogPanel {
             }
             self.list.append(&widget);
             let is_selected = selected.as_deref() == Some(row.id.as_str());
-            let is_aim = row.live.as_ref().is_some_and(|live| live.current);
+            // An issue with no environment is the aimed row when the panes
+            // are aimed at the environment it would be.
+            let is_aim = row.live.as_ref().is_some_and(|live| live.current)
+                || (row.is_issue()
+                    && row.live.is_none()
+                    && aimed.is_some()
+                    && crate::environments::for_issue(&row.id).ok() == aimed);
             // A just-filed issue outranks both: it is what the user is
             // looking for, and this is the render that first has it.
             if self.reveal_next.borrow().as_deref() == Some(row.id.as_str()) {
                 reveal_row = Some(widget.clone());
-            } else if is_selected || (selected.is_none() && is_aim) {
+            } else if is_aim {
                 current_row = Some(widget.clone());
+            } else if is_selected {
+                kept_row = Some(widget.clone());
             }
             listed.push(Listed {
                 id: row.id.clone(),
@@ -2194,8 +2212,11 @@ impl BacklogPanel {
         *self.listed.borrow_mut() = listed;
         *self.shown.borrow_mut() = rows;
 
-        self.selecting.set(true);
-        match reveal_row.as_ref().or(current_row.as_ref()) {
+        match reveal_row
+            .as_ref()
+            .or(current_row.as_ref())
+            .or(kept_row.as_ref())
+        {
             Some(row) => self.list.select_row(Some(row)),
             None => self.list.select_row(gtk::ListBoxRow::NONE),
         }
