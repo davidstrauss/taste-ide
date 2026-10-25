@@ -948,6 +948,13 @@ fn main() -> glib::ExitCode {
                     search_css below. */\n\
                  .hit-badge { font-weight: bold; \
                    border-radius: 9999px; padding: 0 6px; min-height: 16px; }\n\
+                 /* An authenticator that holds no key yet, in the port \
+                    browser's passkey menu (passkey_menu.rs): what a site \
+                    sees as somebody new. */\n\
+                 .fresh-badge { font-weight: bold; border-radius: 9999px; \
+                   padding: 0 7px; min-height: 18px; \
+                   background-color: alpha(@accent_bg_color, 0.15); \
+                   color: @accent_color; }\n\
                  /* A results listing (results.rs) at the foot of a pane. */\n\
                  .results-panel .results-list > row { min-height: 26px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\

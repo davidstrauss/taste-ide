@@ -6,10 +6,12 @@
 //! tried in its own port tab. The browser supplies the API to the page
 //! (`taste-app`'s `passkey_menu.rs`), and every request comes here: a
 //! registration makes a key pair and keeps it, an assertion signs with it.
-//! Keys are grouped into named passkeys the user makes and picks in the
+//! Keys are held by named authenticators the user makes and picks in the
 //! browser's address bar (David, 2026-10-24: "a project-level,
 //! machine-local set"), so "alice" and "bob" are two people signing in to
-//! the same dev site; whichever is chosen answers.
+//! the same dev site; whichever is chosen answers. One is always chosen,
+//! and an authenticator that holds no key yet is what a site sees as a
+//! stranger, which is how "sign up as somebody new" is posed.
 //!
 //! What it is for bounds what it does:
 //!
@@ -22,7 +24,7 @@
 //!   container, so no agent and no repository code reads a private key.
 //! - **ES256 only, attestation "none".** What every relying party accepts,
 //!   and nothing that pretends to be hardware.
-//! - **No user presence beyond the choice.** The chosen passkey answers
+//! - **No user presence beyond the choice.** The chosen authenticator answers
 //!   every request from the project's pages, flagged as user-present and
 //!   user-verified: the user verified it by choosing it.
 //!
@@ -40,7 +42,7 @@ use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// The longest name a passkey may have.
+/// The longest name an authenticator may have.
 pub const MAX_NAME: usize = 40;
 
 /// Why a request was not answered: a `DOMException` name the page's
@@ -58,30 +60,99 @@ fn refuse(name: &'static str, message: impl Into<String>) -> Refusal {
     }
 }
 
-/// A passkey as the menu lists it.
+/// What the store makes when it holds no authenticator, so that one is
+/// always chosen.
+pub const FIRST_NAME: &str = "default";
+
+/// An authenticator as the menu lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PasskeySummary {
+pub struct AuthenticatorSummary {
     pub name: String,
-    /// Where it is registered: `user · site` for each key it holds.
+    /// Where it is registered: `user · site` for each key it holds; none
+    /// for one that has signed up nowhere yet.
     pub sites: Vec<String>,
     pub selected: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct PasskeyFile {
-    #[serde(default)]
-    selected: Option<String>,
-    #[serde(default)]
-    passkeys: Vec<Passkey>,
+/// A key the chosen authenticator could sign in with, as a page's sign-in
+/// field offers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    /// The credential id, base64url.
+    pub id: String,
+    pub user_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Passkey {
+struct PasskeyFile {
+    #[serde(default)]
+    selected: Option<String>,
+    /// `passkeys` before the holders were called authenticators.
+    #[serde(default, alias = "passkeys")]
+    authenticators: Vec<Authenticator>,
+    /// Whether a page's autofill sign-in (`mediation: "conditional"`) is
+    /// offered the chosen authenticator's keys under its field.
+    #[serde(default = "on")]
+    autofill: bool,
+}
+
+impl Default for PasskeyFile {
+    fn default() -> Self {
+        Self {
+            selected: None,
+            authenticators: Vec::new(),
+            autofill: true,
+        }
+    }
+}
+
+fn on() -> bool {
+    true
+}
+
+impl PasskeyFile {
+    /// One authenticator chosen, whatever the file said: a fresh one when
+    /// there is none, the first when the choice names nobody.
+    fn settle(&mut self) {
+        if self.authenticators.is_empty() {
+            self.authenticators.push(Authenticator::fresh(FIRST_NAME));
+        }
+        let known = self
+            .selected
+            .as_deref()
+            .is_some_and(|name| self.authenticators.iter().any(|a| a.name == name));
+        if !known {
+            self.selected = Some(self.authenticators[0].name.clone());
+        }
+    }
+
+    fn chosen(&mut self) -> Result<&mut Authenticator, Refusal> {
+        self.settle();
+        let name = self.selected.clone().unwrap_or_default();
+        self.authenticators
+            .iter_mut()
+            .find(|a| a.name == name)
+            .ok_or_else(|| refuse("UnknownError", "no authenticator is chosen"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Authenticator {
     name: String,
     #[serde(default)]
     created: Option<String>,
     #[serde(default)]
     credentials: Vec<Credential>,
+}
+
+impl Authenticator {
+    fn fresh(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            created: Some(crate::state::now_rfc3339()),
+            credentials: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +172,8 @@ struct Credential {
     created: Option<String>,
 }
 
-/// The project's passkeys: one handle every port tab shares.
+/// The project's authenticators and the keys they hold: one handle every
+/// port tab shares.
 #[derive(Clone)]
 pub struct Passkeys {
     inner: Arc<Mutex<Store>>,
@@ -127,8 +199,8 @@ impl Passkeys {
     }
 
     /// Read the file, once. **Blocking IO** — from `spawn_blocking`. A
-    /// file that cannot be read is no passkeys, and is not written over
-    /// until something is made.
+    /// file that cannot be read is no authenticators, and is not written
+    /// over until something is chosen, made, or used.
     pub fn load(&self) {
         let Ok(mut store) = self.inner.lock() else {
             return;
@@ -136,10 +208,11 @@ impl Passkeys {
         if store.file.is_some() {
             return;
         }
-        let file = std::fs::read(&store.path)
+        let mut file: PasskeyFile = std::fs::read(&store.path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
+        file.settle();
         store.file = Some(file);
     }
 
@@ -147,14 +220,14 @@ impl Passkeys {
         self.inner.lock().is_ok_and(|store| store.file.is_some())
     }
 
-    /// Every passkey, in the order they were made.
-    pub fn list(&self) -> Vec<PasskeySummary> {
+    /// Every authenticator, in the order they were made.
+    pub fn list(&self) -> Vec<AuthenticatorSummary> {
         self.with(|file| {
-            file.passkeys
+            file.authenticators
                 .iter()
-                .map(|passkey| PasskeySummary {
-                    name: passkey.name.clone(),
-                    sites: passkey
+                .map(|authenticator| AuthenticatorSummary {
+                    name: authenticator.name.clone(),
+                    sites: authenticator
                         .credentials
                         .iter()
                         .map(|c| match c.user_name.as_str() {
@@ -162,67 +235,73 @@ impl Passkeys {
                             user => format!("{user} · {}", c.rp_id),
                         })
                         .collect(),
-                    selected: file.selected.as_deref() == Some(passkey.name.as_str()),
+                    selected: file.selected.as_deref() == Some(authenticator.name.as_str()),
                 })
                 .collect()
         })
         .unwrap_or_default()
     }
 
-    /// The chosen passkey's name.
+    /// The chosen authenticator's name; `None` only until the file is read.
     pub fn selected(&self) -> Option<String> {
         self.with(|file| file.selected.clone()).flatten()
     }
 
-    /// Choose `name` to answer the project's pages; `None` for none.
-    pub fn select(&self, name: Option<&str>) -> bool {
+    /// Choose `name` to answer the project's pages.
+    pub fn select(&self, name: &str) -> bool {
         self.with(|file| {
-            let known = name.is_none_or(|n| file.passkeys.iter().any(|p| p.name == n));
+            let known = file.authenticators.iter().any(|a| a.name == name);
             if known {
-                file.selected = name.map(str::to_string);
+                file.selected = Some(name.to_string());
             }
             known
         })
         .unwrap_or(false)
     }
 
-    /// Make a passkey called `name`, and choose it.
+    /// Make an authenticator called `name`, holding no key, and choose it.
     pub fn create(&self, name: &str) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() {
-            return Err("A passkey needs a name".into());
+            return Err("An authenticator needs a name".into());
         }
         if name.chars().count() > MAX_NAME || name.chars().any(char::is_control) {
             return Err(format!(
-                "A passkey's name is one line of at most {MAX_NAME} characters"
+                "An authenticator's name is one line of at most {MAX_NAME} characters"
             ));
         }
         self.with(|file| {
-            if file.passkeys.iter().any(|p| p.name == name) {
-                return Err(format!("There is already a passkey called {name}"));
+            if file.authenticators.iter().any(|a| a.name == name) {
+                return Err(format!("There is already an authenticator called {name}"));
             }
-            file.passkeys.push(Passkey {
-                name: name.to_string(),
-                created: Some(crate::state::now_rfc3339()),
-                credentials: Vec::new(),
-            });
+            file.authenticators.push(Authenticator::fresh(name));
             file.selected = Some(name.to_string());
             Ok(())
         })
-        .unwrap_or_else(|| Err("The passkeys are not read yet".into()))
+        .unwrap_or_else(|| Err("The authenticators are not read yet".into()))
     }
 
-    /// Delete the passkey called `name` and every key it holds.
+    /// Delete the authenticator called `name` and every key it holds. The
+    /// choice moves to the first left, or to a fresh one when none is.
     pub fn delete(&self, name: &str) -> bool {
         self.with(|file| {
-            let before = file.passkeys.len();
-            file.passkeys.retain(|p| p.name != name);
-            if file.selected.as_deref() == Some(name) {
-                file.selected = None;
-            }
-            file.passkeys.len() != before
+            let before = file.authenticators.len();
+            file.authenticators.retain(|a| a.name != name);
+            let gone = file.authenticators.len() != before;
+            file.settle();
+            gone
         })
         .unwrap_or(false)
+    }
+
+    /// Whether a page's autofill sign-in is offered the chosen
+    /// authenticator's keys.
+    pub fn autofill(&self) -> bool {
+        self.with(|file| file.autofill).unwrap_or(false)
+    }
+
+    pub fn set_autofill(&self, on: bool) {
+        self.with(|file| file.autofill = on);
     }
 
     /// Write the file, mode 0600. **Blocking IO** — from `spawn_blocking`.
@@ -258,7 +337,7 @@ impl Passkeys {
         Ok(())
     }
 
-    /// `navigator.credentials.create`: a new key in the chosen passkey for
+    /// `navigator.credentials.create`: a new key in the chosen authenticator for
     /// `options` (the page's `publicKey`), from a page at `origin`, which
     /// must be on this machine's loopback on one of `ports`.
     pub fn register(&self, origin: &str, ports: &[u16], options: &Value) -> Result<Value, Refusal> {
@@ -315,28 +394,26 @@ impl Passkeys {
         let id_text = URL_SAFE_NO_PAD.encode(id);
         let handle_text = URL_SAFE_NO_PAD.encode(&user_handle);
         self.with(|file| {
-            let chosen = file.selected.clone().ok_or_else(no_choice)?;
-            let passkey = file
-                .passkeys
-                .iter_mut()
-                .find(|p| p.name == chosen)
-                .ok_or_else(no_choice)?;
-            if passkey
+            let authenticator = file.chosen()?;
+            if authenticator
                 .credentials
                 .iter()
                 .any(|c| c.rp_id == rp_id && excluded.contains(&c.id))
             {
                 return Err(refuse(
                     "InvalidStateError",
-                    format!("passkey {chosen} is already registered with {rp_id}"),
+                    format!(
+                        "authenticator {} is already registered with {rp_id}",
+                        authenticator.name
+                    ),
                 ));
             }
             // One key per person per site, as an authenticator keeps them:
             // signing up again replaces it.
-            passkey
+            authenticator
                 .credentials
                 .retain(|c| !(c.rp_id == rp_id && c.user_handle == handle_text));
-            passkey.credentials.push(Credential {
+            authenticator.credentials.push(Credential {
                 id: id_text.clone(),
                 rp_id: rp_id.clone(),
                 user_handle: handle_text.clone(),
@@ -360,34 +437,42 @@ impl Passkeys {
         }))
     }
 
-    /// `navigator.credentials.get`: a signature by the chosen passkey's key
-    /// for the site `options` names (the page's `publicKey`), from a page
-    /// at `origin`, as [`Passkeys::register`] bounds it.
-    pub fn assert(&self, origin: &str, ports: &[u16], options: &Value) -> Result<Value, Refusal> {
+    /// `navigator.credentials.get`: a signature by the chosen
+    /// authenticator's key for the site `options` names (the page's
+    /// `publicKey`), from a page at `origin`, as [`Passkeys::register`]
+    /// bounds it. `pick` is the key a sign-in field's offer was taken for
+    /// ([`Passkeys::offers`]); without one, the newest key the page allows.
+    pub fn assert(
+        &self,
+        origin: &str,
+        ports: &[u16],
+        options: &Value,
+        pick: Option<&str>,
+    ) -> Result<Value, Refusal> {
         let host = checked_origin(origin, ports)?;
         let rp_id = rp_id(&host, options["rpId"].as_str())?;
         let challenge = bytes(&options["challenge"], "challenge")?;
         let allowed = ids(&options["allowCredentials"]);
         let (credential, count) = self
             .with(|file| {
-                let chosen = file.selected.clone().ok_or_else(no_choice)?;
-                let passkey = file
-                    .passkeys
-                    .iter_mut()
-                    .find(|p| p.name == chosen)
-                    .ok_or_else(no_choice)?;
-                let credential = passkey
+                let authenticator = file.chosen()?;
+                let name = authenticator.name.clone();
+                let credential = authenticator
                     .credentials
                     .iter_mut()
                     .rev()
-                    .find(|c| c.rp_id == rp_id && (allowed.is_empty() || allowed.contains(&c.id)))
+                    .find(|c| {
+                        c.rp_id == rp_id
+                            && (allowed.is_empty() || allowed.contains(&c.id))
+                            && pick.is_none_or(|id| id == c.id)
+                    })
                     .ok_or_else(|| {
                         refuse(
                             "NotAllowedError",
                             format!(
-                                "passkey {chosen} holds no key for {rp_id}{}: sign up with it \
-                                 chosen first",
-                                if allowed.is_empty() {
+                                "authenticator {name} holds no key for {rp_id}{}: sign up with \
+                                 it chosen first",
+                                if allowed.is_empty() && pick.is_none() {
                                     ""
                                 } else {
                                     " that the page asked for"
@@ -427,6 +512,37 @@ impl Passkeys {
         }))
     }
 
+    /// The keys the chosen authenticator holds for the site a page's
+    /// autofill request names, newest first, as its sign-in field lists
+    /// them; none while autofill is off.
+    pub fn offers(
+        &self,
+        origin: &str,
+        ports: &[u16],
+        options: &Value,
+    ) -> Result<Vec<Offer>, Refusal> {
+        let host = checked_origin(origin, ports)?;
+        let rp_id = rp_id(&host, options["rpId"].as_str())?;
+        let allowed = ids(&options["allowCredentials"]);
+        self.with(|file| {
+            if !file.autofill {
+                return Ok(Vec::new());
+            }
+            Ok(file
+                .chosen()?
+                .credentials
+                .iter()
+                .rev()
+                .filter(|c| c.rp_id == rp_id && (allowed.is_empty() || allowed.contains(&c.id)))
+                .map(|c| Offer {
+                    id: c.id.clone(),
+                    user_name: c.user_name.clone(),
+                })
+                .collect())
+        })
+        .unwrap_or_else(|| Err(not_loaded()))
+    }
+
     fn with<T>(&self, f: impl FnOnce(&mut PasskeyFile) -> T) -> Option<T> {
         let mut store = self.inner.lock().ok()?;
         store.file.as_mut().map(f)
@@ -437,14 +553,6 @@ impl std::fmt::Debug for Passkeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Passkeys")
     }
-}
-
-fn no_choice() -> Refusal {
-    refuse(
-        "NotAllowedError",
-        "no passkey is chosen for this project: choose or make one with the passkey button in \
-         the port browser's address bar",
-    )
 }
 
 fn not_loaded() -> Refusal {
@@ -682,7 +790,7 @@ mod tests {
             "rpId": "localhost",
             "allowCredentials": [{ "type": "public-key", "id": made["id"] }],
         });
-        let signed = passkeys.assert(origin, &[8000], &request).unwrap();
+        let signed = passkeys.assert(origin, &[8000], &request, None).unwrap();
         assert_eq!(signed["userHandle"], b64(b"user-1"));
         let data = unb64(&signed["authenticatorData"]);
         assert_eq!(&data[..32], &rp_hash("localhost"));
@@ -700,14 +808,14 @@ mod tests {
         let reopened = Passkeys::at(dir.path().join("passkeys.json"));
         reopened.load();
         assert_eq!(reopened.selected().as_deref(), Some("alice"));
-        let again = reopened.assert(origin, &[8000], &request).unwrap();
+        let again = reopened.assert(origin, &[8000], &request, None).unwrap();
         let data = unb64(&again["authenticatorData"]);
         assert_eq!(u32::from_be_bytes(data[33..37].try_into().unwrap()), 2);
     }
 
-    /// The chosen passkey answers, and another's keys are not its own.
+    /// The chosen authenticator answers, and another's keys are not its own.
     #[test]
-    fn the_chosen_passkey_answers_and_no_other() {
+    fn the_chosen_authenticator_answers_and_no_other() {
         let (_dir, passkeys) = store();
         passkeys.create("alice").unwrap();
         passkeys
@@ -717,32 +825,105 @@ mod tests {
         assert_eq!(passkeys.selected().as_deref(), Some("bob"));
         let request = json!({ "challenge": b64(b"c") });
         let refused = passkeys
-            .assert("http://localhost:8000", &[8000], &request)
+            .assert("http://localhost:8000", &[8000], &request, None)
             .unwrap_err();
         assert_eq!(refused.name, "NotAllowedError");
         assert!(
             refused.message.contains("bob holds no key for localhost"),
             "{refused:?}"
         );
-        assert!(passkeys.select(Some("alice")));
+        assert!(passkeys.select("alice"));
+        assert!(!passkeys.select("carol"));
         assert!(passkeys
-            .assert("http://localhost:8000", &[8000], &request)
+            .assert("http://localhost:8000", &[8000], &request, None)
             .is_ok());
-
-        assert!(passkeys.delete("alice"));
-        assert_eq!(passkeys.selected(), None);
-        assert_eq!(
-            passkeys
-                .assert("http://localhost:8000", &[8000], &request)
-                .unwrap_err()
-                .message,
-            no_choice().message
-        );
         assert_eq!(
             passkeys.create("bob").unwrap_err(),
-            "There is already a passkey called bob"
+            "There is already an authenticator called bob"
         );
         assert!(passkeys.create(" ").is_err());
+    }
+
+    /// One is always chosen: a fresh store has one, a deleted choice moves
+    /// to the first left, and deleting the last leaves a fresh one.
+    #[test]
+    fn one_authenticator_is_always_chosen() {
+        let (_dir, passkeys) = store();
+        assert_eq!(passkeys.selected().as_deref(), Some(FIRST_NAME));
+        assert!(passkeys.list()[0].sites.is_empty());
+        passkeys.create("alice").unwrap();
+        passkeys
+            .register("http://localhost:8000", &[8000], &creation(b"a"))
+            .unwrap();
+        assert!(passkeys.delete("alice"));
+        assert_eq!(passkeys.selected().as_deref(), Some(FIRST_NAME));
+        assert!(passkeys.delete(FIRST_NAME));
+        let left = passkeys.list();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, FIRST_NAME);
+        assert!(left[0].selected && left[0].sites.is_empty());
+        assert!(!passkeys.delete("nobody"));
+    }
+
+    /// A file written while the holders were called passkeys reads back,
+    /// its choice and keys whole, with autofill on.
+    #[test]
+    fn a_file_from_before_the_rename_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passkeys.json");
+        std::fs::write(
+            &path,
+            r#"{ "selected": "bob", "passkeys": [{ "name": "alice" }, { "name": "bob" }] }"#,
+        )
+        .unwrap();
+        let passkeys = Passkeys::at(path);
+        passkeys.load();
+        let names: Vec<_> = passkeys.list().into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["alice", "bob"]);
+        assert_eq!(passkeys.selected().as_deref(), Some("bob"));
+        assert!(passkeys.autofill());
+    }
+
+    /// A sign-in field is offered the chosen authenticator's keys for the
+    /// site, newest first, and the one taken is the one that signs; with
+    /// autofill off it is offered none.
+    #[test]
+    fn a_sign_in_field_offers_the_chosen_keys() {
+        let (_dir, passkeys) = store();
+        passkeys.create("alice").unwrap();
+        let origin = "http://localhost:8000";
+        let first = passkeys
+            .register(origin, &[8000], &creation(b"user-1"))
+            .unwrap();
+        let mut second = creation(b"user-2");
+        second["user"]["name"] = json!("alice-admin");
+        let second = passkeys.register(origin, &[8000], &second).unwrap();
+        let request = json!({ "challenge": b64(b"c"), "rpId": "localhost" });
+        let offers = passkeys.offers(origin, &[8000], &request).unwrap();
+        let users: Vec<_> = offers.iter().map(|o| o.user_name.as_str()).collect();
+        assert_eq!(users, ["alice-admin", "alice@example.com"]);
+        assert_eq!(offers[1].id, first["id"].as_str().unwrap());
+        let signed = passkeys
+            .assert(origin, &[8000], &request, Some(&offers[1].id))
+            .unwrap();
+        assert_eq!(signed["userHandle"], b64(b"user-1"));
+        let newest = passkeys.assert(origin, &[8000], &request, None).unwrap();
+        assert_eq!(newest["id"], second["id"]);
+        assert!(passkeys
+            .offers("http://localhost:6000", &[8000], &request)
+            .is_err());
+
+        passkeys.set_autofill(false);
+        assert!(passkeys
+            .offers(origin, &[8000], &request)
+            .unwrap()
+            .is_empty());
+        passkeys.create("bob").unwrap();
+        passkeys.set_autofill(true);
+        assert!(passkeys
+            .offers(origin, &[8000], &request)
+            .unwrap()
+            .is_empty());
     }
 
     /// Only the project's own pages are answered, for their own site.

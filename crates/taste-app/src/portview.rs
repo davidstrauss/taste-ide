@@ -224,9 +224,9 @@ pub struct PortPage {
     device_toggles: gtk::Box,
     /// What went wrong loading the page, counted at the address bar's end.
     problems: Rc<crate::port_problems::Problems>,
-    /// The project's passkeys and the button that chooses among them
-    /// (`passkey_menu`); none for a page an agent's check loads, which
-    /// signs in as nobody.
+    /// The project's passkeys and the button that chooses which
+    /// authenticator answers (`passkey_menu`); none for a page an agent's
+    /// check loads, which signs in as nobody.
     passkeys: Option<taste_core::passkeys::Passkeys>,
     passkey_menu: Option<Rc<crate::passkey_menu::PasskeyMenu>>,
     /// Where the problems' Prompt Agent goes; passed on to every page
@@ -458,8 +458,8 @@ impl PortPage {
         browser_bar.append(&reload);
         browser_bar.append(&address);
         let problems = crate::port_problems::Problems::new(spec.port, forwarded.clone());
-        // Left of the problems, as the user placed it: which passkey this
-        // project's sign-ins answer as.
+        // Left of the problems, as the user placed it: which authenticator
+        // this project's sign-ins answer as.
         let passkey_menu = passkeys.clone().map(crate::passkey_menu::PasskeyMenu::new);
         if let Some(menu) = &passkey_menu {
             browser_bar.append(&menu.button);
@@ -724,7 +724,10 @@ impl PortPage {
                     } else {
                         "signed in"
                     };
-                    toast(&page.widget, &format!("Passkey {name} {did} at {site}"));
+                    toast(
+                        &page.widget,
+                        &format!("Authenticator {name} {did} at {site}"),
+                    );
                     if let Some(menu) = &page.passkey_menu {
                         menu.refresh();
                     }
@@ -1355,9 +1358,10 @@ impl PortPage {
         {
             self.set_device(device);
         }
-        // `TASTE_PROBE_PORT_PASSKEYS=1`: two passkeys made in the probe's
-        // own store, the second chosen, and the menu open once the page
-        // has had time to sign up and in with it.
+        // `TASTE_PROBE_PORT_PASSKEYS=1`: two authenticators made in the
+        // probe's own store beside the one it starts with, the second
+        // chosen, and the menu open once the page has had time to sign up
+        // and in with it.
         if let (Ok(_), Some(passkeys)) = (
             std::env::var("TASTE_PROBE_PORT_PASSKEYS"),
             self.passkeys.clone(),
@@ -1373,6 +1377,9 @@ impl PortPage {
                 }
                 if let Some(menu) = weak.upgrade().and_then(|page| page.passkey_menu.clone()) {
                     menu.refresh();
+                }
+                if std::env::var("TASTE_PROBE_PORT_PASSKEYS").as_deref() == Ok("autofill") {
+                    return;
                 }
                 gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(6), move || {
                     if let Some(menu) = weak.upgrade().and_then(|page| page.passkey_menu.clone()) {

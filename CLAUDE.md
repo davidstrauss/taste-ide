@@ -298,11 +298,15 @@ opens the address bar's problem list four seconds in and shoots it as
 `window.port-problems` (`port_problems.rs`) — serve a page on 3000 that
 fails at something (a file on 5432 under `0.0.0.0`, one on a port the
 probe does not forward, a 404, a `throw`) for rows to read,
-and `TASTE_PROBE_PORT_PASSKEYS=1` makes two passkeys in the probe's store,
-alice chosen, and opens the address bar's passkey menu six seconds in,
-shot as `window.passkey-menu` (`passkey_menu.rs`, `taste_core::passkeys`) —
-serve a page on 3000 that signs up and in with `navigator.credentials` to
-see the whole round trip;
+and `TASTE_PROBE_PORT_PASSKEYS=1` makes two authenticators in the probe's
+store beside the fresh one it starts with, alice chosen, and opens the
+address bar's passkey menu six seconds in, shot as `window.passkey-menu`
+(`passkey_menu.rs`, `taste_core::passkeys`) — serve a page on 3000 that
+signs up and in with `navigator.credentials` to see the whole round trip —
+and `=autofill` leaves the menu shut, since opening it takes the keyboard
+from the page and so its sign-in field's autofill list down (serve a page
+that signs up, focuses an `autocomplete="username webauthn"` field, and
+asks with `mediation: "conditional"`);
 `TASTE_PROBE_PORT_CHECK=3000` (or `3000/login`) prints what
 `ide_port_check` answers for that port and path — the page loaded unseen,
 its failed requests, error statuses and script errors — on a spec of its
