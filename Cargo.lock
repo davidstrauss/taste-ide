@@ -3737,10 +3737,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "base64 0.22.1",
  "ec4rs",
  "ignore",
  "libc",
  "notify",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
