@@ -3847,7 +3847,7 @@ impl Supervisor {
     }
 
     pub async fn reload(&self) -> Result<()> {
-        let result = self.reload_reporting().await;
+        let result = self.reload_reporting(false).await;
         if self.agent_reload.swap(false, Ordering::SeqCst) {
             self.events.publish(Event::ReloadReport {
                 env: self.env.id.clone(),
@@ -3862,7 +3862,22 @@ impl Supervisor {
         result
     }
 
-    async fn reload_reporting(&self) -> Result<()> {
+    /// Bring the environment up unless it already is: a start, where
+    /// [`Self::reload`] is a rebuild. Asked under the lifecycle lock, so a
+    /// start that waits behind another finds the environment that one
+    /// brought up and leaves it. Every start goes through here — the
+    /// editor's and the backlog's Start, a message sent to a stopped
+    /// environment's chat — and two of them at once used to rebuild it
+    /// twice: the second replaced the container the first had just started,
+    /// and took down with it the agent that had just been handed the
+    /// user's message (2026-10-24).
+    pub async fn start(&self) -> Result<()> {
+        self.reload_reporting(true).await
+    }
+
+    /// One reload; with `only_if_down`, none when the environment is
+    /// already running ([`Self::start`]).
+    async fn reload_reporting(&self, only_if_down: bool) -> Result<()> {
         self.refuse_while_moving()?;
         if self.inside {
             bail!(
@@ -3875,6 +3890,15 @@ impl Supervisor {
         // One lifecycle operation at a time: a second reload (agent via MCP,
         // second button press) waits instead of interleaving podman calls.
         let _lifecycle = self.lifecycle.lock().await;
+        if only_if_down {
+            if let SupervisorState::Running { container_id } = self.state() {
+                self.log(format!(
+                    "start requested; the environment is already running ({container_id}), so \
+                     nothing is done"
+                ));
+                return Ok(());
+            }
+        }
         let failed_before = self.build_failed.lock().unwrap().clone();
         let result = self.reload_locked_with(false).await;
         let failed_after = self.build_failed.lock().unwrap().clone();
@@ -3936,7 +3960,7 @@ impl Supervisor {
             {
                 return Ok(());
             }
-            return self.reload_reporting().await;
+            return self.reload_reporting(false).await;
         }
         let _lifecycle = self.lifecycle.lock().await;
         if matches!(self.state(), SupervisorState::Running { .. })
@@ -7021,6 +7045,30 @@ mod tests {
     /// until a container is up and its helper has bound. Guessing an
     /// address here would produce the failure this whole batch exists to
     /// remove: an agent that starts fine and has no tools.
+    /// A start of an environment that is running leaves it running: no
+    /// reload is asked of podman, and the log says why. Two starts asked at
+    /// once each rebuilt it, the second replacing the container the first
+    /// had just started, with the agent in it (2026-10-24).
+    #[tokio::test]
+    async fn a_start_leaves_a_running_environment_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let sup = make(dir.path());
+        sup.set_state(SupervisorState::Running {
+            container_id: "deadbeef".into(),
+        });
+        sup.start().await.unwrap();
+        assert_eq!(
+            sup.state(),
+            SupervisorState::Running {
+                container_id: "deadbeef".into()
+            }
+        );
+        let log = sup.logs_tail(5).join("\n");
+        assert!(log.contains("already running (deadbeef)"), "{log}");
+        assert!(!log.contains("reload requested"), "{log}");
+    }
+
     #[test]
     fn there_is_no_channel_address_without_a_channel() {
         let dir = tempfile::tempdir().unwrap();

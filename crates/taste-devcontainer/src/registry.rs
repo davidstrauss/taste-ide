@@ -4715,7 +4715,9 @@ impl EnvironmentRegistry {
             self.pool().cloud().available()?;
         }
         if self.host_of(env) == host {
-            supervisor.reload().await?;
+            // Started where it is — and left as it is when it runs already:
+            // a Start is not a Rebuild.
+            supervisor.start().await?;
             return Ok(format!("{env} started on {}", host.as_str()));
         }
         // The move reads the old VM — the snapshot, the home volume — so it
@@ -4743,7 +4745,7 @@ impl EnvironmentRegistry {
         // Started where it now is, whether or not it was running: a play
         // button was pressed.
         if !supervisor.state().holds_a_container() {
-            supervisor.reload().await?;
+            supervisor.start().await?;
         }
         let place = match host {
             environment::Host::Cloud => format!("cloud host {target}"),

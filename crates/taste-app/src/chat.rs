@@ -5596,7 +5596,7 @@ impl ChatPane {
         let events = self.workspace.events.clone();
         let env = self.environment.clone();
         crate::runtime::runtime().spawn(async move {
-            if let Err(e) = supervisor.reload().await {
+            if let Err(e) = supervisor.start().await {
                 events.publish(taste_core::Event::Toast(format!("{env}: {e:#}")));
             }
         });

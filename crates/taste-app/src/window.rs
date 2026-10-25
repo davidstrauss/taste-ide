@@ -6224,7 +6224,7 @@ fn start_issue(
                 let events = events.clone();
                 let started = env.clone();
                 crate::runtime::runtime().spawn(async move {
-                    if let Err(e) = supervisor.reload().await {
+                    if let Err(e) = supervisor.start().await {
                         events.publish(taste_core::Event::Toast(format!("{started}: {e:#}")));
                     }
                 });
@@ -6330,7 +6330,7 @@ fn call_to_action(
                 let events = events.clone();
                 let env = env.clone();
                 crate::runtime::runtime().spawn(async move {
-                    if let Err(e) = supervisor.reload().await {
+                    if let Err(e) = supervisor.start().await {
                         events.publish(taste_core::Event::Toast(format!("{env}: {e:#}")));
                     }
                 });

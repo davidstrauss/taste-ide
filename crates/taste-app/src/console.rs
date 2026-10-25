@@ -2056,8 +2056,16 @@ impl Console {
             }
             "start" | "rebuild" => {
                 let events = self.workspace.events.clone();
+                // Start leaves a running environment as it is; Rebuild
+                // replaces it.
+                let rebuild = action == "rebuild";
                 crate::runtime::runtime().spawn(async move {
-                    if let Err(e) = supervisor.reload().await {
+                    let done = if rebuild {
+                        supervisor.reload().await
+                    } else {
+                        supervisor.start().await
+                    };
+                    if let Err(e) = done {
                         events.publish(taste_core::Event::Toast(format!("{env}: {e}")));
                     }
                 });
