@@ -62,7 +62,11 @@ pub const STATE: &str = "Your environment's container is made again from its con
      A new, empty volume is given to the container's user, so a program running as that user \
      can write it. A change to `mounts` takes effect with devcontainer_reload, and the volume \
      starts empty: data already written inside the container is not moved into it, so dump it \
-     first (mariadb-dump, pg_dump) and load the dump once the volume is in place.";
+     first (mariadb-dump, pg_dump) and load the dump once the volume is in place. System \
+     packages are the same: put them in the image, a RUN line in .devcontainer/'s \
+     Containerfile (the build runs as root), then devcontainer_reload. The container's own \
+     user is usually not root, so dnf, apt and the like fail inside it, and ide_exec refuses \
+     them there; even as root, what they install goes with the container.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Convention {

@@ -598,6 +598,10 @@ pub struct Supervisor {
     /// The IDE's Task's directory in the container, when the last probe
     /// found it running there (`crate::agentnode::task_probe`).
     agent_task: Mutex<Option<String>>,
+    /// The uid commands in the container run as (`podman exec` with no
+    /// `--user`, as `ide_exec` runs them), asked at start; `None` until
+    /// asked, or when the container would not say.
+    exec_uid: Mutex<Option<u32>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     /// The same lines on disk, once the window that supervises this
@@ -959,6 +963,7 @@ impl Supervisor {
             last_tidy: Mutex::new(None),
             agent_node: Mutex::new(None),
             agent_task: Mutex::new(None),
+            exec_uid: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             log_file: Mutex::new(None),
@@ -2647,6 +2652,18 @@ impl Supervisor {
         self.agent_node.lock().unwrap().clone()
     }
 
+    /// Whether commands in this environment's container run as root, as
+    /// its start found: `None` when not known.
+    pub fn exec_is_root(&self) -> Option<bool> {
+        self.exec_uid.lock().unwrap().map(|uid| uid == 0)
+    }
+
+    /// The uid commands in this environment's container run as, as its
+    /// start found.
+    pub fn exec_uid(&self) -> Option<u32> {
+        *self.exec_uid.lock().unwrap()
+    }
+
     /// The directory of the IDE's own Task in this environment's container,
     /// when the last probe found it running there: what an agent's `PATH`
     /// ends with, so `task` is there whatever the image carries.
@@ -2751,6 +2768,13 @@ impl Supervisor {
             .map(|dir| dir.trim().to_string())
             .filter(|dir| !dir.is_empty());
         *self.agent_task.lock().unwrap() = task;
+        // Who the container's commands run as, for `ide_exec` to know a
+        // package install it would run can only fail.
+        *self.exec_uid.lock().unwrap() = self
+            .run_captured(sh("id -u".into()))
+            .await
+            .ok()
+            .and_then(|uid| uid.trim().parse().ok());
         let hosting = if ours.is_none()
             && self
                 .run_captured(sh("command -v node".into()))

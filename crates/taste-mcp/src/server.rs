@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 16;
+pub const GUIDANCE_REVISION: u32 = 17;
 
 /// `result` with each image block replaced by
 /// [`taste_core::imageless::WITHHELD`].
@@ -2619,6 +2619,15 @@ impl McpServer {
                 // and `command: "cargo"` alone means the same either way.
                 let shell_line = argv.is_empty();
                 let line = command.to_string();
+                // The line as the agent wrote it, before the IDE wraps it.
+                let asked = if shell_line {
+                    line.clone()
+                } else {
+                    std::iter::once(command.to_string())
+                        .chain(argv.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
                 let supervisor = self.supervisor(env)?;
                 let (command, argv) = if shell_line {
                     // The IDE's Task last on the line's PATH, as on the
@@ -2675,6 +2684,25 @@ impl McpServer {
                          host. Call environment with include [\"log\"] to see why, then \
                          devcontainer_reload; the baseline environment comes up even with \
                          no project config."
+                    );
+                }
+                // A change to the system's packages, in a container whose
+                // commands do not run as root, can only fail — and the line
+                // can swallow how it failed (`> /dev/null 2>&1; …`) — so it
+                // is not run, and the refusal says where packages go
+                // (`taste_core::policy::system_package_change`).
+                if let (Some(change), Some(false)) = (
+                    taste_core::policy::system_package_change(&asked),
+                    supervisor.exec_is_root(),
+                ) {
+                    anyhow::bail!(
+                        "Not run: `{change}` changes the system's packages, which needs root, \
+                         and this container's commands run as uid {uid}, so it would fail. Add \
+                         the package to the image in .devcontainer/ (a RUN line in its \
+                         Containerfile; the image build runs as root), then call \
+                         devcontainer_reload. Installed in a running container, a package \
+                         would also be gone when the container is made again.",
+                        uid = supervisor.exec_uid().unwrap_or_default()
                     );
                 }
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -6436,8 +6464,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "2705d7415d741d60bfaad56db83de2a5ea8701b763305fbbefb2e3d011b5f167";
-        const AT_REVISION: u32 = 16;
+            "0c53116fee13e0e581eab95d361528ea2ca09ab5636e2d4c7e9671311bc42d2b";
+        const AT_REVISION: u32 = 17;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

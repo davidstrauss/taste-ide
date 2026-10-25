@@ -290,6 +290,230 @@ pub fn agent_git_config_env() -> Vec<(String, String)> {
     env
 }
 
+/// The system package manager a shell line asks to change the system
+/// with — `microdnf install`, `apt-get remove`, `rpm -i` — run directly
+/// rather than through `sudo`: `Some("microdnf install")`, or `None`.
+///
+/// For `ide_exec`, which refuses such a line in a container whose user is
+/// not root, where it can only fail. An agent ran `microdnf install … >
+/// /dev/null 2>&1; php …`, its own redirect swallowed the refusal and the
+/// `;` its exit status, and it carried on as though the package were there
+/// (2026-10-24). Read only as far as words go: quotes keep a quoted string
+/// one word, so `grep "dnf install" Containerfile` is no install, and the
+/// managers' read-only commands (`dnf list`, `apt show`) are not changes.
+pub fn system_package_change(line: &str) -> Option<String> {
+    const CHANGES: &[(&str, &[&str])] = &[
+        (
+            "dnf",
+            &[
+                "install",
+                "in",
+                "reinstall",
+                "remove",
+                "rm",
+                "erase",
+                "upgrade",
+                "up",
+                "update",
+                "downgrade",
+                "autoremove",
+                "swap",
+                "groupinstall",
+                "localinstall",
+            ],
+        ),
+        (
+            "microdnf",
+            &[
+                "install",
+                "reinstall",
+                "remove",
+                "upgrade",
+                "update",
+                "download",
+            ],
+        ),
+        (
+            "yum",
+            &[
+                "install",
+                "reinstall",
+                "remove",
+                "erase",
+                "upgrade",
+                "update",
+                "downgrade",
+                "groupinstall",
+                "localinstall",
+                "autoremove",
+            ],
+        ),
+        (
+            "apt",
+            &[
+                "install",
+                "reinstall",
+                "remove",
+                "purge",
+                "upgrade",
+                "full-upgrade",
+                "autoremove",
+                "update",
+            ],
+        ),
+        (
+            "apt-get",
+            &[
+                "install",
+                "reinstall",
+                "remove",
+                "purge",
+                "upgrade",
+                "dist-upgrade",
+                "autoremove",
+                "update",
+            ],
+        ),
+        ("apk", &["add", "del", "upgrade", "update", "fix"]),
+        (
+            "zypper",
+            &[
+                "install",
+                "in",
+                "remove",
+                "rm",
+                "update",
+                "up",
+                "dist-upgrade",
+                "dup",
+                "refresh",
+                "ref",
+            ],
+        ),
+        (
+            "rpm",
+            &[
+                "-i",
+                "-U",
+                "-F",
+                "-e",
+                "-ivh",
+                "-Uvh",
+                "-Fvh",
+                "--install",
+                "--upgrade",
+                "--erase",
+            ],
+        ),
+        (
+            "dpkg",
+            &["-i", "-r", "-P", "--install", "--remove", "--purge"],
+        ),
+    ];
+    // A word is preceded by these and still the command's name.
+    const PREFIXES: &[&str] = &["exec", "command", "nice", "nohup", "time", "env", "stdbuf"];
+    for words in shell_commands(line) {
+        let mut rest = words.iter().map(String::as_str).skip_while(|word| {
+            PREFIXES.contains(word) || (word.contains('=') && !word.starts_with('-'))
+        });
+        let Some(program) = rest.next() else { continue };
+        let program = program.rsplit('/').next().unwrap_or(program);
+        let Some((_, verbs)) = CHANGES.iter().find(|(name, _)| *name == program) else {
+            continue;
+        };
+        if let Some(verb) = rest.find(|word| verbs.contains(word)) {
+            return Some(format!("{program} {verb}"));
+        }
+    }
+    None
+}
+
+/// A shell line's simple commands, each as its words: split at `;`, `&`,
+/// `|`, newlines, and parentheses outside quotes, with quotes and
+/// backslashes taken as a shell takes them. Enough to find a command's
+/// name and its arguments; not a shell.
+fn shell_commands(line: &str) -> Vec<Vec<String>> {
+    let mut commands: Vec<Vec<String>> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = line.chars().peekable();
+    let end_word = |words: &mut Vec<String>, word: &mut String, in_word: &mut bool| {
+        if *in_word {
+            words.push(std::mem::take(word));
+            *in_word = false;
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    word.push(q);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(next) = chars.next() {
+                                word.push(next);
+                            }
+                        }
+                        _ => word.push(q),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(next) = chars.next() {
+                    if next != '\n' {
+                        word.push(next);
+                    }
+                }
+            }
+            ';' | '&' | '|' | '\n' | '(' | ')' | '`' => {
+                end_word(&mut words, &mut word, &mut in_word);
+                if !words.is_empty() {
+                    commands.push(std::mem::take(&mut words));
+                }
+            }
+            c if c.is_whitespace() => end_word(&mut words, &mut word, &mut in_word),
+            '#' if !in_word => {
+                // A comment, to the end of the line.
+                for q in chars.by_ref() {
+                    if q == '\n' {
+                        break;
+                    }
+                }
+                if !words.is_empty() {
+                    commands.push(std::mem::take(&mut words));
+                }
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                end_word(&mut words, &mut word, &mut in_word);
+                if !words.is_empty() {
+                    commands.push(std::mem::take(&mut words));
+                }
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    end_word(&mut words, &mut word, &mut in_word);
+    if !words.is_empty() {
+        commands.push(words);
+    }
+    commands
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +748,45 @@ mod tests {
             clone.path(),
             &clone.path().join("escape/secret")
         ));
+    }
+
+    /// A system package change is found wherever it sits on a line, and
+    /// nothing else is taken for one.
+    #[test]
+    fn a_system_package_change_is_found_and_nothing_else() {
+        for (line, found) in [
+            (
+                "microdnf install -y --nodocs ImageMagick-heic >/dev/null 2>&1; php -r 'x'",
+                "microdnf install",
+            ),
+            (
+                "cd /tmp && DEBIAN_FRONTEND=noninteractive apt-get install -y jq",
+                "apt-get install",
+            ),
+            ("echo hi | /usr/bin/dnf -y install foo", "dnf install"),
+            ("rpm -ivh pkg.rpm", "rpm -ivh"),
+            ("apk add --no-cache curl", "apk add"),
+            ("env FOO=1 yum remove x", "yum remove"),
+            ("x=$(dnf install y)", "dnf install"),
+        ] {
+            assert_eq!(
+                system_package_change(line).as_deref(),
+                Some(found),
+                "{line}"
+            );
+        }
+        for line in [
+            "sudo microdnf install -y ImageMagick-heic",
+            "grep \"dnf install\" .devcontainer/Containerfile",
+            "dnf list installed | grep Image",
+            "apt show jq",
+            "rpm -q ImageMagick-heic",
+            "echo 'apt-get install jq' >> notes.md",
+            "cat Containerfile # dnf install lives here",
+            "pip install --user requests",
+        ] {
+            assert_eq!(system_package_change(line), None, "{line}");
+        }
     }
 
     #[test]
