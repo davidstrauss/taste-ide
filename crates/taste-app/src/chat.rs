@@ -1548,6 +1548,31 @@ fn rebuild_report(ok: bool, on_project: bool, message: &str, failure: Option<&st
     text
 }
 
+/// What a session started afresh because its model refused an image is
+/// sent: why it is new, what it no longer has, and the request the old one
+/// failed on — without its images, which would fail it again.
+fn image_refusal_carry(text: &str, images: bool) -> String {
+    let mut carry = String::from(
+        "The IDE started you on a new session: the model you run on cannot read images, and \
+         the old session had one in its history, so every turn of it failed. The old \
+         conversation is not in this session; read again whatever files the request concerns.",
+    );
+    if images {
+        carry.push_str(
+            " The request came with an image, which is left out here: if it matters, ask the \
+             user to say in words what it shows.",
+        );
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        carry.push_str("\n\nThe request was the image alone.");
+    } else {
+        carry.push_str("\n\nThe request the old session failed on:\n\n");
+        carry.push_str(text);
+    }
+    carry
+}
+
 fn ready_status(environment: &str, reading: EnvReading, restored: bool) -> String {
     // No agent name: the identity label beside this line says who, and a
     // 320px header that said "Claude Code" twice showed neither in full.
@@ -7573,13 +7598,26 @@ impl ChatPane {
         format!("{agent}/{}", model.as_deref().unwrap_or("default"))
     }
 
+    /// The prompt the turn now ending was answering — the front of the
+    /// queue, before the turn's end takes it off — as its text and whether
+    /// it carried an image.
+    fn turn_prompt(&self) -> Option<(String, bool)> {
+        self.pending_prompts.borrow().front().map(|prompt| {
+            let images = prompt
+                .attachments
+                .iter()
+                .any(|(_, block)| matches!(block, ContentBlock::Image(_)));
+            (prompt.text.clone(), images)
+        })
+    }
+
     /// The model refused an image: after the event that said so is handled,
     /// since what follows ends the session it came from.
-    fn images_refused_later(self: &Rc<Self>, said: String) {
+    fn images_refused_later(self: &Rc<Self>, said: String, failed: Option<(String, bool)>) {
         let weak = Rc::downgrade(self);
         glib::idle_add_local_once(move || {
             if let Some(pane) = weak.upgrade() {
-                pane.images_refused(&said);
+                pane.images_refused(&said, failed);
             }
         });
     }
@@ -7593,7 +7631,7 @@ impl ChatPane {
     /// orientation prompt it gets, and have it restart the agent with a new
     /// session"). Once in ten minutes: a second refusal soon after is
     /// noted and left to the user.
-    fn images_refused(self: &Rc<Self>, said: &str) {
+    fn images_refused(self: &Rc<Self>, said: &str, failed: Option<(String, bool)>) {
         let model = self.vision_key();
         let imageless = self.workspace.imageless.clone();
         if imageless.remember(&model, said) {
@@ -7625,6 +7663,20 @@ impl ChatPane {
         self.persisted_session.borrow_mut().take();
         self.notify_persist();
         self.ensure_client(None);
+        // ...and the request it failed on goes to the new session, held
+        // until it is up: a fresh session knows nothing of the old one, so
+        // a restart that sent nothing left the agent idle and the request
+        // unanswered (2026-10-24: "But no recovery?").
+        if let Some((text, images)) = failed {
+            if self
+                .submit_prompt(image_refusal_carry(&text, images))
+                .is_err()
+            {
+                self.note(
+                    "the request the old session failed on could not be sent on; send it again",
+                );
+            }
+        }
     }
 
     /// End the session. `clear_controls` only when the control structure is
@@ -9069,7 +9121,7 @@ impl ChatPane {
             }
             SessionEvent::PromptFailed { message } => {
                 if taste_core::imageless::refuses_images(&message) {
-                    self.images_refused_later(message.clone());
+                    self.images_refused_later(message.clone(), self.turn_prompt());
                 }
                 self.end_nudge();
                 self.finalize_stream();
@@ -9123,7 +9175,7 @@ impl ChatPane {
                 use agent_client_protocol::schema::v1::StopReason;
                 let said = std::mem::take(&mut *self.turn_text.borrow_mut());
                 if taste_core::imageless::refuses_images(&said) {
-                    self.images_refused_later(said);
+                    self.images_refused_later(said, self.turn_prompt());
                 }
                 self.turns.set(self.turns.get() + 1);
                 self.touch();
@@ -17750,6 +17802,20 @@ mod tests {
     /// has to read; a clean rebuild says so and no more.
     #[test]
     fn the_rebuild_report_says_how_it_went() {
+        let carried = image_refusal_carry("Fix the header's final newline.", false);
+        assert!(carried.contains("cannot read images"), "{carried}");
+        assert!(
+            carried.ends_with("Fix the header's final newline."),
+            "{carried}"
+        );
+        assert!(!carried.contains("left out"), "{carried}");
+        let pictured = image_refusal_carry("  ", true);
+        assert!(pictured.contains("left out here"), "{pictured}");
+        assert!(
+            pictured.ends_with("The request was the image alone."),
+            "{pictured}"
+        );
+
         let clean = rebuild_report(true, true, "", None);
         assert!(clean.starts_with("REBUILD RESULT"), "{clean}");
         assert!(clean.contains("rebuilt and started"), "{clean}");
