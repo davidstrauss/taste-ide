@@ -15138,6 +15138,11 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
             "chat",
         ),
         "review_list" => "Read what is waiting for review".into(),
+        "review_merge" => about(
+            "Fast-forward the user's branch to the work of",
+            "Fast-forward the user's branch to an environment's work",
+            "environment",
+        ),
         "devcontainer_status" => "Read the container's state".into(),
         "devcontainer_logs" => "Read the container's log".into(),
         "devcontainer_resources" => "Read what the container is using".into(),

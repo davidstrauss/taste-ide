@@ -253,6 +253,12 @@ pub fn agent_git_config() -> Vec<(String, String)> {
     // commit past the dev container's 4 GiB, killed every time
     // (2026-10-12). Above it a blob is stored whole, in bounded memory.
     config.push(("core.bigFileThreshold".into(), BIG_FILE_THRESHOLD.into()));
+    // History stays linear: a `git merge` that cannot fast-forward fails
+    // rather than writing a merge commit. A coordinator merged a worker's
+    // branch by hand after the user's branch had moved, and left
+    // "Merge branch 'agents/…'" in it (2026-10-24); the branch is rebased
+    // and the merge made with `review_merge` instead.
+    config.push(("merge.ff".into(), "only".into()));
     config
 }
 
@@ -531,7 +537,9 @@ mod tests {
         // the hooks and the packing ceiling.
         assert!(config.iter().all(|(k, _)| k.ends_with("pushInsteadOf")
             || k == "core.hooksPath"
-            || k == "core.bigFileThreshold"));
+            || k == "core.bigFileThreshold"
+            || k == "merge.ff"));
+        assert!(config.iter().any(|(k, v)| k == "merge.ff" && v == "only"));
         assert!(config
             .iter()
             .any(|(k, v)| k == "core.bigFileThreshold" && v == BIG_FILE_THRESHOLD));

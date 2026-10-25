@@ -819,6 +819,20 @@ Consequences worth stating:
   `merge_branch`, which records a merge commit when it must, stays for
   callers that want that shape; the review flow no longer does.
 
+  The coordinator merges by the same rule, through `review_merge`: the
+  same `fast_forward_branch` in the user's checkout, refused with nothing
+  changed when the branch is behind (its `next` sends the worker to
+  rebase and publish again) and refused while the checkout is not on the
+  user's branch. It once merged with git in its shell instead, checking
+  each environment's branch out in Personal to try it — which the
+  user's folder follows — and recording `Merge branch 'agents/…'` when
+  the user's branch had moved (2026-10-24). So its brief says to merge
+  only with `review_merge` and never to check another branch out there,
+  agent-run git carries `merge.ff=only` (`taste_core::policy::
+  agent_git_config`), and the user's branch (`issue_target_branch`) is
+  the default branch while the checkout is borrowed: an `agents/…`
+  branch or a detached HEAD is never the target of a publish or a merge.
+
   The two fast-forward rules meet at one point, and it is settled in the
   rule's favour. An environment that checkpoints, falls behind, and
   rebases has rewritten history the user could already see — the

@@ -186,6 +186,10 @@ pub fn effect(tool: &str) -> Effect {
         // Makes an environment: a clone and, later, a container. Heavy,
         // but additive, and `environment_destroy` is how it is undone.
         "issue_start" => Effect::Write,
+        // Moves the user's branch forward to a published one it already
+        // leads to: fast-forward only, so nothing of theirs is rewritten,
+        // and an environment's work is what the user asked to be landed.
+        "review_merge" => Effect::Write,
         // Spends another agent's turn — and so the user's allowance — but
         // destroys nothing.
         "chat_send" => Effect::Write,

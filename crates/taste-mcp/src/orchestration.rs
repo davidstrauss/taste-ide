@@ -70,6 +70,7 @@ pub(crate) fn is_write(tool: &str) -> bool {
             | "environment_reinstantiate"
             | "environment_move"
             | "issue_delete"
+            | "review_merge"
     )
 }
 
@@ -297,6 +298,22 @@ pub(crate) fn tools() -> Vec<Value> {
                     }
                 },
                 "required": ["chat"]
+            }),
+        ),
+        crate::protocol::tool(
+            "review_merge",
+            "Merge an environment's published branch agents/<env> into the user's \
+             branch, fast-forward only: its commits land as they are, with no merge \
+             commit. Refused, with nothing changed, when the user's branch has moved past \
+             it (then chat_send the agent: update_from_main, rebase onto origin/<branch>, \
+             publish with ready: true, and merge again), when it conflicts, or when the \
+             user's checkout is not on their branch. Never merge with git.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "environment": { "type": "string", "description": "the environment id, e.g. i-z0js8h" }
+                },
+                "required": ["environment"]
             }),
         ),
         crate::protocol::tool(

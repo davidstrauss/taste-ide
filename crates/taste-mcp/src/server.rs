@@ -250,7 +250,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 15;
+pub const GUIDANCE_REVISION: u32 = 16;
 
 /// `result` with each image block replaced by
 /// [`taste_core::imageless::WITHHELD`].
@@ -4079,6 +4079,90 @@ impl McpServer {
                 };
                 Ok(crate::orchestration::transcript_json(chat.as_str(), &tail))
             }
+            "review_merge" => {
+                self.require_orchestrator(env, "review_merge")?;
+                let id = arg(&args, &["environment", "env", "chat"])
+                    .as_str()
+                    .context(
+                        "review_merge needs `environment`: the environment whose branch to merge",
+                    )?;
+                let id = EnvironmentId::parse(id.trim()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let branch = format!("agents/{id}");
+                // In the user's main checkout, as the review's own Merge
+                // does (`fast_forward_branch`: libgit2, no hooks, never a
+                // merge commit) — and only onto the user's branch: a
+                // checkout borrowed for an environment's branch is not
+                // where its work lands.
+                let merging = branch.clone();
+                let (target, outcome) = self
+                    .with_main_checkout(move |git| {
+                        let target = git.issue_target_branch();
+                        let current = git.branch_name().unwrap_or_else(|| "HEAD".into());
+                        if current != target {
+                            anyhow::bail!(
+                                "the user's checkout has {current} out, not their branch {target}: \
+                                 check {target} out again in your checkout, then merge. Never \
+                                 check out an environment's branch there; the user's folder \
+                                 follows it"
+                            );
+                        }
+                        let outcome = git.fast_forward_branch(&merging)?;
+                        Ok((target, outcome))
+                    })
+                    .await?;
+                use taste_git::MergeStatus as M;
+                let (merged, next) = match outcome.status {
+                    M::FastForward | M::AlreadyUpToDate => (
+                        true,
+                        format!(
+                            "{branch} is in {target}. Complete its issue (issue_update completed)."
+                        ),
+                    ),
+                    M::NotFastForward => (
+                        false,
+                        format!(
+                            "Nothing changed: {target} has {} commit{} {branch} lacks. chat_send \
+                             the agent in {id}: update_from_main, rebase onto origin/{target}, \
+                             run the tests, publish with ready: true. Then review_merge again.",
+                            outcome.behind,
+                            if outcome.behind == 1 { "" } else { "s" }
+                        ),
+                    ),
+                    M::Conflicted | M::Merged => (
+                        false,
+                        format!(
+                            "Nothing changed: {branch} conflicts with {target}. chat_send the \
+                             agent in {id} to rebase onto origin/{target} (after \
+                             update_from_main), resolve, and publish with ready: true."
+                        ),
+                    ),
+                };
+                if merged {
+                    let review = self.workspace.review.clone();
+                    let settled = id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        review.set(&settled, taste_core::ReviewState::Merged)
+                    })
+                    .await
+                    .context("recording the merge did not finish")??;
+                    self.workspace
+                        .events
+                        .publish(taste_core::Event::FileTreeChanged);
+                }
+                Ok(json!({
+                    "environment": id.as_str(),
+                    "branch": branch,
+                    "target": target,
+                    "merged": merged,
+                    "behind": outcome.behind,
+                    "conflicts": outcome
+                        .conflicts
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>(),
+                    "next": next,
+                }))
+            }
             "review_list" => {
                 let flagged_only = args["flagged_only"].as_bool().unwrap_or(false);
                 // Review is a fact about the USER's checkout — the hub every
@@ -5879,9 +5963,9 @@ fn review_next(
         ),
         R::FlaggedForReview => format!(
             "The agent says it is done; it is not done until merged. Read the branch \
-             against {target} in your checkout, run the tests in your own environment, \
-             merge it there, then issue_update completed. If it falls short, chat_send \
-             the fixes."
+             against {target} without checking it out (git diff {target}...agents/<env>), \
+             have its agent run the tests in its own environment, then review_merge and \
+             issue_update completed. If it falls short, chat_send the fixes."
         ),
         R::Working if stalled => "Idle with unpublished commits: not done. chat_send this \
                                   environment to publish with ready: true."
@@ -6352,8 +6436,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "2cb46e5a0ac37a0c0715ac94b361c9a8d975abc41faf557d56ae7fad39664147";
-        const AT_REVISION: u32 = 15;
+            "2705d7415d741d60bfaad56db83de2a5ea8701b763305fbbefb2e3d011b5f167";
+        const AT_REVISION: u32 = 16;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"
@@ -7054,6 +7138,107 @@ mod tests {
             .map(|b| b.name)
             .collect();
         assert_eq!(branches, vec!["agents/review".to_string()], "{branches:?}");
+    }
+
+    /// The coordinator's merge lands a published branch by fast-forward
+    /// only: refused with nothing changed when the user's branch has moved
+    /// past it, landed once it is rebased, and refused while the user's
+    /// checkout is borrowed for an environment's branch.
+    #[tokio::test]
+    async fn review_merge_fast_forwards_or_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, _environments) = build_test_server(root);
+        let env = EnvironmentId::parse("worker").unwrap();
+        let hub = GitWorkspace::discover(root).unwrap();
+        {
+            let repo = git2::Repository::open(root).unwrap();
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test").unwrap();
+            config
+                .set_str("user.email", "test@example.invalid")
+                .unwrap();
+        }
+        let target = hub.issue_target_branch();
+        commit_on_ref(
+            root,
+            "refs/heads/agents/worker",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
+        // The user moves on after the worker published.
+        std::fs::write(root.join("user.rs"), "fn user() {}\n").unwrap();
+        hub.stage(Path::new("user.rs")).unwrap();
+        hub.commit("user work").unwrap();
+        let moved = hub.read_ref("HEAD").unwrap().unwrap();
+
+        let socket = serve_on(
+            &server,
+            EnvironmentId::primary(),
+            root.join("coordinator.sock"),
+        )
+        .await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let refused = call_tool(
+            &mut stream,
+            "review_merge",
+            json!({"environment": "worker"}),
+        )
+        .await;
+        assert_eq!(refused["merged"], false, "{refused}");
+        assert_eq!(refused["behind"], 1, "{refused}");
+        assert!(
+            refused["next"]
+                .as_str()
+                .unwrap()
+                .contains("update_from_main"),
+            "{refused}"
+        );
+        assert_eq!(hub.read_ref("HEAD").unwrap(), Some(moved), "nothing moved");
+
+        // Rebased onto the user's tip, it lands as a fast-forward: the
+        // worker's own commit, no merge commit.
+        reset_ref(root, "refs/heads/agents/worker", moved);
+        let tip = commit_on_ref(
+            root,
+            "refs/heads/agents/worker",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
+        let landed = call_tool(
+            &mut stream,
+            "review_merge",
+            json!({"environment": "worker"}),
+        )
+        .await;
+        assert_eq!(landed["merged"], true, "{landed}");
+        assert_eq!(landed["target"], target.as_str(), "{landed}");
+        assert_eq!(hub.read_ref("HEAD").unwrap(), Some(tip));
+        assert_eq!(
+            workspace.review.state(&env),
+            taste_core::ReviewState::Merged
+        );
+
+        // The user's checkout borrowed for the branch: not where it lands.
+        git2::Repository::open(root)
+            .unwrap()
+            .set_head("refs/heads/agents/worker")
+            .unwrap();
+        let borrowed = call_tool(
+            &mut stream,
+            "review_merge",
+            json!({"environment": "worker"}),
+        )
+        .await;
+        assert!(
+            borrowed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not their branch"),
+            "{borrowed}"
+        );
     }
 
     /// `ready: true` is refused, before anything moves, unless the branch

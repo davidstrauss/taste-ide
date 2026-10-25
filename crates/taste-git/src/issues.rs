@@ -1601,10 +1601,32 @@ impl GitWorkspace {
         }
     }
 
-    /// The branch a close is verified against: the checked-out branch of
-    /// the user's main checkout, or `HEAD` when it is detached.
+    /// The user's branch: what an environment's work is published against
+    /// and merged into, and what a close is verified against. The branch
+    /// the user's main checkout has out — unless that is an environment's
+    /// (`agents/…`) or none (a detached HEAD), which is the checkout
+    /// borrowed for a moment, not where the user's work goes: then the
+    /// default branch, when there is one here by that name. Taken as the
+    /// checked-out branch whatever it was, a coordinator that checked out
+    /// `agents/<env>` to try it made that the target of every publish and
+    /// merge until it switched back (2026-10-24).
     pub fn issue_target_branch(&self) -> String {
-        self.branch_name().unwrap_or_else(|| "HEAD".to_string())
+        let current = self.branch_name().filter(|branch| branch != "HEAD");
+        if let Some(current) = current.as_ref().filter(|b| !b.starts_with("agents/")) {
+            return current.clone();
+        }
+        let local = |name: &str| self.repo.find_branch(name, git2::BranchType::Local).is_ok();
+        self.default_branch()
+            .map(|(name, _)| name)
+            .filter(|name| local(name))
+            .or_else(|| {
+                ["main", "master"]
+                    .into_iter()
+                    .find(|n| local(n))
+                    .map(str::to_string)
+            })
+            .or(current)
+            .unwrap_or_else(|| "HEAD".to_string())
     }
 
     fn require_issue(&self, id: &str) -> Result<Issue> {
@@ -1889,6 +1911,29 @@ mod tests {
         ws.stage(Path::new("a.txt")).unwrap();
         ws.commit("base").unwrap();
         (dir, ws)
+    }
+
+    /// The user's branch is the one they have out, unless the checkout is
+    /// borrowed — an environment's branch, or no branch — and then it is
+    /// the default branch, not whatever was checked out for a moment.
+    #[test]
+    fn the_users_branch_survives_a_borrowed_checkout() {
+        let (_dir, ws) = temp_repo();
+        let base = ws.branch_name().unwrap();
+        assert!(base == "main" || base == "master", "{base}");
+        assert_eq!(ws.issue_target_branch(), base);
+
+        let head = ws.repo.head().unwrap().peel_to_commit().unwrap();
+        for name in ["agents/i-0001", "feature"] {
+            ws.repo.branch(name, &head, false).unwrap();
+        }
+        ws.repo.set_head("refs/heads/agents/i-0001").unwrap();
+        assert_eq!(ws.issue_target_branch(), base);
+        ws.repo.set_head_detached(head.id()).unwrap();
+        assert_eq!(ws.issue_target_branch(), base);
+        // A branch of the user's own is theirs to work on.
+        ws.repo.set_head("refs/heads/feature").unwrap();
+        assert_eq!(ws.issue_target_branch(), "feature");
     }
 
     #[test]
