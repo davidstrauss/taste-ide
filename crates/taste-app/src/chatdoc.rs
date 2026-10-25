@@ -890,8 +890,7 @@ pub fn edit_counts(edit: &Edit) -> (usize, usize) {
 /// rows across its hunks, then a dim line saying how many more there were.
 pub fn diff_view(edit: &Edit, clip: Option<usize>, layout: Layout) -> DiffView {
     let hunks = hunks(&edit.old, &edit.new);
-    let language = sourceview5::LanguageManager::default()
-        .guess_language(Some(edit.path.to_string_lossy().as_ref()), None);
+    let language = crate::languages::guess(&edit.path);
     let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let mut budget = clip;
     let mut hidden = 0;

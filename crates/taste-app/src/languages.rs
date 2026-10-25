@@ -23,6 +23,25 @@ const LANGUAGES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Extensions GtkSourceView's own definitions do not claim, and the
+/// language each is: CommonJS (`.cjs`) and its TypeScript forms (`.cts`,
+/// `.mts`) are JavaScript and TypeScript, and 5.20's `js.lang` names only
+/// `*.js` and `*.mjs` (David, 2026-10-25: "Add CJS syntax highlighting").
+const ALIASES: &[(&str, &str)] = &[("cjs", "js"), ("cts", "typescript"), ("mts", "typescript")];
+
+/// The language `path` is highlighted as: GtkSourceView's guess from its
+/// name, else what [`ALIASES`] says its extension is.
+pub fn guess(path: &std::path::Path) -> Option<sourceview5::Language> {
+    let manager = sourceview5::LanguageManager::default();
+    manager
+        .guess_language(Some(path.to_string_lossy().as_ref()), None)
+        .or_else(|| {
+            let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+            let (_, id) = ALIASES.iter().find(|(ext, _)| *ext == extension)?;
+            manager.language(id)
+        })
+}
+
 /// Write the definitions where the language manager will look, and put
 /// that directory first on its search path. Once, at startup, before
 /// anything asks the manager for a language: it reads its search path the
@@ -64,6 +83,23 @@ mod tests {
                 .guess_language(Some("slides.typ"), None)
                 .expect("a language for .typ");
             assert_eq!(language.id(), "typst");
+        });
+    }
+
+    #[test]
+    fn commonjs_and_its_typescript_forms_are_highlighted() {
+        crate::gtk_test::on_gtk_thread("languages: no display — skipped", || {
+            for (name, id) in [
+                ("server.cjs", "js"),
+                ("Config.CJS", "js"),
+                ("types.cts", "typescript"),
+                ("module.mts", "typescript"),
+                ("plain.js", "js"),
+            ] {
+                let language = super::guess(std::path::Path::new(name))
+                    .unwrap_or_else(|| panic!("no language for {name}"));
+                assert_eq!(language.id(), id, "{name}");
+            }
         });
     }
 }

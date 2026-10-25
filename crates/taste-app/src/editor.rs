@@ -586,10 +586,10 @@ fn highlighting_ok(path: &Path, content: &str) -> bool {
 }
 
 /// The language a file is highlighted as: GtkSourceView's guess, which for
-/// a notebook is the IDE's own `ipynb` (`crate::languages`).
+/// a notebook is the IDE's own `ipynb`, else the extension's alias
+/// (`crate::languages`).
 fn source_language(path: &Path) -> Option<sourceview5::Language> {
-    sourceview5::LanguageManager::default()
-        .guess_language(Some(path.to_string_lossy().as_ref()), None)
+    crate::languages::guess(path)
 }
 
 use crate::hover::FullTextOnHover;
