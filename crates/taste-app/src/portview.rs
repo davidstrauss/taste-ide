@@ -353,17 +353,12 @@ impl PortPage {
             .css_classes(["flat"])
             .tooltip_text(format!("Open {base_url} in your browser"))
             .build();
-        let copy_button = gtk::Button::builder()
-            .icon_name("edit-copy-symbolic")
-            .css_classes(["flat"])
-            .tooltip_text("Copy the address")
-            .build();
         // Everything the site stored in this tab — cache, cookies, local
         // and session storage, IndexedDB, service workers — gone, and the
         // page loaded again, as a site sees a first visit (David,
         // 2026-10-22: "a button … to purge everything: cache, cookies,
-        // etc. Require holding it two seconds"). Left of the address's
-        // copy, and only while the site is what is shown.
+        // etc. Require holding it two seconds"). Left of Open in Browser,
+        // and only while the site is what is shown.
         let purge = crate::holdbutton::HoldButton::new(
             "edit-clear-all-symbolic",
             "Hold to clear everything this site stored here — cache, cookies, storage — and \
@@ -382,7 +377,6 @@ impl PortPage {
         title_row.append(&heading);
         title_row.append(&device_toggles);
         title_row.append(&purge.widget);
-        title_row.append(&copy_button);
         title_row.append(&open_button);
 
         let state_dot = gtk::Box::builder()
@@ -442,11 +436,16 @@ impl PortPage {
             .css_classes(["flat"])
             .tooltip_text("Reload")
             .build();
+        // The address's copy at its own right end, inside the field, as a
+        // browser keeps it: what it copies is the address the bar shows.
         let address = gtk::Entry::builder()
             .text(&base_url)
             .hexpand(true)
             .width_chars(8)
             .input_purpose(gtk::InputPurpose::Url)
+            .secondary_icon_name("edit-copy-symbolic")
+            .secondary_icon_tooltip_text("Copy the address")
+            .secondary_icon_activatable(true)
             .build();
         let browser_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         browser_bar.set_margin_start(6);
@@ -560,12 +559,11 @@ impl PortPage {
                 });
             });
         }
-        {
-            let url = base_url.clone();
-            copy_button.connect_clicked(move |button| {
-                button.clipboard().set_text(&url);
-            });
-        }
+        page.address.connect_icon_press(|entry, position| {
+            if position == gtk::EntryIconPosition::Secondary {
+                entry.clipboard().set_text(&entry.text());
+            }
+        });
         {
             let weak = Rc::downgrade(&page);
             page.address.connect_activate(move |entry| {
