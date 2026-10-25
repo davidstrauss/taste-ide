@@ -4394,6 +4394,36 @@ impl ChatPane {
         self: &Rc<Self>,
         text: String,
     ) -> Result<taste_core::orchestration::SendOutcome, String> {
+        let sent = self.submit_now(text);
+        if sent.is_ok() {
+            self.back_to_work();
+        }
+        sent
+    }
+
+    /// A prompt for this environment's agent, taken: if the environment
+    /// was flagged for review it is at work again
+    /// (`taste_core::review::ReviewBoard::reopen`), so the ready publish
+    /// that ends this work wakes the coordinator as the first one did, and
+    /// the stop that flag scheduled leaves it running.
+    fn back_to_work(&self) {
+        let review = self.workspace.review.clone();
+        if !review.state(&self.environment).flagged() {
+            return;
+        }
+        let env = self.environment.clone();
+        crate::runtime::runtime().spawn_blocking(move || {
+            if let Err(e) = review.reopen(&env) {
+                tracing::warn!("putting {env} back to work after a prompt: {e:#}");
+            }
+        });
+    }
+
+    /// [`ChatPane::submit_prompt`], before the review board hears of it.
+    fn submit_now(
+        self: &Rc<Self>,
+        text: String,
+    ) -> Result<taste_core::orchestration::SendOutcome, String> {
         if text.trim().is_empty() {
             return Err("an empty prompt is not a message".into());
         }
@@ -8785,6 +8815,19 @@ impl ChatPane {
     /// A stopped environment: the send IS the start (see `revive_wanted`),
     /// and the message waits, on its card, for the container to come up.
     pub fn send_from(
+        self: &Rc<Self>,
+        text: String,
+        attachments: Vec<crate::composer::Attachment>,
+    ) -> Result<(), String> {
+        let sent = self.send_composed(text, attachments);
+        if sent.is_ok() {
+            self.back_to_work();
+        }
+        sent
+    }
+
+    /// [`ChatPane::send_from`], before the review board hears of it.
+    fn send_composed(
         self: &Rc<Self>,
         text: String,
         attachments: Vec<crate::composer::Attachment>,

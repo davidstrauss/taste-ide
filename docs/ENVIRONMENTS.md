@@ -896,6 +896,23 @@ action, `devcontainer_reload`, or **sending a message to its chat**.
 Nothing restarts an environment on the IDE's own initiative: a review
 state is never a reason to spend the user's machine.
 
+**The stop waits for the agent's turn, and a message is back to work.**
+The container goes once the turn that flagged it is over, plus a
+three-second beat (`REVIEW_STOP_GRACE`, bounded by `REVIEW_TURN_WAIT`):
+it went three seconds after the `publish` itself, which cut an agent off
+in the middle of the summary it wrote after it. A prompt to a flagged
+environment's agent — the coordinator's `chat_send` or the user's own —
+puts it back to `Working` (`ReviewBoard::reopen`), the arrow above, and
+the stop is asked of the state as it stands then, so a prompt in the beat
+keeps the container. Until 2026-10-25 nothing took that arrow: an
+environment the coordinator sent back to rebase stayed flagged through
+the rebase, its second ready publish was "already flagged", and the
+coordinator, woken only by a change of state, never heard of it. A ready
+publish that moves a branch already flagged is announced again for the
+same reason, whoever started it. And `chat_status` says a chat its review
+stopped is stopped on purpose, with review_merge as the next step, where
+it said "needs a person".
+
 That third way in is a gesture, not a mechanism. A flagged environment's
 conversation is still there to read, and typing into it used to go
 nowhere useful — the agent spawned into the outside-confined fallback

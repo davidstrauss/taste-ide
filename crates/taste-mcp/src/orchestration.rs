@@ -46,6 +46,7 @@
 use serde_json::{json, Value};
 use taste_core::orchestration::{ChatFacts, TranscriptTail};
 use taste_core::CappedOutput;
+use taste_core::ReviewState;
 
 /// Transcript tail budget, in bytes of rendered text. Generous enough for
 /// a real exchange, small enough that a runaway tool dump cannot turn one
@@ -339,8 +340,11 @@ pub(crate) fn tools() -> Vec<Value> {
 /// The sentence a chat's state calls for. `held_prompts` outranks the
 /// state: a chat whose container is still coming up has no agent whatever
 /// its state field says.
-fn chat_next(facts: &ChatFacts) -> &'static str {
+fn chat_next(facts: &ChatFacts, review: ReviewState) -> &'static str {
     use taste_core::orchestration::ChatState as S;
+    if let Some(stopped) = stopped_for_review(facts, review) {
+        return stopped.next;
+    }
     if facts.held_prompts > 0 || facts.state == S::Starting {
         return "No agent is running here yet: the container is coming up and the prompt \
                 is held. Nothing has been read or done; do not report progress. Call \
@@ -368,7 +372,43 @@ fn chat_next(facts: &ChatFacts) -> &'static str {
     }
 }
 
-pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
+/// What a chat with no agent says when its environment was stopped on
+/// purpose, by its review, rather than lost. Both read `disconnected`, and
+/// "needs a person" sent a coordinator to wait for an agent that had
+/// published, been flagged, and was never coming back on its own
+/// (2026-10-25).
+struct ReviewStop {
+    note: &'static str,
+    next: &'static str,
+}
+
+fn stopped_for_review(facts: &ChatFacts, review: ReviewState) -> Option<ReviewStop> {
+    if facts.state != taste_core::orchestration::ChatState::Disconnected
+        || facts.held_prompts > 0
+        || !review.should_be_stopped()
+    {
+        return None;
+    }
+    Some(if review.flagged() {
+        ReviewStop {
+            note: "stopped on purpose, not lost: its agent published its branch with ready: \
+                   true, which flagged it for review and stops its container. It does not \
+                   reconnect on its own",
+            next: "Review it: review_list, then review_merge. If it needs more work, \
+                   chat_send it what to change; that starts it again and puts it back to \
+                   work.",
+        }
+    } else {
+        ReviewStop {
+            note: "stopped on purpose: its review is settled (merged or rejected), so \
+                   nothing more runs here",
+            next: "Nothing to do here. issue_update completes its issue if that is not done \
+                   yet; environment_destroy removes it.",
+        }
+    })
+}
+
+pub(crate) fn chat_facts_json(facts: &ChatFacts, review: ReviewState) -> Value {
     // A refused model goes in the note as well as in its own field. The
     // note is the line an orchestrator reads on every status; a field it
     // was not looking for is a field it does not check, and the whole
@@ -388,7 +428,9 @@ pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
     // "a chat that stays here needs a person" is the wrong instruction for
     // one that is simply waiting for its container. Re-sending is what it
     // must not provoke (i-0011).
-    let state_note = if facts.held_prompts > 0 {
+    let state_note = if let Some(stopped) = stopped_for_review(facts, review) {
+        stopped.note
+    } else if facts.held_prompts > 0 {
         "no agent process YET — its container is still coming up — and what was sent \
          to this chat is held in it, not lost. It goes on its own when the agent is \
          up; do not re-send it"
@@ -429,7 +471,8 @@ pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
         // What to do about a chat in this state, so the state is not read
         // as something it is not: a starting chat as work in progress, an
         // idle one as work completed.
-        "next": chat_next(facts),
+        "next": chat_next(facts, review),
+        "review": review.as_str(),
         "idle_for_seconds": facts.idle_for_secs,
         "turns": facts.turns,
         "orchestrator": facts.orchestrator,
@@ -492,5 +535,58 @@ mod tests {
         let named = describe(naming_models(tools(), &models));
         assert!(named.contains("claude-code"), "{named}");
         assert!(named.contains("opus[1m]"), "{named}");
+    }
+
+    /// A chat with no agent because its review stopped it says so, and says
+    /// to review it — not that it needs a person; one that was lost still
+    /// says that.
+    #[test]
+    fn a_chat_its_review_stopped_says_so() {
+        use taste_core::environment::EnvironmentId;
+        use taste_core::orchestration::ChatState;
+        let facts = ChatFacts {
+            chat: EnvironmentId::parse("i-0007").unwrap(),
+            agent: "Claude Code".into(),
+            model: None,
+            model_pending: None,
+            model_refused: None,
+            models_advertised: Vec::new(),
+            session: None,
+            state: ChatState::Disconnected,
+            idle_for_secs: Some(19),
+            turns: 0,
+            usage: None,
+            orchestrator: false,
+            held_prompts: 0,
+        };
+        let flagged = chat_facts_json(&facts, ReviewState::FlaggedForReview);
+        assert_eq!(flagged["review"], "flagged-for-review");
+        assert!(
+            flagged["note"]
+                .as_str()
+                .unwrap()
+                .contains("stopped on purpose"),
+            "{flagged}"
+        );
+        assert!(
+            flagged["next"].as_str().unwrap().contains("review_merge"),
+            "{flagged}"
+        );
+        let lost = chat_facts_json(&facts, ReviewState::Working);
+        assert!(
+            lost["note"].as_str().unwrap().contains("needs a person"),
+            "{lost}"
+        );
+        let merged = chat_facts_json(&facts, ReviewState::Merged);
+        assert!(
+            merged["note"].as_str().unwrap().contains("settled"),
+            "{merged}"
+        );
+        let streaming = ChatFacts {
+            state: ChatState::Streaming,
+            ..facts
+        };
+        let busy = chat_facts_json(&streaming, ReviewState::FlaggedForReview);
+        assert_eq!(busy["note"], "", "{busy}");
     }
 }

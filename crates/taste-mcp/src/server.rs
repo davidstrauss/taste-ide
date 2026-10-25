@@ -96,19 +96,29 @@ const CONFIRM_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// The longest `devcontainer_reload` will wait before answering, inside
 /// the tool watchdog (`TOOL_WATCHDOG`) with room for the answer.
 const RELOAD_WAIT_MAX_SECS: u64 = 120;
+/// The longest `wait` and `task_run` wait, for the same reason. They took
+/// up to 600 against the watchdog's 150, so a coordinator's `wait` of 180
+/// came back as the watchdog's error instead of its answer (2026-10-25).
+const WAIT_MAX_SECS: u64 = 120;
 /// The page `issue_list` gives when nobody says: a working set a small
 /// model can hold, with `next_offset` for the rest.
 const ISSUE_LIST_DEFAULT_LIMIT: usize = 50;
 
-/// How long a flagged environment's container stays up after the `publish`
-/// that flagged it.
+/// How long a flagged environment's container stays up after its agent's
+/// turn ends ([`turn_over`]).
 ///
-/// The agent that asked lives in the container being stopped, so the reply
-/// has to get out first — this is the beat that lets it. Deliberately short:
-/// the flag is already persisted, so the worst a lost race costs is a
-/// container that stays up until the next reload, and the worst a too-long
-/// wait costs is the resources the whole mechanism exists to save.
+/// The agent lives in the container being stopped, so its last words have
+/// to get out first — this is the beat after them. Deliberately short: the
+/// flag is already persisted, so the worst a lost race costs is a container
+/// that stays up until the next reload, and the worst a too-long wait costs
+/// is the resources the whole mechanism exists to save.
 const REVIEW_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The longest a flag's stop waits for the agent's turn to end. It was
+/// three seconds from the `publish`, which stopped an agent in the middle
+/// of the summary it wrote after it (2026-10-25); a turn still going after
+/// this is one nobody is waiting on, and its container goes anyway.
+const REVIEW_TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// The long-lived, per-environment state behind the environment-facing
 /// tools. Created on first use for an environment and dropped when that
@@ -1161,7 +1171,8 @@ impl McpServer {
             .as_array()
             .map(|items| items.iter().filter_map(Value::as_u64).collect())
             .unwrap_or_default();
-        let seconds = args["seconds"].as_u64().unwrap_or(120).clamp(1, 600);
+        let asked = args["seconds"].as_u64().unwrap_or(WAIT_MAX_SECS);
+        let seconds = asked.clamp(1, WAIT_MAX_SECS);
         let board = &self.workspace.tasks;
         for name in &tasks {
             if board.state(env, name) == RunState::Idle {
@@ -1225,6 +1236,9 @@ impl McpServer {
             },
             "waited_seconds": started.elapsed().as_secs(),
         });
+        if asked > WAIT_MAX_SECS {
+            out["capped_to"] = json!(WAIT_MAX_SECS);
+        }
         if !task_rows.is_empty() {
             out["tasks"] = json!(task_rows);
         }
@@ -1931,7 +1945,7 @@ impl McpServer {
             "task_run",
             "Run a task in this environment's container, where the user sees it too: its \
              row lights and its output tab fills. Waits up to `wait_seconds` (default 60, at \
-             most 600) and returns the state and the output's last lines. A message from the \
+             most 120) and returns the state and the output's last lines. A message from the \
              user ends the wait at once. A task still running is waited for with wait.",
             json!({
                 "type": "object",
@@ -1945,7 +1959,7 @@ impl McpServer {
         tools.push(tool(
             "wait",
             "Wait for the first of: a task in `tasks` finishing, an ide_exec command in \
-             `commands` exiting, `seconds` passing (default 120, at most 600), or a message \
+             `commands` exiting, `seconds` passing (default and most 120), or a message \
              from the user, which always ends a wait at once. Returns which it was and \
              where each task and command stands. Use it instead of sleep.",
             json!({
@@ -1953,7 +1967,7 @@ impl McpServer {
                 "properties": {
                     "tasks": { "type": "array", "items": { "type": "string" }, "description": "tasks to wait for, as task_list names them" },
                     "commands": { "type": "array", "items": { "type": "integer" }, "description": "ide_exec handles to wait for" },
-                    "seconds": { "type": "integer", "description": "the longest to wait (default 120, at most 600)" }
+                    "seconds": { "type": "integer", "description": "the longest to wait (default and most 120)" }
                 }
             }),
         ));
@@ -3389,7 +3403,9 @@ impl McpServer {
                         self.workspace.events.publish(Event::GitStatusChanged);
                     }
                     self.share_published(env).await?;
-                    let review = self.flag_for_review(env, ready).await?;
+                    let review = self
+                        .flag_for_review(env, ready, attempt.outcome.updated())
+                        .await?;
                     return Ok(personal_note(
                         publish_result(&attempt.outcome, env, review),
                         personal_synced,
@@ -3437,7 +3453,9 @@ impl McpServer {
                         self.workspace.events.publish(Event::GitStatusChanged);
                     }
                     self.share_published(env).await?;
-                    let review = self.flag_for_review(env, ready).await?;
+                    let review = self
+                        .flag_for_review(env, ready, moved.outcome.updated())
+                        .await?;
                     let mut result = publish_result(&moved.outcome, env, review);
                     result["rebased_onto_target"] = json!(true);
                     return Ok(personal_note(result, personal_synced));
@@ -3463,7 +3481,9 @@ impl McpServer {
                     self.workspace.events.publish(Event::GitStatusChanged);
                 }
                 self.share_published(env).await?;
-                let review = self.flag_for_review(env, ready).await?;
+                let review = self
+                    .flag_for_review(env, ready, forced.outcome.updated())
+                    .await?;
                 let mut result = publish_result(&forced.outcome, env, review);
                 result["replaced_commits"] = json!(attempt.dropped);
                 Ok(personal_note(result, personal_synced))
@@ -3902,7 +3922,10 @@ impl McpServer {
                     .as_str()
                     .context("task_run needs `name`: a task as task_list names it")?
                     .to_string();
-                let wait = args["wait_seconds"].as_u64().unwrap_or(60).min(600);
+                let wait = args["wait_seconds"]
+                    .as_u64()
+                    .unwrap_or(60)
+                    .min(WAIT_MAX_SECS);
                 let supervisor = self.supervisor(env)?;
                 // Through the environment's `task` wrapper while its channel
                 // is up, so the run outlives the IDE (`TaskBoard::start`).
@@ -4083,7 +4106,8 @@ impl McpServer {
                 let taste_core::orchestration::OrchestrationReply::Status(facts) = reply else {
                     anyhow::bail!("the chat strip answered chat_status with something else");
                 };
-                Ok(crate::orchestration::chat_facts_json(&facts))
+                let review = self.workspace.review.state(&facts.chat);
+                Ok(crate::orchestration::chat_facts_json(&facts, review))
             }
             "chat_transcript_tail" => {
                 let chat = chat_arg(&args)?;
@@ -5110,34 +5134,61 @@ impl McpServer {
     ///   race in the other direction costs nothing — the flag is already
     ///   persisted, and an environment that stays up until the next reload
     ///   is a wasted container, not a wrong one.
-    async fn flag_for_review(&self, env: &EnvironmentId, ready: bool) -> Result<Option<String>> {
+    async fn flag_for_review(
+        &self,
+        env: &EnvironmentId,
+        ready: bool,
+        moved: bool,
+    ) -> Result<Option<String>> {
         if !ready {
             return Ok(None);
         }
-        let review = taste_core::ReviewState::FlaggedForReview;
         let board = self.workspace.review.clone();
         let flagged = {
-            let env = env.clone();
-            tokio::task::spawn_blocking(move || board.set(&env, review))
-                .await
-                .context("the review board task panicked")??
+            let (board, env) = (board.clone(), env.clone());
+            tokio::task::spawn_blocking(move || {
+                board.set(&env, taste_core::ReviewState::FlaggedForReview)
+            })
+            .await
+            .context("the review board task panicked")??
         };
+        // Flagged already, and the branch moved: what there is to review is
+        // new even though the flag is not, so it is announced as the first
+        // was and the coordinator is woken to it. A rebase it asked for came
+        // back to nobody while only a change of state was news (2026-10-25).
+        if !flagged && moved {
+            self.workspace
+                .events
+                .publish(Event::EnvironmentReviewChanged { env: env.clone() });
+        }
         if let Ok(supervisor) = self.supervisor(env) {
-            let env_name = env.to_string();
+            let chats = self.workspace.orchestration.clone();
+            let env = env.clone();
             tokio::spawn(async move {
+                turn_over(&chats, &env, REVIEW_TURN_WAIT).await;
                 tokio::time::sleep(REVIEW_STOP_GRACE).await;
+                // Asked now, not when flagged: a prompt sent since may have
+                // put it back to work (`ReviewBoard::reopen`).
+                let review = board.state(&env);
                 if let Err(e) = supervisor.apply_review_state(review).await {
-                    tracing::warn!("stopping {env_name} after it was flagged for review: {e:#}");
+                    tracing::warn!("stopping {env} after it was flagged for review: {e:#}");
                 }
             });
         }
-        Ok(Some(if flagged {
-            "flagged for the user's review; this environment's container is being stopped, \
-             so nothing will run here until they start it again"
-                .to_string()
-        } else {
-            "already flagged for the user's review".to_string()
-        }))
+        Ok(Some(
+            match (flagged, moved) {
+                (true, _) => {
+                    "flagged for the user's review; this environment's container stops when \
+                     this turn ends, so nothing runs here until it is started again"
+                }
+                (false, true) => {
+                    "already flagged for the user's review, and the new tip is announced as \
+                     the first was; the container stops when this turn ends"
+                }
+                (false, false) => "already flagged for the user's review",
+            }
+            .to_string(),
+        ))
     }
 
     /// The clone behind an environment that may hand work to the hub.
@@ -6152,6 +6203,32 @@ fn age_seconds(commit_time: i64) -> u64 {
 
 /// A successful publish, in the agent's terms: what moved, from where to
 /// where, and under what name the user will find it.
+/// Until `env`'s chat has no turn in flight, or `limit` passes: what a
+/// flag's stop waits for, so the agent's last words are out before its
+/// container goes. A chat the strip cannot answer for is taken as done.
+async fn turn_over(
+    chats: &taste_core::orchestration::OrchestrationProbe,
+    env: &EnvironmentId,
+    limit: std::time::Duration,
+) {
+    use taste_core::orchestration::{ChatState, OrchestrationReply, OrchestrationRequest};
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let asked = chats.request(OrchestrationRequest::ChatStatus { chat: env.clone() });
+        let busy = match tokio::time::timeout(ORCHESTRATION_TIMEOUT, asked).await {
+            Ok(Ok(OrchestrationReply::Status(facts))) => matches!(
+                facts.state,
+                ChatState::Streaming | ChatState::AwaitingPermission
+            ),
+            _ => false,
+        };
+        if !busy || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 fn publish_result(outcome: &PublishOutcome, env: &EnvironmentId, review: Option<String>) -> Value {
     let status = match outcome.status {
         PublishStatus::Created => "created",
@@ -7379,6 +7456,35 @@ mod tests {
         assert_eq!((facts.ahead, facts.behind), (1, 0));
         let merged = hub.fast_forward_branch("agents/worker").unwrap();
         assert_eq!(merged.status, taste_git::MergeStatus::FastForward);
+
+        // Published ready again over the flag with the branch moved — the
+        // rework a coordinator sends it back for — it is news again, and
+        // the coordinator hears it as it heard the first (2026-10-25).
+        let events = workspace.events.subscribe();
+        commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() { 1 }\n",
+        );
+        let again = call_tool(
+            &mut stream,
+            "publish",
+            json!({"branch": "work", "ready": true}),
+        )
+        .await;
+        assert!(
+            again["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("announced"),
+            "{again}"
+        );
+        let mut announced = false;
+        while let Ok(event) = events.try_recv() {
+            announced |= matches!(&event, Event::EnvironmentReviewChanged { env: e } if *e == env);
+        }
+        assert!(announced, "the new tip is announced");
     }
 
     /// An environment's own branch is its to rewrite: a rebase that also
@@ -8140,6 +8246,18 @@ mod tests {
         assert_eq!(woken["woke"], "message", "{woken}");
         assert_eq!(woken["next"], taste_core::nudge::WOKEN);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        workspace.nudges.withdraw(&EnvironmentId::primary());
+
+        // A wait longer than the watchdog allows is cut to what it allows,
+        // and says so, rather than ending on the watchdog's error.
+        assert!(std::time::Duration::from_secs(WAIT_MAX_SECS) < TOOL_WATCHDOG);
+        let nudges = workspace.nudges.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            nudges.message_waiting(&EnvironmentId::primary());
+        });
+        let long = call_tool(&mut stream, "wait", json!({"seconds": 600})).await;
+        assert_eq!(long["capped_to"], WAIT_MAX_SECS, "{long}");
         workspace.nudges.withdraw(&EnvironmentId::primary());
 
         let refused = call_tool_raw(&mut stream, "wait", json!({"tasks": ["build"]})).await;

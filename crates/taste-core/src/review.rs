@@ -264,6 +264,20 @@ impl ReviewBoard {
         Ok(true)
     }
 
+    /// Back at work: a flagged environment given something more to do, by
+    /// its coordinator or by the user, returns to `Working` — the arc's
+    /// unflag — so the ready publish that ends that work is news again. It
+    /// had no caller, and an environment sent back to rebase stayed flagged
+    /// through the rebase, so its second ready publish told nobody
+    /// (2026-10-25). A settled environment stays settled. **Blocking IO**
+    /// when it changes anything.
+    pub fn reopen(&self, env: &EnvironmentId) -> Result<bool> {
+        if !self.state(env).flagged() {
+            return Ok(false);
+        }
+        self.set(env, ReviewState::Working)
+    }
+
     /// Forget an environment — it was destroyed. Leaves the state file's
     /// entry alone, because destroying already removes it wholesale
     /// (`WorkspaceState::forget_environment`); this only drops the cache so
@@ -436,6 +450,24 @@ mod tests {
             ReviewState::Merged,
             "a settled environment stays settled"
         );
+    }
+
+    /// Given more to do, a flagged environment is at work again, so its
+    /// next flag is a change; a settled or working one is left alone.
+    #[test]
+    fn a_flagged_environment_given_work_is_working_again() {
+        let base = tempfile::tempdir().unwrap();
+        let board = ReviewBoard::with_base_for_tests(base.path(), "/work/p");
+        let calm = env("calm-1");
+        assert!(!board.reopen(&calm).unwrap(), "working already");
+        board.set(&calm, ReviewState::FlaggedForReview).unwrap();
+        assert!(board.reopen(&calm).unwrap());
+        assert_eq!(board.state(&calm), ReviewState::Working);
+        assert!(board.set(&calm, ReviewState::FlaggedForReview).unwrap());
+        board.set(&calm, ReviewState::Merged).unwrap();
+        assert!(!board.reopen(&calm).unwrap());
+        assert_eq!(board.state(&calm), ReviewState::Merged);
+        assert!(!board.reopen(&EnvironmentId::primary()).unwrap());
     }
 
     #[test]
