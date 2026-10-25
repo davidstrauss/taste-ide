@@ -112,6 +112,11 @@ pub struct WorkspaceState {
     /// chat pane shares; this is only where it lands.
     #[serde(default)]
     pub standing: Vec<StandingEntry>,
+    /// The models that refused an image in this project
+    /// ([`crate::imageless`]), read and written through
+    /// [`crate::imageless::ImagelessModels`].
+    #[serde(default)]
+    pub imageless_models: Vec<crate::imageless::ImagelessEntry>,
 }
 
 /// One standing answer, as the state file carries it.
@@ -411,6 +416,7 @@ impl Default for WorkspaceState {
             chats: Vec::new(),
             environments: Vec::new(),
             standing: Vec::new(),
+            imageless_models: Vec::new(),
         }
     }
 }

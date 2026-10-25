@@ -252,6 +252,19 @@ impl McpServer {
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
 pub const GUIDANCE_REVISION: u32 = 15;
 
+/// `result` with each image block replaced by
+/// [`taste_core::imageless::WITHHELD`].
+fn withhold_images(mut result: Value) -> Value {
+    if let Some(content) = result["content"].as_array_mut() {
+        for block in content.iter_mut() {
+            if block["type"] == "image" {
+                *block = json!({ "type": "text", "text": taste_core::imageless::WITHHELD });
+            }
+        }
+    }
+    result
+}
+
 /// The flag the tools that rebuild or move an environment take, said once.
 pub(crate) static WHILE_PRESENTING: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
     json!({
@@ -1088,7 +1101,7 @@ impl McpServer {
                         Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
                     }
                 };
-                Response::ok(id, self.nudged(env, result))
+                Response::ok(id, self.nudged(env, self.withheld(env, result)))
             }
             _ => Response::err(id, -32601, format!("method not found: {method}")),
         }
@@ -1227,6 +1240,17 @@ impl McpServer {
                 "nothing finished: wait again with the same set to keep watching".to_string(),
         });
         Ok(out)
+    }
+
+    /// A tool's result with its images taken out, for an agent whose chat
+    /// says its model cannot read them (`taste_core::imageless`): one image
+    /// in its history fails every turn of the session after it, so each
+    /// goes as a line saying what to use instead.
+    fn withheld(&self, env: &EnvironmentId, result: Value) -> Value {
+        if !self.workspace.imageless.blind(env) {
+            return result;
+        }
+        withhold_images(result)
     }
 
     /// A tool's result, with the ask for a turn after it when the user has
@@ -6300,6 +6324,21 @@ mod tests {
     /// what agents are told, as a coordinator or an environment's agent,
     /// fails here until GUIDANCE_REVISION is raised, so a conversation
     /// briefed before it is sent the new text (taste-app's chat).
+    #[test]
+    fn an_image_blind_agent_gets_words_in_place_of_images() {
+        let result = json!({ "content": [
+            { "type": "image", "data": "iVBOR", "mimeType": "image/png" },
+            { "type": "text", "text": "the window, 1440x900" },
+        ]});
+        let withheld = withhold_images(result);
+        assert_eq!(withheld["content"][0]["type"], "text");
+        assert_eq!(
+            withheld["content"][0]["text"],
+            taste_core::imageless::WITHHELD
+        );
+        assert_eq!(withheld["content"][1]["text"], "the window, 1440x900");
+    }
+
     #[test]
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;

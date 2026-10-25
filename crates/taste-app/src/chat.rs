@@ -1185,6 +1185,12 @@ pub struct ChatPane {
     /// whenever the environment settles into a new state, spent by the
     /// next send.
     orientation_due: Cell<bool>,
+    /// The agent's words this turn, the tail of them, for what only they
+    /// say: a server refusing an image ([`taste_core::imageless`]).
+    turn_text: RefCell<String>,
+    /// When this chat last started its agent afresh because its model
+    /// refused an image: once in ten minutes, so a misreading cannot loop.
+    images_restarted: Cell<Option<std::time::Instant>>,
     // --- orchestration ----------------------------------------------------
     /// (The coordinator role is not stored here: it is the primary
     /// environment's chat, always — `is_orchestrator` reads the
@@ -3634,6 +3640,8 @@ impl ChatPane {
             models_pending: Cell::new(false),
             container_wait: Cell::new(ContainerWait::Idle),
             orientation_due: Cell::new(true),
+            turn_text: RefCell::new(String::new()),
+            images_restarted: Cell::new(None),
             transcript_log: RefCell::new(std::collections::VecDeque::new()),
             progress: Default::default(),
             transcript_dropped: Cell::new(0),
@@ -7376,6 +7384,10 @@ impl ChatPane {
             self.meta_row("briefed as the coordinator with this prompt");
             front.push(taste_core::orchestration::coordinator_brief());
         }
+        // What the MCP server holds back from this agent follows the model
+        // its session runs on, said at every send since the model can change.
+        let imageless = &self.workspace.imageless;
+        imageless.set_blind(&self.environment, imageless.refuses(&self.vision_key()));
         if self.orientation_due.replace(false) {
             if let Some((text, summary)) = self.orientation() {
                 self.meta_row(&summary);
@@ -7496,6 +7508,10 @@ impl ChatPane {
              There are no skills, slash commands, or plugins here.",
             situation.next
         ));
+        if self.workspace.imageless.refuses(&self.vision_key()) {
+            text.push('\n');
+            text.push_str(taste_core::imageless::ORIENTATION);
+        }
         let summary = format!(
             "oriented with this prompt: {} mode{}",
             situation.mode,
@@ -7506,6 +7522,74 @@ impl ChatPane {
             }
         );
         Some((text, summary))
+    }
+
+    /// The model this chat's session runs on, as the project's record of
+    /// image-blind models keys it: the agent, and the model it reaches — a
+    /// custom upstream's own model name, else this chat's choice or the
+    /// agent's default.
+    fn vision_key(&self) -> String {
+        let agent = self.agent_id();
+        let model = if agent == taste_acp::registry::CLAUDE_CODE_CUSTOM {
+            taste_acp::authproxy::custom_model().and_then(|facts| facts.model)
+        } else {
+            self.model_value.borrow().clone()
+        };
+        format!("{agent}/{}", model.as_deref().unwrap_or("default"))
+    }
+
+    /// The model refused an image: after the event that said so is handled,
+    /// since what follows ends the session it came from.
+    fn images_refused_later(self: &Rc<Self>, said: String) {
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(pane) = weak.upgrade() {
+                pane.images_refused(&said);
+            }
+        });
+    }
+
+    /// This chat's model cannot read images, as its server just said: the
+    /// project records it (`taste_core::imageless`), the IDE's tools stop
+    /// handing this agent images, and the agent starts again on a fresh
+    /// session whose orientation says so — the old one holds the image in
+    /// its history, and every turn of it would fail the same way (David,
+    /// 2026-10-24: "cache it (project-level), have it modify the
+    /// orientation prompt it gets, and have it restart the agent with a new
+    /// session"). Once in ten minutes: a second refusal soon after is
+    /// noted and left to the user.
+    fn images_refused(self: &Rc<Self>, said: &str) {
+        let model = self.vision_key();
+        let imageless = self.workspace.imageless.clone();
+        if imageless.remember(&model, said) {
+            let book = imageless.clone();
+            crate::runtime::runtime().spawn_blocking(move || {
+                if let Err(e) = book.persist() {
+                    tracing::warn!("recording a model that cannot read images: {e:#}");
+                }
+            });
+        }
+        imageless.set_blind(&self.environment, true);
+        let recent = self
+            .images_restarted
+            .get()
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(600));
+        if recent {
+            self.meta_row(&format!(
+                "{model} refused an image again; not restarted a second time — start a new \
+                 conversation if every turn fails"
+            ));
+            return;
+        }
+        self.images_restarted.set(Some(std::time::Instant::now()));
+        self.meta_row(&format!(
+            "{model} cannot read images: recorded for this project, and the agent restarted on \
+             a new session that is told so (the old one held an image every turn would fail on)"
+        ));
+        self.reset_session(false);
+        self.persisted_session.borrow_mut().take();
+        self.notify_persist();
+        self.ensure_client(None);
     }
 
     /// End the session. `clear_controls` only when the control structure is
@@ -8949,6 +9033,9 @@ impl ChatPane {
                 }
             }
             SessionEvent::PromptFailed { message } => {
+                if taste_core::imageless::refuses_images(&message) {
+                    self.images_refused_later(message.clone());
+                }
                 self.end_nudge();
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
@@ -8999,6 +9086,10 @@ impl ChatPane {
             }
             SessionEvent::TurnEnded { reason, usage } => {
                 use agent_client_protocol::schema::v1::StopReason;
+                let said = std::mem::take(&mut *self.turn_text.borrow_mut());
+                if taste_core::imageless::refuses_images(&said) {
+                    self.images_refused_later(said);
+                }
                 self.turns.set(self.turns.get() + 1);
                 self.touch();
                 self.finalize_stream();
@@ -10855,6 +10946,17 @@ impl ChatPane {
                     .filter(|_| !self.drawing_history.get())
                 {
                     captured.push_str(&text);
+                }
+                if !self.drawing_history.get() && !self.restoring() {
+                    let mut said = self.turn_text.borrow_mut();
+                    said.push_str(&text);
+                    if said.len() > 8192 {
+                        let mut cut = said.len() - 4096;
+                        while !said.is_char_boundary(cut) {
+                            cut += 1;
+                        }
+                        said.drain(..cut);
+                    }
                 }
             }
         }

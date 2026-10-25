@@ -5211,6 +5211,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // thread. A probe passes the default, so a screenshot run can never be
     // answering permission questions out of the developer's real state.
     workspace.standing.hydrate_from(&persisted);
+    workspace.imageless.hydrate_from(&persisted);
     if state_was_reset {
         // The IDE is alpha and its state schema moves; a discarded file is
         // told to the user once rather than looking like data loss. Through

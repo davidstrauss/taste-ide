@@ -89,6 +89,10 @@ pub struct Workspace {
     /// chat would have to be given once per environment, and there are as
     /// many of those as there are issues in progress.
     pub standing: StandingAnswers,
+    /// The models that cannot read images here, and the environments whose
+    /// agent runs on one ([`crate::imageless`]): the chats say, and the MCP
+    /// server holds its tools' images back.
+    pub imageless: crate::imageless::ImagelessModels,
     /// Every task run (taskfile.dev, [`crate::tasks`]), the user's and the
     /// agents' alike, so a run either starts shows in one row and one tab.
     pub tasks: crate::tasks::TaskBoard,
@@ -110,6 +114,7 @@ impl Workspace {
         let review = ReviewBoard::new(&root);
         review.attach_events(events.clone());
         let standing = StandingAnswers::new(&root);
+        let imageless = crate::imageless::ImagelessModels::new(&root);
         let shells = ShellRoster::new();
         shells.attach_events(events.clone());
         // Terminal and `ide_exec` output is the liveliest signal there is
@@ -130,6 +135,7 @@ impl Workspace {
             activity,
             review,
             standing,
+            imageless,
             tasks,
             nudges: crate::nudge::Nudges::default(),
             models: crate::models::AdvertisedModels::default(),
