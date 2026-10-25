@@ -224,6 +224,11 @@ pub struct PortPage {
     device_toggles: gtk::Box,
     /// What went wrong loading the page, counted at the address bar's end.
     problems: Rc<crate::port_problems::Problems>,
+    /// The project's passkeys and the button that chooses among them
+    /// (`passkey_menu`); none for a page an agent's check loads, which
+    /// signs in as nobody.
+    passkeys: Option<taste_core::passkeys::Passkeys>,
+    passkey_menu: Option<Rc<crate::passkey_menu::PasskeyMenu>>,
     /// Where the problems' Prompt Agent goes; passed on to every page
     /// opened from this one, as the new-tab hook is.
     on_prompt: RefCell<Option<crate::port_problems::PromptHook>>,
@@ -315,16 +320,23 @@ impl PortPage {
         environment: &str,
         spec: PortSpec,
         forwarded: Vec<u16>,
+        passkeys: taste_core::passkeys::Passkeys,
         facts: PortFacts,
     ) -> Rc<Self> {
-        let page = Self::made(environment, spec, forwarded, facts.clone());
+        let page = Self::made(environment, spec, forwarded, Some(passkeys), facts.clone());
         page.set_face(facts.default_face());
         page
     }
 
     /// The page, with no face shown yet: a new tab's adopts its browser
     /// before it shows one, so none is made for it ([`Self::open_related`]).
-    fn made(environment: &str, spec: PortSpec, forwarded: Vec<u16>, facts: PortFacts) -> Rc<Self> {
+    fn made(
+        environment: &str,
+        spec: PortSpec,
+        forwarded: Vec<u16>,
+        passkeys: Option<taste_core::passkeys::Passkeys>,
+        facts: PortFacts,
+    ) -> Rc<Self> {
         let base_url = spec.url();
 
         // The header: what this is, and what is behind it.
@@ -446,6 +458,12 @@ impl PortPage {
         browser_bar.append(&reload);
         browser_bar.append(&address);
         let problems = crate::port_problems::Problems::new(spec.port, forwarded.clone());
+        // Left of the problems, as the user placed it: which passkey this
+        // project's sign-ins answer as.
+        let passkey_menu = passkeys.clone().map(crate::passkey_menu::PasskeyMenu::new);
+        if let Some(menu) = &passkey_menu {
+            browser_bar.append(&menu.button);
+        }
         browser_bar.append(&problems.button);
         browser_bar.append(&problems.inspect);
         let browser_holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -508,6 +526,8 @@ impl PortPage {
             device_clamp,
             device_toggles,
             problems,
+            passkeys,
+            passkey_menu,
             on_prompt: RefCell::new(None),
             first_load: RefCell::new(None),
         });
@@ -693,6 +713,27 @@ impl PortPage {
             .build();
         if let Some(manager) = webkit6::prelude::WebViewExt::user_content_manager(&view) {
             crate::port_problems::Problems::install(&manager);
+            if let Some(passkeys) = self.passkeys.clone() {
+                let mut ports = self.forwarded.clone();
+                ports.push(self.spec.host);
+                let weak = Rc::downgrade(self);
+                let used: crate::passkey_menu::UsedHook = Rc::new(move |name, op, site| {
+                    let Some(page) = weak.upgrade() else { return };
+                    let did = if op == "create" {
+                        "signed up"
+                    } else {
+                        "signed in"
+                    };
+                    toast(&page.widget, &format!("Passkey {name} {did} at {site}"));
+                    if let Some(menu) = &page.passkey_menu {
+                        menu.refresh();
+                    }
+                });
+                crate::passkey_menu::install(&manager, passkeys, ports, used);
+            }
+        }
+        if let Some(menu) = &self.passkey_menu {
+            menu.load_then_refresh();
         }
         self.install_view(&view);
         self.guard_then_load(&view);
@@ -729,7 +770,7 @@ impl PortPage {
                 spec.port
             ));
         }
-        let page = Self::made(environment, spec, forwarded, PortFacts::default());
+        let page = Self::made(environment, spec, forwarded, None, PortFacts::default());
         let url = format!(
             "{}{}{}",
             page.base_url.trim_end_matches('/'),
@@ -804,6 +845,7 @@ impl PortPage {
             &self.environment,
             self.spec.clone(),
             self.forwarded.clone(),
+            self.passkeys.clone(),
             self.facts.borrow().clone(),
         );
         let mut builder = webkit6::WebView::builder()
@@ -1312,6 +1354,32 @@ impl PortPage {
             .and_then(|word| Device::parse(&word))
         {
             self.set_device(device);
+        }
+        // `TASTE_PROBE_PORT_PASSKEYS=1`: two passkeys made in the probe's
+        // own store, the second chosen, and the menu open once the page
+        // has had time to sign up and in with it.
+        if let (Ok(_), Some(passkeys)) = (
+            std::env::var("TASTE_PROBE_PORT_PASSKEYS"),
+            self.passkeys.clone(),
+        ) {
+            let weak = Rc::downgrade(self);
+            gtk::glib::spawn_future_local(async move {
+                let book = passkeys.clone();
+                let _ = crate::runtime::runtime()
+                    .spawn_blocking(move || book.load())
+                    .await;
+                for name in ["bob", "alice"] {
+                    let _ = passkeys.create(name);
+                }
+                if let Some(menu) = weak.upgrade().and_then(|page| page.passkey_menu.clone()) {
+                    menu.refresh();
+                }
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(6), move || {
+                    if let Some(menu) = weak.upgrade().and_then(|page| page.passkey_menu.clone()) {
+                        menu.open_for_probe();
+                    }
+                });
+            });
         }
         // `TASTE_PROBE_PORT_PROBLEMS=1`: the problem list open, once the
         // page has had time to fail at what it fails at.

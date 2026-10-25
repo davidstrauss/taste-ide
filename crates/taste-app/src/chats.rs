@@ -493,8 +493,9 @@ impl Chats {
                 }
                 // First arrival is what spawns this environment's agent: a
                 // remembered conversation comes back here, through the same
-                // lazy `ensure_client` a single chat has always used.
-                pane.activate();
+                // lazy `ensure_client` a single chat has always used. Not
+                // what starts its environment: looking is not asking.
+                pane.activate_for_view();
                 // Deferred: the page is still being mapped, and grabbing
                 // focus into a widget that is not on screen yet silently
                 // does nothing.

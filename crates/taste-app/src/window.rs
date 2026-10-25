@@ -3780,6 +3780,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // The branch switcher, opened by the file tree once
                         // its branches are read: a popover, its own surface.
                         &["window", "window.branch-menu"]
+                    } else if std::env::var("TASTE_PROBE_PORT_PASSKEYS").is_ok() {
+                        // The passkey menu: a popover, its own surface.
+                        &["window", "window.passkey-menu"]
                     } else if std::env::var("TASTE_PROBE_PORT_PROBLEMS").is_ok() {
                         // The port browser's problem list: a popover, its
                         // own surface.

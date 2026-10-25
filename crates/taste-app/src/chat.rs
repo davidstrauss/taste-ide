@@ -128,6 +128,13 @@ enum ContainerWait {
     Idle,
     /// The container is on its way and the agent is held back.
     Waiting,
+    /// The chat was looked at while its environment is not running, and
+    /// nothing has started it: the agent is held back for a container that
+    /// a Start — the editor's, the backlog's, or a message sent here — will
+    /// bring up, and only that. Selecting an environment started it, and
+    /// was not asked to (David, 2026-10-24: "It no longer auto-starts envs
+    /// when they're selected? That was/is annoying").
+    Parked,
     /// It settled without anywhere to exec — no podman at this rung, or a
     /// build that failed. The agent starts outside, as it always could,
     /// and this chat does not hold it back again; `retopologize` still
@@ -5901,7 +5908,18 @@ impl ChatPane {
         // ...and the first moment an agent held back for its container can
         // start in it. Before the queue: the flush activates too, and this
         // is what decides whether that activation is allowed to spawn.
-        if self.container_wait.get() == ContainerWait::Waiting {
+        // Parked — looked at, never started: up now, the agent starts in
+        // it; still down, it stays parked, with nothing to say.
+        if self.container_wait.get() == ContainerWait::Parked {
+            let up = self
+                .environments
+                .get(&self.environment)
+                .is_some_and(|s| s.exec().has_exec_target());
+            if up {
+                self.container_wait.set(ContainerWait::Idle);
+                self.activate();
+            }
+        } else if self.container_wait.get() == ContainerWait::Waiting {
             let up = self
                 .environments
                 .get(&self.environment)
@@ -6171,7 +6189,19 @@ impl ChatPane {
     /// Eager at the point of first use: the user should be greeted by the
     /// sign-in invitation (or a ready session), never an inert empty box.
     pub fn activate(self: &Rc<Self>) {
-        if self.hold_for_container() {
+        if self.hold_for_container(true) {
+            return;
+        }
+        let resume = self.pending_restore.borrow_mut().take();
+        self.ensure_client(resume);
+    }
+
+    /// [`Self::activate`] for a chat brought on screen, which is looking,
+    /// not asking: its environment, not running, is not started for it —
+    /// the agent is parked until something that means to start it does
+    /// ([`ContainerWait::Parked`]).
+    pub fn activate_for_view(self: &Rc<Self>) {
+        if self.hold_for_container(false) {
             return;
         }
         let resume = self.pending_restore.borrow_mut().take();
@@ -6194,7 +6224,7 @@ impl ChatPane {
     /// fail. Either way the agent starts outside — which is what it did
     /// before this — and `retopologize` still moves it in if the container
     /// appears later.
-    fn hold_for_container(self: &Rc<Self>) -> bool {
+    fn hold_for_container(self: &Rc<Self>, may_start: bool) -> bool {
         let supervisor = self.environments.get(&self.environment);
         let facts = GateFacts {
             primary: self.environment.is_primary(),
@@ -6225,6 +6255,11 @@ impl ChatPane {
             Gate::GiveUp => {
                 self.container_wait.set(ContainerWait::GaveUp);
                 false
+            }
+            Gate::StartThenHold if !may_start => {
+                self.container_wait.set(ContainerWait::Parked);
+                self.sync_revive_bar();
+                true
             }
             gate @ (Gate::StartThenHold | Gate::Hold) => {
                 if gate == Gate::StartThenHold {

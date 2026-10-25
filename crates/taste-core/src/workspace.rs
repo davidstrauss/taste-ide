@@ -93,6 +93,10 @@ pub struct Workspace {
     /// agent runs on one ([`crate::imageless`]): the chats say, and the MCP
     /// server holds its tools' images back.
     pub imageless: crate::imageless::ImagelessModels,
+    /// The port browser's passkeys for this project, on this machine
+    /// ([`crate::passkeys`]): one store every port tab answers from, read
+    /// off the main thread when the first browser is made.
+    pub passkeys: crate::passkeys::Passkeys,
     /// Every task run (taskfile.dev, [`crate::tasks`]), the user's and the
     /// agents' alike, so a run either starts shows in one row and one tab.
     pub tasks: crate::tasks::TaskBoard,
@@ -115,6 +119,7 @@ impl Workspace {
         review.attach_events(events.clone());
         let standing = StandingAnswers::new(&root);
         let imageless = crate::imageless::ImagelessModels::new(&root);
+        let passkeys = crate::passkeys::Passkeys::new(&root);
         let shells = ShellRoster::new();
         shells.attach_events(events.clone());
         // Terminal and `ide_exec` output is the liveliest signal there is
@@ -136,6 +141,7 @@ impl Workspace {
             review,
             standing,
             imageless,
+            passkeys,
             tasks,
             nudges: crate::nudge::Nudges::default(),
             models: crate::models::AdvertisedModels::default(),

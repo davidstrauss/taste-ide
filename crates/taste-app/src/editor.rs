@@ -2800,7 +2800,13 @@ impl Editor {
             self.tabs().set_selected_page(&existing.tab);
             return;
         }
-        let page = crate::portview::PortPage::new(env.as_str(), spec.clone(), forwarded, facts);
+        let page = crate::portview::PortPage::new(
+            env.as_str(),
+            spec.clone(),
+            forwarded,
+            self.workspace.passkeys.clone(),
+            facts,
+        );
         page.set_on_new_tab(self.port_new_tab_hook(env));
         {
             // The problems list's Prompt Agent: to the agent of the

@@ -28,6 +28,7 @@ pub mod models;
 pub mod network;
 pub mod nudge;
 pub mod orchestration;
+pub mod passkeys;
 pub mod podman;
 pub mod policy;
 pub mod power;
