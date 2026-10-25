@@ -467,6 +467,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             }
         });
     }
+    // A connection to a forwarded port starts the service the project's
+    // config links to it, when nothing serves the port yet
+    // (`taste_devcontainer::activation`, `activate_service`).
+    {
+        let environments = environments.clone();
+        let task_runs = task_runs.clone();
+        let events = workspace.events.clone();
+        taste_devcontainer::activation::set(std::sync::Arc::new(move |env, port| {
+            Box::pin(activate_service(
+                environments.clone(),
+                task_runs.clone(),
+                events.clone(),
+                env,
+                port,
+            ))
+        }));
+    }
     // Listed again when the panes are aimed elsewhere: a two-second look
     // at where they point, since nothing announces it to this pane.
     {
@@ -6390,6 +6407,115 @@ fn forwarded_list(specs: &[taste_devcontainer::config::PortSpec]) -> String {
         .map(|spec| spec.port.to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// For a connection to `port` (the container's) in `env`: start the
+/// service its config links to that port, as the port row's play starts
+/// it, when the service is not running and nothing in the container
+/// serves the port — and hold the connection until something does, up to
+/// a minute, so the page that asked loads rather than failing. Nothing
+/// when no service is linked, or when the port is served already, by the
+/// service or by a server started by hand; a port found served is not
+/// asked about again for ten seconds, since a browser opens connections by
+/// the dozen and each look is an exec into the container. One connection
+/// at a time does the starting: the others wait for it and then find the
+/// port served (David, 2026-10-24: "auto-start the service if it's linked
+/// to the port").
+async fn activate_service(
+    environments: std::sync::Arc<EnvironmentRegistry>,
+    task_runs: taste_core::tasks::TaskBoard,
+    events: taste_core::EventBus,
+    env: taste_core::environment::EnvironmentId,
+    port: u16,
+) {
+    type Key = (taste_core::environment::EnvironmentId, u16);
+    static SERVED: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<Key, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let key = (env.clone(), port);
+    let served = SERVED.get_or_init(Default::default);
+    let recently = |key: &Key| {
+        served
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(10))
+    };
+    if recently(&key) {
+        return;
+    }
+    let Some(supervisor) = environments.get(&env) else {
+        return;
+    };
+    let Some(task) = supervisor
+        .services()
+        .into_iter()
+        .find(|(_, service)| service.port == Some(port))
+        .map(|(name, _)| name)
+    else {
+        return;
+    };
+    let gate = GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(key.clone())
+        .or_default()
+        .clone();
+    let _turn = gate.lock().await;
+    if recently(&key) {
+        return;
+    }
+    let exec = supervisor.exec();
+    let listening = || async {
+        crate::portview::container_listeners(exec)
+            .await
+            .map(|listeners| listeners.contains_key(&port))
+    };
+    match listening().await {
+        Some(true) => {
+            served
+                .lock()
+                .unwrap()
+                .insert(key, std::time::Instant::now());
+            return;
+        }
+        // The container cannot be asked: let the connection go as it is.
+        None => return,
+        Some(false) => {}
+    }
+    if task_runs.state(&env, &task) != crate::tasks::RunState::Running {
+        let wrapper = supervisor
+            .channel_paths()
+            .map(|paths| paths.task_wrapper.join("task"));
+        if let Err(why) = task_runs.start(&env, &task, exec, false, wrapper.as_deref()) {
+            events.publish(Event::Toast(format!(
+                "{task} was not started for port {port}: {why}"
+            )));
+            return;
+        }
+        events.publish(Event::Toast(format!(
+            "Starting {task} for a connection to port {port}"
+        )));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if listening().await == Some(true) {
+            served
+                .lock()
+                .unwrap()
+                .insert(key, std::time::Instant::now());
+            return;
+        }
+        // It ended without serving the port: the connection goes through
+        // and fails as it would have, and the task's tab says why.
+        if task_runs.state(&env, &task) != crate::tasks::RunState::Running {
+            return;
+        }
+    }
 }
 
 /// TASTE_PROBE_PORT: which state the `port` view's tab is posed in.

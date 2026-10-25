@@ -266,8 +266,47 @@ impl Keys {
     /// container's published port in the guest is reached from here. One
     /// process for all of a container's ports; `ExitOnForwardFailure` so a
     /// port taken on either side is a dead process rather than a silent
-    /// gap.
+    /// gap. What a supervisor runs where it cannot relay the ports itself
+    /// ([`Self::ssh_relay_argv`]).
     pub fn ssh_tunnel_argv(&self, port: u16, forwards: &[u16]) -> (String, Vec<String>) {
+        // Both loopbacks, since a port is reached as `localhost`
+        // (`PortSpec::url`), which resolves to `::1` first on most hosts —
+        // where a forward on 127.0.0.1 alone left `::1` to whatever else
+        // held the number. Not on a host with no IPv6 loopback, where the
+        // bind would fail the whole tunnel (`ExitOnForwardFailure`).
+        let six = taste_core::network::ipv6_loopback();
+        let mut specs = Vec::new();
+        for forward in forwards {
+            specs.push(format!("127.0.0.1:{forward}:127.0.0.1:{forward}"));
+            if six {
+                specs.push(format!("[::1]:{forward}:127.0.0.1:{forward}"));
+            }
+        }
+        self.tunnel_argv(port, &specs, &[])
+    }
+
+    /// [`Self::ssh_tunnel_argv`], each port forwarded to a unix socket of
+    /// the IDE's rather than to this host's loopback: the IDE listens on
+    /// the port itself and relays what connects, so it sees the connection
+    /// and can start the port's service first (`Supervisor`'s relay). The
+    /// sockets are the user's alone, and a stale one is replaced.
+    pub fn ssh_relay_argv(
+        &self,
+        port: u16,
+        sockets: &[(u16, std::path::PathBuf)],
+    ) -> (String, Vec<String>) {
+        let specs: Vec<String> = sockets
+            .iter()
+            .map(|(forward, socket)| format!("{}:127.0.0.1:{forward}", socket.display()))
+            .collect();
+        self.tunnel_argv(
+            port,
+            &specs,
+            &["StreamLocalBindUnlink=yes", "StreamLocalBindMask=0177"],
+        )
+    }
+
+    fn tunnel_argv(&self, port: u16, specs: &[String], options: &[&str]) -> (String, Vec<String>) {
         let mut args: Vec<String> = vec![
             "-N".into(),
             "-o".into(),
@@ -291,19 +330,13 @@ impl Keys {
             "-o".into(),
             LIVENESS[2].into(),
         ];
-        // Both loopbacks, since a port is reached as `localhost`
-        // (`PortSpec::url`), which resolves to `::1` first on most hosts —
-        // where a forward on 127.0.0.1 alone left `::1` to whatever else
-        // held the number. Not on a host with no IPv6 loopback, where the
-        // bind would fail the whole tunnel (`ExitOnForwardFailure`).
-        let six = taste_core::network::ipv6_loopback();
-        for forward in forwards {
+        for option in options {
+            args.push("-o".into());
+            args.push((*option).into());
+        }
+        for spec in specs {
             args.push("-L".into());
-            args.push(format!("127.0.0.1:{forward}:127.0.0.1:{forward}"));
-            if six {
-                args.push("-L".into());
-                args.push(format!("[::1]:{forward}:127.0.0.1:{forward}"));
-            }
+            args.push(spec.clone());
         }
         args.push("-p".into());
         args.push(port.to_string());
@@ -480,6 +513,34 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(!super::is_tunnel_of(&mine, &key));
+    }
+
+    /// A relaying tunnel forwards each port to the IDE's socket, replacing
+    /// a stale one, and is still told as this workspace's by the sweep.
+    #[test]
+    fn a_relaying_tunnel_forwards_to_the_ides_sockets() {
+        let keys = super::Keys::for_workspace(std::path::Path::new("/work/sb"));
+        let key = keys.identity().display().to_string();
+        let socket = std::path::PathBuf::from("/run/user/1000/taste-x-primary-port-8000.sock");
+        let (program, argv) = keys.ssh_relay_argv(36091, &[(8000, socket)]);
+        let mut full = vec![program];
+        full.extend(argv);
+        let at = full.iter().position(|a| a == "-L").unwrap();
+        assert_eq!(
+            full[at + 1],
+            "/run/user/1000/taste-x-primary-port-8000.sock:127.0.0.1:8000"
+        );
+        assert!(
+            full.iter().any(|a| a == "StreamLocalBindUnlink=yes"),
+            "{full:?}"
+        );
+        assert!(
+            !full.iter().any(|a| a.starts_with("127.0.0.1:8000:")),
+            "{full:?}"
+        );
+        if full[0] == "ssh" {
+            assert!(super::is_tunnel_of(&full, &key), "{full:?}");
+        }
     }
 
     use super::*;

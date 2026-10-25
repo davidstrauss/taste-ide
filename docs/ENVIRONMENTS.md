@@ -4499,7 +4499,23 @@ comes here, which is why the baseline carries ripgrep. A remote container's
 forwarded ports are published on the VM's loopback and brought to this
 host's by one `ssh -N -L` per container, started when it runs and ended
 when it stops, so the port tab and the browser face dial the address they
-always did. **Each Ports row graphs its traffic**, in and out, over the
+always did. **The IDE holds the port; the tunnel feeds it.** The ssh
+forwards each port to a unix socket of the IDE's
+(`Keys::ssh_relay_argv`), and the supervisor listens on both loopbacks
+and relays what connects (`relay_port`) — so the IDE sees each
+connection, and the port is held by the IDE's process, gone with it,
+where a tunnel left by a killed IDE once held 8000 until a sweep killed
+it under the next one. **A connection to a port nothing serves starts
+its service**: before relaying, the app's hook
+(`taste_devcontainer::activation`, `window::activate_service`) looks for
+the task the config links to the port (`customizations.taste-ide.
+services`), and when it is not running and the container has no
+listener on the port, starts it as the row's play does and holds the
+connection until the server listens, up to a minute, so the page that
+asked loads (David, 2026-10-24). A tunnel is no longer restarted when a
+state is republished over an unchanged container. Where the supervisor
+has no runtime to relay on, it forwards straight to the loopback as it
+used to. **Each Ports row graphs its traffic**, in and out, over the
 last five minutes: the guest is the IDE's, root included, so beside the
 forward the supervisor keeps an nftables table there (`inet taste_ports`,
 `taste_devcontainer::ports`) with a pair of chains per environment that

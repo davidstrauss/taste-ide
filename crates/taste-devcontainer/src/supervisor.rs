@@ -692,6 +692,12 @@ pub struct Supervisor {
     /// The ssh process forwarding a remote container's published ports to
     /// this host's loopback, while the container runs.
     tunnel: Mutex<Option<std::process::Child>>,
+    /// What the tunnel forwards — the VM, its ssh port, and the host ports —
+    /// so a state republished over an unchanged container leaves it alone.
+    tunnel_shape: Mutex<Option<(String, u16, Vec<u16>)>>,
+    /// The listeners on this host's loopback relaying the forwarded ports
+    /// ([`relay_port`]): aborted with the tunnel.
+    relays: Mutex<Vec<tokio::task::AbortHandle>>,
     /// Personal's forwarded ports, served to this machine's other programs
     /// for as long as they are forwarded (`taste_core::discovery`).
     advertised: Mutex<Option<taste_core::discovery::Advertised>>,
@@ -986,6 +992,8 @@ impl Supervisor {
             folder_changes: Arc::new(AtomicU64::new(0)),
             folder_settled: Arc::new(AtomicU64::new(u64::MAX)),
             tunnel: Mutex::new(None),
+            tunnel_shape: Mutex::new(None),
+            relays: Mutex::new(Vec::new()),
             advertised: Mutex::new(None),
             inside,
             disk: Mutex::new(None),
@@ -1467,10 +1475,25 @@ impl Supervisor {
             hosts.sort_unstable();
             hosts
         };
-        self.stop_tunnel();
         let Some(vm) = self.substrate().vm_details().cloned() else {
+            self.stop_tunnel();
             return;
         };
+        // Forwarding exactly this already, through a tunnel still up: a
+        // state republished (the hosting probe's) is no reason to drop
+        // every open connection and forward again, which it was at every
+        // start.
+        let shape = (vm.domain.clone(), vm.ssh_port, forwards.clone());
+        let alive = self
+            .tunnel
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        if alive && self.tunnel_shape.lock().unwrap().as_ref() == Some(&shape) {
+            return;
+        }
+        self.stop_tunnel();
         let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
         // The counters beside the forward: bytes through each published
         // port, both ways, counted in the guest (`crate::ports`). Off this
@@ -1493,7 +1516,22 @@ impl Supervisor {
             self.advertised.lock().unwrap().take();
             return;
         }
-        let (program, args) = keys.ssh_tunnel_argv(vm.ssh_port, &forwards);
+        // Relayed by the IDE where it has a runtime to do it on: the tunnel
+        // forwards each port to a socket of the IDE's, and the IDE listens
+        // on the port, so it sees each connection — and can start the
+        // port's service before passing it on (`crate::activation`). The
+        // port is then held by the IDE's process and goes with it, where a
+        // tunnel left by a killed IDE held it until something reaped it.
+        let relay = tokio::runtime::Handle::try_current().ok();
+        let sockets: Vec<(u16, PathBuf)> = forwards
+            .iter()
+            .map(|host| (*host, self.forward_socket(*host)))
+            .collect();
+        let (program, args) = if relay.is_some() {
+            keys.ssh_relay_argv(vm.ssh_port, &sockets)
+        } else {
+            keys.ssh_tunnel_argv(vm.ssh_port, &forwards)
+        };
         match std::process::Command::new(program)
             .args(args)
             .stdin(Stdio::null())
@@ -1503,15 +1541,24 @@ impl Supervisor {
         {
             Ok(child) => {
                 *self.tunnel.lock().unwrap() = Some(child);
+                *self.tunnel_shape.lock().unwrap() = Some(shape);
+                if let Some(runtime) = &relay {
+                    self.start_relays(runtime, &sockets);
+                }
                 self.advertise_ports();
                 self.log(format!(
-                    "forwarding localhost:{} from VM {}",
+                    "forwarding localhost:{} from VM {}{}",
                     forwards
                         .iter()
                         .map(u16::to_string)
                         .collect::<Vec<_>>()
                         .join(", localhost:"),
-                    vm.domain
+                    vm.domain,
+                    if relay.is_some() {
+                        ", relayed by the IDE"
+                    } else {
+                        ""
+                    }
                 ));
             }
             Err(e) => self.log(format!(
@@ -1557,9 +1604,59 @@ impl Supervisor {
     }
 
     fn stop_tunnel(&self) {
+        for relay in self.relays.lock().unwrap().drain(..) {
+            relay.abort();
+        }
         if let Some(mut child) = self.tunnel.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some((_, _, forwards)) = self.tunnel_shape.lock().unwrap().take() {
+            for host in forwards {
+                let _ = std::fs::remove_file(self.forward_socket(host));
+            }
+        }
+    }
+
+    /// Where the tunnel hands this environment's `host` port to the IDE.
+    fn forward_socket(&self, host: u16) -> PathBuf {
+        taste_core::mcp::runtime_socket(&format!(
+            "taste-{}-{}-port-{host}.sock",
+            self.workspace_key(),
+            self.env.id
+        ))
+    }
+
+    /// Listen on this host's loopbacks for each forwarded port, and relay
+    /// what connects to the tunnel's socket for it ([`relay_port`]).
+    fn start_relays(&self, runtime: &tokio::runtime::Handle, sockets: &[(u16, PathBuf)]) {
+        let container_port: std::collections::HashMap<u16, u16> = self
+            .published_ports
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(port, host)| (*host, *port))
+            .collect();
+        let loopbacks: Vec<std::net::IpAddr> =
+            std::iter::once(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+                .chain(
+                    taste_core::network::ipv6_loopback()
+                        .then_some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+                )
+                .collect();
+        let mut relays = self.relays.lock().unwrap();
+        for (host, socket) in sockets {
+            let port = container_port.get(host).copied().unwrap_or(*host);
+            for address in &loopbacks {
+                let task = runtime.spawn(relay_port(
+                    self.env.id.clone(),
+                    *address,
+                    *host,
+                    port,
+                    socket.clone(),
+                ));
+                relays.push(task.abort_handle());
+            }
         }
     }
 
@@ -5646,6 +5743,75 @@ fn churn_path(rel: &str) -> bool {
     rel.split('/').any(|part| CHURN.contains(&part))
 }
 
+/// One forwarded port on one of this host's loopbacks: listen on `host`,
+/// and relay each connection to the tunnel's `socket` once the app's
+/// activation has had its say about `port`, the container's
+/// (`crate::activation`).
+async fn relay_port(
+    env: EnvironmentId,
+    address: std::net::IpAddr,
+    host: u16,
+    port: u16,
+    socket: PathBuf,
+) {
+    // The tunnel this replaces lets go of the port as its listener's task
+    // ends, which is a moment after it is aborted: a bind that loses that
+    // race is tried again.
+    let mut tries = 0;
+    let listener = loop {
+        match tokio::net::TcpListener::bind((address, host)).await {
+            Ok(listener) => break listener,
+            Err(_) if tries < 30 => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "{env}: localhost:{host} on {address} could not be opened here: {e}"
+                );
+                return;
+            }
+        }
+    };
+    loop {
+        match listener.accept().await {
+            Ok((client, _)) => {
+                tokio::spawn(relay_connection(env.clone(), client, port, socket.clone()));
+            }
+            Err(e) => {
+                tracing::debug!("{env}: accepting on localhost:{host}: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// One connection to a forwarded port: its service brought up first when
+/// it should be, then joined to the tunnel's socket, which appears a
+/// moment after the tunnel connects.
+async fn relay_connection(
+    env: EnvironmentId,
+    mut client: tokio::net::TcpStream,
+    port: u16,
+    socket: PathBuf,
+) {
+    crate::activation::activate(env.clone(), port).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut upstream = loop {
+        match tokio::net::UnixStream::connect(&socket).await {
+            Ok(upstream) => break upstream,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                tracing::warn!("{env}: port {port}'s tunnel is not there ({e})");
+                return;
+            }
+        }
+    };
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+}
+
 /// Run as the container's root with the user's uid and gid and then the
 /// volumes' targets: each target that is a directory, root's, and empty
 /// is given to that uid and gid, and printed ([`Supervisor::settle_new_volumes`]).
@@ -7069,6 +7235,57 @@ mod tests {
     /// until a container is up and its helper has bound. Guessing an
     /// address here would produce the failure this whole batch exists to
     /// remove: an agent that starts fine and has no tools.
+    /// A connection to a relayed port is held for the activation hook,
+    /// given the container's port, and then joined to the tunnel's socket.
+    #[tokio::test]
+    async fn a_relayed_connection_is_activated_then_joined_to_the_tunnel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        static ASKED: std::sync::Mutex<Vec<(String, u16)>> = std::sync::Mutex::new(Vec::new());
+        crate::activation::set(std::sync::Arc::new(|env, port| {
+            Box::pin(async move {
+                ASKED.lock().unwrap().push((env.to_string(), port));
+            })
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("port.sock");
+        // The tunnel's end: an echo.
+        let tunnel = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = tunnel.accept().await {
+                tokio::spawn(async move {
+                    let (mut read, mut write) = stream.split();
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                });
+            }
+        });
+        let host = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        tokio::spawn(relay_port(
+            EnvironmentId::parse("i-relay").unwrap(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            host,
+            3000,
+            socket,
+        ));
+        let mut client = loop {
+            match tokio::net::TcpStream::connect(("127.0.0.1", host)).await {
+                Ok(client) => break client,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        };
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        assert!(ASKED
+            .lock()
+            .unwrap()
+            .contains(&("i-relay".to_string(), 3000)));
+    }
+
     /// A start of an environment that is running leaves it running: no
     /// reload is asked of podman, and the log says why. Two starts asked at
     /// once each rebuilt it, the second replacing the container the first
