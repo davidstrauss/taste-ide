@@ -1827,7 +1827,7 @@ const MOUSE_BACK: u32 = 8;
 const MOUSE_FORWARD: u32 = 9;
 
 /// A toast in the window `widget` is in.
-fn toast(widget: &gtk::Widget, text: &str) {
+pub(crate) fn toast(widget: &gtk::Widget, text: &str) {
     if let Some(overlay) = widget
         .root()
         .and_then(|root| crate::markdown_view::find_toast_overlay(root.upcast_ref()))

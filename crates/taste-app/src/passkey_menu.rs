@@ -392,6 +392,9 @@ pub struct PasskeyMenu {
     autofill: gtk::CheckButton,
     popover: gtk::Popover,
     passkeys: Passkeys,
+    /// The rows' delete buttons, until the rows are drawn again: a hold
+    /// button keeps itself only weakly, and one nothing held never fired.
+    deletes: std::cell::RefCell<Vec<Rc<crate::holdbutton::HoldButton>>>,
 }
 
 impl PasskeyMenu {
@@ -461,6 +464,7 @@ impl PasskeyMenu {
             autofill,
             popover,
             passkeys,
+            deletes: std::cell::RefCell::new(Vec::new()),
         });
         {
             let weak = Rc::downgrade(&menu);
@@ -543,6 +547,7 @@ impl PasskeyMenu {
         while let Some(row) = self.rows.first_child() {
             self.rows.remove(&row);
         }
+        self.deletes.borrow_mut().clear();
         // Deleting the only authenticator when it holds nothing would make
         // the same fresh one again, so there is nothing to delete.
         let deletable = all.len() > 1 || all.iter().any(|a| !a.sites.is_empty());
@@ -593,7 +598,18 @@ impl PasskeyMenu {
                     }
                 });
             }
+            // A press let go early says to hold, as the bar's purge does,
+            // rather than doing nothing where a delete was looked for.
+            {
+                let button = delete.widget.downgrade();
+                delete.set_on_early_release(move |note| {
+                    if let Some(button) = button.upgrade() {
+                        crate::portview::toast(button.upcast_ref(), &note);
+                    }
+                });
+            }
             row.add_suffix(&delete.widget);
+            self.deletes.borrow_mut().push(delete.clone());
             let weak = Rc::downgrade(self);
             let name = authenticator.name.clone();
             row.connect_activated(move |_| {
