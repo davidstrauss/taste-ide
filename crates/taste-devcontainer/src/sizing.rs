@@ -17,9 +17,12 @@
 //! for each, with eight gibibytes held back for the host itself, is two
 //! VMs on a 32 GiB machine — which is where [`room_for`] draws the line.
 //!
-//! Memory is a **commitment**, not a ceiling: qemu never returns the page
-//! cache it grows into, so the configured number is what the host loses.
-//! Disk is the other way round — a sparse overlay on the shared base image
+//! Memory is a **ceiling the host stays able to give**: the guest hands
+//! back what it frees and the page cache it has let go cold
+//! (`crate::provision::GUEST_BALLOON`), so what a VM holds follows what it
+//! uses — but it can take the rest again at any moment, so placement
+//! counts the configured number whole, and two VMs are never admitted on
+//! the strength of one being quiet. Disk is the other way round — a sparse overlay on the shared base image
 //! that grows only as the guest writes — but qcow2 does not shrink when the
 //! guest frees space, so the floor on free space is checked before every
 //! creation rather than assumed from the last one.

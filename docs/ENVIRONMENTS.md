@@ -3229,11 +3229,18 @@ is shouted, but nothing runs either. The rows say what is missing, and
   first VM, where the primary lands. At reconcile every VM a restored
   environment's checkout is in is brought up and registered, and an
   environment whose VM is gone is placed anew (below).
-- **Sizing is a commitment, not a ceiling.** qemu runs with a memfd
-  backend and no balloon, so guest page cache ratchets host RSS to the
-  configured memory and never returns it (measured in the spike: 1.3 GB
-  idle → 8.4 GB after one image build and one cargo build). Each VM
-  therefore appears as its own row in the environment Resources view —
+- **Sizing is a ceiling the host stays able to give.** Without a
+  balloon, guest page cache ratcheted host RSS to the configured memory
+  and never returned it (measured in the spike: 1.3 GB idle → 8.4 GB
+  after one image build and one cargo build; 2026-10-26, a guest using
+  1.2 GiB held 6.3 GiB). So the guest has a balloon that is never
+  inflated and carries free page reporting, and a timer in it hands the
+  host back the page cache gone cold (`provision::GUEST_BALLOON`,
+  `GUEST_RECLAIM_SCRIPT`): a throwaway guest holding 2.6 GiB after a
+  large read went to 764 MiB. What a VM holds now follows what it uses,
+  but it can grow back into the rest at any moment, so placement still
+  counts the configured memory whole. Each VM
+  appears as its own row in the environment Resources view —
   *"taste-799f-k7m2qx — running, 12 vCPU, 10.0 GiB committed, 4.3 GiB on
   disk of 64 GiB"* — because no per-environment number can explain memory
   the VM took and disk a sparse qcow2 will not give back.
@@ -3854,8 +3861,9 @@ using TCP/UDP to access the VMs" is what is portable).
 **So: one machine per workspace, not one per user.** `MACHINE_NAME` stops
 being a constant and becomes a function of the workspace key that already
 labels every container. What that costs is the memory ratchet, which is
-per machine and one-directional: qemu never returns the page cache it
-grows into. Two projects open is two ceilings committed, which argues for
+per machine and one-directional: qemu never returned the page cache it
+grew into (until the balloon, 2026-10-26: "Sizing is a ceiling the host
+stays able to give", above). Two projects open is two ceilings committed, which argues for
 sizing machines smaller once they are per-project, and for stopping a
 machine when its window closes rather than only its containers.
 

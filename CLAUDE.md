@@ -24,7 +24,8 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 \
 **Builds are contended, and it is the HOST they contend for.** Every
 container the IDE runs is in a VM that takes this machine's memory as a
 commitment (a VM's memory is committed, not shared — qemu's RSS climbs to
-the ceiling and stays), and this devcontainer, the one you build in, is
+the ceiling under a build, and the guest hands back what it frees, and
+cache gone cold, only after: `provision::GUEST_BALLOON`), and this devcontainer, the one you build in, is
 rootless podman on this machine's kernel. So a build that goes wrong
 still takes the machine down: two concurrent `cargo build`s power-cycled
 this host twice. **Never start a workspace-wide build while another

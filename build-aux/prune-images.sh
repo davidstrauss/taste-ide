@@ -7,6 +7,12 @@
 # This is that cleanup as a thing you run, ahead of the IDE doing it at the
 # moment a new image replaces an old one.
 #
+# **It is also what every VM runs.** The IDE writes this file into each
+# guest as /usr/local/bin/taste-prune-images and runs it there as `core`,
+# `--apply --dangling`, every six hours, then trims the freed blocks back
+# to the host (`taste_devcontainer::provision::GUEST_TIDY_SERVICE`). A
+# change here is a change to every guest at its next bring-up.
+#
 # ## What decides that an image is garbage
 #
 # **Reachability, never ownership.** An image tag is content-addressed on

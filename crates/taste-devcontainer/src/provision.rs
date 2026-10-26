@@ -186,6 +186,21 @@ pub struct DomainSpec {
     pub serial_log: String,
 }
 
+/// The guest's balloon, there to give memory back rather than to take
+/// it: never inflated, it carries **free page reporting**, the guest
+/// telling qemu which of its pages are free so qemu drops them from its
+/// resident set. Without it a VM's RSS climbed to its configured memory
+/// and stayed there — a guest using 1.2 GiB held 6.3 GiB of the host's
+/// (2026-10-26) — because nothing the guest frees ever reached the host.
+/// Page cache is not free, so the guest also reclaims what of it has gone
+/// cold ([`GUEST_RECLAIM_SCRIPT`]); between the two a throwaway guest
+/// holding 2.6 GiB after a large read went to 764 MiB, under the 829 it
+/// booted at (2026-10-26). The configured memory stays the ceiling, and
+/// placement still counts it whole (`crate::sizing`): a guest can grow
+/// back into it at any moment. Written into a VM made before it at its
+/// next boot ([`LibvirtSession::start`]).
+pub const GUEST_BALLOON: &str = "<memballoon model='virtio' freePageReporting='on'/>";
+
 /// The libvirt domain XML for a spec.
 ///
 /// Three things in here are load-bearing and easy to lose:
@@ -290,10 +305,7 @@ pub fn domain_xml(spec: &DomainSpec) -> Result<String> {
         xml,
         "    <rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>"
     )?;
-    // No balloon, said to libvirt, which adds one otherwise: the memory
-    // is a commitment (module docs), and a balloon would only make the
-    // guest's RSS look reclaimable when it is not.
-    writeln!(xml, "    <memballoon model='none'/>")?;
+    writeln!(xml, "    {GUEST_BALLOON}")?;
     writeln!(xml, "  </devices>")?;
     writeln!(xml, "</domain>")?;
     Ok(xml)
@@ -451,6 +463,69 @@ fi
 pub const GUEST_IDLE_OFF_SERVICE: &str = "[Unit]\nDescription=Power off when the IDE has been gone a while\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/taste-idle-off\n";
 pub const GUEST_IDLE_OFF_TIMER: &str = "[Unit]\nDescription=Check every minute whether the IDE is still here\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=1min\n\n[Install]\nWantedBy=timers.target\n";
 
+/// The other half of [`GUEST_BALLOON`]: page cache the guest has not
+/// touched lately, handed back. The balloon reports free pages, and cache
+/// is not free, so a guest that had read a gigabyte once held it in the
+/// host's memory for good. The kernel's own cold-page reclaimer,
+/// DAMON_RECLAIM, was tried first and is in this kernel: it spent its
+/// budget scanning the guest's free memory, which looks as cold to it as
+/// cache does, and returned 0.46 GiB of 1.8 (2026-10-26). The cgroup's
+/// `memory.reclaim` took the rest in 73 ms. What it takes is the inactive
+/// file list past half a gibibyte — cache the kernel itself has judged
+/// cold, coldest first — and a page taken is read back through the host's
+/// own page cache, which the host can reclaim, rather than kept twice. A
+/// guest without the balloon (a cloud host, or a VM between this being
+/// written and its next boot) has nobody to give memory to, and does
+/// nothing. Written by Ignition for a new VM, and into one that predates
+/// it at bring-up ([`LibvirtSession::tune_guest_shutdown`]).
+pub const GUEST_RECLAIM_SCRIPT_PATH: &str = "/usr/local/bin/taste-reclaim";
+pub const GUEST_RECLAIM_SCRIPT: &str = r#"#!/bin/sh
+# Hand the host back the page cache this guest has not touched lately: the
+# balloon reports free pages to it, and cache is not free. Written by the
+# IDE (taste_devcontainer::provision); a change here is a change there.
+ls /sys/bus/virtio/drivers/virtio_balloon/ 2>/dev/null | grep -q '^virtio' || exit 0
+keep=524288
+inactive=$(awk '/^Inactive\(file\):/ { print $2 }' /proc/meminfo)
+[ "${inactive:-0}" -gt "$keep" ] || exit 0
+echo "$((inactive - keep))K" > /sys/fs/cgroup/memory.reclaim 2>/dev/null || true
+"#;
+pub const GUEST_RECLAIM_SERVICE: &str = "[Unit]\nDescription=Hand the host back cold page cache\n\n[Service]\nType=oneshot\nLogLevelMax=notice\nExecStart=/usr/local/bin/taste-reclaim\n";
+pub const GUEST_RECLAIM_TIMER: &str = "[Unit]\nDescription=Hand the host back cold page cache every minute\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=10s\n\n[Install]\nWantedBy=timers.target\n";
+
+/// The guest's tidy: the IDE's stale images collected, then the freed
+/// blocks trimmed back to the host. Every config edit mints a
+/// `taste-img-<hash>` and nothing removed the one it replaced, so a VM's
+/// podman store kept every generation; and what the guest frees reaches
+/// the host only when it is trimmed — the disk passes discards through
+/// (`discard='unmap'`), but Fedora's own `fstrim.timer` is weekly, and a
+/// VM that had written 53 GiB still held 51 of them (2026-10-26). The
+/// collecting is `build-aux/prune-images.sh`, the same file, run as
+/// `core` — one policy, by reachability, for the host's podman and a
+/// VM's — with its untagged images older than an hour, which no build
+/// still running can want. The trim waits half a minute after the collect:
+/// XFS will not discard an extent freed since its last log checkpoint, and
+/// a trim straight after a delete handed back 121 MiB of a gibibyte where
+/// one ten seconds later handed back all of it (2026-10-26); thirty is the
+/// interval XFS checkpoints on. Every six hours, and ten minutes after
+/// boot.
+pub const GUEST_PRUNE_SCRIPT_PATH: &str = "/usr/local/bin/taste-prune-images";
+pub const GUEST_PRUNE_SCRIPT: &str = include_str!("../../../build-aux/prune-images.sh");
+pub const GUEST_TIDY_SERVICE: &str = "[Unit]\nDescription=Collect stale images and hand freed disk back to the host\n\n[Service]\nType=oneshot\nNice=19\nIOSchedulingClass=idle\nExecStart=-runuser -u core -- env XDG_RUNTIME_DIR=/run/user/1000 /usr/local/bin/taste-prune-images --apply --dangling\nExecStart=sync\nExecStart=sleep 30\nExecStart=fstrim --all --quiet-unsupported\n";
+pub const GUEST_TIDY_TIMER: &str = "[Unit]\nDescription=Tidy the guest's images and disk every six hours\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=6h\n\n[Install]\nWantedBy=timers.target\n";
+
+/// Units of Fedora CoreOS's that a VM made to be thrown away has no use
+/// for, masked. zincati updates the guest by rebooting it, which a VM
+/// never does (module docs), and masked it is a process gone rather than
+/// one running with nothing to do — 24 MiB of every guest; the timers
+/// count the machine to Fedora, fetch firmware metadata for virtual
+/// hardware, and scrub a RAID there is none of.
+pub const GUEST_MASKED_UNITS: [&str; 4] = [
+    "zincati.service",
+    "rpm-ostree-countme.timer",
+    "fwupd-refresh.timer",
+    "raid-check.timer",
+];
+
 /// How long a closed window's VM keeps running before its shutdown is
 /// sent: a relaunch inside this cancels it and finds the VM up
 /// (`LibvirtSession::shutdown_deferred`, `cancel_deferred_shutdown`),
@@ -509,14 +584,12 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
         "group": core_group,
     })];
     // No self-updates: an update reboots the guest, and a reboot kills
-    // every container in it. Fresh releases arrive as fresh VMs.
-    files.push(serde_json::json!({
-        "path": "/etc/zincati/config.d/90-disable-auto-updates.toml",
-        "mode": 420,
-        "overwrite": true,
-        "contents": { "source": data_url("[updates]\nenabled = false\n") },
-    }));
-    let mut units: Vec<serde_json::Value> = Vec::new();
+    // every container in it. Fresh releases arrive as fresh VMs. zincati
+    // is masked with the rest of what a throwaway VM has no use for.
+    let mut units: Vec<serde_json::Value> = GUEST_MASKED_UNITS
+        .iter()
+        .map(|name| serde_json::json!({ "name": name, "mask": true }))
+        .collect();
     if let Some(host_key) = &spec.host_key {
         files.push(serde_json::json!({
             "path": "/etc/ssh/ssh_host_ed25519_key",
@@ -576,6 +649,31 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
         "enabled": true,
         "contents": GUEST_IDLE_OFF_TIMER,
     }));
+    // ...and keeps only what it is using of the host's memory and disk
+    // (`GUEST_RECLAIM_*`, `GUEST_TIDY_*`).
+    for (path, contents) in [
+        (GUEST_RECLAIM_SCRIPT_PATH, GUEST_RECLAIM_SCRIPT),
+        (GUEST_PRUNE_SCRIPT_PATH, GUEST_PRUNE_SCRIPT),
+    ] {
+        files.push(serde_json::json!({
+            "path": path,
+            "mode": 493,
+            "overwrite": true,
+            "contents": { "source": data_url(contents) },
+        }));
+    }
+    for (name, contents, enabled) in [
+        ("taste-reclaim.service", GUEST_RECLAIM_SERVICE, false),
+        ("taste-reclaim.timer", GUEST_RECLAIM_TIMER, true),
+        ("taste-tidy.service", GUEST_TIDY_SERVICE, false),
+        ("taste-tidy.timer", GUEST_TIDY_TIMER, true),
+    ] {
+        let mut unit = serde_json::json!({ "name": name, "contents": contents });
+        if enabled {
+            unit["enabled"] = serde_json::json!(true);
+        }
+        units.push(unit);
+    }
     let config = serde_json::json!({
         "ignition": { "version": "3.4.0" },
         "passwd": {
@@ -679,6 +777,14 @@ fn escape(text: &str) -> String {
         }
     }
     out
+}
+
+/// A domain's XML with [`GUEST_BALLOON`] in place of the no-balloon a VM
+/// was made with before it, or `None` when there is nothing to swap —
+/// it has the balloon already, or a device the IDE did not write.
+pub fn with_balloon(xml: &str) -> Option<String> {
+    const NONE: &str = "<memballoon model='none'/>";
+    xml.contains(NONE).then(|| xml.replace(NONE, GUEST_BALLOON))
 }
 
 /// The inverse, for what comes back out of `virsh dumpxml`.
@@ -888,9 +994,10 @@ impl Vm {
 ///
 /// Two of these are configuration read back from libvirt and one is the
 /// disk's allocation on the host, and they are kept apart on purpose: the
-/// memory number is what the host *loses* (no balloon, so RSS climbs to it
-/// and stays), while the disk number is what the VM has *taken so far* of
-/// a sparse ceiling.
+/// memory number is what the host must be able to *give* (the guest hands
+/// back what it frees, [`GUEST_BALLOON`], and can take it again at any
+/// moment), while the disk number is what the VM has *taken so far* of a
+/// sparse ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmFacts {
     pub running: bool,
@@ -1318,6 +1425,9 @@ impl LibvirtSession {
         if let Err(e) = self.grow_vcpus(vm).await {
             self.say(&vm.domain, format!("its vCPUs could not be raised: {e:#}"));
         }
+        if let Err(e) = self.give_balloon(vm).await {
+            self.say(&vm.domain, format!("its balloon could not be added: {e:#}"));
+        }
         self.say(&vm.domain, "starting the domain");
         self.virsh(&["start", &vm.domain])
             .await
@@ -1645,8 +1755,10 @@ impl LibvirtSession {
             self.say(
                 &vm.domain,
                 "guest tuned: stop timeouts of 10s per unit and 15s for the user manager, a \
-                 power-off five minutes after the last ssh session, and sshd's connection \
-                 limits sized for the IDE",
+                 power-off five minutes after the last ssh session, sshd's connection \
+                 limits sized for the IDE, cold page cache handed back every minute, stale \
+                 images collected and the disk trimmed every six hours, and zincati and \
+                 Fedora's countme, firmware, and RAID timers masked",
             );
         }
         Ok(())
@@ -1678,6 +1790,35 @@ impl LibvirtSession {
                 "raised its vCPUs from {} to {want} for this boot",
                 facts.cpus
             ),
+        );
+        Ok(())
+    }
+
+    /// Give a VM made before [`GUEST_BALLOON`] its balloon, for the next
+    /// boot: its XML read back, the `model='none'` it was made with
+    /// swapped for the balloon ([`with_balloon`]), and defined again. A VM
+    /// on a cloud host has no domain here.
+    async fn give_balloon(&self, vm: &Vm) -> Result<()> {
+        if vm.cloud.is_some() {
+            return Ok(());
+        }
+        let xml = self.virsh(&["dumpxml", "--inactive", &vm.domain]).await?;
+        let Some(xml) = with_balloon(&xml) else {
+            return Ok(());
+        };
+        let xml_path = Keys::for_workspace(&vm.workspace_root)
+            .dir()
+            .join(format!("{}.xml", vm.domain));
+        std::fs::write(&xml_path, xml)
+            .with_context(|| format!("writing {}", xml_path.display()))?;
+        let defined = self
+            .virsh(&["define", &xml_path.display().to_string()])
+            .await;
+        let _ = std::fs::remove_file(&xml_path);
+        defined?;
+        self.say(
+            &vm.domain,
+            "given the balloon that hands the host back what its guest frees, from this boot",
         );
         Ok(())
     }
@@ -2018,9 +2159,10 @@ xfs_growfs "$(findmnt -rn -S "$src" -O rw -o TARGET | head -1)" >/dev/null
 
 /// The script `tune_guest_shutdown` runs as root in the guest: every
 /// file the Ignition would have written — the stop timeouts, the idle
-/// power-off script and its units — written where it differs, then
-/// systemd reloaded and the timer enabled. Each file travels in a quoted
-/// heredoc, so its quotes and dollars reach the guest as written.
+/// power-off, the cache reclaim, and the tidy, scripts and units — written
+/// where it differs, then systemd reloaded, the timers enabled, and the
+/// units a throwaway VM has no use for masked. Each file travels in a
+/// quoted heredoc, so its quotes and dollars reach the guest as written.
 fn guest_tuning_script() -> String {
     let mut script = String::from(
         "set -e\nchanged=0\nput() { if ! cmp -s \"$1\" \"$2\"; then mkdir -p \"$(dirname \"$2\")\"; \
@@ -2043,6 +2185,22 @@ fn guest_tuning_script() -> String {
         GUEST_IDLE_OFF_TIMER,
         "644",
     ));
+    files.push((GUEST_RECLAIM_SCRIPT_PATH, GUEST_RECLAIM_SCRIPT, "755"));
+    files.push((GUEST_PRUNE_SCRIPT_PATH, GUEST_PRUNE_SCRIPT, "755"));
+    for (path, contents) in [
+        (
+            "/etc/systemd/system/taste-reclaim.service",
+            GUEST_RECLAIM_SERVICE,
+        ),
+        (
+            "/etc/systemd/system/taste-reclaim.timer",
+            GUEST_RECLAIM_TIMER,
+        ),
+        ("/etc/systemd/system/taste-tidy.service", GUEST_TIDY_SERVICE),
+        ("/etc/systemd/system/taste-tidy.timer", GUEST_TIDY_TIMER),
+    ] {
+        files.push((path, contents, "644"));
+    }
     for (index, (path, contents, mode)) in files.iter().enumerate() {
         script.push_str(&format!(
             "cat > /tmp/taste-tune-{index} <<'TASTE_EOF'\n{contents}TASTE_EOF\nput /tmp/taste-tune-{index} {path} {mode}\n"
@@ -2056,9 +2214,17 @@ fn guest_tuning_script() -> String {
     ));
     // A reload keeps the sessions it has, this one included; a config
     // sshd would refuse is not reloaded into, so the old one stays.
+    // Masked where it is not yet, and stopped with it.
+    for unit in GUEST_MASKED_UNITS {
+        script.push_str(&format!(
+            "if [ \"$(systemctl is-enabled {unit} 2>/dev/null)\" != masked ]; then \
+             systemctl mask --now {unit} >/dev/null 2>&1 && changed=1; fi\n"
+        ));
+    }
     script.push_str(
         "if [ \"$changed\" = 1 ]; then systemctl daemon-reload; \
-         systemctl enable --now taste-idle-off.timer >/dev/null 2>&1 || true; \
+         systemctl enable --now taste-idle-off.timer taste-reclaim.timer taste-tidy.timer \
+         >/dev/null 2>&1 || true; \
          sshd -t && systemctl reload sshd.service >/dev/null 2>&1 || true; echo changed; fi\n",
     );
     script
@@ -2282,6 +2448,15 @@ mod tests {
         assert!(tuning.contains("taste-idle-off.timer"));
         assert!(tuning.contains("sport = :22"));
         assert!(tuning.contains("enable --now taste-idle-off.timer"));
+        // ...and the cache reclaim and the tidy, in both.
+        for timer in ["taste-reclaim.timer", "taste-tidy.timer"] {
+            assert!(text.contains(timer), "{timer} missing from the Ignition");
+            assert!(tuning.contains(timer), "{timer} missing from the tuning");
+        }
+        assert!(text.contains(super::GUEST_RECLAIM_SCRIPT_PATH));
+        assert!(text.contains(super::GUEST_PRUNE_SCRIPT_PATH));
+        assert!(tuning.contains("/sys/fs/cgroup/memory.reclaim"));
+        assert!(tuning.contains("--apply --dangling"));
         assert!(
             text.contains("DefaultTimeoutStopSec%3D10s")
                 || text.contains("DefaultTimeoutStopSec=10s")
@@ -2375,8 +2550,8 @@ mod tests {
             "nested virt wants it:\n{xml}"
         );
         assert!(
-            xml.contains("<memballoon model='none'/>"),
-            "no balloon:\n{xml}"
+            xml.contains("<memballoon model='virtio' freePageReporting='on'/>"),
+            "the balloon that hands freed memory back:\n{xml}"
         );
         assert!(xml.contains("<name>taste-799fd7acd369bf5c-k7m2qx</name>"));
         assert!(xml.contains("<memory unit='MiB'>10240</memory>"));
@@ -2624,18 +2799,39 @@ mod tests {
     }
 
     /// The guest never updates itself: an update is a reboot, and a reboot
-    /// is every container in it killed. Fresh releases are fresh VMs.
+    /// is every container in it killed. Fresh releases are fresh VMs. So
+    /// zincati is masked, with the rest a throwaway VM has no use for, in
+    /// a new VM's Ignition and in the tuning an older one is given.
     #[test]
     fn the_guest_has_auto_updates_switched_off() {
         let parsed: serde_json::Value = serde_json::from_str(&ignition(&guest()).unwrap()).unwrap();
-        let zincati = parsed["storage"]["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["path"] == "/etc/zincati/config.d/90-disable-auto-updates.toml")
-            .expect("zincati is configured");
-        let source = zincati["contents"]["source"].as_str().unwrap();
-        assert!(source.contains("enabled%20%3D%20false"), "{source}");
+        let units = parsed["systemd"]["units"].as_array().unwrap();
+        let tuning = guest_tuning_script();
+        for name in GUEST_MASKED_UNITS {
+            assert!(
+                units
+                    .iter()
+                    .any(|u| u["name"] == name && u["mask"] == serde_json::json!(true)),
+                "{name} is not masked in the Ignition"
+            );
+            assert!(
+                tuning.contains(&format!("systemctl mask --now {name}")),
+                "{name} is not masked by the tuning"
+            );
+        }
+        assert!(GUEST_MASKED_UNITS.contains(&"zincati.service"));
+    }
+
+    /// A VM made before the balloon gets it in place of the no-balloon it
+    /// was made with, and one that has it is left alone.
+    #[test]
+    fn an_older_domain_is_given_the_balloon() {
+        let old = "<devices>\n    <memballoon model='none'/>\n  </devices>";
+        let new = with_balloon(old).expect("swapped");
+        assert!(new.contains(GUEST_BALLOON), "{new}");
+        assert!(!new.contains("model='none'"), "{new}");
+        assert_eq!(with_balloon(&new), None);
+        assert_eq!(with_balloon(&domain_xml(&spec()).unwrap()), None);
     }
 
     /// A guest not asked to be isolated carries no ruleset at all, rather
