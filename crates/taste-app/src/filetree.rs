@@ -4894,6 +4894,15 @@ impl FileTree {
             ]);
             task
         };
+        // One that runs on either, on a file's menu and a folder's.
+        let on_either = |name: &str, desc: &str, state| {
+            let mut task = row(name, desc, state);
+            task.info.requires = Some(vec![Required {
+                name: taste_core::tasks::FILE_OR_DIR_VAR.to_string(),
+                allowed: Allowed::Any,
+            }]);
+            task
+        };
         // What their runs said: a build three minutes ago, a suite saying
         // a little all along and more now, a seed that failed after a few
         // lines; the rest nothing.
@@ -4944,6 +4953,7 @@ impl FileTree {
                 row("build", "Build the workspace", RunState::Succeeded),
                 row("test", "Run the test suite", RunState::Running),
                 on_file("lint", "", RunState::Idle),
+                on_either("fmt", "Format a file or a folder", RunState::Idle),
                 row("dev", "Build for dev", RunState::Idle),
                 row("dev:init", "Seed the dev database", RunState::Failed),
                 row("dev:serve", "Serve on :3000", RunState::Idle),
@@ -5574,16 +5584,16 @@ impl FileTree {
         let paths: Vec<&str> = asked
             .iter()
             .map(|required| required.name.as_str())
-            .filter(|name| {
-                *name == taste_core::tasks::FILE_VAR || *name == taste_core::tasks::DIR_VAR
-            })
+            .filter(|name| taste_core::tasks::is_path_var(name))
             .collect();
         let extra = gtk::Box::new(gtk::Orientation::Vertical, 12);
         extra.append(&list);
         if !paths.is_empty() {
             let (names, verb) = match paths.as_slice() {
                 [one] => (one.to_string(), "is a path"),
-                many => (many.join(" and "), "are paths"),
+                [one, two] => (format!("{one} and {two}"), "are paths"),
+                [rest @ .., last] => (format!("{}, and {last}", rest.join(", ")), "are paths"),
+                [] => unreachable!("not empty"),
             };
             extra.append(
                 &gtk::Label::builder()
@@ -5861,23 +5871,16 @@ impl FileTree {
         }
 
         // The tasks that run on this: one whose `requires` asks for `FILE`
-        // on a file's menu, for `DIR` on a folder's, given this one's path
-        // (`taste_core::tasks::FILE_VAR`). Anything else it asks for is
-        // asked when it is chosen.
+        // on a file's menu, for `DIR` on a folder's, and for `FILE_OR_DIR`
+        // on either, given this one's path (`TaskInfo::path_var`). Anything
+        // else it asks for is asked when it is chosen.
         if !node.ghost {
-            let var = if node.is_dir {
-                taste_core::tasks::DIR_VAR
-            } else {
-                taste_core::tasks::FILE_VAR
-            };
             let (offered, runnable) = {
                 let tasks = self.tasks.borrow();
-                let offered: Vec<crate::tasks::TaskInfo> = tasks
+                let offered: Vec<(crate::tasks::TaskInfo, &'static str)> = tasks
                     .0
                     .iter()
-                    .map(|row| &row.info)
-                    .filter(|info| info.takes(var))
-                    .cloned()
+                    .filter_map(|row| Some((row.info.clone(), row.info.path_var(node.is_dir)?)))
                     .collect();
                 (offered, tasks.1.is_none())
             };
@@ -5888,7 +5891,7 @@ impl FileTree {
                     rel.to_string_lossy().into_owned()
                 };
                 let section = gio::Menu::new();
-                for (index, info) in offered.into_iter().enumerate() {
+                for (index, (info, var)) in offered.into_iter().enumerate() {
                     let action_name = format!("task-{index}");
                     // A menu label's underscore is a mnemonic's mark.
                     section.append(
@@ -9990,7 +9993,8 @@ impl FileTree {
             });
         }
         // `TASTE_PROBE_TASKMENU=<path>`: that row's menu open, as a
-        // right-click leaves it, with the seeded tasks that run on it.
+        // right-click leaves it, with the seeded tasks that run on it —
+        // once the row is drawn, which a listing still landing can delay.
         static TASK_MENU: std::sync::Once = std::sync::Once::new();
         if let (Ok(path), false) = (
             std::env::var("TASTE_PROBE_TASKMENU"),
@@ -9998,8 +10002,12 @@ impl FileTree {
         ) {
             TASK_MENU.call_once(|| {});
             let tree = self.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
-                let path = tree.view_root().join(path);
+            let path = match path.as_str() {
+                "." => self.view_root(),
+                rel => self.view_root().join(rel),
+            };
+            let tries = Cell::new(0);
+            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 let node = tree.tree_selection().and_then(|(_, _, model)| {
                     (0..model.n_items())
                         .filter_map(|i| model.row(i))
@@ -10014,10 +10022,31 @@ impl FileTree {
                     .and_then(|handle| handle.label.upgrade())
                     .and_then(|label| label.parent())
                     .and_downcast::<gtk::Box>();
-                match (node, anchor) {
-                    (Some(node), Some(anchor)) => tree.show_context_menu(&anchor, &node),
-                    _ => println!("task menu probe: no row for {}", path.display()),
+                // `.`: the project folder's own menu, on its header row,
+                // which is drawn whatever the listing has scrolled to.
+                let (node, anchor) = if path == tree.view_root() {
+                    (
+                        Some(FileNode {
+                            path: path.clone(),
+                            is_dir: true,
+                            ghost: false,
+                            create: None,
+                        }),
+                        tree.root_label.parent().and_downcast::<gtk::Box>(),
+                    )
+                } else {
+                    (node, anchor)
+                };
+                if let (Some(node), Some(anchor)) = (node, anchor) {
+                    tree.show_context_menu(&anchor, &node);
+                    return glib::ControlFlow::Break;
                 }
+                tries.set(tries.get() + 1);
+                if tries.get() >= 40 {
+                    println!("task menu probe: no row for {}", path.display());
+                    return glib::ControlFlow::Break;
+                }
+                glib::ControlFlow::Continue
             });
         }
         // `TASTE_PROBE_SELECTION=1`: README.md in front, then the first

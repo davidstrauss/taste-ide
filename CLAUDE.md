@@ -256,7 +256,8 @@ the keyboard is;
 question the seeded `lint`'s play asks — a field for `FILE`, a choice for
 its `MODE` enum — and `=file` asks it as a file's menu does, the file
 given; `TASTE_PROBE_TASKMENU=<path>` opens that row's menu, its Run Task
-section among the rest;
+section among the rest (a row the listing has drawn; `.` is the project
+folder's own, on its header, which a folder's `FILE_OR_DIR` task is on);
 `TASTE_PROBE_LINK=<path#fragment>` opens a reference as a clicked link
 opens it (`taste_core::anchor`: `#L12` a line, a PDF's `#page=3`), and
 for a PDF prints the page in view once it is up;

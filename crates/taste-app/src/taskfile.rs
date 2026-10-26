@@ -1,7 +1,7 @@
 //! What each listed task asks to be given, read from the Taskfiles by the
 //! confined `taste-taskfile` helper: the Tasks section's play asks for it,
-//! and the file tree's menus offer a task that takes `FILE` on a file and
-//! one that takes `DIR` on a folder (`taste_core::tasks::FILE_VAR`).
+//! and the file tree's menus offer a task that takes `FILE` on a file, one
+//! that takes `DIR` on a folder, and one that takes `FILE_OR_DIR` on both (`taste_core::tasks::FILE_VAR`).
 //!
 //! **Read in the helper, never here.** A Taskfile is YAML a repository
 //! wrote, and the parser is someone else's code, so it runs in a process

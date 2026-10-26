@@ -463,7 +463,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 .into_iter()
                 .map(|(var, value)| {
                     let value = match &workdir {
-                        Some(workdir) if is_path_var(&var) => container_path(workdir, &value),
+                        Some(workdir) if taste_core::tasks::is_path_var(&var) => {
+                            container_path(workdir, &value)
+                        }
                         _ => value,
                     };
                     (var, value)
@@ -6732,13 +6734,6 @@ fn ask_folder_conflict(
 /// page that is drawing the next start.
 fn startup_state_now(startup: &crate::startup::StartupPage) -> Option<bool> {
     Some(startup.underway() && !startup.settled())
-}
-
-/// Whether a task's variable is a path: `FILE` or `DIR`, which the file
-/// tree's menus give and the play's question takes relative to the
-/// checkout.
-fn is_path_var(var: &str) -> bool {
-    var == taste_core::tasks::FILE_VAR || var == taste_core::tasks::DIR_VAR
 }
 
 /// A path as the task is given it: absolute in the container, so it names

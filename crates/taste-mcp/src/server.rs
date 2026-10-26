@@ -264,7 +264,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 18;
+pub const GUIDANCE_REVISION: u32 = 19;
 
 /// `result` with each image block replaced by
 /// [`taste_core::imageless::WITHHELD`].
@@ -394,10 +394,10 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              shell or ide_exec, or in the user's terminal: each is shown in the user's Tasks \
              section with its output. A task that takes arguments after `--` or asks for \
              input runs from a shell. A task that works on one file or folder takes it as \
-             a required variable named FILE or DIR (`requires: {vars: [FILE]}`), given as an \
-             absolute path and quoted where it is used (`{{q .FILE}}`): the user's file tree \
-             then offers it on that file's or folder's menu, and its play button asks for \
-             each variable its `requires` names.\n\n\
+             a required variable named FILE (a file), DIR (a folder), or FILE_OR_DIR (either), \
+             as in `requires: {vars: [FILE]}`, given as an absolute path and quoted where it \
+             is used (`{{q .FILE}}`): the user's file tree then offers it on that file's or \
+             folder's menu, and its play button asks for each variable its `requires` names.\n\n\
              WAITING. To wait for something, call wait, never sleep: name the tasks \
              (`tasks`) or ide_exec handles (`commands`) to wait for, and `seconds` as the \
              longest to wait. It returns as soon as one of them finishes, when the time is \
@@ -6612,8 +6612,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "5623916aaa1faddd448196116c2b484ae4a193fc3168b49086b836d7a5e4c4a9";
-        const AT_REVISION: u32 = 18;
+            "1a65cb303bc2834108a7084182ef3ce167dbf1220d49f9231063802dad6934ad";
+        const AT_REVISION: u32 = 19;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

@@ -66,6 +66,16 @@ impl TaskInfo {
             .flatten()
             .any(|required| required.name == var)
     }
+
+    /// The variable it is given a file's path in (`is_dir` false) or a
+    /// folder's, when it asks for one: the one that names only that kind
+    /// first, then [`FILE_OR_DIR_VAR`].
+    pub fn path_var(&self, is_dir: bool) -> Option<&'static str> {
+        let own = if is_dir { DIR_VAR } else { FILE_VAR };
+        [own, FILE_OR_DIR_VAR]
+            .into_iter()
+            .find(|var| self.takes(var))
+    }
 }
 
 /// Where a task is defined, as `task --list-all --json` says.
@@ -101,6 +111,16 @@ pub enum Allowed {
 pub const FILE_VAR: &str = "FILE";
 /// The same for a folder.
 pub const DIR_VAR: &str = "DIR";
+/// The same for either: offered on a file's menu and a folder's. Not
+/// `PATH`, which Task would take from the environment, so a task that
+/// required it would always have it.
+pub const FILE_OR_DIR_VAR: &str = "FILE_OR_DIR";
+
+/// Whether `var` is one of the path variables, whose value is a path in
+/// the container.
+pub fn is_path_var(var: &str) -> bool {
+    [FILE_VAR, DIR_VAR, FILE_OR_DIR_VAR].contains(&var)
+}
 
 /// What a task's last run came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1194,6 +1214,36 @@ mod tests {
             })
         );
         assert_eq!(tasks[0].requires, None);
+    }
+
+    /// A task offered on a file's menu or a folder's is given the path in
+    /// the variable that names that kind, or the one that names either.
+    #[test]
+    fn a_path_goes_in_the_variable_that_takes_it() {
+        let task = |vars: &[&str]| TaskInfo {
+            requires: Some(
+                vars.iter()
+                    .map(|name| Required {
+                        name: name.to_string(),
+                        allowed: Allowed::Any,
+                    })
+                    .collect(),
+            ),
+            ..TaskInfo::named("t", "")
+        };
+        assert_eq!(task(&["FILE"]).path_var(false), Some(FILE_VAR));
+        assert_eq!(task(&["FILE"]).path_var(true), None);
+        assert_eq!(task(&["DIR"]).path_var(true), Some(DIR_VAR));
+        let either = task(&["FILE_OR_DIR"]);
+        assert_eq!(either.path_var(false), Some(FILE_OR_DIR_VAR));
+        assert_eq!(either.path_var(true), Some(FILE_OR_DIR_VAR));
+        // Both: the one that names the kind.
+        assert_eq!(
+            task(&["FILE_OR_DIR", "FILE"]).path_var(false),
+            Some(FILE_VAR)
+        );
+        assert_eq!(TaskInfo::named("t", "").path_var(false), None);
+        assert!(is_path_var("FILE_OR_DIR") && !is_path_var("PATH"));
     }
 
     /// Variables go on the command line as `NAME=value`, a name Task takes

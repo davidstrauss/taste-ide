@@ -1,8 +1,8 @@
 //! What each task of a Taskfile asks to be given: the variables its
 //! `requires` names that nothing else gives a value, and the values each
 //! may take — for the Tasks section's play, which asks for them, and the
-//! file tree's menus, which offer a task that takes `FILE` on a file and
-//! one that takes `DIR` on a folder.
+//! file tree's menus, which offer a task that takes `FILE` on a file, one
+//! that takes `DIR` on a folder, and one that takes `FILE_OR_DIR` on both.
 //!
 //! **Read from the Taskfile, held to Task.** `task --list-all --json`
 //! names every task, the file it is in, and where, but says nothing of
