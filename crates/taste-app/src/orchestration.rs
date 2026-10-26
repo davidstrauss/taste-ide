@@ -50,6 +50,8 @@ pub fn attach(
     find: FindInside,
 ) {
     let requests = workspace.orchestration.requests();
+    let root = workspace.root().to_path_buf();
+    let events = workspace.events.clone();
     glib::spawn_future_local(async move {
         while let Ok((request, reply)) = requests.recv().await {
             match request {
@@ -61,6 +63,7 @@ pub fn attach(
                     agent,
                     model,
                     host,
+                    brief,
                 } => {
                     if let Some(reopens) = chats.allowance_exhausted() {
                         let _ = reply
@@ -73,12 +76,14 @@ pub fn attach(
                     // session to come up, and a second orchestration call
                     // queued behind it would wait for all of that. The
                     // reply channel is what keeps them in step.
-                    let reply = reply.clone();
-                    let answer = move |answer: OrchestrationReply| {
-                        glib::spawn_future_local(async move {
-                            let _ = reply.send(answer).await;
-                        });
-                    };
+                    let answer = answer_or_finish(
+                        reply.clone(),
+                        chats.clone(),
+                        root.clone(),
+                        events.clone(),
+                        id.clone(),
+                        brief,
+                    );
                     // An environment, then its chat — in that order,
                     // because a chat is an environment's conversation and
                     // there is nowhere to put one until the clone exists.
@@ -109,26 +114,30 @@ pub fn attach(
                 }
                 // A stranded start's second half: the environment exists,
                 // so only its chat is opened.
-                OrchestrationRequest::FinishIssue { env, model } => {
+                OrchestrationRequest::FinishIssue { env, model, brief } => {
                     if let Some(reopens) = chats.allowance_exhausted() {
                         let _ = reply
                             .send(OrchestrationReply::Error(exhausted(&reopens)))
                             .await;
                         continue;
                     }
-                    let reply = reply.clone();
+                    let answer = answer_or_finish(
+                        reply.clone(),
+                        chats.clone(),
+                        root.clone(),
+                        events.clone(),
+                        env.clone(),
+                        brief,
+                    );
                     chats.create_orchestrated(
                         env,
                         None,
                         model,
                         Box::new(move |outcome| {
-                            let answer = match outcome {
+                            answer(match outcome {
                                 Ok(created) => OrchestrationReply::Created(created),
                                 Err(message) => OrchestrationReply::Error(message),
-                            };
-                            glib::spawn_future_local(async move {
-                                let _ = reply.send(answer).await;
-                            });
+                            })
                         }),
                     );
                 }
@@ -171,6 +180,76 @@ pub fn attach(
             }
         }
     });
+}
+
+/// How a start's answer is given: to the caller, while it waits — or, once
+/// it has stopped waiting, by finishing the start here, as the caller would
+/// have on that answer. `issue_start` waits two minutes for the
+/// environment and its chat, and php-src's clone took all of them; the
+/// tool gave up, the strip went on and made the chat, and its agent sat
+/// made and idle, never told the issue, with the issue never recorded as
+/// started (2026-10-26). So a `Created` nobody receives is followed through
+/// here: the start recorded, then the brief sent — in that order, so a
+/// start that cannot be recorded leaves the chat idle rather than working
+/// on an issue nobody knows is taken.
+fn answer_or_finish(
+    reply: async_channel::Sender<OrchestrationReply>,
+    chats: Rc<Chats>,
+    root: std::path::PathBuf,
+    events: taste_core::EventBus,
+    issue: taste_core::environment::EnvironmentId,
+    brief: String,
+) -> impl FnOnce(OrchestrationReply) + 'static {
+    move |answer: OrchestrationReply| {
+        glib::spawn_future_local(async move {
+            let Err(async_channel::SendError(OrchestrationReply::Created(created))) =
+                reply.send(answer).await
+            else {
+                return;
+            };
+            tracing::info!(
+                "{issue}: issue_start stopped waiting before its chat was made; recording the \
+                 start and sending the brief here"
+            );
+            let agent = created.agent.clone();
+            let model = created.model.clone().or(created.model_pending.clone());
+            let id = issue.to_string();
+            let recorded = crate::runtime::runtime()
+                .spawn_blocking(move || {
+                    let git = taste_git::GitWorkspace::discover(&root)
+                        .ok_or_else(|| anyhow::anyhow!("this workspace is not a git repository"))?;
+                    git.issue_start_with(
+                        &id,
+                        &git.starter_identity(),
+                        Some(&agent),
+                        model.as_deref(),
+                    )
+                    .map(|_| ())
+                })
+                .await;
+            match recorded {
+                Ok(Ok(())) => events.publish(taste_core::Event::GitStatusChanged),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        "{issue}: the start was not recorded, so no brief was sent: {e:#}"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("{issue}: recording the start did not finish: {e}");
+                    return;
+                }
+            }
+            match chats
+                .pane_for(&created.chat)
+                .map(|pane| pane.submit_prompt(brief))
+            {
+                Some(Ok(_)) => tracing::info!("{issue}: the brief went to its agent"),
+                Some(Err(e)) => tracing::warn!("{issue}: the brief was not taken: {e}"),
+                None => tracing::warn!("{issue}: no chat to send the brief to"),
+            }
+        });
+    }
 }
 
 /// The refusal every IDE-started prompt gets while the allowance is

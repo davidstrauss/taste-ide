@@ -1257,6 +1257,10 @@ pub struct ChatPane {
     /// `chat_create` waits for the sub-chat to come up before it validates
     /// a model and seeds the task.
     on_ready_once: RefCell<Option<ReadyHook>>,
+    /// The session up and its Ready done ([`Self::after_ready`]), until it
+    /// ends ([`Self::reset_session`]): a hook armed now has no Ready left to
+    /// wait for, and runs at once.
+    ready_ran: Cell<bool>,
 }
 
 /// A session's model choice: the config option's id, and its (value id,
@@ -3693,6 +3697,7 @@ impl ChatPane {
             model_outcome: RefCell::new(None),
             model_refused: RefCell::new(None),
             on_ready_once: RefCell::new(None),
+            ready_ran: Cell::new(false),
         });
 
         // The subscription gauge's tooltip is built when it is READ rather
@@ -4914,10 +4919,20 @@ impl ChatPane {
         self.model_outcome.borrow().clone()
     }
 
-    /// Run something once, the next time this chat's session is ready.
-    /// Replaces any previous arming — there is one creation in flight per
-    /// chat, by construction.
-    pub fn on_ready_once(&self, action: ReadyHook) {
+    /// Run something once, the next time this chat's session is ready —
+    /// or, when it is ready already, as soon as this returns. Replaces any
+    /// previous arming — there is one creation in flight per chat, by
+    /// construction. Armed only for the next Ready, a hook set on a session
+    /// already up waited for one that never came: `issue_start` finishing a
+    /// start whose environment and agent were both up held the coordinator
+    /// for its whole two minutes and failed, and the agent was never given
+    /// the issue (2026-10-26).
+    pub fn on_ready_once(self: &Rc<Self>, action: ReadyHook) {
+        if self.ready_ran.get() {
+            let pane = self.clone();
+            glib::idle_add_local_once(move || action(pane));
+            return;
+        }
         *self.on_ready_once.borrow_mut() = Some(action);
     }
 
@@ -7796,6 +7811,7 @@ impl ChatPane {
         self.client.borrow_mut().take();
         self.session_info.borrow_mut().take();
         self.session_has_content.set(false);
+        self.ready_ran.set(false);
         // The next session's first prompt says where it is again: whatever
         // the last one was told has gone with it.
         self.orientation_due.set(true);
@@ -10869,10 +10885,12 @@ impl ChatPane {
     /// messages held for an agent. After a restored history is drawn, not
     /// before: what they send is answered after it.
     fn after_ready(self: &Rc<Self>) {
+        self.ready_ran.set(true);
         // Whoever was waiting for this session to come up — today, an
         // orchestrator's `chat_create` — runs now, once, after the
         // controls have applied this chat's model.
-        if let Some(action) = self.on_ready_once.borrow_mut().take() {
+        let waiting = self.on_ready_once.borrow_mut().take();
+        if let Some(action) = waiting {
             action(self.clone());
         }
         // ...and so does anything held for an agent to exist. This is the

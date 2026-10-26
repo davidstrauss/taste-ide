@@ -203,11 +203,15 @@ pub enum OrchestrationRequest {
     /// Start an issue: create the environment that IS that issue's — its
     /// id is the issue's id — and a chat bound to it, ready to prompt.
     ///
-    /// Deliberately does not carry the task. The caller seeds the first
-    /// prompt with an ordinary [`OrchestrationRequest::ChatSend`] once it
-    /// has done whatever else the start needed (recording who started it,
-    /// above all) — so a start that cannot be completed leaves a chat
-    /// sitting idle rather than one already working on the wrong thing.
+    /// The caller seeds the first prompt with an ordinary
+    /// [`OrchestrationRequest::ChatSend`] once it has done whatever else the
+    /// start needed (recording who started it, above all) — so a start that
+    /// cannot be completed leaves a chat sitting idle rather than one
+    /// already working on the wrong thing. It carries the task all the same,
+    /// as `brief`, for one case: a caller that stopped waiting before the
+    /// answer came — a large repository's clone outlasts a tool call — is
+    /// not there to do either, so the strip records the start and sends the
+    /// brief itself, and the agent is not left made and idle (2026-10-26).
     StartIssue {
         /// The issue's id, which is the environment's.
         env: EnvironmentId,
@@ -223,6 +227,8 @@ pub enum OrchestrationRequest {
         /// Where the environment is made: this machine's pool, or the
         /// project's cloud.
         host: crate::environment::Host,
+        /// The first prompt, for a start whose caller stopped waiting.
+        brief: String,
     },
     /// Finish a start that stranded: the environment exists — its clone
     /// was made by an earlier `StartIssue` — but its chat never opened,
@@ -233,6 +239,8 @@ pub enum OrchestrationRequest {
     FinishIssue {
         env: EnvironmentId,
         model: Option<String>,
+        /// As [`OrchestrationRequest::StartIssue`]'s.
+        brief: String,
     },
     /// Prompt a chat. Mid-turn sends queue, as they do from the composer.
     ChatSend { chat: ChatId, text: String },
@@ -551,6 +559,7 @@ mod tests {
             agent: Some("claude".into()),
             model: None,
             host: crate::environment::Host::Local,
+            brief: "work on i-0002".into(),
         }))
         .unwrap();
         match reply {

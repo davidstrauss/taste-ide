@@ -4595,11 +4595,17 @@ impl McpServer {
             );
         }
 
-        // 3. The environment and its chat, from the strip.
+        // 3. The environment and its chat, from the strip. The brief rides
+        //    along for one case: this call giving up first, which a large
+        //    repository's clone makes ordinary (php-src's took the whole two
+        //    minutes, 2026-10-26). The strip then records the start and
+        //    sends the brief itself, and this answers that it will.
+        let brief = taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body);
         let request = if finishing {
             OrchestrationRequest::FinishIssue {
                 env: env.clone(),
                 model: model.clone(),
+                brief: brief.clone(),
             }
         } else {
             OrchestrationRequest::StartIssue {
@@ -4607,11 +4613,34 @@ impl McpServer {
                 agent: agent.clone(),
                 model: model.clone(),
                 host,
+                brief: brief.clone(),
             }
         };
-        let reply = self
-            .orchestrate(request, ORCHESTRATION_CREATE_TIMEOUT)
-            .await?;
+        let reply = match tokio::time::timeout(
+            ORCHESTRATION_CREATE_TIMEOUT,
+            self.workspace.orchestration.request(request),
+        )
+        .await
+        {
+            Err(_) => {
+                return Ok(json!({
+                    "issue": issue.id,
+                    "chat": env.as_str(),
+                    "env": env.as_str(),
+                    "state": "being made",
+                    "note": format!(
+                        "{env} is still being made: its clone and start outlasted this call. \
+                         Nothing more is needed — when its chat exists, the IDE records the \
+                         start and gives its agent the issue. Watch it with chat_status. Do \
+                         not call issue_start for it again."
+                    ),
+                }));
+            }
+            Ok(reply) => match reply? {
+                OrchestrationReply::Error(message) => anyhow::bail!("{message}"),
+                other => other,
+            },
+        };
         let OrchestrationReply::Created(created) = reply else {
             anyhow::bail!("the chat strip answered issue_start with something else");
         };
@@ -4659,12 +4688,11 @@ impl McpServer {
         }
 
         // 5. The brief — the same words the user's Start sends.
-        let prompt = taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body);
         let reply = self
             .orchestrate(
                 OrchestrationRequest::ChatSend {
                     chat: created.chat.clone(),
-                    text: prompt,
+                    text: brief,
                 },
                 ORCHESTRATION_TIMEOUT,
             )
@@ -9168,7 +9196,7 @@ mod tests {
                             None => OrchestrationReply::Error("no strip in this test".into()),
                         }
                     }
-                    OrchestrationRequest::FinishIssue { env, model } => {
+                    OrchestrationRequest::FinishIssue { env, model, .. } => {
                         recorder
                             .lock()
                             .unwrap()
