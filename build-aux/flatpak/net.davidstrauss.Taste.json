@@ -56,6 +56,7 @@
                 "cargo --offline build --release --workspace",
                 "install -Dm755 target/release/taste-ide /app/bin/taste-ide",
                 "install -Dm755 target/release/taste-embed /app/bin/taste-embed",
+                "install -Dm755 target/release/taste-transcribe /app/bin/taste-transcribe",
                 "install -Dm755 target/release/taste-diagram /app/bin/taste-diagram",
                 "install -Dm755 target/release/taste-taskfile /app/bin/taste-taskfile",
                 "install -Dm644 data/net.davidstrauss.Taste.desktop /app/share/applications/net.davidstrauss.Taste.desktop",

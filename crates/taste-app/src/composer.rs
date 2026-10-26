@@ -916,6 +916,9 @@ impl Composer {
                 return;
             }
         }
+        // The speech helper starts now, so its model loads while the user
+        // speaks (`crate::voice::prewarm`).
+        crate::voice::prewarm();
         match taste_voice::Recorder::start() {
             Ok(recorder) => {
                 // Whatever the last dictation left pending is not this

@@ -1,8 +1,10 @@
 //! The app's side of voice input: whether the speech model is here, the
-//! one download when it is not, and a transcriber loaded once and shared
-//! by every composer. `taste-voice` does the work; this keeps the state
-//! that has to be global, because two composers must not download the
-//! same 150 MB twice or hold two copies of the model.
+//! one download when it is not, and one transcriber shared by every
+//! composer. `taste-voice` does the work, its model in a helper process
+//! that starts when the microphone is pressed and exits when idle
+//! (`taste_voice::transcribe`); this keeps the state that has to be
+//! global, because two composers must not download the same 150 MB twice
+//! or run two copies of the model.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -31,6 +33,30 @@ pub enum Readiness {
 struct Shared {
     downloading: bool,
     transcriber: Option<Arc<Transcriber>>,
+}
+
+/// The one transcriber, made the first time it is asked for. Making it
+/// starts nothing.
+fn transcriber() -> Arc<Transcriber> {
+    shared()
+        .lock()
+        .expect("voice state")
+        .transcriber
+        .get_or_insert_with(|| Arc::new(Transcriber::new(&taste_voice::model::model_path(&MODEL))))
+        .clone()
+}
+
+/// The microphone was pressed: start the speech helper now, off the main
+/// thread, so its model loads while the user speaks rather than after.
+pub fn prewarm() {
+    if readiness() != Readiness::Ready {
+        return;
+    }
+    crate::runtime::runtime().spawn_blocking(|| {
+        if let Err(e) = transcriber().prewarm() {
+            tracing::warn!("the speech helper did not start: {e:#}");
+        }
+    });
 }
 
 fn shared() -> &'static Mutex<Shared> {
@@ -95,8 +121,9 @@ pub fn fetch_model(on_progress: impl Fn(Progress) + 'static) {
     });
 }
 
-/// Transcribe on the blocking pool — loading the model the first time —
-/// and hand the text back on the main thread.
+/// Transcribe on the blocking pool — starting the helper, and loading its
+/// model, if no helper is running — and hand the text back on the main
+/// thread.
 pub fn transcribe(samples: Vec<f32>, done: impl FnOnce(Result<String, String>) + 'static) {
     let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
     glib::spawn_future_local(async move {
@@ -105,21 +132,7 @@ pub fn transcribe(samples: Vec<f32>, done: impl FnOnce(Result<String, String>) +
         }
     });
     crate::runtime::runtime().spawn_blocking(move || {
-        let result = (|| -> anyhow::Result<String> {
-            let transcriber = {
-                let existing = shared().lock().expect("voice state").transcriber.clone();
-                match existing {
-                    Some(t) => t,
-                    None => {
-                        let loaded =
-                            Arc::new(Transcriber::load(&taste_voice::model::model_path(&MODEL))?);
-                        shared().lock().expect("voice state").transcriber = Some(loaded.clone());
-                        loaded
-                    }
-                }
-            };
-            transcriber.transcribe(&samples)
-        })();
+        let result = transcriber().transcribe(&samples);
         let _ = tx.send_blocking(result.map_err(|e| format!("{e:#}")));
     });
 }

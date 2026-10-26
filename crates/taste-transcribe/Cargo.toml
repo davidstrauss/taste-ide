@@ -1,0 +1,15 @@
+[package]
+name = "taste-transcribe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The IDE's speech helper: whisper.cpp in a process of its own"
+
+[[bin]]
+name = "taste-transcribe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+whisper-rs.workspace = true

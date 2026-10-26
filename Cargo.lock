@@ -3942,17 +3942,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "taste-transcribe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "whisper-rs",
+]
+
+[[package]]
 name = "taste-voice"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "gstreamer",
  "gstreamer-app",
+ "serde",
+ "serde_json",
  "taste-models",
  "tempfile",
  "tokio",
  "tracing",
- "whisper-rs",
 ]
 
 [[package]]
