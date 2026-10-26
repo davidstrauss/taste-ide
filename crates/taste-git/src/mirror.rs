@@ -49,6 +49,105 @@ use git2::{Delta, Oid};
 
 use crate::GitWorkspace;
 
+/// A tree entry's mode as libgit2's builder takes it.
+fn file_mode(mode: i32) -> git2::FileMode {
+    use git2::FileMode;
+    [FileMode::BlobExecutable, FileMode::Link, FileMode::Commit]
+        .into_iter()
+        .find(|known| i32::from(*known) == mode)
+        .unwrap_or(FileMode::Blob)
+}
+
+/// The rules a pass decides scope by: the folder's sync lines, and the
+/// checkout's, with what the checkout ignores, read from its snapshot.
+struct ScopeRules {
+    folder: crate::sync_ignored::Rules,
+    theirs: crate::sync_ignored::Rules,
+    theirs_ignore: crate::sync_ignored::Ignores,
+}
+
+/// What the last pass in this process decided by, kept for the next: the
+/// rules, and the trees they were read from. While no `.gitignore` or
+/// `.gitattributes` has changed in either tree since, the folder's
+/// `info/` files are as they were, and the archive is the one that pass
+/// recorded, the next pass decides only the paths that changed
+/// ([`GitWorkspace::changed_paths`]). That is exact: every path the archive
+/// holds was in scope when recorded, under these same rules, so the full
+/// pass would neither write nor let go of any path all three hold alike,
+/// and a write cannot meet such a path as file against directory, since
+/// neither side's tree can hold both. Anything else — the first pass in
+/// this process, a rule changed, an archive another process recorded —
+/// reads the rules afresh and decides every path, as every pass did before
+/// (docs/SYNC.md → "The design as built"). What scope the user's global
+/// excludes file adds is not watched: a path it newly ignores that both
+/// sides hold unchanged stays in the archive until either side changes it,
+/// which comes to the same writes.
+struct RulesSeen {
+    archive: Oid,
+    folder_tree: Oid,
+    target: Oid,
+    extra: Vec<u8>,
+    rules: ScopeRules,
+}
+
+impl RulesSeen {
+    /// Whether the rules kept still hold for a pass over these trees.
+    fn holds(
+        &self,
+        git: &GitWorkspace,
+        archive: Oid,
+        folder_tree: Oid,
+        target: Oid,
+        extra: &[u8],
+    ) -> bool {
+        let rule_file = |path: &Path| {
+            path.file_name()
+                .is_some_and(|name| name == ".gitignore" || name == ".gitattributes")
+        };
+        let untouched = |from: Oid, to: Oid| -> bool {
+            if from == to {
+                return true;
+            }
+            let (Ok(from), Ok(to)) = (git.repo.find_tree(from), git.repo.find_tree(to)) else {
+                return false;
+            };
+            let Ok(diff) = git.repo.diff_tree_to_tree(Some(&from), Some(&to), None) else {
+                return false;
+            };
+            !diff.deltas().any(|delta| {
+                [delta.old_file(), delta.new_file()]
+                    .iter()
+                    .any(|file| file.path().is_some_and(rule_file))
+            })
+        };
+        self.archive == archive
+            && self.extra == extra
+            && untouched(self.folder_tree, folder_tree)
+            && untouched(self.target, target)
+    }
+}
+
+/// The rules each working copy's last pass decided by, by its root.
+static RULES_SEEN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, RulesSeen>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The rules `root`'s last pass kept, taken: a pass that fails partway
+/// leaves none, and the next reads them afresh.
+fn take_rules_seen(root: &Path) -> Option<RulesSeen> {
+    RULES_SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(root)
+}
+
+fn keep_rules_seen(root: &Path, seen: RulesSeen) {
+    RULES_SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(root.to_path_buf(), seen);
+}
+
 /// What the mirror last wrote into the folder: a commit whose tree is the
 /// folder's working copy as the mirror left it.
 pub const MIRROR_REF: &str = "refs/taste/mirror/primary";
@@ -369,15 +468,43 @@ impl GitWorkspace {
         // one side and not yet agreed — such a path is left as it is on
         // both, and a rule's change reaches its paths a pass after the
         // rule itself has.
-        let folder_rules = self.sync_rules();
-        let mut their_rules = crate::sync_ignored::Rules::default();
-        their_rules.add_set(crate::sync_ignored::attribute_files_in_tree(
-            &self.repo,
-            target.id(),
-        ));
-        let archive = self.entries(archive_tree)?;
-        let folder = self.entries(folder_tree)?;
-        let theirs = self.entries(target.id())?;
+        //
+        // Kept from the last pass, with the paths it decides narrowed to
+        // the ones that changed, while that holds (`RulesSeen`); read
+        // afresh, and every path decided, otherwise.
+        let extra = self.rule_extras();
+        let seen = take_rules_seen(&self.workdir)
+            .filter(|seen| seen.holds(self, archive_tree, folder_tree, target.id(), &extra));
+        let scoped = seen.is_some();
+        let rules = match seen {
+            Some(seen) => seen.rules,
+            None => ScopeRules {
+                folder: self.sync_rules(),
+                theirs: {
+                    let mut rules = crate::sync_ignored::Rules::default();
+                    rules.add_set(crate::sync_ignored::attribute_files_in_tree(
+                        &self.repo,
+                        target.id(),
+                    ));
+                    rules
+                },
+                theirs_ignore: crate::sync_ignored::ignores_in_tree(&self.repo, target.id()),
+            },
+        };
+        let (archive, folder, theirs) = if scoped {
+            let paths = self.changed_paths(archive_tree, &[folder_tree, target.id()])?;
+            (
+                self.entries_at(archive_tree, &paths)?,
+                self.entries_at(folder_tree, &paths)?,
+                self.entries_at(target.id(), &paths)?,
+            )
+        } else {
+            (
+                self.entries(archive_tree)?,
+                self.entries(folder_tree)?,
+                self.entries(target.id())?,
+            )
+        };
         // A file the folder's working copy leaves out and its disk holds is
         // ignored there, whatever the rules read here say. A directory is
         // not: what is beneath it is in the copy, or is not, on its own.
@@ -398,7 +525,6 @@ impl GitWorkspace {
         // for removed on the side whose snapshot left it out; the sync's
         // simulation found a write into the checkout refused forever by
         // the checkout's ignored copy there (P4, P7).
-        let theirs_ignore = crate::sync_ignored::ignores_in_tree(&self.repo, target.id());
         let plan = crate::plan::plan(
             &crate::plan::Observed {
                 archive: &archive,
@@ -407,8 +533,8 @@ impl GitWorkspace {
                 folder_unseen: &unseen,
             },
             |path| {
-                !self.ignored_unsynced(path, &folder_rules)
-                    && !(theirs_ignore.ignored(path) && !their_rules.syncs(path))
+                !self.ignored_unsynced(path, &rules.folder)
+                    && !(rules.theirs_ignore.ignored(path) && !rules.theirs.syncs(path))
             },
             resolve,
         );
@@ -478,9 +604,23 @@ impl GitWorkspace {
             |i| landed_folder[i],
             |i| landed_checkout[i],
         );
-        let tree = self.tree_from(archive_tree, &next)?;
+        let tree = if scoped {
+            self.tree_updated(archive_tree, &archive, &next)?
+        } else {
+            self.tree_from(archive_tree, &next)?
+        };
         let wrote_checkout = landed_checkout.iter().any(|l| *l);
         self.record_observed(tree, local, tip, Some((snapshot, wrote_checkout)))?;
+        keep_rules_seen(
+            &self.workdir,
+            RulesSeen {
+                archive: tree,
+                folder_tree,
+                target: target.id(),
+                extra,
+                rules,
+            },
+        );
         let landed = |l: &[bool]| l.iter().filter(|x| **x).count();
         let missed_paths = plan
             .to_checkout
@@ -731,6 +871,113 @@ impl GitWorkspace {
             .lines()
             .find_map(|line| line.strip_prefix(RECORDED_TIP))
             .and_then(|tip| Oid::from_str(tip.trim()).ok()))
+    }
+
+    /// The paths where any of `others` differs from `base`: every path a
+    /// pass has anything to decide about, while the rules hold
+    /// ([`RulesSeen`]) — one the archive, the folder, and the checkout all
+    /// hold alike is nothing to write, and in scope by the rules it was
+    /// recorded under. Git's tree diff, which never opens a subtree the two
+    /// trees share, so a pass over a tree php-src's size reads what changed
+    /// rather than 28,000 paths three times over (2026-10-26).
+    fn changed_paths(
+        &self,
+        base: Oid,
+        others: &[Oid],
+    ) -> Result<std::collections::BTreeSet<PathBuf>> {
+        let base = self.repo.find_tree(base)?;
+        let mut paths = std::collections::BTreeSet::new();
+        for other in others {
+            let other = self.repo.find_tree(*other)?;
+            let diff = self
+                .repo
+                .diff_tree_to_tree(Some(&base), Some(&other), None)?;
+            for delta in diff.deltas() {
+                for file in [delta.old_file(), delta.new_file()] {
+                    if let Some(path) = file.path() {
+                        paths.insert(path.to_path_buf());
+                    }
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    /// [`Self::entries`], for `paths` alone.
+    fn entries_at(
+        &self,
+        tree: Oid,
+        paths: &std::collections::BTreeSet<PathBuf>,
+    ) -> Result<std::collections::BTreeMap<PathBuf, Entry>> {
+        let tree = self.repo.find_tree(tree)?;
+        let mut out = std::collections::BTreeMap::new();
+        for path in paths {
+            if let Ok(entry) = tree.get_path(path) {
+                if entry.kind() == Some(git2::ObjectType::Blob) {
+                    out.insert(path.clone(), (entry.id(), entry.filemode()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The archive's tree with `before` — its entries at the paths a
+    /// scoped pass decided — replaced by `after`, and everything else as
+    /// it was. Updated in place; where libgit2 refuses that, a file taking
+    /// a directory's place or one beneath a submodule's pointer, built
+    /// whole as [`Self::tree_from`] builds it.
+    fn tree_updated(
+        &self,
+        base: Oid,
+        before: &std::collections::BTreeMap<PathBuf, Entry>,
+        after: &std::collections::BTreeMap<PathBuf, Entry>,
+    ) -> Result<Oid> {
+        let touched: Vec<&PathBuf> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .collect();
+        if touched.is_empty() {
+            return Ok(base);
+        }
+        let base_tree = self.repo.find_tree(base)?;
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        for path in &touched {
+            match after.get(*path) {
+                Some((id, mode)) => {
+                    update.upsert(path.as_path(), *id, file_mode(*mode));
+                }
+                None => {
+                    update.remove(path.as_path());
+                }
+            }
+        }
+        if let Ok(tree) = update.create_updated(&self.repo, &base_tree) {
+            return Ok(tree);
+        }
+        let mut whole = self.entries(base)?;
+        for path in touched {
+            match after.get(path) {
+                Some(entry) => {
+                    whole.insert(path.clone(), *entry);
+                }
+                None => {
+                    whole.remove(path);
+                }
+            }
+        }
+        self.tree_from(base, &whole)
+    }
+
+    /// What decides scope that neither tree holds: the folder's own
+    /// `info/exclude` and `info/attributes`, as their bytes.
+    fn rule_extras(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for file in ["info/exclude", "info/attributes"] {
+            out.extend(std::fs::read(self.repo.path().join(file)).unwrap_or_default());
+            out.push(0);
+        }
+        out
     }
 
     /// A tree's working copy as the sync sees it: every file and link,
@@ -1928,5 +2175,154 @@ mod tests {
             None
         );
         let _ = OsStrExt::as_bytes(std::ffi::OsStr::new(""));
+    }
+
+    /// A pass decides only the paths that changed while the rules hold,
+    /// and every path once they change: a tracked file the archive records
+    /// that a new `.gitignore` then covers is out of scope and let go (P7)
+    /// — and since it is still in both working copies, unchanged, a pass
+    /// over the changed paths alone would never reach it.
+    #[test]
+    fn a_rule_change_decides_every_path_again() {
+        let (dir, ws) = repo();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        fs::write(root.join("b.log"), "kept\n").unwrap();
+        let mut index = ws.repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.add_path(Path::new("b.log")).unwrap();
+        index.write().unwrap();
+        let tree = ws.repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tip = ws
+            .repo
+            .commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+        let branch = ws.branch_name().unwrap();
+        let pass = || {
+            let snap = ws
+                .snapshot_worktree("refs/taste/snapshot/primary")
+                .unwrap()
+                .commit;
+            done(
+                ws.mirror_from(&branch, tip, snap, None, &Took::default())
+                    .unwrap(),
+            );
+        };
+        let archived = |path: &str| {
+            let archive = ws.read_ref(MIRROR_REF).unwrap().unwrap();
+            let tree = ws.repo.find_commit(archive).unwrap().tree().unwrap();
+            tree.get_path(Path::new(path)).is_ok()
+        };
+        pass();
+        assert!(archived("b.log"), "both sides hold it");
+        // Nothing changed: decided over the changed paths alone, and the
+        // archive is as it was.
+        pass();
+        assert!(archived("b.log"));
+        assert!(archived("a.txt"));
+        // Ignored now, on both sides, and still tracked on both: nothing
+        // about the file changed.
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        pass();
+        assert!(!archived("b.log"), "out of scope: let go");
+        assert!(archived("a.txt"));
+        assert!(root.join("b.log").exists(), "and never removed");
+    }
+
+    /// Profiling harness (run on demand):
+    /// `cargo test -p taste-git perf_mirror -- --ignored --nocapture`.
+    /// A pass with nothing to do over a tree php-src's size — 28,000
+    /// files in 1,000 directories, a `.gitignore` in each tenth — and the
+    /// parts of it, each on its own.
+    #[test]
+    #[ignore]
+    fn perf_mirror_pass_over_a_large_tree() {
+        use std::time::Instant;
+        let (dir, ws) = repo();
+        let root = dir.path();
+        fs::write(root.join(".gitignore"), "*.o\n/out/\n").unwrap();
+        for d in 0..1000 {
+            let sub = root.join(format!("ext/m{}/d{d}", d % 40));
+            fs::create_dir_all(&sub).unwrap();
+            if d % 10 == 0 {
+                fs::write(sub.join(".gitignore"), "*.lo\n").unwrap();
+            }
+            for f in 0..28 {
+                fs::write(sub.join(format!("f{f}.c")), format!("int f{d}_{f};\n")).unwrap();
+            }
+        }
+        let mut index = ws.repo.index().unwrap();
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = ws.repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tip = ws
+            .repo
+            .commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+        let branch = ws.branch_name().unwrap();
+        let time = |what: &str, f: &mut dyn FnMut()| {
+            let start = Instant::now();
+            f();
+            println!("{what}: {:?}", start.elapsed());
+        };
+        let snap = || {
+            ws.snapshot_worktree("refs/taste/snapshot/primary")
+                .unwrap()
+                .commit
+        };
+        let first = snap();
+        time("first pass (records the archive)", &mut || {
+            done(
+                ws.mirror_from(&branch, tip, first, None, &Took::default())
+                    .unwrap(),
+            );
+        });
+        let second = snap();
+        time("a pass with nothing to do", &mut || {
+            done(
+                ws.mirror_from(&branch, tip, second, None, &Took::default())
+                    .unwrap(),
+            );
+        });
+        time("  the folder's working tree", &mut || {
+            ws.worktree_tree().unwrap();
+        });
+        time("  the folder's sync rules", &mut || {
+            ws.sync_rules();
+        });
+        let target = ws.repo.find_commit(second).unwrap().tree_id();
+        time("  the snapshot's sync rules", &mut || {
+            let mut rules = crate::sync_ignored::Rules::default();
+            rules.add_set(crate::sync_ignored::attribute_files_in_tree(
+                &ws.repo, target,
+            ));
+        });
+        time("  the snapshot's ignores", &mut || {
+            crate::sync_ignored::ignores_in_tree(&ws.repo, target);
+        });
+        let mut all = Default::default();
+        time("  one tree's entries", &mut || {
+            all = ws.entries(target).unwrap();
+        });
+        let rules = ws.sync_rules();
+        time("  every path's scope in the folder", &mut || {
+            for path in all.keys() {
+                ws.ignored_unsynced(path, &rules);
+            }
+        });
+        let ignores = crate::sync_ignored::ignores_in_tree(&ws.repo, target);
+        time("  every path's scope in the snapshot", &mut || {
+            for path in all.keys() {
+                ignores.ignored(path);
+            }
+        });
+        time("  the archive's tree, rebuilt", &mut || {
+            ws.tree_from(target, &all).unwrap();
+        });
+        println!("{} paths", all.len());
     }
 }

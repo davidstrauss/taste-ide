@@ -200,6 +200,26 @@ removals emptied stayed in the checkout until 096b680 (P11).
   directory at one path made a conflict instead (P12).
 - **Both directions in one pass.** The folder's changes no longer go out
   first in a pass of their own, with the checkout's waiting for the next.
+- **A pass reads what changed.** "Decides every path" is what a pass
+  computes, not what it has to read: a path the archive, the folder, and
+  the checkout hold alike, in scope by the rules it was recorded under, is
+  "nothing" in the table and nothing to let go of, and no write can meet it
+  as file against directory, since neither side's tree holds both. So while
+  the rules hold — no `.gitignore` or `.gitattributes` changed in either
+  tree since the last pass in this process, the folder's `info/exclude` and
+  `info/attributes` as they were, and the archive the one that pass
+  recorded — the planner is given only the paths git's tree diff finds
+  changed against the archive, and the archive is updated at those paths
+  in place (`mirror::RulesSeen`). Anything else decides every path, as
+  before. The checkout's snapshot keeps its index between runs for the
+  same reason (`snapshot::script`): what a pass reads on php-src's 28,601
+  files went from every one of them, several times over, to the ones that
+  changed (2026-10-26). The one input not watched is the user's global
+  excludes file: a path it newly ignores that both sides hold unchanged
+  stays in the archive until either side changes it. The writes come out
+  the same but in one case: a side that edits such a path in the very pass
+  it comes back into scope has its edit propagated, where P7's "decided
+  with A(p) absent" would ask about it as a conflict.
 - **After a clean shutdown, the folder wins.** A VM brought back up while
   shut off and still marked disposable — its window's close found nothing
   on it this machine lacked, and the re-check just before it went down
