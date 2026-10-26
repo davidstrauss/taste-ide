@@ -890,13 +890,27 @@ pub(crate) const REFRESH_COALESCE: std::time::Duration = std::time::Duration::fr
 /// Where the panes are aimed when it is not home: one environment, its
 /// checkout wherever it is, the files service that reads it, and the
 /// repository on this host holding its refs (its peer, or the clone
-/// itself while a checkout is local).
-#[derive(Clone, PartialEq)]
+/// itself while a checkout is local), and its execution target, which
+/// says whether its own container runs — the safe-mode locks are that
+/// environment's, as Personal's are Personal's.
+#[derive(Clone)]
 pub struct Aim {
     pub env: taste_core::environment::EnvironmentId,
     pub checkout: taste_core::environment::Checkout,
     pub files: taste_core::files::Files,
     pub peer: PathBuf,
+    pub exec: taste_core::ExecContext,
+}
+
+/// The same aim: the same environment's checkout, read the same way. The
+/// execution target is a live handle, the same one either way.
+impl PartialEq for Aim {
+    fn eq(&self, other: &Self) -> bool {
+        self.env == other.env
+            && self.checkout == other.checkout
+            && self.files == other.files
+            && self.peer == other.peer
+    }
 }
 
 #[derive(Default)]
@@ -2748,7 +2762,9 @@ impl FileTree {
             // The watched environment's checkout wherever it is, read
             // through its own files service — the VM's keeper, when it is
             // in one (David, 2026-09-21: "But they should be browsable
-            // now?"). Read-only here, so no ref hook.
+            // now?"). No ref hook: a commit or a switch made here reaches
+            // its peer through that environment's own watch, which syncs
+            // after every ref it sees move (`Supervisor::set_keeper`).
             Some(aim) => Worktree::for_checkout(&aim.checkout, aim.files.clone()),
             None => {
                 let tree =
@@ -2783,15 +2799,10 @@ impl FileTree {
         }
     }
 
-    /// The root the write policy is asked against: the folder the user
-    /// opened while watching (so every path in a clone is refused, as
-    /// before), and otherwise the checkout wherever it is.
+    /// The root the write policy is asked against: the checkout on screen,
+    /// wherever it is.
     fn policy_root(&self) -> PathBuf {
-        if self.read_only() {
-            self.workspace.root().to_path_buf()
-        } else {
-            self.view_root()
-        }
+        self.view_root()
     }
 
     /// List `showing`'s files from now on: the tree is listed again —
@@ -2839,12 +2850,28 @@ impl FileTree {
         self.rebuild_index();
     }
 
-    /// Whether what is on screen belongs to someone else. Non-primary
-    /// environments are read-only to the user — the intervention path is
-    /// reviewing a published branch or taking over the chat, never editing
-    /// under a running agent.
-    fn read_only(&self) -> bool {
+    /// The panes are on another environment than Personal. Not a lock:
+    /// every edit, git operation, and file operation works there as it does
+    /// on Personal (David, 2026-10-26: "There really isn't any reason to
+    /// not let humans leverage the other envs more directly"). What it
+    /// changes is what a few controls MEAN — Push sends the folder's
+    /// branch, the background fetch reaches the folder's remote, and the
+    /// IDE's own log is the same everywhere — so those ask it.
+    fn watching_other(&self) -> bool {
         self.watching.borrow().is_some()
+    }
+
+    /// The checkout on screen is in safe mode: its own environment's
+    /// container is not running, so only devcontainer setup and workspace
+    /// dotfiles may be written there (`taste_core::policy::write_allowed`).
+    /// Personal's, or another environment's — the locks are the one
+    /// restriction every environment keeps (David, 2026-10-26: "The locks
+    /// should still work for safe mode").
+    fn safe_mode_here(&self) -> bool {
+        match self.watching.borrow().as_ref() {
+            Some(aim) => !aim.exec.is_container(),
+            None => !self.workspace.exec.is_container(),
+        }
     }
 
     /// Aim the tree and the git views at an environment's checkout, or
@@ -3239,52 +3266,25 @@ impl FileTree {
         self.backlog.focus();
     }
 
-    /// Everything that writes is disabled — never hidden — while watching,
-    /// with two exceptions.
-    ///
-    /// Disabled controls still say what the pane can do; hiding them would
-    /// make a watched checkout look like a different, smaller application.
-    /// But **Fetch and Pull work**, and the Abort and Continue of the rebase
-    /// a Pull can pause on: taking Personal's commits into an environment
-    /// is the user's to do from here (David, 2026-10-04: "I ought to be able
-    /// to use the GUI pull button in these envs, too"), and it moves the
-    /// environment's branch onto `personal/<branch>` without a byte of the
-    /// user's own editing. Push stays, disabled like the rest, but without
-    /// the tooltip a snapshot gives it — "Push 1 commit to origin/main"
-    /// offered to push the environment's branch into the user's own, which
-    /// is not a thing this view does (David, 2026-10-04: "I just want it
-    /// disabled without such a dumb message"); an environment's work
-    /// reaches the user's branch by being published and reviewed.
+    /// What another environment's view changes here, which is no longer
+    /// what may be done: its files, its git — Pull, Push, branches, commits
+    /// — and its file operations are the user's as Personal's are (David,
+    /// 2026-10-26, of Push's "Read-only" card: "Don't restrict this. In
+    /// fact, drop all the user restrictions for other envs"). Only the
+    /// IDE's own log differs: the same stream whichever checkout the panes
+    /// are aimed at, and offered beside another environment's logs it
+    /// reads as that environment's. Greyed, not hidden, there (David,
+    /// 2026-09-06: "Gray out the IDE logs option for the non-personal
+    /// env").
     fn apply_view_permissions(&self) {
-        let read_only = self.read_only();
-        if read_only {
-            for button in [&self.push_button, &self.init_button] {
-                button.set_sensitive(false);
-            }
-            *self.push_card.borrow_mut() = Some(
-                crate::sync_card::SyncCard::new("Read-only")
-                    .gesture("An environment's work reaches your branch by Publish and review"),
-            );
-            self.branch_label.set_sensitive(false);
-            self.branch_label
-                .set_tooltip_text(Some("Read-only: this is another environment's checkout"));
-            self.commit_box.set_sensitive(false);
-        } else {
-            self.branch_label.set_sensitive(true);
-            self.branch_label.set_tooltip_text(None);
-        }
-        // The IDE's own log is the IDE's, not an environment's: the same
-        // stream whichever checkout the panes are aimed at, and offered
-        // beside another environment's logs it reads as that environment's.
-        // Greyed, not hidden, while watching (David, 2026-09-06: "Gray out
-        // the IDE logs option for the non-personal env").
+        let elsewhere = self.watching_other();
         if let Some(index) = crate::logview::LogKind::ALL
             .iter()
             .position(|kind| *kind == crate::logview::LogKind::Ide)
         {
             if let Some(row) = self.logs_list.row_at_index(index as i32) {
-                row.set_sensitive(!read_only);
-                row.set_tooltip_text(read_only.then_some(
+                row.set_sensitive(!elsewhere);
+                row.set_tooltip_text(elsewhere.then_some(
                     "The IDE's own log is the same for every environment; read it from Personal",
                 ));
             }
@@ -3312,18 +3312,6 @@ impl FileTree {
         for card in [&self.push_card, &self.pull_card, &self.canon_card] {
             card.borrow_mut().take();
         }
-    }
-
-    /// The refusal a read-only view gives, naming the environment.
-    fn refuse_read_only(&self) -> bool {
-        let Some(Aim { env, .. }) = self.watching.borrow().clone() else {
-            return false;
-        };
-        self.workspace.events.publish(Event::Toast(format!(
-            "Read-only: {env} is another environment's checkout. Review its work \
-             with Open Review in the console, or take over its chat."
-        )));
-        true
     }
 
     /// (Re)build the search index in the background, progress shown over
@@ -5205,7 +5193,7 @@ impl FileTree {
         let showing = self.showing.get();
         let synced = std::sync::Arc::new(self.sync_ignored.borrow().clone());
         let worktree = self.worktree();
-        let ghosts_root = (!self.read_only()).then(|| self.view_root());
+        let ghosts_root = Some(self.view_root());
         let mut targets: Vec<(gtk::gio::ListStore, PathBuf, Option<PathBuf>)> =
             vec![(root_store, self.view_root(), ghosts_root.clone())];
         for index in 0..model.n_items() {
@@ -5461,17 +5449,11 @@ impl FileTree {
     // --- file operations ---------------------------------------------------
 
     fn file_op_allowed(&self, path: &Path) -> bool {
-        if self.read_only() {
-            return false;
-        }
-        let safe_mode = !self.workspace.exec.is_container();
+        let safe_mode = self.safe_mode_here();
         taste_core::policy::write_allowed(&self.policy_root(), safe_mode, path)
     }
 
     fn op_denied_dialog(&self) {
-        if self.refuse_read_only() {
-            return;
-        }
         self.workspace.events.publish(Event::Toast(
             "Read-only until the project's environment is running — only devcontainer \
              setup and workspace dotfiles are editable"
@@ -5837,13 +5819,8 @@ impl FileTree {
         }
 
         let actions = gio::SimpleActionGroup::new();
-        // Every file operation in this menu writes. In a watched
-        // environment they are all present and all disabled — the menu
-        // still says what this pane can do, it simply cannot do it here.
-        let writable = !self.read_only();
         let add_action = |name: &str, callback: Box<dyn Fn() + 'static>| {
             let action = gio::SimpleAction::new(name, None);
-            action.set_enabled(writable);
             action.connect_activate(move |_, _| callback());
             actions.add_action(&action);
         };
@@ -6062,7 +6039,6 @@ impl FileTree {
                 Some("row.sync-ignored"),
             );
             let action = gio::SimpleAction::new_stateful("sync-ignored", None, &own.to_variant());
-            action.set_enabled(writable);
             {
                 let (tree, line) = (self.clone(), path_rule.clone());
                 action.connect_activate(move |_, _| tree.set_sync_line(&line, !own));
@@ -6072,7 +6048,6 @@ impl FileTree {
                 sync_section.append(Some(&format!("Sync *.{ext} files")), Some("row.sync-type"));
                 let action =
                     gio::SimpleAction::new_stateful("sync-type", None, &type_on.to_variant());
-                action.set_enabled(writable);
                 let tree = self.clone();
                 action.connect_activate(move |_, _| tree.set_sync_line(&line, !type_on));
                 actions.add_action(&action);
@@ -6398,7 +6373,7 @@ impl FileTree {
         // A safe ↔ container flip restyles every row (the read-only locks)
         // even when git status is identical — starting the devcontainer
         // must not leave stale locks behind.
-        let container_mode = self.workspace.exec.is_container();
+        let container_mode = !self.safe_mode_here();
         let mode_changed = self.container_mode.replace(container_mode) != container_mode;
         // Both arms assign it; no initializer, so a dead one can't hide.
         let unchanged;
@@ -6641,10 +6616,6 @@ impl FileTree {
                                     // old as the last Pull, so both pulls
                                     // stay pressable: they are what fetches.
                                     let stale = self.fetch_hold.borrow().is_some();
-                                    // A view of another environment's
-                                    // checkout pulls nothing into it, as it
-                                    // pushes nothing from it.
-                                    let writable = !self.read_only();
                                     let held = self.fetch_hold.borrow().as_ref().map(|reason| {
                                         format!(
                                             "Not fetched in the background: {reason}. These \
@@ -6672,8 +6643,7 @@ impl FileTree {
                                         (behind > 0 || stale)
                                             && !sync.new_branch
                                             && !sync.push_unknown
-                                            && !sync.push_by_url
-                                            && writable,
+                                            && !sync.push_by_url,
                                     );
                                     let replaced = sync.replaces.as_ref().map_or(0, |(_, n)| *n);
                                     *self.pull_card.borrow_mut() = Some(
@@ -6747,8 +6717,7 @@ impl FileTree {
                                             } else {
                                                 self.canon_face.remove_css_class(WARNED);
                                             }
-                                            self.canon_button
-                                                .set_sensitive((new > 0 || stale) && writable);
+                                            self.canon_button.set_sensitive(new > 0 || stale);
                                             let canon_moves = &snapshot.submodule_sync.canon_moves;
                                             *self.canon_card.borrow_mut() = Some(
                                                 if new == 0 {
@@ -6868,8 +6837,8 @@ impl FileTree {
             self.all_toggle.set_active(true);
             return;
         }
-        // Whatever the git state said about what is possible, a watched
-        // environment is read-only but for its Pull: this has the last word.
+        // What another environment's view changes, which is the IDE log's
+        // row alone.
         self.apply_view_permissions();
         // Views refresh only now, with the fresh map in place — and only
         // if something actually changed.
@@ -7333,9 +7302,7 @@ impl FileTree {
             })
             .css_classes(["flat"])
             .valign(gtk::Align::Center)
-            .sensitive(
-                matches!(state, FileState::Modified | FileState::Conflicted) && !self.read_only(),
-            )
+            .sensitive(matches!(state, FileState::Modified | FileState::Conflicted))
             .build();
         {
             let weak = Rc::downgrade(self);
@@ -7353,7 +7320,6 @@ impl FileTree {
             .icon_name("view-more-symbolic")
             .css_classes(["flat"])
             .valign(gtk::Align::Center)
-            .sensitive(!self.read_only())
             .popover(&popover)
             .build();
         for (label, icon, ignore_flow) in [
@@ -7659,9 +7625,6 @@ impl FileTree {
     /// Switch to (or create-and-switch to) a branch, off the main thread;
     /// failures (e.g. conflicting working-tree changes) surface as toasts.
     fn run_branch_op(self: &Rc<Self>, name: String, create: bool) {
-        if self.refuse_read_only() {
-            return;
-        }
         let events = self.workspace.events.clone();
         let worktree = self.worktree();
         let weak = Rc::downgrade(self);
@@ -7866,7 +7829,6 @@ impl FileTree {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         // The header already counts the selection; buttons just name
         // their move (eligibility still drives sensitivity).
-        let writable = !self.read_only();
         let build = |(label, count, op, tip): &Op, toward_commit: bool| {
             // Discarding stashed work has no other copy to come back to, so
             // it is the trash every other deletion here is: pressed and
@@ -7875,7 +7837,7 @@ impl FileTree {
             // hold-to-confirm like other trash operations").
             if *op == "discard-stashed" {
                 let hold = crate::holdbutton::HoldButton::new("user-trash-symbolic", tip);
-                hold.widget.set_sensitive(*count > 0 && writable);
+                hold.widget.set_sensitive(*count > 0);
                 let weak = Rc::downgrade(self);
                 hold.set_on_confirm(move || {
                     if let Some(tree) = weak.upgrade() {
@@ -7890,7 +7852,7 @@ impl FileTree {
             }
             let button = gtk::Button::builder()
                 .label(*label)
-                .sensitive(*count > 0 && writable)
+                .sensitive(*count > 0)
                 .tooltip_text(*tip)
                 .build();
             if toward_commit {
@@ -7934,9 +7896,6 @@ impl FileTree {
 
     /// Apply one bulk op to the eligible selected files, off-thread.
     fn run_selection_op(self: &Rc<Self>, op: &'static str) {
-        if self.refuse_read_only() {
-            return;
-        }
         let selected: Vec<PathBuf> = self.selection.borrow().iter().cloned().collect();
         let Some(root) = self.worktree_root() else {
             return;
@@ -8109,7 +8068,7 @@ impl FileTree {
                 selection.contains(&abs)
             });
         drop(selection);
-        let committable = all_selected && !self.read_only();
+        let committable = all_selected;
         self.commit_box.set_sensitive(committable);
         self.commit_box
             .set_opacity(if committable { 1.0 } else { 0.4 });
@@ -8151,9 +8110,6 @@ impl FileTree {
 
     /// Discard = destructive, so it confirms — in the panel, not a dialog.
     fn discard_intervention(self: &Rc<Self>, abs: PathBuf) {
-        if self.refuse_read_only() {
-            return;
-        }
         let name = abs
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -8205,9 +8161,6 @@ impl FileTree {
 
     /// Stash one file, with an editable stash message.
     fn stash_intervention(self: &Rc<Self>, abs: PathBuf) {
-        if self.refuse_read_only() {
-            return;
-        }
         let Some(workdir) = self.worktree_root() else {
             return;
         };
@@ -8264,9 +8217,6 @@ impl FileTree {
     /// Add-to-ignores: an editable expression with live feedback (match
     /// count, and a warning when it misses the file it started from).
     fn ignore_intervention(self: &Rc<Self>, abs: PathBuf) {
-        if self.refuse_read_only() {
-            return;
-        }
         let Some(workdir) = self.worktree_root() else {
             return;
         };
@@ -8871,10 +8821,10 @@ impl FileTree {
     /// fire on every save; the network must not), and quiet on failure —
     /// offline means stale counts, not toast spam.
     fn background_fetch(self: &Rc<Self>) {
-        // Never for a watched environment: a clone's `origin` is a host
-        // path no container has mounted, and fetching another
-        // environment's repository on its behalf is not watching.
-        if self.read_only() {
+        // Never for another environment: a clone's `origin` is a host path
+        // no container has mounted, and the folder's remote is fetched for
+        // Personal.
+        if self.watching_other() {
             return;
         }
         const FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -9058,8 +9008,7 @@ impl FileTree {
         };
         let view_root = self.view_root();
         let worktree = self.worktree();
-        // Template suggestions are noise in search results — and an offer
-        // to create a file is a lie in a read-only view.
+        // Template suggestions are noise in search results.
         //
         // Worked out off the main thread, by the first listing that needs
         // them. The existence checks are stats of the checkout wherever it
@@ -9068,8 +9017,7 @@ impl FileTree {
         // re-aimed: switching back to Personal froze it for as long as the
         // service took to answer them all (David, 2026-09-23: "that
         // shouldn't block my UI").
-        let ghosts =
-            Ghosts::new((search.is_none() && !self.read_only()).then(|| view_root.clone()));
+        let ghosts = Ghosts::new(search.is_none().then(|| view_root.clone()));
         // The root listing is handed to `TreeListModel` empty and filled
         // in once the walk lands on the blocking pool — so `rebuild()`
         // returns immediately and the list this call attaches never blocks
@@ -9574,29 +9522,19 @@ impl FileTree {
             }
         }
 
-        // The lock, for its two reasons — the same affordance, because it
-        // means the same thing to the user: you are looking, not editing.
-        //
-        // Watching wins where both apply: "this is calm-1's file" is the
-        // more useful answer than "the devcontainer is down".
-        let watched = self.watching.borrow().as_ref().map(|aim| aim.env.clone());
-        let safe_mode = !self.workspace.exec.is_container();
-        let lock_reason = match watched {
-            Some(env) => Some(format!(
-                "Read-only: {env}'s checkout. Its agent is working here — review \
-                 what it publishes, or take over its chat."
-            )),
-            None if safe_mode
-                && !taste_core::policy::write_allowed(&self.policy_root(), true, &node.path) =>
-            {
-                Some(
-                    "Read-only until the project's environment is running — only \
-                     devcontainer setup and workspace dotfiles are editable"
-                        .to_string(),
-                )
-            }
-            None => None,
-        };
+        // The lock, for safe mode: the checkout on screen's own
+        // environment has no container running. Another environment's is
+        // otherwise the user's to edit as Personal's is (David, 2026-10-26:
+        // "drop all the user restrictions for other envs"; "The locks
+        // should still work for safe mode").
+        let safe_mode = self.safe_mode_here();
+        let lock_reason = (safe_mode
+            && !taste_core::policy::write_allowed(&self.policy_root(), true, &node.path))
+        .then(|| {
+            "Read-only until the project's environment is running — only devcontainer setup \
+             and workspace dotfiles are editable"
+                .to_string()
+        });
         let locked = lock_reason.is_some();
         if let Some(reason) = lock_reason {
             let lock = gtk::Image::from_icon_name("system-lock-screen-symbolic");
@@ -9828,9 +9766,6 @@ impl FileTree {
     }
 
     fn toggle_stage(self: &Rc<Self>, path: &Path, currently_staged: bool) {
-        if self.refuse_read_only() {
-            return;
-        }
         let Some(rel) = self.repo_relative(path) else {
             return;
         };
@@ -9865,9 +9800,6 @@ impl FileTree {
     /// `Err` is a refusal before anything is written; the write itself is
     /// off the main thread, and a failure there is a toast.
     pub fn commit_staged(self: &Rc<Self>, message: &str) -> Result<(), String> {
-        if self.refuse_read_only() {
-            return Err("this checkout is read-only".into());
-        }
         if self.git.borrow().is_none() {
             return Err("this workspace is not a git repository".into());
         }
@@ -10278,12 +10210,10 @@ impl FileTree {
     /// Push, from a click or, `held`, a hold: the hold is what a push that
     /// replaces commits on the remote needs.
     fn push(self: &Rc<Self>, held: bool) {
-        // Push stays user-only and host-side, and it pushes the USER's
-        // checkout. There is no reading of an agent's clone that turns
-        // into publishing it to the world.
-        if self.refuse_read_only() {
-            return;
-        }
+        // The user's act, host-side, with the user's keys: the branch of
+        // the checkout on screen, from the refs that checkout's peer holds
+        // here — Personal's folder, or another environment's peer — to the
+        // push target its branch names.
         // The issues ref rides along, and only here. It is byte-identical
         // to the plain push until the ref exists, so a workspace that has
         // never filed an issue pushes exactly what it always did — and the
@@ -10554,11 +10484,24 @@ impl FileTree {
             return;
         };
         let root = self.workspace.root().to_path_buf();
+        // Its own container running, said outright rather than inherited
+        // from wherever the probe runs — a probe in the devcontainer reads
+        // `/run/.containerenv` as one — or, with
+        // `TASTE_PROBE_WATCH_SAFE=1`, none: safe mode, its rows locked.
+        let exec = taste_core::ExecContext::for_tests(false);
+        if std::env::var_os("TASTE_PROBE_WATCH_SAFE").is_none() {
+            exec.set_container(
+                "taste-probe-watched",
+                root.display().to_string(),
+                taste_core::ConfigAuthority::Project,
+            );
+        }
         self.aim_at(Some(Aim {
             env,
             checkout: taste_core::environment::Checkout::Local(root.clone()),
             files: taste_core::files::Files::Local,
             peer: root,
+            exec,
         }));
     }
 
@@ -11359,8 +11302,8 @@ impl Ghosts {
         Self(std::sync::Arc::new((root, std::sync::OnceLock::new())))
     }
 
-    /// Whether the pane these ghosts are for can write: a read-only view
-    /// has no root for them.
+    /// Whether the listing these ghosts are for offers them: a search's has
+    /// no root for them.
     fn writable(&self) -> bool {
         self.0 .0.is_some()
     }
@@ -11666,8 +11609,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Every folder a writable pane lists ends with New file… and New
-    /// folder…; a read-only pane's, and a search's, do not.
+    /// Every folder the tree lists ends with New file… and New folder…; a
+    /// search's does not.
     #[test]
     fn every_folder_ends_with_a_new_file_and_a_new_folder() {
         let root = std::env::temp_dir().join(format!("taste-creators-{}", std::process::id()));

@@ -1149,15 +1149,19 @@ no-op at every other width.
   never clobber — dirty ones.
 - `GtkSourceView` 5: syntax highlighting, line numbers, style schemes that
   follow the libadwaita dark/light preference.
-- **A file from another environment opens read-only and badged.** The tab
-  title carries the environment (`main.rs · calm-1`), the buffer is not
-  editable, and a save is refused by name. Such a tab lives in *that*
+- **A file from another environment opens badged, and is the user's to
+  edit.** The tab title carries the environment (`main.rs · calm-1`), and
+  a save writes it into that environment's checkout, under that
+  environment's own rules, as a save of Personal's file writes Personal's
+  (David, 2026-10-26: "There really isn't any reason to not let humans
+  leverage the other envs more directly"). Such a tab lives in *that*
   environment's tab set rather than beside the user's own — switching stows
   it and switching back restores it, selection and scroll intact
   (ENVIRONMENTS.md, "Each environment owns its editor tab set"). The
   predicate is
   *whose checkout the file is in*, not *what the tree is showing*, so a
-  tab opened while watching stays read-only after the user has gone home.
+  tab opened while watching still saves to that environment after the user
+  has gone home.
   The same ownership decides what bounds a **write**: an agent's mediated
   write to a file in its own clone is checked against that environment's
   checkout and mode, not against the window's workspace — the window's

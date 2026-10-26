@@ -1291,33 +1291,6 @@ fn project_from_cwd() -> Option<std::path::PathBuf> {
 /// ink is a different shade per scheme, and its values are `palette.rs`
 /// constants the literal sheet above cannot name.
 fn theme_conditional_css(display: &gtk::gdk::Display) {
-    // Not home: this panel is another environment's checkout and read-only.
-    // A tint the corner of an eye can catch, mixed into the window
-    // background in both themes so the theme's own foreground stays
-    // legible on it.
-    //
-    // The RED family, since the search took purple (David, 2026-09-08:
-    // "for read only environments, let's go with something like burgundy
-    // for dark mode and a very light red for light mode"). A different
-    // member per scheme, which is what this provider is for: dark wants a
-    // deep red to read as burgundy, and light wants a bright one thinned
-    // to almost nothing. One colour at two percentages gave a burgundy and
-    // a muddy warm grey.
-    //
-    // The percentages are measured, not chosen: the step the purple used
-    // to take was +4.6 L* on dark and −5.0 on light, and these land on it
-    // (`red_5` at 27% → +4.6; `red_3` at 8% → −5.0). What the eye reads as
-    // "how strong is this tint" is the lightness step, not the recipe.
-    //
-    // The one thing to keep an eye on: red is also two thirds of a failed
-    // state, and a failed environment's dot now sits on a red-family
-    // panel. The wash is desaturated and dark where the alert red is
-    // neither, and a dot is a glyph while this is a ground — but they are
-    // in one family now, where purple was in none.
-    const AWAY_DARK: &str = ".backlog-panel.away { background-color: \
-                        color-mix(in srgb, @red_5 27%, @window_bg_color); }";
-    const AWAY_LIGHT: &str = ".backlog-panel.away { background-color: \
-                         color-mix(in srgb, @red_3 8%, @window_bg_color); }";
     let provider = gtk::CssProvider::new();
     // Above the sheet beside it, so a rule may be stated in both places
     // and the theme-conditional one is the one that lands.
@@ -1380,13 +1353,9 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
     );
     let apply = move |style: &adw::StyleManager, provider: &gtk::CssProvider| {
         let dark = style.is_dark();
-        let away = if dark { AWAY_DARK } else { AWAY_LIGHT };
         let panels = if dark { panels.as_str() } else { "" };
         let tree = if dark { tree_dark.as_str() } else { "" };
-        provider.load_from_string(&format!(
-            "{away}\n{panels}{TREE_TYPE}{tree}{}",
-            search_css(dark)
-        ));
+        provider.load_from_string(&format!("{panels}{TREE_TYPE}{tree}{}", search_css(dark)));
     };
     let style = adw::StyleManager::default();
     apply(&style, &provider);

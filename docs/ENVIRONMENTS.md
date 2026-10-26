@@ -635,15 +635,24 @@ aimed at does, by explicit action only:
   still arrive somewhere, and both do it by asking for the same
   transition rather than moving a pane of their own. Nothing auto-follows:
   watching is deliberate, and the tree never jumps out from under the user.
-- **Non-primary environments are read-only to the user.** Tree rows
-  carry locks (the safe-mode affordance, reused for a second purpose),
-  file operations and stage/discard/commit/push are disabled, and the
-  editor refuses saves to foreign-env files. The user's intervention
-  path is reviewing published branches or taking over the chat — never
-  editing under a running agent, which would race it.
+- **Every environment is the user's to work in, not only Personal.** Its
+  files are edited and saved, its git — stage, discard, stash, commit,
+  branches, Pull, and Push — and its file operations work as Personal's
+  do, and nothing marks it locked: no row locks, no refused saves, no
+  tint on the panel (David, 2026-10-26: "drop all the user restrictions
+  for other envs … There really isn't any reason to not let humans
+  leverage the other envs more directly"). Safe mode still locks, and
+  per environment: one whose own container is not running wears the
+  safe-mode locks, as Personal does in the same state ("The locks should
+  still work for safe mode"). Push from another environment
+  sends that environment's branch, from its peer, to the push target the
+  branch names, with the user's keys, on the user's press. An agent
+  working there meets the user's edits as it meets any change to its
+  files; reviewing published branches and taking over the chat remain the
+  paths for its own work.
 - **Each environment owns its editor tab set.** Files opened from a
-  watched environment are read-only tabs badged with the environment
-  name, and they live in *that* environment's set: switching away stows
+  watched environment are tabs badged with the environment name, and they
+  live in *that* environment's set: switching away stows
   them, switching back restores them in order, with their selection and
   scroll. (They used to be mixed in beside the user's own tabs. That was
   the last place two environments shared a pane.) Opening a file that
@@ -4992,6 +5001,9 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    watched. Files opened from it are read-only editor tabs badged with the
    environment, and they stay that way afterwards, because the predicate is
    whose checkout the file is in rather than what the tree is showing.
+   (Read-only no longer, since 2026-10-26: every environment is the user's
+   to edit, commit in, and push from — "Every environment is the user's to
+   work in" above.)
    That predicate also fixed a real bug it uncovered: the editor bounded
    every write by the *window's* workspace root, so an agent's mediated
    write to a file in its own clone was refused for being outside the

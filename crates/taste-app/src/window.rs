@@ -663,6 +663,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         checkout: supervisor.checkout(),
                         files: supervisor.files(),
                         peer: supervisor.peer().to_path_buf(),
+                        exec: supervisor.exec().clone(),
                     }),
                     // An environment with no supervisor is one that does not
                     // exist. Refuse rather than quietly aiming at the
@@ -2945,10 +2946,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         }
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
         // picks which of its multi-environment faces to shoot, because one
-        // pane gets one screenshot: `watching` (the default — locks, the
-        // panel tinted, git controls disabled), `review` (one environment's
-        // branch against the merge base), or the views that leave it at
-        // home.
+        // pane gets one screenshot: `watching` (the default — another
+        // environment's checkout, the user's to work in, its container
+        // running, or with `TASTE_PROBE_WATCH_SAFE=1` not, its rows locked),
+        // `review` (one environment's branch against the merge base), or
+        // the views that leave it at home.
         // `seed_watching_for_probe` aims the TREE directly, and in the
         // running app nothing does that: `aim_panes` moves the tree, the
         // editor and the console together. Seeding only half of it shot a
@@ -2974,7 +2976,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // untinted, with "Personal" the selected row.
             "hero" | "backlog" | "backlog-composer" | "dirty" | "stashed" | "search" | "port" => {}
             view if view.starts_with("consolidated") => {}
-            _ => filetree.seed_watching_for_probe(probe_env),
+            // After the window's own aim has landed: the file the pose
+            // opens is the watched environment's, and opening it aims the
+            // panes there through `aim_panes`, which finds no environment
+            // behind a probe's id and draws the "has no environment" page
+            // over a tree seeded any earlier.
+            _ => {
+                let filetree = filetree.clone();
+                let env = probe_env.to_string();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                    filetree.seed_watching_for_probe(&env);
+                });
+            }
         }
         // The Dirty filter, on the checkout's own dirty files: the rows
         // with checkboxes, photographed beside the Logs and backlog rows so

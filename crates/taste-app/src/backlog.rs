@@ -226,9 +226,6 @@ impl Row {
             format!("{} — {}", self.id, self.title)
         };
         let mut parts: Vec<String> = vec![live.detail.clone()];
-        if !live.primary {
-            parts.push("read-only to you".into());
-        }
         if let Some(claim) = &live.working_on {
             parts.push(format!("working on {claim}"));
         }
@@ -759,11 +756,6 @@ fn state_classes(stage: Stage) -> Vec<&'static str> {
     } else {
         vec!["backlog-state"]
     }
-}
-
-/// The panel is tinted when the panes are aimed away from home.
-pub fn away(current: Option<&EnvironmentId>) -> bool {
-    current.is_some_and(|env| !env.is_primary())
 }
 
 /// The one query, over what the row shows and what its issue holds: title,
@@ -1881,16 +1873,7 @@ impl BacklogPanel {
             return;
         }
         *self.current.borrow_mut() = current;
-        self.apply_face();
         self.render();
-    }
-
-    fn apply_face(&self) {
-        if away(self.current.borrow().as_ref()) {
-            self.widget.add_css_class("away");
-        } else {
-            self.widget.remove_css_class("away");
-        }
     }
 
     /// Ctrl+Shift+E: the filter when there is one to type into, else the
@@ -2440,14 +2423,13 @@ impl BacklogPanel {
         self.check_slots.borrow_mut().push(slot_stack.clone());
         box_.append(&slot);
         // Whose row it is, at the title's left: the human's for Personal,
-        // an agent's for every issue — and the agent glyph carries what the
-        // lock used to say, that the checkout is the agent's and read-only
-        // for the person watching it (David, 2026-09-06: "Rather than a lock
-        // icon on agent environments, use an AI icon but still explain in
-        // the tooltip that it's functionally locked for the human … put the
-        // AI icon where the issue title starts now and shift the issue
-        // title to the right … a similar 'human' icon … for the Personal
-        // environment").
+        // an agent's for every issue (David, 2026-09-06: "put the AI icon
+        // where the issue title starts now and shift the issue title to the
+        // right … a similar 'human' icon … for the Personal environment").
+        // An agent's environment is the person's to work in too: its files,
+        // its git, and its chat are open to them, as Personal's are (David,
+        // 2026-10-26: "There really isn't any reason to not let humans
+        // leverage the other envs more directly").
         let primary = row.live.as_ref().is_some_and(|live| live.primary);
         let (role_icon, role_tip) = if primary {
             (
@@ -2457,8 +2439,9 @@ impl BacklogPanel {
         } else if row.live.is_some() {
             (
                 "taste-agent-symbolic",
-                "An agent's environment. Its checkout is read-only for you: watch it here, \
-                 judge its branch in the review; only the agent writes in it.",
+                "An agent's environment: its agent works here, and so can you — edit its \
+                 files, commit, or take over its chat. Its branch reaches yours by Publish \
+                 and review.",
             )
         } else {
             (
@@ -4436,7 +4419,6 @@ mod tests {
         assert!(live.primary && live.current && live.light == Light::Green);
         assert!(first.tooltip().contains("your own checkout"));
         assert!(!first.tooltip().contains("read-only"));
-        assert!(!away(None), "home is not tinted");
 
         // No fleet yet: the row still exists and says it does not know.
         let cold = rows(&[], &[], None);
@@ -4483,11 +4465,8 @@ mod tests {
             tip.starts_with("i-0007 — The composer loses a draft"),
             "{tip}"
         );
-        assert!(tip.contains("read-only to you") && tip.contains("waiting for an answer"));
-        assert!(
-            away(Some(&env("i-0007"))),
-            "aimed away from home tints the panel"
-        );
+        assert!(tip.contains("waiting for an answer"), "{tip}");
+        assert!(!tip.contains("read-only"), "{tip}");
         assert!(!rows[0].live.as_ref().unwrap().current, "one current row");
     }
 

@@ -241,8 +241,12 @@ than the photographer's own;
 `TASTE_PROBE_ALIGN=1` prints where the file tree header's folder, branch,
 and All rows start their icon and text, which stand in one column;
 `TASTE_PROBE_TREE_END=1` scrolls the file tree to the end of its listing,
-where every folder's New file… and New folder… rows are (pair it with
-`TASTE_PROBE_VIEW=hero`: a watched environment is read-only and has none);
+where every folder's New file… and New folder… rows are;
+`TASTE_PROBE_WATCH_SAFE=1` poses the watched environment
+(`TASTE_PROBE_VIEW=watching`) in safe mode, its own container not running,
+so its rows wear the safe-mode locks; without it the environment's
+container runs, and its rows, git, and files are the user's to work in as
+Personal's are;
 `TASTE_PROBE_SELECTION=1` puts README.md in front, opens a folder above
 it, makes files above it and refreshes the tree in place, then lights a
 folder and takes the focus out of the tree, printing the lit row against

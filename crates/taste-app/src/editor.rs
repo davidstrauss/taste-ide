@@ -14,8 +14,9 @@
 //! buffers come back because they were never taken apart. Which set a tab
 //! belongs to is decided by whose checkout the file is in
 //! ([`taste_core::policy::in_environment_checkout`]), never by what was on
-//! screen when it was opened, which is also what keeps a foreign file
-//! read-only.
+//! screen when it was opened, which is also how a save of another
+//! environment's file goes to that environment's checkout, under its own
+//! rules (`persist_page`).
 //!
 //! **At the consolidated rung this strip is the window's only one.** The
 //! chat pane's three views and the console's tabs are grafted onto its end
@@ -3932,7 +3933,7 @@ impl Editor {
             (None, Some((env, _, _))) => {
                 tab.set_title(&format!("{file_name} · {env}"));
                 tab.set_tooltip(&format!(
-                    "{}\nRead-only: {env}'s checkout, which its agent is working in",
+                    "{}\n{env}'s checkout, which its agent is working in",
                     self.shown_path(path)
                 ));
             }
@@ -4903,12 +4904,13 @@ impl Editor {
             .unwrap_or_else(|| !self.workspace.exec.is_container())
     }
 
-    /// Save on the USER's behalf (Ctrl+S, save-and-close).
-    ///
-    /// This is where watching's read-only half is enforced: a file from
-    /// another environment's checkout is refused here, by name, before any
-    /// bytes are rendered. The agent's own writes to that file do not come
-    /// through here — see `persist_page`.
+    /// Save on the USER's behalf (Ctrl+S, save-and-close). Another
+    /// environment's file is saved into that environment's checkout, as
+    /// Personal's is into Personal's: what was once refused here, the user
+    /// may do in any environment (David, 2026-10-26: "There really isn't
+    /// any reason to not let humans leverage the other envs more
+    /// directly"). An agent working there meanwhile meets the edit as it
+    /// meets any other change to its files.
     fn save_page(&self, path: &Path, page: &EditorPage) -> Result<(), String> {
         // A review tab is a pair of blobs, not a file. There is nowhere for
         // a save to go, and the key it is filed under is not a path.
@@ -4917,13 +4919,6 @@ impl Editor {
                 "Read-only: this is {}, read from the repository — not a file on disk. \
                  Merge the branch to bring its work into your checkout.",
                 source.comparison()
-            );
-            self.flag_save_failure(page, &message);
-            return Err(message);
-        }
-        if let Some(env) = &page.foreign_env {
-            let message = format!(
-                "Read-only: this file belongs to environment {env}, which its agent                  is working in. Review its work by publishing a branch, or take over                  its chat — editing under a running agent races it."
             );
             self.flag_save_failure(page, &message);
             return Err(message);
@@ -5099,7 +5094,7 @@ impl Editor {
             // Performance guard: no syntax regexes, no restyling.
             page.buffer.set_language(None);
             page.view.set_show_line_numbers(true);
-            page.view.set_editable(page.foreign_env.is_none());
+            page.view.set_editable(true);
             // A notebook's face is drawn whatever its source's lines —
             // its pictures are base64 on one line each — and an SVG's,
             // whose path data is one; anything else plain has no other
@@ -5111,10 +5106,9 @@ impl Editor {
             // The edit face is always a real, highlighted source editor.
             page.buffer.set_language(source_language(path).as_ref());
             page.view.set_show_line_numbers(true);
-            // Another environment's file is read to the letter and edited
-            // not at all: the buffer is not editable, so there is no way to
-            // type work that a save would then have to refuse.
-            page.view.set_editable(page.foreign_env.is_none());
+            // Every environment's file is edited here, another's as well
+            // as Personal's.
+            page.view.set_editable(true);
         }
         if is_svg(path) {
             if self.wysiwyg_active(path, page) {
@@ -5278,9 +5272,9 @@ impl Editor {
     }
 
     /// The page's notebook session, made the first time it is asked for:
-    /// its kernel runs in the workspace's own environment, and a notebook
-    /// of another environment's is looked at and not run — watching is
-    /// looking, as every other file of a watched environment is.
+    /// its kernel runs in the container of the environment the notebook is
+    /// in, another environment's as much as the user's own, and its cells
+    /// are run and saved there.
     fn notebook_session(&self, path: &Path, page: &EditorPage) -> Rc<crate::notebook::Session> {
         if let Some(session) = page.notebook.borrow().as_ref() {
             return session.clone();
@@ -5300,7 +5294,6 @@ impl Editor {
                 .and_then(|environments| environments.get(foreign))
                 .map(|supervisor| supervisor.exec().clone()),
         };
-        let writable = page.foreign_env.is_none();
         let env_for_session = env.clone();
         let hook = self.on_prompt_agent.borrow().clone();
         let on_prompt: Rc<dyn Fn(String, (String, String))> = Rc::new(move |prompt, attachment| {
@@ -5312,7 +5305,7 @@ impl Editor {
             path.to_path_buf(),
             env_for_session,
             exec,
-            writable,
+            true,
             page.buffer.clone(),
             on_prompt,
         );
