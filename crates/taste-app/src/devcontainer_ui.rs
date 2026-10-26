@@ -813,9 +813,8 @@ pub(crate) fn author_prompt() -> String {
      \"build\": {\"dockerfile\": \"Containerfile\"}. Keep it usable by VS Code and \
      Codespaces, and no more: add no customizations.vscode (extensions, settings) or \
      anything else only an editor reads. This IDE does not apply devcontainer features: install tools in the \
-     Containerfile instead. If the checkout has a Taskfile.yml (taskfile.dev), install Task \
-     in the Containerfile too (Fedora's package is go-task; either binary name works): the \
-     IDE lists and runs the project's tasks through it.\n\
+     Containerfile instead. Do not install Task (taskfile.dev): the IDE provides it in \
+     every container.\n\
      If the checkout has Jupyter notebooks (.ipynb files): install ipykernel, which brings \
      jupyter_client, into the Python the project uses, and the packages the notebooks import, \
      and add the notebook kernel's task to the Taskfile. "
@@ -841,7 +840,13 @@ pub(crate) fn author_prompt() -> String {
      the log, fix the files, and reload again. After a start, the IDE checks the container for \
      Task and for nested podman; a failure names what is missing and the change that fixes it. Stop after three attempts and report what you \
      tried.\n\
-     5. Finish with one short paragraph: what the environment provides, and why."
+     5. Once the start succeeds, the whole checkout is writable. If it has no Taskfile \
+     (Taskfile.yml, or another name Task reads), write Taskfile.yml at its root: one task \
+     for each command a developer runs here — build, test, lint, each server — taken from \
+     the README, build files, and CI configuration you read in step 1. Check it with \
+     task_list. The user's Tasks section lists and runs these tasks. Skip this step when \
+     the project has nothing to run.\n\
+     6. Finish with one short paragraph: what the environment provides, and why."
     );
     text
 }
@@ -978,6 +983,17 @@ mod tests {
         assert!(prompt.contains("ipykernel"));
         assert!(prompt.contains("jupyter_client"));
         assert!(prompt.contains(".venv/bin/python, venv/bin/python, python3, and python"));
+    }
+
+    /// A project set up without a Taskfile gets one once its own
+    /// environment runs, where the root is writable, and Task is never
+    /// installed for it: the IDE provides Task in every container.
+    #[test]
+    fn the_authoring_prompt_asks_for_a_taskfile_and_never_for_task() {
+        let prompt = author_prompt();
+        assert!(prompt.contains("write Taskfile.yml at its root"));
+        assert!(prompt.contains("Do not install Task"));
+        assert!(!prompt.contains("go-task"));
     }
 
     #[test]

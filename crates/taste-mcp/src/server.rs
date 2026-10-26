@@ -2484,7 +2484,9 @@ impl McpServer {
                          following the conventions above; call environment with include \
                          [\"log\"] to diagnose, then devcontainer_reload to build and \
                          start it. Once it runs, the whole workspace becomes writable \
-                         and your work continues uninterrupted."
+                         and your work continues uninterrupted; then, if the project has \
+                         no Taskfile, write Taskfile.yml at the root with a task for each \
+                         command a developer runs here (build, test, lint, each server)."
                     } else {
                         "The devcontainer is running: the workspace is writable. Keep writes \
                          inside it; build and run things in the container rather than \
