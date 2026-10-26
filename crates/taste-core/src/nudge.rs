@@ -16,6 +16,16 @@
 //! be something the agent waits on and activates for if in any wait
 //! loop").
 //!
+//! Claude Code needs neither: the IDE installs a hook of Claude Code's own
+//! (`PostToolUse`, its documented `additionalContext`) that, after each of
+//! the agent's tool calls — its own tools as well as the IDE's — takes the
+//! messages waiting behind the turn ([`TAKE_TOOL`]) and puts them beside
+//! the tool's result, for the agent's next step. The message is read within
+//! the turn, as Claude Code's own editor integrations deliver it, and never
+//! sent again after it. A message with an attachment, or one sent while the
+//! agent makes no further tool call, still waits for the turn to end; other
+//! agents keep the ask above.
+//!
 //! Workspace-wide and a handle, like the standing answers: the chat pane
 //! asks on the GTK thread and the MCP server delivers from tokio.
 
@@ -27,6 +37,17 @@ use crate::environment::EnvironmentId;
 /// What a nudged agent's next tool result ends with.
 pub const NOTE: &str = "[The user has a message waiting for you. Finish the step you are on, \
                         then end your turn so it can be sent.]";
+
+/// The IDE's tool a Claude Code hook calls after each of the agent's tool
+/// calls (`taste_acp::relocate`'s hook script): the user's messages waiting
+/// behind the turn, taken for the agent to read within it, which is how a
+/// message reaches Claude Code at its next step, as it does in Claude
+/// Code's own editor integrations, rather than after the turn ends. Not in
+/// any environment's tool listing — the agent is told its messages, not
+/// asked to fetch them — and callable on every environment's socket all the
+/// same (David, 2026-10-26: "Is there a better way to tell Claude to read a
+/// pending message or end its turn?").
+pub const TAKE_TOOL: &str = "take_user_messages";
 
 /// What a wait that a message ended says, in place of what it waited for.
 pub const WOKEN: &str = "The user sent you a message while you waited. End your turn now: it \

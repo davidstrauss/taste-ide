@@ -204,6 +204,13 @@ impl ChatPane {
                 "not delivered — the agent stopped before it took this".into(),
                 None,
             ),
+            Delivery::WithinTurn => (
+                "read by the agent during its turn".into(),
+                Some(
+                    "The agent took this at its next step, without ending the turn it was in"
+                        .into(),
+                ),
+            ),
             Delivery::Undelivered => (
                 "not delivered — the IDE closed before the agent took this".into(),
                 None,

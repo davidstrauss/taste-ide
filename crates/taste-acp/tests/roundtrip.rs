@@ -39,6 +39,7 @@ async fn full_session_roundtrip() {
             SessionEvent::QueuedJoined { count } => format!("QueuedJoined({count})"),
             SessionEvent::QueuedDropped { count } => format!("QueuedDropped({count})"),
             SessionEvent::QueuedWithdrawn { ids } => format!("QueuedWithdrawn({ids:?})"),
+            SessionEvent::QueuedTaken { ids } => format!("QueuedTaken({ids:?})"),
             SessionEvent::Ready { .. } => unreachable!(),
             SessionEvent::Permission { .. } => "Permission".to_string(),
             SessionEvent::Elicitation { .. } => "Elicitation".to_string(),

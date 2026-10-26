@@ -157,6 +157,32 @@ pub fn attach(
                     };
                     let _ = reply.send(answer).await;
                 }
+                // The hook's: what waits behind the chat's turn, taken from
+                // its session for the agent to read within the turn. Off this
+                // loop, since the session answers after its own queue.
+                OrchestrationRequest::TakeWaiting { chat } => {
+                    // Nobody asking any more — the hook's time ran out while
+                    // this thread was busy: nothing is taken.
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let pane = chats.pane_for(&chat);
+                    let taking = pane.as_ref().and_then(|pane| pane.take_waiting_for_hook());
+                    glib::spawn_future_local(async move {
+                        let taken = match taking {
+                            Some(taking) => taking.await.unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                        let texts = taken.iter().map(|(_, text)| text.clone()).collect();
+                        // Taken, and the hook gone before it had them: sent
+                        // again, after the turn, rather than read by nobody.
+                        if reply.send(OrchestrationReply::Taken(texts)).await.is_err() {
+                            if let Some(pane) = pane {
+                                pane.give_back_taken(taken);
+                            }
+                        }
+                    });
+                }
                 OrchestrationRequest::ChatStatus { chat } => {
                     let answer = match chats.pane_for(&chat) {
                         None => OrchestrationReply::Error(no_such_chat(&chats, &chat)),

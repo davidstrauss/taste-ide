@@ -255,7 +255,7 @@ fn exec_in_environment(
             "taste-agent".into(),
             front_arg(relocation),
             path_arg(&relocation.task_dir),
-            claude_settings_script(),
+            claude_settings_script(&relocation.mcp_socket),
         ]);
         args.extend(inner);
         return relocation.podman.argv(args);
@@ -356,8 +356,22 @@ fn is_claude_code(spec: &AgentSpec) -> bool {
 /// no Co-Authored-By trailer or "Generated with" line goes into the
 /// user's history: the commits are theirs. A file that does not parse is
 /// left alone rather than replaced.
-fn claude_settings_script() -> String {
+///
+/// And it installs the IDE's message hook ([`CLAUDE_MESSAGE_HOOK`]) beside
+/// the settings, run after every tool call: the user's messages waiting
+/// behind the turn reach the agent at its next step, as they do in Claude
+/// Code's own editor integrations, where ACP alone can only send them
+/// after the turn ends or cancel the turn to make room (David,
+/// 2026-10-26). An entry of the IDE's from an earlier start is replaced,
+/// never repeated, and the hooks of anyone else's are kept.
+fn claude_settings_script(socket: &Path) -> String {
     let list = |tools: &[&str]| serde_json::to_string(tools).unwrap_or_else(|_| "[]".into());
+    let quoted = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    let hook = CLAUDE_MESSAGE_HOOK.replace("TAKE_TOOL", taste_core::nudge::TAKE_TOOL);
+    let command = format!(
+        "node \"$HOME/.claude/{CLAUDE_MESSAGE_HOOK_FILE}\" {}",
+        quoted(&socket.display().to_string())
+    );
     format!(
         "const fs=require('fs'),path=require('path');\
          const f=path.join(process.env.HOME,'.claude','settings.json');\
@@ -367,13 +381,85 @@ fn claude_settings_script() -> String {
          const add=(k,v)=>{{p[k]=[...new Set([...(p[k]||[]),...v])]}};\
          add('deny',{deny});add('allow',{allow});s.autoMemoryEnabled=false;\
          s.attribution={{...s.attribution,commit:'',pr:''}};\
+         const hooks=s.hooks=s.hooks||{{}};\
+         const ours=g=>(g.hooks||[]).some(h=>String(h.command||'').includes({file}));\
+         hooks.PostToolUse=[...(hooks.PostToolUse||[]).filter(g=>!ours(g)),\
+         {{matcher:'*',hooks:[{{type:'command',command:{command},timeout:5}}]}}];\
          fs.mkdirSync(path.dirname(f),{{recursive:true}});\
+         fs.writeFileSync(path.join(path.dirname(f),{file}),{hook});\
          fs.writeFileSync(f+'.taste-part',JSON.stringify(s,null,2)+'\\n');\
          fs.renameSync(f+'.taste-part',f);",
         deny = list(&CLAUDE_DENIED_TOOLS),
         allow = list(&CLAUDE_ALLOWED_TOOLS),
+        file = quoted(CLAUDE_MESSAGE_HOOK_FILE),
+        command = quoted(&command),
+        hook = quoted(&hook),
     )
 }
+
+/// Where [`CLAUDE_MESSAGE_HOOK`] is written, in the agent's `~/.claude`.
+const CLAUDE_MESSAGE_HOOK_FILE: &str = "taste-ide-messages.cjs";
+
+/// Claude Code's `PostToolUse` hook, as the IDE installs it: it asks the
+/// IDE, on the environment's MCP socket (its argument), for the user's
+/// messages waiting behind the turn ([`taste_core::nudge::TAKE_TOOL`],
+/// standing in for `TAKE_TOOL` here), and gives them back to Claude Code as
+/// `additionalContext`, which Claude reads at its next request, beside the
+/// tool result. Written as facts, as Claude Code's hooks documentation
+/// asks of injected context. Fails open, and quickly: an IDE that does not
+/// answer within four seconds, or answers with nothing, adds nothing, and
+/// the message is sent after the turn as before.
+const CLAUDE_MESSAGE_HOOK: &str = r#"'use strict';
+// The IDE's message hook (taste-ide): after each tool call, the user's
+// messages waiting behind the turn, for the next step. Rewritten by the IDE
+// at each start; edits here do not last.
+const net = require('net');
+let done = false;
+const finish = (text) => {
+  if (done) return;
+  done = true;
+  if (text) {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: text },
+    }));
+  }
+  process.exit(0);
+};
+setTimeout(() => finish(''), 4000);
+const words = (messages) => {
+  const head = messages.length === 1
+    ? 'The user sent this message while you were working on this turn. It reached you here, at your next step, rather than after the turn:'
+    : `The user sent these ${messages.length} messages while you were working on this turn, in this order. They reached you here, at your next step, rather than after the turn:`;
+  return head + '\n\n' + messages.join('\n\n---\n\n');
+};
+const socket = net.connect(process.argv[2]);
+socket.on('error', () => finish(''));
+socket.on('connect', () => {
+  socket.write(JSON.stringify({
+    jsonrpc: '2.0', id: 1, method: 'tools/call',
+    params: { name: 'TAKE_TOOL', arguments: {} },
+  }) + '\n');
+});
+let buffered = '';
+socket.on('data', (data) => {
+  buffered += data;
+  let end;
+  while ((end = buffered.indexOf('\n')) >= 0) {
+    const line = buffered.slice(0, end);
+    buffered = buffered.slice(end + 1);
+    try {
+      const reply = JSON.parse(line);
+      if (reply.id !== 1) continue;
+      const text = reply.result && reply.result.content && reply.result.content[0]
+        && reply.result.content[0].text;
+      const messages = text ? JSON.parse(text).messages : [];
+      finish(messages && messages.length ? words(messages) : '');
+    } catch (e) {
+      finish('');
+    }
+  }
+});
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -722,6 +808,85 @@ mod tests {
         assert_eq!(&args[container + 7..], &plain[container + 7..]);
     }
 
+    /// The message hook, run by node against a stand-in for the IDE's
+    /// socket: a waiting message comes back as the context Claude Code
+    /// reads, nothing waiting adds nothing, and no IDE at all adds nothing
+    /// rather than failing the tool call.
+    #[test]
+    fn the_message_hook_hands_claude_what_waits_and_nothing_else() {
+        use std::io::{BufRead, Write};
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: no node on this machine");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join(CLAUDE_MESSAGE_HOOK_FILE);
+        std::fs::write(
+            &hook,
+            CLAUDE_MESSAGE_HOOK.replace("TAKE_TOOL", taste_core::nudge::TAKE_TOOL),
+        )
+        .unwrap();
+        let answering = |messages: serde_json::Value| -> String {
+            let socket = dir
+                .path()
+                .join(format!("ide-{}.sock", messages.to_string().len()));
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["params"]["name"], taste_core::nudge::TAKE_TOOL);
+                let text = serde_json::json!({ "messages": messages }).to_string();
+                let reply = serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "result": { "content": [{ "type": "text", "text": text }] },
+                });
+                (&stream)
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .unwrap();
+            });
+            let out = std::process::Command::new("node")
+                .arg(&hook)
+                .arg(&socket)
+                .output()
+                .unwrap();
+            // A hook that never asked leaves the stand-in waiting: one
+            // connection of the test's own ends that wait, as a failure,
+            // never a hang.
+            let _ = std::os::unix::net::UnixStream::connect(&socket);
+            assert!(
+                server.join().is_ok(),
+                "the hook never asked: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let said = answering(serde_json::json!(["use the other parser"]));
+        let said: serde_json::Value = serde_json::from_str(&said).unwrap();
+        assert_eq!(said["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        let context = said["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.ends_with("use the other parser"), "{context}");
+        assert_eq!(answering(serde_json::json!([])), "");
+        // No IDE behind the socket: nothing, and no failure.
+        let out = std::process::Command::new("node")
+            .arg(&hook)
+            .arg(dir.path().join("nobody.sock"))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty());
+    }
+
     /// The merge, run by node against a home of its own: the rules join
     /// whatever the file holds, twice is once, and a file that does not
     /// parse is left as it was.
@@ -741,13 +906,13 @@ mod tests {
         let file = home.join(".claude/settings.json");
         std::fs::write(
             &file,
-            r#"{"model":"opus","permissions":{"deny":["Bash(rm:*)"],"allow":["Bash(ls:*)"]}}"#,
+            r#"{"model":"opus","permissions":{"deny":["Bash(rm:*)"],"allow":["Bash(ls:*)"]},"hooks":{"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"./lint.sh"}]}]}}"#,
         )
         .unwrap();
         let run = || {
             let out = std::process::Command::new("node")
                 .arg("-e")
-                .arg(claude_settings_script())
+                .arg(claude_settings_script(Path::new("/run/taste/mcp.sock")))
                 .env("HOME", &home)
                 .output()
                 .unwrap();
@@ -775,6 +940,23 @@ mod tests {
         assert_eq!(
             merged["attribution"],
             serde_json::json!({"commit": "", "pr": ""})
+        );
+        // The IDE's message hook joins the hooks there, once however often
+        // the merge runs, with the socket it asks, and its script beside
+        // the settings.
+        let post = merged["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 2, "{post:?}");
+        assert_eq!(post[0]["hooks"][0]["command"], "./lint.sh");
+        let ours = post[1]["hooks"][0]["command"].as_str().unwrap();
+        assert!(ours.contains(CLAUDE_MESSAGE_HOOK_FILE), "{ours}");
+        assert!(ours.contains("/run/taste/mcp.sock"), "{ours}");
+        assert_eq!(post[1]["matcher"], "*");
+        let script =
+            std::fs::read_to_string(home.join(".claude").join(CLAUDE_MESSAGE_HOOK_FILE)).unwrap();
+        assert!(script.contains(taste_core::nudge::TAKE_TOOL));
+        assert!(
+            !script.contains("TAKE_TOOL"),
+            "the placeholder was replaced"
         );
         std::fs::write(&file, "{ not json").unwrap();
         run();

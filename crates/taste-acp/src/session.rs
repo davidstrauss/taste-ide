@@ -67,6 +67,11 @@ pub enum Command {
     /// Cancel the in-flight turn and drop the prompts waiting behind it,
     /// which never reach the agent ([`SessionEvent::QueuedDropped`]).
     CancelAll,
+    /// Take the messages waiting behind the turn for the agent to read
+    /// within it, by a Claude Code hook ([`TakenMessages`]): out of the
+    /// queue, so they are not sent again after it
+    /// ([`SessionEvent::QueuedTaken`]). Empty when no turn is running.
+    TakeWaiting(tokio::sync::oneshot::Sender<TakenMessages>),
     Authenticate(AuthMethodId),
     SetMode(SessionModeId),
     SetConfigOption(SessionConfigId, SessionConfigValueId),
@@ -127,6 +132,10 @@ pub enum SessionEvent {
     /// [`Command::Withdraw`] or a [`Command::Expedite`], and will never be
     /// sent.
     QueuedWithdrawn { ids: Vec<String> },
+    /// These prompts, by their ids, were taken from behind the turn for the
+    /// agent to read within it ([`Command::TakeWaiting`]), and will not be
+    /// sent after it.
+    QueuedTaken { ids: Vec<String> },
     /// A turn finished, with the agent's session-cumulative token usage
     /// when it reports one.
     TurnEnded {
@@ -242,6 +251,14 @@ impl AgentClient {
             queued: Some(queued),
             id,
         })
+    }
+
+    /// Take the messages waiting behind the turn ([`Command::TakeWaiting`]):
+    /// the answer comes on the receiver, empty when nothing could be taken.
+    pub fn take_waiting(&self) -> Result<tokio::sync::oneshot::Receiver<TakenMessages>> {
+        let (reply, taken) = tokio::sync::oneshot::channel();
+        self.send(Command::TakeWaiting(reply))?;
+        Ok(taken)
     }
 
     /// Drop the prompt `id` from behind the turn, if it is still waiting.
@@ -1317,6 +1334,47 @@ fn is_prompt(command: &Command, id: &str) -> bool {
     matches!(command, Command::Prompt { id: Some(own), .. } if own == id)
 }
 
+/// Messages taken from behind a turn ([`Command::TakeWaiting`]), in the
+/// order they were sent: each one's id and its words.
+pub type TakenMessages = Vec<(String, String)>;
+
+/// Take from `queued` the prompts a turn's own reading can carry: those
+/// waiting at its front, text alone and named, up to the first that is not
+/// — a message with a picture or a file in it waits for the turn to end,
+/// and nothing after it goes ahead of it. The other commands waiting (a
+/// mode, a setting) stay where they are.
+fn take_waiting(queued: &mut std::collections::VecDeque<Command>) -> TakenMessages {
+    let mut taken = Vec::new();
+    let mut at = 0;
+    while at < queued.len() {
+        let Command::Prompt { blocks, id, .. } = &queued[at] else {
+            at += 1;
+            continue;
+        };
+        let text_only = blocks.iter().all(|b| matches!(b, ContentBlock::Text(_)));
+        if id.is_none() || !text_only {
+            break;
+        }
+        if let Some(Command::Prompt {
+            blocks,
+            id: Some(id),
+            ..
+        }) = queued.remove(at)
+        {
+            let text = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            taken.push((id, text));
+        }
+    }
+    taken
+}
+
 /// The post-setup command loop, shared by fresh and restored sessions.
 /// Commands arriving while a turn is in flight are queued (Cancel excepted),
 /// never dropped, and run in the order they came: a prompt typed during a
@@ -1408,6 +1466,18 @@ async fn serve_commands(
                                         .await;
                                 }
                             }
+                            Ok(Command::TakeWaiting(reply)) => {
+                                let taken = take_waiting(&mut queued);
+                                let ids: Vec<String> =
+                                    taken.iter().map(|(id, _)| id.clone()).collect();
+                                // Said to the chat before the hook has them,
+                                // so a turn that ends meanwhile cannot send
+                                // them again.
+                                if !ids.is_empty() {
+                                    let _ = event_tx.send(SessionEvent::QueuedTaken { ids }).await;
+                                }
+                                let _ = reply.send(taken);
+                            }
                             Ok(Command::Withdraw(id)) => {
                                 let before = queued.len();
                                 queued.retain(|command| !is_prompt(command, &id));
@@ -1460,6 +1530,9 @@ async fn serve_commands(
             }
             // Nothing in flight, so nothing waits behind it either.
             Command::Cancel | Command::CancelAll | Command::Withdraw(_) | Command::Expedite(_) => {}
+            Command::TakeWaiting(reply) => {
+                let _ = reply.send(Vec::new());
+            }
             // Control commands are never fatal: a rejected mode or config
             // change must not tear down a healthy conversation.
             Command::SetMode(mode) => {
@@ -1951,6 +2024,46 @@ pub fn login_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a turn's own reading takes from behind it: the named text
+    /// messages at the front, in order, past a mode change, up to the first
+    /// with anything but text in it — which keeps its place, with all after
+    /// it, and so does the mode change.
+    #[test]
+    fn the_hook_takes_the_text_at_the_front_and_nothing_past_an_attachment() {
+        let text = |t: &str| ContentBlock::Text(TextContent::new(t.to_string()));
+        let prompt = |blocks: Vec<ContentBlock>, id: &str| Command::Prompt {
+            blocks,
+            queued: None,
+            id: Some(id.to_string()),
+        };
+        let picture = ContentBlock::Image(agent_client_protocol::schema::v1::ImageContent::new(
+            "iVBORw0KGgo=",
+            "image/png",
+        ));
+        let mut queued: std::collections::VecDeque<Command> = [
+            prompt(vec![text("first")], "a"),
+            Command::SetMode(SessionModeId::new("plan")),
+            prompt(vec![text("second"), text("more")], "b"),
+            prompt(vec![text("look"), picture], "c"),
+            prompt(vec![text("after")], "d"),
+        ]
+        .into_iter()
+        .collect();
+        let taken = take_waiting(&mut queued);
+        assert_eq!(
+            taken,
+            vec![
+                ("a".to_string(), "first".to_string()),
+                ("b".to_string(), "second\n\nmore".to_string()),
+            ]
+        );
+        assert_eq!(queued.len(), 3);
+        assert!(matches!(queued[0], Command::SetMode(_)));
+        assert!(is_prompt(&queued[1], "c"));
+        assert!(is_prompt(&queued[2], "d"));
+        assert!(take_waiting(&mut std::collections::VecDeque::new()).is_empty());
+    }
 
     /// The messages that waited behind a turn go out as one prompt, each
     /// after its own note and in the order written; a prompt that did not

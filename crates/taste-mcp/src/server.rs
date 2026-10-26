@@ -62,6 +62,10 @@ const ORCHESTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// cut off by the outer timer with nothing to say.
 const ORCHESTRATION_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long the message hook's take may wait on the main thread: under the
+/// four seconds the hook itself waits (`taste_acp::relocate`).
+const HOOK_TAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The most issues one `issue_list` call returns, whatever `limit` asks.
 /// The listing is compact by default — a row per issue, no bodies — so
 /// this bounds a page of rows; `detail: "full"` brings bodies and comments
@@ -1080,7 +1084,11 @@ impl McpServer {
                     let listed = tools
                         .iter()
                         .any(|t| t["name"].as_str() == Some(name.as_str()));
-                    if !listed && !own_gate && !REPLACED.contains(&name.as_str()) {
+                    if !listed
+                        && !own_gate
+                        && !REPLACED.contains(&name.as_str())
+                        && name != taste_core::nudge::TAKE_TOOL
+                    {
                         break 'call tool_result(
                             &json!({"error": format!("{name} is not a tool of this environment")}),
                             true,
@@ -2018,6 +2026,7 @@ impl McpServer {
             | "devcontainer_logs"
             | "devcontainer_resources"
             | "ide_environment" => self.environment_tool(env, name, &args).await,
+            name if name == taste_core::nudge::TAKE_TOOL => self.take_user_messages(env).await,
             "ide_guide" => Ok(json!({
                 "revision": GUIDANCE_REVISION,
                 "guidance": guidance(self.workspace.root(), env),
@@ -4426,6 +4435,34 @@ impl McpServer {
     /// and the first prompt goes; a start that fails between steps leaves
     /// an idle chat rather than one working on the wrong thing, and says
     /// which step it reached.
+    /// The hook's call after each of the agent's tool calls
+    /// ([`taste_core::nudge::TAKE_TOOL`]): the messages waiting behind the
+    /// turn, taken. Answered here, with nothing, while none is waiting —
+    /// the common case, after every tool call there is — so the main thread
+    /// is asked only when there is something to take.
+    async fn take_user_messages(&self, env: &EnvironmentId) -> Result<Value> {
+        use taste_core::orchestration::{OrchestrationReply, OrchestrationRequest};
+        if !self.workspace.nudges.should_wake(env) {
+            return Ok(json!({ "messages": [] }));
+        }
+        // Inside the hook's own four seconds: an answer that came after
+        // the hook gave up would be messages taken and read by nobody. Given
+        // up on here first, the strip finds nobody asking and takes nothing,
+        // and what it took after all it sends again
+        // (`ChatPane::give_back_taken`).
+        let reply = self
+            .orchestrate(
+                OrchestrationRequest::TakeWaiting { chat: env.clone() },
+                HOOK_TAKE_TIMEOUT,
+            )
+            .await;
+        let messages = match reply {
+            Ok(OrchestrationReply::Taken(messages)) => messages,
+            _ => Vec::new(),
+        };
+        Ok(json!({ "messages": messages }))
+    }
+
     async fn issue_start(&self, args: Value) -> Result<Value> {
         use taste_core::orchestration::{OrchestrationReply, OrchestrationRequest};
 
@@ -8254,6 +8291,40 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
+    /// The hook's tool answers with nothing, asking nobody, while no message
+    /// waits; with one waiting it takes it from the chat strip. Unlisted,
+    /// and callable all the same.
+    #[tokio::test]
+    async fn the_hook_takes_a_waiting_message_and_nothing_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, workspace) = start_test_server(dir.path()).await;
+        let log = attach_fake_strip(&workspace, None);
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let listed = roundtrip(
+            &mut stream,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        assert!(
+            !listed.to_string().contains(taste_core::nudge::TAKE_TOOL),
+            "{listed}"
+        );
+
+        let none = call_tool(&mut stream, taste_core::nudge::TAKE_TOOL, json!({})).await;
+        assert_eq!(none["messages"], json!([]), "{none}");
+        assert!(log.lock().unwrap().is_empty(), "nobody was asked");
+
+        workspace.nudges.message_waiting(&EnvironmentId::primary());
+        let taken = call_tool(&mut stream, taste_core::nudge::TAKE_TOOL, json!({})).await;
+        assert_eq!(
+            taken["messages"],
+            json!(["hold on, use the other parser"]),
+            "{taken}"
+        );
+        assert_eq!(*log.lock().unwrap(), vec!["take primary".to_string()]);
+        workspace.nudges.withdraw(&EnvironmentId::primary());
+    }
+
     /// A wait ends on the first of its set — here, its time — and always,
     /// at once, on a message from the user, whether or not a turn was asked
     /// for; a task never run is refused rather than waited on forever.
@@ -9257,6 +9328,10 @@ mod tests {
                             }],
                             chats: Vec::new(),
                         })
+                    }
+                    OrchestrationRequest::TakeWaiting { chat } => {
+                        recorder.lock().unwrap().push(format!("take {chat}"));
+                        OrchestrationReply::Taken(vec!["hold on, use the other parser".into()])
                     }
                     OrchestrationRequest::ChatTranscript { chat, max } => {
                         recorder

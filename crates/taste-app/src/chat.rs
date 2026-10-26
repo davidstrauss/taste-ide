@@ -7410,6 +7410,79 @@ impl ChatPane {
         }
     }
 
+    /// The messages waiting behind this chat's turn, taken from its session
+    /// for the agent to read within it (`taste_core::nudge::TAKE_TOOL`);
+    /// `None` with no agent.
+    pub fn take_waiting_for_hook(
+        &self,
+    ) -> Option<tokio::sync::oneshot::Receiver<taste_acp::session::TakenMessages>> {
+        self.client.borrow().as_ref()?.take_waiting().ok()
+    }
+
+    /// Messages taken for the hook that it never had — it gave up waiting
+    /// first: queued again behind the turn, as typed, to go after it, their
+    /// cards back to queued. Not recorded again: their records were written
+    /// when they were first sent.
+    pub fn give_back_taken(&self, taken: taste_acp::session::TakenMessages) {
+        for (prompt, text) in taken {
+            let written = self.written_here();
+            let blocks = vec![ContentBlock::Text(TextContent::new(text.clone()))];
+            let sent = match self.client.borrow().as_ref() {
+                Some(client) => {
+                    client.prompt_blocks_queued(blocks, written.clone(), Some(prompt.clone()))
+                }
+                None => Err(anyhow::anyhow!("no agent to send to")),
+            };
+            match sent {
+                Ok(()) => {
+                    self.pending_prompts.borrow_mut().push_back(PendingPrompt {
+                        unfinished: Unfinished::Composer(text.clone()),
+                        prompt: prompt.clone(),
+                        text,
+                        attachments: Vec::new(),
+                        queued: Some(written),
+                        joined: false,
+                        taken: false,
+                    });
+                    self.offer_nudge();
+                    self.deliver(&prompt, model::Delivery::Queued);
+                }
+                Err(e) => self.deliver(&prompt, model::Delivery::NotSent(e.to_string())),
+            }
+        }
+    }
+
+    /// These messages were taken from behind the turn for the agent to read
+    /// within it (`SessionEvent::QueuedTaken`): out of what waits, their
+    /// cards saying so. Never the turn's own prompt, at the front.
+    fn taken_within_turn(&self, ids: &[String]) {
+        let (taken, still_waiting): (Vec<model::PromptId>, bool) = {
+            let mut pending = self.pending_prompts.borrow_mut();
+            let taken = ids
+                .iter()
+                .filter_map(|id| {
+                    let at = pending
+                        .iter()
+                        .position(|p| p.prompt == *id && !p.taken && !p.joined)
+                        .filter(|at| *at > 0)?;
+                    pending.remove(at).map(|prompt| prompt.prompt)
+                })
+                .collect();
+            (taken, pending.len() > 1)
+        };
+        for prompt in taken {
+            if self.nudged_prompt.borrow().as_ref() == Some(&prompt) {
+                self.end_nudge();
+            }
+            self.deliver(&prompt, model::Delivery::WithinTurn);
+        }
+        // Nothing left behind the turn: no wait of its tools is to wake for
+        // a message any more.
+        if !still_waiting {
+            self.end_nudge();
+        }
+    }
+
     /// Stop, pressed on a queued message's card: it is dropped from behind
     /// the turn and never sent, if it has not gone already.
     pub(super) fn withdraw_prompt(&self, prompt: &str) {
@@ -7526,6 +7599,7 @@ impl ChatPane {
             model::Delivery::Refused(why) => self.record_delivery(prompt, "refused", Some(why)),
             model::Delivery::NotSent(why) => self.record_delivery(prompt, "notSent", Some(why)),
             model::Delivery::Lost => self.record_delivery(prompt, "lost", None),
+            model::Delivery::WithinTurn => self.record_delivery(prompt, "withinTurn", None),
             _ => {}
         }
         self.update_model(|model| model.set_delivery(prompt, delivery));
@@ -9314,6 +9388,7 @@ impl ChatPane {
             SessionEvent::Elicitation { request, reply } => self.on_questions(request, reply),
             SessionEvent::QueuedDropped { count } => self.withdraw_queued(count),
             SessionEvent::QueuedWithdrawn { ids } => self.withdraw_prompts(&ids),
+            SessionEvent::QueuedTaken { ids } => self.taken_within_turn(&ids),
             SessionEvent::QueuedJoined { count } => {
                 // The prompt that just went out carries the next `count`
                 // messages too: each is taken where the first was, in order.
@@ -16447,6 +16522,9 @@ fn session_event_label(event: &SessionEvent) -> String {
         SessionEvent::QueuedDropped { count } => format!("{count} queued messages dropped"),
         SessionEvent::QueuedWithdrawn { ids } => {
             format!("{} queued messages withdrawn", ids.len())
+        }
+        SessionEvent::QueuedTaken { ids } => {
+            format!("{} queued messages taken within the turn", ids.len())
         }
         SessionEvent::Permission { .. } => "a permission request".into(),
         SessionEvent::Elicitation { .. } => "questions".into(),

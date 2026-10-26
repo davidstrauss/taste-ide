@@ -76,6 +76,7 @@ fn describe(event: &SessionEvent) -> String {
         SessionEvent::QueuedJoined { count } => format!("QueuedJoined({count})"),
         SessionEvent::QueuedDropped { count } => format!("QueuedDropped({count})"),
         SessionEvent::QueuedWithdrawn { ids } => format!("QueuedWithdrawn({ids:?})"),
+        SessionEvent::QueuedTaken { ids } => format!("QueuedTaken({ids:?})"),
         SessionEvent::Permission { .. } => "Permission".into(),
         SessionEvent::Elicitation { .. } => "Elicitation".into(),
         SessionEvent::ModeChangeFailed { message, .. } => format!("ModeChangeFailed({message})"),
@@ -246,6 +247,7 @@ fn attach_strip(
                 OrchestrationRequest::Find { .. } => {
                     OrchestrationReply::Found(taste_core::orchestration::FoundInside::default())
                 }
+                OrchestrationRequest::TakeWaiting { .. } => OrchestrationReply::Taken(Vec::new()),
             };
             let _ = reply.send(answer).await;
         }

@@ -244,6 +244,10 @@ pub enum OrchestrationRequest {
     },
     /// Prompt a chat. Mid-turn sends queue, as they do from the composer.
     ChatSend { chat: ChatId, text: String },
+    /// The user's messages waiting behind a chat's turn, taken for its
+    /// agent to read within that turn — asked by the IDE's Claude Code hook
+    /// after each of the agent's tool calls, never by an orchestrator.
+    TakeWaiting { chat: ChatId },
     /// One chat's state, without touching it.
     ChatStatus { chat: ChatId },
     /// The tail of a chat's transcript, as text.
@@ -301,6 +305,9 @@ pub enum OrchestrationReply {
     Status(ChatFacts),
     Transcript(TranscriptTail),
     Found(FoundInside),
+    /// The messages [`OrchestrationRequest::TakeWaiting`] took, in the
+    /// order they were sent; empty when none could be.
+    Taken(Vec<String>),
     /// The app refused, and why. Honest refusals travel this way rather
     /// than as a panic or an empty success.
     Error(String),

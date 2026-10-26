@@ -68,6 +68,9 @@ pub(super) enum Delivery {
     NotSent(String),
     /// The agent stopped before it took it.
     Lost,
+    /// Read by the agent within the turn it waited behind, at its next step
+    /// (`taste_core::nudge::TAKE_TOOL`), rather than sent after it.
+    WithinTurn,
     /// Read back from the record never taken: the IDE closed first.
     Undelivered,
 }
@@ -1189,6 +1192,7 @@ impl Model {
             "refused" => self.set_delivery(prompt, Delivery::Refused(detail.unwrap_or_default())),
             "notSent" => self.set_delivery(prompt, Delivery::NotSent(detail.unwrap_or_default())),
             "lost" => self.set_delivery(prompt, Delivery::Lost),
+            "withinTurn" => self.set_delivery(prompt, Delivery::WithinTurn),
             "withdrawn" => self.remove_prompt(prompt),
             _ => {}
         }
