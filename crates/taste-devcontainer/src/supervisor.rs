@@ -2065,6 +2065,25 @@ impl Supervisor {
             ));
         }
         if (sync.missed > 0 || sync.pushed) && depth < 2 {
+            // Said, since each is a whole pass more: what a close waits on
+            // when a pass goes three times over (2026-10-26).
+            let mut why = Vec::new();
+            if sync.missed > 0 {
+                let named: Vec<String> = sync
+                    .missed_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                why.push(format!(
+                    "{} write(s) missed ({})",
+                    sync.missed,
+                    named.join(", ")
+                ));
+            }
+            if sync.pushed {
+                why.push("the folder's commits went to Personal".into());
+            }
+            tracing::info!("Personal's sync goes again: {}", why.join("; "));
             return self.sync_primary_blocking(vm, keys, path, None, depth + 1);
         }
         Ok(())
@@ -2198,6 +2217,13 @@ impl Supervisor {
                 changes.saturating_sub(settled)
             )
         }
+    }
+
+    /// The placement's own pass found the folder and the checkout in step,
+    /// before either watcher counted a change: settled as of now.
+    pub fn settle_folder_at_placement(&self) {
+        self.folder_settled
+            .store(self.folder_changes.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 
     /// Return once no pass of Personal's sync is running: one under way may

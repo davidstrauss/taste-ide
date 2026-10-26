@@ -1841,6 +1841,12 @@ impl EnvironmentRegistry {
                 }
             }
             let sync = crate::peer::sync_primary_peer(&peer, vm, &keys, &files, &path, &say)?;
+            // A whole pass, before the watchers start: when it left nothing
+            // for another, the folder is in step, and a close soon after
+            // need make none (it said "no pass has finished", 2026-10-26).
+            if sync.missed == 0 && !sync.pushed && sync.conflicts.is_empty() {
+                primary.settle_folder_at_placement();
+            }
             self.note_vm(
                 &vm.domain,
                 match &sync.note {

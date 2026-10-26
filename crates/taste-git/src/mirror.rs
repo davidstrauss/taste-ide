@@ -174,6 +174,9 @@ pub struct Pass {
     /// Writes not made, because their side changed the path after the
     /// pass observed it: the next pass decides those again.
     pub missed: usize,
+    /// The first few of those, for the log line that says why a pass went
+    /// again.
+    pub missed_paths: Vec<PathBuf>,
     /// Paths both sides changed, differently, since they last agreed:
     /// written on neither, until the user answers.
     pub conflicts: Vec<PathBuf>,
@@ -479,12 +482,22 @@ impl GitWorkspace {
         let wrote_checkout = landed_checkout.iter().any(|l| *l);
         self.record_observed(tree, local, tip, Some((snapshot, wrote_checkout)))?;
         let landed = |l: &[bool]| l.iter().filter(|x| **x).count();
+        let missed_paths = plan
+            .to_checkout
+            .iter()
+            .zip(&landed_checkout)
+            .chain(plan.to_folder.iter().zip(&landed_folder))
+            .filter(|(_, landed)| !**landed)
+            .map(|(write, _)| write.path.clone())
+            .take(5)
+            .collect();
         Ok(Mirror::Done(Pass {
             received: landed(&landed_folder),
             sent: landed(&landed_checkout),
             missed: landed_folder.len() + landed_checkout.len()
                 - landed(&landed_folder)
                 - landed(&landed_checkout),
+            missed_paths,
             conflicts: plan.conflicts,
             switched: !on_branch,
         }))

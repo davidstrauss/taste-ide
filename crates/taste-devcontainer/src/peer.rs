@@ -1029,6 +1029,8 @@ pub struct PeerSync {
     /// Writes not made, either way, because their side changed the path
     /// after the pass observed it: another pass decides them again.
     pub missed: usize,
+    /// The first few of those, for the log.
+    pub missed_paths: Vec<PathBuf>,
     /// The folder was switched onto the checkout's branch this pass.
     pub switched: bool,
 }
@@ -1610,6 +1612,8 @@ fn sync_submodules(
                 sync.sent += inner.sent;
                 sync.received += inner.received;
                 sync.missed += inner.missed;
+                sync.missed_paths
+                    .extend(inner.missed_paths.into_iter().map(|p| sub.join(p)));
                 // A push skips that pass's mirror, so it asks for another
                 // pass, which the parent's account carries: left out, a
                 // submodule's working copy waited for something else to set
@@ -1852,6 +1856,7 @@ fn settle_mirror(outcome: taste_git::mirror::Mirror, branch: Option<&str>, sync:
             sync.received += pass.received;
             sync.sent += pass.sent;
             sync.missed += pass.missed;
+            sync.missed_paths.extend(pass.missed_paths);
             sync.switched = pass.switched;
             sync.mirrored = true;
             sync.branch = branch.map(str::to_string).or(sync.branch.take());
