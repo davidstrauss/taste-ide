@@ -436,8 +436,10 @@ impl Worktree {
 
     /// `run_git`, with the repository's own attributes read: the files
     /// service's git otherwise reads none (`GIT_ATTR_SOURCE`, the keeper's),
-    /// so that no filter a repository names runs. Only for commands that run
-    /// no filter, which only report what the attributes say.
+    /// so that no filter a repository names runs. Only for commands that
+    /// report what the attributes say, or that compare files through git's
+    /// built-in conversions ([`Self::status`]): a filter driver the
+    /// repository's config defines is `cat` here all the same.
     fn run_git_reading_attributes(&self, args: &[String]) -> Result<ExecOutput> {
         match self {
             Worktree::Local(_) => {
@@ -554,12 +556,31 @@ impl Worktree {
     }
 
     /// What `git status` shows, keyed by path relative to the root.
+    ///
+    /// With the repository's attributes read, so git's own conversions —
+    /// `ident`, `text` and `eol`, `working-tree-encoding` — are undone
+    /// before a file is compared, as the user's git and libgit2 do. Without
+    /// them every file php-src marks `ident` read as modified, its
+    /// `$Id: <blob> $` lines against the committed `$Id$` (2026-10-26).
+    /// What a repository's config could run in their place, a filter
+    /// driver, is still `cat` (the keeper's `gitSafe`).
     pub fn status(&self) -> Result<HashMap<PathBuf, FileState>> {
         match self {
             Worktree::Local(_) => self.local()?.status(),
             Worktree::Remote { .. } => {
-                let out =
-                    self.git_ok(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+                let args =
+                    ["status", "--porcelain=v1", "-z", "--untracked-files=all"].map(String::from);
+                let out = self.run_git_reading_attributes(&args)?;
+                if !out.success() {
+                    let stderr = out.stderr_utf8();
+                    let last = stderr
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("git failed");
+                    return Err(GitFailed(last.to_string()).into());
+                }
+                let out = out.stdout_utf8();
                 let mut status = taste_git::status_from_porcelain(&out);
                 // And the files inside each submodule, which the parent's
                 // status names only as the submodule, modified — so only
@@ -1715,6 +1736,61 @@ mod tests {
             path: root.to_path_buf(),
             after_ref_change: None,
         }
+    }
+
+    /// A file git expands `$Id$` in on checkout (`ident`) is unchanged
+    /// while only its expansion differs, and changed once its text does.
+    #[test]
+    fn an_ident_expansion_is_not_a_change() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".gitattributes"), "/cdb.c ident\n").unwrap();
+        std::fs::write(root.join("cdb.c"), "/* $Id$ */\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::remove_file(root.join("cdb.c")).unwrap();
+        git(&["checkout", "--", "cdb.c"]);
+        let text = std::fs::read_to_string(root.join("cdb.c")).unwrap();
+        assert!(text.starts_with("/* $Id: "), "{text}");
+        // Written again, as the mirror writes it, so git's stat cache no
+        // longer vouches for it and the contents are compared.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(root.join("cdb.c"), &text).unwrap();
+
+        let worktree = remote_at(root);
+        // The keeper's attributes, the empty tree's: the expansion reads
+        // as an edit, which is what the Dirty list showed.
+        let blind = worktree
+            .run_git(
+                &["status", "--porcelain"],
+                &[(
+                    "GIT_ATTR_SOURCE".to_string(),
+                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string(),
+                )],
+            )
+            .unwrap();
+        assert!(blind.stdout_utf8().contains("cdb.c"), "{blind:?}");
+        assert!(worktree.status().unwrap().is_empty());
+        std::fs::write(root.join("cdb.c"), format!("{text}int x;\n")).unwrap();
+        assert_eq!(
+            worktree.status().unwrap().get(Path::new("cdb.c")),
+            Some(&FileState::Modified)
+        );
     }
 
     /// The list moved under the verb: an entry pushed after the list was
