@@ -124,7 +124,7 @@ for mains instead, a struck plug in the minutes' place) —,
 Unstash and held trash in the frame, against the checkout's own stash)
 and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `quiet` — `busy` silent for over a minute, the
-working line saying for how long and naming Stop —, `queued` — `busy` with a message sent during the turn waiting behind it, its fast-forward (a click asks for a turn, `taste_core::nudge`; a two-second hold stops the turn and sends it alone) and its stop at the badge's end —, `refused` — `busy` with a message the agent refused, kept where it was sent and marked so —, `starting` — the line above the composer while the environment comes up,
+working line saying for how long and naming Stop —, `queued` — `busy` with a message sent during the turn waiting behind it, its fast-forward (a click asks for a turn, `taste_core::nudge`; a two-second hold stops the turn and sends it alone) and its trash can at the badge's end —, `refused` — `busy` with a message the agent refused, kept where it was sent and marked so —, `starting` — the line above the composer while the environment comes up,
 a message waiting on it —, `replies` — the turn over on a question, the agent's suggested replies
 under it as the question card's radios and Send (`TASTE_PROBE_REPLIES=several`: replies that combine, as checkboxes) —, `restored` — the same conversation as a restore
 replays it, the buttons read back from the `suggest_replies` call's input

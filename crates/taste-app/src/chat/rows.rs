@@ -270,17 +270,19 @@ impl ChatPane {
                     }
                 });
             }
-            let stop = gtk::Button::builder()
-                .icon_name("media-playback-stop-symbolic")
+            // A trash can, not a stop: nothing is running to stop, and
+            // what it does is throw the message away.
+            let delete = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
                 .css_classes(["flat"])
                 .valign(gtk::Align::Center)
                 .margin_end(CARD_INSET)
-                .tooltip_text("Cancel this message: it is not sent")
+                .tooltip_text("Delete this message: it is not sent")
                 .build();
             {
                 let weak = self.weak_self.borrow().clone();
                 let prompt = prompt.clone();
-                stop.connect_clicked(move |button| {
+                delete.connect_clicked(move |button| {
                     button.set_sensitive(false);
                     if let Some(pane) = weak.upgrade() {
                         pane.withdraw_prompt(&prompt);
@@ -288,7 +290,7 @@ impl ChatPane {
                 });
             }
             line.append(&forward.widget);
-            line.append(&stop);
+            line.append(&delete);
             // Held by the pane: a hold button keeps itself only weakly.
             self.keep_card_hold(prompt, forward);
         }
