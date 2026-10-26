@@ -831,6 +831,23 @@ struct RowHandle {
     own: std::cell::Cell<bool>,
     /// The sync status, left of the badge (`crate::sync_mark`).
     mark: crate::sync_mark::SyncMark,
+    /// A submodule's row: what it says of its pin, repainted in place.
+    submodule: Option<SubmoduleRow>,
+}
+
+/// What a submodule's row was painted with ([`paint_submodule`]), so a
+/// head that moved, or a sync starting or ending, repaints that one row in
+/// place ([`FileTree::restyle_submodule_rows`]). Until 2026-10-26 either
+/// rebuilt every row of the tree, and closed whatever menu was open: a
+/// project with a submodule, syncing every few seconds, had a tree whose
+/// folders would not open and whose context menus would not stay up.
+struct SubmoduleRow {
+    name: String,
+    row: glib::WeakRef<gtk::Box>,
+    /// The warning icon, while one shows.
+    warning: RefCell<Option<gtk::Image>>,
+    /// The head, and whether a folder sync was under way, as painted.
+    painted: RefCell<(taste_devcontainer::worktree::SubmoduleHead, bool)>,
 }
 
 impl RowHandle {
@@ -6164,6 +6181,9 @@ impl FileTree {
         // change what a row shows for reasons the status map doesn't
         // record, and those take the full rebind.
         let mut states_only = false;
+        // A submodule moved: its row is repainted in place
+        // (`restyle_submodule_rows`), never the whole tree.
+        let mut heads_moved = false;
         // Conflict transitions steer the view (applied at the end, once
         // the fresh maps are in place).
         let mut conflicts_appeared = false;
@@ -6172,8 +6192,9 @@ impl FileTree {
             Some(snapshot) => {
                 self.rendered_non_repo.set(false);
                 // A submodule that moved rewrites its row's name, which no
-                // file state says: a full rebind, as rarely as that is.
+                // file state says: its row repainted, the rest left be.
                 let heads_changed = *self.submodule_heads.borrow() != snapshot.submodules;
+                heads_moved = heads_changed;
                 // Unchanged status must not churn row widgets: factory
                 // resets during agent/build activity are what made hovering
                 // feel laggy. ignore_rules participates: a new rule changes
@@ -6185,9 +6206,7 @@ impl FileTree {
                     && *self.stashed.borrow() == snapshot.stashed
                     && *self.sync_ignored.borrow() == snapshot.sync_ignored
                     && self.ignore_rules.get() == snapshot.ignore_rules;
-                states_only = !mode_changed
-                    && !heads_changed
-                    && self.ignore_rules.get() == snapshot.ignore_rules;
+                states_only = !mode_changed && self.ignore_rules.get() == snapshot.ignore_rules;
                 let conflict_count = |status: &HashMap<PathBuf, FileState>| {
                     status
                         .values()
@@ -6635,6 +6654,9 @@ impl FileTree {
             self.render_filter_view();
         } else if states_only {
             self.restyle_changed_rows();
+            if heads_moved {
+                self.restyle_submodule_rows();
+            }
         } else {
             self.rebuild_rows_in_place();
         }
@@ -8767,7 +8789,7 @@ impl FileTree {
         // closed opened by themselves at every sync (David, 2026-10-06:
         // "Did the folders start auto-expanding?").
         if warned {
-            self.rebuild_rows_in_place();
+            self.restyle_submodule_rows();
         }
     }
 
@@ -9231,31 +9253,6 @@ impl FileTree {
             .is_dir
             .then(|| self.submodule_head(&node.path))
             .flatten();
-        // A submodule says what its parent pins it to, after its name and
-        // dimmed: the commit, whatever branch is there — "@ 37cf0ad (main)"
-        // when it is at the pin on a branch, "@ 37cf0ad → main" when it
-        // has moved off it (David, 2026-10-06: "I want to see what it's
-        // pinned to, even if it's equivalent to a branch").
-        if let Some(head) = &submodule {
-            let place = if head.pin == taste_devcontainer::worktree::SubmodulePin::Same {
-                if head.at == head.pinned {
-                    head.pinned.clone()
-                } else {
-                    format!("{} ({})", head.pinned, head.at)
-                }
-            } else if head.at == head.pinned {
-                head.pinned.clone()
-            } else {
-                format!("{} → {}", head.pinned, head.at)
-            };
-            label.set_use_markup(true);
-            label.set_label(&format!(
-                "{} <span alpha=\"55%\">@ {}</span>",
-                glib::markup_escape_text(&name),
-                glib::markup_escape_text(&place)
-            ));
-        }
-
         // A submodule's row does not wear the parent's "M" for its commit
         // differing from the one the parent records: past it is the way a
         // submodule is while it is worked in. It wears a warning only for
@@ -9307,16 +9304,17 @@ impl FileTree {
         row.append(&label);
         row.append(&mark.widget);
         row.append(&badge_label);
-        if let Some(head) = &submodule {
-            let standing = format!("{name} is {}", head.pin.describe());
-            row.set_tooltip_text(Some(&standing));
-            if head.pin.is_problem() && !self.folder_syncing.get() {
-                let warning = gtk::Image::from_icon_name("dialog-warning-symbolic");
-                warning.add_css_class("warning");
-                warning.set_tooltip_text(Some(&standing));
-                row.append(&warning);
+        let submodule_row = submodule.as_ref().map(|head| {
+            let syncing = self.folder_syncing.get();
+            let warning = RefCell::new(None);
+            paint_submodule(&label, &row, &badge_label, &warning, &name, head, syncing);
+            SubmoduleRow {
+                name: name.clone(),
+                row: row.downgrade(),
+                warning,
+                painted: RefCell::new((head.clone(), syncing)),
             }
-        }
+        });
 
         // Search annotations: per-file match count; in ghost mode the
         // non-matching rows stay but fade.
@@ -9400,6 +9398,7 @@ impl FileTree {
                 badge: badge_label.downgrade(),
                 own: std::cell::Cell::new(own),
                 mark,
+                submodule: submodule_row,
             };
             // A submodule's row wears no state of its own here.
             if submodule.is_none() {
@@ -10252,6 +10251,42 @@ impl FileTree {
         self.refresh_status();
     }
 
+    /// Repaint the submodule rows whose head moved, or whose warning a
+    /// folder sync starting or ending shows or hides, in place: every other
+    /// row, an open context menu with it, stays as it is.
+    fn restyle_submodule_rows(&self) {
+        let syncing = self.folder_syncing.get();
+        for (path, handle) in self.rows.borrow().iter() {
+            let Some(sub) = &handle.submodule else {
+                continue;
+            };
+            let Some(head) = self.submodule_head(path) else {
+                continue;
+            };
+            let wanted = (head, syncing);
+            if *sub.painted.borrow() == wanted {
+                continue;
+            }
+            let (Some(row), Some(label), Some(badge)) = (
+                sub.row.upgrade(),
+                handle.label.upgrade(),
+                handle.badge.upgrade(),
+            ) else {
+                continue;
+            };
+            paint_submodule(
+                &label,
+                &row,
+                &badge,
+                &sub.warning,
+                &sub.name,
+                &wanted.0,
+                syncing,
+            );
+            *sub.painted.borrow_mut() = wanted;
+        }
+    }
+
     /// Repaint only the rows whose git state actually moved.
     ///
     /// This is the ordinary status tick, and on a watched checkout it is
@@ -10582,6 +10617,60 @@ fn status_at_rest_in(
 
 /// A row's state, or the synced mark when git has nothing to say about it
 /// and it is ignored but syncs anyway (`taste_git::sync_ignored`).
+/// A submodule's row as it says where it stands: after its name, dimmed,
+/// what its parent pins it to — the commit, whatever branch is there, "@
+/// 37cf0ad (main)" at the pin on a branch, "@ 37cf0ad → main" moved off it
+/// (David, 2026-10-06: "I want to see what it's pinned to, even if it's
+/// equivalent to a branch") — its standing as the row's tooltip, and a
+/// warning after the badge only for something to fix, and not while a
+/// folder sync, which may be what fixes it, is under way.
+fn paint_submodule(
+    label: &gtk::Label,
+    row: &gtk::Box,
+    badge: &gtk::Label,
+    warning: &RefCell<Option<gtk::Image>>,
+    name: &str,
+    head: &taste_devcontainer::worktree::SubmoduleHead,
+    syncing: bool,
+) {
+    let place = if head.pin == taste_devcontainer::worktree::SubmodulePin::Same {
+        if head.at == head.pinned {
+            head.pinned.clone()
+        } else {
+            format!("{} ({})", head.pinned, head.at)
+        }
+    } else if head.at == head.pinned {
+        head.pinned.clone()
+    } else {
+        format!("{} → {}", head.pinned, head.at)
+    };
+    label.set_use_markup(true);
+    label.set_label(&format!(
+        "{} <span alpha=\"55%\">@ {}</span>",
+        glib::markup_escape_text(name),
+        glib::markup_escape_text(&place)
+    ));
+    let standing = format!("{name} is {}", head.pin.describe());
+    row.set_tooltip_text(Some(&standing));
+    let shows = head.pin.is_problem() && !syncing;
+    let mut current = warning.borrow_mut();
+    match (shows, current.as_ref()) {
+        (true, Some(icon)) => icon.set_tooltip_text(Some(&standing)),
+        (true, None) => {
+            let icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+            icon.add_css_class("warning");
+            icon.set_tooltip_text(Some(&standing));
+            row.insert_child_after(&icon, Some(badge));
+            *current = Some(icon);
+        }
+        (false, Some(icon)) => {
+            row.remove(icon);
+            *current = None;
+        }
+        (false, None) => {}
+    }
+}
+
 fn synced_or(
     state: FileState,
     sync_ignored: &taste_devcontainer::worktree::SyncIgnored,
