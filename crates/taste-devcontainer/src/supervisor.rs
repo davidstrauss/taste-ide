@@ -4811,9 +4811,22 @@ impl Supervisor {
     /// is carried in, and a project that names none commits as nobody,
     /// with git's "Author identity unknown" saying so. Never fatal: a
     /// container without git installed must still start.
+    ///
+    /// A project whose author IS the host's pair — the file tree's banner
+    /// copied it in, on the user's say-so (`author_bar.rs`) — has it in the
+    /// checkout's own config because it belongs there, so that config is
+    /// left alone rather than emptied and filled again, which logged a
+    /// removal that was not one and left the checkout without an author
+    /// for the moment between.
     async fn settle_git_identity(&self, name: &str, user: Option<&str>) {
         *self.git_exec.lock().unwrap() = Some((name.to_string(), user.map(str::to_string)));
         if let Some(host) = taste_git::host_identity() {
+            let root = self.workspace_root().to_path_buf();
+            let chosen = tokio::task::spawn_blocking(move || project_author(&root))
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|author| author == host);
             let checkout = self.checkout().path().display().to_string();
             let agent_home = Some(taste_core::policy::AGENT_HOME_IN_DEVCONTAINER);
             // Where, the checkout (`git -C`) when it is the checkout's own
@@ -4834,6 +4847,9 @@ impl Supervisor {
                 ),
             ];
             for (place, dir, scope, home) in places {
+                if chosen && scope == "--local" {
+                    continue;
+                }
                 let exec = |tail: &[&str]| {
                     let mut args: Vec<String> = vec!["exec".into()];
                     if let Some(user) = user {
