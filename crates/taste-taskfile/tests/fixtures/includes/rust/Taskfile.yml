@@ -1,0 +1,9 @@
+version: '3'
+
+vars:
+  OWN: o
+
+tasks:
+  fmt:
+    requires: {vars: [FILE, FROMINC, ROOTVAR, OWN, DIR]}
+    cmds: [echo hi]

@@ -1,0 +1,78 @@
+version: '3'
+
+vars:
+  GLOBAL: g
+  MODES: [x, y]
+
+x-needs-file: &needs-file
+  requires:
+    vars: [FILE]
+
+tasks:
+  plain:
+    cmds: [echo hi]
+
+  one-liner: echo hi
+
+  short:
+    requires: {vars: [FILE]}
+    cmds: [echo hi]
+
+  long:
+    requires:
+      vars:
+        - FILE
+        - name: MODE
+          enum: [check, write]
+    cmds: [echo hi]
+
+  numbers:
+    requires:
+      vars:
+        - name: N
+          enum: [1, 2]
+    cmds: [echo hi]
+
+  referenced:
+    requires:
+      vars:
+        - name: MODE
+          enum:
+            ref: .MODES
+    cmds: [echo hi]
+
+  defaulted:
+    vars:
+      FILE: '{{.FILE | default "x"}}'
+    requires: {vars: [FILE, DIR]}
+    cmds: [echo hi]
+
+  global:
+    requires: {vars: [GLOBAL, DIR]}
+    cmds: [echo hi]
+
+  merged:
+    <<: *needs-file
+    cmds: [echo hi]
+
+  file:fmt:
+    requires: {vars: [FILE]}
+    cmds: [echo hi]
+
+  "quoted:key":
+    requires: {vars: [DIR]}
+    cmds: [echo hi]
+
+  'single':
+    requires: {vars: [DIR]}
+    cmds: [echo hi]
+
+  twice:
+    requires: {vars: [FILE, FILE]}
+    cmds: [echo hi]
+
+  empty:
+    requires: {}
+    cmds: [echo hi]
+
+  flow: {requires: {vars: [FILE]}, cmds: [echo hi]}

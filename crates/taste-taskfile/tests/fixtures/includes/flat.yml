@@ -1,0 +1,6 @@
+version: '3'
+
+tasks:
+  flatfmt:
+    requires: {vars: [FILE]}
+    cmds: [echo hi]

@@ -1,0 +1,21 @@
+version: '3'
+
+vars:
+  ROOTVAR: r
+
+includes:
+  rs:
+    taskfile: ./rust
+    vars:
+      FROMINC: i
+  docs: ./docs/Docs.yml
+  flat:
+    taskfile: ./flat.yml
+    flatten: true
+  a:
+    taskfile: ./a.yml
+
+tasks:
+  top:
+    requires: {vars: [FILE]}
+    cmds: [echo hi]

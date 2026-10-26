@@ -28,6 +28,22 @@ RUN dnf install -y \
 RUN rm -f /usr/share/dbus-1/services/org.freedesktop.portal.*.service \
     /usr/share/dbus-1/services/org.freedesktop.impl.portal.*.service
 
+# Task, at the version the IDE brings into every environment
+# (`taste_core::tasks::IDE_TASK_VERSION` and its sums, which a test holds
+# this line to): `taste-taskfile`'s reader is checked against it, so the
+# gate needs it here. Fedora's go-task is whatever version Fedora ships.
+ARG TASK_VERSION=3.54.0
+RUN case "$(uname -m)" in \
+      x86_64) arch=amd64 sum=680859dbb4d881a9c72d4d9a8f510825450849af8567deacd7302c01124416fb ;; \
+      aarch64) arch=arm64 sum=d7189d439d4a6058e39e1b2acd7c8b27acd4856691b408f23b242e4294e1df5b ;; \
+      *) echo "no Task for $(uname -m)" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /tmp/task.tar.gz \
+      "https://github.com/go-task/task/releases/download/v${TASK_VERSION}/task_linux_${arch}.tar.gz" && \
+    echo "$sum  /tmp/task.tar.gz" | sha256sum -c --quiet - && \
+    tar -xzf /tmp/task.tar.gz -C /usr/local/bin task && \
+    rm /tmp/task.tar.gz
+
 # Rootless podman with --userns=keep-id maps the host user onto this uid.
 RUN useradd --uid 1000 --create-home dev
 USER dev

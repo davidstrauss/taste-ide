@@ -83,6 +83,7 @@ mod sync_mark;
 mod syncstatus;
 mod tabfamily;
 mod table;
+mod taskfile;
 mod tasks;
 mod textline;
 mod ui_probe;

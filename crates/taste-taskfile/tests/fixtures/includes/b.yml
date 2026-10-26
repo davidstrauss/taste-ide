@@ -1,0 +1,6 @@
+version: '3'
+
+tasks:
+  t:
+    requires: {vars: [DEEP, FILE, ROOTVAR]}
+    cmds: [echo hi]

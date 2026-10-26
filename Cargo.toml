@@ -16,6 +16,7 @@ members = [
     "crates/taste-embed",
     "crates/taste-confine",
     "crates/taste-diagram",
+    "crates/taste-taskfile",
     "crates/taste-app",
 ]
 

@@ -440,7 +440,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let environments = environments.clone();
         let task_runs = task_runs.clone();
         let events = workspace.events.clone();
-        filetree.set_on_run_task(move |env, name| {
+        filetree.set_on_run_task(move |env, name, vars| {
             if task_runs.state(&env, &name) == crate::tasks::RunState::Running {
                 task_runs.stop(&env, &name);
                 return;
@@ -458,9 +458,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let wrapper = supervisor
                 .channel_paths()
                 .map(|paths| paths.task_wrapper.join("task"));
-            if let Err(why) =
-                task_runs.start(&env, &name, supervisor.exec(), false, wrapper.as_deref())
-            {
+            let workdir = supervisor.exec().container_workdir();
+            let vars: Vec<(String, String)> = vars
+                .into_iter()
+                .map(|(var, value)| {
+                    let value = match &workdir {
+                        Some(workdir) if is_path_var(&var) => container_path(workdir, &value),
+                        _ => value,
+                    };
+                    (var, value)
+                })
+                .collect();
+            if let Err(why) = task_runs.start_with(
+                &env,
+                &name,
+                &vars,
+                supervisor.exec(),
+                false,
+                wrapper.as_deref(),
+            ) {
                 events.publish(Event::Toast(format!("{name} was not run: {why}")));
             }
         });
@@ -3780,6 +3796,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             "window.commit-card",
                             "window.loss-card",
                         ]
+                    } else if std::env::var("TASTE_PROBE_TASKMENU").is_ok() {
+                        // A file row's menu, its Run Task section among
+                        // the rest: a popover, its own surface.
+                        &["window", "filetree", "window.row-menu"]
                     } else if std::env::var("TASTE_PROBE_BRANCHES").is_ok() {
                         // The branch switcher, opened by the file tree once
                         // its branches are read: a popover, its own surface.
@@ -6714,6 +6734,31 @@ fn startup_state_now(startup: &crate::startup::StartupPage) -> Option<bool> {
     Some(startup.underway() && !startup.settled())
 }
 
+/// Whether a task's variable is a path: `FILE` or `DIR`, which the file
+/// tree's menus give and the play's question takes relative to the
+/// checkout.
+fn is_path_var(var: &str) -> bool {
+    var == taste_core::tasks::FILE_VAR || var == taste_core::tasks::DIR_VAR
+}
+
+/// A path as the task is given it: absolute in the container, so it names
+/// the same file wherever the task's `dir` is. A path relative to the
+/// checkout is joined to where the checkout is in the container; `.` is
+/// the checkout itself, and an absolute one is left as typed.
+fn container_path(workdir: &str, value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with('/') {
+        return value.to_string();
+    }
+    let rel = value.trim_start_matches("./").trim_end_matches('/');
+    let workdir = workdir.trim_end_matches('/');
+    if rel.is_empty() || rel == "." {
+        workdir.to_string()
+    } else {
+        format!("{workdir}/{rel}")
+    }
+}
+
 /// List the tasks of the environment the panes are aimed at and put them
 /// in the file tree — once; `refresh_tasks` decides how often.
 async fn list_tasks_once(
@@ -6729,7 +6774,18 @@ async fn list_tasks_once(
     let files = supervisor.files();
     let root = supervisor.checkout().path().to_path_buf();
     let listed = runtime()
-        .spawn_blocking(move || crate::tasks::list(&exec, &files, &root))
+        .spawn_blocking(move || {
+            let mut listing = crate::tasks::list(&exec, &files, &root);
+            // What each task asks to be given, for its play and the file
+            // tree's menus.
+            crate::taskfile::annotate(
+                &mut listing,
+                &files,
+                &root,
+                exec.container_workdir().as_deref(),
+            );
+            listing
+        })
         .await;
     let Ok(listing) = listed else { return };
     // The panes may have been aimed elsewhere while it listed.
@@ -6761,6 +6817,16 @@ async fn list_tasks_once(
 mod title_tests {
     use super::window_title;
     use std::path::Path;
+
+    #[test]
+    fn a_path_a_task_is_given_is_the_containers() {
+        use super::container_path;
+        assert_eq!(container_path("/w/p", "src/a.rs"), "/w/p/src/a.rs");
+        assert_eq!(container_path("/w/p/", "./src/"), "/w/p/src");
+        assert_eq!(container_path("/w/p", "."), "/w/p");
+        assert_eq!(container_path("/w/p", ""), "/w/p");
+        assert_eq!(container_path("/w/p", "/etc/hosts"), "/etc/hosts");
+    }
 
     #[test]
     fn the_title_names_the_project_folder_without_its_path() {

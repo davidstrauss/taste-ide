@@ -252,6 +252,11 @@ folder that opened looking for it, refreshes, and prints whether it
 opened again (it must not);
 `TASTE_PROBE_NAME_PROMPT=1` opens the New file dialog and prints where
 the keyboard is;
+`TASTE_PROBE_TASKVARS=1` opens the
+question the seeded `lint`'s play asks — a field for `FILE`, a choice for
+its `MODE` enum — and `=file` asks it as a file's menu does, the file
+given; `TASTE_PROBE_TASKMENU=<path>` opens that row's menu, its Run Task
+section among the rest;
 `TASTE_PROBE_LINK=<path#fragment>` opens a reference as a clicked link
 opens it (`taste_core::anchor`: `#L12` a line, a PDF's `#page=3`), and
 for a PDF prints the page in view once it is up;
@@ -591,6 +596,12 @@ to.
 - `crates/taste-diagram` — Mermaid drawn in a confined process (merman
   for layout and SVG, resvg for pixels); `taste-app`'s `mermaid.rs` is
   its client, and checks every reply before believing it.
+- `crates/taste-taskfile` — what a task's `requires` asks for, read from
+  the Taskfiles in a confined process (serde_yaml_ng); `taste-app`'s
+  `taskfile.rs` is its client. `tests/against_task.rs` holds the reader to
+  the pinned Task's `--dry` on every fixture under `tests/fixtures`, which
+  is why the devcontainer image carries that Task: a Taskfile shape the
+  reader gets wrong is a fixture to add there.
 - `crates/taste-voice` — voice input: the pinned speech model, microphone
   capture (GStreamer), local transcription (whisper.cpp). No GTK; the
   composer drives it.

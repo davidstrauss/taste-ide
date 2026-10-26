@@ -1,0 +1,6 @@
+version: '3'
+
+tasks:
+  build:
+    requires: {vars: [DIR, ROOTVAR]}
+    cmds: [echo hi]

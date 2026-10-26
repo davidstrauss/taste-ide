@@ -1,0 +1,28 @@
+[package]
+name = "taste-taskfile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The IDE's Taskfile helper: what a task requires, read in a confined process"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "taste-taskfile"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+# A Taskfile is YAML a repository wrote, so it is parsed here, confined
+# (taste-confine), and never in the IDE. The maintained fork of
+# serde_yaml, for `Value::apply_merge`: Task honors `<<` merge keys.
+serde_yaml_ng = "0.10"
+
+[dev-dependencies]
+taste-confine.workspace = true
+# The Task this reader is held to (`IDE_TASK_VERSION`).
+taste-core.workspace = true
+tempfile = "3"

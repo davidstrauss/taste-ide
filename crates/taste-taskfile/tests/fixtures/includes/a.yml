@@ -1,0 +1,12 @@
+version: '3'
+
+includes:
+  b:
+    taskfile: ./b.yml
+    vars:
+      DEEP: d
+
+tasks:
+  t:
+    requires: {vars: [FILE, DEEP]}
+    cmds: [echo hi]

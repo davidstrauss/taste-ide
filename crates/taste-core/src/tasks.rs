@@ -39,7 +39,68 @@ pub struct TaskInfo {
     pub name: String,
     /// Its `desc`, when it has one.
     pub desc: String,
+    /// Where `task` says it is defined: the Taskfile, as a path in the
+    /// container, and its key's line and column.
+    pub location: Option<TaskLocation>,
+    /// What it asks to be given (`requires` less what is given elsewhere),
+    /// as the Taskfile reader found it (`taste-taskfile`): `None` until
+    /// read, or when it could not be.
+    pub requires: Option<Vec<Required>>,
 }
+
+impl TaskInfo {
+    /// A task listed by name alone, before anything about it is read.
+    pub fn named(name: impl Into<String>, desc: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            desc: desc.into(),
+            location: None,
+            requires: None,
+        }
+    }
+
+    /// Whether it asks for `var` to be given.
+    pub fn takes(&self, var: &str) -> bool {
+        self.requires
+            .iter()
+            .flatten()
+            .any(|required| required.name == var)
+    }
+}
+
+/// Where a task is defined, as `task --list-all --json` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLocation {
+    pub taskfile: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+/// One variable a task asks to be given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Required {
+    pub name: String,
+    pub allowed: Allowed,
+}
+
+/// The values a required variable may take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Allowed {
+    Any,
+    /// One of these (`enum: [check, write]`).
+    OneOf(Vec<String>),
+    /// An `enum` Task fills in at run time: anything may be typed, and
+    /// Task refuses what it does not allow.
+    Unresolved,
+}
+
+/// The variable a task that runs on a file asks for: the file tree offers
+/// such a task on a file's menu and gives it the file. The value is the
+/// path in the container, absolute, so `{{q .FILE}}` names the file
+/// wherever the task's `dir` is.
+pub const FILE_VAR: &str = "FILE";
+/// The same for a folder.
+pub const DIR_VAR: &str = "DIR";
 
 /// What a task's last run came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +141,9 @@ pub enum Listing {
 /// mounted read-only into every container at [`IDE_TASK_DIR`]
 /// (`taste_devcontainer::agentnode`). Task is one static binary, so it runs
 /// whatever the image's C library. Bump all three from
-/// `https://github.com/go-task/task/releases/download/v<version>/task_checksums.txt`.
+/// `https://github.com/go-task/task/releases/download/v<version>/task_checksums.txt`,
+/// and `.devcontainer/Containerfile`'s with them, which a test holds equal:
+/// `taste-taskfile`'s reader is checked against that Task.
 pub const IDE_TASK_VERSION: &str = "3.54.0";
 /// `task_linux_amd64.tar.gz`.
 pub const IDE_TASK_SHA256_AMD64: &str =
@@ -225,6 +288,35 @@ pub fn list(exec: &ExecContext, files: &Files, root: &Path) -> Listing {
     }
 }
 
+/// Whether `var` is a name a `NAME=value` argument gives Task: a letter
+/// or an underscore, then letters, digits, and underscores.
+fn is_var_name(var: &str) -> bool {
+    let mut chars = var.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A run's arguments as its first line shows them: quoted as a shell would
+/// need them, so the line is one that could be typed.
+fn shown_args(args: &[&str]) -> String {
+    args.iter()
+        .map(|arg| {
+            if !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=+,@%".contains(c))
+            {
+                arg.to_string()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A line as a terminal left it: a task runs in one, so its lines end in
 /// `\r`, and a progress bar redraws itself with bare `\r`s — of which only
 /// what the last one left is what a terminal ended up showing.
@@ -282,13 +374,21 @@ fn parse_list_json(bytes: &[u8]) -> Option<Vec<TaskInfo>> {
         tasks
             .iter()
             .filter_map(|task| {
+                let location = task.get("location").and_then(|at| {
+                    Some(TaskLocation {
+                        taskfile: at.get("taskfile")?.as_str()?.to_string(),
+                        line: at.get("line")?.as_u64()? as usize,
+                        column: at.get("column")?.as_u64()? as usize,
+                    })
+                });
                 Some(TaskInfo {
-                    name: task.get("name")?.as_str()?.to_string(),
-                    desc: task
-                        .get("desc")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                    location,
+                    ..TaskInfo::named(
+                        task.get("name")?.as_str()?,
+                        task.get("desc")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                    )
                 })
             })
             .collect(),
@@ -490,6 +590,29 @@ impl TaskBoard {
         by_agent: bool,
         wrapper: Option<&std::path::Path>,
     ) -> Result<(), String> {
+        self.start_with(env, name, &[], exec, by_agent, wrapper)
+    }
+
+    /// [`Self::start`], with variables given as `task` takes them on its
+    /// command line (`task fmt FILE=/workspaces/p/src/a.rs`): what the play
+    /// asked for, or the file a menu was opened on. The run is still the
+    /// task's — one at a time, whatever it was given.
+    pub fn start_with(
+        &self,
+        env: &EnvironmentId,
+        name: &str,
+        vars: &[(String, String)],
+        exec: &ExecContext,
+        by_agent: bool,
+        wrapper: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        if vars.iter().any(|(var, _)| !is_var_name(var)) {
+            return Err("a variable's name is not one Task takes".to_string());
+        }
+        let args: Vec<String> = std::iter::once(name.to_string())
+            .chain(vars.iter().map(|(var, value)| format!("{var}={value}")))
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         if !exec.has_exec_target() {
             return Err("no container is running to run it in".to_string());
         }
@@ -500,9 +623,9 @@ impl TaskBoard {
             return Err(format!("{name} is already running"));
         }
         if let Some(wrapper) = wrapper {
-            return self.start_detached(&runtime, key, exec, by_agent, wrapper);
+            return self.start_detached(&runtime, key, &args, exec, by_agent, wrapper);
         }
-        let (program, argv) = task_command(&[name]);
+        let (program, argv) = task_command(&args);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let spec = if by_agent {
             exec.resolve_for_agent_in_terminal(program, &argv)
@@ -524,7 +647,7 @@ impl TaskBoard {
         let stderr = child.stderr.take();
         let stopper = spec.stopper.clone();
         let stop = Arc::new(tokio::sync::Notify::new());
-        let first = format!("$ task {name}");
+        let first = format!("$ task {}", shown_args(&args));
         self.runs.lock().unwrap().insert(
             key.clone(),
             Run {
@@ -710,6 +833,7 @@ impl TaskBoard {
         &self,
         runtime: &tokio::runtime::Handle,
         key: (EnvironmentId, String),
+        args: &[&str],
         exec: &ExecContext,
         by_agent: bool,
         wrapper: &std::path::Path,
@@ -718,7 +842,7 @@ impl TaskBoard {
         let wrapper = wrapper.display().to_string();
         let spec = exec.resolve_detached(
             &wrapper,
-            &[key.1.as_str()],
+            args,
             by_agent,
             &[("TASTE_TASK_ORIGIN".to_string(), origin.to_string())],
         );
@@ -742,7 +866,7 @@ impl TaskBoard {
                 stopper: spec.stopper.clone(),
             },
         );
-        self.publish_lines(&key, vec![format!("$ task {}", key.1)]);
+        self.publish_lines(&key, vec![format!("$ task {}", shown_args(args))]);
         self.events.publish(Event::TaskState {
             env: key.0.clone(),
             name: key.1.clone(),
@@ -880,6 +1004,27 @@ impl TaskBoard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The devcontainer image carries the Task the IDE brings, which is
+    /// the one `taste-taskfile`'s reader is checked against: a bump here
+    /// is a bump there.
+    #[test]
+    fn the_image_carries_the_ides_task() {
+        let containerfile = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.devcontainer/Containerfile"),
+        )
+        .unwrap();
+        assert!(
+            containerfile.contains(&format!("ARG TASK_VERSION={IDE_TASK_VERSION}\n")),
+            "the Containerfile's TASK_VERSION is not {IDE_TASK_VERSION}"
+        );
+        for sum in [IDE_TASK_SHA256_AMD64, IDE_TASK_SHA256_ARM64] {
+            assert!(
+                containerfile.contains(sum),
+                "the Containerfile does not check {sum}"
+            );
+        }
+    }
 
     /// A run its wrapper never reports ends instead of standing running,
     /// one the wrapper did report is left alone, and a report that comes
@@ -1034,5 +1179,46 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].name, "docs:serve");
         assert_eq!(parse_list_json(b"not json"), None);
+    }
+
+    #[test]
+    fn a_tasks_place_is_read_from_its_json() {
+        let json = br#"{"tasks":[{"name":"rs:fmt","desc":"","location":{"line":3,"column":3,"taskfile":"/w/sub/Rust.yml"}}]}"#;
+        let tasks = parse_list_json(json).unwrap();
+        assert_eq!(
+            tasks[0].location,
+            Some(TaskLocation {
+                taskfile: "/w/sub/Rust.yml".into(),
+                line: 3,
+                column: 3
+            })
+        );
+        assert_eq!(tasks[0].requires, None);
+    }
+
+    /// Variables go on the command line as `NAME=value`, a name Task takes
+    /// and a value shown quoted where a shell would need it.
+    #[test]
+    fn a_runs_variables_are_its_arguments() {
+        assert!(is_var_name("FILE") && is_var_name("_x1"));
+        assert!(!is_var_name("1X") && !is_var_name("A-B") && !is_var_name(""));
+        assert_eq!(
+            shown_args(&["fmt", "FILE=/w/src/a.rs"]),
+            "fmt FILE=/w/src/a.rs"
+        );
+        assert_eq!(
+            shown_args(&["fmt", "FILE=/w/it's here.rs"]),
+            r#"fmt 'FILE=/w/it'\''s here.rs'"#
+        );
+        let board = TaskBoard::new(EventBus::new());
+        let refused = board.start_with(
+            &EnvironmentId::primary(),
+            "fmt",
+            &[("A B".into(), "x".into())],
+            &ExecContext::for_tests(true),
+            false,
+            None,
+        );
+        assert!(refused.is_err());
     }
 }

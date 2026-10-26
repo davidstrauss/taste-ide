@@ -3980,6 +3980,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/ryu/ryu-1.0.23.crate",
+        "sha256": "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f",
+        "dest": "cargo/vendor/ryu-1.0.23"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f\", \"files\": {}}",
+        "dest": "cargo/vendor/ryu-1.0.23",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/ryu-js/ryu-js-1.0.3.crate",
         "sha256": "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714",
         "dest": "cargo/vendor/ryu-js-1.0.3"
@@ -4183,6 +4196,19 @@
         "type": "inline",
         "contents": "{\"package\": \"8705578779c2b6bd90d84d66eb2e206b708b1a4d7b9f17641b293545bf1c7e46\", \"files\": {}}",
         "dest": "cargo/vendor/serde_with_macros-3.22.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/serde_yaml_ng/serde_yaml_ng-0.10.0.crate",
+        "sha256": "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f",
+        "dest": "cargo/vendor/serde_yaml_ng-0.10.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f\", \"files\": {}}",
+        "dest": "cargo/vendor/serde_yaml_ng-0.10.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -5210,6 +5236,19 @@
         "type": "inline",
         "contents": "{\"package\": \"ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853\", \"files\": {}}",
         "dest": "cargo/vendor/unicode-xid-0.2.6",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/unsafe-libyaml/unsafe-libyaml-0.2.11.crate",
+        "sha256": "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861",
+        "dest": "cargo/vendor/unsafe-libyaml-0.2.11"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861\", \"files\": {}}",
+        "dest": "cargo/vendor/unsafe-libyaml-0.2.11",
         "dest-filename": ".cargo-checksum.json"
     },
     {

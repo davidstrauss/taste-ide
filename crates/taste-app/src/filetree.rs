@@ -29,6 +29,10 @@ pub struct PortRow {
 
 type OpenLogCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind)>;
 type TaskCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, String)>;
+/// A task to run, with the variables it is given (`NAME`, value): a path
+/// variable's value relative to the checkout (`taste_core::tasks::FILE_VAR`).
+type RunTaskCallback =
+    Box<dyn Fn(taste_core::environment::EnvironmentId, String, Vec<(String, String)>)>;
 
 /// One row of the Tasks section: the task, and how its last run went.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,7 +724,7 @@ pub struct FileTree {
     task_hits: RefCell<HashMap<String, usize>>,
     tasks_results: Rc<crate::results::ResultsPanel>,
     on_open_task: RefCell<Option<TaskCallback>>,
-    on_run_task: RefCell<Option<TaskCallback>>,
+    on_run_task: RefCell<Option<RunTaskCallback>>,
     /// Per published host port, the row's in and out sparklines, for the
     /// tick to feed; and the last readings, so a redrawn row starts from
     /// them (David, 2026-09-21: "proper ingress/egress sparklines for
@@ -3692,10 +3696,11 @@ impl FileTree {
         *self.on_open_task.borrow_mut() = Some(Box::new(f));
     }
 
-    /// A Tasks row's button: run the task, or stop it when it is running.
+    /// A Tasks row's button: run the task, with what it asked to be given,
+    /// or stop it when it is running.
     pub fn set_on_run_task(
         &self,
-        f: impl Fn(taste_core::environment::EnvironmentId, String) + 'static,
+        f: impl Fn(taste_core::environment::EnvironmentId, String, Vec<(String, String)>) + 'static,
     ) {
         *self.on_run_task.borrow_mut() = Some(Box::new(f));
     }
@@ -3960,14 +3965,16 @@ impl FileTree {
             .sensitive(runnable || running)
             .build();
         {
+            // A task that asks for variables is asked about first; a stop
+            // is a stop.
             let weak = Rc::downgrade(self);
-            let name = row.info.name.clone();
+            let info = row.info.clone();
             button.connect_clicked(move |_| {
                 let Some(tree) = weak.upgrade() else { return };
-                let env = tree.aimed_environment();
-                let hook = tree.on_run_task.borrow();
-                if let Some(hook) = hook.as_ref() {
-                    hook(env, name.clone());
+                if running {
+                    tree.run_task(&info.name, Vec::new());
+                } else {
+                    tree.ask_and_run_task(&info, Vec::new());
                 }
             });
         }
@@ -4717,11 +4724,7 @@ impl FileTree {
         let weak = Rc::downgrade(self);
         button.connect_clicked(move |_| {
             let Some(tree) = weak.upgrade() else { return };
-            let env = tree.aimed_environment();
-            let hook = tree.on_run_task.borrow();
-            if let Some(hook) = hook.as_ref() {
-                hook(env, name.clone());
-            }
+            tree.run_task(&name, Vec::new());
         });
         Some(button)
     }
@@ -4867,15 +4870,29 @@ impl FileTree {
     /// so it scrolls — posed without a container running `task`.
     #[doc(hidden)]
     pub fn seed_tasks_for_probe(self: &Rc<Self>) {
-        use crate::tasks::{RunState, TaskInfo};
+        use crate::tasks::{Allowed, Required, RunState, TaskInfo};
         // One namespace open, one folded: both of the heading's faces.
         self.tasks_open.borrow_mut().insert("dev".to_string());
         let row = |name: &str, desc: &str, state| TaskRow {
-            info: TaskInfo {
-                name: name.to_string(),
-                desc: desc.to_string(),
-            },
+            info: TaskInfo::named(name, desc),
             state,
+        };
+        // A task that runs on a file, as its `requires` says
+        // (`taste-taskfile`): on a file's menu, and asked about by its play
+        // (`TASTE_PROBE_TASKVARS`).
+        let on_file = |name: &str, desc: &str, state| {
+            let mut task = row(name, desc, state);
+            task.info.requires = Some(vec![
+                Required {
+                    name: taste_core::tasks::FILE_VAR.to_string(),
+                    allowed: Allowed::Any,
+                },
+                Required {
+                    name: "MODE".to_string(),
+                    allowed: Allowed::OneOf(vec!["check".into(), "fix".into()]),
+                },
+            ]);
+            task
         };
         // What their runs said: a build three minutes ago, a suite saying
         // a little all along and more now, a seed that failed after a few
@@ -4926,7 +4943,7 @@ impl FileTree {
                 row("ci:e2e", "Against a server", RunState::Succeeded),
                 row("build", "Build the workspace", RunState::Succeeded),
                 row("test", "Run the test suite", RunState::Running),
-                row("lint", "", RunState::Idle),
+                on_file("lint", "", RunState::Idle),
                 row("dev", "Build for dev", RunState::Idle),
                 row("dev:init", "Seed the dev database", RunState::Failed),
                 row("dev:serve", "Serve on :3000", RunState::Idle),
@@ -5452,6 +5469,162 @@ impl FileTree {
         ));
     }
 
+    /// Run `name` in the environment the tree is aimed at, given `vars` —
+    /// or stop it, when it is running (the play's second face).
+    fn run_task(&self, name: &str, vars: Vec<(String, String)>) {
+        let env = self.aimed_environment();
+        let hook = self.on_run_task.borrow();
+        if let Some(hook) = hook.as_ref() {
+            hook(env, name.to_string(), vars);
+        }
+    }
+
+    /// Run a task, first asking for what it requires beyond `given`: at
+    /// once when it requires nothing more. A task already running is left
+    /// running — a menu's run is never a stop.
+    fn ask_and_run_task(
+        self: &Rc<Self>,
+        info: &crate::tasks::TaskInfo,
+        given: Vec<(String, String)>,
+    ) {
+        let running =
+            self.tasks.borrow().0.iter().any(|row| {
+                row.info.name == info.name && row.state == crate::tasks::RunState::Running
+            });
+        if running {
+            self.workspace
+                .events
+                .publish(Event::Toast(format!("{} is already running", info.name)));
+            return;
+        }
+        let asked: Vec<crate::tasks::Required> = info
+            .requires
+            .iter()
+            .flatten()
+            .filter(|required| !given.iter().any(|(var, _)| *var == required.name))
+            .cloned()
+            .collect();
+        if asked.is_empty() {
+            self.run_task(&info.name, given);
+            return;
+        }
+        self.ask_task_vars(info, given, asked);
+    }
+
+    /// The question a task's play asks: a row per variable it requires —
+    /// a choice of its values when its `enum` lists them, a field
+    /// otherwise — and Run. A field left empty is not given, so Task
+    /// takes the variable from the environment, or says it is missing.
+    fn ask_task_vars(
+        self: &Rc<Self>,
+        info: &crate::tasks::TaskInfo,
+        given: Vec<(String, String)>,
+        asked: Vec<crate::tasks::Required>,
+    ) {
+        use crate::tasks::Allowed;
+        let mut body = info.desc.clone();
+        for (var, value) in &given {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&format!("{var}: {value}"));
+        }
+        let dialog = adw::AlertDialog::new(
+            Some(&format!("Run {}", info.name)),
+            (!body.is_empty()).then_some(body.as_str()),
+        );
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        enum Field {
+            Entry(adw::EntryRow),
+            Choice(adw::ComboRow, Vec<String>),
+        }
+        let mut fields = Vec::new();
+        let mut first_entry = None;
+        for required in &asked {
+            match &required.allowed {
+                Allowed::OneOf(values) if !values.is_empty() => {
+                    let strings: Vec<&str> = values.iter().map(String::as_str).collect();
+                    let row = adw::ComboRow::builder()
+                        .title(&required.name)
+                        .use_underline(false)
+                        .model(&gtk::StringList::new(&strings))
+                        .build();
+                    list.append(&row);
+                    fields.push((required.name.clone(), Field::Choice(row, values.clone())));
+                }
+                _ => {
+                    let row = adw::EntryRow::builder()
+                        .title(&required.name)
+                        .use_underline(false)
+                        .activates_default(true)
+                        .build();
+                    list.append(&row);
+                    if first_entry.is_none() {
+                        first_entry = Some(row.clone());
+                    }
+                    fields.push((required.name.clone(), Field::Entry(row)));
+                }
+            }
+        }
+        // Which of what it asks are paths, and how they are written: from the
+        // project's folder, as the tree names its files.
+        let paths: Vec<&str> = asked
+            .iter()
+            .map(|required| required.name.as_str())
+            .filter(|name| {
+                *name == taste_core::tasks::FILE_VAR || *name == taste_core::tasks::DIR_VAR
+            })
+            .collect();
+        let extra = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        extra.append(&list);
+        if !paths.is_empty() {
+            let (names, verb) = match paths.as_slice() {
+                [one] => (one.to_string(), "is a path"),
+                many => (many.join(" and "), "are paths"),
+            };
+            extra.append(
+                &gtk::Label::builder()
+                    .label(format!(
+                        "{names} {verb} from the project's folder, as in src/main.rs."
+                    ))
+                    .css_classes(["dim-label", "caption"])
+                    .wrap(true)
+                    .xalign(0.0)
+                    .build(),
+            );
+        }
+        dialog.set_extra_child(Some(&extra));
+        dialog.add_responses(&[("cancel", "Cancel"), ("run", "Run")]);
+        dialog.set_response_appearance("run", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("run"));
+        dialog.set_close_response("cancel");
+        if let Some(entry) = &first_entry {
+            dialog.set_focus(Some(entry));
+        }
+        let tree = self.clone();
+        let name = info.name.clone();
+        dialog.connect_response(Some("run"), move |_, _| {
+            let mut vars = given.clone();
+            for (var, field) in &fields {
+                let value = match field {
+                    Field::Entry(row) => row.text().trim().to_string(),
+                    Field::Choice(row, values) => values
+                        .get(row.selected() as usize)
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                if !value.is_empty() {
+                    vars.push((var.clone(), value));
+                }
+            }
+            tree.run_task(&name, vars);
+        });
+        dialog.present(Some(&self.widget));
+    }
+
     fn prompt_name(
         self: Rc<Self>,
         heading: &str,
@@ -5687,6 +5860,54 @@ impl FileTree {
             }
         }
 
+        // The tasks that run on this: one whose `requires` asks for `FILE`
+        // on a file's menu, for `DIR` on a folder's, given this one's path
+        // (`taste_core::tasks::FILE_VAR`). Anything else it asks for is
+        // asked when it is chosen.
+        if !node.ghost {
+            let var = if node.is_dir {
+                taste_core::tasks::DIR_VAR
+            } else {
+                taste_core::tasks::FILE_VAR
+            };
+            let (offered, runnable) = {
+                let tasks = self.tasks.borrow();
+                let offered: Vec<crate::tasks::TaskInfo> = tasks
+                    .0
+                    .iter()
+                    .map(|row| &row.info)
+                    .filter(|info| info.takes(var))
+                    .cloned()
+                    .collect();
+                (offered, tasks.1.is_none())
+            };
+            if let (false, Some(rel)) = (offered.is_empty(), self.repo_relative(&node.path)) {
+                let value = if rel.as_os_str().is_empty() {
+                    ".".to_string()
+                } else {
+                    rel.to_string_lossy().into_owned()
+                };
+                let section = gio::Menu::new();
+                for (index, info) in offered.into_iter().enumerate() {
+                    let action_name = format!("task-{index}");
+                    // A menu label's underscore is a mnemonic's mark.
+                    section.append(
+                        Some(&info.name.replace('_', "__")),
+                        Some(&format!("row.{action_name}")),
+                    );
+                    let action = gio::SimpleAction::new(&action_name, None);
+                    action.set_enabled(runnable);
+                    let tree = self.clone();
+                    let given = vec![(var.to_string(), value.clone())];
+                    action.connect_activate(move |_, _| {
+                        tree.ask_and_run_task(&info, given.clone());
+                    });
+                    actions.add_action(&action);
+                }
+                menu.append_section(Some("Run Task"), &section);
+            }
+        }
+
         let target_dir = if node.is_dir {
             node.path.clone()
         } else {
@@ -5877,6 +6098,8 @@ impl FileTree {
         }
 
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        // `TASTE_PROBE_TASKMENU` shoots it by this name.
+        popover.set_widget_name("row-menu");
         popover.insert_action_group("row", Some(&actions));
         popover.set_parent(anchor);
         popover.connect_closed(|popover| {
@@ -9731,6 +9954,70 @@ impl FileTree {
                             .unwrap_or_else(|| "nothing".to_string())
                     );
                 });
+            });
+        }
+        // `TASTE_PROBE_TASKVARS=1`: the question the seeded `lint`'s play
+        // asks (`TASTE_PROBE_VIEW`'s tasks), as a click on it leaves it —
+        // `=file` as its row on a file's menu asks it, the file given.
+        static TASK_VARS: std::sync::Once = std::sync::Once::new();
+        if let (Ok(pose), false) = (
+            std::env::var("TASTE_PROBE_TASKVARS"),
+            TASK_VARS.is_completed(),
+        ) {
+            TASK_VARS.call_once(|| {});
+            let tree = self.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+                let info = tree
+                    .tasks
+                    .borrow()
+                    .0
+                    .iter()
+                    .map(|row| row.info.clone())
+                    .find(|info| info.takes(taste_core::tasks::FILE_VAR));
+                let Some(info) = info else {
+                    println!("task vars probe: no task takes FILE");
+                    return;
+                };
+                let given = if pose == "file" {
+                    vec![(
+                        taste_core::tasks::FILE_VAR.to_string(),
+                        "crates/taste-app/src/filetree.rs".to_string(),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                tree.ask_and_run_task(&info, given);
+            });
+        }
+        // `TASTE_PROBE_TASKMENU=<path>`: that row's menu open, as a
+        // right-click leaves it, with the seeded tasks that run on it.
+        static TASK_MENU: std::sync::Once = std::sync::Once::new();
+        if let (Ok(path), false) = (
+            std::env::var("TASTE_PROBE_TASKMENU"),
+            TASK_MENU.is_completed(),
+        ) {
+            TASK_MENU.call_once(|| {});
+            let tree = self.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                let path = tree.view_root().join(path);
+                let node = tree.tree_selection().and_then(|(_, _, model)| {
+                    (0..model.n_items())
+                        .filter_map(|i| model.row(i))
+                        .filter_map(|row| row.item().and_downcast::<BoxedAnyObject>())
+                        .map(|item| item.borrow::<FileNode>().clone())
+                        .find(|node| node.path == path)
+                });
+                let anchor = tree
+                    .rows
+                    .borrow()
+                    .get(&path)
+                    .and_then(|handle| handle.label.upgrade())
+                    .and_then(|label| label.parent())
+                    .and_downcast::<gtk::Box>();
+                match (node, anchor) {
+                    (Some(node), Some(anchor)) => tree.show_context_menu(&anchor, &node),
+                    _ => println!("task menu probe: no row for {}", path.display()),
+                }
             });
         }
         // `TASTE_PROBE_SELECTION=1`: README.md in front, then the first
