@@ -235,14 +235,21 @@ impl ChatPane {
         // it stops the turn now, drops the other queued messages, and
         // sends this one next. Stop: the message is dropped before the
         // agent takes it (David, 2026-10-24).
-        if let (Delivery::Queued | Delivery::Asking { .. }, Some(prompt)) =
+        // Held for an agent that is not up — no turn to finish — the same
+        // two: fast-forward puts it first, so it goes on its own when the
+        // agent is back, and held drops the others held with it.
+        if let (Delivery::Queued | Delivery::Asking { .. } | Delivery::Held(_), Some(prompt)) =
             (&user.delivery, &user.prompt)
         {
-            let forward = crate::holdbutton::HoldButton::new(
-                "media-seek-forward-symbolic",
+            let tooltip = if matches!(user.delivery, Delivery::Held(_)) {
+                "Send this first, on its own, when the agent is back. Hold for two seconds to \
+                 send only this, dropping the other held messages"
+            } else {
                 "Ask the agent to finish the step it is on and take this next. Hold for two \
-                 seconds to stop it now and send only this, dropping the other queued messages",
-            );
+                 seconds to stop it now and send only this, dropping the other queued messages"
+            };
+            let forward =
+                crate::holdbutton::HoldButton::new("media-seek-forward-symbolic", tooltip);
             forward.widget.add_css_class("flat");
             forward.widget.set_valign(gtk::Align::Center);
             {

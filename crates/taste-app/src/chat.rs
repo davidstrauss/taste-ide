@@ -1346,16 +1346,17 @@ struct Holding {
 
 /// Where an unfinished prompt goes when the process holding it dies.
 ///
-/// The distinction is who is owed the message back. A typed one is the
-/// user's and belongs in their box, where they can edit it or send it
-/// again. One the IDE accepted on an orchestrator's behalf has no box to
-/// go back to — which is why it used to simply evaporate, taking a
-/// started issue's whole brief with it (i-0011) — so it goes back on the
-/// hold queue and is delivered when an agent comes up.
+/// Back on the hold queue, on its own card, delivered when an agent comes
+/// up — removable there, and put first with its fast-forward. One the IDE
+/// accepted on an orchestrator's behalf once simply evaporated, taking a
+/// started issue's whole brief with it (i-0011); a typed one went back to
+/// the composer, which left the user to send it again (2026-10-26). Who
+/// typed it is still kept, so a message orphaned twice is still the
+/// user's.
 enum Unfinished {
-    /// Back into the composer.
+    /// Typed by the user.
     Composer(String),
-    /// Back onto the hold queue.
+    /// Sent by the IDE, for an orchestrator.
     Requeue(String),
     /// Nothing to hand back: a utility prompt, whose caller has already
     /// been handed an empty answer.
@@ -1383,6 +1384,9 @@ fn guidance_update(seen: u32, current: u32, guidance: &str) -> String {
          lists the notes. ide_guide gives this guidance again at any time.]\n\n{guidance}"
     )
 }
+
+/// What a held message's badge adds once fast-forward has put it first.
+const GOES_FIRST: &str = " — goes first";
 
 struct QueuedSend {
     prompt: model::PromptId,
@@ -5617,7 +5621,7 @@ impl ChatPane {
         // To the bottom for the user's own send, which is their act; an
         // orchestrator's, or one put back after the agent died, leaves a
         // reader where they are.
-        if typed {
+        if typed && prompt.is_none() {
             self.stick_to_bottom.set(true);
             self.jump_banner.set_reveal_child(false);
         }
@@ -7219,6 +7223,9 @@ impl ChatPane {
 
     /// Fast-forward, clicked on `prompt`'s card: a turn asked for.
     pub(super) fn ask_for_turn(&self, prompt: &str) {
+        if self.held_first(prompt, false) {
+            return;
+        }
         self.workspace.nudges.ask(&self.environment);
         *self.nudged_prompt.borrow_mut() = Some(prompt.to_string());
         self.update_model(|model| {
@@ -7406,6 +7413,9 @@ impl ChatPane {
     /// Stop, pressed on a queued message's card: it is dropped from behind
     /// the turn and never sent, if it has not gone already.
     pub(super) fn withdraw_prompt(&self, prompt: &str) {
+        if self.withdraw_held_prompt(prompt) {
+            return;
+        }
         if let Some(client) = self.client.borrow().as_ref() {
             let _ = client.withdraw(prompt);
         }
@@ -7415,12 +7425,75 @@ impl ChatPane {
     /// now, every other queued message is dropped, and this one goes next,
     /// for the agent to take up at once.
     pub(super) fn expedite_prompt(&self, prompt: &str) {
+        if self.held_first(prompt, true) {
+            return;
+        }
         if let Some(client) = self.client.borrow().as_ref() {
             *self.expedited.borrow_mut() = Some(prompt.to_string());
             if client.expedite(prompt).is_err() {
                 self.expedited.borrow_mut().take();
             }
         }
+    }
+
+    /// Fast-forward on a held message's card — one waiting for the agent
+    /// or its environment to come back, with no turn to finish: it goes
+    /// first when the agent is back, which also sends it on its own, since
+    /// the first message handed over starts a turn and the rest wait
+    /// behind it. With `only` (the button held), the other held messages
+    /// are dropped (David, 2026-10-26: "The FF button, in this situation,
+    /// would just ensure the message goes first/exclusively on resume").
+    /// False when `prompt` is not held.
+    fn held_first(&self, prompt: &str, only: bool) -> bool {
+        let (label, dropped) = {
+            let mut held = self.revive_queue.borrow_mut();
+            let Some(at) = held.iter().position(|send| send.prompt == prompt) else {
+                return false;
+            };
+            let mut item = held.remove(at).expect("found above");
+            let dropped: Vec<QueuedSend> = if only {
+                held.drain(..).collect()
+            } else {
+                Vec::new()
+            };
+            if !item.label.ends_with(GOES_FIRST) {
+                item.label.push_str(GOES_FIRST);
+            }
+            let label = item.label.clone();
+            held.push_front(item);
+            (label, dropped)
+        };
+        self.deliver(prompt, model::Delivery::Held(label));
+        for send in dropped {
+            self.deliver(
+                &send.prompt,
+                model::Delivery::NotSent(
+                    "dropped when another message was fast-forwarded past it".into(),
+                ),
+            );
+        }
+        self.sync_revive_bar();
+        true
+    }
+
+    /// The trash on a held message's card: it is taken out of what waits
+    /// for the agent, and never sent. False when `prompt` is not held.
+    fn withdraw_held_prompt(&self, prompt: &str) -> bool {
+        let removed = {
+            let mut held = self.revive_queue.borrow_mut();
+            held.iter()
+                .position(|send| send.prompt == prompt)
+                .and_then(|at| held.remove(at))
+        };
+        let Some(send) = removed else {
+            return false;
+        };
+        self.deliver(
+            &send.prompt,
+            model::Delivery::NotSent(Self::WITHDRAWN.into()),
+        );
+        self.sync_revive_bar();
+        true
     }
 
     /// The messages held for this chat's agent or its environment to come
@@ -9535,49 +9608,45 @@ impl ChatPane {
                 }
                 let pending: Vec<PendingPrompt> =
                     self.pending_prompts.borrow_mut().drain(..).collect();
-                let mut restored: Vec<String> = Vec::new();
+                // Every unfinished message stays on its card, waiting again
+                // for the agent, in the order it was written — the user's
+                // own as much as one the IDE sent for an orchestrator: still
+                // queued, its fast-forward and trash still on it. Typed ones
+                // once went back to the composer, their cards marked "not
+                // delivered" (David, 2026-10-26: "Stuff like this should
+                // stay queued (and removable)").
                 let mut requeued: Vec<(
                     String,
+                    Vec<(String, ContentBlock)>,
                     Option<taste_core::queued::Queued>,
                     model::PromptId,
+                    bool,
                 )> = Vec::new();
-                // In the order they were written, whoever wrote them: once one
-                // goes back to the composer, each written after it goes there
-                // too, to be sent again after it rather than ahead of it
-                // (David, 2026-10-11: "ensure queued messages stay ordered for
-                // dispatch").
-                let mut to_composer = false;
                 for prompt in pending {
                     let written = prompt.queued;
                     match prompt.unfinished {
                         Unfinished::Composer(text) => {
-                            to_composer = true;
-                            restored.push(text);
-                            self.deliver(&prompt.prompt, model::Delivery::Lost);
+                            requeued.push((text, prompt.attachments, written, prompt.prompt, true))
                         }
-                        Unfinished::Requeue(text) if to_composer => {
-                            restored.push(text);
-                            self.deliver(&prompt.prompt, model::Delivery::Lost);
-                        }
-                        // The same card, waiting again.
                         Unfinished::Requeue(text) => {
-                            requeued.push((text, written, prompt.prompt));
+                            requeued.push((text, prompt.attachments, written, prompt.prompt, false))
                         }
                         Unfinished::Nothing => self.deliver(&prompt.prompt, model::Delivery::Lost),
                     }
                 }
-                if !restored.is_empty() {
-                    let current = self.entry_text();
-                    if !current.trim().is_empty() {
-                        restored.push(current);
-                    }
-                    self.entry.buffer().set_text(&restored.join("\n\n"));
-                }
                 // Not for the environment: these wait on the process, which
                 // the reconnect below is bringing back. Ahead of anything
                 // held since, which was written after them.
-                for (text, written, prompt) in requeued.into_iter().rev() {
-                    self.hold_send_at(&text, Vec::new(), false, false, written, true, Some(prompt));
+                for (text, attachments, written, prompt, typed) in requeued.into_iter().rev() {
+                    self.hold_send_at(
+                        &text,
+                        attachments,
+                        false,
+                        typed,
+                        written,
+                        true,
+                        Some(prompt),
+                    );
                 }
                 // Captured before reset_session, which clears it.
                 let resume = self
