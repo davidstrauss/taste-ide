@@ -720,7 +720,8 @@ to.
   parser fed what a repository or an agent wrote goes in a helper binary
   started through `taste_confine::confine` (David, 2026-10-09, of the
   Mermaid renderer's eighty crates: "Build the sandboxed helper first").
-  `taste-embed` predates this and is not yet confined.
+  `taste-embed` (llama.cpp over the checkout's text) is one, and refuses
+  to run otherwise.
 - Adapter packages fetched from registries stay version-pinned.
 - **The interface must be beautiful — and the chat pane and prompt box
   are held to the highest bar in the app.** Beauty here means libadwaita

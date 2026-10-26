@@ -242,7 +242,9 @@ commits such a link. This is the "Mirror all, note the risk" decision of
   (`supervisor.rs`, `podman run --rm --entrypoint sh <image> -c "id -u; id
   -g"`). `--network=none`, `--memory`, and `--pids-limit` cost nothing.
 - **`taste-embed` is not confined** (CLAUDE.md says so); it tokenizes the
-  checkout's text with llama.cpp in a host process.
+  checkout's text with llama.cpp in a host process. Closed 2026-10-26: it
+  runs under `taste_confine` with the model file and the CPU topology to
+  read, and refuses to start otherwise.
 - **The build has no process limit** (ROADMAP → "Bound a runaway build
   step"), still open.
 - **No container in the guest reaches the guest's loopback**, measured

@@ -7,6 +7,11 @@
 //! the IDE's process, which is where a crash in a 100 MB model would
 //! otherwise land.
 //!
+//! It runs only confined (`taste-confine`, started so by `taste-semantic`):
+//! what it tokenizes is the checkout's text, which a repository or an agent
+//! wrote, and llama.cpp is a large C++ parser of it. Started by hand, it
+//! refuses.
+//!
 //! Protocol, one JSON object per line, request then reply:
 //!   → {"kind": "document" | "query", "texts": ["…", …]}
 //!   ← {"vectors": [[f32, …], …]}   or   {"error": "…"}
@@ -236,7 +241,35 @@ fn yield_to_everything() {
     }
 }
 
+/// Whether this process is confined as `taste-confine` confines: the
+/// three things it can ask about itself.
+fn confined() -> Result<(), String> {
+    // SAFETY: prctl queries with no pointers.
+    let (no_new_privs, seccomp) = unsafe {
+        (
+            libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0),
+            libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0),
+        )
+    };
+    if no_new_privs != 1 || seccomp != 2 {
+        return Err(
+            "taste-embed runs only confined, and this process is not: it is \
+                    started by the IDE (taste-confine), not by hand"
+                .to_string(),
+        );
+    }
+    // The root is never granted, so a confined process cannot list it.
+    if std::fs::read_dir("/").is_ok() {
+        return Err("taste-embed runs only under Landlock, and this process can read /".into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    if let Err(why) = confined() {
+        println!("{}", serde_json::json!({ "error": why }));
+        std::process::exit(2);
+    }
     let path = std::env::args()
         .nth(1)
         .context("usage: taste-embed <model.gguf>")?;

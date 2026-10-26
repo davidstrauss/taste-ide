@@ -8,7 +8,8 @@
 //! ([`EMBEDDING`], fetched once by `taste-models`), run through llama.cpp on
 //! the CPU — in a process of its own, `taste-embed`, because the IDE
 //! already links whisper.cpp for voice and the two carry ggmls that cannot
-//! share a binary.
+//! share a binary, and confined (`taste_confine`), because what it reads
+//! is text a repository or an agent wrote.
 //!
 //! **One store, many checkouts.** A workspace's environments are clones of
 //! one repository, each the primary plus a branch's worth of change, so
@@ -271,12 +272,21 @@ struct Reply {
 impl Helper {
     fn spawn(model: &Path) -> Result<(Self, usize)> {
         let path = helper_path()?;
-        let mut child = Command::new(&path)
+        // Confined (taste-confine): llama.cpp tokenizes the checkout's text,
+        // which a repository or an agent wrote, so it reads the model, the
+        // CPU topology its thread count is taken from, and nothing else.
+        let mut policy = taste_confine::Policy::for_program(&path)?;
+        policy.read.push(model.to_path_buf());
+        policy.read.push(PathBuf::from("/sys/devices/system/cpu"));
+        let mut command = Command::new(&path);
+        command
             .arg(model)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // llama.cpp's narration; errors come back as JSON.
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        taste_confine::confine(&mut command, &policy)?;
+        let mut child = command
             .spawn()
             .with_context(|| format!("starting {}", path.display()))?;
         let stdin = child.stdin.take().context("the helper has no stdin")?;
@@ -1314,6 +1324,29 @@ mod tests {
         std::fs::write(&path, b"NOPE").unwrap();
         assert!(Store::load(&path).is_err());
         assert!(Manifest::load(&path).is_err());
+    }
+
+    /// The helper as the IDE starts it, confined, embedding a question and
+    /// a document — the model read through Landlock, and the vectors whole.
+    /// Needs the pinned model and the helper:
+    /// `cargo build -p taste-embed && TASTE_EMBED_BIN=target/debug/taste-embed
+    /// TASTE_SEMANTIC_MODEL=/path/to.gguf cargo test -p taste-semantic
+    /// embeds_confined -- --ignored`.
+    #[test]
+    #[ignore]
+    fn embeds_confined_as_the_ide_starts_it() {
+        let model = std::env::var("TASTE_SEMANTIC_MODEL").expect("TASTE_SEMANTIC_MODEL");
+        let embedder = Embedder::load(Path::new(&model)).unwrap();
+        assert_eq!(embedder.dim(), 768);
+        let query = embedder.query("where is authentication handled?").unwrap();
+        let documents = embedder
+            .documents(&["fn login(user: &str) -> Session {}".to_string()])
+            .unwrap();
+        for vector in std::iter::once(&query).chain(&documents) {
+            assert_eq!(vector.len(), 768);
+            let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "{norm}");
+        }
     }
 
     /// Needs the pinned model, the helper and a checkout to index:
