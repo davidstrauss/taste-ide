@@ -601,13 +601,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let startup_follow: Rc<
         RefCell<Option<Rc<dyn Fn(&taste_core::environment::EnvironmentId)>>>,
     > = Rc::new(RefCell::new(None));
-    // The environment the user just pressed Start on, while it is still
-    // being made: its startup page comes forward from its first stage, as
-    // the aimed environment's does, though nothing can be aimed at it until
-    // it exists (David, 2026-10-18: "It should go to that immediately if
-    // I've requested startup").
-    let startup_wanted: Rc<RefCell<Option<taste_core::environment::EnvironmentId>>> =
-        Rc::new(RefCell::new(None));
     // An environment the user chose while it was still being made: the
     // panes go there the moment it exists (`Event::EnvironmentCreated`),
     // unless the user has chosen somewhere else since. Until 2026-10-24 a
@@ -629,7 +622,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let aim_panes: std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)> = {
         let dress_call = dress_call.clone();
         let startup_follow = startup_follow.clone();
-        let startup_wanted = startup_wanted.clone();
         let aim_pending = aim_pending.clone();
         let filetree = filetree.clone();
         let editor = editor.clone();
@@ -708,7 +700,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             // exists (`Event::EnvironmentCreated`).
                             tracing::info!("panes: aimed at {env}, still being made");
                             *aim_pending.borrow_mut() = Some(env.clone());
-                            *startup_wanted.borrow_mut() = Some(env.clone());
                             watch_slot.borrow_mut().aim(None);
                             for supervisor in environments.list() {
                                 supervisor.set_panes_watching(false);
@@ -1159,7 +1150,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let workspace = workspace.clone();
         let aim_panes = aim_panes.clone();
         let console = console.clone();
-        let startup_wanted = startup_wanted.clone();
         let aim_pending = aim_pending.clone();
         filetree.set_on_start_issue(move |issue| {
             start_issue(
@@ -1168,7 +1158,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 &workspace,
                 &aim_panes,
                 &console,
-                &startup_wanted,
                 &aim_pending,
                 issue,
             )
@@ -4610,8 +4599,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                 s.config_authority() == taste_core::ConfigAuthority::Baseline
                             });
                             page.on_state(&state, baseline);
-                            let aimed = filetree.aimed_environment() == env
-                                || startup_wanted.borrow().as_ref() == Some(&env);
+                            // Forward only for the environment the panes are
+                            // aimed at — one still being made included,
+                            // which Start aims them at from its first click
+                            // (`FileTree::aim_pending`). Nothing else may put
+                            // a start in front: Start once kept its
+                            // environment "wanted" until it was made, and
+                            // the panes gone back to Personal meanwhile had
+                            // that start take the editor over at every stage
+                            // (David, 2026-10-26: "These env views need to be
+                            // firmly segmented").
+                            let aimed = filetree.aimed_environment() == env;
                             let bring_forward = || {
                                 if !aimed {
                                     return;
@@ -6136,9 +6134,6 @@ fn start_issue(
     workspace: &taste_core::Workspace,
     aim_panes: &std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)>,
     console: &std::rc::Rc<crate::console::Console>,
-    startup_wanted: &std::rc::Rc<
-        std::cell::RefCell<Option<taste_core::environment::EnvironmentId>>,
-    >,
     aim_pending: &std::rc::Rc<std::cell::RefCell<Option<taste_core::environment::EnvironmentId>>>,
     issue: crate::backlog::StartedIssue,
 ) {
@@ -6183,11 +6178,9 @@ fn start_issue(
     let aim_panes = aim_panes.clone();
     let console = console.clone();
     let registry = environments.clone();
-    // Its page comes forward at its first stage (`startup_wanted`), and
-    // the panes take over once it exists.
-    *startup_wanted.borrow_mut() = Some(env.clone());
-    // ...and the panes follow once it exists, unless the user has gone
-    // somewhere else by then (`aim_pending`).
+    // The panes go there now, its start in front from its first stage,
+    // and take it over once it exists, unless the user has gone somewhere
+    // else by then (`aim_pending`).
     *aim_pending.borrow_mut() = Some(env.clone());
     // There now: Start is the act of going to it (David, 2026-10-24: "I
     // should be able to immediately focus an env as soon as I click
@@ -6195,7 +6188,6 @@ fn start_issue(
     aim_panes(Some(env.clone()));
     let pending = aim_pending.clone();
     let started = env.clone();
-    let wanted = startup_wanted.clone();
     if issue.host == taste_core::environment::Host::Cloud {
         workspace.events.publish(taste_core::Event::Toast(format!(
             "Starting {env} in the cloud — a host is started or made there first, which can \
@@ -6207,7 +6199,6 @@ fn start_issue(
         env,
         issue.host,
         Box::new(move |outcome| {
-            wanted.borrow_mut().take();
             let env = match outcome {
                 Ok(env) => env,
                 Err(e) => {
