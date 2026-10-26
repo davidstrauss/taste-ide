@@ -876,11 +876,9 @@ impl EnvironmentRegistry {
             }
             let env = supervisor.id().clone();
             let for_snapshot = supervisor.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                for_snapshot.snapshot_blocking()?;
-                for_snapshot.sync_peer_blocking()
-            })
-            .await;
+            let outcome =
+                tokio::task::spawn_blocking(move || for_snapshot.snapshot_and_sync_blocking())
+                    .await;
             match outcome {
                 Ok(Ok(())) => self.note_vm(domain, format!("{env}: snapshotted")),
                 Ok(Err(e)) => self.note_vm(
@@ -4946,13 +4944,11 @@ impl EnvironmentRegistry {
         // uncommitted work.
         supervisor.move_step(&format!("{moving}: saving its uncommitted work"));
         let for_snapshot = supervisor.clone();
-        let snapshot = tokio::task::spawn_blocking(move || {
-            for_snapshot.snapshot_blocking()?;
-            for_snapshot.sync_peer_blocking()
-        })
-        .await
-        .context("the snapshot did not finish")
-        .and_then(|done| done.context("snapshotting before the move"));
+        let snapshot =
+            tokio::task::spawn_blocking(move || for_snapshot.snapshot_and_sync_blocking())
+                .await
+                .context("the snapshot did not finish")
+                .and_then(|done| done.context("snapshotting before the move"));
         // The checkout's stashes, which no refspec carries: bundled out of
         // the old checkout while its VM is up, kept on this host, and
         // fetched into the peer so the old copy's look before it is deleted

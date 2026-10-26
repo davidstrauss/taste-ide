@@ -1295,8 +1295,11 @@ impl Supervisor {
         let primary = self.env.id.is_primary();
         let folder_events = self.events.clone();
         let transfers = self.transfers.clone();
+        // Which of the working tree's changes the mirror carries, judged by
+        // the folder's rules, which mirror the checkout's tracked ones.
+        let carried = ChangeJudge::for_folder(primary.then_some(self.env.peer.as_path()));
         if primary {
-            self.watch_folder();
+            self.watch_folder(carried.clone());
         }
         // The tree the panes show has its changes over there become the
         // events inotify would have raised here — the editor reloads, the
@@ -1337,7 +1340,7 @@ impl Supervisor {
             // files are not the working tree, and a build's output churns
             // without being anything git would show.
             let worktree_changed =
-                primary && git_part(&name).is_none() && !name.is_empty() && !churn_path(&name);
+                primary && git_part(&name).is_none() && !name.is_empty() && carried.counts(&name);
             if worktree_changed {
                 transfers.changed(Path::new(&name), false);
             }
@@ -1375,26 +1378,13 @@ impl Supervisor {
                     }
                     snapshot_pending.store(false, Ordering::SeqCst);
                     if let Some(supervisor) = weak.upgrade() {
-                        let seen = supervisor.folder_changes.load(Ordering::SeqCst);
-                        let mut snapshot = supervisor.snapshot_blocking();
+                        // The pass marks the folder in step itself
+                        // (`sync_peer_blocking`).
+                        let snapshot = supervisor.snapshot_and_sync_blocking();
                         if let Err(e) = &snapshot {
-                            tracing::warn!("snapshot after a ref moved in the VM: {e:#}");
-                        }
-                        let synced = supervisor.sync_peer_blocking();
-                        if let Err(e) = &synced {
-                            tracing::warn!("peer sync after a ref moved in the VM: {e:#}");
-                        }
-                        // The pass repairs a damaged object it meets
-                        // (`crate::repair`), which may be what the snapshot
-                        // failed on: tried again before it is said.
-                        if snapshot.is_err() && synced.is_ok() {
-                            snapshot = supervisor.snapshot_blocking();
-                        }
-                        if primary && snapshot.is_ok() && synced.is_ok() {
-                            supervisor.folder_settled.store(seen, Ordering::SeqCst);
+                            tracing::warn!("snapshot and sync after a change in the VM: {e:#}");
                         }
                         // Said where the user looks, not only in the log:
-                        // without a snapshot the folder cannot follow, and
                         // a sync that stopped for two hours went unseen
                         // (2026-10-11). After the pass, so its "done" does
                         // not cover it.
@@ -1403,8 +1393,8 @@ impl Supervisor {
                                 taste_core::FolderSync::Failed {
                                     reason: plain_failure(
                                         Some(
-                                            "Personal's working copy could not be snapshotted, \
-                                             so your folder is not following it",
+                                            "Personal's working copy could not be snapshotted \
+                                             and brought here, so your folder is not following it",
                                         ),
                                         &e,
                                     ),
@@ -1789,6 +1779,42 @@ impl Supervisor {
         }
     }
 
+    /// A snapshot of the checkout and the peer brought up to date with it,
+    /// in ONE pass. Personal's pass in a VM takes the snapshot itself
+    /// (`crate::peer::sync_primary_peer_with`), so a snapshot first was the
+    /// same work twice; and a snapshot in a VM that wrote syncs the peer on
+    /// its own ([`Self::snapshot_blocking`]), so the sync every caller made
+    /// after it was a second whole pass — on php-src, eighteen seconds
+    /// each, which kept the folder out of step through every burst of
+    /// edits (2026-10-26). A snapshot that fails is tried again after the
+    /// sync, which repairs a damaged object it meets (`crate::repair`).
+    pub fn snapshot_and_sync_blocking(&self) -> Result<()> {
+        if let Checkout::Remote { path, .. } = self.checkout() {
+            if self.env.id.is_primary() {
+                self.sync_peer_blocking()?;
+                self.tidy_checkout(&self.files(), &path);
+                return Ok(());
+            }
+        }
+        match self.snapshot_blocking() {
+            Ok(snapshot) => {
+                let synced = !self.checkout().is_local() && snapshot.is_some_and(|s| s.wrote);
+                if !synced {
+                    self.sync_peer_blocking()?;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "snapshotting {}: {e:#}; trying again after a sync",
+                    self.env.id
+                );
+                self.sync_peer_blocking()?;
+                self.snapshot_blocking().map(|_| ())
+            }
+        }
+    }
+
     /// Clear what the checkout's replaced snapshots left in its git
     /// (`taste_git::snapshot::TIDY_SCRIPT`), at most every ten minutes,
     /// the first time at once. Best effort: a tidy that fails costs disk,
@@ -1906,9 +1932,17 @@ impl Supervisor {
         // checkout's word whole.
         if self.env.id.is_primary() {
             let _one = self.folder_sync.lock().unwrap_or_else(|e| e.into_inner());
+            // The changes either side had made when the pass began: a pass
+            // that succeeds took Personal's snapshot and brought it here,
+            // so it settles every one of them (`folder_in_step`). Marked
+            // here, by the pass, not by whoever asked for it after, which
+            // was seconds later and behind a tidy, so a close that waited
+            // the pass out still found the folder out of step.
+            let seen = self.folder_changes.load(Ordering::SeqCst);
             let pass = self.sync_primary_blocking(&vm_info, &keys, &path, None, 0);
             self.folder_passes.fetch_add(1, Ordering::SeqCst);
             pass?;
+            self.folder_settled.store(seen, Ordering::SeqCst);
             // Each pass puts the checkout's upstreams back to the folder's,
             // so one set there lasts until the next ref moves, not longer.
             if let Err(e) = crate::peer::share_tracking(&self.env.peer, &self.files(), &path) {
@@ -1958,11 +1992,19 @@ impl Supervisor {
                 }));
             }
         };
+        // When each phase began, for the log line a slow pass leaves.
+        let started = std::time::Instant::now();
+        let phases: Arc<Mutex<Vec<(String, std::time::Instant)>>> = Arc::default();
         // The pass's phases as the running step, the first word raised as
         // the badge's other steps are written.
         let say = {
             let events = events.clone();
+            let phases = phases.clone();
             move |line: &str| {
+                phases
+                    .lock()
+                    .unwrap()
+                    .push((line.to_string(), std::time::Instant::now()));
                 let mut chars = line.chars();
                 let step = match chars.next() {
                     Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -1988,6 +2030,7 @@ impl Supervisor {
         );
         // Whatever the pass came to, nothing is on its way any more.
         self.transfers.settle();
+        log_slow_pass(started, &phases.lock().unwrap());
         if let Err(e) = &sync {
             events.publish(Event::FolderSync(taste_core::FolderSync::Failed {
                 reason: plain_failure(None, e),
@@ -2040,7 +2083,7 @@ impl Supervisor {
     /// that remains is the burst's: the sync runs two seconds after its
     /// LAST event, so a checkout or a build writing for longer is not sent
     /// half-written.
-    fn watch_folder(self: &Arc<Self>) {
+    fn watch_folder(self: &Arc<Self>, carried: ChangeJudge) {
         use notify::Watcher;
         let folder = self.env.peer.clone();
         let weak = Arc::downgrade(self);
@@ -2059,7 +2102,7 @@ impl Supervisor {
             for path in &event.paths {
                 if let Ok(rel) = path.strip_prefix(&root) {
                     let text = rel.to_string_lossy();
-                    if !text.is_empty() && git_part(&text).is_none() && !churn_path(&text) {
+                    if !text.is_empty() && git_part(&text).is_none() && carried.counts(&text) {
                         transfers.changed(rel, true);
                     }
                 }
@@ -2069,7 +2112,7 @@ impl Supervisor {
                     let rel = rel.to_string_lossy();
                     match git_part(&rel) {
                         // The working tree: an edit to send.
-                        None => !rel.is_empty() && !churn_path(&rel),
+                        None => !rel.is_empty() && carried.counts(&rel),
                         // A commit or switch in a submodule is its pair's
                         // to carry, and a fetch there moves its
                         // remote-tracking refs, which the sync gives
@@ -2105,13 +2148,11 @@ impl Supervisor {
                 }
                 pending.store(false, Ordering::SeqCst);
                 if let Some(supervisor) = weak.upgrade() {
-                    let seen = supervisor.folder_changes.load(Ordering::SeqCst);
                     // The folder's change, sent into the checkout, is a
                     // change there too: its watcher counts it, and the
                     // snapshot that follows settles it.
-                    match supervisor.sync_peer_blocking() {
-                        Ok(()) => supervisor.folder_settled.store(seen, Ordering::SeqCst),
-                        Err(e) => tracing::warn!("sync after a change in your folder: {e:#}"),
+                    if let Err(e) = supervisor.sync_peer_blocking() {
+                        tracing::warn!("sync after a change in your folder: {e:#}");
                     }
                 }
             });
@@ -2138,6 +2179,32 @@ impl Supervisor {
     pub fn folder_in_step(&self) -> bool {
         self.folder_settled.load(Ordering::SeqCst) == self.folder_changes.load(Ordering::SeqCst)
             && self.folder_conflicts().is_empty()
+    }
+
+    /// Why the folder is not [`Self::folder_in_step`], in a few words, for
+    /// the close's log line: a close that has to sync says what it is
+    /// catching up on.
+    pub fn folder_out_of_step(&self) -> String {
+        let settled = self.folder_settled.load(Ordering::SeqCst);
+        let changes = self.folder_changes.load(Ordering::SeqCst);
+        let conflicts = self.folder_conflicts().len();
+        if conflicts > 0 {
+            format!("{conflicts} conflict(s) waiting")
+        } else if settled == u64::MAX {
+            "no pass has finished since the IDE started".into()
+        } else {
+            format!(
+                "{} change(s) seen since the last pass began",
+                changes.saturating_sub(settled)
+            )
+        }
+    }
+
+    /// Return once no pass of Personal's sync is running: one under way may
+    /// be what brings the folder in step, so a close waits it out before
+    /// deciding to make one of its own.
+    pub fn wait_for_folder_pass(&self) {
+        drop(self.folder_sync.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     /// The paths the folder and the checkout both changed, differently,
@@ -5754,6 +5821,91 @@ fn moves_a_ref(inside: &str, remotes: bool) -> bool {
         || (remotes && under("refs/remotes/"))
 }
 
+/// A pass of Personal's sync that took over five seconds, said in the log
+/// with how long each of its phases took (`say`'s words, merged where a
+/// phase repeats them as its progress), so what a slow close waited on is
+/// on record rather than guessed at: php-src's pass took eighteen seconds
+/// and the log said nothing of where (2026-10-26).
+fn log_slow_pass(started: std::time::Instant, phases: &[(String, std::time::Instant)]) {
+    let total = started.elapsed();
+    if total < std::time::Duration::from_secs(5) {
+        return;
+    }
+    tracing::info!(
+        "Personal's sync took {:.1} s: {}",
+        total.as_secs_f64(),
+        slow_pass_words(started, phases, std::time::Instant::now())
+    );
+}
+
+/// [`log_slow_pass`]'s phases, each as `words N.N s`, in order: a phase's
+/// time runs to the next one's start, or to `end`, and a phase said again
+/// at once — git's progress through one transfer — is one phase.
+fn slow_pass_words(
+    started: std::time::Instant,
+    phases: &[(String, std::time::Instant)],
+    end: std::time::Instant,
+) -> String {
+    // Its first few words: a progress line says the phase, then how far.
+    let name = |line: &str| -> String {
+        let cut = line.find(|c: char| c.is_ascii_digit() || c == '(' || c == ':');
+        line[..cut.unwrap_or(line.len())].trim().to_string()
+    };
+    let mut merged: Vec<(String, std::time::Instant)> = Vec::new();
+    for (line, at) in phases {
+        let line = name(line);
+        if merged.last().is_none_or(|(last, _)| *last != line) {
+            merged.push((line, *at));
+        }
+    }
+    let mut words = Vec::new();
+    if let Some((_, first)) = merged.first() {
+        let before = first.duration_since(started).as_secs_f64();
+        if before >= 0.1 {
+            words.push(format!("starting {before:.1} s"));
+        }
+    }
+    for (i, (line, at)) in merged.iter().enumerate() {
+        let until = merged.get(i + 1).map_or(end, |(_, next)| *next);
+        words.push(format!(
+            "{line} {:.1} s",
+            until.duration_since(*at).as_secs_f64()
+        ));
+    }
+    words.join(", ")
+}
+
+/// Whether a change in Personal's working tree, or the folder's, is one
+/// the mirror carries (`taste_git::sync_ignored::Carried`): what decides
+/// that the sync has something to do, and that the folder is out of step
+/// until it has. Ignored paths are not, unless set to sync, so a build
+/// writing its output in the tree keeps nothing waiting. Read by the
+/// folder's rules for both sides, since the two track the same
+/// `.gitignore` files. Without a folder to read them from, a fixed list
+/// of build directories stands in, as it did for everything before.
+#[derive(Clone)]
+struct ChangeJudge(Option<Arc<Mutex<taste_git::sync_ignored::Carried>>>);
+
+impl ChangeJudge {
+    fn for_folder(folder: Option<&Path>) -> Self {
+        Self(
+            folder
+                .and_then(taste_git::sync_ignored::Carried::open)
+                .map(|carried| Arc::new(Mutex::new(carried))),
+        )
+    }
+
+    fn counts(&self, rel: &str) -> bool {
+        match &self.0 {
+            Some(carried) => carried
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .carries(Path::new(rel)),
+            None => !churn_path(rel),
+        }
+    }
+}
+
 fn churn_path(rel: &str) -> bool {
     const CHURN: [&str; 6] = ["target", "node_modules", ".cache", "dist", "build", ".venv"];
     rel.split('/').any(|part| CHURN.contains(&part))
@@ -6021,6 +6173,30 @@ fn podman_event_line(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A slow pass's log line names each phase once, with how long it
+    /// took: git's progress through one transfer is the phase it is in.
+    #[test]
+    fn a_slow_pass_says_where_its_time_went() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let phases = vec![
+            ("looking at Personal's working copy".to_string(), at(0)),
+            (
+                "fetching Personal's branches and working copy".to_string(),
+                at(2000),
+            ),
+            ("receiving objects 10% (1 of 10)".to_string(), at(2500)),
+            ("receiving objects 90% (9 of 10)".to_string(), at(9000)),
+            ("comparing the working copies".to_string(), at(12000)),
+        ];
+        assert_eq!(
+            super::slow_pass_words(start, &phases, at(18000)),
+            "looking at Personal's working copy 2.0 s, fetching Personal's branches and \
+             working copy 0.5 s, receiving objects 9.5 s, comparing the working copies 6.0 s"
+        );
+    }
+
     /// The title bar says why in a sentence, never git's output: damage it
     /// could not repair, a VM that did not answer, a disk too full.
     #[test]

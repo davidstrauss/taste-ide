@@ -225,14 +225,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let share = share_fetched.clone();
         filetree.set_peer_hooks(
             std::sync::Arc::new(move || {
-                // The snapshot first, so the ref that restores the working
-                // copy is of the copy as it stands after the commit; then
-                // the sync, unconditionally, since a commit that left the
-                // tree clean writes no snapshot and still moves the branch.
-                if let Err(e) = sync.snapshot_blocking() {
-                    tracing::warn!("snapshotting the checkout in the VM after a commit: {e:#}");
-                }
-                if let Err(e) = sync.sync_peer_blocking() {
+                // The snapshot, so the ref that restores the working copy
+                // is of the copy as it stands after the commit, and the
+                // sync, whether or not the snapshot wrote, since a commit
+                // that left the tree clean still moves the branch: one
+                // pass for both.
+                if let Err(e) = sync.snapshot_and_sync_blocking() {
                     tracing::warn!("syncing the folder with the checkout in the VM: {e:#}");
                 }
             }),
@@ -5661,9 +5659,30 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
                     lap("move");
                 }
-                // In step already — no change on either side since a
-                // snapshot and a sync that both succeeded — the close makes
-                // neither again.
+                // In step already — no change on either side since a pass
+                // that succeeded began — the close makes no pass at all. One
+                // under way is waited out first, since it may be what puts
+                // the folder in step; otherwise ONE pass, which takes
+                // Personal's snapshot as it begins, so the close never pays
+                // for a snapshot and then a pass that takes another (David,
+                // 2026-10-26: "closing the IDE should only need to stay
+                // around to close marginal gaps"). One budget for all of
+                // it, so a VM that does not answer cannot hold the window
+                // open.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                let left = move || deadline.saturating_duration_since(std::time::Instant::now());
+                if remote && !skip.get() && !supervisor.folder_in_step() {
+                    page.begin(Step::Sync, Some("Waiting for the sync under way"));
+                    let waiting = supervisor.clone();
+                    let _ = crate::runtime::runtime()
+                        .spawn(async move {
+                            let work =
+                                tokio::task::spawn_blocking(move || waiting.wait_for_folder_pass());
+                            tokio::time::timeout(left(), work).await
+                        })
+                        .await;
+                    lap("wait");
+                }
                 let in_step = remote && supervisor.folder_in_step();
                 if in_step && !skip.get() {
                     page.finish(Step::Snapshot, "Already kept");
@@ -5673,61 +5692,41 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         .push("snapshot and sync skipped, in step".into());
                 }
                 if remote && !skip.get() && !in_step {
-                    // One budget for both, so a VM that does not answer
-                    // cannot hold the window open longer than it did
-                    // before these were two steps.
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-                    let left =
-                        move || deadline.saturating_duration_since(std::time::Instant::now());
+                    let why = supervisor.folder_out_of_step();
+                    timings.borrow_mut().push(format!("out of step: {why}"));
                     page.begin(Step::Snapshot, None);
-                    let snapshotting = supervisor.clone();
-                    let snapshot = crate::runtime::runtime().spawn(async move {
-                        let work =
-                            tokio::task::spawn_blocking(move || snapshotting.snapshot_blocking());
+                    page.begin(Step::Sync, None);
+                    let sync = crate::runtime::runtime().spawn(async move {
+                        let work = tokio::task::spawn_blocking(move || {
+                            supervisor.snapshot_and_sync_blocking()
+                        });
                         tokio::time::timeout(left(), work).await
                     });
-                    let snapshot = snapshot.await;
-                    lap("snapshot");
-                    match snapshot {
-                        Ok(Ok(Ok(Ok(Some(_))))) => {
-                            page.finish(Step::Snapshot, "Kept as a snapshot of Personal")
+                    let sync = sync.await;
+                    lap("sync");
+                    match sync {
+                        Ok(Ok(Ok(Ok(())))) => {
+                            page.finish(Step::Snapshot, "Kept as a snapshot of Personal");
+                            page.finish(Step::Sync, "Your folder is up to date");
                         }
-                        Ok(Ok(Ok(Ok(None)))) => {
-                            page.finish(Step::Snapshot, "Nothing uncommitted to keep")
+                        Ok(Ok(Ok(Err(e)))) => {
+                            tracing::warn!("bringing the folder up to date on close: {e:#}");
+                            page.fail(Step::Snapshot, "Personal still has the work");
+                            page.fail(Step::Sync, &format!("{e:#}"));
                         }
-                        Ok(Ok(Ok(Err(e)))) => page.fail(Step::Snapshot, &format!("{e:#}")),
-                        _ => page.fail(
-                            Step::Snapshot,
-                            "Did not finish in time — Personal still has the work",
-                        ),
-                    }
-                    if !skip.get() {
-                        page.begin(Step::Sync, None);
-                        let sync = crate::runtime::runtime().spawn(async move {
-                            let work = tokio::task::spawn_blocking(move || {
-                                supervisor.sync_peer_blocking()
-                            });
-                            tokio::time::timeout(left(), work).await
-                        });
-                        let sync = sync.await;
-                        lap("sync");
-                        match sync {
-                            Ok(Ok(Ok(Ok(())))) => {
-                                page.finish(Step::Sync, "Your folder is up to date")
-                            }
-                            Ok(Ok(Ok(Err(e)))) => {
-                                tracing::warn!("bringing the folder up to date on close: {e:#}");
-                                page.fail(Step::Sync, &format!("{e:#}"));
-                            }
-                            _ => {
-                                tracing::warn!(
-                                    "bringing the folder up to date on close did not finish in 20s"
-                                );
-                                page.fail(
-                                    Step::Sync,
-                                    "Did not finish in time — your folder catches up next launch",
-                                );
-                            }
+                        _ => {
+                            tracing::warn!(
+                                "bringing the folder up to date on close did not finish in 20s \
+                                 ({why})"
+                            );
+                            page.fail(
+                                Step::Snapshot,
+                                "Did not finish in time — Personal still has the work",
+                            );
+                            page.fail(
+                                Step::Sync,
+                                "Did not finish in time — your folder catches up next launch",
+                            );
                         }
                     }
                 }

@@ -804,6 +804,46 @@ impl crate::GitWorkspace {
     }
 }
 
+/// Which changes in a working copy the mirror carries, for the watchers
+/// that decide whether the sync has anything to do: a path git does not
+/// ignore, or an ignored one whose `taste-sync` is set — the mirror's own
+/// rule (`GitWorkspace::ignored_unsynced`). Everything else is the
+/// decluttering `.gitignore` is for, and a build writing it is no change:
+/// php-src built in its own tree kept the folder out of step with
+/// Personal, and every pass that followed found nothing to carry
+/// (2026-10-26).
+pub struct Carried {
+    git: crate::GitWorkspace,
+    rules: Rules,
+}
+
+impl Carried {
+    /// For the working copy at `root`; `None` when it is not a repository.
+    pub fn open(root: &Path) -> Option<Self> {
+        let git = crate::GitWorkspace::discover(root)?;
+        let rules = git.sync_rules();
+        Some(Self { git, rules })
+    }
+
+    /// Whether a change at `rel`, relative to the root, is one the mirror
+    /// carries. A `.gitignore` or a `.gitattributes` always is — the rules
+    /// themselves — and a `.gitattributes` is read again here, since the
+    /// sync's lines live there; libgit2 reads a changed `.gitignore` again
+    /// itself. A path git cannot judge counts, since a pass too many costs
+    /// time and a pass too few leaves the folder behind.
+    pub fn carries(&mut self, rel: &Path) -> bool {
+        match rel.file_name().and_then(|name| name.to_str()) {
+            Some(".gitattributes") => {
+                self.rules = self.git.sync_rules();
+                return true;
+            }
+            Some(".gitignore") => return true,
+            _ => {}
+        }
+        !(self.git.repo.is_path_ignored(rel).unwrap_or(false) && !self.rules.syncs(rel))
+    }
+}
+
 /// A path as a libgit2 pathspec that matches it, and what is under it,
 /// literally.
 fn escape_pathspec(path: &Path) -> String {
@@ -820,6 +860,32 @@ fn escape_pathspec(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What git ignores is no change to carry, unless it is set to sync;
+    /// what it tracks is, wherever it is — `build/` among them.
+    #[test]
+    fn the_mirror_carries_what_is_tracked_or_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        std::fs::write(root.join(".gitignore"), "*.o\n/out/\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "/out/keep/** taste-sync\n").unwrap();
+        let mut carried = Carried::open(root).unwrap();
+        assert!(carried.carries(Path::new("main/php.c")));
+        assert!(carried.carries(Path::new("build/gen_stub.php")));
+        assert!(!carried.carries(Path::new("main/php.o")));
+        assert!(!carried.carries(Path::new("out/a.bin")));
+        assert!(carried.carries(Path::new("out/keep/a.bin")));
+        assert!(carried.carries(Path::new(".gitignore")));
+        // A sync line added later is read when its file changes.
+        std::fs::write(
+            root.join(".gitattributes"),
+            "/out/keep/** taste-sync\n*.o taste-sync\n",
+        )
+        .unwrap();
+        assert!(carried.carries(Path::new(".gitattributes")));
+        assert!(carried.carries(Path::new("main/php.o")));
+    }
 
     fn rules(files: &[(&str, &str)]) -> Rules {
         let mut rules = Rules::default();
