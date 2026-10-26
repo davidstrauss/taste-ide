@@ -487,7 +487,14 @@ to.
   documented surfaces — public CLI, documented env vars, ACP, MCP — and
   never by reverse-engineering their internals, scraping their private
   state, or depending on an undocumented file format. If a capability
-  needs one of those, it is not available yet; say so.
+  needs one of those, it is not available yet; say so. A file format
+  with a published schema is one of those surfaces — a Taskfile, a
+  `devcontainer.json` — and may be parsed directly (David, 2026-10-26:
+  "If the Taskfile is documented and published as a public schema, then
+  it's actually a defined interface, and you should be allowed to parse
+  it"). A reader of one is held to the tool's own behavior by a test
+  that runs the tool on the same fixtures and compares, never to the
+  schema's text alone.
 - **Reach for a lighter subagent.** Sonnet or the default weight for
   scoped fixes, resolvers, screenshots, and documentation; Opus only for
   design-heavy work or an unknown mechanism. A heavyweight agent on a
