@@ -386,7 +386,13 @@ fn remember_hashed(path: &std::path::Path, meta: &std::fs::Metadata, oid: Oid) {
 ///
 /// The same definition as [`GitWorkspace::snapshot_worktree`], spelled in
 /// git's own plumbing: a temporary index seeded from HEAD's tree (so the
-/// snapshot is the whole working copy and deletions land), `add -A` (which
+/// snapshot is the whole working copy and deletions land) — by
+/// `read-tree -m` over the last snapshot's index, kept for it
+/// (`taste-snapshot-cache` in the git directory), which keeps each
+/// unchanged file's stat data, so `add -A` reads only the files that
+/// changed: a plain `read-tree` keeps none, and php-src's 28,601 files were
+/// read and hashed whole on every snapshot, two seconds of every pass
+/// (2026-10-26) —, `add -A` (which
 /// honours `.gitignore` for free and is exactly what `git status` would
 /// show), `write-tree`, `commit-tree` parented on HEAD, `update-ref`. Neither HEAD nor the real index is touched; the
 /// scratch index is the script's own — named for its process, so two
@@ -445,10 +451,14 @@ trap 'rm -f "$GIT_INDEX_FILE" "$GIT_INDEX_FILE".*' EXIT
 rm -f "$GIT_INDEX_FILE"
 prev=$(git rev-parse --verify -q "$name" || true)
 head=$(git rev-parse --verify -q HEAD || true)
-if [ -n "$head" ]; then git read-tree "$head"; fi
+cache="$gitdir/taste-snapshot-cache"
+if [ -n "$head" ]; then
+  cp -p "$cache" "$GIT_INDEX_FILE" 2>/dev/null || rm -f "$GIT_INDEX_FILE"
+  git read-tree -m "$head" 2>/dev/null || {{ rm -f "$GIT_INDEX_FILE"; git read-tree "$head"; }}
+fi
 git add -A -- . 2>/dev/null || git add -A -- .
 {synced}tree=$(git write-tree) || {{ rm -f "$gitdir/taste-synced-index"; exit 1; }}
-rm -f "$GIT_INDEX_FILE"
+mv -f "$GIT_INDEX_FILE" "$cache"
 if [ -n "$head" ]; then msg="taste snapshot against $head"; else msg="taste snapshot against an unborn branch"; fi
 tries=0
 while :; do
@@ -1010,6 +1020,79 @@ mod tests {
             .filter(|name| name.starts_with("taste-snapshot-index"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// The VM's snapshot keeps its index between runs for the stat data,
+    /// and that never changes what a snapshot holds: a file changed since
+    /// is read again, and one the last snapshot's index had but HEAD no
+    /// longer tracks — dropped from the repository and ignored — is not
+    /// carried into the next.
+    #[test]
+    fn the_scripts_cached_index_changes_only_what_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "a1\n").unwrap();
+        std::fs::write(root.join("junk.o"), "junk\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        let text = script("refs/taste/snapshot/script").unwrap();
+        let run = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&text)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            parse_script_output(&String::from_utf8_lossy(&out.stdout)).unwrap()
+        };
+        let repo = git2::Repository::open(root).unwrap();
+        let read = |commit: Oid, path: &str| {
+            let tree = repo.find_commit(commit).unwrap().tree().unwrap();
+            tree.get_path(Path::new(path))
+                .ok()
+                .map(|entry| repo.find_blob(entry.id()).unwrap().content().to_vec())
+        };
+        std::fs::write(root.join("a.txt"), "a2\n").unwrap();
+        let first = run();
+        assert!(root.join(".git/taste-snapshot-cache").exists());
+        assert_eq!(read(first.commit, "a.txt").as_deref(), Some(&b"a2\n"[..]));
+        assert_eq!(
+            read(first.commit, "junk.o").as_deref(),
+            Some(&b"junk\n"[..])
+        );
+
+        // Dropped from the repository and ignored, still on disk.
+        git(&["rm", "-q", "--cached", "junk.o"]);
+        std::fs::write(root.join(".gitignore"), "*.o\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-qm", "ignore objects"]);
+        // Changed again, by a write of the same length.
+        std::fs::write(root.join("a.txt"), "a3\n").unwrap();
+        let second = run();
+        assert_eq!(read(second.commit, "a.txt").as_deref(), Some(&b"a3\n"[..]));
+        assert_eq!(read(second.commit, "junk.o"), None);
+
+        // Unchanged: nothing written, and the same tree.
+        let third = run();
+        assert!(!third.wrote);
+        assert_eq!(third.commit, second.commit);
     }
 
     #[test]
