@@ -78,6 +78,11 @@ use taste_core::files::{Entry, ExecOutput, Kind, RemoteFiles, Stat};
 /// will not come. Left paused, node found nothing else to wait on and
 /// exited — cleanly, with code 0, mid-conversation. An interval that
 /// never fires keeps the loop alive whatever else is paused.
+///
+/// And stdout's `drain` has one listener, `whenDrained`'s, which wakes
+/// everything waiting on it: each read and each command's output once
+/// added its own, one per 64 KiB that had to wait, and a stall on a busy
+/// host passed node's ten and warned of a leak (2026-10-26).
 pub const KEEPER: &str = r#"'use strict';
 const fs=require('fs'),fsp=fs.promises,path=require('path'),cp=require('child_process');
 // Every git the IDE runs here runs none of the repository's commands: its
@@ -132,7 +137,10 @@ const kindOf=(d)=>d.isFile()?'file':d.isDirectory()?'dir':d.isSymbolicLink()?'sy
 const writes=new Map(),watches=new Map(),procs=new Map();
 const stdinResume=()=>{if(process.stdin.isPaused())process.stdin.resume()};
 setInterval(()=>{},2147483647);
-const pushFrom=(id,kind,src)=>{src.on('data',d=>{for(let i=0;i<d.length;i+=CHUNK){if(!frame(id,kind,d.subarray(i,Math.min(i+CHUNK,d.length)))){src.pause();out.once('drain',()=>src.resume())}}})};
+let drained=[];
+out.on('drain',()=>{const waiting=drained;drained=[];for(const wake of waiting)wake()});
+const whenDrained=(wake)=>{drained.push(wake)};
+const pushFrom=(id,kind,src)=>{src.on('data',d=>{for(let i=0;i<d.length;i+=CHUNK){if(!frame(id,kind,d.subarray(i,Math.min(i+CHUNK,d.length)))&&!src.isPaused()){src.pause();whenDrained(()=>src.resume())}}})};
 // A tree is watched a directory at a time. node's own {recursive:true} on
 // Linux watches each FILE by its inode, so a file replaced by a rename (this
 // keeper's own writes, git's, most editors') is never heard from again; a
@@ -164,7 +172,7 @@ async function handle(id,req){
     case 'ping':return done(id,{pong:true});
     case 'stat':{const st=await fsp.lstat(req.path);return done(id,{kind:kindOf(st),size:st.size,mtime_ms:Math.floor(st.mtimeMs),mode:st.mode&0o7777})}
     case 'list':{const ents=await fsp.readdir(req.path,{withFileTypes:true});return done(id,{entries:ents.map(d=>({name:d.name,kind:kindOf(d)}))})}
-    case 'read':{const fh=await fsp.open(req.path,'r');try{const buf=Buffer.alloc(CHUNK);for(;;){const {bytesRead}=await fh.read(buf,0,CHUNK,null);if(!bytesRead)break;if(!frame(id,1,Buffer.from(buf.subarray(0,bytesRead))))await new Promise(r=>out.once('drain',r))}}finally{await fh.close()}return done(id,{})}
+    case 'read':{const fh=await fsp.open(req.path,'r');try{const buf=Buffer.alloc(CHUNK);for(;;){const {bytesRead}=await fh.read(buf,0,CHUNK,null);if(!bytesRead)break;if(!frame(id,1,Buffer.from(buf.subarray(0,bytesRead))))await new Promise(whenDrained)}}finally{await fh.close()}return done(id,{})}
     // A write over a file keeps that file's mode: a read-only archive's
     // files were written back writable by every sync that touched them
     // (2026-10-11).
