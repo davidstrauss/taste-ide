@@ -563,7 +563,9 @@ impl Worktree {
     /// them every file php-src marks `ident` read as modified, its
     /// `$Id: <blob> $` lines against the committed `$Id$` (2026-10-26).
     /// What a repository's config could run in their place, a filter
-    /// driver, is still `cat` (the keeper's `gitSafe`).
+    /// driver, is still `cat` (the keeper's `gitSafe`). A file git takes
+    /// for changed by its size alone is read before it is believed
+    /// ([`Self::stat_only`]).
     pub fn status(&self) -> Result<HashMap<PathBuf, FileState>> {
         match self {
             Worktree::Local(_) => self.local()?.status(),
@@ -582,6 +584,9 @@ impl Worktree {
                 }
                 let out = out.stdout_utf8();
                 let mut status = taste_git::status_from_porcelain(&out);
+                for same in self.stat_only(&status) {
+                    status.remove(&same);
+                }
                 // And the files inside each submodule, which the parent's
                 // status names only as the submodule, modified — so only
                 // asked when something is. One that cannot be read leaves
@@ -603,6 +608,69 @@ impl Worktree {
                 Ok(status)
             }
         }
+    }
+
+    /// The files `status` calls changed in the working tree whose contents
+    /// are what the index has, and which are then recorded again so git
+    /// stops saying so. `git status` takes a file whose size is not the
+    /// one the index recorded for changed without reading it, and a file
+    /// git wrote here with the attributes unread — `$Id$` unexpanded, by
+    /// the files service — and the folder's expanded copy then put over it
+    /// has exactly that: php-src's seven `ident` files sat in the Dirty
+    /// list with nothing to show (2026-10-26). `git diff` compares the
+    /// contents, and `git add` of a file whose contents match stores the
+    /// same blob, so the index changes in its stat data alone. Asked only
+    /// of a working tree with a few hundred changes or fewer, since each
+    /// is read.
+    fn stat_only(&self, status: &HashMap<PathBuf, FileState>) -> Vec<PathBuf> {
+        const LIMIT: usize = 500;
+        let changed: Vec<&PathBuf> = status
+            .iter()
+            .filter(|(_, state)| **state == FileState::Modified)
+            .map(|(path, _)| path)
+            .collect();
+        if changed.is_empty() || changed.len() > LIMIT {
+            return Vec::new();
+        }
+        let literal = |path: &PathBuf| format!(":(literal){}", path.display());
+        let mut args: Vec<String> = ["diff", "--name-only", "-z", "--no-renames", "--"]
+            .map(String::from)
+            .to_vec();
+        args.extend(changed.iter().map(|path| literal(path)));
+        let Ok(out) = self.run_git_reading_attributes(&args) else {
+            return Vec::new();
+        };
+        if !out.success() {
+            return Vec::new();
+        }
+        let differ: std::collections::HashSet<PathBuf> = out
+            .stdout_utf8()
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        let same: Vec<PathBuf> = changed
+            .into_iter()
+            .filter(|path| !differ.contains(*path))
+            .cloned()
+            .collect();
+        if same.is_empty() {
+            return same;
+        }
+        let mut args: Vec<String> = ["add", "--"].map(String::from).to_vec();
+        args.extend(same.iter().map(literal));
+        match self.run_git_reading_attributes(&args) {
+            Ok(out) if out.success() => tracing::info!(
+                "recorded {} file(s) again that git took for changed by their size alone",
+                same.len()
+            ),
+            Ok(out) => tracing::debug!(
+                "files changed in their stat data alone not recorded: {}",
+                out.stderr_utf8().trim()
+            ),
+            Err(e) => tracing::debug!("files changed in their stat data alone not recorded: {e:#}"),
+        }
+        same
     }
 
     /// Each submodule of this checkout, by its path, and where it is: the
@@ -1739,54 +1807,61 @@ mod tests {
     }
 
     /// A file git expands `$Id$` in on checkout (`ident`) is unchanged
-    /// while only its expansion differs, and changed once its text does.
+    /// while only its expansion differs, and changed once its text does —
+    /// even after git wrote it with the attributes unread, `$Id$` as
+    /// committed, and the folder's expanded copy went over it: the index
+    /// then holds the shorter size, which `git status` takes for a change
+    /// without reading the file. The status reads it, and records the file
+    /// again, so git's own status agrees from then on.
     #[test]
     fn an_ident_expansion_is_not_a_change() {
         if !git_present() {
             eprintln!("SKIP: no git");
             return;
         }
+        const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+        let git = |args: &[&str], blind: bool| {
+            let mut command = std::process::Command::new("git");
+            command
                 .arg("-C")
                 .arg(root)
                 .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .output()
-                .unwrap();
+                .args(args);
+            if blind {
+                command.env("GIT_ATTR_SOURCE", EMPTY_TREE);
+            }
+            let out = command.output().unwrap();
             assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap()
         };
-        git(&["init", "-q"]);
+        git(&["init", "-q"], false);
         std::fs::write(root.join(".gitattributes"), "/cdb.c ident\n").unwrap();
         std::fs::write(root.join("cdb.c"), "/* $Id$ */\n").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "init"]);
+        git(&["add", "."], false);
+        git(&["commit", "-qm", "init"], false);
         std::fs::remove_file(root.join("cdb.c")).unwrap();
-        git(&["checkout", "--", "cdb.c"]);
-        let text = std::fs::read_to_string(root.join("cdb.c")).unwrap();
-        assert!(text.starts_with("/* $Id: "), "{text}");
-        // Written again, as the mirror writes it, so git's stat cache no
-        // longer vouches for it and the contents are compared.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        std::fs::write(root.join("cdb.c"), &text).unwrap();
+        git(&["checkout", "--", "cdb.c"], false);
+        let expanded = std::fs::read_to_string(root.join("cdb.c")).unwrap();
+        assert!(expanded.starts_with("/* $Id: "), "{expanded}");
+
+        // Written by the files service's git, attributes unread: as
+        // committed, and the index records that size.
+        std::fs::remove_file(root.join("cdb.c")).unwrap();
+        git(&["checkout", "--", "cdb.c"], true);
+        assert_eq!(
+            std::fs::read_to_string(root.join("cdb.c")).unwrap(),
+            "/* $Id$ */\n"
+        );
+        // Then the folder's copy, expanded, over it.
+        std::fs::write(root.join("cdb.c"), &expanded).unwrap();
+        assert!(git(&["status", "--porcelain"], false).contains("cdb.c"));
 
         let worktree = remote_at(root);
-        // The keeper's attributes, the empty tree's: the expansion reads
-        // as an edit, which is what the Dirty list showed.
-        let blind = worktree
-            .run_git(
-                &["status", "--porcelain"],
-                &[(
-                    "GIT_ATTR_SOURCE".to_string(),
-                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string(),
-                )],
-            )
-            .unwrap();
-        assert!(blind.stdout_utf8().contains("cdb.c"), "{blind:?}");
         assert!(worktree.status().unwrap().is_empty());
-        std::fs::write(root.join("cdb.c"), format!("{text}int x;\n")).unwrap();
+        assert_eq!(git(&["status", "--porcelain"], false), "");
+        std::fs::write(root.join("cdb.c"), format!("{expanded}int x;\n")).unwrap();
         assert_eq!(
             worktree.status().unwrap().get(Path::new("cdb.c")),
             Some(&FileState::Modified)
