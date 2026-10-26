@@ -492,6 +492,11 @@ printf '%s wrote
 /// (a rebase, a merge, a cherry-pick, a revert, a bisect), nothing is
 /// removed. It touches only the checkout in the VM, never the user's
 /// folder, whose git keeps its own two weeks.
+///
+/// Its sorts spill into the git directory (`sort -T`), never `/tmp`: the
+/// files service cannot write there, and a repository the size of
+/// php-src — 1.1 million objects — is past what sort holds in memory, so
+/// every tidy of it failed and its replaced snapshots stayed (2026-10-26).
 pub const TIDY_SCRIPT: &str = r#"set -eu
 gd=$(git rev-parse --git-dir)
 for s in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG sequencer; do
@@ -501,14 +506,14 @@ before=$(du -sk "$gd/objects" | cut -f1)
 git prune --expire=30.minutes.ago
 reach="$gd/taste-reach.$$"
 trap 'rm -f "$reach"' EXIT
-git rev-list --objects --all --reflog --indexed-objects --no-object-names | LC_ALL=C sort -u > "$reach"
+git rev-list --objects --all --reflog --indexed-objects --no-object-names | LC_ALL=C sort -T "$gd" -u > "$reach"
 for idx in "$gd"/objects/pack/pack-*.idx; do
   [ -e "$idx" ] || continue
   base=${idx%.idx}
   [ -e "$base.pack" ] || continue
   [ -e "$base.keep" ] && continue
   [ -n "$(find "$base.pack" -mmin -30)" ] && continue
-  if git show-index < "$idx" | awk '{print $2}' | LC_ALL=C sort | LC_ALL=C comm -12 - "$reach" | grep -q .; then
+  if git show-index < "$idx" | awk '{print $2}' | LC_ALL=C sort -T "$gd" | LC_ALL=C comm -12 - "$reach" | grep -q .; then
     continue
   fi
   rm -f "$base.pack" "$base.idx" "$base.rev" "$base.bitmap" "$base.mtimes"
@@ -808,6 +813,21 @@ mod tests {
         // While a rebase is under way, nothing is touched.
         fs::create_dir_all(root.join(".git/rebase-merge")).unwrap();
         assert_eq!(tidy_freed(&sh(TIDY_SCRIPT)), 0);
+    }
+
+    /// Every sort the tidy runs keeps its spill in the git directory: the
+    /// files service cannot write `/tmp`, and a large repository's object
+    /// list is past what sort holds in memory.
+    #[test]
+    fn the_tidy_never_sorts_through_tmp() {
+        let sorts: Vec<&str> = TIDY_SCRIPT
+            .split('|')
+            .filter(|part| part.contains(" sort"))
+            .collect();
+        assert_eq!(sorts.len(), 2, "{sorts:?}");
+        for sort in sorts {
+            assert!(sort.contains(r#"sort -T "$gd""#), "{sort}");
+        }
     }
 
     /// A sync rule that matches nothing yet — a directory set to sync
