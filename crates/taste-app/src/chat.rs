@@ -2787,7 +2787,10 @@ impl ChatPane {
         // offered (`handle_event`). Not a fixed Allow/Deny pair: an agent
         // that offers yes, yes-and-don't-ask-again, and no had the middle
         // one dropped on the floor here, so the only answer that stops the
-        // asking was never on screen (i-0025).
+        // asking was never on screen (i-0025). A permission's answers are
+        // a column of radios and Answer now (`build_permission_answers`),
+        // which is one child here filling the line; what follows is the
+        // question card's Skip and Answer, which still sit in this box.
         //
         // A WRAP box, not a row. The pane's minimum is 320px and an
         // agent's own wording for a standing answer is a sentence
@@ -3685,10 +3688,10 @@ impl ChatPane {
             card_holds: RefCell::new(HashMap::new()),
             capture: RefCell::new(None),
             relocated: Cell::new(false),
+            refused_outside: Cell::new(false),
             hosting_refusal: RefCell::new(None),
             relocation_pending: Cell::new(false),
             refused_launch: RefCell::new(None),
-            refused_outside: Cell::new(false),
             refused_error: RefCell::new(String::new()),
             channel_retried: Cell::new(false),
             spawned_top_tier: RefCell::new(None),
@@ -9191,17 +9194,17 @@ impl ChatPane {
                 // rather than leaving the refusal as the transcript's last
                 // word under an agent that is up.
                 *self.refused_error.borrow_mut() = e.to_string();
+                self.refused_outside.set(!relocating);
                 let note = self.launch_refusal_note();
                 self.note_keyed(LAUNCH_NOTE, &note);
                 *self.refused_launch.borrow_mut() = Some(resume_for_retry);
-                self.refused_outside.set(!relocating);
                 return;
             }
         };
+        self.relocated.set(relocating);
         self.refused_launch.borrow_mut().take();
         let refusal_shown = self.keyed_notes.borrow().contains_key(LAUNCH_NOTE);
         if refusal_shown {
-        self.relocated.set(relocating);
             self.note_keyed(
                 LAUNCH_NOTE,
                 if self.relocated.get() {
@@ -14075,7 +14078,8 @@ impl ChatPane {
         self.refresh_plan_usage();
     }
 
-    /// Fill the card with one button per answer the agent offered.
+    /// Fill the card with one radio per answer the agent offered, and
+    /// Answer.
     ///
     /// Rebuilt per request rather than relabelled, because the SET of
     /// answers is the agent's to choose: two for most calls, three when it
@@ -14085,36 +14089,55 @@ impl ChatPane {
     /// "yes, and don't ask again" and "no" had the middle answer silently
     /// dropped, and nothing the user could click ever stopped the asking
     /// (i-0025).
+    ///
+    /// Radios, as the question card has its options, not a button each: a
+    /// standing answer's name is a sentence ("Yes, and don't ask again for
+    /// Update From Main commands"), and a button does not wrap, so the
+    /// card took the width it needed and pushed the whole column past the
+    /// window's edge (David, 2026-10-27: "Switch permissions to also use the
+    /// question radio format, which wraps better"). Top-down from the
+    /// one-shot yes, the likeliest, which is picked to start with, as the
+    /// suggested replies pick theirs: Answer sends the one picked.
     fn build_permission_answers(self: &Rc<Self>, request: &RequestPermissionRequest) {
         self.permission_answers.remove_all();
-        for option in card_options(&request.options) {
-            let kind = option.kind;
-            let button = gtk::Button::builder()
-                .label(&option.name)
-                .css_classes(if kind == PermissionOptionKind::AllowOnce {
-                    // The one-shot yes is the suggested action and the only
-                    // one: a standing answer is never what the eye should
-                    // land on first, however much the user wants the
-                    // asking to stop.
-                    vec!["suggested-action", "pill-action"]
-                } else {
-                    vec!["pill-action"]
-                })
-                .build();
-            // The full option name, and only that: a long one ellipsizes in
-            // a narrow pane. What a standing answer would BIND is said once,
-            // under the buttons and on screen (`permission_scope_note`) —
-            // a second copy of it in a tooltip is a second copy to keep
-            // true, and it would be read by fewer people.
-            button.set_tooltip_text(Some(&option.name));
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        column.set_hexpand(true);
+        // The radios in the detail's column, under the title, where the
+        // question card has its options.
+        let radios = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        radios.set_margin_start(PERMISSION_ICON + PERMISSION_ICON_GAP);
+        column.append(&radios);
+        let mut picks: Vec<(gtk::CheckButton, PermissionOptionKind)> = Vec::new();
+        let mut leader: Option<gtk::CheckButton> = None;
+        for option in card_options(&request.options).into_iter().rev() {
+            let button = gtk::CheckButton::new();
+            match &leader {
+                Some(leader) => button.set_group(Some(leader)),
+                None => leader = Some(button.clone()),
+            }
+            if option.kind == PermissionOptionKind::AllowOnce {
+                button.set_active(true);
+            }
+            radios.append(&question_option(&button, &option.name, None, false));
+            picks.push((button, option.kind));
+        }
+        let answer = gtk::Button::builder()
+            .label("Answer")
+            .css_classes(["suggested-action", "pill-action"])
+            .halign(gtk::Align::End)
+            .tooltip_text("Send the answer picked")
+            .build();
+        {
             let weak = Rc::downgrade(self);
-            button.connect_clicked(move |_| {
-                if let Some(pane) = weak.upgrade() {
-                    pane.answer_permission(kind);
+            answer.connect_clicked(move |_| {
+                let Some(pane) = weak.upgrade() else { return };
+                if let Some((_, kind)) = picks.iter().find(|(button, _)| button.is_active()) {
+                    pane.answer_permission(*kind);
                 }
             });
-            self.permission_answers.append(&button);
         }
+        column.append(&answer);
+        self.permission_answers.append(&column);
         let note = permission_scope_note(request, &self.agent_name(), self.environment.as_str());
         self.permission_scope.set_visible(note.is_some());
         if let Some(note) = note {
