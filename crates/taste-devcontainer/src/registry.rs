@@ -952,6 +952,26 @@ impl EnvironmentRegistry {
         crate::pool::Pool::new(&self.workspace_root).with_sink(self.vm_log_sink())
     }
 
+    /// [`Self::pool`], telling `named` the first VM other than `leaving`
+    /// it says anything of: the VM a move is making or starting, named as
+    /// soon as it is, before its boot rather than after.
+    fn pool_naming(&self, leaving: Option<String>, named: VmNamed) -> crate::pool::Pool {
+        let sink = self.vm_log_sink();
+        let told = std::sync::Mutex::new(None::<String>);
+        crate::pool::Pool::new(&self.workspace_root).with_sink(Arc::new(
+            move |domain: &str, line: String| {
+                if leaving.as_deref() != Some(domain) {
+                    let mut told = told.lock().unwrap();
+                    if told.as_deref() != Some(domain) {
+                        *told = Some(domain.to_string());
+                        named(domain);
+                    }
+                }
+                sink(domain, line);
+            },
+        ))
+    }
+
     /// Where a VM's step lines go: the ring, and the bus, as the IDE's
     /// own lines — marked, so they read apart from the guest's console.
     fn vm_log_sink(&self) -> crate::provision::StepSink {
@@ -984,6 +1004,48 @@ impl EnvironmentRegistry {
         });
     }
 
+    /// A move's next step: the environment's state, and a line in the
+    /// story of the VM it is in — or going to — so the log keeps the move
+    /// as it happened, step by step, rather than its first line alone.
+    fn move_step(&self, env: &EnvironmentId, supervisor: &Supervisor, moving: &str, step: &str) {
+        supervisor.move_step(&format!("{moving}: {step}"));
+        if let Some(domain) = self.vm_log_domain_for(env) {
+            self.note_vm(&domain, format!("{env}: {step}"));
+        }
+    }
+
+    /// How a volume being carried is going, as the active step's detail:
+    /// what has gone so far and how fast, and — carrying in, where the
+    /// size is known — how much of it, and how long is left.
+    fn carry_reporter(
+        self: &Arc<Self>,
+        env: &EnvironmentId,
+        step: String,
+        total: Option<u64>,
+    ) -> Arc<dyn Fn(u64) + Send + Sync> {
+        let (registry, env) = (self.clone(), env.clone());
+        let began = std::time::Instant::now();
+        Arc::new(move |done: u64| {
+            if let Some(domain) = registry.vm_log_domain_for(&env) {
+                registry.progress_vm(&domain, carry_words(&step, done, total, began.elapsed()));
+            }
+        })
+    }
+
+    /// A volume carried: how much, and in how long, in the story.
+    fn carried(&self, env: &EnvironmentId, what: &str, bytes: u64, began: std::time::Instant) {
+        if let Some(domain) = self.vm_log_domain_for(env) {
+            self.note_vm(
+                &domain,
+                format!(
+                    "{env}: {what}: {} in {}",
+                    size_words(bytes),
+                    duration_words(began.elapsed())
+                ),
+            );
+        }
+    }
+
     /// The last `n` lines of a VM's story.
     pub fn vm_log_tail(&self, domain: &str, n: usize) -> Vec<String> {
         let logs = self.vm_logs.lock().unwrap();
@@ -995,6 +1057,14 @@ impl EnvironmentRegistry {
     /// Which VM's story an environment's Virtual Machine log row shows,
     /// and whose progress its startup page hears ([`story_domain`]).
     pub fn vm_log_domain_for(&self, env: &EnvironmentId) -> Option<String> {
+        // A move follows the VM it is going to as soon as that VM has a
+        // name: its boot is the move's story, and the checkout names the
+        // VM being left until it is placed — a move showed one line of
+        // its own for minutes while the new VM's whole boot went to a log
+        // nothing drew (2026-10-26).
+        if let Some(target) = self.get(env).and_then(|s| s.move_target()) {
+            return Some(target);
+        }
         let placed = self
             .get(env)
             .and_then(|s| s.checkout().vm().map(str::to_string));
@@ -2352,7 +2422,7 @@ impl EnvironmentRegistry {
     /// (`Pool::place`) for `demand`, brought up and registered. Blocking,
     /// from the runtime's blocking pool — creation runs there.
     fn place_by_capacity(&self, demand: Grant, host: environment::Host) -> Result<Vm> {
-        self.place_replacing(demand, host, None)
+        self.place_replacing(demand, host, None, None)
     }
 
     /// [`Self::place_by_capacity`] for a move out of `retiring`, the VM it
@@ -2362,8 +2432,12 @@ impl EnvironmentRegistry {
         demand: Grant,
         host: environment::Host,
         retiring: Option<&str>,
+        named: Option<VmNamed>,
     ) -> Result<Vm> {
-        let pool = self.pool();
+        let pool = match named {
+            Some(named) => self.pool_naming(retiring.map(str::to_string), named),
+            None => self.pool(),
+        };
         let occupancy = self.occupancy();
         let handle = tokio::runtime::Handle::try_current()
             .context("placing an environment needs the runtime")?;
@@ -5016,6 +5090,7 @@ impl EnvironmentRegistry {
         // the startup page, and the chat all show a move under way rather
         // than an environment at rest (`Supervisor::begin_move`).
         supervisor.begin_move(&format!("{moving}: stopping its container"));
+        self.note_vm(&old_domain, format!("{env}: stopping its container"));
 
         // The container stops first, and is seen to be gone, so the
         // snapshot after it is the last word on the checkout: taken first,
@@ -5044,7 +5119,7 @@ impl EnvironmentRegistry {
 
         // Nothing moves without a fresh snapshot: it is what carries the
         // uncommitted work.
-        supervisor.move_step(&format!("{moving}: saving its uncommitted work"));
+        self.move_step(env, &supervisor, moving, "saving its uncommitted work");
         let for_snapshot = supervisor.clone();
         let snapshot =
             tokio::task::spawn_blocking(move || for_snapshot.snapshot_and_sync_blocking())
@@ -5139,7 +5214,7 @@ impl EnvironmentRegistry {
         {
             Ok(target) => {
                 if let Some(bundle) = stashes {
-                    supervisor.move_step(&format!("{moving}: putting its stashes back"));
+                    self.move_step(env, &supervisor, moving, "putting its stashes back");
                     let (files, checkout) = (supervisor.files(), supervisor.checkout());
                     let put = tokio::task::spawn_blocking(move || match checkout {
                         Checkout::Remote { path, .. } => carry_stashes_in(&files, &path, &bundle),
@@ -5157,7 +5232,7 @@ impl EnvironmentRegistry {
                         );
                     }
                 }
-                supervisor.move_step(&format!("{moving}: clearing out the old VM"));
+                self.move_step(env, &supervisor, moving, "clearing out the old VM");
                 if let Err(e) = (Placement {
                     vm: old_domain.clone(),
                     path: old_path.clone(),
@@ -5233,21 +5308,27 @@ impl EnvironmentRegistry {
         let mut tars = CarriedFiles::default();
         let mut carried: Vec<(String, PathBuf)> = Vec::new();
         for (n, volume) in supervisor.env_volumes().into_iter().enumerate() {
+            let began = std::time::Instant::now();
             let tar = self.env_dir(env).join(format!("volume-{n}.tar"));
             tars.0.push(tar.clone());
-            supervisor.move_step(&format!("{moving}: carrying {} out", what(&volume)));
+            let step = format!("carrying {} out", what(&volume));
+            self.move_step(env, supervisor, moving, &step);
             let exported = {
                 let (substrate, name, tar) = (old_substrate.clone(), volume.clone(), tar.clone());
-                tokio::task::spawn_blocking(move || export_volume(&substrate, &name, &tar))
-                    .await
-                    .with_context(|| format!("exporting volume {volume} did not finish"))??
+                let report = self.carry_reporter(env, step.clone(), None);
+                tokio::task::spawn_blocking(move || {
+                    export_volume(&substrate, &name, &tar, &*report)
+                })
+                .await
+                .with_context(|| format!("exporting volume {volume} did not finish"))??
             };
-            if exported {
+            if let Some(bytes) = exported {
+                self.carried(env, &format!("carried {} out", what(&volume)), bytes, began);
                 carried.push((volume, tar));
             }
         }
 
-        supervisor.move_step(&format!("{moving}: bringing up the VM it moves to"));
+        self.move_step(env, supervisor, moving, "bringing up the VM it moves to");
         // The old VM goes once nothing of this workspace is left in it
         // (`finish_move`), so when this environment is the last there, the
         // room its disk could still grow into is not held against the VM
@@ -5263,12 +5344,25 @@ impl EnvironmentRegistry {
             let registry = self.clone();
             let grant = supervisor.grant();
             let retiring = last_in_old.then(|| old_domain.clone());
+            // The VM it moves to is this environment's story from the
+            // moment it has a name — its boot, its console — rather than
+            // once the checkout is placed in it, minutes later.
+            let named: VmNamed = {
+                let supervisor = supervisor.clone();
+                let leaving = old_domain.clone();
+                Arc::new(move |domain: &str| {
+                    if domain != leaving {
+                        supervisor.set_move_target(domain);
+                    }
+                })
+            };
             tokio::task::spawn_blocking(move || {
-                registry.place_replacing(grant, host, retiring.as_deref())
+                registry.place_replacing(grant, host, retiring.as_deref(), Some(named))
             })
             .await
             .context("choosing a VM did not finish")??
         };
+        supervisor.set_move_target(&target.domain);
         let target_substrate = self
             .substrate_of_vm(&target.domain)
             .with_context(|| format!("VM {} is not brought up", target.domain))?;
@@ -5277,15 +5371,21 @@ impl EnvironmentRegistry {
             format!("{env}: moving in from VM {old_domain}"),
         );
         for (volume, tar) in carried {
-            supervisor.move_step(&format!("{moving}: carrying {} in", what(&volume)));
+            let began = std::time::Instant::now();
+            let step = format!("carrying {} in", what(&volume));
+            self.move_step(env, supervisor, moving, &step);
+            let size = std::fs::metadata(&tar).map(|m| m.len()).unwrap_or(0);
             let substrate = target_substrate.clone();
-            tokio::task::spawn_blocking(move || import_volume(&substrate, &volume, &tar))
+            let report = self.carry_reporter(env, step, Some(size));
+            let name = volume.clone();
+            tokio::task::spawn_blocking(move || import_volume(&substrate, &name, &tar, &*report))
                 .await
                 .context("importing a volume did not finish")??;
+            self.carried(env, &format!("carried {} in", what(&volume)), size, began);
         }
         drop(tars);
 
-        supervisor.move_step(&format!("{moving}: placing its checkout"));
+        self.move_step(env, supervisor, moving, "placing its checkout");
         if env.is_primary() {
             self.set_substrate(target_substrate.clone());
             let (registry, vm) = (self.clone(), target.clone());
@@ -5671,7 +5771,12 @@ impl Drop for CarriedFiles {
     }
 }
 
-fn export_volume(substrate: &Substrate, volume: &str, to: &Path) -> Result<bool> {
+fn export_volume(
+    substrate: &Substrate,
+    volume: &str,
+    to: &Path,
+    progress: &(dyn Fn(u64) + Send + Sync),
+) -> Result<Option<u64>> {
     // 1 is podman's "no such volume"; anything else but 0 is podman not
     // answering, which read as "nothing to carry" and the move went on
     // without the agent's conversation (2026-10-22's audit).
@@ -5683,47 +5788,153 @@ fn export_volume(substrate: &Substrate, volume: &str, to: &Path) -> Result<bool>
         .context("asking podman for the volume")?;
     match status.code() {
         Some(0) => {}
-        Some(1) => return Ok(false),
+        Some(1) => return Ok(None),
         _ => bail!("podman could not say whether volume {volume} exists ({status})"),
     }
     let file = std::fs::File::create(to).with_context(|| format!("creating {}", to.display()))?;
-    let out = substrate
+    let mut child = substrate
         .std_command(&[])
         .args(["volume", "export", volume])
         .stdin(std::process::Stdio::null())
         .stdout(file)
-        .output()
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("running podman volume export")?;
-    if !out.status.success() {
+    let stderr = drain(child.stderr.take());
+    // The tar's size as it grows is how far the export has got: podman
+    // says nothing while it writes.
+    let written = || std::fs::metadata(to).map(|m| m.len()).unwrap_or(0);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("waiting for podman volume export")?
+        {
+            break status;
+        }
+        progress(written());
+        std::thread::sleep(CARRY_TICK);
+    };
+    if !status.success() {
         bail!(
             "podman volume export {volume}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            stderr.join().unwrap_or_default().trim()
         );
     }
-    Ok(true)
+    Ok(Some(written()))
+}
+
+/// How often a volume being carried says how far it has got.
+const CARRY_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A child's stream read to its end on a thread of its own, so a child
+/// that writes more than a pipe holds is never blocked on it.
+fn drain<R: std::io::Read + Send + 'static>(stream: Option<R>) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stream) = stream {
+            let _ = stream.read_to_string(&mut text);
+        }
+        text
+    })
+}
+
+/// A carry's progress, as a step's detail: `carrying its agent's home in
+/// · 63% · 0.9 of 1.4 GiB · 85 MiB/s · 12 s left`, or, with no size to
+/// measure against, `… · 412 MiB · 85 MiB/s`.
+fn carry_words(step: &str, done: u64, total: Option<u64>, took: std::time::Duration) -> String {
+    let rate = done as f64 / took.as_secs_f64().max(0.5);
+    let per_second = format!("{}/s", size_words(rate as u64));
+    match total.filter(|total| *total > 0) {
+        Some(total) => {
+            let left = total.saturating_sub(done) as f64 / rate.max(1.0);
+            format!(
+                "{step} · {}% · {} of {} · {per_second} · {} left",
+                (done * 100 / total).min(100),
+                size_words(done),
+                size_words(total),
+                duration_words(std::time::Duration::from_secs_f64(left))
+            )
+        }
+        None => format!("{step} · {} · {per_second}", size_words(done)),
+    }
+}
+
+/// A size as a person reads it: `412 MiB`, `1.4 GiB`.
+fn size_words(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let mib = bytes as f64 / MIB;
+    if mib < 1024.0 {
+        format!("{} MiB", mib.round() as u64)
+    } else {
+        format!("{:.1} GiB", mib / 1024.0)
+    }
 }
 
 /// A tar file on this host into a podman volume of `substrate`, made for it.
-fn import_volume(substrate: &Substrate, volume: &str, from: &Path) -> Result<()> {
+fn import_volume(
+    substrate: &Substrate,
+    volume: &str,
+    from: &Path,
+    progress: &(dyn Fn(u64) + Send + Sync),
+) -> Result<()> {
+    use std::io::{Read, Write};
     let _ = substrate
         .std_command(&[])
         .args(["volume", "create", "--ignore", volume])
         .stdin(std::process::Stdio::null())
         .output();
-    let file = std::fs::File::open(from).with_context(|| format!("opening {}", from.display()))?;
-    let out = substrate
+    let mut file =
+        std::fs::File::open(from).with_context(|| format!("opening {}", from.display()))?;
+    let mut child = substrate
         .std_command(&[])
         .args(["volume", "import", volume, "-"])
-        .stdin(file)
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("running podman volume import")?;
-    if !out.status.success() {
+    let stderr = drain(child.stderr.take());
+    // Fed here a megabyte at a time, so what has gone in is counted.
+    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let feeder = {
+        let (sent, stdin) = (sent.clone(), child.stdin.take());
+        std::thread::spawn(move || -> std::io::Result<()> {
+            let Some(mut stdin) = stdin else {
+                return Ok(());
+            };
+            let mut buffer = vec![0u8; 1 << 20];
+            loop {
+                let n = file.read(&mut buffer)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                stdin.write_all(&buffer[..n])?;
+                sent.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+    };
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("waiting for podman volume import")?
+        {
+            break status;
+        }
+        progress(sent.load(std::sync::atomic::Ordering::Relaxed));
+        std::thread::sleep(CARRY_TICK);
+    };
+    let fed = feeder.join();
+    if !status.success() {
         bail!(
             "podman volume import {volume}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            stderr.join().unwrap_or_default().trim()
         );
     }
-    Ok(())
+    match fed {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e).context("feeding podman volume import"),
+        Err(_) => bail!("feeding podman volume import stopped"),
+    }
 }
 
 /// The memory the room check sees, as the sweep's conclusion says it.
@@ -5745,6 +5956,10 @@ pub(crate) fn duration_words(took: std::time::Duration) -> String {
         (m, s) => format!("{m} min {s} s"),
     }
 }
+
+/// Told the name of the VM a move is going to, as soon as the pool says
+/// anything of it ([`EnvironmentRegistry::pool_naming`]).
+type VmNamed = Arc<dyn Fn(&str) + Send + Sync>;
 
 fn push_vm_log(
     logs: &Mutex<BTreeMap<String, VecDeque<String>>>,

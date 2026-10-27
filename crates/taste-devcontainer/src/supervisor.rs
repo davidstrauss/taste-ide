@@ -655,6 +655,11 @@ pub struct Supervisor {
     /// under way, in the row's words, and the state it was in before.
     /// See [`Supervisor::begin_move`].
     moving: Mutex<Option<(String, SupervisorState)>>,
+    /// The VM a move is taking this environment to, once it has a name:
+    /// whose story the startup page and the Logs follow from then on
+    /// (`EnvironmentRegistry::vm_log_domain_for`), since the checkout
+    /// still names the VM it is leaving until it is placed.
+    move_target: Mutex<Option<String>>,
     /// What gives the other environments Personal's branches
     /// (`EnvironmentRegistry::share_personal`): run by the primary after
     /// each sync with the folder, and by any other environment after it
@@ -981,6 +986,7 @@ impl Supervisor {
             placer: Mutex::new(None),
             waker: Mutex::new(None),
             moving: Mutex::new(None),
+            move_target: Mutex::new(None),
             sharer: Mutex::new(None),
             applied_grant: Mutex::new(None),
             substrate: Mutex::new(substrate),
@@ -1075,10 +1081,24 @@ impl Supervisor {
     /// does — set back to stopped first, it read as at rest for a moment
     /// again. Without one, the state it was in before.
     pub fn end_move(&self, restarting: bool) {
+        self.move_target.lock().unwrap().take();
         let before = self.moving.lock().unwrap().take().map(|(_, before)| before);
         if let Some(before) = before.filter(|_| !restarting) {
             self.set_state(before);
         }
+    }
+
+    /// The VM the move is taking this environment to has a name: its
+    /// story is this environment's from now on.
+    pub fn set_move_target(&self, domain: &str) {
+        if self.is_moving() {
+            *self.move_target.lock().unwrap() = Some(domain.to_string());
+        }
+    }
+
+    /// The VM a move under way is taking this environment to, once named.
+    pub fn move_target(&self) -> Option<String> {
+        self.move_target.lock().unwrap().clone()
     }
 
     /// Whether the registry is moving this environment.

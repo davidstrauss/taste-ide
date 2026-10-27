@@ -312,6 +312,9 @@ pub struct LogPage {
     /// Set by our own scroll-to-end so the value-changed handler does not
     /// read it as the user scrolling.
     scrolling: Rc<Cell<bool>>,
+    /// The fewest lines of text the view is ever shorter than
+    /// ([`Self::set_min_lines`]), and whether its realize is watched for it.
+    min_lines: Rc<Cell<Option<u32>>>,
     state: gtk::Label,
     /// The bar, for an action a page of one kind offers (`add_action`).
     bar: gtk::Box,
@@ -409,6 +412,7 @@ impl LogPage {
             follow: Rc::new(Cell::new(true)),
             jump,
             scrolling: Rc::new(Cell::new(false)),
+            min_lines: Rc::new(Cell::new(None)),
             state,
             bar,
             on_follow_changed: RefCell::new(None),
@@ -555,17 +559,25 @@ impl LogPage {
     /// Never shorter than `lines` of text, measured in the view's own
     /// font once it has one — the floor a page that holds this log beside
     /// other things shrinks it to before it scrolls itself instead.
+    ///
+    /// Said again as often as a page needs — the startup page moves it with
+    /// its own height — and measured again at realize, once a font is in
+    /// force, from one handler however often it is said.
     pub fn set_min_lines(&self, lines: u32) {
+        let first = self.min_lines.replace(Some(lines)).is_none();
         let apply = {
-            let scroller = self.scroller.clone();
+            let (scroller, wanted) = (self.scroller.clone(), self.min_lines.clone());
             move |view: &gtk::TextView| {
-                let text = vec!["X"; lines.max(1) as usize].join("\n");
+                let lines = wanted.get().unwrap_or(1).max(1) as usize;
+                let text = vec!["X"; lines].join("\n");
                 let (_, height) = view.create_pango_layout(Some(&text)).pixel_size();
                 scroller.set_min_content_height(height + view.top_margin() + view.bottom_margin());
             }
         };
         apply(&self.view);
-        self.view.connect_realize(move |view| apply(view));
+        if first {
+            self.view.connect_realize(move |view| apply(view));
+        }
     }
 
     pub fn is_following(&self) -> bool {

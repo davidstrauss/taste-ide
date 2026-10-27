@@ -4275,6 +4275,35 @@ the chat, whose agent stops with the container, waits for the move to end
 rather than trying to start its agent anywhere else, and says what it is
 waiting for.
 
+**And said in detail** (David, 2026-10-26: "Could I get a lot more
+progress feedback on these moves?"). A move has rows of its own — stop
+and save, copy volumes out of the old VM, copy them into the new one,
+clear out the old VM — between the start's, rather than its steps sorted
+onto the start's rows by their words. A volume being copied says how far
+it has got, as the bytes go: out, what has gone and how fast (podman
+says nothing while it writes, so the tar's size is read as it grows); in,
+the share of it, how fast, and how long is left, counted as it is fed to
+`podman volume import`. Every step is a line in the VM's story as well as
+the row's words, so the log keeps the move as it happened, and each
+copy's conclusion says how much and in how long. The page and the Logs
+follow the VM the move is going to from the moment the pool names it
+(`Supervisor::set_move_target`): the checkout names the VM it is leaving
+until it is placed, minutes later, and the new VM's whole boot once went
+to a log nothing drew, the page showing one line of its own throughout.
+The step under way says how long it has been at it, past five seconds.
+And the page fits the strip it is in, never the strip it: the log's tail
+gives way first, down to two lines; then the checked steps lose their
+conclusions, fold into one line, and the steps after the next two into
+another, then all of them; then the log goes to one line, and to none —
+the active step's own line is the latest news — so the user's editor and
+console keep the layout they were given (David: "abbreviate the startup
+logs currently being tailed rather than disrupting the user's
+editor/console layout"). Meanwhile the file tree says the checkout is
+away because the environment is moving or starting, rather than that its
+VM is not answering, which read as a fault (David: "This shouldn't be
+presented like a malfunction when the VM/container are getting
+rebuilt").
+
 **Packages age too, and are refreshed the same way** (David, 2026-09-22:
 "that too — and with the same notifications and constraints"), with as
 little rebuilding as starting fresh allows ("minimize the work while

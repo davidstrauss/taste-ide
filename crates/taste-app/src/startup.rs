@@ -49,21 +49,29 @@ pub const READY_LINGER: std::time::Duration = std::time::Duration::from_millis(2
 /// conclusion is what says whether the act was needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
-    /// A move's start: the work in progress saved, the container stopped,
-    /// and the agent's home carried out. Shown only for a move.
+    /// A move's start: the container stopped and the work in progress
+    /// saved. Shown only for a move, as are the other move rows.
     Leave,
+    /// A move's volumes — the agent's home, the config's — copied out of
+    /// the VM it leaves, onto this machine.
+    CarryOut,
     /// Other projects' VMs that no window owns, stopped for the room.
     Sweep,
     /// The guest image fetched, unpacked, and verified — once per machine.
     GuestImage,
     /// The workspace's VM booted and answering.
     Vm,
+    /// A move's volumes copied into the VM it moves to.
+    CarryIn,
     /// The files service's image built in the VM — once per VM.
     ServiceImage,
     /// The files service connected.
     Files,
     /// The checkout placed in the VM and synced with the folder.
     Place,
+    /// A move's old checkout, and the old VM once nothing is left in it,
+    /// removed.
+    Retire,
     /// The environment's image built.
     Build,
     /// The container started and its setup commands run.
@@ -73,14 +81,17 @@ pub enum Step {
 }
 
 impl Step {
-    pub const ALL: [Step; 10] = [
+    pub const ALL: [Step; 13] = [
         Step::Leave,
+        Step::CarryOut,
         Step::Sweep,
         Step::GuestImage,
         Step::Vm,
+        Step::CarryIn,
         Step::ServiceImage,
         Step::Files,
         Step::Place,
+        Step::Retire,
         Step::Build,
         Step::Start,
         Step::Ready,
@@ -88,7 +99,10 @@ impl Step {
 
     fn title(self) -> &'static str {
         match self {
-            Step::Leave => "Save work and stop container",
+            Step::Leave => "Stop container and save work",
+            Step::CarryOut => "Copy volumes out of the old VM",
+            Step::CarryIn => "Copy volumes into the new VM",
+            Step::Retire => "Clear out the old VM",
             Step::Sweep => "Stop unused VMs and verify capacity",
             Step::GuestImage => "Download guest image",
             Step::Vm => "Start workspace VM",
@@ -101,11 +115,32 @@ impl Step {
         }
     }
 
+    /// The steps only a move has, hidden for a start.
+    const MOVE_ONLY: [Step; 4] = [Step::Leave, Step::CarryOut, Step::CarryIn, Step::Retire];
+
     /// Which log tells this step's story.
     fn log(self) -> LogKind {
         match self {
             Step::Build | Step::Start | Step::Ready => LogKind::Environment,
             _ => LogKind::Vm,
+        }
+    }
+
+    /// The row a move's step belongs on (`EnvironmentRegistry::
+    /// relocate_inner`'s words).
+    fn of_move(step: &str) -> Step {
+        if step.starts_with("stopping") || step.starts_with("saving") {
+            Step::Leave
+        } else if step.starts_with("carrying") && step.ends_with(" out") {
+            Step::CarryOut
+        } else if step.starts_with("carrying") && step.ends_with(" in") {
+            Step::CarryIn
+        } else if step.contains("checkout") || step.contains("stashes back") {
+            Step::Place
+        } else if step.contains("old VM") {
+            Step::Retire
+        } else {
+            Step::Vm
         }
     }
 
@@ -146,6 +181,11 @@ pub(crate) struct StepRow {
     spinner: gtk::Spinner,
     title: gtk::Label,
     detail: gtk::Label,
+    /// How long the active step has been at it, at the row's end.
+    elapsed: gtk::Label,
+    /// A checked step shows its title alone, its conclusion left out, on a
+    /// page short of room ([`StartupPage::fit`]).
+    terse: Cell<bool>,
     status: Cell<Status>,
     /// What the step came to, once it is done — shown under its check.
     conclusion: RefCell<Option<String>>,
@@ -189,19 +229,50 @@ impl StepRow {
             .build();
         words.append(&title);
         words.append(&detail);
+        let elapsed = gtk::Label::builder()
+            .valign(gtk::Align::Start)
+            .css_classes(["caption", "dim-label", "numeric"])
+            .visible(false)
+            .build();
         row.append(&mark);
         row.append(&words);
+        row.append(&elapsed);
         let this = Self {
             row,
             icon,
             spinner,
             title,
             detail,
+            elapsed,
+            terse: Cell::new(false),
             status: Cell::new(Status::Pending),
             conclusion: RefCell::new(None),
         };
         this.set(Status::Pending, None);
         this
+    }
+
+    /// Whether a checked step leaves its conclusion out.
+    fn set_terse(&self, terse: bool) {
+        if self.terse.replace(terse) != terse && self.status.get() == Status::Done {
+            self.set(Status::Done, None);
+        }
+    }
+
+    /// How long the active step has been at it, shown from five seconds
+    /// on as minutes and seconds: a step that is slow says it is still
+    /// going, rather than looking stuck.
+    pub(crate) fn show_elapsed(&self, took: std::time::Duration) {
+        let secs = took.as_secs();
+        if self.status.get() != Status::Active || secs < 5 {
+            self.elapsed.set_visible(false);
+            return;
+        }
+        let words = format!("{}:{:02}", secs / 60, secs % 60);
+        if self.elapsed.label() != words {
+            self.elapsed.set_label(&words);
+        }
+        self.elapsed.set_visible(true);
     }
 
     /// What a checked step came to, shown under its check.
@@ -254,6 +325,7 @@ impl StepRow {
             (Status::Active, None) => {
                 // Keep the last substep until the next one arrives.
             }
+            (Status::Done, _) if self.terse.get() => self.detail.set_visible(false),
             (Status::Done, _) => match self.conclusion.borrow().as_deref() {
                 Some(text) => show(text),
                 None => self.detail.set_visible(false),
@@ -264,6 +336,7 @@ impl StepRow {
             self.title.add_css_class("heading");
         } else {
             self.title.remove_css_class("heading");
+            self.elapsed.set_visible(false);
         }
     }
 }
@@ -276,6 +349,11 @@ pub struct StartupPage {
     subject: RefCell<String>,
     note: gtk::Label,
     rows: Vec<StepRow>,
+    /// The checked steps folded into one line, and the later ones into
+    /// another, on a page too short for every row ([`Self::fit`]).
+    folded_done: StepRow,
+    folded_later: StepRow,
+    card: gtk::Box,
     logs: gtk::Stack,
     vm_log: Rc<LogPage>,
     build_log: Rc<LogPage>,
@@ -319,6 +397,10 @@ impl StartupPage {
             .visible(false)
             .build();
         let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let folded_done = StepRow::titled("");
+        folded_done.set(Status::Done, None);
+        folded_done.row.set_visible(false);
+        list.append(&folded_done.row);
         let rows: Vec<StepRow> = Step::ALL
             .iter()
             .map(|step| {
@@ -327,6 +409,9 @@ impl StartupPage {
                 row
             })
             .collect();
+        let folded_later = StepRow::titled("");
+        folded_later.row.set_visible(false);
+        list.append(&folded_later.row);
         let card = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(14)
@@ -365,13 +450,16 @@ impl StartupPage {
         logs.set_visible_child_name("vm");
 
         // The log gives way first: it fills whatever the checklist leaves
-        // and shrinks with the pane down to five lines, and below that the
-        // page scrolls as one — checklist, note, and log — rather than
-        // running off the bottom of the pane, clipped (David, 2026-09-22:
-        // "If you can't even show 5 lines, then the env rebuild panel
-        // should be scrollable").
-        vm_log.set_min_lines(5);
-        build_log.set_min_lines(5);
+        // and shrinks with the pane down to its last two lines; then the
+        // checklist folds what is behind and well ahead of it
+        // ([`Self::fit`]); and only below that does the page scroll as one
+        // rather than run off the bottom of the pane, clipped (David,
+        // 2026-09-22: "If you can't even show 5 lines, then the env rebuild
+        // panel should be scrollable"; 2026-10-26: "abbreviate the startup
+        // logs currently being tailed rather than disrupting the user's
+        // editor/console layout").
+        vm_log.set_min_lines(2);
+        build_log.set_min_lines(2);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&card);
         content.append(&logs);
@@ -393,6 +481,9 @@ impl StartupPage {
             subject: RefCell::new("Environment".to_string()),
             note,
             rows,
+            folded_done,
+            folded_later,
+            card: card.clone(),
             logs,
             vm_log,
             build_log,
@@ -418,6 +509,15 @@ impl StartupPage {
                     this.offset.get(),
                     adw::StyleManager::default().is_dark(),
                 );
+            });
+        }
+        {
+            // The page fits the strip it is given, as that strip is resized.
+            let weak = Rc::downgrade(&this);
+            this.area.connect_resize(move |_, _, _| {
+                if let Some(this) = weak.upgrade() {
+                    this.fit();
+                }
             });
         }
         this
@@ -460,7 +560,9 @@ impl StartupPage {
             .set_label(&format!("{} starting", self.subject.borrow()));
         // A start has nothing to leave; a move shows the step (`on_move`).
         self.moving.set(false);
-        self.row(Step::Leave).row.set_visible(false);
+        for step in Step::MOVE_ONLY {
+            self.row(step).row.set_visible(false);
+        }
         self.note.set_visible(false);
         self.since.set(None);
         self.build_steps.set((0, 0));
@@ -509,9 +611,91 @@ impl StartupPage {
             }
             last.set(Some(now));
             area.queue_draw();
+            if let (Some(step), Some(since)) = (this.current.get(), this.since.get()) {
+                this.row(step).show_elapsed(since.elapsed());
+            }
             glib::ControlFlow::Continue
         });
         *self.tick.borrow_mut() = Some(id);
+    }
+
+    /// Fold the checklist until it and two lines of the log fit the page's
+    /// height: first every checked step without its conclusion, then the
+    /// checked steps folded into one line and those after the next two
+    /// into another, and last every step still to come into that one. The
+    /// step under way is always shown whole. What still does not fit
+    /// scrolls.
+    fn fit(&self) {
+        let (width, height) = (self.area.width(), self.area.height());
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        // The log at its last two lines while there is room for them; the
+        // checklist folds before the log goes below that.
+        self.logs.set_visible(true);
+        self.log_lines(2);
+        let fits = |this: &Self| {
+            let card = this.card.measure(gtk::Orientation::Vertical, width).1;
+            let log = this.logs.measure(gtk::Orientation::Vertical, width).0;
+            card + log <= height
+        };
+        for level in 0..=3 {
+            self.fold(level);
+            if fits(self) {
+                return;
+            }
+        }
+        // Then the last line, and then none: the active step's own line is
+        // the latest news, and a log the page has to scroll shows its top,
+        // which is its oldest.
+        self.log_lines(1);
+        if !fits(self) {
+            self.logs.set_visible(false);
+        }
+    }
+
+    /// The fewest lines either log is shown at.
+    fn log_lines(&self, lines: u32) {
+        self.vm_log.set_min_lines(lines);
+        self.build_log.set_min_lines(lines);
+    }
+
+    /// The checklist at a level of folding ([`Self::fit`]).
+    fn fold(&self, level: u8) {
+        let shown: Vec<(Step, &StepRow)> = Step::ALL
+            .iter()
+            .map(|step| (*step, self.row(*step)))
+            .filter(|(step, _)| self.moving.get() || !Step::MOVE_ONLY.contains(step))
+            .collect();
+        let (mut done, mut later, mut pending_shown) = (0, 0, 0);
+        for (_, row) in &shown {
+            row.set_terse(level >= 1);
+            let visible = match row.status.get() {
+                Status::Done if level >= 2 => {
+                    done += 1;
+                    false
+                }
+                Status::Pending if level >= 2 => {
+                    pending_shown += 1;
+                    let ahead = if level >= 3 { 0 } else { 2 };
+                    if pending_shown > ahead {
+                        later += 1;
+                    }
+                    pending_shown <= ahead
+                }
+                _ => true,
+            };
+            row.row.set_visible(visible);
+        }
+        let say = |row: &StepRow, n: usize, what: &str| {
+            row.row.set_visible(n > 0);
+            row.title.set_label(&format!(
+                "{n} {}{what}",
+                if n == 1 { "step" } else { "steps" }
+            ));
+        };
+        say(&self.folded_done, done, " done");
+        say(&self.folded_later, later, " more");
     }
 
     fn row(&self, step: Step) -> &StepRow {
@@ -559,6 +743,7 @@ impl StartupPage {
             LogKind::Environment => "build",
             _ => "vm",
         });
+        self.fit();
     }
 
     /// The conclusions the page works out from what it watched, for the
@@ -585,6 +770,17 @@ impl StartupPage {
                 (of, cached) => format!("Built in {took}: {of} steps, {cached} from the cache."),
             },
             Step::Start => format!("Container up in {took}."),
+            // A copy ends on what its last line said — "Carried its agent's
+            // home out: 1.4 GiB in 21 s" — and the move's other rows on how
+            // long they took.
+            Step::CarryOut | Step::CarryIn
+                if row.detail.is_visible() && row.detail.label().starts_with("Carried") =>
+            {
+                format!("{}.", row.detail.label())
+            }
+            Step::Leave | Step::CarryOut | Step::CarryIn | Step::Retire => {
+                format!("Done in {took}.")
+            }
             _ => return,
         };
         row.conclusion.replace(Some(words));
@@ -612,6 +808,7 @@ impl StartupPage {
         if row.status.get() == Status::Done {
             row.set(Status::Done, None);
         }
+        self.fit();
     }
 
     /// Every step done; the heading says so.
@@ -629,6 +826,7 @@ impl StartupPage {
         }
         self.row(Step::Ready).set(Status::Done, None);
         self.current.set(Some(Step::Ready));
+        self.fit();
         self.heading
             .set_label(&format!("{} ready", self.subject.borrow()));
     }
@@ -718,21 +916,13 @@ impl StartupPage {
         if !self.underway.get() || self.settled.get() || !self.moving.get() {
             self.begin();
             self.moving.set(true);
-            self.row(Step::Leave).row.set_visible(true);
+            for step in Step::MOVE_ONLY {
+                self.row(step).row.set_visible(true);
+            }
         }
         self.heading
             .set_label(&format!("{} {head}", self.subject.borrow()));
-        let at = if step.starts_with("saving")
-            || step.starts_with("stopping")
-            || step.ends_with("home out")
-        {
-            Step::Leave
-        } else if step.contains("checkout") || step.contains("old VM") {
-            Step::Place
-        } else {
-            Step::Vm
-        };
-        self.activate(at, Some(step));
+        self.activate(Step::of_move(step), Some(step));
     }
 
     fn set_note(&self, text: &str) {
@@ -831,6 +1021,13 @@ impl StartupPage {
             .strip_prefix("[taste-ide] ")
             .filter(|said| !said.starts_with('—'))
         {
+            // A line about one environment in a VM several share leads with
+            // its name (`i-0042: carrying its agent's home in`); under that
+            // environment's own step the name is already the heading's.
+            let said = said
+                .split_once(": ")
+                .filter(|(who, _)| !who.contains(' '))
+                .map_or(said, |(_, rest)| rest);
             let row = self.row(step);
             if row.status.get() == Status::Active {
                 row.set(Status::Active, Some(&substep_words(said)));
@@ -861,17 +1058,30 @@ impl StartupPage {
         // its work saved and its container stopped, the new VM booting.
         if kind == "move" {
             let head = "moving to a VM on the current release";
-            for step in ["saving its uncommitted work", "stopping its container"] {
+            for step in [
+                "stopping its container",
+                "saving its uncommitted work",
+                "carrying its agent's home out",
+            ] {
                 self.on_move(head, step);
             }
+            self.on_vm_line("[taste-ide] i-b72113: carried its agent's home out: 1.4 GiB in 21 s");
             self.on_move(head, "bringing up the VM it moves to");
             for line in [
-                "[taste-ide] taste-ed69211e7a0eb5f1-niw7xn: primary: moving in from VM taste-ed69211e7a0eb5f1-77rb1w",
+                "[taste-ide] i-b72113: moving in from VM taste-ed69211e7a0eb5f1-77rb1w",
                 "[taste-ide] starting the domain",
-                "[taste-ide] waiting for the guest's sshd on 127.0.0.1:32833 (up to 240s)",
+                "[  OK  ] Started sshd.service - OpenSSH server daemon.",
+                "[taste-ide] podman in the guest answers; the VM is ready",
             ] {
                 self.on_vm_line(line);
             }
+            self.on_move(head, "carrying its agent's home in");
+            self.on_vm_progress(
+                "carrying its agent's home in · 63% · 0.9 of 1.4 GiB · 84 MiB/s · 7 s left",
+            );
+            // A minute and a bit into the copy, so the shot shows the clock.
+            self.since
+                .set(std::time::Instant::now().checked_sub(std::time::Duration::from_secs(72)));
             return;
         }
         self.begin();
