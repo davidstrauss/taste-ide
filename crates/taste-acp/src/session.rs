@@ -1029,7 +1029,38 @@ fn describe_close_error(raw: &str) -> String {
             );
         }
     }
+    // The exit, then the dead process's stderr: the adapter's own log
+    // lines (`[session/models] sessionId=… phase=…`) ride in it beside
+    // the line that says what happened, which is podman's or the
+    // runtime's `Error: …`. A notification shows one line, and it once
+    // showed the adapter's timing log for a container that was gone.
+    if let Some((exit, stderr)) = exit_and_stderr(text) {
+        let said = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .rfind(|line| line.starts_with("Error") || line.starts_with("error"))
+            .or_else(|| {
+                stderr
+                    .lines()
+                    .map(str::trim)
+                    .rfind(|line| !line.is_empty() && !line.starts_with('['))
+            });
+        return match said {
+            Some(said) => format!("{exit}: {said}"),
+            None => exit.to_string(),
+        };
+    }
     text.trim_end().to_string()
+}
+
+/// `Process exited with exit status: N: <stderr>` split at the stderr.
+fn exit_and_stderr(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("Process exited with exit status: ")?;
+    let code_end = rest.find(|c: char| !c.is_ascii_digit() && c != '-')?;
+    let stderr = rest[code_end..].strip_prefix(": ")?;
+    let exit = &text[..text.len() - rest.len() + code_end];
+    Some((exit, stderr))
 }
 
 /// The `data` of the ACP crate's dead-process error, unescaped: the spawn
@@ -2147,8 +2178,23 @@ mod tests {
         let raw = "Internal error: {\n  \"spawned_at\": \"/x/rpc.rs:100\",\n  \"data\": \"Process exited with exit status: 125: [session/create] phase=\\\"register\\\"\\nError: no such container\\n\"\n}";
         assert_eq!(
             describe_close_error(raw),
-            "Process exited with exit status: 125: [session/create] phase=\"register\"\n\
-             Error: no such container"
+            "Process exited with exit status: 125: Error: no such container"
+        );
+    }
+
+    /// The adapter's log lines are not the reason: podman's error is, and
+    /// without one, the last line that is not a log line.
+    #[test]
+    fn the_reason_is_the_error_line_not_the_adapters_log() {
+        let raw = "Internal error: {\n  \"spawned_at\": \"/x/rpc.rs:100\",\n  \"data\": \"Process exited with exit status: 125: [session/models] sessionId=c1 phase=read-transcript durationMs=75\"\n}";
+        assert_eq!(
+            describe_close_error(raw),
+            "Process exited with exit status: 125"
+        );
+        let raw = "Process exited with exit status: 1: [session/new] phase=x\nTypeError: boom\n";
+        assert_eq!(
+            describe_close_error(raw),
+            "Process exited with exit status: 1: TypeError: boom"
         );
     }
 

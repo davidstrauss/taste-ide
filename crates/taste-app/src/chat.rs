@@ -1161,6 +1161,10 @@ pub struct ChatPane {
     /// process was spawned in, so a transition is detected by comparing it
     /// with what the environment now allows rather than by counting events.
     relocated: Cell<bool>,
+    /// Whether the last refused launch was one outside a container — what
+    /// its note says the container's standing for. Apart from
+    /// `relocated`, which stays the running agent's until another starts.
+    refused_outside: Cell<bool>,
     /// The last reason relocation was declined, so it is said once rather
     /// than on every reconnect.
     hosting_refusal: RefCell<Option<String>>,
@@ -3684,6 +3688,7 @@ impl ChatPane {
             hosting_refusal: RefCell::new(None),
             relocation_pending: Cell::new(false),
             refused_launch: RefCell::new(None),
+            refused_outside: Cell::new(false),
             refused_error: RefCell::new(String::new()),
             channel_retried: Cell::new(false),
             spawned_top_tier: RefCell::new(None),
@@ -5869,7 +5874,7 @@ impl ChatPane {
     fn launch_refusal_note(&self) -> String {
         let error = self.refused_error.borrow().clone();
         match self.container_standing() {
-            Some(standing) if !self.relocated.get() => {
+            Some(standing) if self.refused_outside.get() => {
                 format!("agent launch refused: {error}; {standing}")
             }
             _ => format!("agent launch refused: {error}"),
@@ -9135,7 +9140,12 @@ impl ChatPane {
         // not decide. Read fresh, every spawn: a container coming up is the
         // ordinary way a chat's agent moves in beside its files.
         let relocation = self.relocation(&spec);
-        self.relocated.set(relocation.is_some());
+        // Recorded once the agent starts, not before: a spawn refused for
+        // want of an exec target — the stop that took the target away
+        // prompts one — must not relabel the agent still dying with its
+        // container, whose close arrives after it and reads this to know
+        // it was the environment's doing (`closed_by_environment`).
+        let relocating = relocation.is_some();
         // ...and whether this session serves terminals, which follows the
         // topology rather than being decided a second time. A respawn is
         // how the advertisement changes: ACP v1 sends capabilities once, at
@@ -9184,12 +9194,14 @@ impl ChatPane {
                 let note = self.launch_refusal_note();
                 self.note_keyed(LAUNCH_NOTE, &note);
                 *self.refused_launch.borrow_mut() = Some(resume_for_retry);
+                self.refused_outside.set(!relocating);
                 return;
             }
         };
         self.refused_launch.borrow_mut().take();
         let refusal_shown = self.keyed_notes.borrow().contains_key(LAUNCH_NOTE);
         if refusal_shown {
+        self.relocated.set(relocating);
             self.note_keyed(
                 LAUNCH_NOTE,
                 if self.relocated.get() {
