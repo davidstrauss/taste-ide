@@ -604,10 +604,56 @@ impl GitWorkspace {
         let mut map = HashMap::new();
         for entry in statuses.iter() {
             if let Some(path) = entry.path() {
+                if entry.status() == git2::Status::WT_MODIFIED && self.ident_unchanged(path) {
+                    continue;
+                }
                 map.insert(PathBuf::from(path), FileState::from_status(entry.status()));
             }
         }
         Ok(map)
+    }
+
+    /// Whether `path`, which libgit2 calls changed in the working tree, is
+    /// an `ident` file whose contents are what the index has once every
+    /// `$Id: … $` in it is collapsed to `$Id$`, as git collapses them.
+    ///
+    /// libgit2, like git, takes a file whose size is not the one the index
+    /// recorded for changed without reading it, and an `ident` file's size
+    /// moves with its expansion: `$Id$` written by one hand and `$Id: <40
+    /// hex> $` by another are the same file to git. After a move restored
+    /// Personal's work, php-src's seven `ident` files sat in the folder at
+    /// the other length, and a review's fast-forward refused the folder as
+    /// holding "uncommitted work" that `git diff` could not show
+    /// (2026-10-26) — the folder's side of what `Worktree::stat_only` does
+    /// in a VM, read here rather than recorded, since the folder's index is
+    /// the user's. Only an exact match with the index's blob is believed,
+    /// so a file that differs in anything else stays changed.
+    fn ident_unchanged(&self, path: &str) -> bool {
+        let ident = self
+            .repo
+            .get_attr(
+                Path::new(path),
+                "ident",
+                git2::AttrCheckFlags::FILE_THEN_INDEX,
+            )
+            .ok()
+            .flatten();
+        if git2::AttrValue::from_string(ident) != git2::AttrValue::True {
+            return false;
+        }
+        let Some(entry) = self
+            .repo
+            .index()
+            .ok()
+            .and_then(|index| index.get_path(Path::new(path), 0))
+        else {
+            return false;
+        };
+        let Ok(bytes) = std::fs::read(self.workdir.join(path)) else {
+            return false;
+        };
+        git2::Oid::hash_object(git2::ObjectType::Blob, &collapse_idents(&bytes))
+            .is_ok_and(|oid| oid == entry.id)
     }
 
     /// Discard one tracked path's working-tree changes: the index's
@@ -1342,9 +1388,86 @@ fn inside(path: &Path) -> bool {
             .all(|part| matches!(part, std::path::Component::Normal(_)))
 }
 
+/// `bytes` with every expanded `$Id: … $` collapsed to `$Id$`, as git's
+/// `ident` conversion cleans a file: an expansion runs from `$Id:` to the
+/// next `$`, and one with a line break before that `$` is not one.
+fn collapse_idents(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at..].starts_with(b"$Id:") {
+            let rest = &bytes[at + 4..];
+            if let Some(end) = rest.iter().position(|b| *b == b'$' || *b == b'\n') {
+                if rest[end] == b'$' {
+                    out.extend_from_slice(b"$Id$");
+                    at += 4 + end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `ident` file whose expansion is not the length the index
+    /// recorded — `$Id$` added, `$Id: <40 hex> $` on disk, as the folder
+    /// had php-src's after a move — is unchanged: `git diff` shows
+    /// nothing, though git's status and libgit2's take the size alone. An
+    /// edit to it is still an edit.
+    #[test]
+    fn an_ident_file_at_another_length_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t"]);
+        std::fs::write(root.join(".gitattributes"), "/cdb.c ident\n").unwrap();
+        std::fs::write(root.join("cdb.c"), "/* $Id$ */\nint x;\n/* $Id$ */\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "seed"]);
+        let expanded = "/* $Id: b8aa21bea7508109b3661b41845201cbfa6b2e7f $ */\nint x;\n\
+                        /* $Id: b8aa21bea7508109b3661b41845201cbfa6b2e7f $ */\n";
+        std::fs::write(root.join("cdb.c"), expanded).unwrap();
+        assert_eq!(
+            git(&["diff", "--name-only"]),
+            "",
+            "git's diff reads it unchanged"
+        );
+        let ws = GitWorkspace::discover(root).unwrap();
+        assert_eq!(ws.status().unwrap(), HashMap::new());
+
+        std::fs::write(root.join("cdb.c"), expanded.replace("int x;", "int y;")).unwrap();
+        assert_eq!(
+            ws.status().unwrap().get(Path::new("cdb.c")),
+            Some(&FileState::Modified)
+        );
+    }
+
+    #[test]
+    fn collapsing_ids_follows_git() {
+        assert_eq!(collapse_idents(b"$Id: abc $ x $Id: d $"), b"$Id$ x $Id$");
+        assert_eq!(
+            collapse_idents(b"$Id$ and $Id: q\n$"),
+            b"$Id$ and $Id: q\n$"
+        );
+        assert_eq!(collapse_idents(b"no ids"), b"no ids");
+    }
 
     #[test]
     fn a_submodule_path_must_stay_inside_the_working_tree() {
