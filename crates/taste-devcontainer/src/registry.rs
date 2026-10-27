@@ -3271,6 +3271,65 @@ impl EnvironmentRegistry {
                 "the ladder resolved onto this VM; starting the files service",
             );
         }
+        // The primary's checkout, first: it moves into the VM — seeded from
+        // the user's folder, uncommitted work included — or, when it is
+        // already there, the folder is brought up to date with it. Before
+        // the housekeeping and the pool's other VMs, which nothing here
+        // reads: behind them, the startup page sat on "Start workspace VM"
+        // while other environments' VMs booted and their files services
+        // were built, under a log line already saying the files service
+        // was starting (David, 2026-10-26: "Why does it stay an earlier
+        // stage up top but 'starting files service' below?").
+        if substrate.vm_details().is_some() {
+            // Not announced here: the placement starts the files service
+            // first, building its image when the VM has none, and says
+            // each of those and then itself in that order
+            // (`place_primary_now`, `keeper_for`). Said here as well, the
+            // startup page lit "Sync checkout into VM" first, and the image
+            // build — minutes, with its progress — ran under that row,
+            // since the page never steps back (2026-10-05).
+            let registry = self.clone();
+            match tokio::task::spawn_blocking(move || registry.place_primary_now()).await {
+                Ok(Ok(Some(sync))) => {
+                    if let Some(note) = sync.note {
+                        let note = format!("the folder you opened: {note}");
+                        taste_core::app_log::push("info", "environments", &note);
+                        self.events.publish(Event::Toast(note));
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
+                    let note = format!(
+                        "the primary environment's checkout could not be placed in the \
+                         workspace's VM ({e:#}); it stays on this machine"
+                    );
+                    taste_core::app_log::push("warn", "environments", &note);
+                    self.events.publish(Event::Toast(note));
+                }
+                Err(e) => tracing::warn!("placing the primary did not finish: {e}"),
+            }
+        }
+
+        // The primary is not in `restored` (it is not a clone). Its first
+        // check waits for its checkout to be placed rather than running
+        // with the window's first frame: a container started before that
+        // would bind the folder on this host, and the one started now binds
+        // the checkout in the VM. It does NOT wait for the fleet below:
+        // moving, restoring, and rechecking every other environment one at
+        // a time is minutes on a restored fleet, and the primary's startup
+        // page sat on "the container comes next" through all of it (David,
+        // 2026-09-22: "This is not enough progress info for such a slow
+        // step"). Nothing the fleet does is anything the primary's check
+        // reads.
+        let primary = self.primary();
+        if let Err(e) = primary.recheck() {
+            tracing::warn!("the primary environment's recheck failed: {e:#}");
+        }
+        if let Err(e) = self.watch_config(&primary) {
+            tracing::warn!("the primary environment's watcher failed: {e:#}");
+        }
+        primary.probe_agent_hosting().await;
+
         // The legacy scheme's containers were made before any checkout
         // could be in a VM, so they are wherever a local checkout runs.
         let mut swept = reconcile::sweep_legacy_resources(
@@ -3412,58 +3471,6 @@ impl EnvironmentRegistry {
                 Err(e) => tracing::warn!("connecting the keeper did not finish: {e}"),
             }
         }
-        // The primary too. Its checkout moves into the VM — seeded from the
-        // user's folder, uncommitted work included — or, when it is already
-        // there, the folder is brought up to date with it.
-        if substrate.vm_details().is_some() {
-            // Not announced here: the placement starts the files service
-            // first, building its image when the VM has none, and says
-            // each of those and then itself in that order
-            // (`place_primary_now`, `keeper_for`). Said here as well, the
-            // startup page lit "Sync checkout into VM" first, and the image
-            // build — minutes, with its progress — ran under that row,
-            // since the page never steps back (2026-10-05).
-            let registry = self.clone();
-            match tokio::task::spawn_blocking(move || registry.place_primary_now()).await {
-                Ok(Ok(Some(sync))) => {
-                    if let Some(note) = sync.note {
-                        let note = format!("the folder you opened: {note}");
-                        taste_core::app_log::push("info", "environments", &note);
-                        self.events.publish(Event::Toast(note));
-                    }
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => {
-                    let note = format!(
-                        "the primary environment's checkout could not be placed in the \
-                         workspace's VM ({e:#}); it stays on this machine"
-                    );
-                    taste_core::app_log::push("warn", "environments", &note);
-                    self.events.publish(Event::Toast(note));
-                }
-                Err(e) => tracing::warn!("placing the primary did not finish: {e}"),
-            }
-        }
-
-        // The primary is not in `restored` (it is not a clone). Its first
-        // check waits for its checkout to be placed rather than running
-        // with the window's first frame: a container started before that
-        // would bind the folder on this host, and the one started now binds
-        // the checkout in the VM. It does NOT wait for the fleet below:
-        // moving, restoring, and rechecking every other environment one at
-        // a time is minutes on a restored fleet, and the primary's startup
-        // page sat on "the container comes next" through all of it (David,
-        // 2026-09-22: "This is not enough progress info for such a slow
-        // step"). Nothing the fleet does is anything the primary's check
-        // reads.
-        let primary = self.primary();
-        if let Err(e) = primary.recheck() {
-            tracing::warn!("the primary environment's recheck failed: {e:#}");
-        }
-        if let Err(e) = self.watch_config(&primary) {
-            tracing::warn!("the primary environment's watcher failed: {e:#}");
-        }
-        primary.probe_agent_hosting().await;
         // Environments made before the flip have their checkouts on this
         // host, where nothing runs any more. Each is moved into a VM of the
         // pool with its uncommitted work — the clone becomes its peer, as
