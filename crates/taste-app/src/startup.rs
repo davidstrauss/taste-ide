@@ -376,6 +376,10 @@ pub struct StartupPage {
     area: gtk::DrawingArea,
     offset: Cell<f64>,
     tick: RefCell<Option<gtk::TickCallbackId>>,
+    /// A fit is waiting for the frame's layout to end ([`Self::queue_fit`]).
+    fit_queued: Cell<bool>,
+    /// The page itself, for the fit it queues from `&self`.
+    me: RefCell<std::rc::Weak<Self>>,
 }
 
 impl StartupPage {
@@ -496,6 +500,8 @@ impl StartupPage {
             area,
             offset: Cell::new(0.0),
             tick: RefCell::new(None),
+            fit_queued: Cell::new(false),
+            me: RefCell::new(std::rc::Weak::new()),
         });
         {
             let weak = Rc::downgrade(&this);
@@ -511,12 +517,13 @@ impl StartupPage {
                 );
             });
         }
+        *this.me.borrow_mut() = Rc::downgrade(&this);
         {
             // The page fits the strip it is given, as that strip is resized.
             let weak = Rc::downgrade(&this);
             this.area.connect_resize(move |_, _, _| {
                 if let Some(this) = weak.upgrade() {
-                    this.fit();
+                    this.queue_fit();
                 }
             });
         }
@@ -617,6 +624,25 @@ impl StartupPage {
             glib::ControlFlow::Continue
         });
         *self.tick.borrow_mut() = Some(id);
+    }
+
+    /// [`Self::fit`], once the frame's layout is over, and once however
+    /// often it is asked for in a frame. A resize arrives during layout,
+    /// and folding there — rows shown and hidden, the log hidden, its floor
+    /// moved — changed sizes GTK was in the middle of giving out, and the
+    /// log's scrollbar was drawn with none ("Trying to snapshot GtkGizmo
+    /// without a current allocation", 2026-10-27).
+    fn queue_fit(&self) {
+        if self.fit_queued.replace(true) {
+            return;
+        }
+        let weak = self.me.borrow().clone();
+        glib::idle_add_local_once(move || {
+            if let Some(this) = weak.upgrade() {
+                this.fit_queued.set(false);
+                this.fit();
+            }
+        });
     }
 
     /// Fold the checklist until it and two lines of the log fit the page's
@@ -743,7 +769,7 @@ impl StartupPage {
             LogKind::Environment => "build",
             _ => "vm",
         });
-        self.fit();
+        self.queue_fit();
     }
 
     /// The conclusions the page works out from what it watched, for the
@@ -808,7 +834,7 @@ impl StartupPage {
         if row.status.get() == Status::Done {
             row.set(Status::Done, None);
         }
-        self.fit();
+        self.queue_fit();
     }
 
     /// Every step done; the heading says so.
@@ -826,7 +852,7 @@ impl StartupPage {
         }
         self.row(Step::Ready).set(Status::Done, None);
         self.current.set(Some(Step::Ready));
-        self.fit();
+        self.queue_fit();
         self.heading
             .set_label(&format!("{} ready", self.subject.borrow()));
     }
