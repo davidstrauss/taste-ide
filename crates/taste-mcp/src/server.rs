@@ -1009,6 +1009,7 @@ impl McpServer {
             tokio::spawn(async move {
                 let _permit = permit;
                 let method = request.method.clone();
+                let tool = request.params["name"].as_str().map(str::to_string);
                 // A tool that never returns is a hung agent. Nothing here
                 // legitimately outlives this watchdog: the slow paths carry
                 // their own, smaller bounds.
@@ -1021,16 +1022,7 @@ impl McpServer {
                     Ok(response) => response,
                     Err(_) => Response::ok(
                         id,
-                        tool_result(
-                            &json!({
-                                "error": format!(
-                                    "{method} did not finish within {}s; the IDE is still \
-                                     running and other tools still answer",
-                                    TOOL_WATCHDOG.as_secs()
-                                )
-                            }),
-                            true,
-                        ),
+                        tool_result(&json!({ "error": overran(&method, tool.as_deref()) }), true),
                     ),
                 };
                 if let Ok(mut payload) = serde_json::to_vec(&response) {
@@ -6400,6 +6392,31 @@ fn is_config_path(root: &std::path::Path, path: &std::path::Path) -> bool {
     relative.starts_with(".devcontainer") || relative == std::path::Path::new(".devcontainer.json")
 }
 
+/// What a call that outlived [`TOOL_WATCHDOG`] is answered with. Its
+/// work is not stopped by the answer: a step running off the reactor
+/// finishes in the IDE whatever the agent is told. So the answer says not
+/// to call again — an agent that retried a publish stacked a second one
+/// behind the first, still running (2026-10-26) — and where to look for
+/// whether it landed.
+fn overran(method: &str, tool: Option<&str>) -> String {
+    let secs = TOOL_WATCHDOG.as_secs();
+    let Some(tool) = tool else {
+        return format!(
+            "{method} did not finish within {secs}s; the IDE is still running and other tools \
+             still answer"
+        );
+    };
+    let check = if tool == "publish" {
+        " Call review_list in a minute: your branch is there once it is published."
+    } else {
+        ""
+    };
+    format!(
+        "{tool} did not answer within {secs}s. Its work may still finish in the IDE: do not \
+         call {tool} again now.{check} The IDE is running, and other tools answer."
+    )
+}
+
 /// How many replies `suggest_replies` shows, and how long each may be:
 /// choices in a chat column, not a menu. A choice is a radio's row that
 /// wraps, not a button's face, so a reply may say what it chooses whole
@@ -6618,6 +6635,15 @@ async fn read_pdf(files: &taste_core::files::Files, path: &Path, args: &Value) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_call_that_overran_is_told_not_to_be_repeated() {
+        let said = super::overran("tools/call", Some("publish"));
+        assert!(said.contains("do not call publish again"), "{said}");
+        assert!(said.contains("review_list"), "{said}");
+        let plain = super::overran("tools/list", None);
+        assert!(plain.starts_with("tools/list did not finish"), "{plain}");
+    }
+
     use super::*;
 
     /// The guidance's high-water mark moves with its text: a change to

@@ -1856,7 +1856,7 @@ impl Supervisor {
     /// folder's copy as the last pass left it. A publish used to take the
     /// lock and then run a whole pass of its own behind one already moving
     /// a large file, and ran out the tool watchdog (2026-10-17).
-    pub fn sync_peer_for_publish(&self, wait: std::time::Duration) -> Result<bool> {
+    pub fn sync_peer_for_publish(self: &Arc<Self>, wait: std::time::Duration) -> Result<bool> {
         if !self.env.id.is_primary() || self.checkout().is_local() {
             self.sync_peer_blocking()?;
             return Ok(true);
@@ -1864,6 +1864,31 @@ impl Supervisor {
         let before = self.folder_passes.load(Ordering::SeqCst);
         let deadline = std::time::Instant::now() + wait;
         let started = std::time::Instant::now();
+        // A pass this publish starts itself is held to what is left of the
+        // wait too: it runs on, in the background, and the publish goes
+        // against the folder's copy of the branches. Run inline, a pass
+        // that could not settle held a publish past the tool's watchdog,
+        // twice (2026-10-26, php-src's `ident` files).
+        let run_pass = |deadline: std::time::Instant| -> Result<bool> {
+            let (done, finished) = std::sync::mpsc::channel();
+            let supervisor = self.clone();
+            std::thread::spawn(move || {
+                let _ = done.send(supervisor.sync_peer_blocking());
+            });
+            match finished
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(pass) => pass.map(|()| true),
+                Err(_) => {
+                    tracing::warn!(
+                        "publish: Personal's sync was still running after {} s; publishing \
+                         against the folder's copy of its branches",
+                        started.elapsed().as_secs()
+                    );
+                    Ok(false)
+                }
+            }
+        };
         loop {
             match self.folder_sync.try_lock() {
                 Ok(guard) => {
@@ -1876,12 +1901,10 @@ impl Supervisor {
                         );
                         return Ok(true);
                     }
-                    self.sync_peer_blocking()?;
-                    return Ok(true);
+                    return run_pass(deadline);
                 }
                 Err(std::sync::TryLockError::Poisoned(_)) => {
-                    self.sync_peer_blocking()?;
-                    return Ok(true);
+                    return run_pass(deadline);
                 }
                 Err(std::sync::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {

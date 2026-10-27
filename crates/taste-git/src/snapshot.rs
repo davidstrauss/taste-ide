@@ -168,6 +168,13 @@ impl GitWorkspace {
         let mut paths: Vec<PathBuf> = status.into_keys().collect();
         // And what is ignored but syncs anyway (`crate::sync_ignored`).
         paths.extend(self.synced_ignored_files(&self.sync_rules()));
+        // And what git converts on its way out of the repository, whose
+        // bytes are not HEAD's though status calls it unchanged
+        // (`crate::converted`): its bytes are hashed, as the checkout's
+        // snapshot hashes them.
+        let converted = crate::converted::changed(&self.repo, &self.workdir, &base_tree, &paths)
+            .context("finding the files git converts")?;
+        paths.extend(converted);
         paths.sort();
         paths.dedup();
 
@@ -703,6 +710,44 @@ impl GitWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file git expands `$Id$` in on checkout is in the folder's snapshot
+    /// as its bytes, as the checkout's snapshot has it — not as HEAD's
+    /// blob, which status vouches for and the two sides then never agreed
+    /// on (php-src, 2026-10-26).
+    #[test]
+    fn an_expanded_ident_file_is_snapshotted_as_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".gitattributes"), "/cdb.c ident\n").unwrap();
+        std::fs::write(root.join("cdb.c"), "/* $Id$ */\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::remove_file(root.join("cdb.c")).unwrap();
+        git(&["checkout", "--", "cdb.c"]);
+        let bytes = std::fs::read(root.join("cdb.c")).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("$Id: "));
+
+        let ws = GitWorkspace::discover(root).unwrap();
+        assert!(ws.status().unwrap().is_empty(), "status calls it unchanged");
+        let tree = ws.repo.find_tree(ws.worktree_tree().unwrap()).unwrap();
+        let entry = tree.get_path(Path::new("cdb.c")).unwrap();
+        assert_eq!(
+            entry.id(),
+            Oid::hash_object(git2::ObjectType::Blob, &bytes).unwrap()
+        );
+    }
 
     #[test]
     fn a_commit_that_leaves_the_working_copy_as_it_was_is_a_new_snapshot() {

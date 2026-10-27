@@ -12,6 +12,7 @@ use git2::{Repository, Status, StatusOptions};
 
 pub mod beneath;
 pub mod clone;
+mod converted;
 pub mod issues;
 pub mod mediate;
 pub mod merge;
