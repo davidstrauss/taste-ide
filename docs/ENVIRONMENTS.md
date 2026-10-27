@@ -4648,7 +4648,25 @@ user committed here with another tool) is pushed into the checkout, and
 two sides that both moved are named as a divergence and left for the
 person. Pull spans both: the fetch is the peer's with the user's keys,
 the peer's remote-tracking refs are pushed into the checkout, the rebase
-runs where the working tree is, and the peer is synced after. The primary
+runs where the working tree is, and the peer is synced after. **This host
+fetches; the sandbox merges** (2026-10-26). The rebase, the fast-forward
+with the autostash put back over it, and a rebase's Continue run in the
+environment's own container (`Worktree::with_merges`), not through the
+files service: the files service is one per VM, shared by every
+environment in it, so its git reads no attributes and runs every filter
+as `cat`, and a repository's own `merge=` driver, or a filter that has to
+see both sides, never ran there. The container is where that
+repository's code already runs, so its merges run there too (David:
+"we should use custom merge drivers inside the container+VM sandboxes,
+which is where complex merges should all happen, anyway"). Safe mode's
+baseline binds the checkout read-only, so its merges stay with the files
+service, as does one the container cannot start at all (podman's 125, or
+no `git` in the image), before anything has been touched. Nothing merges
+content on this host: a review lands by fast-forward, and what the
+merged-branch check computes in memory is never written. One merge is
+still the files service's: the sync's stash put back over a folder that
+was ahead (`SYNC_SCRIPT`), which keeps the stash for Unstash when it
+does not apply rather than merging it. The primary
 is snapshotted on the same cadence as every other environment now, and
 the two early returns that kept it out are gone.
 

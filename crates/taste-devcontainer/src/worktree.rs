@@ -32,6 +32,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use taste_core::environment::Checkout;
 use taste_core::files::{ExecOutput, Files};
+use taste_core::ExecContext;
 use taste_git::{FileState, GitWorkspace, StashEntry};
 
 /// What syncs though git ignores it, as the file tree shows it
@@ -120,6 +121,10 @@ pub enum Worktree {
         /// Run after a commit, a switch, or anything else that moves a ref
         /// over there, so the peer on this host learns of it.
         after_ref_change: Option<Arc<dyn Fn() + Send + Sync>>,
+        /// The environment's own container, where a rebase or a merge runs
+        /// ([`Self::with_merges`]); `None` runs them through the files
+        /// service, as every other verb does.
+        merges: Option<ExecContext>,
     },
 }
 
@@ -148,6 +153,7 @@ impl Worktree {
                 files,
                 path: path.clone(),
                 after_ref_change: None,
+                merges: None,
             },
         }
     }
@@ -160,6 +166,29 @@ impl Worktree {
         } = &mut self
         {
             *after_ref_change = Some(hook);
+        }
+        self
+    }
+
+    /// [`Self::for_checkout`], with its rebases and merges run in the
+    /// environment's own container, `exec`, rather than through the files
+    /// service.
+    ///
+    /// The files service is one per VM and shared by every environment in
+    /// it, so its git reads no attributes and runs every filter as `cat`
+    /// (`GIT_ATTR_SOURCE`, the keeper's `gitSafe`): no repository's config
+    /// runs anything there. A merge is where a repository most wants its
+    /// own: a `merge=` driver in `.gitattributes` defined in its config, a
+    /// filter that has to see both sides as the user's git does. The
+    /// environment's container is where that repository's code already
+    /// runs, so that is where its merges run too (David, 2026-10-26: "we
+    /// should use custom merge drivers inside the container+VM sandboxes,
+    /// which is where complex merges should all happen, anyway"). Only in
+    /// container mode: the baseline binds the checkout read-only, so safe
+    /// mode's merges stay with the files service.
+    pub fn with_merges(mut self, exec: ExecContext) -> Self {
+        if let Worktree::Remote { merges, .. } = &mut self {
+            *merges = Some(exec);
         }
         self
     }
@@ -1100,18 +1129,83 @@ impl Worktree {
     /// what knows the upstream; the caller names the ref it wants — in a
     /// VM that is a `refs/remotes/*` the registry pushed over.
     pub fn rebase_onto(&self, onto: &str) -> Result<()> {
-        self.git_ok(&["rebase", "--autostash", onto])?;
+        self.merge_ok(&["rebase", "--autostash", onto])?;
         self.ref_changed();
         Ok(())
     }
 
     /// Move the branch forward to `onto` and only forward
     /// (`taste_git::GitWorkspace::fast_forward_onto_command`): a branch with
-    /// a commit of its own is refused, never replayed.
+    /// a commit of its own is refused, never replayed. A merge all the
+    /// same, for the autostash put back over it.
     pub fn fast_forward_onto(&self, onto: &str) -> Result<()> {
-        self.git_ok(&["merge", "--ff-only", "--autostash", onto])?;
+        self.merge_ok(&["merge", "--ff-only", "--autostash", onto])?;
         self.ref_changed();
         Ok(())
+    }
+
+    /// `git_ok` for a command that merges, in the environment's container
+    /// when the tree has one in container mode ([`Self::with_merges`]),
+    /// and through the files service otherwise.
+    ///
+    /// A container that cannot run it at all — gone between the check and
+    /// the exec, or an image with no `git` — is podman's 125 or `env`'s 126
+    /// and 127, and nothing has been touched yet, so the files service runs
+    /// it instead; any other failure is git's, after it may have begun, and
+    /// is the answer.
+    fn merge_ok(&self, args: &[&str]) -> Result<String> {
+        let Worktree::Remote {
+            merges: Some(exec),
+            path,
+            ..
+        } = self
+        else {
+            return self.git_ok(args);
+        };
+        if !exec.is_container() {
+            return self.git_ok(args);
+        }
+        // The checkout as the container mounts it; where the IDE's own
+        // container is the environment, the same path as here.
+        let dir = exec
+            .container_workdir()
+            .unwrap_or_else(|| path.display().to_string());
+        let mut argv = vec![
+            "GIT_TERMINAL_PROMPT=0",
+            "GIT_EDITOR=true",
+            "git",
+            "-C",
+            &dir,
+        ];
+        argv.extend_from_slice(args);
+        let spec = exec.resolve("env", &argv, false);
+        let output = std::process::Command::new(&spec.program)
+            .args(&spec.args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("running git in the environment's container")?;
+        match output.status.code() {
+            Some(0) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
+            Some(125..=127) | None => {
+                tracing::warn!(
+                    "git {} could not run in the environment's container ({}); \
+                     running it through the files service",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                self.git_ok(args)
+            }
+            Some(_) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let last = stderr
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("git failed")
+                    .to_string();
+                Err(GitFailed(last).into())
+            }
+        }
     }
 
     pub fn rebase_abort(&self) -> Result<()> {
@@ -1121,7 +1215,7 @@ impl Worktree {
     }
 
     pub fn rebase_continue(&self) -> Result<()> {
-        self.git_ok(&["-c", "core.editor=true", "rebase", "--continue"])?;
+        self.merge_ok(&["-c", "core.editor=true", "rebase", "--continue"])?;
         self.ref_changed();
         Ok(())
     }
@@ -1434,6 +1528,59 @@ mod tests {
         assert!(names[Path::new("x")].pin.is_problem());
     }
 
+    /// A rebase in the environment's container reads the repository's own
+    /// attributes and config, so a `merge=` driver they name runs: the
+    /// file is what the driver wrote, and it saw the container's
+    /// environment (`GIT_EDITOR`, which only that path sets). The IDE's
+    /// own container standing in for the environment, as when it
+    /// self-hosts, so the path is the tree's own.
+    #[test]
+    fn a_rebase_with_merges_runs_the_repositorys_merge_driver() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_commit(root);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        std::fs::write(root.join(".gitattributes"), "a.txt merge=mark\n").unwrap();
+        git(&[
+            "config",
+            "merge.mark.driver",
+            "echo \"merged by the driver, editor $GIT_EDITOR\" > %A",
+        ]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "attributes"]);
+        git(&["checkout", "-qb", "up"]);
+        std::fs::write(root.join("a.txt"), "up\n").unwrap();
+        git(&["commit", "-qam", "up"]);
+        git(&["checkout", "-q", "-"]);
+        std::fs::write(root.join("a.txt"), "mine\n").unwrap();
+        git(&["commit", "-qam", "mine"]);
+
+        let remote = Worktree::Remote {
+            files: Files::Local,
+            path: root.to_path_buf(),
+            after_ref_change: None,
+            merges: None,
+        }
+        .with_merges(ExecContext::for_tests(true));
+        remote.rebase_onto("up").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "merged by the driver, editor true\n"
+        );
+    }
+
     fn git_present() -> bool {
         std::process::Command::new("git")
             .arg("--version")
@@ -1486,6 +1633,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
+            merges: None,
         };
         assert_eq!(
             Worktree::Local(root.to_path_buf()).sync_ignored(&HashMap::new()),
@@ -1558,6 +1706,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
+            merges: None,
         };
         let shown = worktree.sync_ignored(&worktree.status().unwrap());
         assert_eq!(
@@ -1584,6 +1733,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
+            merges: None,
         };
         std::fs::write(root.join("a.txt"), "a changed\n").unwrap();
         std::fs::write(root.join("b.txt"), "b changed\n").unwrap();
@@ -1669,6 +1819,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
+            merges: None,
         };
         assert_eq!(local.branch_name(), remote.branch_name());
         assert!(local.branch_name().is_some());
@@ -1803,6 +1954,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
+            merges: None,
         }
     }
 
