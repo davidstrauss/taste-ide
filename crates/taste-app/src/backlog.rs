@@ -879,6 +879,9 @@ type QueuedWrite = Box<dyn FnOnce(&Rc<BacklogPanel>)>;
 /// probe can find it by id.
 struct Listed {
     id: String,
+    /// Whether its row takes drags: a kept row keeps the controllers it
+    /// was built with, so a row is kept only where this is unchanged.
+    reorderable: bool,
     /// The issue this row is, or `None` for the primary row.
     issue: Option<String>,
     env: Option<EnvironmentId>,
@@ -2029,11 +2032,40 @@ impl BacklogPanel {
         // (2026-10-24).
         let selected = self.selected_issue();
         let aimed = self.current.borrow().clone();
+        // The rows the list will hold, in order. When they are the rows it
+        // holds now — the same ids, taking drags alike — the rows are KEPT
+        // and only what is in them is replaced (`adopt`): a row taken out
+        // took the tooltip the pointer was reading with it, and a starting
+        // environment's row changes every few seconds, so its tooltip
+        // blinked out and back on that rhythm (David, 2026-10-27).
+        let admitted = |row: &Row| {
+            let current = row.live.as_ref().is_some_and(|live| live.current);
+            kept_by_query(row)
+                && (!row.is_issue()
+                    || current
+                    || status_filter.admits(standing_of(row, row.approved).stage))
+        };
+        let kept: Option<Vec<gtk::ListBoxRow>> = {
+            let listed = self.listed.borrow();
+            let next: Vec<(&str, bool)> = rows
+                .iter()
+                .filter(|row| admitted(row))
+                .map(|row| (row.id.as_str(), row.reorderable()))
+                .collect();
+            let now: Vec<(&str, bool)> = listed
+                .iter()
+                .map(|listed| (listed.id.as_str(), listed.reorderable))
+                .collect();
+            (next == now && self.list.first_child().is_some())
+                .then(|| listed.iter().map(|listed| listed.widget.clone()).collect())
+        };
         // The whole rebuild is the panel's own selecting, not only the
         // `select_row` that ends it.
         self.selecting.set(true);
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
+        if kept.is_none() {
+            while let Some(child) = self.list.first_child() {
+                self.list.remove(&child);
+            }
         }
         let mut listed: Vec<Listed> = Vec::new();
         let mut current_row: Option<gtk::ListBoxRow> = None;
@@ -2068,7 +2100,14 @@ impl BacklogPanel {
             {
                 continue;
             }
-            let (widget, sparkline) = self.build_row(row, own_hits, within);
+            let (built, sparkline) = self.build_row(row, own_hits, within);
+            let widget = match kept.as_ref().and_then(|kept| kept.get(listed.len())) {
+                Some(kept) => adopt(kept, &built),
+                None => {
+                    self.list.append(&built);
+                    built
+                }
+            };
             if !query.is_empty() && !own && within == 0 && !current {
                 widget.add_css_class("search-dim");
             }
@@ -2079,7 +2118,6 @@ impl BacklogPanel {
                     if within == 1 { "" } else { "es" }
                 )));
             }
-            self.list.append(&widget);
             let is_selected = selected.as_deref() == Some(row.id.as_str());
             // An issue with no environment is the aimed row when the panes
             // are aimed at the environment it would be.
@@ -2099,6 +2137,7 @@ impl BacklogPanel {
             }
             listed.push(Listed {
                 id: row.id.clone(),
+                reorderable: row.reorderable(),
                 issue: row.is_issue().then(|| row.id.clone()),
                 env: row.live.as_ref().map(|live| live.env.clone()),
                 widget,
@@ -2114,8 +2153,9 @@ impl BacklogPanel {
         // while the list is short, and a longer list carries it out of
         // sight — by then it has taught what it had to (David, 2026-09-07:
         // "a ghost item at the very bottom of the backlog that indicates
-        // using the universal composer box to create new items").
-        {
+        // using the universal composer box to create new items"). Kept
+        // rows keep theirs.
+        if kept.is_none() {
             // The rows' own geometry (`filetree::leading_slot`), so the
             // glyph sits on the state icons' centre line (David,
             // 2026-09-08: "Align this").
@@ -3878,6 +3918,22 @@ impl BacklogPanel {
         };
         self.show_context_menu(&row, id, None);
     }
+}
+
+/// `built`'s contents moved into `kept`, a row already in the list: its
+/// child, classes, tooltip, and whether it activates. The kept row's own
+/// handlers stay, which is right because each is keyed by the row's id,
+/// and that is what made it the same row. Returns `kept`.
+fn adopt(kept: &gtk::ListBoxRow, built: &gtk::ListBoxRow) -> gtk::ListBoxRow {
+    let child = built.child();
+    built.set_child(gtk::Widget::NONE);
+    kept.set_child(child.as_ref());
+    let classes = built.css_classes();
+    let classes: Vec<&str> = classes.iter().map(|class| class.as_str()).collect();
+    kept.set_css_classes(&classes);
+    kept.set_tooltip_text(built.tooltip_text().as_deref());
+    kept.set_activatable(built.is_activatable());
+    kept.clone()
 }
 
 /// Which edge of `row` a pointer at `y` is asking to drop against. The
