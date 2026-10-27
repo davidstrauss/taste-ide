@@ -1648,10 +1648,12 @@ async fn read_text_file(
             // the VM the checkout is in. Off the reactor either way.
             let files = files.clone();
             let read_path = canonical.clone();
-            tokio::task::spawn_blocking(move || files.read_to_string(&read_path))
-                .await
-                .map_err(|e| format!("read task failed: {e}"))?
-                .map_err(|e| format!("{}: {e}", canonical.display()))?
+            tokio::task::spawn_blocking(move || {
+                taste_core::textfile::read_text(&files, &read_path).map(|(text, _)| text)
+            })
+            .await
+            .map_err(|e| format!("read task failed: {e}"))?
+            .map_err(|e| format!("{}: {e}", canonical.display()))?
         }
     };
     Ok(slice_lines(&content, line, limit))

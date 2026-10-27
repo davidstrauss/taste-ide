@@ -56,6 +56,9 @@ struct EditorPage {
     eol_override: Cell<Option<bool>>,
     /// UTF-8 BOM present at load (or demanded by charset = utf-8-bom).
     bom: Cell<bool>,
+    /// The encoding the file is stored in, when its project names one
+    /// other than UTF-8 (`textfile::read_text`).
+    encoding: Cell<Option<&'static textfile::Encoding>>,
     /// Markdown raw-source mode (false = WYSIWYG) for this page.
     raw_source: Cell<bool>,
     /// Performance guard: very long lines (minified files, data blobs) make
@@ -354,6 +357,8 @@ type FileOwner = (taste_core::environment::EnvironmentId, PathBuf, bool);
 struct Prepared {
     owner: Option<FileOwner>,
     config: taste_core::textfile::EditorConfig,
+    /// The encoding the file was read in, when not UTF-8.
+    encoding: Option<&'static textfile::Encoding>,
 }
 
 /// The registry as the resolver needs it: either the probe's fabricated
@@ -600,6 +605,7 @@ fn source_language(path: &Path) -> Option<sourceview5::Language> {
 use crate::hover::FullTextOnHover;
 use taste_core::files::Files;
 use taste_core::textfile::{self, content_hash, normalize_load, FileFormat};
+use taste_devcontainer::worktree::DiffDisplay;
 use taste_devcontainer::Worktree;
 
 /// A file the agent is writing that the user has NOT opened, for the length
@@ -621,6 +627,7 @@ impl EditorPage {
             trim_trailing_ws: self.trim_trailing_ws.get(),
             final_newline: self.final_newline.get(),
             eol_override: self.eol_override.get(),
+            encoding: self.encoding.get(),
         }
     }
 
@@ -630,6 +637,7 @@ impl EditorPage {
         self.trim_trailing_ws.set(format.trim_trailing_ws);
         self.final_newline.set(format.final_newline);
         self.eol_override.set(format.eol_override);
+        self.encoding.set(format.encoding);
     }
 }
 
@@ -3390,7 +3398,7 @@ impl Editor {
             let handle = crate::runtime::runtime().spawn_blocking(
                 move || -> std::io::Result<(String, Prepared)> {
                     let files = files_among(&read_path, &access);
-                    let content = files.read_to_string(&read_path)?;
+                    let (content, encoding) = textfile::read_text(&files, &read_path)?;
                     let owner = match checkouts {
                         Checkouts::Probe(owner) => Some(owner),
                         Checkouts::Real(checkouts) => owner_among(&read_path, &checkouts),
@@ -3398,7 +3406,14 @@ impl Editor {
                     // `.editorconfig` is an ancestor walk of the file's own
                     // directories, through whichever service has them.
                     let config = taste_core::textfile::EditorConfig::read_via(&files, &read_path);
-                    Ok((content, Prepared { owner, config }))
+                    Ok((
+                        content,
+                        Prepared {
+                            owner,
+                            config,
+                            encoding,
+                        },
+                    ))
                 },
             );
             let (content, prepared) = match handle.await {
@@ -3677,9 +3692,14 @@ impl Editor {
         // badged, in that environment's own tab set. Both answers cost
         // filesystem work, so the open path resolves them alongside its read
         // and hands them in; only the cold paths pay for them here.
-        let Prepared { owner, config } = prepared.unwrap_or_else(|| Prepared {
+        let Prepared {
+            owner,
+            config,
+            encoding,
+        } = prepared.unwrap_or_else(|| Prepared {
             owner: self.owning_environment(path),
             config: taste_core::textfile::EditorConfig::read(path),
+            encoding: None,
         });
         let (content, had_crlf, had_bom) = normalize_load(&content);
         let buffer = sourceview5::Buffer::new(None);
@@ -4024,6 +4044,7 @@ impl Editor {
             crlf: Cell::new(false),
             eol_override: Cell::new(None),
             bom: Cell::new(false),
+            encoding: Cell::new(None),
             // Markdown defaults to the editing interface (raw source);
             // the preview is opt-in and read-only. A notebook opens as a
             // notebook: its JSON is the face nobody reads first.
@@ -4156,6 +4177,11 @@ impl Editor {
         // .editorconfig charset (applied above) wins over detection.
         if !page.bom.get() {
             page.bom.set(had_bom);
+        }
+        // What the file was read in is what it is, whatever charset
+        // `.editorconfig` would give a file with nothing to say.
+        if encoding.is_some() {
+            page.encoding.set(encoding);
         }
         self.refresh_markdown_mode(path, &page);
         page.buffer.set_text(&content);
@@ -4307,9 +4333,9 @@ impl Editor {
         let files = page.files.clone();
         glib::spawn_future_local(async move {
             let read_path = path.clone();
-            let handle =
-                crate::runtime::runtime().spawn_blocking(move || files.read_to_string(&read_path));
-            let Ok(Ok(content)) = handle.await else {
+            let handle = crate::runtime::runtime()
+                .spawn_blocking(move || textfile::read_text(&files, &read_path));
+            let Ok(Ok((content, encoding))) = handle.await else {
                 return;
             };
             let Some(editor) = weak.upgrade() else { return };
@@ -4318,6 +4344,9 @@ impl Editor {
             let (content, crlf, bom) = normalize_load(&content);
             page.crlf.set(crlf);
             page.bom.set(bom);
+            if encoding.is_some() {
+                page.encoding.set(encoding);
+            }
             let held = hold_scroll(&page.view, &page.scroller);
             page.buffer.set_text(&content);
             page.buffer.set_modified(false);
@@ -4540,10 +4569,11 @@ impl Editor {
         // envs, the diff view always seems to show full file creation").
         let worktree = worktree_at(&page.origin_root, &page.files);
         let file = path.to_path_buf();
+        let encoding = page.encoding.get();
         let weak_page = Rc::downgrade(page);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime()
-                .spawn_blocking(move || changes_face(&worktree, &file, now));
+                .spawn_blocking(move || changes_face(&worktree, &file, now, encoding));
             let Ok(face) = handle.await else { return };
             let Some(page) = weak_page.upgrade() else {
                 return;
@@ -4564,7 +4594,16 @@ impl Editor {
                     Some(git) => git.review_blobs(&source.branch, &source.target, &source.rel),
                     None => Err(anyhow::anyhow!("this workspace is not a git repository")),
                 };
+                // What the attributes say is read where the branch's own
+                // `.gitattributes` and config are: this checkout, the
+                // peer, through git, which reads a pattern and runs nothing.
+                let display = taste_devcontainer::Worktree::Local(source.root.clone())
+                    .diff_display(
+                        &source.rel,
+                        &format!("{}...{}", source.target, source.branch),
+                    );
                 match blobs {
+                    Ok(_) if display.binary => ChangesFace::Note(BINARY_BY_ATTRIBUTE.into()),
                     Ok(blobs) if blobs.binary => {
                         ChangesFace::Note("Binary file — nothing to show as lines.".into())
                     }
@@ -4572,11 +4611,14 @@ impl Editor {
                         "{} is on neither side of this comparison.",
                         source.rel.display()
                     )),
-                    Ok(blobs) => ChangesFace::Diff(crate::chatdoc::Edit {
-                        path: source.rel.clone(),
-                        old: blobs.base.unwrap_or_default(),
-                        new: blobs.head.unwrap_or_default(),
-                    }),
+                    Ok(blobs) => ChangesFace::Diff(
+                        crate::chatdoc::Edit {
+                            path: source.rel.clone(),
+                            old: blobs.base.unwrap_or_default(),
+                            new: blobs.head.unwrap_or_default(),
+                        },
+                        display,
+                    ),
                     // Say why rather than render an empty diff that reads
                     // as "the agent changed nothing".
                     Err(e) => ChangesFace::Note(format!("Cannot read this branch: {e}")),
@@ -4868,9 +4910,9 @@ impl Editor {
         let path = path.to_path_buf();
         glib::spawn_future_local(async move {
             let read_path = path.clone();
-            let handle =
-                crate::runtime::runtime().spawn_blocking(move || files.read_to_string(&read_path));
-            let Ok(Ok(raw)) = handle.await else {
+            let handle = crate::runtime::runtime()
+                .spawn_blocking(move || textfile::read_text(&files, &read_path));
+            let Ok(Ok((raw, encoding))) = handle.await else {
                 return; // deleted or unreadable; the tree reflects that
             };
             let Some(editor) = weak.upgrade() else { return };
@@ -4924,6 +4966,9 @@ impl Editor {
             }
             page.crlf.set(crlf);
             page.bom.set(bom);
+            if encoding.is_some() {
+                page.encoding.set(encoding);
+            }
             let held = hold_scroll(&page.view, &page.scroller);
             dismiss_suggestion(&page);
             // Re-evaluate the performance guard: an agent may have rewritten
@@ -5530,7 +5575,12 @@ fn status_roots<'a>(window: &Path, pages: impl Iterator<Item = &'a PathBuf>) -> 
 /// outside it is a question this cannot answer — and answering it with an
 /// empty left side is how a diff comes to claim the user wrote a file they
 /// did not touch.
-fn changes_face(worktree: &Worktree, file: &Path, now: String) -> ChangesFace {
+fn changes_face(
+    worktree: &Worktree,
+    file: &Path,
+    now: String,
+    encoding: Option<&'static textfile::Encoding>,
+) -> ChangesFace {
     let Some(workdir) = worktree.workdir() else {
         return ChangesFace::Note("This file's checkout is not a git repository.".into());
     };
@@ -5539,19 +5589,42 @@ fn changes_face(worktree: &Worktree, file: &Path, now: String) -> ChangesFace {
             "This file is outside its checkout, so there is nothing to compare it with.".into(),
         );
     };
-    let old = worktree.head_content(rel).unwrap_or_default();
+    // A file kept in another encoding in the repository itself is decoded
+    // as the page was; one kept as UTF-8 there and converted only in the
+    // working tree (`working-tree-encoding`) is UTF-8 in HEAD already.
+    let old = worktree
+        .head_content(rel)
+        .or_else(|| {
+            let bytes = worktree.head_bytes(rel)?;
+            let (text, malformed) = encoding?.decode_without_bom_handling(&bytes);
+            (!malformed).then(|| normalize_load(&text).0)
+        })
+        .unwrap_or_default();
     if old == now {
         return ChangesFace::Note("No changes since the last commit.".into());
     }
-    ChangesFace::Diff(crate::chatdoc::Edit {
-        path: file.to_path_buf(),
-        old,
-        new: now,
-    })
+    let display = worktree.diff_display(rel, "HEAD");
+    if display.binary {
+        return ChangesFace::Note(BINARY_BY_ATTRIBUTE.into());
+    }
+    ChangesFace::Diff(
+        crate::chatdoc::Edit {
+            path: file.to_path_buf(),
+            old,
+            new: now,
+        },
+        display,
+    )
 }
 
+/// What the changes face says of a file the repository's attributes mark
+/// `-diff` or `binary`.
+const BINARY_BY_ATTRIBUTE: &str =
+    "Marked binary in .gitattributes, so there are no lines to compare.";
+
 enum ChangesFace {
-    Diff(crate::chatdoc::Edit),
+    /// The diff, shown as the file's attributes say ([`DiffDisplay`]).
+    Diff(crate::chatdoc::Edit, DiffDisplay),
     Note(String),
 }
 
@@ -5572,15 +5645,44 @@ fn render_changes(holder: &gtk::Box, face: ChangesFace) {
                     .build(),
             );
         }
-        ChangesFace::Diff(edit) => {
-            let view = crate::chatdoc::diff_view(&edit, None, crate::chatdoc::Layout::Auto);
+        ChangesFace::Diff(edit, display) => {
+            let named = |from: usize, len: usize| display.function_for(from, len).map(String::from);
+            let view =
+                crate::chatdoc::diff_view_named(&edit, None, crate::chatdoc::Layout::Auto, &named);
             holder.append(&crate::chatdoc::diff_header(
                 &edit,
                 view.added,
                 view.removed,
                 None,
             ));
-            holder.append(&view.widget);
+            if !display.generated {
+                holder.append(&view.widget);
+                return;
+            }
+            // A generated file's diff is folded: its lines are a tool's,
+            // and its counts above say how much it moved. One click shows
+            // it all the same.
+            let folded = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            folded.append(
+                &gtk::Label::builder()
+                    .label("Generated, as .gitattributes marks it (linguist-generated).")
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .wrap(true)
+                    .css_classes(["dim-label"])
+                    .build(),
+            );
+            let show = gtk::Button::builder()
+                .label("Show Diff")
+                .valign(gtk::Align::Center)
+                .build();
+            folded.append(&show);
+            holder.append(&folded);
+            let (holder, diff) = (holder.clone(), view.widget.clone());
+            show.connect_clicked(move |_| {
+                holder.remove(&folded);
+                holder.append(&diff);
+            });
         }
     }
 }
@@ -6264,10 +6366,11 @@ mod tests {
             &super::Worktree::Local(outside.to_path_buf()),
             &outside.join("cpuinfo"),
             "text\n".into(),
+            None,
         );
         match face {
             ChangesFace::Note(note) => assert!(note.contains("not a git repository"), "{note}"),
-            ChangesFace::Diff(edit) => {
+            ChangesFace::Diff(edit, _) => {
                 panic!(
                     "claimed a diff of {} instead of saying why",
                     edit.path.display()
@@ -6286,10 +6389,11 @@ mod tests {
                 &super::Worktree::Local(root.to_path_buf()),
                 Path::new("/proc/cpuinfo"),
                 "text\n".into(),
+                None,
             );
             match face {
                 ChangesFace::Note(note) => assert!(note.contains("outside its checkout"), "{note}"),
-                ChangesFace::Diff(edit) => {
+                ChangesFace::Diff(edit, _) => {
                     panic!(
                         "claimed a diff of {} instead of saying why",
                         edit.path.display()

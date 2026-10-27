@@ -1037,6 +1037,79 @@ impl Worktree {
         }
     }
 
+    /// `rel` as HEAD has it, as bytes: what [`Self::head_content`] cannot
+    /// give for a file the repository itself keeps in another encoding
+    /// (the `encoding` attribute), for the caller to decode.
+    pub fn head_bytes(&self, rel: &Path) -> Option<Vec<u8>> {
+        let out = self
+            .run_git(&["show", &format!("HEAD:{}", rel.display())], &[])
+            .ok()?;
+        out.success().then_some(out.stdout)
+    }
+
+    /// What the repository's attributes say about showing `rel`'s diff
+    /// against `revs` — `HEAD` for the working tree's changes, `A...B` for
+    /// a branch against where it left another — and the function git names
+    /// for each of its hunks.
+    ///
+    /// Both are git's own answers, read rather than reimplemented: `-diff`
+    /// and `binary` from `check-attr`, and a hunk's function from `diff
+    /// -U0`, which finds it by the `diff=` driver the attributes name (its
+    /// `xfuncname` in the repository's config, or git's built-in one for
+    /// `rust`, `python`, and the rest), and by git's default rule where
+    /// none is named. A pattern is all that is read: no external diff and
+    /// no `textconv` runs (`--no-ext-diff`, `--no-textconv`), and in the VM
+    /// the files service's filters stay `cat`. Anything git cannot answer
+    /// is the plain diff, never an error.
+    pub fn diff_display(&self, rel: &Path, revs: &str) -> DiffDisplay {
+        let rel = rel.display().to_string();
+        let mut display = DiffDisplay::default();
+        let attrs = [
+            "check-attr",
+            "-z",
+            "diff",
+            "binary",
+            "linguist-generated",
+            "--",
+            &rel,
+        ]
+        .map(String::from);
+        if let Ok(out) = self.run_git_reading_attributes(&attrs) {
+            if out.success() {
+                let text = out.stdout_utf8();
+                let fields: Vec<&str> = text.split('\0').collect();
+                for entry in fields.chunks(3) {
+                    let [_, attr, value] = entry else { continue };
+                    match (*attr, *value) {
+                        ("diff", "unset") | ("binary", "set") => display.binary = true,
+                        ("linguist-generated", "set" | "true") => display.generated = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if display.binary {
+            return display;
+        }
+        let diff = [
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-U0",
+            revs,
+            "--",
+            &rel,
+        ]
+        .map(String::from);
+        if let Ok(out) = self.run_git_reading_attributes(&diff) {
+            if out.success() {
+                display.headers = hunk_functions(&out.stdout_utf8());
+            }
+        }
+        display
+    }
+
     /// The staged diff, as a patch, cut at `max_bytes`.
     pub fn staged_diff(&self, max_bytes: usize) -> Result<String> {
         match self {
@@ -1332,6 +1405,51 @@ impl Worktree {
         self.ref_changed();
         Ok(())
     }
+}
+
+/// How a file's diff is shown, as its attributes and git have it
+/// ([`Worktree::diff_display`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffDisplay {
+    /// `-diff`, or `binary`: the repository says it has no lines to show.
+    pub binary: bool,
+    /// `linguist-generated`: a diff nobody reads line by line, shown
+    /// folded until asked for.
+    pub generated: bool,
+    /// Each hunk's first line on the old side, and the function git names
+    /// for it, which follows the `@@ … @@` of its header.
+    pub headers: Vec<(usize, String)>,
+}
+
+impl DiffDisplay {
+    /// The function for a hunk of the old side's lines `from..from + len`
+    /// (1-based): git's for the first of its hunks that starts there. A
+    /// hunk git does not have — one only the buffer's unsaved edits make —
+    /// has none.
+    pub fn function_for(&self, from: usize, len: usize) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(start, _)| *start + 1 >= from && *start <= from + len)
+            .map(|(_, name)| name.as_str())
+    }
+}
+
+/// The functions of `diff -U0`'s hunks: `@@ -A[,B] +C[,D] @@ name` read as
+/// `(A, name)`, for every hunk that has a name.
+fn hunk_functions(diff: &str) -> Vec<(usize, String)> {
+    diff.lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("@@ -")?;
+            let (ranges, name) = rest.split_once(" @@")?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let old = ranges.split(' ').next()?;
+            let start = old.split(',').next()?.parse().ok()?;
+            Some((start, name.to_string()))
+        })
+        .collect()
 }
 
 /// Where a submodule is ([`Worktree::submodule_heads`]).
@@ -1766,6 +1884,58 @@ mod tests {
         );
         assert_eq!(tree(true).status().unwrap().get(Path::new("a.dat")), None);
         assert_eq!(tree(false).status().unwrap().get(Path::new("a.dat")), None);
+    }
+
+    /// A file's attributes, as the diff shows them: `-diff` is binary,
+    /// `linguist-generated` folds, and a hunk's function is the one git's
+    /// own driver names — a pattern from the repository's config here.
+    #[test]
+    fn a_diff_is_shown_as_its_attributes_say() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_commit(root);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        std::fs::write(
+            root.join(".gitattributes"),
+            "a.txt -diff\nb.txt linguist-generated\n*.cfg diff=sections\n",
+        )
+        .unwrap();
+        git(&["config", "diff.sections.xfuncname", "^\\[.*\\]$"]);
+        let body: String = (1..=12).map(|n| format!("key{n} = {n}\n")).collect();
+        std::fs::write(root.join("app.cfg"), format!("[server]\n{body}")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "attributes"]);
+        std::fs::write(
+            root.join("app.cfg"),
+            format!("[server]\n{}", body.replace("key9 = 9", "key9 = 99")),
+        )
+        .unwrap();
+
+        let tree = Worktree::Remote {
+            files: Files::Local,
+            path: root.to_path_buf(),
+            after_ref_change: None,
+            sandbox: None,
+        };
+        let shown = tree.diff_display(Path::new("app.cfg"), "HEAD");
+        assert_eq!(shown.headers, vec![(10, "[server]".to_string())]);
+        assert_eq!(shown.function_for(7, 7), Some("[server]"));
+        assert_eq!(shown.function_for(1, 2), None);
+        assert!(!shown.binary && !shown.generated);
+        assert!(tree.diff_display(Path::new("a.txt"), "HEAD").binary);
+        assert!(tree.diff_display(Path::new("b.txt"), "HEAD").generated);
     }
 
     fn git_present() -> bool {

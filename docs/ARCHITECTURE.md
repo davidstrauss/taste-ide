@@ -1216,6 +1216,24 @@ no-op at every other width.
   (GtkSourceView defaults both off), which is also the only moment those
   indent settings are *visible*: the whitespace auto-indent inserts is tabs
   or spaces at the width that file's config asked for.
+- **A file's encoding is its project's.** Buffers are UTF-8; a file that
+  is not opens in the encoding a UTF-16 byte-order mark, `.editorconfig`'s
+  `charset`, or its git attributes (`working-tree-encoding`, or
+  `encoding`) name, and saves back in it, byte order and BOM kept
+  (`taste_core::textfile::read_text`, `encode`). A character that
+  encoding cannot hold refuses the save and says which, rather than
+  writing something else in its place. Only a file that is not plain
+  UTF-8 asks: a UTF-8 file opens as it always did.
+- **A diff is shown as the repository's attributes say** (2026-10-26),
+  each answer git's own rather than a reimplementation
+  (`Worktree::diff_display`): a file marked `-diff` or `binary` is a
+  note, not lines; one marked `linguist-generated` is folded under its
+  counts with Show Diff; and every hunk's header names the function git
+  names for it — the `diff=` driver's `xfuncname`, git's built-in driver
+  for `rust`, `python`, and the rest, or git's default rule — read with
+  `diff -U0 --no-ext-diff --no-textconv`, so a pattern is read and
+  nothing a repository names is run. A hunk only the buffer's unsaved
+  edits make has no name until it is saved.
 - AI inline suggestions render as grey "ghost text" after the cursor
   (Tab accepts, Esc dismisses), sourced from the active ACP agent where the
   agent supports completion-shaped prompts, or from the escape hatch.

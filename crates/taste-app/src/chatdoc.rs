@@ -889,6 +889,17 @@ pub fn edit_counts(edit: &Edit) -> (usize, usize) {
 /// The diff of `edit`, in `layout`. With `clip`, only the first so many
 /// rows across its hunks, then a dim line saying how many more there were.
 pub fn diff_view(edit: &Edit, clip: Option<usize>, layout: Layout) -> DiffView {
+    diff_view_named(edit, clip, layout, &|_, _| None)
+}
+
+/// [`diff_view`], each hunk's header followed by the function `function`
+/// names for its old lines `from..from + len`, as git's own headers are.
+pub fn diff_view_named(
+    edit: &Edit,
+    clip: Option<usize>,
+    layout: Layout,
+    function: &dyn Fn(usize, usize) -> Option<String>,
+) -> DiffView {
     let hunks = hunks(&edit.old, &edit.new);
     let language = crate::languages::guess(&edit.path);
     let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -926,13 +937,19 @@ pub fn diff_view(edit: &Edit, clip: Option<usize>, layout: Layout) -> DiffView {
                 .max(row.left.1.chars().count())
                 .max(row.right.1.chars().count());
         }
+        let mut head = format!(
+            "@@ -{},{} +{},{} @@",
+            hunk.old_from, hunk.old_len, hunk.new_from, hunk.new_len
+        );
+        if let Some(name) = function(hunk.old_from, hunk.old_len) {
+            head.push(' ');
+            head.push_str(&name);
+        }
         column.append(
             &gtk::Label::builder()
-                .label(format!(
-                    "@@ -{},{} +{},{} @@",
-                    hunk.old_from, hunk.old_len, hunk.new_from, hunk.new_len
-                ))
+                .label(head)
                 .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["caption", "dim-label", "monospace", "hunk-head"])
                 .build(),
         );

@@ -3765,6 +3765,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "ec4rs",
+ "encoding_rs",
  "ignore",
  "libc",
  "notify",

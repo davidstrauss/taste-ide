@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub use encoding_rs::Encoding;
+
 /// How a file is stored: detected at load, overridden by `.editorconfig`.
 ///
 /// Buffers are LF-only and BOM-free internally; this is what puts the file
@@ -24,6 +26,9 @@ pub struct FileFormat {
     /// `end_of_line`: `Some(true)` = CRLF, `Some(false)` = LF, `None` =
     /// keep whatever the file had.
     pub eol_override: Option<bool>,
+    /// The encoding the file is stored in when it is not UTF-8, as its
+    /// project names it ([`read_text`]); `None` is UTF-8.
+    pub encoding: Option<&'static encoding_rs::Encoding>,
 }
 
 impl Default for FileFormat {
@@ -36,6 +41,7 @@ impl Default for FileFormat {
             // opinion; `.editorconfig` can still turn it off.
             final_newline: true,
             eol_override: None,
+            encoding: None,
         }
     }
 }
@@ -92,6 +98,9 @@ pub struct EditorConfig {
     /// `charset`: `Some(true)` demands a BOM, `Some(false)` forbids one,
     /// `None` leaves whatever the file had.
     bom: Option<bool>,
+    /// `charset` naming an encoding other than UTF-8: `latin1`,
+    /// `utf-16le`, or `utf-16be`.
+    pub charset: Option<&'static encoding_rs::Encoding>,
 }
 
 impl EditorConfig {
@@ -181,10 +190,19 @@ impl EditorConfig {
             Ok(EndOfLine::Lf) | Ok(EndOfLine::Cr) => Some(false),
             Err(_) => None,
         };
-        // Other charsets are not re-encoded: buffers are UTF-8.
         out.bom = match props.get::<Charset>() {
             Ok(Charset::Utf8Bom) => Some(true),
             Ok(Charset::Utf8) => Some(false),
+            _ => None,
+        };
+        // Buffers are UTF-8; these are decoded at a load and encoded again
+        // at a save ([`read_text`], [`encode`]). Latin-1 is read as
+        // windows-1252, whose decoder keeps the bytes 0x80 to 0x9F as the
+        // C1 controls Latin-1 has there, so a file goes back as it came.
+        out.charset = match props.get::<Charset>() {
+            Ok(Charset::Latin1) => Some(encoding_rs::WINDOWS_1252),
+            Ok(Charset::Utf16Le) => Some(encoding_rs::UTF_16LE),
+            Ok(Charset::Utf16Be) => Some(encoding_rs::UTF_16BE),
             _ => None,
         };
         out
@@ -200,7 +218,136 @@ impl EditorConfig {
         if let Some(bom) = self.bom {
             format.bom = bom;
         }
+        // A file read as plain ASCII still saves in the charset its
+        // project names, once something non-ASCII is typed into it.
+        if format.encoding.is_none() {
+            format.encoding = self.charset;
+        }
     }
+}
+
+/// A file's text: UTF-8, as nearly every file is, or decoded from the
+/// encoding its project says it is in, with that encoding to save it back
+/// in. **IO, through the service** — off the GTK main thread.
+///
+/// What says so, first to last: a UTF-16 byte-order mark; `.editorconfig`'s
+/// `charset`; and the file's git attributes, `working-tree-encoding` (git
+/// keeps the file UTF-8 in the repository and in this encoding in the
+/// working tree) or `encoding` (the one `gitk` and `git gui` show it in),
+/// read with `git check-attr` beside the file, which reads attributes and
+/// runs nothing. They are asked only of a file that is not plain UTF-8 —
+/// one that does not decode as UTF-8, or has a NUL in it, as UTF-16 does —
+/// so a UTF-8 file costs no more than it did. The BOM is kept in the text,
+/// where [`normalize_load`] finds it and a save puts it back, in the
+/// file's own byte order. A file that is not UTF-8 and names no encoding
+/// is refused as it always was.
+pub fn read_text(
+    files: &crate::files::Files,
+    path: &Path,
+) -> std::io::Result<(String, Option<&'static encoding_rs::Encoding>)> {
+    let bytes = files.read(path)?;
+    let utf8 = std::str::from_utf8(&bytes).is_ok();
+    if utf8 && !bytes.contains(&0) {
+        return Ok((String::from_utf8(bytes).unwrap_or_default(), None));
+    }
+    let named = declared_encoding(files, path, &bytes);
+    match named {
+        Some(encoding) if encoding != encoding_rs::UTF_8 => {
+            let (text, malformed) = encoding.decode_without_bom_handling(&bytes);
+            if malformed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("not valid {}", encoding.name()),
+                ));
+            }
+            Ok((text.into_owned(), Some(encoding)))
+        }
+        _ if utf8 => Ok((String::from_utf8(bytes).unwrap_or_default(), None)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )),
+    }
+}
+
+/// The encoding `path`'s bytes, its `.editorconfig`, or its attributes name
+/// ([`read_text`]).
+fn declared_encoding(
+    files: &crate::files::Files,
+    path: &Path,
+    bytes: &[u8],
+) -> Option<&'static encoding_rs::Encoding> {
+    match bytes {
+        [0xFF, 0xFE, ..] => return Some(encoding_rs::UTF_16LE),
+        [0xFE, 0xFF, ..] => return Some(encoding_rs::UTF_16BE),
+        _ => {}
+    }
+    if let Some(charset) = EditorConfig::read_via(files, path).charset {
+        return Some(charset);
+    }
+    let (dir, name) = (path.parent()?, path.file_name()?);
+    let argv: Vec<String> = [
+        "env",
+        "-u",
+        "GIT_ATTR_SOURCE",
+        "git",
+        "check-attr",
+        "-z",
+        "working-tree-encoding",
+        "encoding",
+        "--",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([name.to_string_lossy().into_owned()])
+    .collect();
+    let out = files.exec(dir, &argv).ok()?;
+    if !out.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let fields: Vec<&str> = text.split('\0').collect();
+    fields.chunks(3).find_map(|entry| match entry {
+        [_, _, value] if !matches!(*value, "unspecified" | "set" | "unset") => {
+            encoding_rs::Encoding::for_label(value.as_bytes())
+        }
+        _ => None,
+    })
+}
+
+/// The bytes `rendered` is saved as in `format`'s encoding: UTF-8, or the
+/// encoding it was read in. A character that encoding has no byte for is
+/// refused with its name rather than written as something else — the
+/// encoder's own fallback is an HTML character reference, which in a
+/// source file is a corruption nobody asked for.
+pub fn encode(rendered: &str, format: &FileFormat) -> Result<Vec<u8>, String> {
+    let Some(encoding) = format.encoding.filter(|e| *e != encoding_rs::UTF_8) else {
+        return Ok(rendered.as_bytes().to_vec());
+    };
+    // The WHATWG encoder writes UTF-8 for either UTF-16, so those two are
+    // written here.
+    if encoding == encoding_rs::UTF_16LE {
+        return Ok(rendered.encode_utf16().flat_map(u16::to_le_bytes).collect());
+    }
+    if encoding == encoding_rs::UTF_16BE {
+        return Ok(rendered.encode_utf16().flat_map(u16::to_be_bytes).collect());
+    }
+    let (bytes, _, unmappable) = encoding.encode(rendered);
+    if unmappable {
+        let missing = rendered
+            .chars()
+            .find(|c| {
+                let mut one = [0u8; 4];
+                encoding.encode(c.encode_utf8(&mut one)).2
+            })
+            .map(|c| format!(" (“{c}”)"))
+            .unwrap_or_default();
+        return Err(format!(
+            "it has a character {} cannot hold{missing}; it is kept in the editor, unsaved",
+            encoding.name()
+        ));
+    }
+    Ok(bytes.into_owned())
 }
 
 /// Strip the BOM and fold CRLF to LF, reporting what was there so a save can
@@ -221,15 +368,16 @@ pub fn normalize_load(raw: &str) -> (String, bool, bool) {
 /// back with, `.editorconfig` included. A missing file is not an error —
 /// it is a new file, and its format comes from `.editorconfig` alone.
 pub fn load(path: &Path) -> std::io::Result<(String, FileFormat)> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let (raw, encoding) = match read_text(&crate::files::Files::Local, path) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
         Err(e) => return Err(e),
     };
     let (text, crlf, bom) = normalize_load(&raw);
     let mut format = FileFormat {
         crlf,
         bom,
+        encoding,
         ..FileFormat::default()
     };
     format.apply_editorconfig(path);
@@ -242,15 +390,16 @@ pub fn load_via(files: &crate::files::Files, path: &Path) -> std::io::Result<(St
     if files.is_local() {
         return load(path);
     }
-    let raw = match files.read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let (raw, encoding) = match read_text(files, path) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
         Err(e) => return Err(e),
     };
     let (text, crlf, bom) = normalize_load(&raw);
     let mut format = FileFormat {
         crlf,
         bom,
+        encoding,
         ..FileFormat::default()
     };
     EditorConfig::read_via(files, path).apply_to(&mut format);
@@ -278,8 +427,9 @@ pub fn save_via(
         ));
     }
     let rendered = render(text, format);
+    let bytes = encode(&rendered, format).map_err(|e| format!("{}: {e}", path.display()))?;
     files
-        .write(path, rendered.as_bytes())
+        .write(path, &bytes)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(content_hash(&rendered))
 }
@@ -338,18 +488,79 @@ pub fn save(
         ));
     }
     let rendered = render(text, format);
+    let bytes = encode(&rendered, format).map_err(|e| format!("{}: {e}", path.display()))?;
     // Ghost-flow and agent writes both land in directories that may not
     // exist yet.
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, &rendered).map_err(|e| e.to_string())?;
+    std::fs::write(path, &bytes).map_err(|e| e.to_string())?;
     Ok(content_hash(&rendered))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file in the encoding its attributes name opens as its text and
+    /// saves as the same bytes: Latin-1 through `working-tree-encoding`,
+    /// UTF-16 through its byte-order mark, its BOM and byte order kept. A
+    /// character Latin-1 has no byte for is refused, never written as
+    /// something else.
+    #[test]
+    fn a_file_in_its_projects_encoding_reads_and_saves_as_itself() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            root.join(".gitattributes"),
+            "*.txt working-tree-encoding=ISO-8859-1\n",
+        )
+        .unwrap();
+        let latin = root.join("menu.txt");
+        std::fs::write(&latin, b"caf\xe9\n").unwrap();
+        let (text, format) = load(&latin).unwrap();
+        assert_eq!(text, "caf\u{e9}\n");
+        assert_eq!(format.encoding, Some(encoding_rs::WINDOWS_1252));
+        save(root, false, &latin, "caf\u{e9} cr\u{e8}me\n", &format).unwrap();
+        assert_eq!(std::fs::read(&latin).unwrap(), b"caf\xe9 cr\xe8me\n");
+        let refused = save(root, false, &latin, "\u{2603}\n", &format).unwrap_err();
+        assert!(refused.contains('\u{2603}'), "{refused}");
+        assert_eq!(std::fs::read(&latin).unwrap(), b"caf\xe9 cr\xe8me\n");
+
+        let wide = root.join("wide.dat");
+        let bytes: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain("hi\n".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        std::fs::write(&wide, &bytes).unwrap();
+        let (text, format) = load(&wide).unwrap();
+        assert_eq!((text.as_str(), format.bom), ("hi\n", true));
+        save(root, false, &wide, &text, &format).unwrap();
+        assert_eq!(std::fs::read(&wide).unwrap(), bytes);
+
+        // Plain UTF-8 asks nobody, and is what it always was.
+        let plain = root.join("plain.md");
+        std::fs::write(&plain, "caf\u{e9}\n").unwrap();
+        assert_eq!(load(&plain).unwrap().1.encoding, None);
+    }
 
     /// Trimming takes the spaces at the ends of lines and nothing else: the
     /// final newline and the blank lines before it stay.
@@ -374,6 +585,7 @@ mod tests {
             trim_trailing_ws: true,
             final_newline: true,
             eol_override: Some(false),
+            encoding: None,
         };
         let text = "**Star pitch**  \nline\n\n\n";
         assert_eq!(render(text, &editor), "**Star pitch**\nline\n\n\n");
