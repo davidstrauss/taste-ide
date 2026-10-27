@@ -1301,7 +1301,7 @@ body.single .pdfViewer .page { margin: 2px auto; }
    gone, the pointer hidden while it is still. */
 body.presenting { background: #000; }
 body.presenting #map { display: none; }
-body.presenting .pane { inset: 0; }
+body.presenting .pane { inset: 0; overflow: hidden; }
 body.presenting .pdfViewer { min-height: 100%; display: flex;
   align-items: center; justify-content: center; }
 body.presenting .pdfViewer .page { margin: 0 auto; box-shadow: none; }
@@ -1337,7 +1337,15 @@ try {
     const eventBus = new EventBus();
     const linkService = new PDFLinkService({ eventBus });
     const findController = new PDFFindController({ eventBus, linkService });
-    const viewer = new PDFViewer({ container, eventBus, linkService, findController });
+    // Presenting, a fitted page fills the screen: pdf.js otherwise keeps
+    // 40 pixels of a fit's width for a scrollbar, and 5 of its height,
+    // which stood as black bars down both sides of a slide shaped like
+    // the screen (David, 2026-10-26: "the left and right sides don't seem
+    // to go to the edge of my screen").
+    const removePageBorders = new URLSearchParams(location.search).get("present") === "1";
+    const viewer = new PDFViewer({
+      container, eventBus, linkService, findController, removePageBorders,
+    });
     linkService.setViewer(viewer);
     const it = { container, eventBus, linkService, viewer, findController, doc: null, location: null };
     eventBus.on("updateviewarea", (event) => { it.location = event.location; });
