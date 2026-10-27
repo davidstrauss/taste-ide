@@ -3328,7 +3328,9 @@ is shouted, but nothing runs either. The rows say what is missing, and
   failed and the peer's last one restores the environment instead.
 - **What the guest is**: Fedora CoreOS, pinned by release and digest
   (`taste_devcontainer::guest`), configured by Ignition
-  (`provision::ignition`): rootless podman as `core`, ssh in on a loopback
+  (`provision::ignition`) once per release, into the golden base its VMs
+  boot (`taste_devcontainer::golden`, "The guest, concretely" below):
+  rootless podman as `core`, ssh in on a loopback
   forward passt provides, the IDE-minted host key so the VM is known
   before first boot, and nftables on the guest's own egress — internet
   allowed, RFC1918 and link-local rejected — because host-side
@@ -4173,6 +4175,28 @@ loopback; the podman connection is registered against it as
 `ssh://core@127.0.0.1:<port>/run/user/1000/podman/podman.sock`, named for
 the domain. The serial console goes to a file, so a guest that does not
 come up is read rather than guessed at.
+
+**A release's VMs boot its golden base** (2026-10-26,
+`taste_devcontainer::golden`; docs/spikes/golden-base.md). The first VM
+of a release prepares it: the base image booted once in a builder VM that
+belongs to no workspace, with the same Ignition every VM was given, the
+baseline image built in it, everything that makes it one machine removed,
+and the disk flattened and zstd-compressed into a standalone qcow2, about
+1.2 GiB with the baseline image in it where the base image alone was 1.8.
+The base image is then pruned as soon as no VM overlays it, so the next
+golden base is a fresh download. A VM made from it boots past Ignition in
+seconds with the files service's image already there, and is told who it
+is through **systemd system credentials** in `fw_cfg` files
+(`provision::guest_credentials`): `system.hostname`, and a
+`tmpfiles.extra` that writes `/etc/hostname`, core's key, and the host
+key. They are files, never values on qemu's command line, which every
+user of the host can read. Credentials are also what systemd's IMDS
+import fills from a cloud instance's userdata, so a cloud host whose
+guest has it takes the same two, and nothing in the guest changes. Until
+then a cloud host boots Fedora CoreOS with Ignition, as does a local VM
+whose golden base could not be prepared. Being nobody's is what lets the
+builder's baseline image go under every project's checkouts, where a copy
+saved out of a workspace's VM may not.
 
 **Provisioner credentials are the PROJECT's, under the same rule as the
 Anthropic one** (David, 2026-09-17: "cloud provisioning keys are also

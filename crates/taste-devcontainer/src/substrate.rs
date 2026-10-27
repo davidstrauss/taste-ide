@@ -653,6 +653,9 @@ pub fn report_download(fetch: taste_core::GuestImageFetch) {
             format!("verifying the guest image {}", fetch.release)
         }
         GuestImagePhase::Verifying => return,
+        GuestImagePhase::Preparing => {
+            format!("preparing the base VMs boot from out of {}", fetch.release)
+        }
         GuestImagePhase::Ready => format!("the guest image {} is ready", fetch.release),
     };
     taste_core::app_log::push("info", "substrate", &line);

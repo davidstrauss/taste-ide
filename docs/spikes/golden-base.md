@@ -6,8 +6,9 @@ when a new base is needed. He also asked that whatever hands each VM its
 own identity be able to "seamlessly switch" to systemd's IMDS support once
 the guest's systemd has it. This note is the prototype, done by hand on
 throwaway VMs against Fedora CoreOS 44.20260928.3.2 (systemd 259.9), with
-what it measured and what it turned up. Nothing here is wired into the IDE
-yet.
+what it measured and what it turned up. It shipped the same day as
+`taste_devcontainer::golden`, with one change of transport (below, "As
+shipped").
 
 ## What was built
 
@@ -105,6 +106,19 @@ on 259 runs before the network is up.
   command line (CoreOS removes the flag after the builder's first boot),
   a clone boots past Ignition. Re-arming it is not a supported interface,
   and this design does not need it.
+
+## As shipped: fw_cfg files, not SMBIOS strings
+
+The prototype handed the credentials over as SMBIOS type 11 strings. libvirt
+puts those on qemu's command line, and every user of the host can read a
+process's command line in `/proc`: the guest's private host key would have
+been there. systemd reads the same credentials from `fw_cfg` as
+`opt/io.systemd.credentials/<name>`, and libvirt's `<sysinfo type='fwcfg'>`
+takes each as a **file**, which is how the Ignition config already
+travelled. Checked on systemd 259 before building on it: both credentials
+arrived ("Acquired 2 regular credentials"), and qemu's command line named
+only the files. A credential's name has 28 bytes there (`fw_cfg` names are
+55), which both of these fit.
 
 ## What wiring it in would take
 

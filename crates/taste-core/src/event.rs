@@ -51,6 +51,10 @@ pub enum GuestImagePhase {
     Decompressing,
     /// Decompressed; its digest being checked against the pin.
     Verifying,
+    /// Verified; the base every VM boots from being prepared from it in
+    /// a VM of its own (`taste_devcontainer::golden`). No measure: its
+    /// steps are said as lines.
+    Preparing,
     /// The base image is on disk and checked. Nothing to show.
     Ready,
 }
@@ -58,7 +62,10 @@ pub enum GuestImagePhase {
 impl GuestImagePhase {
     /// Whether something is happening that a person would want to see.
     pub fn active(self) -> bool {
-        matches!(self, Self::Fetching | Self::Decompressing | Self::Verifying)
+        matches!(
+            self,
+            Self::Fetching | Self::Decompressing | Self::Verifying | Self::Preparing
+        )
     }
 }
 

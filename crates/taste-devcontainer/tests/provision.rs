@@ -141,6 +141,12 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
     let root: &Path = workspace.path();
     {
         let repo = git2::Repository::init(root).unwrap();
+        // The author is the repository's own, as for any project: nothing
+        // takes one from the machine (CLAUDE.md → House rules), so a commit
+        // made in the VM below has nobody to sign as without it.
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "t").unwrap();
+        config.set_str("user.email", "t@t").unwrap();
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         let mut index = repo.index().unwrap();
         index

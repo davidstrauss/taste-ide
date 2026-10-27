@@ -160,6 +160,9 @@ pub fn ensure_image_with(
 /// not a minute of packages fetched and installed (David, 2026-10-22:
 /// "Could we optimize the files service to be at least cached as a
 /// build?"). A copy that will not load is removed and the image built.
+/// A VM made from a golden base has the image already, so this matters
+/// for an image the base does not carry: a baseline changed since the
+/// base was made, or a VM on a base image with no golden one.
 ///
 /// **Per workspace, never shared.** The copy comes out of a VM, where
 /// agents run, and the image it is goes under every checkout in the VM
@@ -184,11 +187,10 @@ pub fn ensure_image_kept(
         .is_ok()
     };
     let kept = kept_path(workspace_key, &tag);
+    // Already there — from the golden base the VM was made from
+    // (`crate::golden`), which carries it for every workspace — and no
+    // copy is wanted: the next VM is made from the same base.
     if exists(substrate) {
-        // Built before copies were kept: one is made now, for the next VM.
-        if !kept.is_file() {
-            keep_in_background(substrate, &tag, kept);
-        }
         return Ok(tag);
     }
     if kept.is_file() {

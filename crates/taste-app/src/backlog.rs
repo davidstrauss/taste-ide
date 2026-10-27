@@ -3197,6 +3197,11 @@ impl BacklogPanel {
                 "Verifying Fedora CoreOS {} against its pinned digest: {progress}{pace}.",
                 fetch.release
             ),
+            GuestImagePhase::Preparing => format!(
+                "Preparing the base every VM boots from out of Fedora CoreOS {}: a VM of its \
+                 own, the files service's image built in it, then compressed. Once per release.",
+                fetch.release
+            ),
             GuestImagePhase::Absent | GuestImagePhase::Ready => String::new(),
         };
         self.guest_fetch_box.set_tooltip_text(Some(&tooltip));

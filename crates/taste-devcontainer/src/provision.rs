@@ -173,9 +173,8 @@ pub struct DomainSpec {
     /// (`crate::guest`), never the pinned file itself, which is a base
     /// shared by every machine.
     pub disk: String,
-    /// The Ignition config, as a file the guest reads once through
-    /// `fw_cfg`.
-    pub ignition: String,
+    /// What the guest is told at boot, and how ([`GuestBoot`]).
+    pub boot: GuestBoot,
     /// The loopback port on the host that passt forwards to the guest's
     /// sshd. The one inbound door.
     pub ssh_port: u16,
@@ -185,6 +184,26 @@ pub struct DomainSpec {
     /// come up is read here rather than guessed at.
     pub serial_log: String,
 }
+
+/// What a guest is told when it boots, always through `fw_cfg` and always
+/// as files: a value on a qemu command line is readable by every user of
+/// this host in `/proc`, and both of these carry the guest's private host
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestBoot {
+    /// An Ignition config, read once on the guest's first boot: a VM made
+    /// from Fedora CoreOS as it ships, and the VM a golden base is prepared
+    /// in (`crate::golden`).
+    Ignition(String),
+    /// systemd system credentials, `(name, file)`, each read as
+    /// `opt/io.systemd.credentials/<name>`: a VM made from a golden base,
+    /// which has been through Ignition already ([`guest_credentials`]).
+    Credentials(Vec<(String, String)>),
+}
+
+/// The longest credential name `fw_cfg` carries: its names are 55 bytes,
+/// and `opt/io.systemd.credentials/` takes 27 of them.
+const FW_CFG_CREDENTIAL_NAME_MAX: usize = 55 - "opt/io.systemd.credentials/".len();
 
 /// The guest's balloon, there to give memory back rather than to take
 /// it: never inflated, it carries **free page reporting**, the guest
@@ -232,7 +251,6 @@ pub fn domain_xml(spec: &DomainSpec) -> Result<String> {
     let mut xml = String::new();
     let name = escape(&spec.name);
     let disk = escape(&spec.disk);
-    let ignition = escape(&spec.ignition);
     let workspace = escape(&spec.workspace_root);
     let serial_log = escape(&spec.serial_log);
     writeln!(xml, "<domain type='kvm'>")?;
@@ -263,12 +281,32 @@ pub fn domain_xml(spec: &DomainSpec) -> Result<String> {
     )?;
     writeln!(xml, "    <boot dev='hd'/>")?;
     writeln!(xml, "  </os>")?;
-    // The Ignition config, handed to the guest through firmware config.
+    // What the guest is told, handed to it through firmware config.
     writeln!(xml, "  <sysinfo type='fwcfg'>")?;
-    writeln!(
-        xml,
-        "    <entry name='opt/com.coreos/config' file='{ignition}'/>"
-    )?;
+    match &spec.boot {
+        GuestBoot::Ignition(file) => writeln!(
+            xml,
+            "    <entry name='opt/com.coreos/config' file='{}'/>",
+            escape(file)
+        )?,
+        GuestBoot::Credentials(credentials) => {
+            for (name, file) in credentials {
+                if name.is_empty()
+                    || name.len() > FW_CFG_CREDENTIAL_NAME_MAX
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                {
+                    bail!("{name:?} cannot be a credential's name in fw_cfg");
+                }
+                writeln!(
+                    xml,
+                    "    <entry name='opt/io.systemd.credentials/{name}' file='{}'/>",
+                    escape(file)
+                )?;
+            }
+        }
+    }
     writeln!(xml, "  </sysinfo>")?;
     writeln!(xml, "  <features>")?;
     writeln!(xml, "    <acpi/>")?;
@@ -692,6 +730,68 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
     serde_json::to_string_pretty(&config).context("serialising the ignition config")
 }
 
+/// What makes a VM booted from a golden base this VM, as systemd system
+/// credentials: its hostname, the key the IDE logs in with, and its ssh
+/// host key. Everything else a VM of the IDE's carries is in the golden
+/// base already, put there by [`ignition`] (`crate::golden`).
+///
+/// **The credentials are the interface, not the transport.** Here they
+/// travel as `fw_cfg` files ([`GuestBoot::Credentials`]). systemd's IMDS
+/// support (`systemd-imds-import.service`, systemd 261) imports a cloud
+/// instance's userdata `systemd.credentials` the same way, so a cloud host
+/// whose guest has it would be handed these same two in its userdata, and
+/// nothing in the guest would change (docs/spikes/golden-base.md). The
+/// guest consumes them with systemd's own units and nothing of ours:
+///
+/// - `system.hostname`: PID 1 sets the hostname from it at the earliest
+///   point. A transient name alone lost to DHCP a minute in, and DHCP
+///   through passt carries the host's own hostname, so the same name is
+///   written to `/etc/hostname` below as well.
+/// - `tmpfiles.extra`: `systemd-tmpfiles-setup` writes `/etc/hostname`,
+///   core's authorized key, and the host key. The initrd's run of it fails
+///   on `core`, who does not exist there, and the real root's writes it all
+///   a moment later; numeric ids would quiet that by writing the host key
+///   into the initrd's tmpfs.
+///
+/// `metadata_server` and `deny_private_networks` are the golden base's,
+/// fixed when it was made, so they are not said here.
+pub fn guest_credentials(spec: &GuestSpec) -> Result<Vec<(&'static str, String)>> {
+    use base64::Engine as _;
+    if spec.ssh_public_key.trim().is_empty() {
+        bail!("a guest with no ssh key is a guest the IDE cannot reach");
+    }
+    if spec.hostname.is_empty() || spec.hostname.contains(char::is_whitespace) {
+        bail!("{:?} cannot be a guest's hostname", spec.hostname);
+    }
+    let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+    let home = format!("/var/home/{GUEST_USER}");
+    let mut lines = vec![
+        format!("f+ /etc/hostname 0644 root root - {}", spec.hostname),
+        format!("d {home}/.ssh 0700 {GUEST_USER} {GUEST_USER} -"),
+        format!("d {home}/.ssh/authorized_keys.d 0700 {GUEST_USER} {GUEST_USER} -"),
+        format!(
+            "f+~ {home}/.ssh/authorized_keys.d/taste 0600 {GUEST_USER} {GUEST_USER} - {}",
+            b64(&format!("{}\n", spec.ssh_public_key.trim()))
+        ),
+    ];
+    if let Some(host_key) = &spec.host_key {
+        lines.push(format!(
+            "f+~ /etc/ssh/ssh_host_ed25519_key 0600 root root - {}",
+            b64(&host_key.private)
+        ));
+        lines.push(format!(
+            "f+~ /etc/ssh/ssh_host_ed25519_key.pub 0644 root root - {}",
+            b64(&host_key.public)
+        ));
+    }
+    let mut tmpfiles = lines.join("\n");
+    tmpfiles.push('\n');
+    Ok(vec![
+        ("system.hostname", spec.hostname.clone()),
+        ("tmpfiles.extra", tmpfiles),
+    ])
+}
+
 /// The ruleset that keeps a guest off the user's network.
 ///
 /// Output filtering, so it covers everything in the guest including every
@@ -985,6 +1085,13 @@ impl Vm {
         self.guest_dir().join(format!("{}.ign", self.domain))
     }
 
+    /// Where a VM made from a golden base keeps the credentials it boots
+    /// with ([`guest_credentials`]), one file each, as `fw_cfg` reads them.
+    pub fn credentials_dir(&self) -> PathBuf {
+        self.guest_dir()
+            .join(format!("{}.credentials", self.domain))
+    }
+
     pub fn serial_log_path(&self) -> PathBuf {
         self.guest_dir().join(format!("{}.serial.log", self.domain))
     }
@@ -1079,7 +1186,7 @@ pub type StepSink = std::sync::Arc<dyn Fn(&str, String) + Send + Sync>;
 /// with no credential: it is the user.
 #[derive(Clone)]
 pub struct LibvirtSession {
-    sandboxed: bool,
+    pub(crate) sandboxed: bool,
     /// The VM log, when the caller keeps one. Every step here is also a
     /// tracing line, so the IDE log has the story either way.
     sink: Option<StepSink>,
@@ -1159,7 +1266,7 @@ impl LibvirtSession {
         Some(release)
     }
 
-    async fn run(&self, program: &str, args: Vec<String>) -> Result<String> {
+    pub(crate) async fn run(&self, program: &str, args: Vec<String>) -> Result<String> {
         let what = format!("{program} {}", subcommand(&args));
         let (program, args) = host_argv(self.sandboxed, program, args);
         let output = tokio::process::Command::new(&program)
@@ -1177,7 +1284,7 @@ impl LibvirtSession {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    async fn virsh(&self, args: &[&str]) -> Result<String> {
+    pub(crate) async fn virsh(&self, args: &[&str]) -> Result<String> {
         let mut argv = vec!["-c".to_string(), SESSION_URI.to_string()];
         argv.extend(args.iter().map(|s| s.to_string()));
         self.run("virsh", argv).await
@@ -1319,9 +1426,33 @@ impl LibvirtSession {
         report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> Result<Vm> {
         // The base first: a first launch downloads it, and the room the
-        // new disk is judged against is what is left after it.
+        // new disk is judged against is what is left after it. A release's
+        // first VM prepares its golden base from it; one that cannot be
+        // prepared leaves this VM on the base image as Fedora ships it,
+        // with an Ignition, as every VM was before.
         let image = crate::guest::image()?;
-        let base = image.ensure_base(self.sandboxed, report).await?;
+        let mut base = image.ensure_base(self.sandboxed, report.clone()).await?;
+        if base != image.golden_path() {
+            match crate::golden::ensure(self, &image, &base, report).await {
+                Ok(golden) => base = golden,
+                Err(e) => {
+                    taste_core::app_log::push(
+                        "warn",
+                        "substrate",
+                        &format!(
+                            "the golden base for {} could not be prepared ({e:#}); this VM \
+                             boots the base image with an Ignition instead",
+                            image.release
+                        ),
+                    );
+                    self.say(
+                        "golden",
+                        format!("not prepared ({e:#}); booting the base image as it ships"),
+                    );
+                }
+            }
+        }
+        let golden = base == image.golden_path();
         // Made only when the host has room for its start beside what the
         // other disks could still grow into, so the VMs together cannot
         // take the desktop's disk under the floor — decided and the disk
@@ -1346,14 +1477,26 @@ impl LibvirtSession {
             cloud: None,
         };
 
-        let ignition_text = ignition(&GuestSpec {
+        let guest = GuestSpec {
             ssh_public_key: keys.identity_public()?,
             hostname: domain.clone(),
             deny_private_networks: true,
             host_key: Some(keys.host_key()?),
             metadata_server: false,
-        })?;
-        write_private(&vm.ignition_path(), &ignition_text)?;
+        };
+        let boot = if golden {
+            let dir = vm.credentials_dir();
+            let mut files = Vec::new();
+            for (name, value) in guest_credentials(&guest)? {
+                let file = dir.join(name);
+                write_private(&file, &value)?;
+                files.push((name.to_string(), file.display().to_string()));
+            }
+            GuestBoot::Credentials(files)
+        } else {
+            write_private(&vm.ignition_path(), &ignition(&guest)?)?;
+            GuestBoot::Ignition(vm.ignition_path().display().to_string())
+        };
 
         let disk = vm.disk_path();
         std::fs::create_dir_all(disks_dir())
@@ -1383,7 +1526,7 @@ impl LibvirtSession {
             vcpus: sizing.vcpus,
             memory_mib: sizing.memory_mib,
             disk: disk.display().to_string(),
-            ignition: vm.ignition_path().display().to_string(),
+            boot,
             ssh_port,
             workspace_root: workspace_root.display().to_string(),
             serial_log: vm.serial_log_path().display().to_string(),
@@ -1399,17 +1542,23 @@ impl LibvirtSession {
         if let Err(e) = defined {
             let _ = std::fs::remove_file(&disk);
             let _ = std::fs::remove_file(vm.ignition_path());
+            let _ = std::fs::remove_dir_all(vm.credentials_dir());
             return Err(e);
         }
         keys.record_host(ssh_port)?;
         self.say(
             &domain,
             format!(
-                "defined for {} — {} vCPU, {} MiB, a {} GiB disk on the pinned image, ssh forwarded on 127.0.0.1:{ssh_port}",
+                "defined for {} — {} vCPU, {} MiB, a {} GiB disk on the {}, ssh forwarded on 127.0.0.1:{ssh_port}",
                 workspace_root.display(),
                 sizing.vcpus,
                 sizing.memory_mib,
-                sizing.disk_gib
+                sizing.disk_gib,
+                if golden {
+                    "golden base"
+                } else {
+                    "pinned image"
+                }
             ),
         );
         Ok(vm)
@@ -1995,6 +2144,7 @@ impl LibvirtSession {
             .with_context(|| format!("undefining {}", vm.domain))?;
         for path in [
             vm.disk_path(),
+            vm.release_path(),
             crate::disposable::marker_path(&vm.domain),
             vm.ignition_path(),
             vm.serial_log_path(),
@@ -2005,6 +2155,7 @@ impl LibvirtSession {
                 Err(e) => tracing::warn!("removing {}: {e}", path.display()),
             }
         }
+        let _ = std::fs::remove_dir_all(vm.credentials_dir());
         let podman = PodmanTarget::local(self.sandboxed);
         let (program, args) = podman.argv(["system", "connection", "remove", &vm.domain]);
         let _ = tokio::process::Command::new(program)
@@ -2015,7 +2166,7 @@ impl LibvirtSession {
         Keys::for_workspace(&vm.workspace_root).forget_host(vm.ssh_port)?;
         self.say(
             &vm.domain,
-            "destroyed — the domain, its disk, its Ignition, its console log, and its connection are gone",
+            "destroyed — the domain, its disk, its Ignition or credentials, its console log, and its connection are gone",
         );
         Ok(())
     }
@@ -2248,7 +2399,7 @@ fn serial_tail(path: &Path, lines: usize) -> String {
 
 /// Written `0600` from the first byte: the Ignition carries the guest's
 /// private host key.
-fn write_private(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, text: &str) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
@@ -2266,9 +2417,14 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
 }
 
 /// `44.20260829.3.1` of a base image's path,
-/// `…/fedora-coreos-44.20260829.3.1-qemu.x86_64.qcow2`.
+/// `…/fedora-coreos-44.20260829.3.1-qemu.x86_64.qcow2`, or of a golden
+/// base's, `…/taste-base-44.20260829.3.1-x86_64-r1.qcow2`.
 pub fn release_from_base_name(path: &str) -> Option<String> {
     let name = path.rsplit('/').next()?;
+    if let Some(rest) = name.strip_prefix("taste-base-") {
+        let (release, _) = rest.split_once('-')?;
+        return Some(release.to_string());
+    }
     let rest = name.strip_prefix("fedora-coreos-")?;
     let (release, _) = rest.split_once("-qemu.")?;
     Some(release.to_string())
@@ -2492,7 +2648,9 @@ mod tests {
             vcpus: 8,
             memory_mib: 10240,
             disk: "/home/dev/.local/share/taste-ide/guests/machines/ws.qcow2".into(),
-            ignition: "/home/dev/.local/state/taste-ide/workspaces/ws/guest/ws.ign".into(),
+            boot: GuestBoot::Ignition(
+                "/home/dev/.local/state/taste-ide/workspaces/ws/guest/ws.ign".into(),
+            ),
             ssh_port: 40022,
             workspace_root: "/home/dev/Projects/ws".into(),
             serial_log: "/home/dev/.local/state/taste-ide/workspaces/ws/guest/ws.serial.log".into(),
@@ -2820,6 +2978,81 @@ mod tests {
             );
         }
         assert!(GUEST_MASKED_UNITS.contains(&"zincati.service"));
+    }
+
+    /// A VM made from a golden base is told who it is through fw_cfg files
+    /// under systemd's credential names, and never through an Ignition.
+    #[test]
+    fn a_golden_vm_boots_with_credentials_in_fw_cfg() {
+        let xml = domain_xml(&DomainSpec {
+            boot: GuestBoot::Credentials(vec![
+                (
+                    "system.hostname".into(),
+                    "/s/x.credentials/system.hostname".into(),
+                ),
+                (
+                    "tmpfiles.extra".into(),
+                    "/s/x.credentials/tmpfiles.extra".into(),
+                ),
+            ]),
+            ..spec()
+        })
+        .unwrap();
+        assert!(xml.contains(
+            "<entry name='opt/io.systemd.credentials/tmpfiles.extra' file='/s/x.credentials/tmpfiles.extra'/>"
+        ));
+        assert!(xml.contains("opt/io.systemd.credentials/system.hostname"));
+        assert!(!xml.contains("com.coreos"), "{xml}");
+        // fw_cfg names are 55 bytes, and a name could otherwise inject.
+        for bad in ["", "a'/><x", &"n".repeat(29)] {
+            let spec = DomainSpec {
+                boot: GuestBoot::Credentials(vec![(bad.to_string(), "/f".into())]),
+                ..spec()
+            };
+            assert!(domain_xml(&spec).is_err(), "{bad:?}");
+        }
+    }
+
+    /// What a golden VM is given: its name, statically, the IDE's key for
+    /// core, and its host key, every file in one tmpfiles credential.
+    #[test]
+    fn a_golden_vms_credentials_carry_its_name_and_keys() {
+        use base64::Engine as _;
+        let spec = GuestSpec {
+            host_key: Some(crate::keys::HostKey {
+                private: "-----PRIVATE-----\n".into(),
+                public: "ssh-ed25519 HOSTKEY\n".into(),
+            }),
+            ..guest()
+        };
+        let credentials = guest_credentials(&spec).unwrap();
+        let names: Vec<&str> = credentials.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["system.hostname", "tmpfiles.extra"]);
+        assert_eq!(credentials[0].1, spec.hostname);
+        let tmpfiles = &credentials[1].1;
+        let b64 = |t: &str| base64::engine::general_purpose::STANDARD.encode(t);
+        for line in [
+            format!("f+ /etc/hostname 0644 root root - {}", spec.hostname),
+            format!(
+                "f+~ /var/home/core/.ssh/authorized_keys.d/taste 0600 core core - {}",
+                b64(&format!("{}\n", spec.ssh_public_key.trim()))
+            ),
+            format!(
+                "f+~ /etc/ssh/ssh_host_ed25519_key 0600 root root - {}",
+                b64("-----PRIVATE-----\n")
+            ),
+        ] {
+            assert!(
+                tmpfiles.lines().any(|l| l == line),
+                "{line}\nin\n{tmpfiles}"
+            );
+        }
+        assert!(tmpfiles.ends_with('\n'));
+        assert!(guest_credentials(&GuestSpec {
+            ssh_public_key: " ".into(),
+            ..guest()
+        })
+        .is_err());
     }
 
     /// A VM made before the balloon gets it in place of the no-balloon it

@@ -763,6 +763,7 @@ impl StartupPage {
         let doing = match fetch.phase {
             P::Fetching => "downloading",
             P::Decompressing => "unpacking",
+            P::Preparing => "preparing the base VMs boot from",
             _ => "verifying",
         };
         let detail = if fetch.total > 0 {

@@ -27,6 +27,14 @@
 //! be against digests a commit wrote in — so what changed is who vouches
 //! for the bits, not whether anything does.
 //!
+//! # What a VM boots
+//!
+//! is not the base image as Fedora ships it, once a release's **golden
+//! base** is prepared from it (`crate::golden`): that base, booted once and
+//! made into one of the IDE's, is what every later VM of the release
+//! overlays, and the base image it came from is pruned once no VM
+//! overlays it ([`prune_unused_bases`]).
+//!
 //! The download and the digest check are [`taste_models::fetch_pinned`],
 //! reused rather than reimplemented: a second downloader would be a second
 //! place to get the verification subtly wrong.
@@ -131,12 +139,38 @@ impl GuestImage {
         ))
     }
 
+    /// The **golden base** this release's VMs boot from: the base image
+    /// booted once, given everything a VM of the IDE's carries, generalised,
+    /// and compressed (`crate::golden`). Named for the release and for
+    /// [`crate::golden::REVISION`], so a change to how it is made makes a
+    /// new one rather than reusing an old one.
+    pub fn golden_path(&self) -> PathBuf {
+        images_dir().join(format!(
+            "taste-base-{}-{}-r{}.qcow2",
+            self.release,
+            self.arch,
+            crate::golden::REVISION
+        ))
+    }
+
+    /// Whether the golden base is here. It takes its name only once it is
+    /// whole (`crate::golden`), so a file under the name is the base.
+    pub fn golden_is_present(&self) -> bool {
+        self.golden_path().is_file()
+    }
+
+    /// Whether this release can make a VM without a download: its golden
+    /// base, or the verified base image it is prepared from.
+    pub fn base_is_present(&self) -> bool {
+        self.golden_is_present() || self.source_is_present()
+    }
+
     /// Whether the base image is here and was verified: its digest marker
     /// names this release's uncompressed digest — written only once the
     /// hash matched, so nothing rehashes two gigabytes on a launch — or,
     /// for a base made before markers, it is the size the compiled-in
     /// release states.
-    pub fn base_is_present(&self) -> bool {
+    pub fn source_is_present(&self) -> bool {
         let Ok(meta) = std::fs::metadata(self.base_path()) else {
             return false;
         };
@@ -154,27 +188,7 @@ impl GuestImage {
     /// dropped: an exclusive `flock` on a file beside the base image,
     /// waited for off the runtime's threads.
     async fn fetch_lock(&self) -> Result<std::fs::File> {
-        let path = self.base_path().with_extension("qcow2.lock");
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        tokio::task::spawn_blocking(move || {
-            use std::os::fd::AsRawFd;
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&path)
-                .with_context(|| format!("opening {}", path.display()))?;
-            // SAFETY: the descriptor is the open file's, alive for the call.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("locking {}", path.display()));
-            }
-            Ok(file)
-        })
-        .await
-        .context("waiting for the guest image's fetch lock")?
+        lock_file(self.base_path().with_extension("qcow2.lock")).await
     }
 
     /// The day the release was built, as its version names it:
@@ -190,8 +204,14 @@ impl GuestImage {
     /// The day the base image was checked against the pin: the file takes
     /// its name only once its digest matches, and nothing writes it again,
     /// so its modification time is that moment.
+    /// A golden base is made only from a verified one, and only once, so
+    /// its own time is the same answer when the base it came from is gone.
     pub fn verified_on(&self) -> Option<String> {
-        let modified = std::fs::metadata(self.base_path()).ok()?.modified().ok()?;
+        let modified = std::fs::metadata(self.base_path())
+            .or_else(|_| std::fs::metadata(self.golden_path()))
+            .ok()?
+            .modified()
+            .ok()?;
         let secs = modified
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -206,7 +226,11 @@ impl GuestImage {
     /// image at the right size is ready.
     pub fn status(&self) -> GuestImageFetch {
         let unpacked = self.uncompressed_bytes.unwrap_or(0);
-        let (phase, done, total) = if self.base_is_present() {
+        let (phase, done, total) = if self.golden_is_present() {
+            (GuestImagePhase::Ready, unpacked, unpacked)
+        } else if crate::golden::preparing(self) {
+            (GuestImagePhase::Preparing, 0, 0)
+        } else if self.source_is_present() {
             (GuestImagePhase::Ready, unpacked, unpacked)
         } else if let Ok(part) = std::fs::metadata(self.base_path().with_extension("qcow2.part")) {
             (GuestImagePhase::Decompressing, part.len(), unpacked)
@@ -244,10 +268,12 @@ impl GuestImage {
         });
     }
 
-    /// The base image, fetched and decompressed if this host has never had
-    /// it, and verified against the pinned uncompressed digest before it is
-    /// given its name. Every phase is reported as it starts and the fetch
-    /// as it goes.
+    /// The base a VM of this release is made from: the golden base when it
+    /// is here, else the base image, fetched and decompressed if this host
+    /// has never had it, and verified against the pinned uncompressed
+    /// digest before it is given its name. Every phase is reported as it
+    /// starts and the fetch as it goes. Preparing the golden base from the
+    /// base image is [`crate::golden::ensure`]'s, which needs a VM.
     ///
     /// `xz` runs on the host through the same wrapper every host program
     /// is reached by; the sandbox's own `xz` would do, but the file it
@@ -259,7 +285,11 @@ impl GuestImage {
     ) -> Result<PathBuf> {
         let base = self.base_path();
         let unpacked = self.uncompressed_bytes.unwrap_or(0);
-        if self.base_is_present() {
+        if self.golden_is_present() {
+            self.report(&*report, GuestImagePhase::Ready, unpacked, unpacked);
+            return Ok(self.golden_path());
+        }
+        if self.source_is_present() {
             self.report(&*report, GuestImagePhase::Ready, unpacked, unpacked);
             return Ok(base);
         }
@@ -271,7 +301,11 @@ impl GuestImage {
         // image present. A file lock, so another project's IDE on this
         // machine waits the same way.
         let _lock = self.fetch_lock().await?;
-        if self.base_is_present() {
+        if self.golden_is_present() {
+            self.report(&*report, GuestImagePhase::Ready, unpacked, unpacked);
+            return Ok(self.golden_path());
+        }
+        if self.source_is_present() {
             self.report(&*report, GuestImagePhase::Ready, unpacked, unpacked);
             return Ok(base);
         }
@@ -540,17 +574,28 @@ fn newest_present(arch: &str) -> Option<GuestImage> {
 /// marker is beside it, which is written only once the digest matched.
 fn newest_present_in(dir: &Path, arch: &str) -> Option<GuestImage> {
     let suffix = format!("-qemu.{arch}.qcow2");
+    let golden_suffix = format!("-{arch}-r{}.qcow2", crate::golden::REVISION);
     let mut found: Vec<GuestImage> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
-            let release = name
-                .strip_prefix("fedora-coreos-")?
-                .strip_suffix(&suffix)?
-                .to_string();
-            let marker = entry.path().with_extension("qcow2.sha256");
-            let digest = std::fs::read_to_string(marker).ok()?.trim().to_string();
+            // A golden base is whole once it has its name, and is the
+            // answer with no digest to carry.
+            let (release, digest) = if let Some(release) = name
+                .strip_prefix("taste-base-")
+                .and_then(|rest| rest.strip_suffix(&golden_suffix))
+            {
+                (release.to_string(), String::new())
+            } else {
+                let release = name
+                    .strip_prefix("fedora-coreos-")?
+                    .strip_suffix(&suffix)?
+                    .to_string();
+                let marker = entry.path().with_extension("qcow2.sha256");
+                let digest = std::fs::read_to_string(marker).ok()?.trim().to_string();
+                (release, digest)
+            };
             Some(GuestImage {
                 release,
                 arch: if arch == "aarch64" {
@@ -703,6 +748,34 @@ fn sha256_file(path: &Path, progress: impl Fn(u64)) -> Result<String> {
         .collect())
 }
 
+/// An exclusive `flock` on `path`, made if it is not there, held until the
+/// returned file is dropped and waited for off the runtime's threads: one
+/// fetch, or one preparation of a base, at a time on this machine, and a
+/// second caller waits and finds the work done. A file lock, so another
+/// project's IDE waits the same way.
+pub(crate) async fn lock_file(path: PathBuf) -> Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    tokio::task::spawn_blocking(move || {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: the descriptor is the open file's, alive for the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("locking {}", path.display()));
+        }
+        Ok(file)
+    })
+    .await
+    .context("waiting for a lock on the guest images")?
+}
+
 /// `$XDG_DATA_HOME/taste-ide/guests`, beside the models directory and
 /// separate from it: a bootable operating system is not a model, and a
 /// directory that said otherwise would be the kind of small lie that
@@ -720,7 +793,11 @@ pub fn images_dir() -> PathBuf {
 /// downloads and digest markers; the bytes that freed. The current
 /// release's base is always kept — the next VM is made from it — and when
 /// the current release cannot be told, nothing is removed, since removing
-/// it would cost the next launch a gigabyte's download.
+/// it would cost the next launch a gigabyte's download. Once its golden
+/// base is here, that is the one kept, and the base image it was prepared
+/// from goes as soon as no VM overlays it: a new golden base is prepared
+/// from a fresh download (David, 2026-10-26: "toss out all other source
+/// data (and redownload if I need a new VM base image)").
 ///
 /// Each release is a base of its own, and a VM keeps the release it was
 /// made from for life, so a base outlives its pin for as long as one disk
@@ -730,11 +807,12 @@ pub fn prune_unused_bases() -> u64 {
     let Ok(current) = image() else {
         return 0;
     };
-    prune_bases_in(
-        &images_dir(),
-        &crate::provision::disks_dir(),
-        &current.base_path(),
-    )
+    let keep = if current.golden_is_present() {
+        current.golden_path()
+    } else {
+        current.base_path()
+    };
+    prune_bases_in(&images_dir(), &crate::provision::disks_dir(), &keep)
 }
 
 /// The downloads whose base image is here and verified, removed: a
