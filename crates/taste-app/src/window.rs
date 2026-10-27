@@ -251,6 +251,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.set_unsaved_under(move |path| editor.unsaved_under(path));
     }
     {
+        // A checkout out of reach while its environment is being brought
+        // up says so, rather than that its VM stopped answering.
+        let environments = environments.clone();
+        filetree.set_coming_up(move |env| {
+            use taste_devcontainer::SupervisorState as S;
+            match environments.get(env)?.state() {
+                S::Preparing { what } if what.starts_with("moving") => {
+                    Some("Moving to a new VM — files return once it is placed".to_string())
+                }
+                S::Preparing { .. } | S::Building | S::Starting => {
+                    Some("Its VM is starting — files return once it answers".to_string())
+                }
+                _ => None,
+            }
+        });
+    }
+    {
         // Changed-list rows open as diffs: the tab lands on its Changes face.
         let editor = editor.clone();
         filetree.set_on_open_diff(move |path| editor.open_changes(&path));
@@ -4629,9 +4646,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // back out when it goes. This is the only
                         // subscriber here that is not primary-only.
                         chats.on_environment_state(&env, &state);
-                        // The empty page's play comes and goes with it.
+                        // The empty page's play comes and goes with it, and
+                        // an unreachable checkout's line says what is under
+                        // way.
                         if filetree.aimed_environment() == env {
                             dress_call_for_events(&env);
+                            filetree.on_environment_state();
                         }
                         let running = matches!(
                             state,

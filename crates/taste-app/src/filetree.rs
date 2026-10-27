@@ -673,6 +673,10 @@ pub struct FileTree {
     /// The open files with unsaved edits at or under a path, which a move
     /// of it waits for (`Editor::unsaved_under`).
     unsaved_under: RefCell<Option<Box<dyn Fn(&Path) -> Vec<PathBuf>>>>,
+    /// What an environment that is coming up is doing, in the words its
+    /// unreachable checkout is told in, or `None` for one at rest
+    /// ([`Self::set_coming_up`]).
+    coming_up: RefCell<Option<ComingUp>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
     on_open_diff: RefCell<Option<OpenDiffCallback>>,
     /// What syncs though git ignores it (`Worktree::sync_ignored`): the
@@ -909,6 +913,9 @@ pub struct Aim {
     pub peer: PathBuf,
     pub exec: taste_core::ExecContext,
 }
+
+/// What a file tree asks of an environment's state ([`FileTree::set_coming_up`]).
+type ComingUp = Box<dyn Fn(&taste_core::environment::EnvironmentId) -> Option<String>>;
 
 /// The same aim: the same environment's checkout, read the same way. The
 /// execution target is a live handle, the same one either way.
@@ -2311,6 +2318,7 @@ impl FileTree {
             dragging: RefCell::new(None),
             on_moved: RefCell::new(None),
             unsaved_under: RefCell::new(None),
+            coming_up: RefCell::new(None),
             on_open_diff: RefCell::new(None),
             sync_ignored: RefCell::new(Default::default()),
             commit_suggester: RefCell::new(None),
@@ -3671,6 +3679,25 @@ impl FileTree {
 
     pub fn set_unsaved_under(&self, f: impl Fn(&Path) -> Vec<PathBuf> + 'static) {
         *self.unsaved_under.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// How to ask whether an environment is being brought up — started,
+    /// rebuilt, or moved to another VM — and what to say of its checkout
+    /// meanwhile ([`Self::apply_unreachable`]).
+    pub fn set_coming_up(
+        &self,
+        f: impl Fn(&taste_core::environment::EnvironmentId) -> Option<String> + 'static,
+    ) {
+        *self.coming_up.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// The aimed environment's state moved: an unreachable checkout's line
+    /// is said again, so a start or a move under way never reads as a VM
+    /// that stopped answering, nor the reverse.
+    pub fn on_environment_state(self: &Rc<Self>) {
+        if self.unreachable.get() {
+            self.apply_unreachable(&self.view_root());
+        }
     }
 
     pub fn set_on_open_diff(&self, f: impl Fn(PathBuf) + 'static) {
@@ -6364,8 +6391,20 @@ impl FileTree {
     /// says why (David, 2026-09-21: "I shouldn't see 'initialize repo'
     /// under these circumstances. I stopped the VM"). The next status
     /// that succeeds puts everything back.
+    ///
+    /// Unless its environment is being brought up: a start, a rebuild,
+    /// or a move to another VM takes the checkout away on purpose, and
+    /// said as "not answering" it read as something broken (David,
+    /// 2026-10-26: "This shouldn't be presented like a malfunction when
+    /// the VM/container are getting rebuilt"). Then the line says what is
+    /// under way, and that the files come back with it.
     fn apply_unreachable(self: &Rc<Self>, root: &Path) {
-        self.apply_blocked(root, "Checkout unreachable — its VM is not answering");
+        let env = self.aimed_environment();
+        let underway = self.coming_up.borrow().as_ref().and_then(|ask| ask(&env));
+        match underway {
+            Some(words) => self.apply_blocked(root, &words),
+            None => self.apply_blocked(root, "Checkout unreachable — its VM is not answering"),
+        }
     }
 
     /// git, beside a checkout in a VM, refused the status: the VM is
