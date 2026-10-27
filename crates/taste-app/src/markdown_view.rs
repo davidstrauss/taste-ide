@@ -890,7 +890,7 @@ fn picture(base: &DocumentBase, path: PathBuf, alt: &str, hold: Option<Hold>) ->
                 let bytes = files
                     .read(&read_path)
                     .map_err(|e| format!("could not be read: {e}"))?;
-                gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+                crate::glycin::decode(&glib::Bytes::from_owned(bytes))
                     .map_err(|e| format!("is not an image this build can decode: {e}"))
             })
             .await;
@@ -1305,16 +1305,16 @@ mod tests {
         assert_eq!(base().resolve_link("../../etc/passwd"), None);
     }
 
-    /// The decode the preview relies on, against a real screenshot of the
-    /// docs set: a PNG the size of the window comes back as a texture of
-    /// that size, off any thread.
+    /// The decode the preview relies on, glycin's, against a real
+    /// screenshot of the docs set: a PNG the size of the window comes back
+    /// as a texture of that size, off any thread.
     #[test]
     fn a_docs_screenshot_decodes_to_a_texture() {
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots/hero.png");
         let bytes = std::fs::read(&path).expect("the docs set has a hero shot");
-        let texture =
-            gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).expect("a PNG decodes");
+        let texture = crate::glycin::tests::decode_here(&glib::Bytes::from_owned(bytes))
+            .expect("a PNG decodes");
         assert_eq!((texture.width(), texture.height()), (1440, 900));
     }
 

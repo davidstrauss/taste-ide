@@ -107,7 +107,7 @@ pub fn load(
     let bytes = glib::Bytes::from_owned(files.read(path).map_err(|e| e.to_string())?);
     let fingerprint = fingerprint(&bytes);
     let content = match kind {
-        ViewKind::Image => gtk::gdk::Texture::from_bytes(&bytes)
+        ViewKind::Image => crate::glycin::decode(&bytes)
             .map(Content::Image)
             .map_err(|e| format!("this image could not be decoded: {e}"))?,
         ViewKind::Pdf | ViewKind::Media => Content::Bytes(bytes),
@@ -240,6 +240,8 @@ pub struct ViewerPage {
     reload: RefCell<Option<Rc<dyn Fn()>>>,
     /// This page's PDF, while it has one, on the viewer scheme.
     pdf_id: Cell<Option<u64>>,
+    /// This page's audio or video, while it has one, on the media scheme.
+    media_id: Cell<Option<u64>>,
     /// What the shown bytes were ([`fingerprint`]).
     shown: Cell<u64>,
     /// The file changed on disk and the tab still shows what it was.
@@ -295,6 +297,7 @@ impl ViewerPage {
             content,
             reload: RefCell::new(None),
             pdf_id: Cell::new(None),
+            media_id: Cell::new(None),
             shown: Cell::new(loaded.fingerprint),
             pending: Cell::new(false),
             auto: Cell::new(false),
@@ -680,6 +683,9 @@ impl ViewerPage {
         if let Some(id) = self.pdf_id.take() {
             pdf_documents().borrow_mut().remove(&id);
         }
+        if let Some(id) = self.media_id.take() {
+            media_files().borrow_mut().remove(&id);
+        }
         self.shown.set(loaded.fingerprint);
         let shown: gtk::Widget = match (self.kind, loaded.content) {
             (ViewKind::Image, Content::Image(texture)) => {
@@ -690,9 +696,16 @@ impl ViewerPage {
                 *self.image.borrow_mut() = Some(image.clone());
                 image.scroller.clone().upcast()
             }
-            (ViewKind::Media, Content::Bytes(bytes)) => media_view(&bytes),
+            (ViewKind::Media, Content::Bytes(bytes)) => {
+                let id = next_document_id();
+                media_files()
+                    .borrow_mut()
+                    .insert(id, (bytes, media_mime(&self.path)));
+                self.media_id.set(Some(id));
+                media_view(id, &self.path)
+            }
             (ViewKind::Pdf, Content::Bytes(bytes)) => {
-                let id = next_pdf_id();
+                let id = next_document_id();
                 pdf_documents().borrow_mut().insert(id, bytes);
                 self.pdf_id.set(Some(id));
                 // The page tells the toolbar its mode and zoom, however
@@ -1004,6 +1017,9 @@ impl ViewerPage {
         if let Some(id) = self.pdf_id.take() {
             pdf_documents().borrow_mut().remove(&id);
         }
+        if let Some(id) = self.media_id.take() {
+            media_files().borrow_mut().remove(&id);
+        }
         let status = adw::StatusPage::builder()
             .icon_name("dialog-warning-symbolic")
             .title("Cannot show this file")
@@ -1019,22 +1035,168 @@ impl Drop for ViewerPage {
         if let Some(id) = self.pdf_id.take() {
             pdf_documents().borrow_mut().remove(&id);
         }
+        if let Some(id) = self.media_id.take() {
+            media_files().borrow_mut().remove(&id);
+        }
     }
 }
 
-/// An image, scaled down to fit and never up, centred on the pane, with
-/// its size under it.
-/// Audio or video, with GTK's own controls, from the bytes read.
-fn media_view(bytes: &glib::Bytes) -> gtk::Widget {
-    let stream = gtk::gio::MemoryInputStream::from_bytes(bytes);
-    let media = gtk::MediaFile::for_input_stream(&stream);
-    let video = gtk::Video::builder()
-        .media_stream(&media)
-        .autoplay(false)
+// --- Audio and video ---------------------------------------------------
+
+/// Audio and video play in a WebKit view rather than in a `GtkVideo`:
+/// GTK's media plays through GStreamer in the calling process, so a
+/// demuxer or a decoder fed a file a repository or an agent wrote would run
+/// with everything the IDE's process holds (CLAUDE.md → "Third-party code
+/// that parses untrusted content runs in a confined helper"). WebKit plays
+/// it in its web process, which WebKitGTK 6 always sandboxes — bwrap, or
+/// `flatpak-spawn --sandbox` inside the Flatpak — with the same GStreamer.
+const MEDIA_SCHEME: &str = "taste-media";
+
+/// The page: one `<video>` or `<audio>` with the engine's own controls,
+/// fitted to the view. The file is fetched whole into a blob, which the
+/// element can seek in; a scheme answer has no ranges to seek with. It is
+/// preloaded whole too, since it is in memory already: on `metadata`, the
+/// element stalled half-loaded and its controls kept their spinner and
+/// `--:--` over a file that was ready to play.
+const MEDIA_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><style>
+:root { color-scheme: light dark; }
+html, body { margin: 0; height: 100%; background: transparent; }
+body { display: flex; align-items: center; justify-content: center; }
+video { max-width: 100%; max-height: 100%; }
+audio { width: min(640px, calc(100% - 48px)); }
+p { font: 15px system-ui, sans-serif; opacity: 0.7; margin: 24px; text-align: center; }
+</style></head><body><script>
+const audio = new URLSearchParams(location.search).get("kind") === "audio";
+const element = document.createElement(audio ? "audio" : "video");
+element.controls = true;
+element.preload = "auto";
+const fail = (why) => {
+  const said = document.createElement("p");
+  said.textContent = "This file cannot be played here: " + why;
+  document.body.replaceChildren(said);
+};
+element.addEventListener("error", () =>
+  fail((element.error && element.error.message) || "the engine has no decoder for it"));
+fetch("file")
+  .then((response) => {
+    if (!response.ok) throw new Error("it is no longer open");
+    return response.blob();
+  })
+  .then((blob) => { element.src = URL.createObjectURL(blob); })
+  .catch((error) => fail(error.message));
+document.body.append(element);
+</script></body></html>
+"#;
+
+thread_local! {
+    static MEDIA_FILES: Rc<RefCell<HashMap<u64, (glib::Bytes, String)>>> = Rc::default();
+}
+
+/// The audio and video the open viewers play, by id, with their types.
+fn media_files() -> Rc<RefCell<HashMap<u64, (glib::Bytes, String)>>> {
+    MEDIA_FILES.with(Rc::clone)
+}
+
+/// The media type `path`'s name calls for, as [`kind_for`] reads it.
+fn media_mime(path: &Path) -> String {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let (content_type, _) = gtk::gio::functions::content_type_guess(Some(name), None::<&[u8]>);
+    gtk::gio::functions::content_type_get_mime_type(&content_type)
+        .map(|mime| mime.to_string())
+        .unwrap_or_else(|| "application/octet-stream".into())
+}
+
+/// The answer the media scheme gives for `uri`: the page, or the file of
+/// the id the host names; `None` for anything else.
+fn media_resource(uri: &str) -> Option<(glib::Bytes, String)> {
+    let rest = uri.strip_prefix(&format!("{MEDIA_SCHEME}://"))?;
+    let (id, file) = rest.split_once('/').unwrap_or((rest, ""));
+    match file.split(['?', '#']).next().unwrap_or("") {
+        "" | "index.html" => Some((
+            glib::Bytes::from_static(MEDIA_PAGE.as_bytes()),
+            "text/html".into(),
+        )),
+        "file" => media_files().borrow().get(&id.parse().ok()?).cloned(),
+        _ => None,
+    }
+}
+
+/// Register the media scheme on the default web context, once: secure, so
+/// the page may fetch its own file.
+fn register_media_scheme() {
+    thread_local! {
+        static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    }
+    if REGISTERED.with(|done| done.replace(true)) {
+        return;
+    }
+    let Some(context) = webkit6::WebContext::default() else {
+        return;
+    };
+    if let Some(security) = context.security_manager() {
+        security.register_uri_scheme_as_secure(MEDIA_SCHEME);
+        security.register_uri_scheme_as_cors_enabled(MEDIA_SCHEME);
+    }
+    context.register_uri_scheme(MEDIA_SCHEME, |request| {
+        let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+        match media_resource(&uri) {
+            Some((bytes, mime)) => {
+                let stream = gtk::gio::MemoryInputStream::from_bytes(&bytes);
+                request.finish(&stream, bytes.len() as i64, Some(&mime));
+            }
+            None => {
+                let mut error = glib::Error::new(
+                    gtk::gio::IOErrorEnum::NotFound,
+                    &format!("{uri} is not an open media file"),
+                );
+                request.finish_error(&mut error);
+            }
+        }
+    });
+}
+
+/// Audio or video, the file of `id` on the media scheme, with the
+/// engine's own controls: a view that loads nothing but that scheme.
+fn media_view(id: u64, path: &Path) -> gtk::Widget {
+    register_media_scheme();
+    let session = webkit6::NetworkSession::new_ephemeral();
+    let view = webkit6::WebView::builder()
+        .network_session(&session)
         .vexpand(true)
         .hexpand(true)
         .build();
-    video.upcast()
+    webkit6::prelude::WebViewExt::set_background_color(
+        &view,
+        &gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0),
+    );
+    webkit6::prelude::WebViewExt::connect_decide_policy(&view, |_, decision, kind| {
+        use webkit6::prelude::PolicyDecisionExt;
+        let uri = match kind {
+            webkit6::PolicyDecisionType::NavigationAction
+            | webkit6::PolicyDecisionType::NewWindowAction => decision
+                .downcast_ref::<webkit6::NavigationPolicyDecision>()
+                .and_then(|d| d.navigation_action())
+                .and_then(|action| action.request())
+                .and_then(|request| request.uri()),
+            _ => return false,
+        };
+        if uri.is_some_and(|uri| uri.starts_with(&format!("{MEDIA_SCHEME}://"))) {
+            return false;
+        }
+        decision.ignore();
+        true
+    });
+    let kind = if media_mime(path).starts_with("audio/") {
+        "audio"
+    } else {
+        "video"
+    };
+    webkit6::prelude::WebViewExt::load_uri(
+        &view,
+        &format!("{MEDIA_SCHEME}://{id}/index.html?kind={kind}"),
+    );
+    view.upcast()
 }
 
 // --- PDFs ----------------------------------------------------------------
@@ -1703,15 +1865,17 @@ try {
 
 thread_local! {
     static PDF_DOCUMENTS: Rc<RefCell<HashMap<u64, glib::Bytes>>> = Rc::default();
-    static NEXT_PDF: Cell<u64> = const { Cell::new(1) };
+    static NEXT_DOCUMENT: Cell<u64> = const { Cell::new(1) };
 }
 
 fn pdf_documents() -> Rc<RefCell<HashMap<u64, glib::Bytes>>> {
     PDF_DOCUMENTS.with(Rc::clone)
 }
 
-fn next_pdf_id() -> u64 {
-    NEXT_PDF.with(|next| {
+/// A fresh id for what a viewer serves to its web view, a PDF or a media
+/// file: one count for both, so an id names one thing.
+fn next_document_id() -> u64 {
+    NEXT_DOCUMENT.with(|next| {
         let id = next.get();
         next.set(id + 1);
         id
@@ -2523,5 +2687,26 @@ mod tests {
         assert!(pdf_resource("taste-pdf://7/../../etc/passwd").is_none());
         assert!(pdf_resource("https://example.com/").is_none());
         pdf_documents().borrow_mut().remove(&7);
+    }
+
+    #[test]
+    fn the_media_scheme_serves_its_page_and_only_the_files_it_holds() {
+        assert_eq!(
+            media_resource("taste-media://9/index.html?kind=audio")
+                .unwrap()
+                .1,
+            "text/html"
+        );
+        assert!(media_resource("taste-media://9/file").is_none());
+        let mime = media_mime(Path::new("/x/talk.mp3"));
+        assert_eq!(mime, "audio/mpeg");
+        media_files()
+            .borrow_mut()
+            .insert(9, (glib::Bytes::from_static(b"ID3"), mime));
+        let (bytes, mime) = media_resource("taste-media://9/file").unwrap();
+        assert_eq!((bytes.as_ref(), mime.as_str()), (&b"ID3"[..], "audio/mpeg"));
+        assert!(media_resource("taste-media://9/../../etc/passwd").is_none());
+        assert!(media_resource("taste-pdf://9/file").is_none());
+        media_files().borrow_mut().remove(&9);
     }
 }

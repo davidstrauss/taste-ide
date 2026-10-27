@@ -174,7 +174,11 @@ the face the toggle at the editor's tab bar's end switches it to) opens that ste
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_PREVIEW=README.md` (a markdown file, relative
 to where the probe was started; an image, a PDF, or audio or video opens in
-its viewer tab instead, `viewer.rs`, and `build-aux/headless/fixtures/sample.pdf`
+its viewer tab instead, `viewer.rs` — a picture decodes in glycin's
+sandbox, which starts in a container only run with `--security-opt
+unmask=ALL --security-opt label=disable` (as `shoot.sh`'s comment has it),
+and audio plays only with a sound server up (`pipewire`, `wireplumber`, and
+`pipewire-pulse`, all in the image) —, and `build-aux/headless/fixtures/sample.pdf`
 is a one-page PDF for it, and `TASTE_PROBE_CHANGED=pending` or `=auto` poses
 the viewer's changed-on-disk bar — a change waiting, or Reload automatically
 on — and `=unseen` puts `sample.typ` in front and changes the viewer behind
@@ -721,7 +725,11 @@ to.
   started through `taste_confine::confine` (David, 2026-10-09, of the
   Mermaid renderer's eighty crates: "Build the sandboxed helper first").
   `taste-embed` (llama.cpp over the checkout's text) is one, and refuses
-  to run otherwise.
+  to run otherwise. Images and media use the platform's own sandboxes
+  instead of a helper of ours: pictures decode through glycin
+  (`glycin.rs`, a sandboxed loader process per image), and audio and
+  video play in a WebKit view, whose web process is sandboxed — never
+  GDK's `Texture::from_bytes` or a `GtkVideo` in the IDE's process.
 - Adapter packages fetched from registries stay version-pinned.
 - **The interface must be beautiful — and the chat pane and prompt box
   are held to the highest bar in the app.** Beauty here means libadwaita

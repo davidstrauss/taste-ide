@@ -9,8 +9,16 @@
 # Run it INSIDE the devcontainer, from the workspace root:
 #
 #   podman run --rm --userns=keep-id:uid=1000,gid=1000 \
+#     --security-opt unmask=ALL --security-opt label=disable \
 #     -v "$PWD:/workspaces/taste-ide:z" -v taste-ide-cargo:/home/dev/.cargo \
 #     taste-ide-devcontainer sh build-aux/headless/shoot.sh watching
+#
+# The two --security-opt flags are what lets glycin's bwrap sandbox start
+# inside a container (a fresh /proc and devpts, under rootless podman's
+# masks and SELinux label), and every picture in a frame — the composer's
+# attachment stamp in the hero shot among them — is decoded there. Without
+# them a picture draws as its missing-image icon. They are for this
+# person-run container only, never the build's.
 #
 # The view name is a TASTE_PROBE_VIEW value; the shot lands in
 # docs/screenshots/<view>.png, dark and optipng'd, exactly as the ones

@@ -587,9 +587,18 @@ impl Composer {
             // where what the eye is checking before it sends is which
             // files are attached.
             if let ContentBlock::Image(image) = &attachment.block {
-                if let Some(texture) = decode_image(image) {
-                    content.append(&chip_stamp(&texture));
-                }
+                let stamp = chip_stamp();
+                content.append(&stamp);
+                let stamp = stamp.downgrade();
+                decode_image_later(image, move |decoded| {
+                    let Some(stamp) = stamp.upgrade() else {
+                        return;
+                    };
+                    match decoded {
+                        Ok(texture) => stamp.set_paintable(Some(&texture)),
+                        Err(_) => stamp.set_icon_name(Some("image-missing-symbolic")),
+                    }
+                });
             }
             content.append(
                 &gtk::Label::builder()
@@ -1384,8 +1393,11 @@ pub fn image_attachment(
     Ok((label, ContentBlock::Image(ImageContent::new(data, mime))))
 }
 
-pub fn image_thumbnail(texture: &gtk::gdk::Texture) -> gtk::Picture {
-    let picture = gtk::Picture::for_paintable(texture);
+/// A transcript's thumbnail, empty until its picture is decoded: its size
+/// is the request's, not the picture's, so the row does not grow when the
+/// picture lands.
+pub fn image_thumbnail() -> gtk::Picture {
+    let picture = gtk::Picture::new();
     picture.set_content_fit(gtk::ContentFit::Cover);
     picture.set_size_request(ATTACHMENT_THUMBNAIL_PX, ATTACHMENT_THUMBNAIL_PX);
     picture
@@ -1399,19 +1411,39 @@ pub fn image_thumbnail(texture: &gtk::gdk::Texture) -> gtk::Picture {
 /// picture's natural size is the texture's — 64 by 44 for the posed one —
 /// and `set_size_request` is a floor, not a ceiling, so the first attempt
 /// at this drew a stamp three chips tall.
-fn chip_stamp(texture: &gtk::gdk::Texture) -> gtk::Image {
-    let stamp = gtk::Image::from_paintable(Some(texture));
+///
+/// It stands as a picture's icon until the decode lands, at the same size,
+/// so the chip does not move when the picture arrives.
+fn chip_stamp() -> gtk::Image {
+    let stamp = gtk::Image::from_icon_name("image-x-generic-symbolic");
     stamp.set_pixel_size(CHIP_THUMBNAIL_PX);
     stamp.add_css_class("attachment-stamp");
     stamp
 }
 
-pub fn decode_image(image: &ImageContent) -> Option<gtk::gdk::Texture> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&image.data)
-        .ok()?;
-    gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+/// Decode an image block through glycin (`crate::glycin`), on the blocking
+/// pool, and hand the picture to `apply` on the main thread: at once, for
+/// one decoded lately, since a transcript's rows are built again as they
+/// scroll back into view.
+pub fn decode_image_later(
+    image: &ImageContent,
+    apply: impl FnOnce(Result<gtk::gdk::Texture, String>) + 'static,
+) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    image.data.hash(&mut hasher);
+    let data = image.data.clone();
+    crate::glycin::decode_later(
+        hasher.finish(),
+        move || {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(&data)
+                .map(glib::Bytes::from_owned)
+                .map_err(|e| format!("the image is not base64: {e}"))
+        },
+        apply,
+    );
 }
 
 #[cfg(test)]

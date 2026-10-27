@@ -25,7 +25,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use crate::chatdoc::Document;
-use crate::composer::{decode_image, image_thumbnail};
+use crate::composer::{decode_image_later, image_thumbnail};
 use taste_acp::session::{
     allow_option, card_options, first_allow_outcome, kind_allows, kind_stands, option_of_kind,
     outcome_for, reject_option,

@@ -1030,7 +1030,14 @@ no-op at every other width.
   them), and a PDF's Continuous and Single page (`Editor::show_view_modes`;
   David, 2026-10-20: "pack these now quite lean controls into the right
   side of the document tab bar area"). An SVG file is edited as XML and
-  previewed as a picture, drawn by the confined helper Mermaid uses. A place in a file is
+  previewed as a picture, drawn by the confined helper Mermaid uses. An
+  image file, a picture in a Markdown preview, and an image in a
+  transcript are decoded by glycin (`glycin.rs`), the GNOME platform's
+  loaders, each format's in a sandboxed process of its own (bwrap, or
+  `flatpak-spawn --sandbox` in the Flatpak), and audio and video play in a
+  WebKit view (`taste-media://`), whose web process WebKitGTK always
+  sandboxes — never GDK's in-process decoders or a `GtkVideo`'s
+  GStreamer in this process (2026-10-26). A place in a file is
   named as a URI names one (`taste_core::anchor`): the reference's path
   says which file and its fragment where, in that kind of file's own
   convention — `#L42` a line, RFC 8118's `#page=3` a PDF's page — so a

@@ -38,6 +38,7 @@ mod filetree;
 mod fleet;
 mod gadget;
 mod gauge;
+mod glycin;
 #[cfg(test)]
 mod gtk_test;
 mod holdbutton;

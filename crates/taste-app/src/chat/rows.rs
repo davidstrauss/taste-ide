@@ -10,7 +10,9 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
-use agent_client_protocol::schema::v1::{ContentBlock, PlanEntryStatus, ToolCallContent};
+use agent_client_protocol::schema::v1::{
+    ContentBlock, ImageContent, PlanEntryStatus, ToolCallContent,
+};
 
 use super::model::{
     Answer, Delivery, Dot, Kind, PlanCard, Rail, Row, RowId, Step, Task, Thought, User,
@@ -502,15 +504,14 @@ impl ChatPane {
             }
         }
         // Images get an openable thumbnail; everything else stays a name on
-        // the paperclip row.
-        let mut thumbnails: Vec<(String, gtk::gdk::Texture)> = Vec::new();
+        // the paperclip row. The thumbnail stands empty, at its size, until
+        // glycin has decoded the picture; one that cannot be decoded says
+        // so in its place.
+        let mut thumbnails: Vec<(String, &ImageContent)> = Vec::new();
         let mut names: Vec<String> = Vec::new();
         for (label, block) in attachments {
             match block {
-                ContentBlock::Image(image) => match decode_image(image) {
-                    Some(texture) => thumbnails.push((label.clone(), texture)),
-                    None => names.push(label.clone()),
-                },
+                ContentBlock::Image(image) => thumbnails.push((label.clone(), image)),
                 _ => names.push(label.clone()),
             }
         }
@@ -520,15 +521,44 @@ impl ChatPane {
             strip.set_margin_bottom(CARD_INSET);
             strip.set_margin_start(CARD_INSET);
             strip.set_margin_end(CARD_INSET);
-            for (label, texture) in thumbnails {
-                let picture = image_thumbnail(&texture);
+            for (label, image) in thumbnails {
+                let picture = image_thumbnail();
                 let button = gtk::Button::builder()
                     .child(&picture)
                     .tooltip_text(format!("Open {label}"))
                     .css_classes(["flat"])
                     .build();
+                let decoded: Rc<RefCell<Option<gtk::gdk::Texture>>> = Rc::default();
+                let opened = decoded.clone();
+                let title = label.clone();
                 button.connect_clicked(move |button| {
-                    present_image_dialog(button, &label, &texture);
+                    if let Some(texture) = opened.borrow().as_ref() {
+                        present_image_dialog(button, &title, texture);
+                    }
+                });
+                let weak = button.downgrade();
+                decode_image_later(image, move |result| {
+                    let Some(button) = weak.upgrade() else {
+                        return;
+                    };
+                    match result {
+                        Ok(texture) => {
+                            picture.set_paintable(Some(&texture));
+                            *decoded.borrow_mut() = Some(texture);
+                        }
+                        Err(why) => {
+                            let missing = gtk::Image::from_icon_name("image-missing-symbolic");
+                            missing.set_pixel_size(crate::composer::ATTACHMENT_THUMBNAIL_PX / 2);
+                            missing.set_size_request(
+                                crate::composer::ATTACHMENT_THUMBNAIL_PX,
+                                crate::composer::ATTACHMENT_THUMBNAIL_PX,
+                            );
+                            button.set_child(Some(&missing));
+                            button.set_tooltip_text(Some(&format!(
+                                "{label} could not be decoded: {why}"
+                            )));
+                        }
+                    }
                 });
                 strip.append(&button);
             }
