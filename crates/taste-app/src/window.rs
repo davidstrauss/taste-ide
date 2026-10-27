@@ -243,6 +243,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.set_on_open(move |path, line| editor.open_at(&path, line));
     }
     {
+        // A file or folder moved in the tree takes its tabs with it, and
+        // a move waits for the unsaved edits to what it moves.
+        let editor_moved = editor.clone();
+        filetree.set_on_moved(move |from, to| editor_moved.follow_move(&from, &to));
+        let editor = editor.clone();
+        filetree.set_unsaved_under(move |path| editor.unsaved_under(path));
+    }
+    {
         // Changed-list rows open as diffs: the tab lands on its Changes face.
         let editor = editor.clone();
         filetree.set_on_open_diff(move |path| editor.open_changes(&path));
@@ -3231,6 +3239,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             filetree.seed_ports_for_probe(port_state_for_probe());
         }
         filetree.seed_log_activity_for_probe();
+        filetree.drop_for_probe();
         // `TASTE_PROBE_EXPAND=<folder>`: that folder of the tree expanded,
         // and the longest the main thread went without a turn printed.
         if let Ok(folder) = std::env::var("TASTE_PROBE_EXPAND") {
@@ -3558,6 +3567,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if let Some(preview) = std::env::var_os("TASTE_PROBE_PREVIEW") {
                     let path = std::env::current_dir().unwrap_or_default().join(preview);
                     editor_for_probe.open_preview_for_probe(path);
+                }
+                // `TASTE_PROBE_DROP`: the tabs open once the drops are done,
+                // which say whether they followed what moved.
+                if let Ok(spec) = std::env::var("TASTE_PROBE_DROP") {
+                    let editor = editor_for_probe.clone();
+                    let after = 4000 + 1500 * (spec.split(',').count() as u64 + 1);
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(after),
+                        move || println!("probe drop: open {:?}", editor.open_paths_for_probe()),
+                    );
                 }
                 // `TASTE_PROBE_LINK=<path#fragment>`: a reference opened as
                 // a clicked link opens it (`taste_core::anchor`), and for a

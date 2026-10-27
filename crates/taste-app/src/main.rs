@@ -89,6 +89,7 @@ mod table;
 mod taskfile;
 mod tasks;
 mod textline;
+mod tree_drop;
 mod ui_probe;
 mod viewer;
 mod voice;
@@ -425,6 +426,12 @@ fn main() -> glib::ExitCode {
                  .prompt-entry:focus-within { \
                    outline: 2px solid @accent_color; \
                    outline-offset: -2px; }\n\
+                 /* Where a drop on the file tree would land (tree_drop.rs): \
+                    the row or the open space under the pointer, in the \
+                    accent's wash, as GTK marks it :drop(active). */\n\
+                 .file-row:drop(active), .tree-drop:drop(active) { \
+                   background-color: color-mix(in srgb, @accent_bg_color 25%, \
+                   transparent); border-radius: 6px; }\n\
                  /* The same treatment, at the NESTED step of the scale, \
                     for a composer whose fields sit INSIDE a card rather \
                     than being one: same wash, same platform focus ring, \

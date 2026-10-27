@@ -665,6 +665,14 @@ pub struct FileTree {
     on_author_set: RefCell<Option<Box<dyn Fn()>>>,
     submodule_busy: Cell<bool>,
     on_open: RefCell<Option<OpenCallback>>,
+    /// The row a drag out of the tree began on, while the drag lasts: what
+    /// a drop on the tree moves or copies (`tree_drop`).
+    dragging: RefCell<Option<PathBuf>>,
+    /// Told of each move, so the editor's tabs follow (`Editor::follow_move`).
+    on_moved: RefCell<Option<Box<dyn Fn(PathBuf, PathBuf)>>>,
+    /// The open files with unsaved edits at or under a path, which a move
+    /// of it waits for (`Editor::unsaved_under`).
+    unsaved_under: RefCell<Option<Box<dyn Fn(&Path) -> Vec<PathBuf>>>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
     on_open_diff: RefCell<Option<OpenDiffCallback>>,
     /// What syncs though git ignores it (`Worktree::sync_ignored`): the
@@ -2300,6 +2308,9 @@ impl FileTree {
             merged_bar,
             submodule_busy: Cell::new(false),
             on_open: RefCell::new(None),
+            dragging: RefCell::new(None),
+            on_moved: RefCell::new(None),
+            unsaved_under: RefCell::new(None),
             on_open_diff: RefCell::new(None),
             sync_ignored: RefCell::new(Default::default()),
             commit_suggester: RefCell::new(None),
@@ -2566,6 +2577,12 @@ impl FileTree {
             // too, whose right-click is not the folder's.
             root_button.add_controller(context);
             root_button.connect_clicked(move |_| open_menu());
+            // A drop on the folder's name, or in the open space under the
+            // rows, goes into the folder the tree shows (`tree_drop`).
+            tree.list_holder.add_css_class("tree-drop");
+            root_button.add_css_class("tree-drop");
+            tree.accept_drops(&tree.list_holder, None);
+            tree.accept_drops(&root_button, None);
         }
         // A click takes what moves the branch forward and nothing else; a
         // hold rebases, replaying the branch's own commits, which a click
@@ -3643,6 +3660,14 @@ impl FileTree {
 
     pub fn set_on_open(&self, f: impl Fn(PathBuf, Option<u32>) + 'static) {
         *self.on_open.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub fn set_on_moved(&self, f: impl Fn(PathBuf, PathBuf) + 'static) {
+        *self.on_moved.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub fn set_unsaved_under(&self, f: impl Fn(&Path) -> Vec<PathBuf> + 'static) {
+        *self.unsaved_under.borrow_mut() = Some(Box::new(f));
     }
 
     pub fn set_on_open_diff(&self, f: impl Fn(PathBuf) + 'static) {
@@ -9613,25 +9638,256 @@ impl FileTree {
         // Dragged out, to a browser's upload, a file manager, or the
         // composer (`file_drag`): the file on this host where the folder
         // has it, a copy out of the VM made at the drop where it does not.
+        // Beside that, the tree's own mark, so a drop back on the tree
+        // moves the row rather than fetching it (`tree_drop`). A copy is
+        // all it offers anyone else: a file manager never moves a file out
+        // of the user's folder by a drag.
         {
             let source = gtk::DragSource::builder()
                 .actions(gtk::gdk::DragAction::COPY)
                 .build();
             let tree = Rc::downgrade(self);
-            let node = node.clone();
+            let prepared = node.clone();
             source.connect_prepare(move |_, _, _| {
                 let tree = tree.upgrade()?;
-                Some(crate::file_drag::provider(tree.drag_source_of(&node)?))
+                let mark =
+                    gtk::gdk::ContentProvider::for_value(&crate::tree_drop::TreeDrag.to_value());
+                Some(match tree.drag_source_of(&prepared) {
+                    Some(outside) => gtk::gdk::ContentProvider::new_union(&[
+                        mark,
+                        crate::file_drag::provider(outside),
+                    ]),
+                    None => mark,
+                })
             });
             let dragged = row.downgrade();
+            let tree = Rc::downgrade(self);
+            let path = node.path.clone();
             source.connect_drag_begin(move |source, _| {
                 if let Some(row) = dragged.upgrade() {
                     source.set_icon(Some(&gtk::WidgetPaintable::new(Some(&row))), 0, 0);
                 }
+                if let Some(tree) = tree.upgrade() {
+                    *tree.dragging.borrow_mut() = Some(path.clone());
+                }
+            });
+            let tree = Rc::downgrade(self);
+            source.connect_drag_end(move |_, _, _| {
+                if let Some(tree) = tree.upgrade() {
+                    tree.dragging.borrow_mut().take();
+                }
             });
             row.add_controller(source);
         }
+        // A drop on a folder goes into it, and on a file into the folder
+        // the file is in.
+        let into = if node.is_dir {
+            node.path.clone()
+        } else {
+            node.path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.view_root())
+        };
+        self.accept_drops(&row, Some(into));
         row
+    }
+
+    /// Take drops on `widget`: into `into`, or into the folder the tree
+    /// shows when `None`. A drop from the tree itself moves its row there,
+    /// or copies it with Ctrl held; one from outside copies the files in.
+    fn accept_drops(self: &Rc<Self>, widget: &impl IsA<gtk::Widget>, into: Option<PathBuf>) {
+        let target = gtk::DropTarget::new(glib::Type::INVALID, gtk::gdk::DragAction::COPY);
+        target.set_types(&[
+            crate::tree_drop::TreeDrag::static_type(),
+            gtk::gdk::FileList::static_type(),
+        ]);
+        let weak = Rc::downgrade(self);
+        target.connect_drop(move |target, value, _, _| {
+            let Some(tree) = weak.upgrade() else {
+                return false;
+            };
+            let dir = into.clone().unwrap_or_else(|| tree.view_root());
+            if value.get::<crate::tree_drop::TreeDrag>().is_ok() {
+                let Some(from) = tree.dragging.borrow().clone() else {
+                    return false;
+                };
+                let copy = target
+                    .current_event_state()
+                    .contains(gtk::gdk::ModifierType::CONTROL_MASK);
+                tree.drop_own(from, dir, copy);
+                return true;
+            }
+            let Ok(list) = value.get::<gtk::gdk::FileList>() else {
+                return false;
+            };
+            let sources: Vec<PathBuf> = list.files().iter().filter_map(|f| f.path()).collect();
+            if sources.is_empty() {
+                return false;
+            }
+            tree.drop_outside(sources, dir);
+            true
+        });
+        widget.add_controller(target);
+    }
+
+    /// The tree's own row dropped into `dir`: moved there, or copied with
+    /// Ctrl held. A folder never goes inside itself, a copy takes a free
+    /// name rather than replacing anything, and a move asks before it
+    /// replaces what is there and waits for unsaved edits to its files.
+    fn drop_own(self: &Rc<Self>, from: PathBuf, dir: PathBuf, copy: bool) {
+        use crate::tree_drop;
+        let Some(name) = from.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return;
+        };
+        if tree_drop::into_itself(&from, &dir) {
+            if from != dir {
+                self.workspace
+                    .events
+                    .publish(Event::Toast(format!("{name} cannot go inside itself")));
+            }
+            return;
+        }
+        let to = dir.join(&name);
+        if !self.file_op_allowed(&to) || (!copy && !self.file_op_allowed(&from)) {
+            self.op_denied_dialog();
+            return;
+        }
+        let files = self.worktree().files();
+        if copy {
+            self.file_op(
+                format!("Copying {name} failed"),
+                move || {
+                    let free = tree_drop::free_name(&name, |n| files.exists(&dir.join(n)));
+                    tree_drop::copy_within(&files, &from, &dir.join(free))
+                },
+                None,
+                |_, _| {},
+            );
+            return;
+        }
+        if from.parent() == Some(dir.as_path()) {
+            return;
+        }
+        let unsaved = self
+            .unsaved_under
+            .borrow()
+            .as_ref()
+            .map(|unsaved| unsaved(&from))
+            .unwrap_or_default();
+        if let Some(open) = unsaved.first() {
+            let open = open.file_name().map(|n| n.to_string_lossy().into_owned());
+            self.workspace.events.publish(Event::Toast(format!(
+                "Save or close {} first: it has unsaved changes",
+                open.unwrap_or(name)
+            )));
+            return;
+        }
+        let tree = self.clone();
+        glib::spawn_future_local(async move {
+            let taken = {
+                let (files, to) = (files.clone(), to.clone());
+                crate::runtime::runtime()
+                    .spawn_blocking(move || files.exists(&to))
+                    .await
+                    .unwrap_or(true)
+            };
+            if !taken {
+                tree.move_into_place(from, to, false);
+                return;
+            }
+            let dialog = adw::AlertDialog::new(
+                Some(&format!("Replace “{name}”?")),
+                Some(&format!(
+                    "{} already has one by that name. Replacing it removes what is there.",
+                    tree_drop::folder_name(&dir)
+                )),
+            );
+            dialog.add_responses(&[("cancel", "Cancel"), ("replace", "Replace")]);
+            dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let replacing = tree.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response == "replace" {
+                    replacing.move_into_place(from.clone(), to.clone(), true);
+                }
+            });
+            dialog.present(Some(&tree.widget));
+        });
+    }
+
+    /// Move `from` to `to`, what is at `to` removed first when `replace`,
+    /// and tell the editor so its tabs follow.
+    fn move_into_place(self: &Rc<Self>, from: PathBuf, to: PathBuf, replace: bool) {
+        let files = self.worktree().files();
+        let name = from
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (moved_from, moved_to) = (from.clone(), to.clone());
+        self.file_op(
+            format!("Moving {name} failed"),
+            move || {
+                if replace {
+                    let folder = files.is_dir(&to);
+                    files.remove(&to, folder)?;
+                }
+                files.rename(&from, &to)
+            },
+            None,
+            move |tree, done| {
+                if done {
+                    if let Some(moved) = tree.on_moved.borrow().as_ref() {
+                        moved(moved_from, moved_to);
+                    }
+                }
+            },
+        );
+    }
+
+    /// Files from outside dropped into `dir`: each copied in under a free
+    /// name, a folder whole, and what was done said once.
+    fn drop_outside(self: &Rc<Self>, sources: Vec<PathBuf>, dir: PathBuf) {
+        use crate::tree_drop;
+        for source in &sources {
+            if let Some(name) = source.file_name() {
+                if !self.file_op_allowed(&dir.join(name)) {
+                    self.op_denied_dialog();
+                    return;
+                }
+            }
+        }
+        let files = self.worktree().files();
+        let into = tree_drop::folder_name(&dir);
+        let tally = std::sync::Arc::new(std::sync::Mutex::new(tree_drop::Copied::default()));
+        let counted = tally.clone();
+        self.file_op(
+            "Copying in failed".to_string(),
+            move || {
+                for source in sources {
+                    let Some(name) = source.file_name().map(|n| n.to_string_lossy().into_owned())
+                    else {
+                        continue;
+                    };
+                    let free = tree_drop::free_name(&name, |n| files.exists(&dir.join(n)));
+                    let copied = tree_drop::import(&files, &source, &dir.join(free))?;
+                    let mut tally = counted.lock().unwrap_or_else(|e| e.into_inner());
+                    tally.files += copied.files;
+                    tally.skipped_links += copied.skipped_links;
+                }
+                Ok(())
+            },
+            None,
+            move |tree, done| {
+                if done {
+                    let tally = tally.lock().unwrap_or_else(|e| e.into_inner());
+                    tree.workspace
+                        .events
+                        .publish(Event::Toast(tally.summary(&into)));
+                }
+            },
+        );
     }
 
     /// What dragging `node` out carries: the path on this host when there
@@ -9847,6 +10103,42 @@ impl FileTree {
     /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CARD=push` (or `pull`,
     /// `canon`) shows that button's hover card once the counts have
     /// landed, as a hover would: a shot has no pointer to hover with.
+    /// TASTE_PROBE_CHECK only: the drops `TASTE_PROBE_DROP` names, done as
+    /// a drop on the tree does them.
+    #[doc(hidden)]
+    pub fn drop_for_probe(self: &Rc<Self>) {
+        // `TASTE_PROBE_DROP=move:<path>:<folder>` (or `copy:`, or
+        // `in:<a path on this host>:<folder>`), paths from the folder the
+        // probe opened, several comma-separated a second and a half apart:
+        // what a drop of that row (Ctrl held, for `copy`), or of that file
+        // from outside, does, done the way a drop does it. The first four
+        // seconds in, once the probe's `TASTE_PROBE_PREVIEW` tab is open:
+        // a move before it opened had no tab to carry along.
+        if let Ok(spec) = std::env::var("TASTE_PROBE_DROP") {
+            for (n, step) in spec.split(',').map(str::to_string).enumerate() {
+                let tree = self.clone();
+                let delay = std::time::Duration::from_millis(4000 + 1500 * n as u64);
+                glib::timeout_add_local_once(delay, move || {
+                    let mut parts = step.splitn(3, ':');
+                    let (Some(kind), Some(what), Some(into)) =
+                        (parts.next(), parts.next(), parts.next())
+                    else {
+                        return;
+                    };
+                    let root = tree.view_root();
+                    let dir = root.join(into);
+                    println!("probe drop: {kind} {what} into {}", dir.display());
+                    match kind {
+                        "move" => tree.drop_own(root.join(what), dir, false),
+                        "copy" => tree.drop_own(root.join(what), dir, true),
+                        "in" => tree.drop_outside(vec![PathBuf::from(what)], dir),
+                        _ => {}
+                    }
+                });
+            }
+        }
+    }
+
     fn probe_card(self: &Rc<Self>) {
         if std::env::var("TASTE_PROBE_CHECK").is_err() {
             return;

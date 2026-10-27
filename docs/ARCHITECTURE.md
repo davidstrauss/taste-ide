@@ -861,6 +861,18 @@ no-op at every other width.
 - A workspace watcher makes external edits visible: content changes reload
   clean editor buffers, structural changes rebuild the tree, `.git` changes
   refresh status — an agent's work shows up like your own.
+- A row dragged onto a folder moves into it, or copies with Ctrl held,
+  and files dropped from outside (a file manager, a download) are copied
+  in (`tree_drop.rs`, 2026-10-26). Everything goes through the files
+  service, so a checkout in a VM moves as one on this host does: a copy
+  is `cp -a` beside the files, and an import writes each file, its
+  executable bit put back and its symbolic links skipped, so a drop never
+  pulls in what a link points at. A folder never goes inside itself, a
+  copy takes a free name ("name (copy).ext") rather than replacing
+  anything, a move asks before replacing and waits for unsaved edits to
+  what it moves, and the tabs of what moved follow it. A drag out offers
+  other applications a copy and nothing else, so a file manager cannot
+  move a file out of the user's folder by a drag.
 - Rows stay uniform icon+label+badge; stage/unstage lives in the row's
   context menu (with file operations), and directories aggregate their
   children. Header bar: branch indicator, the Sync tool (upstream

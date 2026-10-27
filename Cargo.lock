@@ -3701,6 +3701,7 @@ dependencies = [
  "taste-models",
  "taste-semantic",
  "taste-voice",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -261,6 +261,13 @@ folder that opened looking for it, refreshes, and prints whether it
 opened again (it must not);
 `TASTE_PROBE_NAME_PROMPT=1` opens the New file dialog and prints where
 the keyboard is;
+`TASTE_PROBE_DROP=move:<path>:<folder>` (or `copy:` for a Ctrl-drag, or
+`in:<a path on this host>:<folder>` for a drop from outside; several,
+comma-separated, a second and a half apart from four seconds in), paths from the folder the
+probe opened, does what that drop on the file tree does (`tree_drop.rs`)
+and prints the tabs then open, which say whether they followed what moved
+— open a scratch repository, since the files really move, and list it
+after;
 `TASTE_PROBE_TASKVARS=1` opens the
 question the seeded `lint`'s play asks — a field for `FILE`, a choice for
 its `MODE` enum — and `=file` asks it as a file's menu does, the file

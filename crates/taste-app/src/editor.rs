@@ -1018,6 +1018,62 @@ impl Editor {
     }
 
     /// The view `tab` is in, whichever environment's it is.
+    /// The open files at or under `path` with unsaved edits: a move of
+    /// `path` waits for them (`FileTree`'s drops), since an edit saved
+    /// after it would land where the file no longer is.
+    pub fn unsaved_under(&self, path: &Path) -> Vec<PathBuf> {
+        self.pages
+            .borrow()
+            .iter()
+            .filter(|(open, page)| open.starts_with(path) && page.buffer.is_modified())
+            .map(|(open, _)| open.clone())
+            .collect()
+    }
+
+    /// The files open in tabs, sorted: what a probe prints.
+    #[doc(hidden)]
+    pub fn open_paths_for_probe(&self) -> Vec<PathBuf> {
+        let mut open: Vec<PathBuf> = self.pages.borrow().keys().cloned().collect();
+        open.sort();
+        open
+    }
+
+    /// Tabs follow files that moved: each tab open at or under `from` is
+    /// closed and opened again at its place under `to`, the one in front
+    /// staying in front. A page's path is held by everything made for it,
+    /// so it is opened again rather than renamed in place; nothing it had
+    /// unsaved is lost, since a move waits for those (`unsaved_under`).
+    pub fn follow_move(self: &Rc<Self>, from: &Path, to: &Path) {
+        let front = self.tabs().selected_page();
+        let mut moved: Vec<(adw::TabPage, PathBuf)> = Vec::new();
+        for (path, page) in self.pages.borrow().iter() {
+            if let Some(new) = crate::tree_drop::moved_to(path, from, to) {
+                moved.push((page.page.clone(), new));
+            }
+        }
+        for surface in self.surfaces.borrow().values() {
+            if let SurfaceKind::View(view) = &surface.kind {
+                if let Some(new) = crate::tree_drop::moved_to(&view.path, from, to) {
+                    moved.push((surface.tab.clone(), new));
+                }
+            }
+        }
+        let mut in_front = None;
+        for (tab, new) in moved {
+            if let Some(view) = self.view_of(&tab) {
+                view.close_page(&tab);
+            }
+            if front.as_ref() == Some(&tab) {
+                in_front = Some(new);
+            } else {
+                self.open_in_background(&new, None);
+            }
+        }
+        if let Some(new) = in_front {
+            self.open_at(&new, None);
+        }
+    }
+
     fn view_of(&self, tab: &adw::TabPage) -> Option<adw::TabView> {
         self.views
             .borrow()
