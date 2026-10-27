@@ -186,10 +186,26 @@ impl Migration {
         }
     }
 
+    /// Whether a move is for the base its VM was made from rather than for
+    /// its release: the VM is on the current release, made before that
+    /// release's golden base (`Pool::outdated`).
+    fn for_the_base(&self) -> bool {
+        self.from_release == self.to_release
+    }
+
     /// What is out of date and what fixing it does, in a sentence — the
     /// part of every message that differs by kind.
     fn situation(&self, env: &str) -> String {
         match self.kind {
+            Kind::Guest if self.for_the_base() => format!(
+                "Environment {env} runs in VM {}, made before the IDE's current base for \
+                 Fedora CoreOS {}. A VM on that base starts in seconds, carries the agent's \
+                 runtime for every container on it, and hands the host back what it does not \
+                 use. It must be reinstantiated in one: the checkout is snapshotted with its \
+                 uncommitted work, the container stops, and both come back in the new VM with \
+                 this conversation, in a few minutes.",
+                self.from_vm, self.to_release
+            ),
             Kind::Guest => format!(
                 "Environment {env} runs in VM {} on Fedora CoreOS {}; the stable release is now \
                  {}. It must be reinstantiated in a VM on {}: the checkout is snapshotted with \
@@ -286,6 +302,10 @@ impl Migration {
     /// agent would have been asked to".
     pub fn what(&self) -> String {
         match self.kind {
+            Kind::Guest if self.for_the_base() => format!(
+                "move this environment to a VM on the current base for {}",
+                self.to_release
+            ),
             Kind::Guest => format!(
                 "move this environment to a VM on {} (it is on {})",
                 self.to_release, self.from_release
@@ -535,5 +555,25 @@ mod tests {
             r#"{"from_vm":"taste-a","from_release":"44.1","to_release":"44.2","pending_since":5}"#;
         let m: Migration = serde_json::from_str(text).unwrap();
         assert_eq!(m.kind, Kind::Guest);
+    }
+
+    /// A move for the base names the base, not a release it is not behind.
+    #[test]
+    fn a_move_for_the_base_says_so() {
+        let m = Migration::new("taste-ws-abc", "44.1", "44.1", 0);
+        let text = m.nudge_text("i-0001", 0);
+        assert!(
+            text.contains("made before the IDE's current base"),
+            "{text}"
+        );
+        assert!(!text.contains("the stable release is now"), "{text}");
+        assert_eq!(
+            m.what(),
+            "move this environment to a VM on the current base for 44.1"
+        );
+        let behind = Migration::new("taste-ws-abc", "44.1", "44.2", 0);
+        assert!(behind
+            .nudge_text("i-0001", 0)
+            .contains("the stable release is now 44.2"));
     }
 }

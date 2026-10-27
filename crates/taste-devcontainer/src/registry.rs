@@ -468,6 +468,9 @@ pub struct EnvironmentRegistry {
     /// Whether the new release's base image is being fetched ahead of the
     /// moves that need it.
     prefetching_guest: AtomicBool,
+    /// Whether this launch has started preparing the current release's
+    /// golden base for VMs made before it ([`Self::prepare_golden`]).
+    preparing_golden: AtomicBool,
     /// Package checks under way, by image, so one image is asked once.
     image_checks: Mutex<std::collections::BTreeSet<String>>,
     /// One writer at a time for the image records file.
@@ -552,6 +555,7 @@ impl EnvironmentRegistry {
             relocations_in_flight: Mutex::new(std::collections::BTreeSet::new()),
             relocating: tokio::sync::Mutex::new(()),
             prefetching_guest: AtomicBool::new(false),
+            preparing_golden: AtomicBool::new(false),
             image_checks: Mutex::new(std::collections::BTreeSet::new()),
             image_records_lock: Mutex::new(()),
             free_disk_for_tests: Mutex::new(None),
@@ -1207,16 +1211,25 @@ impl EnvironmentRegistry {
             } else {
                 format!("Booted in {}: {size}", duration_words(took))
             };
-            match pool.libvirt().release_of(&vm).await {
-                Some(release) if crate::guest::release_is_behind(&release, &image.release) => {
+            match (
+                pool.libvirt().release_of(&vm).await,
+                pool.outdated(&vm, &image).await,
+            ) {
+                (Some(release), Some(_)) if release == image.release => {
+                    words.push_str(&format!(
+                        ", on {release}, made before its golden base; its environments move to \
+                         a VM on it"
+                    ));
+                }
+                (Some(release), Some(_)) => {
                     words.push_str(&format!(
                         ", on {release} — behind stable's {}; its environments move to a VM \
                          on the new release",
                         image.release
                     ));
                 }
-                Some(release) => words.push_str(&format!(", on {release}")),
-                None => {}
+                (Some(release), None) => words.push_str(&format!(", on {release}")),
+                (None, _) => {}
             }
             words.push('.');
             self.conclude(taste_core::StartupStage::Vm, words);
@@ -3899,9 +3912,12 @@ impl EnvironmentRegistry {
             return;
         };
         let mut releases: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut outdated: BTreeMap<String, Option<String>> = BTreeMap::new();
         for vm in &vms {
             releases.insert(vm.domain.clone(), pool.release_of(vm).await);
+            outdated.insert(vm.domain.clone(), pool.outdated(vm, &image).await);
         }
+        self.prepare_golden(&image, &vms).await;
         let now = now_secs();
         let mut idle = Vec::new();
         for supervisor in self.list() {
@@ -3911,10 +3927,7 @@ impl EnvironmentRegistry {
             };
             let dir = self.env_dir(&id);
             let release = releases.get(&domain).cloned().flatten();
-            let behind = release
-                .as_deref()
-                .is_some_and(|r| crate::guest::release_is_behind(r, &image.release));
-            let Some(release) = release.clone().filter(|_| behind) else {
+            let Some(from) = outdated.get(&domain).cloned().flatten() else {
                 // Not behind: what is left to age is the packages.
                 self.detect_package_refresh(&supervisor, &domain, release.as_deref(), now)
                     .await;
@@ -3936,13 +3949,20 @@ impl EnvironmentRegistry {
                     m
                 }
                 None => {
-                    let note = format!(
-                        "environment {id} is in VM {domain} on {release}, behind stable's {}; \
-                         it moves to a VM on {}",
-                        image.release, image.release
-                    );
+                    let note = if from == image.release {
+                        format!(
+                            "environment {id} is in VM {domain}, made before {from}'s golden \
+                             base; it moves to a VM on it"
+                        )
+                    } else {
+                        format!(
+                            "environment {id} is in VM {domain} on {from}, behind stable's {}; \
+                             it moves to a VM on {}",
+                            image.release, image.release
+                        )
+                    };
                     taste_core::app_log::push("info", "environments", &note);
-                    crate::migration::Migration::new(&domain, &release, &image.release, now)
+                    crate::migration::Migration::new(&domain, &from, &image.release, now)
                 }
             };
             if let Err(e) = migration.write(&dir) {
@@ -4223,6 +4243,75 @@ impl EnvironmentRegistry {
             });
         }
         Ok(())
+    }
+
+    /// The current release's golden base, prepared in the background when a
+    /// VM here was made before it and it is not here yet: what lets those
+    /// VMs be found outdated and their environments moved
+    /// ([`Self::detect_migrations`], `Pool::outdated`), rather than waiting
+    /// for the next VM someone happens to make. Not on a metered connection
+    /// or while the user presents, as the moves are not; only with room for
+    /// the builder beside what the running VMs commit; and once a launch,
+    /// so a host that cannot prepare one tries again at its next launch
+    /// rather than every minute.
+    async fn prepare_golden(self: &Arc<Self>, image: &crate::guest::GuestImage, vms: &[Vm]) {
+        if image.golden_is_present() || Hold::now().is_some() {
+            return;
+        }
+        let made_before = vms.iter().any(|vm| {
+            !vm.is_cloud()
+                && crate::golden::revision_of(&vm.disk_path()) != Some(crate::golden::REVISION)
+        });
+        if !made_before {
+            return;
+        }
+        let pool = self.pool();
+        let Ok(room) = pool.memory_room().await else {
+            return;
+        };
+        if !crate::sizing::room_for(
+            room.committed_mib,
+            crate::golden::BUILDER_MEMORY_MIB,
+            room.host_mib,
+        ) || self.preparing_golden.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let libvirt = pool.libvirt().clone();
+        let sandboxed = self.substrate().target().sandboxed();
+        let image = image.clone();
+        tokio::spawn(async move {
+            let report: Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync> =
+                Arc::new(crate::substrate::report_download);
+            let prepared = async {
+                let source = image.ensure_base(sandboxed, report.clone()).await?;
+                if source == image.golden_path() {
+                    return Ok(source);
+                }
+                crate::golden::ensure(&libvirt, &image, &source, report).await
+            }
+            .await;
+            match prepared {
+                Ok(_) => taste_core::app_log::push(
+                    "info",
+                    "environments",
+                    &format!(
+                        "prepared {}'s golden base; environments in VMs made before it move to \
+                         one on it",
+                        image.release
+                    ),
+                ),
+                Err(e) => taste_core::app_log::push(
+                    "warn",
+                    "environments",
+                    &format!(
+                        "{}'s golden base could not be prepared ({e:#}); VMs made before it stay \
+                         as they are",
+                        image.release
+                    ),
+                ),
+            }
+        });
     }
 
     /// The new release's base image, fetched in the background once a move

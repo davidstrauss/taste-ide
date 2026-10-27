@@ -227,6 +227,28 @@ impl Pool {
         &self.workspace_root
     }
 
+    /// The release a VM's environments move off, when they should move to
+    /// a fresh VM: its release is behind `image`'s, or — a VM on this host
+    /// — it was not made from the golden base `image` has here now
+    /// (`crate::golden`), being on Fedora CoreOS as it ships or an earlier
+    /// revision of the base (David, 2026-10-26: "Can we nudge migration to
+    /// the new VMs and containers?"). Only once that golden base is here: a
+    /// host that cannot prepare one makes its VMs without, and they are not
+    /// outdated for it. A cloud host boots Fedora's image by design.
+    pub async fn outdated(&self, vm: &Vm, image: &crate::guest::GuestImage) -> Option<String> {
+        let release = self.release_of(vm).await;
+        if release
+            .as_deref()
+            .is_some_and(|r| crate::guest::release_is_behind(r, &image.release))
+        {
+            return release;
+        }
+        let made_before = !vm.is_cloud()
+            && image.golden_is_present()
+            && crate::golden::revision_of(&vm.disk_path()) != Some(crate::golden::REVISION);
+        made_before.then(|| release.unwrap_or_else(|| image.release.clone()))
+    }
+
     /// Whether this process may provision at all. A probe run may not.
     pub fn provisioning_allowed() -> bool {
         std::env::var_os("TASTE_PROBE_CHECK").is_none()
@@ -334,15 +356,13 @@ impl Pool {
             .await
             .map_err(PoolError::Unavailable)?;
         let mut candidates: Vec<(Vm, VmFacts, Grant)> = Vec::new();
-        // Nothing is placed in a VM behind the stream: its environments are
-        // on their way out of it (`crate::migration`), and a new one would
+        // Nothing is placed in an outdated VM: its environments are on
+        // their way out of it (`crate::migration`), and a new one would
         // only join them.
-        let current = crate::guest::image().ok().map(|image| image.release);
+        let current = crate::guest::image().ok();
         for vm in self.vms().await.map_err(PoolError::Unavailable)? {
-            if let (Some(current), Some(release)) =
-                (current.as_deref(), self.libvirt.release_of(&vm).await)
-            {
-                if crate::guest::release_is_behind(&release, current) {
+            if let Some(image) = &current {
+                if self.outdated(&vm, image).await.is_some() {
                     continue;
                 }
             }

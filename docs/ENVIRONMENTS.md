@@ -4200,7 +4200,14 @@ guest has it takes the same two, and nothing in the guest changes. Until
 then a cloud host boots Fedora CoreOS with Ignition, as does a local VM
 whose golden base could not be prepared. Being nobody's is what lets the
 builder's baseline image go under every project's checkouts, where a copy
-saved out of a workspace's VM may not.
+saved out of a workspace's VM may not. A local VM made before its
+release's golden base is outdated as one behind the release is
+(`Pool::outdated`): nothing new is placed in it, and its environments move
+to a VM on the base by the same migration — the agent told, the
+coordinator approving, forced after two hours, at once when nothing runs.
+When such a VM exists and the golden base does not, a launch prepares it
+in the background, once, with room for the builder and not while metered
+or presenting (`EnvironmentRegistry::prepare_golden`).
 
 **Provisioner credentials are the PROJECT's, under the same rule as the
 Anthropic one** (David, 2026-09-17: "cloud provisioning keys are also

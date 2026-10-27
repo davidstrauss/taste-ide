@@ -66,7 +66,7 @@ pub const BUILDER_PREFIX: &str = "taste-golden-";
 
 /// The builder's memory: a `microdnf` transaction and a podman build, not
 /// a project's workload.
-const BUILDER_MEMORY_MIB: u64 = 3072;
+pub const BUILDER_MEMORY_MIB: u64 = 3072;
 
 /// The most vCPUs the builder is given.
 const BUILDER_VCPUS: u32 = 4;
@@ -85,6 +85,25 @@ pub fn builder_dir() -> PathBuf {
 /// again: its being here is the preparation being under way.
 fn builder_disk(image: &GuestImage) -> PathBuf {
     builder_dir().join(format!("{}-{}.qcow2", image.release, image.arch))
+}
+
+/// The [`REVISION`] of the golden base a VM's disk overlays, read off its
+/// qcow2 header; `None` for a disk on Fedora CoreOS as it ships. What says
+/// a VM was made before the golden base it would be made from now, and
+/// its environments move (`Pool::outdated`).
+pub fn revision_of(disk: &Path) -> Option<u32> {
+    let backing = crate::guest::qcow2_backing_file(disk)?;
+    revision_of_base(backing.file_name()?.to_str()?)
+}
+
+/// `2` of `taste-base-44.20260928.3.2-x86_64-r2.qcow2`.
+fn revision_of_base(name: &str) -> Option<u32> {
+    name.strip_prefix("taste-base-")?
+        .strip_suffix(".qcow2")?
+        .rsplit_once("-r")?
+        .1
+        .parse()
+        .ok()
 }
 
 /// Whether `image`'s golden base is being prepared on this machine.
@@ -456,6 +475,37 @@ mod tests {
         assert!(!disk.starts_with(provision::disks_dir()));
         assert!(disk.starts_with(crate::guest::images_dir()));
         assert!(disk.to_string_lossy().contains(&image.release));
+    }
+
+    /// A disk's base gives its revision back, and Fedora's base image, or
+    /// none, gives none.
+    #[test]
+    fn a_disk_says_which_golden_base_it_was_made_from() {
+        let image = crate::guest::pinned_for("x86_64").unwrap();
+        let name = image.golden_path();
+        let name = name.file_name().unwrap().to_str().unwrap();
+        assert_eq!(revision_of_base(name), Some(REVISION));
+        assert_eq!(
+            revision_of_base("taste-base-44.20260928.3.2-x86_64-r1.qcow2"),
+            Some(1)
+        );
+        assert_eq!(
+            revision_of_base("fedora-coreos-44.20260928.3.2-qemu.x86_64.qcow2"),
+            None
+        );
+        // A real overlay, read through its header.
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("vm.qcow2");
+        let made = std::process::Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2", "-u", "-F", "qcow2", "-b"])
+            .arg(dir.path().join(name))
+            .arg(&disk)
+            .arg("1G")
+            .status();
+        if made.is_ok_and(|s| s.success()) {
+            assert_eq!(revision_of(&disk), Some(REVISION));
+        }
+        assert_eq!(revision_of(&dir.path().join("missing.qcow2")), None);
     }
 
     /// A golden base's name gives its release back, as a base image's
