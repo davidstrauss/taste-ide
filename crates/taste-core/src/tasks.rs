@@ -67,15 +67,48 @@ impl TaskInfo {
             .any(|required| required.name == var)
     }
 
-    /// The variable it is given a file's path in (`is_dir` false) or a
-    /// folder's, when it asks for one: the one that names only that kind
-    /// first, then [`FILE_OR_DIR_VAR`].
-    pub fn path_var(&self, is_dir: bool) -> Option<&'static str> {
+    /// The variable it is given the path of the file or folder named
+    /// `name` in, when it asks for one that path fits: on a file, a
+    /// `FILE_<EXT>` whose extension the name ends in, then `FILE`; on a
+    /// folder, `DIR`; on either, then [`FILE_OR_DIR_VAR`]. `None` when it
+    /// asks for none, and so is not offered on that row.
+    pub fn path_var(&self, name: &str, is_dir: bool) -> Option<String> {
+        let names = self.requires.iter().flatten().map(|r| r.name.as_str());
+        if !is_dir {
+            let name = name.to_lowercase();
+            let typed = names
+                .clone()
+                .filter_map(|var| Some((var, file_ext(var)?)))
+                .filter(|(_, ext)| name.len() > ext.len() && name.ends_with(ext.as_str()))
+                // The longest extension that fits: `FILE_TAR_GZ` before
+                // `FILE_GZ` on `a.tar.gz`.
+                .max_by_key(|(_, ext)| ext.len());
+            if let Some((var, _)) = typed {
+                return Some(var.to_string());
+            }
+        }
         let own = if is_dir { DIR_VAR } else { FILE_VAR };
         [own, FILE_OR_DIR_VAR]
             .into_iter()
             .find(|var| self.takes(var))
+            .map(str::to_string)
     }
+}
+
+/// The extension a `FILE_<EXT>` variable names, lowercased with its dot:
+/// `FILE_RS` is `.rs`, and each further underscore is a dot, so
+/// `FILE_TAR_GZ` is `.tar.gz`. `None` for any other variable, and for
+/// [`FILE_OR_DIR_VAR`], which is not an extension.
+pub fn file_ext(var: &str) -> Option<String> {
+    let rest = var.strip_prefix("FILE_")?;
+    if var == FILE_OR_DIR_VAR
+        || rest
+            .split('_')
+            .any(|part| part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+    Some(format!(".{}", rest.to_lowercase().replace('_', ".")))
 }
 
 /// Where a task is defined, as `task --list-all --json` says.
@@ -115,11 +148,14 @@ pub const DIR_VAR: &str = "DIR";
 /// `PATH`, which Task would take from the environment, so a task that
 /// required it would always have it.
 pub const FILE_OR_DIR_VAR: &str = "FILE_OR_DIR";
+// And `FILE_<EXT>` ([`file_ext`]): a file, offered only on a file whose
+// name ends in that extension, whatever its case. Nothing enforces it;
+// it says where the task belongs, not what it will take.
 
 /// Whether `var` is one of the path variables, whose value is a path in
 /// the container.
 pub fn is_path_var(var: &str) -> bool {
-    [FILE_VAR, DIR_VAR, FILE_OR_DIR_VAR].contains(&var)
+    [FILE_VAR, DIR_VAR, FILE_OR_DIR_VAR].contains(&var) || file_ext(var).is_some()
 }
 
 /// What a task's last run came to.
@@ -1231,19 +1267,65 @@ mod tests {
             ),
             ..TaskInfo::named("t", "")
         };
-        assert_eq!(task(&["FILE"]).path_var(false), Some(FILE_VAR));
-        assert_eq!(task(&["FILE"]).path_var(true), None);
-        assert_eq!(task(&["DIR"]).path_var(true), Some(DIR_VAR));
-        let either = task(&["FILE_OR_DIR"]);
-        assert_eq!(either.path_var(false), Some(FILE_OR_DIR_VAR));
-        assert_eq!(either.path_var(true), Some(FILE_OR_DIR_VAR));
+        let var = |vars: &[&str], name: &str, is_dir: bool| task(vars).path_var(name, is_dir);
+        assert_eq!(var(&["FILE"], "a.py", false).as_deref(), Some(FILE_VAR));
+        assert_eq!(var(&["FILE"], "src", true), None);
+        assert_eq!(var(&["DIR"], "src", true).as_deref(), Some(DIR_VAR));
+        assert_eq!(
+            var(&["FILE_OR_DIR"], "a.py", false).as_deref(),
+            Some(FILE_OR_DIR_VAR)
+        );
+        assert_eq!(
+            var(&["FILE_OR_DIR"], "src", true).as_deref(),
+            Some(FILE_OR_DIR_VAR)
+        );
         // Both: the one that names the kind.
         assert_eq!(
-            task(&["FILE_OR_DIR", "FILE"]).path_var(false),
+            var(&["FILE_OR_DIR", "FILE"], "a.py", false).as_deref(),
             Some(FILE_VAR)
         );
-        assert_eq!(TaskInfo::named("t", "").path_var(false), None);
+        assert_eq!(TaskInfo::named("t", "").path_var("a.py", false), None);
         assert!(is_path_var("FILE_OR_DIR") && !is_path_var("PATH"));
+    }
+
+    /// A `FILE_<EXT>` task is offered only on a file with that extension,
+    /// whatever its case, and never on a folder.
+    #[test]
+    fn a_file_ext_variable_is_offered_on_its_extension_alone() {
+        let task = |vars: &[&str]| TaskInfo {
+            requires: Some(
+                vars.iter()
+                    .map(|name| Required {
+                        name: name.to_string(),
+                        allowed: Allowed::Any,
+                    })
+                    .collect(),
+            ),
+            ..TaskInfo::named("t", "")
+        };
+        let rs = task(&["FILE_RS"]);
+        assert_eq!(rs.path_var("main.rs", false).as_deref(), Some("FILE_RS"));
+        assert_eq!(rs.path_var("MAIN.RS", false).as_deref(), Some("FILE_RS"));
+        assert_eq!(rs.path_var("main.py", false), None);
+        assert_eq!(rs.path_var("rs", false), None);
+        assert_eq!(rs.path_var(".rs", false), None);
+        assert_eq!(rs.path_var("src.rs", true), None);
+        let both = task(&["FILE_GZ", "FILE_TAR_GZ"]);
+        assert_eq!(
+            both.path_var("a.tar.gz", false).as_deref(),
+            Some("FILE_TAR_GZ")
+        );
+        assert_eq!(both.path_var("a.gz", false).as_deref(), Some("FILE_GZ"));
+        // A typed variable first, then plain FILE.
+        let mixed = task(&["FILE", "FILE_RS"]);
+        assert_eq!(mixed.path_var("a.rs", false).as_deref(), Some("FILE_RS"));
+        assert_eq!(mixed.path_var("a.py", false).as_deref(), Some("FILE"));
+        assert_eq!(file_ext("FILE_TAR_GZ").as_deref(), Some(".tar.gz"));
+        assert_eq!(file_ext("FILE_OR_DIR"), None);
+        assert_eq!(file_ext("FILE_"), None);
+        assert_eq!(file_ext("FILE__RS"), None);
+        assert_eq!(file_ext("FILE"), None);
+        assert!(is_path_var("FILE_RS"));
     }
 
     /// Variables go on the command line as `NAME=value`, a name Task takes

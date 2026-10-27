@@ -4882,6 +4882,16 @@ impl FileTree {
             ]);
             task
         };
+        // One that runs on one kind of file (`FILE_RS`), on that kind's
+        // menu alone.
+        let on_ext = |name: &str, desc: &str, var: &str, state| {
+            let mut task = row(name, desc, state);
+            task.info.requires = Some(vec![Required {
+                name: var.to_string(),
+                allowed: Allowed::Any,
+            }]);
+            task
+        };
         // One that runs on either, on a file's menu and a folder's.
         let on_either = |name: &str, desc: &str, state| {
             let mut task = row(name, desc, state);
@@ -4942,6 +4952,7 @@ impl FileTree {
                 row("test", "Run the test suite", RunState::Running),
                 on_file("lint", "", RunState::Idle),
                 on_either("fmt", "Format a file or a folder", RunState::Idle),
+                on_ext("rustfmt", "Format a Rust file", "FILE_RS", RunState::Idle),
                 row("dev", "Build for dev", RunState::Idle),
                 row("dev:init", "Seed the dev database", RunState::Failed),
                 row("dev:serve", "Serve on :3000", RunState::Idle),
@@ -5848,16 +5859,25 @@ impl FileTree {
         }
 
         // The tasks that run on this: one whose `requires` asks for `FILE`
-        // on a file's menu, for `DIR` on a folder's, and for `FILE_OR_DIR`
-        // on either, given this one's path (`TaskInfo::path_var`). Anything
-        // else it asks for is asked when it is chosen.
+        // on a file's menu (`FILE_RS` on a `.rs` file's alone), for `DIR`
+        // on a folder's, and for `FILE_OR_DIR` on either, given this one's
+        // path (`TaskInfo::path_var`). Anything else it asks for is asked
+        // when it is chosen.
         if !node.ghost {
             let (offered, runnable) = {
                 let tasks = self.tasks.borrow();
-                let offered: Vec<(crate::tasks::TaskInfo, &'static str)> = tasks
+                let name = node
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let offered: Vec<(crate::tasks::TaskInfo, String)> = tasks
                     .0
                     .iter()
-                    .filter_map(|row| Some((row.info.clone(), row.info.path_var(node.is_dir)?)))
+                    .filter_map(|row| {
+                        let var = row.info.path_var(&name, node.is_dir)?;
+                        Some((row.info.clone(), var))
+                    })
                     .collect();
                 (offered, tasks.1.is_none())
             };
@@ -5878,7 +5898,7 @@ impl FileTree {
                     let action = gio::SimpleAction::new(&action_name, None);
                     action.set_enabled(runnable);
                     let tree = self.clone();
-                    let given = vec![(var.to_string(), value.clone())];
+                    let given = vec![(var, value.clone())];
                     action.connect_activate(move |_, _| {
                         tree.ask_and_run_task(&info, given.clone());
                     });

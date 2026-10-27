@@ -264,7 +264,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 19;
+pub const GUIDANCE_REVISION: u32 = 20;
 
 /// `result` with each image block replaced by
 /// [`taste_core::imageless::WITHHELD`].
@@ -397,7 +397,9 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              a required variable named FILE (a file), DIR (a folder), or FILE_OR_DIR (either), \
              as in `requires: {vars: [FILE]}`, given as an absolute path and quoted where it \
              is used (`{{q .FILE}}`): the user's file tree then offers it on that file's or \
-             folder's menu, and its play button asks for each variable its `requires` names.\n\n\
+             folder's menu, and its play button asks for each variable its `requires` names. \
+             FILE_<EXT> is a file of one type, offered only on files with that extension in \
+             any case: FILE_RS on `.rs`, FILE_TAR_GZ on `.tar.gz`.\n\n\
              WAITING. To wait for something, call wait, never sleep: name the tasks \
              (`tasks`) or ide_exec handles (`commands`) to wait for, and `seconds` as the \
              longest to wait. It returns as soon as one of them finishes, when the time is \
@@ -6641,8 +6643,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "1a65cb303bc2834108a7084182ef3ce167dbf1220d49f9231063802dad6934ad";
-        const AT_REVISION: u32 = 19;
+            "4af17b445bb68a88a79ece65411b3e5436ad50d473c8f1a1d4ea42dd83db830f";
+        const AT_REVISION: u32 = 20;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"
