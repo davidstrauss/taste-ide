@@ -403,7 +403,7 @@ fn worktree_at(root: &Path, files: &Files) -> Worktree {
             files: files.clone(),
             path: root.to_path_buf(),
             after_ref_change: None,
-            merges: None,
+            sandbox: None,
         }
     }
 }

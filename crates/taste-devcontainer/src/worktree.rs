@@ -109,6 +109,21 @@ impl std::fmt::Display for GitFailed {
 
 impl std::error::Error for GitFailed {}
 
+/// A git run's output, or its last line of complaint as a [`GitFailed`].
+fn succeeded(out: ExecOutput) -> Result<String> {
+    if !out.success() {
+        let stderr = out.stderr_utf8();
+        let last = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("git failed")
+            .to_string();
+        return Err(GitFailed(last).into());
+    }
+    Ok(out.stdout_utf8())
+}
+
 /// The working tree of one environment, on this host or in a VM.
 #[derive(Clone)]
 pub enum Worktree {
@@ -121,10 +136,11 @@ pub enum Worktree {
         /// Run after a commit, a switch, or anything else that moves a ref
         /// over there, so the peer on this host learns of it.
         after_ref_change: Option<Arc<dyn Fn() + Send + Sync>>,
-        /// The environment's own container, where a rebase or a merge runs
-        /// ([`Self::with_merges`]); `None` runs them through the files
-        /// service, as every other verb does.
-        merges: Option<ExecContext>,
+        /// The environment's own container, where git runs whatever runs
+        /// a repository's own commands — a merge, a filter
+        /// ([`Self::with_sandbox`]); `None` runs it all through the files
+        /// service.
+        sandbox: Option<ExecContext>,
     },
 }
 
@@ -153,7 +169,7 @@ impl Worktree {
                 files,
                 path: path.clone(),
                 after_ref_change: None,
-                merges: None,
+                sandbox: None,
             },
         }
     }
@@ -170,25 +186,30 @@ impl Worktree {
         self
     }
 
-    /// [`Self::for_checkout`], with its rebases and merges run in the
-    /// environment's own container, `exec`, rather than through the files
-    /// service.
+    /// [`Self::for_checkout`], with the git that runs a repository's own
+    /// commands run in the environment's own container, `exec`, rather
+    /// than through the files service: its merges and rebases, and every
+    /// verb that runs a `filter=` driver — stage (the clean filter),
+    /// discard, switch, and a conflict's side (the smudge), and stash and
+    /// unstash (both).
     ///
     /// The files service is one per VM and shared by every environment in
     /// it, so its git reads no attributes and runs every filter as `cat`
     /// (`GIT_ATTR_SOURCE`, the keeper's `gitSafe`): no repository's config
-    /// runs anything there. A merge is where a repository most wants its
-    /// own: a `merge=` driver in `.gitattributes` defined in its config, a
-    /// filter that has to see both sides as the user's git does. The
-    /// environment's container is where that repository's code already
-    /// runs, so that is where its merges run too (David, 2026-10-26: "we
-    /// should use custom merge drivers inside the container+VM sandboxes,
-    /// which is where complex merges should all happen, anyway"). Only in
-    /// container mode: the baseline binds the checkout read-only, so safe
-    /// mode's merges stay with the files service.
-    pub fn with_merges(mut self, exec: ExecContext) -> Self {
-        if let Worktree::Remote { merges, .. } = &mut self {
-            *merges = Some(exec);
+    /// runs anything there. A merge driver, a filter like Git LFS's, are
+    /// the repository's code, and the environment's container is where
+    /// that code already runs, so that is where they run too (David,
+    /// 2026-10-26: "we should use custom merge drivers inside the
+    /// container+VM sandboxes, which is where complex merges should all
+    /// happen, anyway"; and of `filter=`, the same). What only reads —
+    /// the listing, status, the stash list — stays with the files
+    /// service, which answers fast; status asks the container only about
+    /// the files a filter applies to ([`Self::filtered_unchanged`]). Only
+    /// in container mode: the baseline binds the checkout read-only, so
+    /// safe mode's git stays with the files service.
+    pub fn with_sandbox(mut self, exec: ExecContext) -> Self {
+        if let Worktree::Remote { sandbox, .. } = &mut self {
+            *sandbox = Some(exec);
         }
         self
     }
@@ -219,7 +240,7 @@ impl Worktree {
         let mut args = vec!["stash", "push", "--include-untracked", "-m", message, "--"];
         let rels: Vec<String> = rels.iter().map(|r| r.display().to_string()).collect();
         args.extend(rels.iter().map(String::as_str));
-        self.git_ok(&args)?;
+        self.sandbox_ok(&args)?;
         Ok(())
     }
 
@@ -230,7 +251,7 @@ impl Worktree {
         let mut args = vec!["checkout", side, "--"];
         let rels: Vec<String> = rels.iter().map(|r| r.display().to_string()).collect();
         args.extend(rels.iter().map(String::as_str));
-        self.git_ok(&args)?;
+        self.sandbox_ok(&args)?;
         Ok(())
     }
 
@@ -560,18 +581,93 @@ impl Worktree {
 
     /// `run_git`, failing on a non-zero status with git's last line.
     fn git_ok(&self, args: &[&str]) -> Result<String> {
-        let out = self.run_git(args, &[])?;
-        if !out.success() {
-            let stderr = out.stderr_utf8();
-            let last = stderr
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("git failed")
-                .to_string();
-            return Err(GitFailed(last).into());
+        succeeded(self.run_git(args, &[])?)
+    }
+
+    /// Whether git that runs a repository's commands runs in the
+    /// environment's container ([`Self::with_sandbox`]).
+    fn has_sandbox(&self) -> bool {
+        matches!(self, Worktree::Remote { sandbox: Some(exec), .. } if exec.is_container())
+    }
+
+    /// `git <args>` in the environment's container, or `None` where there
+    /// is none to run it in ([`Self::with_sandbox`]).
+    ///
+    /// A container that cannot run it at all — gone between the check and
+    /// the exec, or an image with no `git` — is podman's 125 or `env`'s 126
+    /// and 127, and nothing has been touched yet, so that is `None` too,
+    /// for the files service to run it instead; any other answer is git's,
+    /// after it may have begun, and is the answer.
+    fn in_sandbox(&self, args: &[&str]) -> Option<ExecOutput> {
+        let Worktree::Remote {
+            sandbox: Some(exec),
+            path,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if !exec.is_container() {
+            return None;
         }
-        Ok(out.stdout_utf8())
+        // The checkout as the container mounts it; where the IDE's own
+        // container is the environment, the same path as here.
+        let dir = exec
+            .container_workdir()
+            .unwrap_or_else(|| path.display().to_string());
+        let mut argv = vec![
+            "GIT_TERMINAL_PROMPT=0",
+            "GIT_EDITOR=true",
+            "git",
+            "-C",
+            &dir,
+        ];
+        argv.extend_from_slice(args);
+        let spec = exec.resolve("env", &argv, false);
+        let unrun = |why: &str| {
+            tracing::warn!(
+                "git {} could not run in the environment's container ({why}); \
+                 running it through the files service",
+                args.join(" "),
+            );
+        };
+        let output = match std::process::Command::new(&spec.program)
+            .args(&spec.args)
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Ok(output) => output,
+            Err(e) => {
+                unrun(&e.to_string());
+                return None;
+            }
+        };
+        match output.status.code() {
+            Some(125..=127) | None => {
+                unrun(String::from_utf8_lossy(&output.stderr).trim());
+                None
+            }
+            Some(status) => Some(ExecOutput {
+                status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }),
+        }
+    }
+
+    /// `git <args>` in the environment's container where there is one
+    /// ([`Self::in_sandbox`]), through the files service otherwise.
+    fn sandbox_run(&self, args: &[&str]) -> Result<ExecOutput> {
+        match self.in_sandbox(args) {
+            Some(out) => Ok(out),
+            None => self.run_git(args, &[]),
+        }
+    }
+
+    /// [`Self::sandbox_run`], failing on a non-zero status with git's last
+    /// line.
+    fn sandbox_ok(&self, args: &[&str]) -> Result<String> {
+        succeeded(self.sandbox_run(args)?)
     }
 
     fn ref_changed(&self) {
@@ -616,6 +712,9 @@ impl Worktree {
                 for same in self.stat_only(&status) {
                     status.remove(&same);
                 }
+                for same in self.filtered_unchanged(&status) {
+                    status.remove(&same);
+                }
                 // And the files inside each submodule, which the parent's
                 // status names only as the submodule, modified — so only
                 // asked when something is. One that cannot be read leaves
@@ -637,6 +736,84 @@ impl Worktree {
                 Ok(status)
             }
         }
+    }
+
+    /// The files `status` calls changed that a `filter=` driver applies to
+    /// and whose contents, once that driver has run, are what the index
+    /// has — refreshed in the index so status stops saying so.
+    ///
+    /// The files service runs every filter as `cat`, so a file whose clean
+    /// filter changes it — a Git LFS file, its content where the index has
+    /// its pointer — read as changed there forever. The container runs
+    /// the repository's own driver ([`Self::with_sandbox`]): `update-index
+    /// --refresh` there records the stat data of every such file whose
+    /// cleaned content matches, which never stages a change, and `diff`
+    /// says which still differ. Only files the attributes name a filter
+    /// for are asked, so a repository with none pays one `check-attr` for
+    /// what status listed, and nothing when it listed nothing.
+    fn filtered_unchanged(&self, status: &HashMap<PathBuf, FileState>) -> Vec<PathBuf> {
+        const LIMIT: usize = 500;
+        if !self.has_sandbox() {
+            return Vec::new();
+        }
+        let changed: Vec<String> = status
+            .iter()
+            .filter(|(_, state)| **state == FileState::Modified)
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+        if changed.is_empty() || changed.len() > LIMIT {
+            return Vec::new();
+        }
+        let mut args: Vec<String> = ["check-attr", "-z", "filter", "--"]
+            .map(String::from)
+            .to_vec();
+        args.extend(changed.iter().cloned());
+        let Ok(out) = self.run_git_reading_attributes(&args) else {
+            return Vec::new();
+        };
+        if !out.success() {
+            return Vec::new();
+        }
+        let text = out.stdout_utf8();
+        let fields: Vec<&str> = text.split('\0').collect();
+        let filtered: Vec<String> = fields
+            .chunks(3)
+            .filter_map(|entry| match entry {
+                [path, _, value] if !matches!(*value, "unspecified" | "unset" | "set") => {
+                    Some(path.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        if filtered.is_empty() {
+            return Vec::new();
+        }
+        let literal: Vec<String> = filtered
+            .iter()
+            .map(|path| format!(":(literal){path}"))
+            .collect();
+        let mut refresh = vec!["update-index", "-q", "--refresh", "--"];
+        refresh.extend(filtered.iter().map(String::as_str));
+        let _ = self.in_sandbox(&refresh);
+        let mut diff = vec!["diff", "--name-only", "-z", "--no-renames", "--"];
+        diff.extend(literal.iter().map(String::as_str));
+        let Some(out) = self.in_sandbox(&diff) else {
+            return Vec::new();
+        };
+        if !out.success() {
+            return Vec::new();
+        }
+        let differ: HashSet<String> = out
+            .stdout_utf8()
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .map(String::from)
+            .collect();
+        filtered
+            .into_iter()
+            .filter(|path| !differ.contains(path))
+            .map(PathBuf::from)
+            .collect()
     }
 
     /// The files `status` calls changed in the working tree whose contents
@@ -778,7 +955,7 @@ impl Worktree {
         match self {
             Worktree::Local(_) => self.local()?.stage(rel),
             Worktree::Remote { .. } => {
-                self.git_ok(&["add", "-A", "--", &rel.display().to_string()])?;
+                self.sandbox_ok(&["add", "-A", "--", &rel.display().to_string()])?;
                 Ok(())
             }
         }
@@ -822,7 +999,7 @@ impl Worktree {
                 } else {
                     &["restore", "--worktree", "--", &rel]
                 };
-                let out = self.run_git(args, &[])?;
+                let out = self.sandbox_run(args)?;
                 if !out.success() && !out.stderr_utf8().contains("did not match") {
                     bail!("{}", out.stderr_utf8().trim());
                 }
@@ -885,7 +1062,7 @@ impl Worktree {
         match self {
             Worktree::Local(_) => self.local()?.switch_branch(name)?,
             Worktree::Remote { .. } => {
-                self.git_ok(&["switch", "-q", name])?;
+                self.sandbox_ok(&["switch", "-q", name])?;
             }
         }
         self.ref_changed();
@@ -950,7 +1127,7 @@ impl Worktree {
 
     /// Stash one path, tracked or not, under `message`.
     pub fn stash_file(&self, rel: &Path, message: &str) -> Result<()> {
-        self.git_ok(&[
+        self.sandbox_ok(&[
             "stash",
             "push",
             "--include-untracked",
@@ -974,7 +1151,7 @@ impl Worktree {
         let rel = rel.display().to_string();
         let mut last = String::new();
         for source in [id.to_string(), format!("{id}^3")] {
-            match self.git_ok(&[
+            match self.sandbox_ok(&[
                 "restore",
                 &format!("--source={source}"),
                 "--worktree",
@@ -1129,7 +1306,7 @@ impl Worktree {
     /// what knows the upstream; the caller names the ref it wants — in a
     /// VM that is a `refs/remotes/*` the registry pushed over.
     pub fn rebase_onto(&self, onto: &str) -> Result<()> {
-        self.merge_ok(&["rebase", "--autostash", onto])?;
+        self.sandbox_ok(&["rebase", "--autostash", onto])?;
         self.ref_changed();
         Ok(())
     }
@@ -1139,73 +1316,9 @@ impl Worktree {
     /// a commit of its own is refused, never replayed. A merge all the
     /// same, for the autostash put back over it.
     pub fn fast_forward_onto(&self, onto: &str) -> Result<()> {
-        self.merge_ok(&["merge", "--ff-only", "--autostash", onto])?;
+        self.sandbox_ok(&["merge", "--ff-only", "--autostash", onto])?;
         self.ref_changed();
         Ok(())
-    }
-
-    /// `git_ok` for a command that merges, in the environment's container
-    /// when the tree has one in container mode ([`Self::with_merges`]),
-    /// and through the files service otherwise.
-    ///
-    /// A container that cannot run it at all — gone between the check and
-    /// the exec, or an image with no `git` — is podman's 125 or `env`'s 126
-    /// and 127, and nothing has been touched yet, so the files service runs
-    /// it instead; any other failure is git's, after it may have begun, and
-    /// is the answer.
-    fn merge_ok(&self, args: &[&str]) -> Result<String> {
-        let Worktree::Remote {
-            merges: Some(exec),
-            path,
-            ..
-        } = self
-        else {
-            return self.git_ok(args);
-        };
-        if !exec.is_container() {
-            return self.git_ok(args);
-        }
-        // The checkout as the container mounts it; where the IDE's own
-        // container is the environment, the same path as here.
-        let dir = exec
-            .container_workdir()
-            .unwrap_or_else(|| path.display().to_string());
-        let mut argv = vec![
-            "GIT_TERMINAL_PROMPT=0",
-            "GIT_EDITOR=true",
-            "git",
-            "-C",
-            &dir,
-        ];
-        argv.extend_from_slice(args);
-        let spec = exec.resolve("env", &argv, false);
-        let output = std::process::Command::new(&spec.program)
-            .args(&spec.args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .context("running git in the environment's container")?;
-        match output.status.code() {
-            Some(0) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
-            Some(125..=127) | None => {
-                tracing::warn!(
-                    "git {} could not run in the environment's container ({}); \
-                     running it through the files service",
-                    args.join(" "),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                self.git_ok(args)
-            }
-            Some(_) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let last = stderr
-                    .lines()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("git failed")
-                    .to_string();
-                Err(GitFailed(last).into())
-            }
-        }
     }
 
     pub fn rebase_abort(&self) -> Result<()> {
@@ -1215,7 +1328,7 @@ impl Worktree {
     }
 
     pub fn rebase_continue(&self) -> Result<()> {
-        self.merge_ok(&["-c", "core.editor=true", "rebase", "--continue"])?;
+        self.sandbox_ok(&["-c", "core.editor=true", "rebase", "--continue"])?;
         self.ref_changed();
         Ok(())
     }
@@ -1571,14 +1684,88 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
-            merges: None,
+            sandbox: None,
         }
-        .with_merges(ExecContext::for_tests(true));
+        .with_sandbox(ExecContext::for_tests(true));
         remote.rebase_onto("up").unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "merged by the driver, editor true\n"
         );
+    }
+
+    /// A `filter=` driver runs in the environment's container: a stage
+    /// there stores what its clean filter makes, and status asks it about
+    /// a filtered file the files service — whose filters are `cat` — takes
+    /// for changed. The driver cleans only where the container's
+    /// environment is (`GIT_EDITOR`, which only that path sets), and is
+    /// `cat` elsewhere, which is the files service's shape.
+    #[test]
+    fn a_filter_runs_in_the_sandbox_and_status_believes_it() {
+        if !git_present() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_commit(root);
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env_remove("GIT_EDITOR")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        std::fs::write(root.join(".gitattributes"), "*.dat filter=upper\n").unwrap();
+        git(&[
+            "config",
+            "filter.upper.clean",
+            "if [ \"$GIT_EDITOR\" = true ]; then tr a-z A-Z; else cat; fi",
+        ]);
+        git(&["config", "filter.upper.smudge", "tr A-Z a-z"]);
+        git(&["add", ".gitattributes"]);
+        git(&["commit", "-qm", "attributes"]);
+        std::fs::write(root.join("a.dat"), "hello\n").unwrap();
+
+        let tree = |sandboxed: bool| {
+            let tree = Worktree::Remote {
+                files: Files::Local,
+                path: root.to_path_buf(),
+                after_ref_change: None,
+                sandbox: None,
+            };
+            if sandboxed {
+                tree.with_sandbox(ExecContext::for_tests(true))
+            } else {
+                tree
+            }
+        };
+        tree(true).stage(Path::new("a.dat")).unwrap();
+        assert_eq!(git(&["cat-file", "-p", ":a.dat"]), "HELLO\n");
+        git(&["commit", "-qm", "dat"]);
+
+        // The same bytes, their time a minute back: what git recorded no
+        // longer matches, so it has to read the file. (A minute ahead is
+        // git's "racily clean", which it reads every time however often
+        // the index is refreshed.)
+        let file = std::fs::File::options()
+            .write(true)
+            .open(root.join("a.dat"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+        drop(file);
+        assert_eq!(
+            tree(false).status().unwrap().get(Path::new("a.dat")),
+            Some(&FileState::Modified),
+            "the files service's cat takes it for changed"
+        );
+        assert_eq!(tree(true).status().unwrap().get(Path::new("a.dat")), None);
+        assert_eq!(tree(false).status().unwrap().get(Path::new("a.dat")), None);
     }
 
     fn git_present() -> bool {
@@ -1633,7 +1820,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
-            merges: None,
+            sandbox: None,
         };
         assert_eq!(
             Worktree::Local(root.to_path_buf()).sync_ignored(&HashMap::new()),
@@ -1706,7 +1893,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
-            merges: None,
+            sandbox: None,
         };
         let shown = worktree.sync_ignored(&worktree.status().unwrap());
         assert_eq!(
@@ -1733,7 +1920,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
-            merges: None,
+            sandbox: None,
         };
         std::fs::write(root.join("a.txt"), "a changed\n").unwrap();
         std::fs::write(root.join("b.txt"), "b changed\n").unwrap();
@@ -1819,7 +2006,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
-            merges: None,
+            sandbox: None,
         };
         assert_eq!(local.branch_name(), remote.branch_name());
         assert!(local.branch_name().is_some());
@@ -1954,7 +2141,7 @@ mod tests {
             files: Files::Local,
             path: root.to_path_buf(),
             after_ref_change: None,
-            merges: None,
+            sandbox: None,
         }
     }
 

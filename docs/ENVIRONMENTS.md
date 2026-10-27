@@ -4651,7 +4651,7 @@ the peer's remote-tracking refs are pushed into the checkout, the rebase
 runs where the working tree is, and the peer is synced after. **This host
 fetches; the sandbox merges** (2026-10-26). The rebase, the fast-forward
 with the autostash put back over it, and a rebase's Continue run in the
-environment's own container (`Worktree::with_merges`), not through the
+environment's own container (`Worktree::with_sandbox`), not through the
 files service: the files service is one per VM, shared by every
 environment in it, so its git reads no attributes and runs every filter
 as `cat`, and a repository's own `merge=` driver, or a filter that has to
@@ -4666,7 +4666,20 @@ content on this host: a review lands by fast-forward, and what the
 merged-branch check computes in memory is never written. One merge is
 still the files service's: the sync's stash put back over a folder that
 was ahead (`SYNC_SCRIPT`), which keeps the stash for Unstash when it
-does not apply rather than merging it. The primary
+does not apply rather than merging it. **A `filter=` driver runs there too**
+(2026-10-26), Git LFS's among them: stage (the clean filter), discard,
+switch, a conflict's side (the smudge), and stash and Unstash (both) go
+to the container, and status, which the files service still answers,
+asks the container only about the files a filter applies to — the files
+service's `cat` took an LFS file's content for a change against its
+pointer forever — refreshing their stat data there, which never stages
+anything (`Worktree::filtered_unchanged`). The driver is the image's to
+carry (`git-lfs` in the Dockerfile); without it, git's own refusal is
+what the file tree shows. The folder's mirror needs no filter: both
+sides snapshot a file's bytes, so a filtered file cannot loop it the way
+an `ident` one did. Not yet: an LFS object reaches the remote only with
+a push that carries it, and the push is this host's while the objects
+are in the checkout's `.git/lfs`. The primary
 is snapshotted on the same cadence as every other environment now, and
 the two early returns that kept it out are gone.
 

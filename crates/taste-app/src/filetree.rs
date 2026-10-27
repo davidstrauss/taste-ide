@@ -2774,7 +2774,7 @@ impl FileTree {
     /// switch, stash, rebase — wherever it is. One call per operation
     /// (`taste_devcontainer::Worktree`); a tree in the VM syncs the peer
     /// after every ref it moves, and merges in its environment's container
-    /// (`Worktree::with_merges`): this host fetches, the sandbox merges.
+    /// (`Worktree::with_sandbox`): this host fetches, the sandbox merges.
     fn worktree(&self) -> Worktree {
         match self.watching.borrow().as_ref() {
             // The watched environment's checkout wherever it is, read
@@ -2784,11 +2784,11 @@ impl FileTree {
             // its peer through that environment's own watch, which syncs
             // after every ref it sees move (`Supervisor::set_keeper`).
             Some(aim) => Worktree::for_checkout(&aim.checkout, aim.files.clone())
-                .with_merges(aim.exec.clone()),
+                .with_sandbox(aim.exec.clone()),
             None => {
                 let tree =
                     Worktree::for_checkout(&self.workspace.checkout(), self.workspace.files())
-                        .with_merges(self.workspace.exec.clone());
+                        .with_sandbox(self.workspace.exec.clone());
                 match self.after_ref_change.borrow().as_ref() {
                     Some(hook) => tree.with_after_ref_change(hook.clone()),
                     None => tree,
@@ -11856,7 +11856,7 @@ mod tests {
             files: taste_core::files::Files::Local,
             path: root.clone(),
             after_ref_change: None,
-            merges: None,
+            sandbox: None,
         };
         let mut synced = taste_devcontainer::worktree::SyncIgnored::default();
         synced.toggled.dirs.insert(std::path::PathBuf::from("data"));
