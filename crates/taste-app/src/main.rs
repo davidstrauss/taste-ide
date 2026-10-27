@@ -43,6 +43,7 @@ mod glycin;
 mod gtk_test;
 mod holdbutton;
 mod hover;
+mod html_view;
 mod inset;
 mod intervention;
 mod issue_pill;

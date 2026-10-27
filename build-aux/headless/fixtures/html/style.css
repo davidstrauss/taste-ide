@@ -1,0 +1,5 @@
+body { font: 16px/1.5 system-ui, sans-serif; margin: 32px; color: #222; background: #fdf6e3; }
+h1 { color: #268bd2; }
+code { background: #eee8d5; padding: 0 4px; border-radius: 4px; }
+.ran { color: #2aa198; font-weight: bold; }
+.refused { color: #cb4b16; font-weight: bold; }

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta name="viewport" content="width=device-width">
+<title>An HTML preview</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<h1>An HTML preview — café</h1>
+<p id="script">The script beside the page has not run.</p>
+<p id="network">The fetch to the network has not settled.</p>
+<p>Drawn by WebKit from the tab's buffer, with <code>style.css</code>,
+<code>logo.svg</code>, and <code>app.js</code> read from beside it.</p>
+<img src="logo.svg" alt="A logo from beside the page" width="96" height="96">
+<!-- Both of these reach for a server on this machine, and the preview's
+     policy refuses both: the probe's server logs any request that arrives. -->
+<img src="http://127.0.0.1:8765/beacon.png" alt="">
+<ul>
+<li><a href="other.html">Another page of the checkout</a>, which opens its own tab</li>
+<li><a href="https://example.com/">A page on the web</a>, which opens in the browser</li>
+</ul>
+<script src="app.js"></script>
+</body>
+</html>

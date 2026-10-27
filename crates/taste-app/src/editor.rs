@@ -84,6 +84,9 @@ struct EditorPage {
     svg: RefCell<Option<Rc<crate::viewer::ZoomImage>>>,
     /// Which drawing of the SVG is the latest.
     svg_generation: Rc<Cell<u64>>,
+    /// An HTML file's preview: the page in a WebKit view, made the first
+    /// time it is shown (`crate::html_view`).
+    html: RefCell<Option<Rc<crate::html_view::HtmlPreview>>>,
     /// Revealed when the file changed on disk UNDER unsaved edits.
     conflict_bar: crate::viewer::ChangedBar,
     /// Hash of the bytes the last save wrote: the watcher echoes our own
@@ -2426,6 +2429,11 @@ impl Editor {
                     image.scroller.grab_focus();
                 }
             }
+            Some("web") => {
+                if let Some(html) = page.html.borrow().as_ref() {
+                    html.view.grab_focus();
+                }
+            }
             _ => {
                 if let Some(face) = page.stack.visible_child() {
                     face.child_focus(gtk::DirectionType::TabForward);
@@ -3974,6 +3982,7 @@ impl Editor {
             preview_generation: Rc::new(Cell::new(0)),
             svg: RefCell::new(None),
             svg_generation: Rc::new(Cell::new(0)),
+            html: RefCell::new(None),
             conflict_bar,
             saved_hash: Cell::new(None),
             warned: Cell::new(false),
@@ -4375,6 +4384,12 @@ impl Editor {
                     self.show_svg(page);
                 }
                 "image"
+            }
+            (true, false) if is_html(path) => {
+                if page.html.borrow().is_none() {
+                    self.show_html(path, page);
+                }
+                "web"
             }
             (true, false) => "preview",
             _ => "edit",
@@ -5075,8 +5090,9 @@ impl Editor {
             return !page.raw_source.get();
         }
         // An SVG is drawn by the helper, whatever its lines — a path's
-        // data is often one long line, which makes the file plain.
-        if is_svg(path) {
+        // data is often one long line, which makes the file plain — and an
+        // HTML page by WebKit, minified or not.
+        if is_svg(path) || is_html(path) {
             return !page.raw_source.get();
         }
         is_markdown(path)
@@ -5097,9 +5113,9 @@ impl Editor {
             page.view.set_editable(true);
             // A notebook's face is drawn whatever its source's lines —
             // its pictures are base64 on one line each — and an SVG's,
-            // whose path data is one; anything else plain has no other
-            // face.
-            if !is_notebook(path) && !is_svg(path) {
+            // whose path data is one, and an HTML page's, minified or
+            // not; anything else plain has no other face.
+            if !is_notebook(path) && !is_svg(path) && !is_html(path) {
                 return;
             }
         } else {
@@ -5113,6 +5129,10 @@ impl Editor {
         if is_svg(path) {
             if self.wysiwyg_active(path, page) {
                 self.show_svg(page);
+            }
+        } else if is_html(path) {
+            if self.wysiwyg_active(path, page) {
+                self.show_html(path, page);
             }
         } else if self.wysiwyg_active(path, page) {
             // Full-quality preview: pulldown-cmark rendered into native
@@ -5195,6 +5215,45 @@ impl Editor {
         if !page.changes_view.get() {
             self.show_face(path, page);
         }
+    }
+
+    /// An HTML file's preview: the buffer as WebKit draws it, with what it
+    /// links to read from beside it in its own checkout.
+    fn show_html(&self, path: &Path, page: &EditorPage) {
+        let text = page
+            .buffer
+            .text(&page.buffer.start_iter(), &page.buffer.end_iter(), true)
+            .to_string();
+        let existing = page.html.borrow().clone();
+        let preview = match existing {
+            Some(preview) => preview,
+            None => {
+                let open_events = self.workspace.events.clone();
+                let base = crate::markdown_view::DocumentBase {
+                    files: page.files.clone(),
+                    dir: path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| page.origin_root.clone()),
+                    root: page.origin_root.clone(),
+                    open_file: Rc::new(move |path, at| {
+                        open_events.publish(taste_core::Event::OpenFileRequested { path, at });
+                    }),
+                };
+                let url_events = self.workspace.events.clone();
+                let preview = crate::html_view::HtmlPreview::new(
+                    base,
+                    path,
+                    Rc::new(move |url: &str| {
+                        url_events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
+                    }),
+                );
+                page.stack.add_named(&preview.view, Some("web"));
+                *page.html.borrow_mut() = Some(preview.clone());
+                preview
+            }
+        };
+        preview.show(text);
     }
 
     /// An SVG's preview: the buffer drawn by the confined helper — the
@@ -5474,9 +5533,9 @@ fn is_notebook(path: &Path) -> bool {
 }
 
 /// Whether a file has a face besides its source: Markdown's preview, a
-/// notebook's cells.
+/// notebook's cells, an SVG's picture, an HTML file's page.
 fn has_preview(path: &Path) -> bool {
-    is_markdown(path) || is_notebook(path) || is_svg(path)
+    is_markdown(path) || is_notebook(path) || is_svg(path) || is_html(path)
 }
 
 /// A plain text file, whose lines may be wrapped from its tab bar (David,
@@ -5509,6 +5568,16 @@ fn is_svg(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
+}
+
+/// An HTML file: markup to edit, a page to preview, drawn by WebKit
+/// (`crate::html_view`).
+fn is_html(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        ["html", "htm", "xhtml"]
+            .iter()
+            .any(|h| e.eq_ignore_ascii_case(h))
+    })
 }
 
 fn is_markdown(path: &Path) -> bool {

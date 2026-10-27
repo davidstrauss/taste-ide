@@ -1031,6 +1031,14 @@ no-op at every other width.
   David, 2026-10-20: "pack these now quite lean controls into the right
   side of the document tab bar area"). An SVG file is edited as XML and
   previewed as a picture, drawn by the confined helper Mermaid uses. An
+  HTML file is edited as markup and previewed as a page, in a WebKit view
+  (`html_view.rs`): the buffer, unsaved edits and all, with what it links
+  to read from beside it in its checkout, on a `taste-html://` scheme
+  whose every answer carries a Content-Security-Policy of this preview's
+  own origin and inline content, so nothing it runs reaches the network,
+  and whose requests are answered only for the view that made them; a
+  click to another file of the checkout opens that file's tab, and one to
+  the web the user's browser (2026-10-26). An
   image file, a picture in a Markdown preview, and an image in a
   transcript are decoded by glycin (`glycin.rs`), the GNOME platform's
   loaders, each format's in a sandboxed process of its own (bwrap, or
