@@ -3852,7 +3852,7 @@ impl Supervisor {
         // and where every environment's container runs.
         if !self.checkout().is_local() {
             mounts.push("-v".into());
-            mounts.push(crate::agentnode::mount_arg(&self.env.workspace_root));
+            mounts.push(crate::agentnode::mount_arg());
         }
 
         // **No IDE socket is mounted here, deliberately.** The MCP socket

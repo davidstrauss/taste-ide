@@ -5,6 +5,7 @@
 //! ever crosses this boundary.
 
 pub mod activity;
+pub mod agent_runtime;
 pub mod agentedit;
 pub mod anchor;
 pub mod app_log;

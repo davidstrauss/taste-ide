@@ -3235,9 +3235,13 @@ is shouted, but nothing runs either. The rows say what is missing, and
   after one image build and one cargo build; 2026-10-26, a guest using
   1.2 GiB held 6.3 GiB). So the guest has a balloon that is never
   inflated and carries free page reporting, and a timer in it hands the
-  host back the page cache gone cold (`provision::GUEST_BALLOON`,
-  `GUEST_RECLAIM_SCRIPT`): a throwaway guest holding 2.6 GiB after a
-  large read went to 764 MiB. What a VM holds now follows what it uses,
+  host back the page cache gone cold and then compacts the guest's memory,
+  since the balloon reports only whole 2 MiB blocks
+  (`provision::GUEST_BALLOON`, `GUEST_RECLAIM_SCRIPT`): a throwaway guest
+  holding 2.6 GiB after a large read went to 764 MiB, and a compaction
+  gave back another 292 MiB a fragmented guest had stranded. KSM and zram
+  were measured beside it and left out: 50 MiB across three agents for a
+  scanner waking fifty times a second, and 40 MiB that mostly came back. What a VM holds now follows what it uses,
   but it can grow back into the rest at any moment, so placement still
   counts the configured memory whole. Each VM
   appears as its own row in the environment Resources view —

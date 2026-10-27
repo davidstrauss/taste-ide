@@ -150,6 +150,15 @@ process.exit(1)});\
 child.on('exit',code=>process.exit(code==null?1:code));\
 });";
 
+/// Run a pinned `npx -y <package> …` from the copy the VM installed for
+/// every container on it (`taste_core::agent_runtime::preinstalled_run`)
+/// when it is there: `$1` is its `run`, and the `npx` command after it is
+/// what runs when it is not — a VM made before the copy, or a package it
+/// does not carry. `exec` either way, so nothing stays behind it: under
+/// `npx`, an `npm exec` sat beside the adapter for the whole session.
+const PREINSTALLED: &str =
+    r#"run="$1"; shift; if [ -x "$run" ]; then shift 3; exec "$run" "$@"; fi; exec "$@""#;
+
 /// The command the agent runs under, inside the container: itself, or the
 /// forwarder wrapping itself.
 fn inner_command(spec: &AgentSpec, auth: Option<&AuthForward>) -> Vec<String> {
@@ -160,9 +169,30 @@ fn inner_command(spec: &AgentSpec, auth: Option<&AuthForward>) -> Vec<String> {
         argv.push(FORWARDER.into());
         argv.push(auth.socket.display().to_string());
     }
+    if let Some(run) = preinstalled(spec) {
+        argv.extend([
+            "sh".into(),
+            "-c".into(),
+            PREINSTALLED.into(),
+            "taste-agent".into(),
+            run,
+        ]);
+    }
     argv.push(spec.command.clone());
     argv.extend(spec.args.iter().cloned());
     argv
+}
+
+/// Where the VM's own copy of the package a `npx -y <package> …` spec
+/// runs would be, in the container: only for that exact shape, since the
+/// three arguments [`PREINSTALLED`] drops are `npx`, `-y`, and the package.
+fn preinstalled(spec: &AgentSpec) -> Option<String> {
+    match (spec.command.as_str(), spec.args.as_slice()) {
+        ("npx", [yes, package, ..]) if yes == "-y" => {
+            taste_core::agent_runtime::preinstalled_run(package)
+        }
+        _ => None,
+    }
 }
 
 /// Compose the relocated spawn: `podman exec` into the environment's
@@ -962,5 +992,67 @@ mod tests {
         run();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ not json");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A pinned `npx -y` runs the VM's own copy of the package when the
+    /// container has it, with the agent's own arguments, and `npx` when it
+    /// does not; any other command is left as it is.
+    #[test]
+    fn a_pinned_adapter_runs_from_the_vms_copy_when_there_is_one() {
+        let spec = AgentSpec::new(
+            "claude-code",
+            "Claude",
+            "npx",
+            &["-y", "@scope/adapter@1.2.3", "--flag"],
+            &[],
+        );
+        let argv = inner_command(&spec, None);
+        assert_eq!(&argv[..3], ["sh", "-c", PREINSTALLED]);
+        assert_eq!(
+            argv[4],
+            format!(
+                "{}/agents/scope-adapter-1.2.3/run",
+                taste_core::agent_runtime::IN_CONTAINER
+            )
+        );
+        assert_eq!(&argv[5..], ["npx", "-y", "@scope/adapter@1.2.3", "--flag"]);
+        // Unpinned, or not `npx -y`: nothing is put in front.
+        for (command, args) in [
+            ("npx", vec!["-y", "@scope/adapter", "--flag"]),
+            ("npx", vec!["acp"]),
+            ("adapter", vec!["-y", "x@1"]),
+        ] {
+            let spec = AgentSpec::new("a", "A", command, &args, &[]);
+            assert_eq!(inner_command(&spec, None)[0], command);
+        }
+    }
+
+    /// The selector itself, run: the copy with the agent's arguments when it
+    /// is executable, the `npx` command whole when it is not.
+    #[test]
+    fn the_selector_runs_the_copy_or_falls_back_to_npx() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let npx = dir.path().join("npx");
+        for (path, said) in [(&run, "copy"), (&npx, "npx")] {
+            std::fs::write(path, format!("#!/bin/sh\necho {said} \"$@\"\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let select = |run: &std::path::Path| {
+            let out = std::process::Command::new("sh")
+                .args(["-c", PREINSTALLED, "taste-agent"])
+                .arg(run)
+                .arg(&npx)
+                .args(["-y", "@scope/adapter@1.2.3", "--flag", "two words"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(select(&run), "copy --flag two words");
+        assert_eq!(
+            select(&dir.path().join("missing")),
+            "npx -y @scope/adapter@1.2.3 --flag two words"
+        );
     }
 }

@@ -7,7 +7,8 @@
 //! VM did that work again, and every VM's disk held its own copy of what
 //! came of it. So the first VM of a release prepares a **golden base**
 //! once instead: the base image booted in a VM of its own with that same
-//! Ignition, the baseline image built in it, everything that would make it
+//! Ignition, the baseline image built in it and the agent's runtime
+//! installed (`crate::agentnode`), everything that would make it
 //! one machine rather than another removed ([`GENERALISE_SCRIPT`]), and the
 //! disk flattened and compressed into a standalone qcow2 (David,
 //! 2026-10-26: "generate a reusable VM base image and toss out all other
@@ -56,8 +57,9 @@ use crate::keys::Keys;
 use crate::provision::{self, DomainSpec, DomainState, GuestBoot, GuestSpec, LibvirtSession, Vm};
 
 /// What a golden base is made by. Raised when what goes into one, or how
-/// it is generalised, changes, so every release's is made again.
-pub const REVISION: u32 = 1;
+/// it is generalised, changes, so every release's is made again. 2: the
+/// agent's runtime, its node and its adapter, went in.
+pub const REVISION: u32 = 2;
 
 /// What a builder's domain is named under.
 pub const BUILDER_PREFIX: &str = "taste-golden-";
@@ -277,7 +279,23 @@ async fn build(
     })
     .await
     .context("building the files service's image")??;
-    session.say(domain, format!("built {tag}; generalising"));
+    session.say(domain, format!("built {tag}"));
+
+    // The agent's runtime — its node, Task, and the adapter — where every
+    // container on a VM mounts it from (`crate::agentnode`), so a VM made
+    // from the base has it before its first environment starts. Not having
+    // it is not fatal: a VM fetches what it lacks at bring-up.
+    let (port, root) = (vm.ssh_port, vm.workspace_root.clone());
+    match tokio::task::spawn_blocking(move || crate::agentnode::ensure_in_vm(port, &root)).await {
+        Ok(Ok((build, None))) => session.say(domain, format!("the agent's runtime is {build}")),
+        Ok(Ok((build, Some(said)))) => session.say(
+            domain,
+            format!("the agent's runtime is {build}, but: {said}"),
+        ),
+        Ok(Err(e)) => session.say(domain, format!("the agent's runtime is not in it: {e:#}")),
+        Err(e) => session.say(domain, format!("the agent's runtime is not in it: {e}")),
+    }
+    session.say(domain, "generalising");
 
     generalise(keys, vm).await?;
     let deadline = Instant::now() + POWER_OFF_WAIT;

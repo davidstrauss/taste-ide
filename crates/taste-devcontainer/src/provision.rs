@@ -514,7 +514,16 @@ pub const GUEST_IDLE_OFF_TIMER: &str = "[Unit]\nDescription=Check every minute w
 /// own page cache, which the host can reclaim, rather than kept twice. A
 /// guest without the balloon (a cloud host, or a VM between this being
 /// written and its next boot) has nobody to give memory to, and does
-/// nothing. Written by Ignition for a new VM, and into one that predates
+/// nothing.
+///
+/// Then the guest's memory is compacted. The balloon reports free memory
+/// only in whole 2 MiB blocks (`page_reporting_order` 9), and a guest whose
+/// agents' heaps and page cache had interleaved held 1.63 GiB of the
+/// host's while using 1.06: one compaction, 137 ms, gave back 292 MiB, and
+/// a run on a guest already compact takes 15–20 ms (2026-10-26). Measured
+/// beside it on three idle agents, for comparison: KSM merged 50 MiB at
+/// the cost of a scanner waking fifty times a second, and zram took 40 MiB
+/// net, half of what it compressed coming back within ninety seconds. Written by Ignition for a new VM, and into one that predates
 /// it at bring-up ([`LibvirtSession::tune_guest_shutdown`]).
 pub const GUEST_RECLAIM_SCRIPT_PATH: &str = "/usr/local/bin/taste-reclaim";
 pub const GUEST_RECLAIM_SCRIPT: &str = r#"#!/bin/sh
@@ -524,8 +533,12 @@ pub const GUEST_RECLAIM_SCRIPT: &str = r#"#!/bin/sh
 ls /sys/bus/virtio/drivers/virtio_balloon/ 2>/dev/null | grep -q '^virtio' || exit 0
 keep=524288
 inactive=$(awk '/^Inactive\(file\):/ { print $2 }' /proc/meminfo)
-[ "${inactive:-0}" -gt "$keep" ] || exit 0
-echo "$((inactive - keep))K" > /sys/fs/cgroup/memory.reclaim 2>/dev/null || true
+if [ "${inactive:-0}" -gt "$keep" ]; then
+    echo "$((inactive - keep))K" > /sys/fs/cgroup/memory.reclaim 2>/dev/null || true
+fi
+# The balloon reports free memory in whole 2 MiB blocks: what is free in
+# smaller pieces stays the host's loss until it is compacted.
+echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
 "#;
 pub const GUEST_RECLAIM_SERVICE: &str = "[Unit]\nDescription=Hand the host back cold page cache\n\n[Service]\nType=oneshot\nLogLevelMax=notice\nExecStart=/usr/local/bin/taste-reclaim\n";
 pub const GUEST_RECLAIM_TIMER: &str = "[Unit]\nDescription=Hand the host back cold page cache every minute\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=10s\n\n[Install]\nWantedBy=timers.target\n";
@@ -1905,7 +1918,8 @@ impl LibvirtSession {
                 &vm.domain,
                 "guest tuned: stop timeouts of 10s per unit and 15s for the user manager, a \
                  power-off five minutes after the last ssh session, sshd's connection \
-                 limits sized for the IDE, cold page cache handed back every minute, stale \
+                 limits sized for the IDE, cold page cache handed back and memory compacted every \
+                 minute, stale \
                  images collected and the disk trimmed every six hours, and zincati and \
                  Fedora's countme, firmware, and RAID timers masked",
             );
@@ -2612,6 +2626,7 @@ mod tests {
         assert!(text.contains(super::GUEST_RECLAIM_SCRIPT_PATH));
         assert!(text.contains(super::GUEST_PRUNE_SCRIPT_PATH));
         assert!(tuning.contains("/sys/fs/cgroup/memory.reclaim"));
+        assert!(tuning.contains("/proc/sys/vm/compact_memory"));
         assert!(tuning.contains("--apply --dangling"));
         assert!(
             text.contains("DefaultTimeoutStopSec%3D10s")

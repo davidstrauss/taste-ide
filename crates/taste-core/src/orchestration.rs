@@ -89,6 +89,12 @@ pub fn issue_brief(id: &str, title: &str, body: &str) -> String {
 /// depend on the ACP crate.
 pub const AGENT_IDS: &[&str] = &["claude-code", "claude-code-custom", "copilot", "gemini"];
 
+/// Claude Code's ACP adapter, pinned: what both Claude Code agents run
+/// (`taste_acp::registry::builtin_agents`) and what each VM has installed
+/// once for every container on it (`taste_devcontainer::agentnode`). Here
+/// so the two cannot disagree; bump it in this one place.
+pub const CLAUDE_CODE_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@0.81.0";
+
 pub fn coordinator_brief() -> String {
     String::from(
         "YOU ARE THE COORDINATOR: the user's own environment's chat, the one with \
