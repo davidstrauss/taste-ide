@@ -39,6 +39,8 @@ pub enum ViewKind {
     Image,
     Pdf,
     Media,
+    /// A web archive: MHTML, WARC, or WACZ (`crate::archive_view`).
+    Archive,
 }
 
 /// The viewer a file name calls for, or `None` for one the text editor
@@ -46,6 +48,11 @@ pub enum ViewKind {
 /// text underneath (SVG is XML) is the text editor's.
 pub fn kind_for(path: &Path) -> Option<ViewKind> {
     let name = path.file_name()?.to_str()?;
+    // An archive by its name before its type, which for `.mht` is a mail
+    // message's and for `.warc.gz` a gzip's.
+    if crate::archive_view::format_of(name).is_some() {
+        return Some(ViewKind::Archive);
+    }
     let (content_type, _) = gtk::gio::functions::content_type_guess(Some(name), None::<&[u8]>);
     if gtk::gio::functions::content_type_is_a(&content_type, "text/plain") {
         return None;
@@ -78,6 +85,7 @@ pub struct Loaded {
 enum Content {
     Image(gtk::gdk::Texture),
     Bytes(glib::Bytes),
+    Archive(crate::archive_view::Unpacked),
 }
 
 /// What a file's bytes are, for telling a real change from an event that
@@ -111,6 +119,13 @@ pub fn load(
             .map(Content::Image)
             .map_err(|e| format!("this image could not be decoded: {e}"))?,
         ViewKind::Pdf | ViewKind::Media => Content::Bytes(bytes),
+        // Unpacked here, on the blocking pool, by the confined helper.
+        ViewKind::Archive => {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            crate::archive_view::unpack(name, bytes)
+                .map(Content::Archive)
+                .map_err(|e| format!("this archive could not be read: {e}"))?
+        }
     };
     Ok(Loaded {
         content,
@@ -242,6 +257,8 @@ pub struct ViewerPage {
     pdf_id: Cell<Option<u64>>,
     /// This page's audio or video, while it has one, on the media scheme.
     media_id: Cell<Option<u64>>,
+    /// This page's web archive, while it has one, served to its view.
+    archive: RefCell<Option<Rc<crate::archive_view::ArchiveView>>>,
     /// What the shown bytes were ([`fingerprint`]).
     shown: Cell<u64>,
     /// The file changed on disk and the tab still shows what it was.
@@ -298,6 +315,7 @@ impl ViewerPage {
             reload: RefCell::new(None),
             pdf_id: Cell::new(None),
             media_id: Cell::new(None),
+            archive: RefCell::new(None),
             shown: Cell::new(loaded.fingerprint),
             pending: Cell::new(false),
             auto: Cell::new(false),
@@ -346,6 +364,7 @@ impl ViewerPage {
             ViewKind::Image => "image-x-generic-symbolic",
             ViewKind::Pdf => "x-office-document-symbolic",
             ViewKind::Media => "multimedia-player-symbolic",
+            ViewKind::Archive => "web-browser-symbolic",
         }
     }
 
@@ -686,8 +705,15 @@ impl ViewerPage {
         if let Some(id) = self.media_id.take() {
             media_files().borrow_mut().remove(&id);
         }
+        self.archive.borrow_mut().take();
         self.shown.set(loaded.fingerprint);
         let shown: gtk::Widget = match (self.kind, loaded.content) {
+            (ViewKind::Archive, Content::Archive(unpacked)) => {
+                let archive = crate::archive_view::ArchiveView::new(unpacked);
+                let view = archive.view.clone().upcast();
+                *self.archive.borrow_mut() = Some(archive);
+                view
+            }
             (ViewKind::Image, Content::Image(texture)) => {
                 let image = ZoomImage::new(
                     &texture,
@@ -800,6 +826,9 @@ impl ViewerPage {
         if let Some(tools) = self.pdf_tools.borrow().as_ref() {
             return Some(tools.widget.clone().upcast());
         }
+        if let Some(archive) = self.archive.borrow().as_ref() {
+            return archive.tools.clone();
+        }
         self.image
             .borrow()
             .as_ref()
@@ -811,6 +840,8 @@ impl ViewerPage {
     pub fn focus(&self) {
         if let Some(view) = self.pdf_view.borrow().as_ref() {
             view.grab_focus();
+        } else if let Some(archive) = self.archive.borrow().as_ref() {
+            archive.view.grab_focus();
         } else if let Some(image) = self.image.borrow().as_ref() {
             image.scroller.grab_focus();
         }
@@ -1020,6 +1051,7 @@ impl ViewerPage {
         if let Some(id) = self.media_id.take() {
             media_files().borrow_mut().remove(&id);
         }
+        self.archive.borrow_mut().take();
         let status = adw::StatusPage::builder()
             .icon_name("dialog-warning-symbolic")
             .title("Cannot show this file")
@@ -2662,6 +2694,8 @@ mod tests {
             ("Hero.PNG", Some(ViewKind::Image)),
             ("photo.jpeg", Some(ViewKind::Image)),
             ("clip.webm", Some(ViewKind::Media)),
+            ("Saved Page.mhtml", Some(ViewKind::Archive)),
+            ("crawl.warc.gz", Some(ViewKind::Archive)),
             ("talk.mp3", Some(ViewKind::Media)),
             ("logo.svg", None),
             ("main.rs", None),

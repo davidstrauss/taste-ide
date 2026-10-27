@@ -1,0 +1,91 @@
+From: <Saved by Blink>
+Snapshot-Content-Location: http://127.0.0.1:8731/index.html
+Subject: An HTML preview
+Date: Mon, 26 Oct 2026 00:00:00 -0000
+MIME-Version: 1.0
+Content-Type: multipart/related;
+	type="text/html";
+	boundary="----MultipartBoundary--fixture0123456789----"
+
+
+------MultipartBoundary--fixture0123456789----
+Content-Type: text/html
+Content-ID: <frame-0@mhtml.blink>
+Content-Transfer-Encoding: quoted-printable
+Content-Location: http://127.0.0.1:8731/index.html
+
+<!doctype html>
+<html lang=3D"en">
+<head>
+<meta name=3D"viewport" content=3D"width=3Ddevice-width">
+<title>An HTML preview</title>
+<link rel=3D"stylesheet" href=3D"style.css">
+</head>
+<body>
+<h1>An HTML preview =E2=80=94 caf=C3=A9</h1>
+<p id=3D"script">The script beside the page has not run.</p>
+<p id=3D"network">The fetch to the network has not settled.</p>
+<p>Drawn by WebKit from the tab's buffer, with <code>style.css</code>,
+<code>logo.svg</code>, and <code>app.js</code> read from beside it.</p>
+<img src=3D"logo.svg" alt=3D"A logo from beside the page" width=3D"96" heig=
+ht=3D"96">
+<!-- Both of these reach for a server on this machine, and the preview's
+     policy refuses both: the probe's server logs any request that arrives.=
+ -->
+<img src=3D"http://127.0.0.1:8765/beacon.png" alt=3D"">
+<ul>
+<li><a href=3D"other.html">Another page of the checkout</a>, which opens it=
+s own tab</li>
+<li><a href=3D"https://example.com/">A page on the web</a>, which opens in =
+the browser</li>
+</ul>
+<iframe src=3D"cid:frame-1@mhtml.blink" width=3D"400" height=3D"80"></ifram=
+e>
+<script src=3D"app.js"></script>
+</body>
+</html>
+
+------MultipartBoundary--fixture0123456789----
+Content-Type: text/html
+Content-ID: <frame-1@mhtml.blink>
+Content-Transfer-Encoding: quoted-printable
+
+<!doctype html>
+<title>Another page</title>
+<p>Another page of the checkout.</p>
+
+------MultipartBoundary--fixture0123456789----
+Content-Type: text/css
+Content-Transfer-Encoding: base64
+Content-Location: http://127.0.0.1:8731/style.css
+
+Ym9keSB7IGZvbnQ6IDE2cHgvMS41IHN5c3RlbS11aSwgc2Fucy1zZXJpZjsgbWFyZ2luOiAzMnB4
+OyBjb2xvcjogIzIyMjsgYmFja2dyb3VuZDogI2ZkZjZlMzsgfQpoMSB7IGNvbG9yOiAjMjY4YmQy
+OyB9CmNvZGUgeyBiYWNrZ3JvdW5kOiAjZWVlOGQ1OyBwYWRkaW5nOiAwIDRweDsgYm9yZGVyLXJh
+ZGl1czogNHB4OyB9Ci5yYW4geyBjb2xvcjogIzJhYTE5ODsgZm9udC13ZWlnaHQ6IGJvbGQ7IH0K
+LnJlZnVzZWQgeyBjb2xvcjogI2NiNGIxNjsgZm9udC13ZWlnaHQ6IGJvbGQ7IH0K
+------MultipartBoundary--fixture0123456789----
+Content-Type: image/svg+xml
+Content-Transfer-Encoding: base64
+Content-Location: http://127.0.0.1:8731/logo.svg
+
+PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA5NiA5
+NiI+PGNpcmNsZSBjeD0iNDgiIGN5PSI0OCIgcj0iNDQiIGZpbGw9IiM2YzcxYzQiLz48cGF0aCBk
+PSJNMjggNTBsMTQgMTQgMjYtMzAiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxMCIgZmls
+bD0ibm9uZSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+Cg==
+------MultipartBoundary--fixture0123456789----
+Content-Type: application/javascript
+Content-Transfer-Encoding: base64
+Content-Location: http://127.0.0.1:8731/app.js
+
+Ly8gUnVuIGZyb20gYmVzaWRlIHRoZSBwYWdlOiBtYXJrcyBpdHNlbGYsIHRoZW4gcmVhY2hlcyBm
+b3IgdGhlIG5ldHdvcmssCi8vIHdoaWNoIHRoZSBwcmV2aWV3J3MgcG9saWN5IHJlZnVzZXMuCmRv
+Y3VtZW50LmdldEVsZW1lbnRCeUlkKCJzY3JpcHQiKS50ZXh0Q29udGVudCA9ICJUaGUgc2NyaXB0
+IGJlc2lkZSB0aGUgcGFnZSByYW4uIjsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInNjcmlwdCIp
+LmNsYXNzTmFtZSA9ICJyYW4iOwpjb25zdCBuZXR3b3JrID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5
+SWQoIm5ldHdvcmsiKTsKZmV0Y2goImh0dHA6Ly8xMjcuMC4wLjE6ODc2NS9mZXRjaCIpCiAgLnRo
+ZW4oKCkgPT4geyBuZXR3b3JrLnRleHRDb250ZW50ID0gIlRoZSBmZXRjaCByZWFjaGVkIHRoZSBu
+ZXR3b3JrLiI7IH0pCiAgLmNhdGNoKCgpID0+IHsKICAgIG5ldHdvcmsudGV4dENvbnRlbnQgPSAi
+VGhlIGZldGNoIHRvIHRoZSBuZXR3b3JrIHdhcyByZWZ1c2VkLiI7CiAgICBuZXR3b3JrLmNsYXNz
+TmFtZSA9ICJyZWZ1c2VkIjsKICB9KTsK
+------MultipartBoundary--fixture0123456789------

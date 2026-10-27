@@ -1038,7 +1038,13 @@ no-op at every other width.
   own origin and inline content, so nothing it runs reaches the network,
   and whose requests are answered only for the view that made them; a
   click to another file of the checkout opens that file's tab, and one to
-  the web the user's browser (2026-10-26). An
+  the web the user's browser (2026-10-26). A web archive (MHTML, WARC, or
+  WACZ) opens in a viewer tab: the confined `taste-archive` helper unpacks
+  it and rewrites every URL its pages and stylesheets name to that
+  resource's path in the archive, and a WebKit view draws it from a
+  `taste-archive://` scheme under the same policy, its pages on the tab
+  bar's drop-down; a link to a page the archive does not hold opens the
+  live page in the browser (`archive_view.rs`). An
   image file, a picture in a Markdown preview, and an image in a
   transcript are decoded by glycin (`glycin.rs`), the GNOME platform's
   loaders, each format's in a sandboxed process of its own (bwrap, or

@@ -188,7 +188,7 @@ before the reload for one whose earlier page is taller to check that a reload
 holds the place in the document rather than the pixel) opens it on its preview face in front,
 which is how the preview's rendering — its pictures, its tables, its
 path links — gets looked at; `build-aux/headless/fixtures/markdown-table.md`
-is a short document with a table and path links for exactly that, and `fixtures/html/index.html` a page with a stylesheet, a picture, and a script beside it, and a picture and a fetch aimed at 127.0.0.1:8765, which the preview's policy must refuse — serve that port and see that nothing arrives (`sample.ipynb` and `figures.ipynb` beside it are notebooks, the second made by running real matplotlib and Seaborn cells through the kernel bridge: a PNG, a retina PNG, an SVG, and the objects interface, and `widgets.ipynb` real ipywidgets saved with their state, `interact` over a Seaborn plot among them; `TASTE_PROBE_NOTEBOOK=failed` poses the kernel-failed banner, `TASTE_PROBE_NOTEBOOK=drag` runs the notebook's cells for real and drags its first slider, printing what the widgets did (`build-aux/headless/notebook-drag.sh`, run on the host, is that against `widgets.ipynb` in this image plus Jupyter and Task, in a scratch workspace whose Taskfile defines the `jupyter:kernel` task the kernel is (`taste_core::kernel_task`): inside a container the container IS the environment, so no VM is needed), and `TASTE_PROBE_PREVIEW_AT=0.5` scrolls any preview that far down before the shot), and
+is a short document with a table and path links for exactly that, and `fixtures/html/index.html` a page with a stylesheet, a picture, and a script beside it, and a picture and a fetch aimed at 127.0.0.1:8765, which the preview's policy must refuse — serve that port and see that nothing arrives, and `fixtures/archives/page.wacz` (or `page.warc.gz`, `page.mhtml`) the same page archived, which opens in a viewer tab of its own, its pages on the tab bar's drop-down (`sample.ipynb` and `figures.ipynb` beside it are notebooks, the second made by running real matplotlib and Seaborn cells through the kernel bridge: a PNG, a retina PNG, an SVG, and the objects interface, and `widgets.ipynb` real ipywidgets saved with their state, `interact` over a Seaborn plot among them; `TASTE_PROBE_NOTEBOOK=failed` poses the kernel-failed banner, `TASTE_PROBE_NOTEBOOK=drag` runs the notebook's cells for real and drags its first slider, printing what the widgets did (`build-aux/headless/notebook-drag.sh`, run on the host, is that against `widgets.ipynb` in this image plus Jupyter and Task, in a scratch workspace whose Taskfile defines the `jupyter:kernel` task the kernel is (`taste_core::kernel_task`): inside a container the container IS the environment, so no VM is needed), and `TASTE_PROBE_PREVIEW_AT=0.5` scrolls any preview that far down before the shot), and
 a SHORT document is the case to shoot, since a two-block preview once
 came out as a blank window while a long one rendered; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
 the search's Tab stop on that section, for the lit lozenge and an empty
@@ -612,6 +612,13 @@ to.
   the pinned Task's `--dry` on every fixture under `tests/fixtures`, which
   is why the devcontainer image carries that Task: a Taskfile shape the
   reader gets wrong is a fixture to add there.
+- `crates/taste-archive` — web archives (MHTML, WARC, WACZ) unpacked in
+  a confined process, their HTML and CSS rewritten (lol_html) so every URL
+  leads back into the archive; `taste-app`'s `archive_view.rs` is its
+  client, serving the result to a WebKit view. `tests/fixtures.rs` reads
+  the archives under `build-aux/headless/fixtures/archives`, made by real
+  tools from `fixtures/html` (`make.sh` there: warcio's WARC from a live
+  server, the WACZ around it, an MHTML in Chrome's layout).
 - `crates/taste-voice` — voice input: the pinned speech model, microphone
   capture (GStreamer), local transcription (whisper.cpp). No GTK; the
   composer drives it.

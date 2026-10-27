@@ -1,0 +1,32 @@
+[package]
+name = "taste-archive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The IDE's web archive helper: MHTML, WARC, and WACZ read in a confined process"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "taste-archive"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+base64.workspace = true
+# An archive is bytes a repository, an agent, or the web wrote, so it is
+# read here, confined (taste-confine), and never in the IDE: MIME parts,
+# WARC records, gzip members, HTTP responses, zip entries, and the HTML and
+# CSS rewritten to lead back into the archive.
+flate2 = "1"
+httparse = "1"
+url = "2"
+encoding_rs = "0.8"
+lol_html = "3"
+brotli-decompressor = "5"
+
+[dev-dependencies]
+taste-confine.workspace = true

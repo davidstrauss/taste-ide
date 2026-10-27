@@ -12,6 +12,7 @@
 
 mod agent_fetch;
 mod ansi;
+mod archive_view;
 mod askpass;
 mod author_bar;
 mod backlog;

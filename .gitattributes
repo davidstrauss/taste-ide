@@ -1,1 +1,5 @@
 * text=auto
+# MIME is CRLF by definition, and an MHTML fixture is kept as Chrome writes
+# one, byte for byte.
+*.mhtml -text
+*.mht -text
