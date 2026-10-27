@@ -566,18 +566,18 @@ fn pin_text(text: &str, attachments: &[(String, ContentBlock)]) -> String {
 /// 2026-10-08: "If I haven't chosen a reply yet, I should still see the
 /// options on restoring the IDE after closing it"). None when a message
 /// after it answered them, or the server refused them.
-fn replayed_replies(records: &[model::Record]) -> (Vec<String>, bool) {
+fn replayed_replies(records: &[model::Record]) -> (Vec<taste_core::Reply>, bool) {
     let mut replies = Vec::new();
     let mut several = false;
     let mut call: Option<String> = None;
-    let mut recover = |replies: &mut Vec<String>,
+    let mut recover = |replies: &mut Vec<taste_core::Reply>,
                        input: Option<&serde_json::Value>,
                        status: Option<ToolCallStatus>| {
         if status == Some(ToolCallStatus::Failed) {
             replies.clear();
             return;
         }
-        let offered = input.map(offered_replies).unwrap_or_default();
+        let offered = input.map(taste_core::Reply::offered).unwrap_or_default();
         if !offered.is_empty() {
             *replies = offered;
             several = input.is_some_and(|input| input["several"].as_bool() == Some(true));
@@ -750,7 +750,7 @@ pub struct ChatPane {
     replies_box: gtk::Box,
     /// Offered during the turn, shown when it ends: a question is answered
     /// once it has been asked, not while the agent is still writing it.
-    pending_replies: RefCell<Vec<String>>,
+    pending_replies: RefCell<Vec<taste_core::Reply>>,
     /// The pending replies combine — checkboxes, every one ticked sent
     /// together — rather than exclude one another.
     replies_several: Cell<bool>,
@@ -8543,7 +8543,7 @@ impl ChatPane {
 
     /// The agent offered replies to its question (`suggest_replies`):
     /// held until its turn ends, then drawn as buttons (`show_replies`).
-    pub fn offer_replies(self: &Rc<Self>, replies: Vec<String>, several: bool) {
+    pub fn offer_replies(self: &Rc<Self>, replies: Vec<taste_core::Reply>, several: bool) {
         *self.pending_replies.borrow_mut() = replies;
         self.replies_several.set(several);
         if !self.busy.get() {
@@ -8596,9 +8596,16 @@ impl ChatPane {
                     }
                 }
             }
-            self.replies_box
-                .append(&question_option(&button, reply, None, several));
-            picks.push((button, reply.clone()));
+            // The label in the body's colour, and what choosing it does
+            // lighter under it, as the question card has an option's
+            // description.
+            self.replies_box.append(&question_option(
+                &button,
+                &reply.label,
+                reply.description.as_deref(),
+                several,
+            ));
+            picks.push((button, reply.label.clone()));
         }
         let own = gtk::CheckButton::builder()
             .valign(gtk::Align::Center)
@@ -12297,11 +12304,20 @@ impl ChatPane {
             // IDE's event.
             Ok(variant @ ("replies" | "restored")) => {
                 let restored = variant == "restored";
-                let offers = vec![
-                    "File it".to_string(),
-                    "Change the title first".to_string(),
-                    "Move all six into the template".to_string(),
-                ];
+                // As an agent offers them: a label alone, and labels with
+                // what choosing them does, which draw lighter under them.
+                let offered_input = serde_json::json!({ "replies": [
+                    "File it",
+                    {
+                        "label": "Change the title first",
+                        "description": "Retitle it after the template, then file it."
+                    },
+                    {
+                        "label": "Move all six into the template",
+                        "description": "Every piece the list names, in one commit to the template repository."
+                    }
+                ]});
+                let offers = taste_core::Reply::offered(&offered_input);
                 // `restored` goes the way a restore does: the conversation
                 // as records, drawn from them (`draw_history`).
                 let mut records: Vec<serde_json::Value> = Vec::new();
@@ -12359,7 +12375,7 @@ impl ChatPane {
                 let mut offered = ToolCall::new("probe-replies", "mcp__taste-ide__suggest_replies");
                 offered.kind = ToolKind::Other;
                 offered.status = ToolCallStatus::Completed;
-                offered.raw_input = Some(serde_json::json!({ "replies": offers }));
+                offered.raw_input = Some(offered_input);
                 offered.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
                     TextContent::new(
                         serde_json::json!({
@@ -16398,22 +16414,6 @@ fn edit_from(diff: &Diff) -> crate::chatdoc::Edit {
     }
 }
 
-/// The replies a `suggest_replies` call offered, read from its input as
-/// the IDE's MCP server reads them: trimmed, the empty ones dropped.
-fn offered_replies(input: &serde_json::Value) -> Vec<String> {
-    input["replies"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(|reply| reply.trim().to_string())
-                .filter(|reply| !reply.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// One `<task-notification>` block: the message Claude Code puts into the
 /// conversation when a background task (a subagent, a background shell)
 /// ends, which reaches a client as a user message like any other.
@@ -16996,16 +16996,6 @@ mod tests {
             working_line("Working…", secs(5), false, Some(streaming)),
             "Working…"
         );
-    }
-
-    /// A restored `suggest_replies` call gives back what the server would
-    /// have shown: trimmed, nothing empty, and nothing from a malformed
-    /// input.
-    #[test]
-    fn a_replayed_offer_reads_back_the_replies_it_showed() {
-        let input = serde_json::json!({ "replies": [" File it ", "", 3, "Not yet"] });
-        assert_eq!(offered_replies(&input), vec!["File it", "Not yet"]);
-        assert!(offered_replies(&serde_json::json!({ "replies": "File it" })).is_empty());
     }
 
     /// The message Claude Code delivers when a subagent ends, as the

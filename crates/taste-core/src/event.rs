@@ -103,6 +103,53 @@ pub enum MigrationAudience {
     Coordinator,
 }
 
+/// One reply an agent offers the user (`suggest_replies`): its label,
+/// which is what is sent when it is picked, and what choosing it does,
+/// drawn lighter under the label when the agent gave one, as Claude Code
+/// draws an option's description (David, 2026-10-26: "darker answers
+/// followed by lighter explanatory text").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+impl Reply {
+    /// The replies a `suggest_replies` call's input offers, read the one
+    /// way both the IDE's MCP server and a restored transcript read them:
+    /// a string is a label alone, an object its `label` and its
+    /// `description`, each trimmed; a reply with no label is dropped, and
+    /// an empty description is none.
+    pub fn offered(input: &serde_json::Value) -> Vec<Reply> {
+        let trimmed = |value: &serde_json::Value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        input["replies"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        serde_json::Value::String(_) => Some(Reply {
+                            label: trimmed(item)?,
+                            description: None,
+                        }),
+                        serde_json::Value::Object(_) => Some(Reply {
+                            label: trimmed(&item["label"])?,
+                            description: trimmed(&item["description"]),
+                        }),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Git working-tree status changed (files staged, modified, committed…).
@@ -174,7 +221,7 @@ pub enum Event {
     /// together, every one ticked — as the user's message.
     SuggestedReplies {
         env: crate::environment::EnvironmentId,
-        replies: Vec<String>,
+        replies: Vec<Reply>,
         several: bool,
     },
     MigrationNotice {
@@ -591,6 +638,34 @@ impl EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply is a string or a label with its description; both are
+    /// trimmed, a reply without a label is dropped, and anything else in
+    /// the list is passed over.
+    #[test]
+    fn offered_replies_take_a_string_or_a_described_label() {
+        let input = serde_json::json!({ "replies": [
+            " File it ",
+            { "label": "Change the title first", "description": " Then file it. " },
+            { "label": "Not yet", "description": "  " },
+            { "description": "no label" },
+            "",
+            3,
+        ]});
+        let reply = |label: &str, description: Option<&str>| Reply {
+            label: label.into(),
+            description: description.map(Into::into),
+        };
+        assert_eq!(
+            Reply::offered(&input),
+            vec![
+                reply("File it", None),
+                reply("Change the title first", Some("Then file it.")),
+                reply("Not yet", None),
+            ]
+        );
+        assert!(Reply::offered(&serde_json::json!({ "replies": "File it" })).is_empty());
+    }
 
     #[test]
     fn all_subscribers_receive_events() {

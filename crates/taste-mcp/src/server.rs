@@ -1699,16 +1699,38 @@ impl McpServer {
                      it last, after your answer and the question are written: the choices \
                      stand under them. They are alternatives, one picked; set `several` when \
                      they combine instead, any of them together, and they are checkboxes \
-                     sent as one list. The user can still type anything instead.",
+                     sent as one list. The user can still type anything instead. A reply may \
+                     be {\"label\", \"description\"} instead of a string: the label is \
+                     what is sent, and the description, one sentence shown lighter under \
+                     it, says what choosing it does or costs when the label alone does \
+                     not.",
                     json!({
                         "type": "object",
                         "properties": {
                             "replies": {
                                 "type": "array",
-                                "items": { "type": "string" },
+                                "items": {
+                                    "anyOf": [
+                                        { "type": "string" },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "label": {
+                                                    "type": "string",
+                                                    "description": "what is sent when picked, under 120 characters"
+                                                },
+                                                "description": {
+                                                    "type": "string",
+                                                    "description": "what choosing it does, one sentence under 240 characters"
+                                                }
+                                            },
+                                            "required": ["label"]
+                                        }
+                                    ]
+                                },
                                 "minItems": 1,
                                 "maxItems": 4,
-                                "description": "the replies, most likely first, each under 120 characters"
+                                "description": "the replies, most likely first: each a label under 120 characters, or a label with a description"
                             },
                             "several": {
                                 "type": "boolean",
@@ -2286,17 +2308,7 @@ impl McpServer {
                 Ok(json!({ "selection": selection }))
             }
             "suggest_replies" => {
-                let replies: Vec<String> = args["replies"]
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(|reply| reply.trim().to_string())
-                            .filter(|reply| !reply.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let replies = taste_core::Reply::offered(&args);
                 if replies.is_empty() {
                     anyhow::bail!(
                         "suggest_replies needs `replies`: one to four short strings, e.g. \
@@ -2310,10 +2322,25 @@ impl McpServer {
                         replies.len()
                     );
                 }
-                if let Some(long) = replies.iter().find(|r| r.chars().count() > MAX_REPLY_CHARS) {
+                if let Some(long) = replies
+                    .iter()
+                    .find(|r| r.label.chars().count() > MAX_REPLY_CHARS)
+                {
                     anyhow::bail!(
                         "each reply is one line of a list of choices, at most \
-                         {MAX_REPLY_CHARS} characters; shorten \"{long}\""
+                         {MAX_REPLY_CHARS} characters; shorten \"{}\"",
+                        long.label
+                    );
+                }
+                if let Some(long) = replies.iter().find(|r| {
+                    r.description
+                        .as_ref()
+                        .is_some_and(|d| d.chars().count() > MAX_REPLY_DESCRIPTION_CHARS)
+                }) {
+                    anyhow::bail!(
+                        "a reply's description is one sentence, at most \
+                         {MAX_REPLY_DESCRIPTION_CHARS} characters; shorten the one under \"{}\"",
+                        long.label
                     );
                 }
                 let shown = replies.len();
@@ -6377,6 +6404,8 @@ fn is_config_path(root: &std::path::Path, path: &std::path::Path) -> bool {
 /// (2026-10-21: an 81-character reply refused as too long for a button).
 const MAX_REPLIES: usize = 4;
 const MAX_REPLY_CHARS: usize = 120;
+/// And the sentence under one, which says what choosing it does.
+const MAX_REPLY_DESCRIPTION_CHARS: usize = 240;
 
 /// One job snapshot as a tool result. A command still running comes back
 /// as a handle rather than a result, and says so in the shape of the
