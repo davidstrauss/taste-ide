@@ -456,6 +456,15 @@ impl PortPage {
         browser_bar.append(&forward);
         browser_bar.append(&reload);
         browser_bar.append(&address);
+        // The page in front saved as one file the archive viewer opens
+        // again (`archive_view`): MHTML, which WebKit writes itself, the
+        // page with its pictures and stylesheets inside it.
+        let save = gtk::Button::builder()
+            .icon_name("document-save-as-symbolic")
+            .css_classes(["flat"])
+            .tooltip_text("Save Page as a Web Archive (MHTML)…")
+            .build();
+        browser_bar.append(&save);
         let problems = crate::port_problems::Problems::new(spec.port, forwarded.clone());
         // Left of the problems, as the user placed it: which authenticator
         // this project's sign-ins answer as.
@@ -579,6 +588,14 @@ impl PortPage {
                     if let Some(view) = page.browser.borrow().as_ref() {
                         view.reload();
                     }
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&page);
+            save.connect_clicked(move |button| {
+                if let Some(page) = weak.upgrade() {
+                    page.save_page(button.upcast_ref());
                 }
             });
         }
@@ -1338,6 +1355,53 @@ impl PortPage {
     /// page draws what these facts say about why. That page and the
     /// loopback header are otherwise reachable only from a checkout with
     /// a container running a server bound the wrong way.
+    /// Save the page in front as MHTML, to a file the user picks, named
+    /// for the page's title: the archive viewer opens it again, as does
+    /// any browser that reads MHTML.
+    fn save_page(&self, from: &gtk::Widget) {
+        let Some(view) = self.browser.borrow().clone() else {
+            return;
+        };
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Web archive (MHTML)"));
+        filter.add_pattern("*.mhtml");
+        filter.add_pattern("*.mht");
+        let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk::FileDialog::builder()
+            .title("Save Page")
+            .initial_name(suggested_name(view.title().as_deref(), self.port))
+            .filters(&filters)
+            .default_filter(&filter)
+            .modal(true)
+            .build();
+        let window = from.root().and_downcast::<gtk::Window>();
+        let from = from.downgrade();
+        dialog.save(
+            window.as_ref(),
+            gtk::gio::Cancellable::NONE,
+            move |chosen| {
+                // Dismissed: nothing to save.
+                let Ok(file) = chosen else { return };
+                view.save_to_file(
+                    &file,
+                    webkit6::SaveMode::Mhtml,
+                    gtk::gio::Cancellable::NONE,
+                    move |saved| {
+                        let Err(why) = saved else { return };
+                        tracing::warn!("saving the page: {why}");
+                        let alert = adw::AlertDialog::new(
+                            Some("The page was not saved"),
+                            Some(why.message()),
+                        );
+                        alert.add_response("close", "Close");
+                        alert.present(from.upgrade().as_ref());
+                    },
+                );
+            },
+        );
+    }
+
     #[doc(hidden)]
     pub fn seed_state_for_probe(self: &Rc<Self>, state: PortState) {
         self.set_facts(&PortFacts {
@@ -1384,6 +1448,51 @@ impl PortPage {
                         menu.open_for_probe();
                     }
                 });
+            });
+        }
+        // `TASTE_PROBE_PORT_SAVE=<path>`: the page saved as the Save button
+        // saves it, once it has loaded, and the file opened again by the
+        // archive viewer's own unpacker, which says what it found.
+        if let Some(target) = std::env::var_os("TASTE_PROBE_PORT_SAVE") {
+            let weak = Rc::downgrade(self);
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
+                let Some(view) = weak
+                    .upgrade()
+                    .and_then(|page| page.browser.borrow().clone())
+                else {
+                    return;
+                };
+                let file = gtk::gio::File::for_path(&target);
+                view.save_to_file(
+                    &file,
+                    webkit6::SaveMode::Mhtml,
+                    gtk::gio::Cancellable::NONE,
+                    move |saved| {
+                        println!("probe port save: {saved:?} to {}", target.to_string_lossy());
+                        gtk::glib::spawn_future_local(async move {
+                            let reopened = crate::runtime::runtime()
+                                .spawn_blocking(move || {
+                                    let bytes =
+                                        std::fs::read(&target).map_err(|e| e.to_string())?;
+                                    let size = bytes.len();
+                                    crate::archive_view::unpack(
+                                        "saved.mhtml",
+                                        gtk::glib::Bytes::from_owned(bytes),
+                                    )
+                                    .map(|unpacked| (size, unpacked.pages.len(), unpacked.paths()))
+                                })
+                                .await;
+                            match reopened {
+                                Ok(Ok((size, pages, paths))) => println!(
+                                    "probe port save: {size} bytes reopened, {pages} page(s), \
+                                     resources {paths:?}"
+                                ),
+                                Ok(Err(why)) => println!("probe port save: not reopened: {why}"),
+                                Err(e) => println!("probe port save: not reopened: {e}"),
+                            }
+                        });
+                    },
+                );
             });
         }
         // `TASTE_PROBE_PORT_PROBLEMS=1`: the problem list open, once the
@@ -1836,8 +1945,50 @@ pub(crate) fn toast(widget: &gtk::Widget, text: &str) {
     }
 }
 
+/// The file name a saved page is offered under: its title, made safe for
+/// a file name and cut short, or its port's when it has none.
+fn suggested_name(title: Option<&str>, port: u16) -> String {
+    let cleaned: String = title
+        .unwrap_or("")
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let stem: String = cleaned.chars().take(80).collect();
+    let stem = stem.trim_matches(['.', ' ']);
+    if stem.is_empty() {
+        format!("port-{port}.mhtml")
+    } else {
+        format!("{stem}.mhtml")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A saved page is offered under its title, made a file name: no
+    /// separators, its runs of space one, and its port's name when it
+    /// has none.
+    #[test]
+    fn a_saved_page_is_named_for_its_title() {
+        assert_eq!(
+            super::suggested_name(Some("Orders / Admin — Acme"), 3000),
+            "Orders Admin — Acme.mhtml"
+        );
+        assert_eq!(
+            super::suggested_name(Some("  ..  "), 3000),
+            "port-3000.mhtml"
+        );
+        assert_eq!(super::suggested_name(None, 8080), "port-8080.mhtml");
+    }
+
     /// The page names the theme it is drawn in, and what it quotes is
     /// escaped: a reason with a `<` in it is text, never markup.
     #[test]

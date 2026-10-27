@@ -6546,9 +6546,12 @@ async fn activate_service(
 /// TASTE_PROBE_PORT: which state the `port` view's tab is posed in.
 /// Absent poses the REST face at work; `loopback` and `nothing` are the
 /// two states a screenshot cannot otherwise reach, because they need a
-/// container with a server bound the wrong way, or none at all.
+/// container with a server bound the wrong way, or none at all; and
+/// `listening` the browser face on whatever the probe's machine serves on
+/// the port.
 fn port_state_for_probe() -> Option<crate::portview::PortState> {
     match std::env::var("TASTE_PROBE_PORT").ok().as_deref() {
+        Some("listening") => Some(crate::portview::PortState::Listening),
         Some("loopback") => Some(crate::portview::PortState::Loopback),
         Some("nothing") => Some(crate::portview::PortState::Nothing),
         _ => None,

@@ -17,6 +17,7 @@ Content-Location: http://127.0.0.1:8731/index.html
 <!doctype html>
 <html lang=3D"en">
 <head>
+<meta charset=3D"utf-8">
 <meta name=3D"viewport" content=3D"width=3Ddevice-width">
 <title>An HTML preview</title>
 <link rel=3D"stylesheet" href=3D"style.css">

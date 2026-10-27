@@ -299,6 +299,12 @@ and `TASTE_PROBE_VIEW=task` opens a task's output in front, its row lit
 poses the console's Resources list as a workspace on a VM has it — the VM
 at the root, the container under it, its image and volumes under that —
 which a shot otherwise never has, since a probe provisions nothing;
+`TASTE_PROBE_PORT=listening` poses the port tab on its browser face over
+whatever the probe's machine serves on 3000, and `TASTE_PROBE_PORT_SAVE=<path>`
+with it saves that page five seconds in as the address bar's Save button
+does (MHTML, WebKit's own) and opens the file again with the archive
+viewer's unpacker, printing what it found — serve `fixtures/html` on 3000
+for a page with a stylesheet, a picture, and a script;
 `TASTE_PROBE_PORT=loopback` (or `nothing`) poses the port tab in the
 state its published address cannot show — a server on the container's
 own loopback, or nothing behind the port at all — on the browser face,

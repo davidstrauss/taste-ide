@@ -98,6 +98,16 @@ impl Unpacked {
     }
 }
 
+impl Unpacked {
+    /// The paths it serves, sorted: what a probe reports.
+    #[doc(hidden)]
+    pub fn paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.resources.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+}
+
 /// Where the helper is: beside this executable, or wherever
 /// `TASTE_ARCHIVE_BIN` names.
 fn helper_path() -> Result<PathBuf, String> {
