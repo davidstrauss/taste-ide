@@ -192,6 +192,10 @@ enum Target {
         id: String,
         workdir: String,
         authority: ConfigAuthority,
+        /// Who a command runs as when its caller names nobody: the
+        /// config's `remoteUser` (or `containerUser`). `None` is the
+        /// image's own user.
+        user: Option<String>,
     },
 }
 
@@ -297,10 +301,31 @@ impl ExecContext {
         workdir: impl Into<String>,
         authority: ConfigAuthority,
     ) {
+        self.set_container_as(id, workdir, authority, None);
+    }
+
+    /// [`Self::set_container`], with the user every command resolved into
+    /// it runs as unless its caller names one: the config's `remoteUser`
+    /// or `containerUser`, which the devcontainer spec says terminals,
+    /// tasks, and tools run as, and which VS Code runs them as. Left to
+    /// the image's own user, an image whose Containerfile ends on `USER
+    /// root` ran every `ide_exec`, task, and agent commit as container
+    /// root — under `keep-id` a subordinate uid in the VM — and the
+    /// objects it wrote into the checkout's `.git` refused the IDE's own
+    /// push into it ("unable to write file ./objects/70/…: Permission
+    /// denied", 2026-10-28).
+    pub fn set_container_as(
+        &self,
+        id: impl Into<String>,
+        workdir: impl Into<String>,
+        authority: ConfigAuthority,
+        user: Option<String>,
+    ) {
         *self.target.write().unwrap() = Target::Container {
             id: id.into(),
             workdir: workdir.into(),
             authority,
+            user,
         };
     }
 
@@ -537,7 +562,15 @@ impl ExecContext {
     ) -> CommandSpec {
         let (podman, stop) = match &*self.target.read().unwrap() {
             Target::Host => return self.host_spec(program, args),
-            Target::Container { id, workdir, .. } => {
+            Target::Container {
+                id, workdir, user, ..
+            } => {
+                let mut exec_flags = exec_flags.to_vec();
+                if let Some(user) = user {
+                    if !exec_flags.iter().any(|f| f == "--user" || f == "-u") {
+                        exec_flags.extend(["--user".into(), user.clone()]);
+                    }
+                }
                 let mark = new_mark();
                 let mut v = vec!["exec".to_string()];
                 v.extend(exec_flags.iter().cloned());
@@ -627,7 +660,12 @@ impl ExecContext {
     ) -> CommandSpec {
         let podman: Vec<String> = match &*self.target.read().unwrap() {
             Target::Host => return self.host_spec(program, args),
-            Target::Container { id, workdir, .. } => {
+            Target::Container {
+                id,
+                workdir,
+                user: default_user,
+                ..
+            } => {
                 let mut v = vec!["exec".to_string()];
                 if interactive {
                     v.push("-it".into());
@@ -636,7 +674,7 @@ impl ExecContext {
                     v.push("--env".into());
                     v.push(format!("{key}={value}"));
                 }
-                if let Some(user) = user {
+                if let Some(user) = user.or(default_user.as_deref()) {
                     v.push("--user".into());
                     v.push(user.to_string());
                 }
@@ -682,6 +720,44 @@ mod stop_tests {
             .resolve_for_agent("true", &[])
             .stopper
             .is_none());
+    }
+
+    /// The config's user rides on every resolution into its container —
+    /// the user's, the agent's, a task's, a detached one — and on the
+    /// stopper, which must signal as the user that started the run; a
+    /// caller that names a user of its own keeps it.
+    #[test]
+    fn every_command_runs_as_the_configs_user() {
+        let ctx = ExecContext::for_tests(false);
+        ctx.set_container_as(
+            "c",
+            "/workspace",
+            ConfigAuthority::Project,
+            Some("dev".into()),
+        );
+        let as_dev = |args: &[String]| {
+            let at = args.iter().position(|a| a == "--user").expect("a --user");
+            assert_eq!(args[at + 1], "dev", "{args:?}");
+            assert_eq!(
+                args.iter().filter(|a| *a == "--user").count(),
+                1,
+                "{args:?}"
+            );
+        };
+        as_dev(&ctx.resolve("cargo", &["build"], false).args);
+        as_dev(&ctx.resolve_in_terminal("task", &["build"]).args);
+        as_dev(&ctx.resolve_detached("task", &["serve"], false, &[]).args);
+        let agent = ctx.resolve_for_agent("git", &["commit"]);
+        as_dev(&agent.args);
+        as_dev(&agent.stopper.expect("a stopper").argv("TERM"));
+        let root = ctx.resolve_as(Some("root"), "systemctl", &["status"], false);
+        assert_eq!(root.args[..3], ["exec", "--user", "root"]);
+        assert_eq!(root.args.iter().filter(|a| *a == "--user").count(), 1);
+        ctx.set_container("c", "/workspace", ConfigAuthority::Project);
+        assert!(!ctx
+            .resolve("cargo", &["build"], false)
+            .args
+            .contains(&"--user".to_string()));
     }
 }
 

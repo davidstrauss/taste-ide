@@ -582,6 +582,7 @@ mod tests {
             cwd,
             &crate::Relocation {
                 container: "taste-abc123-review".into(),
+                user: None,
                 podman: taste_core::PodmanTarget::local(false),
                 mcp_socket: taste_core::environment::container_mcp_socket(
                     &taste_core::environment::EnvironmentId::parse("review").unwrap(),

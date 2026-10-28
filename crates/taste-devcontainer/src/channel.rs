@@ -708,14 +708,24 @@ impl EnvChannel {
     /// stdio — so a machine or a remote host costs it nothing but the
     /// connection flag, which is the property `crates/taste-devcontainer/
     /// tests/substrate.rs` asserts against a real non-local connection.
+    ///
+    /// As `user`, the user the container's commands run as
+    /// (`Supervisor::container_user`): the sockets and the directory are
+    /// its alone (0600, 0700), so the agent that dials them must be the
+    /// same user.
     pub async fn start(
         env: EnvironmentId,
         container: &str,
+        user: Option<&str>,
         node: &str,
         substrate: &crate::substrate::Substrate,
         services: Arc<dyn ChannelServices>,
     ) -> Result<Arc<Self>> {
-        let mut args: Vec<String> = vec!["exec".into(), "-i".into(), container.to_string()];
+        let mut args: Vec<String> = vec!["exec".into(), "-i".into()];
+        if let Some(user) = user {
+            args.extend(["--user".into(), user.to_string()]);
+        }
+        args.push(container.to_string());
         args.extend(helper_command(&env, node));
         let mut child = crate::reconcile::podman(substrate, &args)
             .stdin(Stdio::piped())

@@ -5306,6 +5306,9 @@ impl ChatPane {
         });
         Some(taste_acp::Relocation {
             container: supervisor.container_name(),
+            // As whoever the container's commands run as, which is who
+            // the channel's sockets belong to.
+            user: supervisor.container_user(),
             // Which podman that container is on. The agent follows its
             // environment onto the substrate; the name alone is not an
             // address.

@@ -385,6 +385,7 @@ impl Relocated {
         let channel = EnvChannel::start(
             environment.clone(),
             &env.container,
+            None,
             "node",
             &substrate(),
             Arc::new(TestServices {
@@ -440,6 +441,7 @@ impl Relocated {
                 // supervisor's substrate.
                 podman: substrate().target().clone(),
                 container: env.container.clone(),
+                user: None,
                 mcp_socket: channel.paths().mcp.clone(),
                 auth: Some(AuthForward {
                     socket: channel.paths().auth.clone(),

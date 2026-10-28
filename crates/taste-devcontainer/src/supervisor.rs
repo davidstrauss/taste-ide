@@ -509,8 +509,9 @@ pub struct Supervisor {
     channel_services: Mutex<Option<Arc<dyn ChannelServices>>>,
     /// Hash of the config the running container was created from.
     running_hash: Mutex<Option<String>>,
-    /// The running container and the user git runs as in it, for carrying
-    /// the project's author in after the start ([`Self::carry_project_author`]).
+    /// The running container and the user its commands run as
+    /// ([`Self::container_user`]), for carrying the project's author in
+    /// after the start ([`Self::carry_project_author`]).
     git_exec: Mutex<Option<(String, Option<String>)>>,
     /// The forwarded ports of the config this environment last resolved —
     /// what the file tree's Ports section lists. Recorded by
@@ -2386,6 +2387,18 @@ impl Supervisor {
         &self.exec
     }
 
+    /// Who the running container's commands run as: its config's
+    /// `remoteUser` or `containerUser`, the user [`Self::exec`] runs
+    /// everything as. `None` is the image's own user, and so is a
+    /// container that is not running.
+    pub fn container_user(&self) -> Option<String> {
+        self.git_exec
+            .lock()
+            .unwrap()
+            .clone()
+            .and_then(|(_, user)| user)
+    }
+
     pub fn state(&self) -> SupervisorState {
         self.state.lock().unwrap().clone()
     }
@@ -2972,14 +2985,16 @@ impl Supervisor {
             return AgentHosting::Unknown;
         }
         let name = self.container_name();
+        // As the user the container's commands run as, which is who the
+        // answers are about.
+        let user = self.container_user();
         let sh = |script: String| {
-            vec![
-                "exec".into(),
-                name.clone(),
-                "sh".into(),
-                "-c".into(),
-                script,
-            ]
+            let mut args: Vec<String> = vec!["exec".into()];
+            if let Some(user) = &user {
+                args.extend(["--user".into(), user.clone()]);
+            }
+            args.extend([name.clone(), "sh".into(), "-c".into(), script]);
+            args
         };
         let home = taste_core::policy::AGENT_HOME_IN_DEVCONTAINER;
         let writable = format!("mkdir -p {home} 2>/dev/null; test -w {home}");
@@ -3003,11 +3018,18 @@ impl Supervisor {
         *self.agent_task.lock().unwrap() = task;
         // Who the container's commands run as, for `ide_exec` to know a
         // package install it would run can only fail.
-        *self.exec_uid.lock().unwrap() = self
-            .run_captured(sh("id -u".into()))
+        let owner: Option<(u32, u32)> = self
+            .run_captured(sh("id -u; id -g".into()))
             .await
             .ok()
-            .and_then(|uid| uid.trim().parse().ok());
+            .and_then(|ids| {
+                let mut ids = ids.split_whitespace().map(|id| id.parse().ok());
+                Some((ids.next()??, ids.next()??))
+            });
+        *self.exec_uid.lock().unwrap() = owner.map(|(uid, _)| uid);
+        if let Some((uid, gid)) = owner {
+            self.settle_ownership(&name, uid, gid).await;
+        }
         let hosting = if ours.is_none()
             && self
                 .run_captured(sh("command -v node".into()))
@@ -3022,28 +3044,6 @@ impl Supervisor {
                 ),
             }
         } else {
-            if self.run_captured(sh(writable.clone())).await.is_err() {
-                // Best-effort repair before the verdict. What this catches
-                // is podman handing a brand-new named volume to root, not
-                // anything the repo did — so chown it to whoever `podman
-                // exec` actually runs as, asked rather than assumed.
-                if let Ok(owner) = self.run_captured(sh("id -u; id -g".into())).await {
-                    let owner: Vec<&str> = owner.split_whitespace().collect();
-                    if let [uid, gid] = owner[..] {
-                        let _ = self
-                            .run_captured(vec![
-                                "exec".into(),
-                                "--user".into(),
-                                "root".into(),
-                                name.clone(),
-                                "sh".into(),
-                                "-c".into(),
-                                format!("mkdir -p {home} && chown -R {uid}:{gid} {home}"),
-                            ])
-                            .await;
-                    }
-                }
-            }
             match self.run_captured(sh(writable)).await {
                 Err(e) => AgentHosting::No {
                     reason: format!("{name} cannot write the agent home at {home} ({e})"),
@@ -3149,6 +3149,7 @@ impl Supervisor {
         let channel = EnvChannel::start(
             self.env.id.clone(),
             &self.container_name(),
+            self.container_user().as_deref(),
             &node,
             &self.substrate(),
             services,
@@ -3200,14 +3201,18 @@ impl Supervisor {
             .unwrap()
             .as_ref()
             .is_some_and(|services| services.serves(crate::channel::Service::Auth));
-        let mut args = vec![
-            "exec".into(),
+        // As the agent will dial it.
+        let mut args: Vec<String> = vec!["exec".into()];
+        if let Some(user) = self.container_user() {
+            args.extend(["--user".into(), user]);
+        }
+        args.extend([
             name.to_string(),
             self.node_program(),
             "-e".into(),
             crate::channel::REACH_PROBE.into(),
             channel.paths().mcp.display().to_string(),
-        ];
+        ]);
         if serves_auth {
             args.push(channel.paths().auth.display().to_string());
         }
@@ -3701,19 +3706,19 @@ impl Supervisor {
         // /workspaces/taste-ide: No such file or directory` (David,
         // 2026-09-22). The drift flag below still says the two rungs
         // disagree; the workdir just stops lying about the container.
-        let workdir = match authority {
-            ConfigAuthority::Baseline => crate::baseline::ensure_baseline_config()
-                .map(|config| config.workspace_folder().to_string())
-                .unwrap_or_else(|_| resolved.config.workspace_folder().to_string()),
-            ConfigAuthority::Project => resolved.config.workspace_folder().to_string(),
+        // Its user likewise.
+        let own = match authority {
+            ConfigAuthority::Baseline => crate::baseline::ensure_baseline_config().ok(),
+            ConfigAuthority::Project => None,
         };
-        self.exec.set_container(name.clone(), workdir, authority);
+        let own = own.as_ref().unwrap_or(&resolved.config);
+        let workdir = own.workspace_folder().to_string();
+        let user = own.effective_user().map(str::to_string);
+        self.exec
+            .set_container_as(name.clone(), workdir, authority, user.clone());
         *self.authority.lock().unwrap() = authority;
         *self.running_hash.lock().unwrap() = Some(started_hash.clone());
-        *self.git_exec.lock().unwrap() = Some((
-            name.clone(),
-            resolved.config.effective_user().map(str::to_string),
-        ));
+        *self.git_exec.lock().unwrap() = Some((name.clone(), user));
         let drift = config_hash(
             &resolved.config,
             &self.ide_mounts(&resolved.config, resolved.authority),
@@ -4749,7 +4754,12 @@ impl Supervisor {
         *self.running_hash.lock().unwrap() = Some(hash);
         *self.authority.lock().unwrap() = authority;
         self.set_pending(false);
-        self.exec.set_container(name, workdir, authority);
+        self.exec.set_container_as(
+            name,
+            workdir,
+            authority,
+            config.effective_user().map(str::to_string),
+        );
         // Answered before anyone can ask. A chat reacting to the Running
         // event decides its topology from this, and `Unknown` would cost it
         // a spawn outside followed by a respawn inside. Said first, since
@@ -4932,6 +4942,60 @@ impl Supervisor {
                 }
             }
             Err(e) => self.log(format!("the new volumes' owner could not be settled: {e}")),
+        }
+    }
+
+    /// What the container's commands write is theirs to write again: the
+    /// agent's home, the channel's directory, and the checkout, given to
+    /// the user they run as ([`Self::container_user`], `uid`:`gid`) where
+    /// someone else holds them. Until 2026-10-28 an image whose last
+    /// `USER` was root ran every command as container root whatever its
+    /// `remoteUser` said, and under `keep-id` that is a subordinate uid in
+    /// the VM: the checkout's `.git` held objects the IDE's own push into
+    /// it could not add to, an agent environment's `target/` and
+    /// `Cargo.lock` were root's, and so was its agent's home — every
+    /// conversation in it — which the agent, run as the config's user now,
+    /// would no longer have been able to write. So what root left is taken
+    /// back here, on every start, before the channel binds and the agent
+    /// moves in. The home is the IDE's own volume and goes whole; the
+    /// checkout is the user's, and only what root owns in it goes, never
+    /// what is mounted inside it. Never fatal.
+    async fn settle_ownership(&self, name: &str, uid: u32, gid: u32) {
+        let settle: Vec<String> = vec![
+            "exec".into(),
+            "--user".into(),
+            "root".into(),
+            name.into(),
+            "sh".into(),
+            "-c".into(),
+            OWNERSHIP.into(),
+            "sh".into(),
+            uid.to_string(),
+            gid.to_string(),
+            taste_core::policy::AGENT_HOME_IN_DEVCONTAINER.into(),
+            environment::container_channel_dir(&self.env.id)
+                .display()
+                .to_string(),
+            self.checkout().path().display().to_string(),
+        ];
+        match self.run_captured(settle).await {
+            Ok(said) => {
+                for line in said.lines().map(str::trim) {
+                    match line {
+                        "home" => self.log(format!(
+                            "the agent's home was given to the container's user ({uid}:{gid})"
+                        )),
+                        "" | "0" => {}
+                        count => self.log(format!(
+                            "{count} file(s) container root left in the checkout were given \
+                             to the container's user ({uid}:{gid})"
+                        )),
+                    }
+                }
+            }
+            Err(e) => self.log(format!(
+                "the container user's files could not be settled: {e}"
+            )),
         }
     }
 
@@ -6059,6 +6123,27 @@ for t in "$@"; do
   [ -z "$(ls -A "$t")" ] || continue
   chown "$u:$g" "$t" && printf '%s\n' "$t"
 done"#;
+
+/// Run as the container's root with the user's uid and gid, the agent's
+/// home, the channel's directory, and the checkout
+/// ([`Supervisor::settle_ownership`]): the home is given to the user whole
+/// when anything in it is not theirs, the channel's directory whenever it
+/// is there, and in the checkout what root owns, less whatever is mounted
+/// inside it — the project's volumes are as the project left them. Prints
+/// `home` when the home was given, then how many of the checkout's files
+/// were.
+const OWNERSHIP: &str = r#"u=$1; g=$2; home=$3; chan=$4; root=$5
+mkdir -p "$home"
+if [ -n "$(find "$home" -xdev ! -uid "$u" 2>/dev/null | head -n 1)" ]; then
+  chown -R "$u:$g" "$home" && echo home
+fi
+[ -e "$chan" ] && chown -R "$u:$g" "$chan"
+[ "$u" = 0 ] && exit 0
+set --
+for m in $(awk -v r="$root/" 'index($5, r) == 1 { print $5 }' /proc/self/mountinfo); do
+  set -- "$@" -path "$m" -prune -o
+done
+find "$root" "$@" -uid 0 -print -exec chown -h "$u:$g" {} + | wc -l"#;
 
 /// Nested podman, end to end and offline: a user namespace, then an image
 /// built FROM scratch and a container run on it — which mounts storage,

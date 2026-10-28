@@ -3519,6 +3519,20 @@ safe mode for no visible reason. What this changes and what it does not:
   stale and is offered its rebuild rather than adopted as it is; and the
   probe after a start tests that the container's user can write the
   checkout, logging and toasting when it cannot.
+- Every command the IDE runs in the container runs as that same user —
+  `ide_exec`, the user's terminals, tasks, language servers, the channel's
+  helper, and the relocated agent (`ExecContext::set_container_as`,
+  `Relocation::user`) — as the devcontainer spec has terminals and tools
+  run, and VS Code runs them. They ran as the image's own user until
+  2026-10-28, and an image whose Containerfile ends on `USER root` beside
+  `"remoteUser": "dev"` ran all of them as container root, which under
+  `keep-id` is a subordinate uid in the VM: Personal's agent committed
+  as it, and the IDE's own push of a published branch into that
+  checkout failed on "unable to write file ./objects/70/…: Permission
+  denied". What root left behind is given back on every start
+  (`Supervisor::settle_ownership`): the agent's home whole, the
+  channel's directory, and in the checkout what root owns, never what is
+  mounted inside it.
 - A lifecycle command that fails — `composer install` wanting an
   extension the image lacks — does NOT fail the environment. The
   container is up and real, so it stays up and the environment runs; the

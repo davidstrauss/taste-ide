@@ -79,6 +79,11 @@ pub struct AuthForward {
 pub struct Relocation {
     /// The environment's running container, by name.
     pub container: String,
+    /// Who the agent runs as there: the user the container's commands run
+    /// as (`Supervisor::container_user`, the config's `remoteUser`), so
+    /// what the agent writes is the user's and the channel's sockets, that
+    /// user's alone, are its to dial. `None` is the image's own user.
+    pub user: Option<String>,
     /// Which podman service that container is on — the local host, a
     /// machine, or a remote one.
     ///
@@ -234,6 +239,9 @@ fn exec_in_environment(
 ) -> (String, Vec<String>) {
     let mut args: Vec<String> = Vec::new();
     args.extend(["exec".into(), if tty { "-it" } else { "-i" }.into()]);
+    if let Some(user) = &relocation.user {
+        args.extend(["--user".into(), user.clone()]);
+    }
     args.push("--workdir".into());
     args.push(cwd.display().to_string());
 
@@ -508,6 +516,7 @@ mod tests {
         let env = taste_core::environment::EnvironmentId::parse("review").unwrap();
         Relocation {
             container: "taste-abc123-review".into(),
+            user: None,
             podman,
             mcp_socket: taste_core::environment::container_mcp_socket(&env),
             auth: Some(AuthForward {
@@ -521,6 +530,25 @@ mod tests {
 
     fn relocation() -> Relocation {
         relocation_on(taste_core::PodmanTarget::local(false))
+    }
+
+    /// The agent runs as the container's user, named on the exec itself
+    /// and before the container, where podman reads it; with none named,
+    /// as the image's own.
+    #[test]
+    fn the_agent_runs_as_the_containers_user() {
+        let mut relocation = relocation();
+        relocation.user = Some("dev".into());
+        let (_, args) = relocated_agent_command(&spec(), Path::new("/work/p"), &relocation);
+        let user = args.iter().position(|a| a == "--user").expect("a --user");
+        let container = args
+            .iter()
+            .position(|a| a == "taste-abc123-review")
+            .unwrap();
+        assert_eq!(args[user + 1], "dev");
+        assert!(user < container, "{args:?}");
+        let (_, args) = relocated_agent_command(&spec(), Path::new("/work/p"), &self::relocation());
+        assert!(!args.contains(&"--user".to_string()), "{args:?}");
     }
 
     /// With the IDE's own Task found in the container, the agent's shell
@@ -802,6 +830,7 @@ mod tests {
             Path::new("/work/p"),
             &Relocation {
                 container: "c".into(),
+                user: None,
                 podman: taste_core::PodmanTarget::local(false),
                 mcp_socket: PathBuf::from("/tmp/taste-ide-p/mcp.sock"),
                 auth: None,
