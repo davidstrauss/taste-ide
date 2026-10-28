@@ -1910,7 +1910,7 @@ impl EnvironmentRegistry {
             // Each phase, and git's progress through the slow ones, is the
             // step's detail while it runs.
             let say = |line: &str| self.progress_vm(&vm.domain, format!("syncing: {line}"));
-            // Back from a clean shutdown: what the folder holds now was
+            // Back still marked from its close: what the folder holds now was
             // done since, and Personal takes it whole before the ordinary
             // sync, which then finds the two in step.
             if crate::disposable::take_clean_return(&vm.domain) {

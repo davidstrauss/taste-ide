@@ -2388,16 +2388,18 @@ git for-each-ref --format='%(refname)' "$staged" | while IFS= read -r ref; do
 done
 "#;
 
-/// The folder, as it is now, made Personal's: what a VM that shut down
-/// cleanly finds on its return (`disposable::take_clean_return`). Its
-/// window's close found nothing on it this machine lacked, and the re-check
-/// before it went down found nothing moved since — so everything that
-/// differs now was done on this side, after: a history rewritten, a fresh
-/// clone, a branch switched, files edited. That wins outright, rather than
-/// standing as a divergence for the person to settle (David, 2026-10-22:
-/// "give strict preference to the local git and working copy if
-/// reconnecting to a VM that had a clean shutdown … any changes since the
-/// VM's clean shutdown should clearly win").
+/// The folder, as it is now, made Personal's: what a VM still marked
+/// finds on its return (`disposable::take_clean_return`), shut down since
+/// or met still running. Its window's close found nothing on it this
+/// machine lacked, so everything that differs now was done on this side,
+/// after: a history rewritten, a fresh clone, a branch switched, files
+/// edited. That wins outright, rather than standing as a divergence for the
+/// person to settle (David, 2026-10-22: "give strict preference to the
+/// local git and working copy if reconnecting to a VM that had a clean
+/// shutdown … any changes since the VM's clean shutdown should clearly
+/// win"; 2026-10-27: "The local copy is supposed to win when the VM
+/// diverges (including no shared history) and the VM was already marked as
+/// safe to delete").
 ///
 /// The branches, the checked-out one and its commit, and the working copy
 /// — less what is ignored, which is the checkout's own build output and
@@ -2447,7 +2449,7 @@ pub fn give_checkout_the_folder(
     if same.success() {
         return Ok(None);
     }
-    say("this VM shut down cleanly; making Personal this folder's");
+    say("this VM was marked as holding nothing this folder lacks; making Personal this folder's");
     // The folder's uncommitted work travels as a snapshot, as a fresh
     // placement's does; the snapshot it replaces is pinned first.
     let snapshot_ref =
@@ -2512,8 +2514,8 @@ pub fn give_checkout_the_folder(
         }
     }
     Ok(Some(format!(
-        "Personal was made this folder's — {} at {}{} — since the VM shut down cleanly; its \
-         old tip is kept at {kept}",
+        "Personal was made this folder's — {} at {}{} — since the VM was marked as holding \
+         nothing this folder lacks; its old tip is kept at {kept}",
         head.describe(),
         &tip_hex[..tip_hex.len().min(8)],
         if dirty {

@@ -93,19 +93,23 @@ pub fn recheck_path(domain: &str) -> PathBuf {
     disks_dir().join(format!("{domain}.recheck"))
 }
 
-/// The VMs this process brought back up from a clean shutdown: shut off
-/// (or going down) and still marked, so their window's close found
-/// nothing on them this machine lacked and the re-check before the
-/// shutdown found nothing moved since. What differs from the folder on
-/// such a VM's return was done on this side, and wins
-/// (`peer::give_checkout_the_folder`).
+/// The VMs this process brought back into use still marked: their window's
+/// close found nothing on them this machine lacked. What differs from the
+/// folder on such a VM's return was done on this side, and wins
+/// (`peer::give_checkout_the_folder`) — whether the VM shut down in
+/// between or was met still running inside the deferred shutdown's grace.
+/// The clean shutdown the rule names is the window's close that marked it,
+/// not the power-off; read as the power-off, it skipped the common
+/// relaunch and kept a re-cloned folder standing as a divergence (David,
+/// 2026-10-27: "The local copy is supposed to win when the VM diverges
+/// (including no shared history) and the VM was already marked as safe to
+/// delete"). Personal's old tip is kept either way.
 static CLEAN_RETURNS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// `vm` is being brought up while `running` says whether it already was:
-/// remember whether it comes back from a clean shutdown. Asked before its
-/// marker is withdrawn, which the bring-up does next.
-pub fn note_return(vm: &Vm, running: bool) {
-    if !running && is_marked(vm) {
+/// `vm` is being brought into use: remember whether it comes back marked.
+/// Asked before its marker is withdrawn, which the bring-up does next.
+pub fn note_return(vm: &Vm) {
+    if is_marked(vm) {
         let mut clean = CLEAN_RETURNS.lock().unwrap();
         if !clean.contains(&vm.domain) {
             clean.push(vm.domain.clone());
@@ -113,7 +117,7 @@ pub fn note_return(vm: &Vm, running: bool) {
     }
 }
 
-/// Whether `domain` came back from a clean shutdown, answered once: the
+/// Whether `domain` came back marked, answered once: the
 /// first sync after the return is the one it is for.
 pub fn take_clean_return(domain: &str) -> bool {
     let mut clean = CLEAN_RETURNS.lock().unwrap();

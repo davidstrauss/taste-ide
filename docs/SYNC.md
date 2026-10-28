@@ -220,11 +220,10 @@ removals emptied stayed in the checkout until 096b680 (P11).
   the same but in one case: a side that edits such a path in the very pass
   it comes back into scope has its edit propagated, where P7's "decided
   with A(p) absent" would ask about it as a conflict.
-- **After a clean shutdown, the folder wins.** A VM brought back up while
-  shut off and still marked disposable — its window's close found nothing
-  on it this machine lacked, and the re-check just before it went down
-  found nothing moved since (`disposable`) — cannot have changed since the
-  two last agreed, so whatever differs was done on the folder's side: a
+- **After a clean close, the folder wins.** A VM brought back into use
+  still marked disposable — its window's close found nothing on it this
+  machine lacked (`disposable`) — is taken as unchanged since the two last
+  agreed, so whatever differs was done on the folder's side: a
   history rewritten, a fresh clone, a branch switched, files edited. Before
   the first pass, Personal takes the folder whole — its branches (the
   IDE's `agents/*` aside, and a branch the folder lacks deleted), HEAD and
@@ -234,8 +233,16 @@ removals emptied stayed in the checkout until 096b680 (P11).
   step. Without it, a folder cloned afresh had no archive to measure from,
   and its rewritten history stood as a divergence for the person to settle
   (David, 2026-10-22: "any changes since the VM's clean shutdown should
-  clearly win"). A VM that was still running, or went down without the
-  re-check, keeps the rules above.
+  clearly win"). The clean shutdown in that is the window's close that
+  marked the VM, not the VM powering off: the deferred shutdown comes
+  minutes later, and a relaunch inside its grace — the common one — meets
+  the VM still running and still marked. Read as the power-off, the rule
+  skipped exactly that relaunch, and a re-cloned folder stood as a
+  divergence with a commit made in Personal on the old history, uncounted
+  by ↑ (2026-10-27; David: "The local copy is supposed to win when the VM
+  diverges (including no shared history) and the VM was already marked as
+  safe to delete"). A VM whose marker was taken back — the re-check before
+  the shutdown found something moved — keeps the rules above.
 
 **What remains.** Between the second check and the rename is a window of
 a system call or two; a write landing in it is lost. Unison has the same

@@ -1718,10 +1718,9 @@ impl LibvirtSession {
     /// seconds, and a launch that met it used to give up on the whole
     /// workspace.
     async fn bring_up(&self, vm: &Vm) -> Result<()> {
-        // Whether it returns from a clean shutdown — down, and still
-        // marked — is read before the marker goes.
-        let running = matches!(self.state(vm).await, Ok(DomainState::Running));
-        crate::disposable::note_return(vm, running);
+        // Whether it returns marked — down or still up — is read before
+        // the marker goes.
+        crate::disposable::note_return(vm);
         // In use from here on, so what it holds is no longer known: the
         // marker its last window left goes before anything can write.
         crate::disposable::withdraw(&vm.domain);
