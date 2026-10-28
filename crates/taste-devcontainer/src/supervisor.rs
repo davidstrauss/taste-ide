@@ -463,6 +463,87 @@ pub struct ResolvedConfig {
 /// failing step's own output and podman's error after it.
 const FAILED_BUILD_LOG_LINES: usize = 120;
 
+/// How long a build that could not reach the network waits before each
+/// try again ([`Supervisor::reload`]): about two minutes in all.
+const NETWORK_RETRY_WAITS: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(60),
+];
+
+/// How often, and for how long, a project whose build could not reach the
+/// network asks whether it is back ([`Supervisor::watch_for_network`]).
+const NETWORK_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+const NETWORK_WATCH_FOR: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The line of a failed build's log that says it could not reach the
+/// network, if one does: a name that would not resolve, a connection that
+/// timed out or was refused a route, as dnf, curl, apt, npm, pip, Go's
+/// resolver (podman's own pull), and the TLS layer each say it. A typo in a
+/// registry's name reads the same, and costs only the waits.
+pub(crate) fn network_failure(log: &[String]) -> Option<String> {
+    const SIGNS: [&str; 20] = [
+        "could not resolve host",
+        "couldn't resolve host",
+        "could not resolve hostname",
+        "temporary failure in name resolution",
+        "temporary failure resolving",
+        "no such host",
+        "name or service not known",
+        "network is unreachable",
+        "no route to host",
+        "connection timed out",
+        "operation timed out",
+        "i/o timeout",
+        "tls handshake timeout",
+        "could not connect to server",
+        "failed to connect to",
+        "connection reset by peer",
+        "eai_again",
+        "etimedout",
+        "enetunreach",
+        "newconnectionerror",
+    ];
+    // This build's lines only: the tail can still hold an earlier try's,
+    // and the IDE's own "waiting for the network" line quotes one.
+    log.iter()
+        .rev()
+        .take_while(|line| !line.contains("$ podman build") && !line.contains("$ podman pull"))
+        .find_map(|line| {
+            let lower = line.to_lowercase();
+            SIGNS.iter().any(|sign| lower.contains(sign)).then(|| {
+                // dnf marks its curl errors `>>> `, which says nothing.
+                let line = line.trim().trim_start_matches('>').trim_start();
+                let cut: String = line.chars().take(200).collect();
+                if cut.len() < line.len() {
+                    format!("{cut}…")
+                } else {
+                    cut
+                }
+            })
+        })
+}
+
+/// The host a network failure's line names — `Could not resolve host:
+/// mirrors.fedoraproject.org`, `https://registry.npmjs.org/…`, `lookup
+/// quay.io` — for asking whether it resolves again.
+fn host_named(line: &str) -> Option<String> {
+    let lower = line.to_lowercase();
+    let candidate = if let Some(at) = lower.find("://") {
+        &line[at + 3..]
+    } else if let Some(at) = lower.find("resolve host:") {
+        &line[at + "resolve host:".len()..]
+    } else {
+        &line[lower.find("lookup ")? + "lookup ".len()..]
+    };
+    let host: String = candidate
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+        .collect();
+    (host.contains('.') && !host.ends_with('.')).then_some(host)
+}
+
 pub struct Supervisor {
     env: EnvironmentIdentity,
     events: EventBus,
@@ -545,6 +626,18 @@ pub struct Supervisor {
     /// this banner with the one suggesting rebuild as soon as new changes
     /// occur").
     build_failed: Mutex<Option<(String, String)>>,
+    /// The line that says the last failed build could not reach the
+    /// network, when that is why it failed ([`network_failure`]): such a
+    /// failure is tried again rather than passed over ([`Self::reload`]).
+    offline: Mutex<Option<String>>,
+    /// The build under way is followed by another try should it fail for
+    /// the network, so its failure is not said as the environment's.
+    network_retry_follows: AtomicBool,
+    /// A watch is waiting for the network to come back to build the
+    /// project's environment again ([`Self::watch_for_network`]).
+    network_watch: AtomicBool,
+    /// This supervisor, for the watch it starts from `&self`.
+    me: std::sync::Weak<Supervisor>,
     /// The failed build's own log, as it stood when it failed — before the
     /// baseline that stands in writes its build after it. What a repair is
     /// handed (David, 2026-09-23: "the prompt agent button will direct the
@@ -943,7 +1036,11 @@ impl Supervisor {
         let checkout = env.checkout.clone();
         let env_is_primary = env.id.is_primary();
         let transfers = crate::transfers::Transfers::new(events.clone());
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            offline: Mutex::new(None),
+            network_retry_follows: AtomicBool::new(false),
+            network_watch: AtomicBool::new(false),
             env,
             events,
             exec,
@@ -2833,8 +2930,91 @@ impl Supervisor {
             Some(said) => format!("{error} — {said}"),
             None => error.to_string(),
         };
+        *self.offline.lock().unwrap() = network_failure(&log);
+        let reason = match self.offline.lock().unwrap().as_deref() {
+            Some(line) => format!("the build could not reach the network — {line}"),
+            None => reason,
+        };
         *self.build_failed.lock().unwrap() = Some((hash, reason));
         *self.failed_build_log.lock().unwrap() = Some(log);
+    }
+
+    /// A failed build or pull, said as the environment's state — unless it
+    /// failed for the network and another try follows, which is no
+    /// failure yet ([`Self::reload_reporting`]). One that failed for the
+    /// network says so, so the page and the banner read it as the
+    /// connection rather than the project's configuration.
+    fn say_build_failed(&self, error: &anyhow::Error) {
+        let offline = self.offline.lock().unwrap().clone();
+        if offline.is_some() && self.network_retry_follows.load(Ordering::SeqCst) {
+            return;
+        }
+        let message = match offline {
+            Some(line) => format!("the build could not reach the network — {line}"),
+            None => error.to_string(),
+        };
+        self.set_state(SupervisorState::Failed { message });
+    }
+
+    /// Wait for the network to come back, then build the project's
+    /// environment again — once per failure, in the background, while the
+    /// safe-mode environment stands in. Whether it is back is asked of the
+    /// running container, which shares the VM's network: a lookup of the
+    /// host the build could not reach, every half minute for an hour.
+    /// Asking that, rather than rebuilding on a timer, leaves the
+    /// safe-mode environment and its agent alone until there is a reason
+    /// to replace them.
+    fn watch_for_network(&self) {
+        if self.network_watch.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = self.me.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(NETWORK_WATCH_EVERY).await;
+                let Some(this) = weak.upgrade() else { return };
+                let Some(line) = this.offline.lock().unwrap().clone() else {
+                    this.network_watch.store(false, Ordering::SeqCst);
+                    return;
+                };
+                if started.elapsed() > NETWORK_WATCH_FOR || this.is_moving() {
+                    this.log(
+                        "stopped waiting for the network; Rebuild builds the project's \
+                         environment again"
+                            .to_string(),
+                    );
+                    this.network_watch.store(false, Ordering::SeqCst);
+                    return;
+                }
+                if !this.network_answers(&line).await {
+                    continue;
+                }
+                this.log(
+                    "the network answers again; building the project's environment".to_string(),
+                );
+                this.network_watch.store(false, Ordering::SeqCst);
+                this.build_failed.lock().unwrap().take();
+                this.offline.lock().unwrap().take();
+                if let Err(e) = this.reload().await {
+                    this.log(format!(
+                        "building it again after the network came back: {e:#}"
+                    ));
+                }
+                return;
+            }
+        });
+    }
+
+    /// Whether the host a build could not reach — named in `line` — now
+    /// resolves from the running container; a well-known host when the
+    /// line names none.
+    async fn network_answers(&self, line: &str) -> bool {
+        let host = host_named(line).unwrap_or_else(|| "registry.fedoraproject.org".to_string());
+        let args: Vec<String> = ["exec", &self.container_name(), "getent", "hosts", &host]
+            .map(String::from)
+            .to_vec();
+        self.run_captured(args).await.is_ok()
     }
 
     /// The last failed build's own log, while that failure stands.
@@ -4161,9 +4341,55 @@ impl Supervisor {
                 return Ok(());
             }
         }
+        // A reason the network was down is the last build's; this one has
+        // yet to say (and a watch waiting on it stands down if it builds).
+        self.offline.lock().unwrap().take();
         let failed_before = self.build_failed.lock().unwrap().clone();
-        let result = self.reload_locked_with(false).await;
+        // A build that could not reach the network is tried again after a
+        // wait, a few times, before anything is said to have failed: a
+        // connection that drops for a minute — a laptop's Wi-Fi, a VM's
+        // first moments — is not a broken configuration, and the safe-mode
+        // environment once stood in for one (David, 2026-10-27: "I'll be
+        // on flakey connections often").
+        let mut tries = 0;
+        let result = loop {
+            self.network_retry_follows
+                .store(tries < NETWORK_RETRY_WAITS.len(), Ordering::SeqCst);
+            let result = self.reload_locked_with(false).await;
+            let offline = self.offline.lock().unwrap().clone();
+            let failed_now = self.build_failed.lock().unwrap().clone();
+            match offline {
+                Some(line)
+                    if result.is_err()
+                        && failed_now.is_some()
+                        && failed_now != failed_before
+                        && tries < NETWORK_RETRY_WAITS.len() =>
+                {
+                    let wait = NETWORK_RETRY_WAITS[tries];
+                    tries += 1;
+                    self.log(format!(
+                        "waiting for the network: trying again in {} s ({tries} of {}); the \
+                         build could not reach it ({line})",
+                        wait.as_secs(),
+                        NETWORK_RETRY_WAITS.len()
+                    ));
+                    self.set_state(SupervisorState::Building);
+                    // Forgotten, so the next try builds the project's own
+                    // config rather than passing it over as failed.
+                    self.build_failed.lock().unwrap().take();
+                    self.offline.lock().unwrap().take();
+                    tokio::time::sleep(wait).await;
+                }
+                _ => break result,
+            }
+        };
+        self.network_retry_follows.store(false, Ordering::SeqCst);
         let failed_after = self.build_failed.lock().unwrap().clone();
+        if result.is_err() && failed_after.is_some() && self.offline.lock().unwrap().is_some() {
+            // Still unreachable: the safe-mode environment stands in, and
+            // the project's build follows the network back.
+            self.watch_for_network();
+        }
         if result.is_err() && failed_after.is_some() && failed_after != failed_before {
             // The project's image would not build or pull. Nothing running
             // is the one outcome that helps nobody — the agent that could
@@ -4470,9 +4696,7 @@ impl Supervisor {
                 if authority == ConfigAuthority::Project {
                     self.remember_build_failure(&config, e);
                 }
-                self.set_state(SupervisorState::Failed {
-                    message: e.to_string(),
-                })
+                self.say_build_failed(e);
             })?;
             tag
         } else {
@@ -4483,9 +4707,7 @@ impl Supervisor {
                     if authority == ConfigAuthority::Project {
                         self.remember_build_failure(&config, e);
                     }
-                    self.set_state(SupervisorState::Failed {
-                        message: e.to_string(),
-                    })
+                    self.say_build_failed(e);
                 })?;
             image
         };
@@ -7963,5 +8185,65 @@ mod tests {
         assert!(error.contains("host-side IDE"), "{error}");
         assert!(inside.stop().await.is_err());
         assert!(inside.nuke().await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(String::from).collect()
+    }
+
+    /// The sb build that fell back to safe mode on a dropped connection
+    /// reads as the network; a real failure, and an earlier try's lines
+    /// before this build's own command, do not.
+    #[test]
+    fn a_build_that_could_not_reach_the_network_is_told_apart() {
+        let dnf = lines(concat!(
+            "$ podman build -t taste-img-1 -f Containerfile .\n",
+            "STEP 2/6: RUN microdnf install -y php\n",
+            ">>> Curl error (6): Could not resolve hostname for ",
+            "https://mirrors.fedoraproject.org/metalink?repo=fedora-44&arch=x86_64 ",
+            "[Could not resolve host: mirrors.fedoraproject.org]\n",
+            "Error: building at STEP \"RUN microdnf install -y php\": exit status 1",
+        ));
+        let said = network_failure(&dnf).expect("a network failure");
+        assert!(said.contains("mirrors.fedoraproject.org"), "{said}");
+        assert_eq!(
+            host_named(&said).as_deref(),
+            Some("mirrors.fedoraproject.org")
+        );
+
+        let typo = lines(concat!(
+            "$ podman build -t taste-img-1 -f Containerfile .\n",
+            "error: No package matches 'phpp'\n",
+            "Error: building at STEP \"RUN microdnf install -y phpp\": exit status 1",
+        ));
+        assert_eq!(network_failure(&typo), None);
+
+        let after_a_retry = lines(concat!(
+            "waiting for the network: the build could not reach it ",
+            "(Could not resolve host: x.org)\n",
+            "$ podman build -t taste-img-1 -f Containerfile .\n",
+            "error: No package matches 'phpp'",
+        ));
+        assert_eq!(network_failure(&after_a_retry), None);
+
+        let pull = lines(concat!(
+            "$ podman pull quay.io/x/y\n",
+            "Error: initializing source docker://quay.io/x/y: pinging container registry ",
+            "quay.io: Get \"https://quay.io/v2/\": dial tcp: lookup quay.io: no such host",
+        ));
+        let said = network_failure(&pull).expect("a network failure");
+        assert_eq!(host_named(&said).as_deref(), Some("quay.io"));
+
+        let npm = lines(concat!(
+            "$ podman build .\n",
+            "npm error code EAI_AGAIN\n",
+            "npm error request to https://registry.npmjs.org/x failed",
+        ));
+        assert!(network_failure(&npm).is_some());
     }
 }

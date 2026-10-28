@@ -926,6 +926,17 @@ impl StartupPage {
                              not the project's configuration — it is this machine's setup, the \
                              VM provider, or a bug in the IDE. The Taste IDE log has the detail."
                     ));
+                } else if first.contains("could not reach the network") {
+                    // The connection, not the project: nothing to repair,
+                    // and the build comes back on its own with the network
+                    // (`Supervisor::watch_for_network`).
+                    self.heading.set_label("Waiting for the network");
+                    self.set_note(
+                        "The project's environment could not be built: its build could not \
+                         reach the network, even after trying again for two minutes. The \
+                         safe-mode environment stands in meanwhile, and the project's \
+                         environment is built again on its own once the connection is back.",
+                    );
                 } else {
                     self.heading.set_label("Falling back to safe mode");
                     self.set_note(&format!(
@@ -1092,6 +1103,12 @@ impl StartupPage {
             return;
         }
         match self.current.get() {
+            Some(Step::Build) if clean.starts_with("waiting for the network") => {
+                // The build could not reach the network and is trying
+                // again: said on its row, so the wait reads as one.
+                self.row(Step::Build)
+                    .set(Status::Active, Some(&substep_words(clean)));
+            }
             Some(Step::Build) => {
                 let (of, cached) = self.build_steps.get();
                 if clean.starts_with("--> Using cache") {
@@ -1271,6 +1288,34 @@ impl StartupPage {
                     },
                     false,
                 );
+            }
+            // `waiting`: a build that could not reach the network, trying
+            // again; `offline`: the same after its last try, the baseline
+            // standing in until the network is back.
+            "waiting" | "offline" => {
+                self.activate(Step::Vm, None);
+                self.activate(Step::Files, None);
+                self.activate(Step::Place, None);
+                self.activate(Step::Build, None);
+                self.on_build_line("STEP 2/6: RUN microdnf install -y php php-cli");
+                self.on_build_line(
+                    ">>> Curl error (6): Could not resolve hostname for \
+                     https://mirrors.fedoraproject.org/metalink?repo=fedora-44",
+                );
+                self.on_build_line(
+                    "waiting for the network: trying again in 30 s (2 of 3); the build could \
+                     not reach it (Could not resolve host: mirrors.fedoraproject.org)",
+                );
+                if kind == "offline" {
+                    self.on_state(
+                        &DevcontainerStateEvent::Failed {
+                            message: "the build could not reach the network — Curl error \
+                                      (6): Could not resolve host: mirrors.fedoraproject.org"
+                                .into(),
+                        },
+                        false,
+                    );
+                }
             }
             "noconfig" => {
                 self.activate(Step::Vm, None);

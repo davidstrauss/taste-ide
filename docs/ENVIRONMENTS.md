@@ -3561,6 +3561,23 @@ safe mode for no visible reason. What this changes and what it does not:
   config on the rung below both, outside any container on a read-only
   stand-in, where its own devcontainer.json read as "File does not exist"
   (David, 2026-09-16: "The agent is getting stymied again").
+- **A build that could not reach the network is not a broken config**
+  (2026-10-27; David: "I'll be on flakey connections often"). A move to
+  a fresh VM rebuilt a project's image from nothing a minute after the VM
+  booted, its `dnf` could not resolve the mirrors, and the environment
+  came up in safe mode as though its definition were wrong. A failed
+  build or pull whose own output says it could not reach the network
+  (`network_failure`: a name that would not resolve, a connection that
+  timed out or had no route — dnf's, curl's, apt's, npm's, pip's, and
+  Go's own words for it) is tried again after 10, 30, and 60 seconds,
+  the startup page's build row saying it is waiting for the network,
+  before anything is said to have failed. Still unreachable, the
+  baseline stands in, the page says the network was the reason rather
+  than the definition, and the failure is never pinned: a watch asks the
+  running container every half minute, for an hour, whether the host the
+  build could not reach resolves again, and builds the project's
+  environment when it does — without replacing the safe-mode environment
+  and its agent on a timer meanwhile.
 - Builds stay IDE-supervised: the project's image is built by the IDE,
   never by a container runtime inside another container. A project's OWN
   use of podman — its build, its tests, its tasks — is a different thing,
