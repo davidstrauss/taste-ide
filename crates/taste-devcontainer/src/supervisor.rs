@@ -5316,6 +5316,16 @@ impl Supervisor {
                 self.env.id
             );
         }
+        self.remove_owned_volume(volume).await
+    }
+
+    /// [`Self::remove_volume`] without asking the config again, for a
+    /// destroy, which reads [`Self::env_volumes`] once, before the
+    /// checkout goes. Asked after, the config was gone or going — the
+    /// checkout's `.devcontainer/` removed, and its mirror here following
+    /// it — and the config's own volumes were refused as "does not belong
+    /// to environment" and left behind (2026-10-28).
+    pub(crate) async fn remove_owned_volume(&self, volume: &str) -> Result<()> {
         self.log(format!("removing volume {volume}"));
         self.run_captured(vec![
             "volume".into(),
@@ -5324,6 +5334,52 @@ impl Supervisor {
             volume.into(),
         ])
         .await?;
+        Ok(())
+    }
+
+    /// This environment's checkout in its VM, removed through the files
+    /// service — and, where that is refused, by root in the VM's keeper
+    /// container. What a container's root wrote there is a subordinate
+    /// uid's in the VM, which the files service, running as the VM's
+    /// user, may not delete: an agent environment's `target/`, built as
+    /// container root before its commands ran as the config's user, kept
+    /// its checkout on "EACCES: permission denied, rmdir" (2026-10-28).
+    /// The keeper's root is that same uid, since both containers map the
+    /// VM's user with `keep-id`, and it holds every uid of the namespace
+    /// besides; the environment's own container cannot do it, being
+    /// stopped by now, and often stopped long since. Nothing for a local
+    /// checkout.
+    pub(crate) async fn remove_remote_checkout(&self) -> Result<()> {
+        let Checkout::Remote { path, .. } = self.checkout().clone() else {
+            return Ok(());
+        };
+        let files = self.files();
+        let target = path.clone();
+        let refused = match tokio::task::spawn_blocking(move || files.remove(&target, true))
+            .await
+            .context("the removal did not finish")?
+        {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => e,
+        };
+        self.log(format!(
+            "the files service could not remove {} ({refused}); removing it as root in the \
+             keeper",
+            path.display()
+        ));
+        self.run_captured(vec![
+            "exec".into(),
+            "--user".into(),
+            "root".into(),
+            crate::keeper::container_name(&self.env.workspace_root),
+            "rm".into(),
+            "-rf".into(),
+            "--".into(),
+            path.display().to_string(),
+        ])
+        .await
+        .with_context(|| format!("{refused}; and as root in the keeper"))?;
         Ok(())
     }
 

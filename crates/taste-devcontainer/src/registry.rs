@@ -3103,6 +3103,9 @@ impl EnvironmentRegistry {
             })
             .unwrap_or_default();
 
+        // Its volumes, named while its config is still there to name them
+        // (`Supervisor::remove_owned_volume`).
+        let volumes = supervisor.env_volumes();
         // Container next: a running container holds the clone's mount.
         let _ = supervisor.stop().await;
         // A checkout in a VM goes after its container, through the files
@@ -3110,25 +3113,13 @@ impl EnvironmentRegistry {
         // named in the report, for the reason on `kept_volumes`: the first
         // live run left one behind and the only trace was a log line.
         if let Checkout::Remote { vm, path } = supervisor.checkout().clone() {
-            let files = supervisor.files();
-            let target = path.clone();
-            let removed = tokio::task::spawn_blocking(move || files.remove(&target, true)).await;
-            match removed {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!("removing {id}'s checkout from VM {vm}: {e}");
-                    report.kept_checkout = Some(format!("{} in VM {vm} ({e})", path.display()));
-                }
-                Err(e) => {
-                    report.kept_checkout = Some(format!(
-                        "{} in VM {vm} (the removal did not finish: {e})",
-                        path.display()
-                    ));
-                }
+            if let Err(e) = supervisor.remove_remote_checkout().await {
+                tracing::warn!("removing {id}'s checkout from VM {vm}: {e:#}");
+                report.kept_checkout = Some(format!("{} in VM {vm} ({e:#})", path.display()));
             }
         }
-        for volume in supervisor.env_volumes() {
-            match supervisor.remove_volume(&volume).await {
+        for volume in volumes {
+            match supervisor.remove_owned_volume(&volume).await {
                 Ok(()) => report.removed_volumes.push(volume),
                 // Not fatal — the clone and the container still go, and an
                 // environment half-destroyed would be worse than one that
