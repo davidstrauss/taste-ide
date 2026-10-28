@@ -1176,6 +1176,33 @@ fn sync_primary_peer_pass(
     transfers: Option<&crate::transfers::Transfers>,
 ) -> Result<PeerSync> {
     use taste_git::mirror::Head;
+    // Neither side partway through a rebase, a merge, or the like: such an
+    // operation moves HEAD through states it does not end on — a rebase
+    // detaches it at its base while it replays — and a pass that followed
+    // one recorded the two as agreeing there. When the rebase finished,
+    // the folder stayed detached, its branch at the old commit and the
+    // rebased files over it as uncommitted work (2026-10-27). The pass
+    // stands down; the next, once it is over, finds where it ended.
+    let checkout_git = checkout_git_dir(files, path);
+    let folder_git = taste_git::GitWorkspace::discover(peer).map(|git| git.git_dir().to_path_buf());
+    let busy = operation_in_progress(|name| files.exists(&checkout_git.join(name)))
+        .map(|op| format!("Personal is partway through {op}"))
+        .or_else(|| {
+            folder_git.as_ref().and_then(|dir| {
+                operation_in_progress(|name| dir.join(name).exists())
+                    .map(|op| format!("this folder is partway through {op}"))
+            })
+        });
+    if let Some(busy) = busy {
+        say(&format!("waiting: {busy}"));
+        let git = taste_git::GitWorkspace::discover(peer)
+            .with_context(|| format!("{} is not a git working tree", peer.display()))?;
+        return Ok(PeerSync {
+            branch: git.branch_name(),
+            note: Some(format!("{busy}; the two are compared once it is over")),
+            ..PeerSync::default()
+        });
+    }
     // The checkout observed by this pass, now — not by whatever last took
     // a snapshot of it, seconds or minutes ago: a pass that decided on an
     // older picture took an agent's edit since for no change at all, and
@@ -1190,7 +1217,7 @@ fn sync_primary_peer_pass(
     // pinned to a ref first, so the fetch brings its commit: a commit no
     // branch holds is otherwise one the folder never receives.
     let checkout_head = files
-        .read_to_string(&checkout_git_dir(files, path).join("HEAD"))
+        .read_to_string(&checkout_git.join("HEAD"))
         .ok()
         .and_then(|head| Head::parse(&head));
     let detached = matches!(checkout_head, Some(Head::Commit(_)));
@@ -1640,6 +1667,28 @@ fn sync_submodules(
 /// The git directory of the checkout at `path`: its `.git`, or where a
 /// `.git` file sends it — which is how a submodule's is kept, inside the
 /// parent's `.git/modules/`.
+/// What git leaves in a repository's git directory while an operation
+/// that moves HEAD through states it does not end on is under way, with
+/// the operation's name.
+const IN_PROGRESS: [(&str, &str); 7] = [
+    ("rebase-merge", "a rebase"),
+    ("rebase-apply", "a rebase"),
+    ("MERGE_HEAD", "a merge"),
+    ("CHERRY_PICK_HEAD", "a cherry-pick"),
+    ("REVERT_HEAD", "a revert"),
+    ("sequencer", "a cherry-pick or a revert"),
+    ("BISECT_LOG", "a bisect"),
+];
+
+/// The operation a repository is partway through, by what `exists` says of
+/// the names in its git directory, or `None`.
+fn operation_in_progress(exists: impl Fn(&str) -> bool) -> Option<&'static str> {
+    IN_PROGRESS
+        .iter()
+        .find(|(name, _)| exists(name))
+        .map(|(_, op)| *op)
+}
+
 fn checkout_git_dir(files: &Files, path: &Path) -> PathBuf {
     let dot_git = path.join(".git");
     match files.read_to_string(&dot_git) {
@@ -2655,6 +2704,47 @@ fn push_ahead_into_checkout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rebase stopped on a conflict, and a merge stopped on one, are each
+    /// seen as under way from what git leaves in the git directory, and
+    /// nothing is once each is over.
+    #[test]
+    fn a_stopped_rebase_or_merge_is_an_operation_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let in_progress = || operation_in_progress(|name| root.join(".git").join(name).exists());
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "base\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["switch", "-qc", "topic"]);
+        std::fs::write(root.join("a.txt"), "topic\n").unwrap();
+        git(&["commit", "-qam", "topic"]);
+        git(&["switch", "-q", "main"]);
+        std::fs::write(root.join("a.txt"), "main\n").unwrap();
+        git(&["commit", "-qam", "main"]);
+        assert_eq!(in_progress(), None);
+
+        git(&["switch", "-q", "topic"]);
+        assert!(!git(&["rebase", "main"]).status.success(), "it stops");
+        assert_eq!(in_progress(), Some("a rebase"));
+        assert!(git(&["rebase", "--abort"]).status.success());
+        assert_eq!(in_progress(), None);
+
+        assert!(!git(&["merge", "main"]).status.success(), "it stops");
+        assert_eq!(in_progress(), Some("a merge"));
+        assert!(git(&["merge", "--abort"]).status.success());
+        assert_eq!(in_progress(), None);
+    }
 
     /// After a clean shutdown the folder wins whole: a Personal on the old
     /// history, with a branch the folder dropped, an edit, and an untracked

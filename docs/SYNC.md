@@ -247,6 +247,17 @@ removals emptied stayed in the checkout until 096b680 (P11).
   the VM was already marked as safe to delete"). A VM whose marker was
   taken back (the re-check before the shutdown found something moved)
   keeps the rules above.
+- **Never partway through an operation.** A pass stands down while
+  either side is in the middle of a rebase, a merge, a cherry-pick, a
+  revert, or a bisect, as git's own files in the git directory say
+  (`peer::operation_in_progress`): each moves HEAD through states it does
+  not end on. A pass that followed an agent's rebase halfway took
+  Personal's detached HEAD at the rebase's base and recorded the two as
+  agreeing there; when the rebase finished, the folder stayed detached,
+  its branch at the pre-rebase commit and the rebased files over it as
+  uncommitted work, since the rule that follows a rewrite asks for
+  agreement on the branch (2026-10-27). The next pass, once the operation
+  is over, sees only where it ended.
 
 **What remains.** Between the second check and the rename is a window of
 a system call or two; a write landing in it is lost. Unison has the same
