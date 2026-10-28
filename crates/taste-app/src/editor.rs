@@ -4080,6 +4080,7 @@ impl Editor {
         self.apply_editorconfig(&config, &page);
         self.apply_review_facts(&page);
         self.install_page_keys(path.to_path_buf(), &page);
+        crate::viewport_matches::watch(&page.view);
 
         // Modified marker on the tab title; dirty state mirrors into the
         // shared IDE state agents read over MCP.

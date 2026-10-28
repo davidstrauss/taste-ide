@@ -797,6 +797,19 @@ impl Search {
                 }
             });
         }
+        // The document on screen answers each keystroke at once, ahead of
+        // the delay every other surface waits out: its visible matches lit
+        // (`viewport_matches`), a screen of text searched.
+        {
+            let weak = Rc::downgrade(&search);
+            entry.connect_changed(move |entry| {
+                if let Some(search) = weak.upgrade() {
+                    let mut query = search.query.borrow().clone();
+                    query.text = entry.text().trim().to_string();
+                    crate::viewport_matches::set_query(&query);
+                }
+            });
+        }
         {
             let weak = Rc::downgrade(&search);
             hide_unmatched.connect_toggled(move |button| {
@@ -971,6 +984,7 @@ impl Search {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         *self.query.borrow_mut() = query.clone();
+        crate::viewport_matches::set_query(&query);
         self.status.borrow_mut().clear();
         self.panel_hits.borrow_mut().clear();
         self.sync_meaning_sensitivity();

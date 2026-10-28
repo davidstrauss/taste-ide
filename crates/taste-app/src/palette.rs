@@ -202,6 +202,28 @@ pub fn rgba(color: &str) -> gtk::gdk::RGBA {
 
 const HIT_TAG: &str = "taste-search-hit";
 
+/// What every match of the query on screen wears in a document
+/// (`viewport_matches`): the search hue as a wash, under the text's own
+/// colours, where the one selected hit is the solid. Stronger than a lit
+/// row's tint, since it sits behind a word in a page of words rather than
+/// behind a whole row.
+pub fn match_background(dark: bool) -> gtk::gdk::RGBA {
+    let mut wash = rgba(SEARCH_FILL);
+    wash.set_alpha(if dark { 0.45 } else { 0.28 });
+    wash
+}
+
+/// Keep the selected hit's tag above `under` in `buffer`, when the buffer
+/// has one: of two tags' backgrounds, the higher priority's is drawn.
+pub fn keep_hit_above(buffer: &gtk::TextBuffer, under: &gtk::TextTag) {
+    let table = buffer.tag_table();
+    if let Some(hit) = table.lookup(HIT_TAG) {
+        if hit.priority() < under.priority() {
+            hit.set_priority(table.size() - 1);
+        }
+    }
+}
+
 /// Put the hit colours on one range of a buffer, and nowhere else in it:
 /// the previous hit's tag comes off first. The tag is made on first use
 /// and recoloured every time, so a scheme flip between two hits is drawn
@@ -219,6 +241,8 @@ pub fn highlight_range(buffer: &gtk::TextBuffer, start: &gtk::TextIter, end: &gt
     let dark = adw::StyleManager::default().is_dark();
     tag.set_background(Some(hit_background(dark)));
     tag.set_foreground(Some(hit_foreground(dark)));
+    // Over every other tag, the matches' wash among them.
+    tag.set_priority(table.size() - 1);
     buffer.remove_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
     buffer.apply_tag(&tag, start, end);
 }

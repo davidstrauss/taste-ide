@@ -382,6 +382,7 @@ impl LogPage {
             .hexpand(true)
             .vexpand(true)
             .build();
+        crate::viewport_matches::watch(&view);
 
         // New lines while the reader is up the page: the floating jump
         // (inset.rs) on the bottom edge, the chat's shape exactly.

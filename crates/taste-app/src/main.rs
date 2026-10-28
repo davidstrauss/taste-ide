@@ -92,6 +92,7 @@ mod textline;
 mod tree_drop;
 mod ui_probe;
 mod viewer;
+mod viewport_matches;
 mod voice;
 mod widgets;
 mod window;

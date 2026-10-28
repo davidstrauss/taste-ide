@@ -46,7 +46,13 @@ history.
    hue's solid shade (`palette.rs`: `hit_background`, the purple under a
    contrasting foreground — see "the search's own hue" below): the match
    coloured in the buffer, the terminal's own search highlight
-   on the row, the log line coloured, the transcript row lit. Listings
+   on the row, the log line coloured, the transcript row lit. And every
+   match of the query on screen in a document's text — a file's buffer, a
+   log's, a task's output — wears the hue's wash under that solid, lit at
+   each keystroke with no delay, a screen of text searched, and again as
+   the view scrolls or its text changes (`viewport_matches`; David,
+   2026-10-27: "highlight matches in the active viewport and feel as fast
+   as doing a typical, document-local Ctrl-F search"). Listings
    carry no group headings of their own except where a grouping adds
    something (a file's definitions before its other matches): the
    listing's title already says what it lists. Clicking a row with a badge opens
