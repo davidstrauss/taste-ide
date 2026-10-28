@@ -233,16 +233,20 @@ removals emptied stayed in the checkout until 096b680 (P11).
   step. Without it, a folder cloned afresh had no archive to measure from,
   and its rewritten history stood as a divergence for the person to settle
   (David, 2026-10-22: "any changes since the VM's clean shutdown should
-  clearly win"). The clean shutdown in that is the window's close that
-  marked the VM, not the VM powering off: the deferred shutdown comes
-  minutes later, and a relaunch inside its grace — the common one — meets
-  the VM still running and still marked. Read as the power-off, the rule
-  skipped exactly that relaunch, and a re-cloned folder stood as a
-  divergence with a commit made in Personal on the old history, uncounted
-  by ↑ (2026-10-27; David: "The local copy is supposed to win when the VM
-  diverges (including no shared history) and the VM was already marked as
-  safe to delete"). A VM whose marker was taken back — the re-check before
-  the shutdown found something moved — keeps the rules above.
+  clearly win"). Why it wins is what the marker is: a synchronization
+  point. The close that writes it has found Personal holding nothing the
+  folder lacks, and from then until the IDE is back, the folder is the
+  only side anyone works on. That is true from the moment the IDE closes,
+  not from when the VM powers off, so the VM's state on return does not
+  enter into it: one shut down and one met still running inside the
+  deferred shutdown's grace (the common relaunch) are the same case. Keyed
+  to the power-off, the rule once skipped that relaunch, and a re-cloned
+  folder stood as a divergence, with a commit made in Personal on the old
+  history and uncounted by ↑ (2026-10-27; David: "The local copy is
+  supposed to win when the VM diverges (including no shared history) and
+  the VM was already marked as safe to delete"). A VM whose marker was
+  taken back (the re-check before the shutdown found something moved)
+  keeps the rules above.
 
 **What remains.** Between the second check and the rename is a window of
 a system call or two; a write landing in it is lost. Unison has the same

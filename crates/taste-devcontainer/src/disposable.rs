@@ -98,12 +98,15 @@ pub fn recheck_path(domain: &str) -> PathBuf {
 /// folder on such a VM's return was done on this side, and wins
 /// (`peer::give_checkout_the_folder`) — whether the VM shut down in
 /// between or was met still running inside the deferred shutdown's grace.
-/// The clean shutdown the rule names is the window's close that marked it,
-/// not the power-off; read as the power-off, it skipped the common
-/// relaunch and kept a re-cloned folder standing as a divergence (David,
-/// 2026-10-27: "The local copy is supposed to win when the VM diverges
-/// (including no shared history) and the VM was already marked as safe to
-/// delete"). Personal's old tip is kept either way.
+/// The marker is a synchronization point: the close found Personal holding
+/// nothing the folder lacks, and while the IDE is gone the folder is the
+/// only side anyone works on. That holds from the close, not from the
+/// power-off, so the VM's state on return does not enter into it. Keyed to
+/// the power-off, it skipped the common relaunch and kept a re-cloned
+/// folder standing as a divergence (David, 2026-10-27: "The local copy is
+/// supposed to win when the VM diverges (including no shared history) and
+/// the VM was already marked as safe to delete"). Personal's old tip is
+/// kept either way.
 static CLEAN_RETURNS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// `vm` is being brought into use: remember whether it comes back marked.
