@@ -809,6 +809,17 @@ pub struct FileTree {
     /// read off the live model before it is replaced and replayed onto the
     /// new one as its rows arrive (`rebuild`).
     expanded_dirs: RefCell<HashSet<PathBuf>>,
+    /// [`Self::expanded_dirs`] as it stood when a query began, put back
+    /// when it ends: the folders a search's tree opened for its hits close
+    /// again with it, and only what the user had open stays open.
+    before_search: RefCell<Option<HashSet<PathBuf>>>,
+    /// That snapshot, handed to the next [`Self::rebuild`] to replace what
+    /// it reads off the search's tree.
+    restore_expanded: RefCell<Option<HashSet<PathBuf>>>,
+    /// The folders the user closed in a search's tree, kept closed when the
+    /// search runs again — on every write, while a query stands — rather
+    /// than opened with every other folder that holds a hit.
+    closed_in_search: RefCell<HashSet<PathBuf>>,
     /// Collapses the watcher's per-path event fan-out into one status query.
     refresh: RefreshGate,
     /// The last status found the checkout unreachable (its VM down, its
@@ -2349,6 +2360,9 @@ impl FileTree {
             rows: RefCell::new(HashMap::new()),
             moving: RefCell::new(syncing_for_probe()),
             expanded_dirs: RefCell::new(HashSet::new()),
+            before_search: RefCell::new(None),
+            restore_expanded: RefCell::new(None),
+            closed_in_search: RefCell::new(HashSet::new()),
             refresh: RefreshGate::default(),
             unreachable: Cell::new(false),
             git_refused_since: RefCell::new(None),
@@ -3465,6 +3479,15 @@ impl FileTree {
 
     fn apply_query(self: &Rc<Self>, query: crate::search::Query) {
         let was_empty = self.query.borrow().is_empty();
+        // The folders open as the query begins are what its end puts back.
+        if was_empty && !query.is_empty() {
+            self.remember_expanded();
+            *self.before_search.borrow_mut() = Some(self.expanded_dirs.borrow().clone());
+            self.closed_in_search.borrow_mut().clear();
+        } else if !was_empty && query.is_empty() {
+            *self.restore_expanded.borrow_mut() = self.before_search.borrow_mut().take();
+            self.closed_in_search.borrow_mut().clear();
+        }
         *self.query.borrow_mut() = query.clone();
         // The Ports rows wear the query's badge; the Logs rows' badges come
         // from the window, which holds the logs.
@@ -9240,6 +9263,11 @@ impl FileTree {
     fn rebuild(self: &Rc<Self>) {
         self.close_open_menu();
         self.remember_expanded();
+        // A query just ended: the folders as they were before it, not as
+        // its tree left them.
+        if let Some(before) = self.restore_expanded.borrow_mut().take() {
+            *self.expanded_dirs.borrow_mut() = before;
+        }
         // A new list means new rows; the handles for the old one address
         // widgets that are about to be dropped (and, after an `aim_at`,
         // paths relative to a different repository).
@@ -9318,6 +9346,36 @@ impl FileTree {
                 None
             }
         });
+        // A search's tree opens every folder with a hit as its row arrives,
+        // and a folder the user closed in the last run of it is closed again.
+        if autoexpand {
+            let tree = Rc::downgrade(self);
+            tree_model.connect_items_changed(move |model, position, _removed, added| {
+                let Some(tree) = tree.upgrade() else { return };
+                let close: Vec<gtk::TreeListRow> = {
+                    let closed = tree.closed_in_search.borrow();
+                    if closed.is_empty() {
+                        return;
+                    }
+                    (position..position + added)
+                        .filter_map(|index| model.row(index))
+                        .filter(|row| {
+                            row.is_expanded()
+                                && row
+                                    .item()
+                                    .and_downcast::<BoxedAnyObject>()
+                                    .is_some_and(|item| {
+                                        let node = item.borrow::<FileNode>();
+                                        node.is_dir && closed.contains(&node.path)
+                                    })
+                        })
+                        .collect()
+                };
+                for row in close {
+                    row.set_expanded(false);
+                }
+            });
+        }
         // Reopen what was open, as the rows arrive. The listings land
         // asynchronously — the root's, then each expanded folder's — so
         // this cannot be one pass after construction: every splice is
@@ -9569,6 +9627,31 @@ impl FileTree {
 
     /// TASTE_PROBE_CHECK only: open one folder, the way a click does, so a
     /// frame can show what a rebuild does to an open folder.
+    /// The folders the tree shows open, relative to its root, sorted.
+    pub fn open_folders_for_probe(&self) -> Vec<String> {
+        let Some((_, _, model)) = self.tree_selection() else {
+            return Vec::new();
+        };
+        let root = self.view_root();
+        let mut open: Vec<String> = (0..model.n_items())
+            .filter_map(|index| model.row(index))
+            .filter(|row| row.is_expanded())
+            .filter_map(|row| {
+                let item = row.item().and_downcast::<BoxedAnyObject>()?;
+                let node = item.borrow::<FileNode>();
+                node.is_dir.then(|| {
+                    node.path
+                        .strip_prefix(&root)
+                        .unwrap_or(&node.path)
+                        .display()
+                        .to_string()
+                })
+            })
+            .collect();
+        open.sort();
+        open
+    }
+
     pub fn expand_for_probe(&self, relative: &str) {
         let Some(model) = self
             .list_holder
@@ -9603,8 +9686,8 @@ impl FileTree {
     /// folder under a closed parent is not in the model at all, so it
     /// keeps whatever was remembered — reopening the parent later brings
     /// its children back the way they were, which the model on its own
-    /// does not do. A search's model autoexpands everything and says
-    /// nothing about what the user chose, so it is not read.
+    /// does not do. A search's model is read too, and what the user closed
+    /// in it is also kept as [`Self::closed_in_search`].
     fn remember_expanded(&self) {
         let Some(model) = self
             .list_holder
@@ -9617,10 +9700,17 @@ impl FileTree {
         else {
             return;
         };
-        // A search's model autoexpands every folder with a hit, and what
-        // the user sees expanded is what stays expanded — toggling the
-        // ghost, or clearing the query, must not fold what was open (David,
-        // 2026-09-06). So an autoexpanded model is read like any other.
+        // A search's model autoexpands every folder with a hit, and is read
+        // like any other: toggling the ghost keeps what was open (David,
+        // 2026-09-06: "Using 'highlight without filtering' shouldn't change
+        // which folders I have expanded already"). Clearing the query is
+        // another matter: it puts back what was open before the query
+        // (`before_search`), since a search left standing while an agent
+        // wrote opened every folder its hits reached, and they stayed open
+        // after it (2026-10-27). In a search's tree, a folder the user
+        // closed is remembered as closed for the next run of the search.
+        let autoexpand = model.is_autoexpand();
+        let mut closed_in_search = self.closed_in_search.borrow_mut();
         let mut remembered = self.expanded_dirs.borrow_mut();
         for index in 0..model.n_items() {
             let Some(row) = model.row(index) else {
@@ -9635,8 +9725,12 @@ impl FileTree {
             }
             if row.is_expanded() {
                 remembered.insert(node.path.clone());
+                closed_in_search.remove(&node.path);
             } else {
                 remembered.remove(&node.path);
+                if autoexpand {
+                    closed_in_search.insert(node.path.clone());
+                }
             }
         }
     }
@@ -10368,6 +10462,45 @@ impl FileTree {
                         x(label.upcast_ref())
                     );
                 }
+            });
+        }
+        // `TASTE_PROBE_SEARCH_CLEAR=<query>`: a folder opened, the query
+        // posed, and then cleared, printing the folders open before, while
+        // it stands, and after — the last of which must be the first.
+        static SEARCH_CLEAR: std::sync::Once = std::sync::Once::new();
+        if let (Ok(posed), false) = (
+            std::env::var("TASTE_PROBE_SEARCH_CLEAR"),
+            SEARCH_CLEAR.is_completed(),
+        ) {
+            SEARCH_CLEAR.call_once(|| {});
+            let tree = self.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                tree.expand_for_probe("crates");
+                let tree = tree.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                    println!("search clear: before {:?}", tree.open_folders_for_probe());
+                    let search = tree.search.borrow().clone();
+                    let Some(search) = search else { return };
+                    search.seed_for_probe(&posed);
+                    let tree = tree.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(3000),
+                        move || {
+                            println!("search clear: during {:?}", tree.open_folders_for_probe());
+                            search.seed_for_probe("");
+                            let tree = tree.clone();
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(3000),
+                                move || {
+                                    println!(
+                                        "search clear: after {:?}",
+                                        tree.open_folders_for_probe()
+                                    );
+                                },
+                            );
+                        },
+                    );
+                });
             });
         }
         // `TASTE_PROBE_BRANCHES=1`: the branch switcher open, once, as a

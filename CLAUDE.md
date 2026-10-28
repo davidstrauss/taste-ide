@@ -247,6 +247,10 @@ than the photographer's own;
 and All rows start their icon and text, which stand in one column;
 `TASTE_PROBE_TREE_END=1` scrolls the file tree to the end of its listing,
 where every folder's New file… and New folder… rows are;
+`TASTE_PROBE_SEARCH_CLEAR=<query>` opens a folder, poses that query, and
+clears it, printing the folders open before, while it stands, and after —
+after must be before, since a query's end puts back the folders its tree
+opened;
 `TASTE_PROBE_WATCH_SAFE=1` poses the watched environment
 (`TASTE_PROBE_VIEW=watching`) in safe mode, its own container not running,
 so its rows wear the safe-mode locks; without it the environment's
