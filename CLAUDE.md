@@ -284,7 +284,9 @@ which should be the document;
 `TASTE_PROBE_BRANCHES=1` opens the branch switcher once the branches are
 read and shoots it as `window.branch-menu` (a popover, its own surface;
 give the fixture more branches than fit, since the create row under the
-scrolling list is what a long list once cut off);
+scrolling list is what a long list once cut off, and branches only its
+remote has, which are drawn gray; any value but `1` is typed into the
+switcher's filter, `=fix` for the rows that word leaves);
 `TASTE_PROBE_CARD=push` (or `pull`, `canon`) shows that sync count's hover
 card once the counts land (`sync_card.rs`, drawn in the window, so the
 shot has it), since a shot has no pointer to hover with, and shoots the

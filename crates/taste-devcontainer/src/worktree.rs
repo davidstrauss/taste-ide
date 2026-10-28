@@ -1142,6 +1142,20 @@ impl Worktree {
         Ok(())
     }
 
+    /// Make a local branch of `remote`'s `name`, tracking it, and switch
+    /// to it: a branch the remote has that this checkout has none of.
+    pub fn track_branch(&self, remote: &str, name: &str) -> Result<()> {
+        match self {
+            Worktree::Local(_) => self.local()?.track_branch(remote, name)?,
+            Worktree::Remote { .. } => {
+                let upstream = format!("{remote}/{name}");
+                self.sandbox_ok(&["switch", "-q", "-c", name, "--track", &upstream])?;
+            }
+        }
+        self.ref_changed();
+        Ok(())
+    }
+
     pub fn create_branch(&self, name: &str) -> Result<()> {
         match self {
             Worktree::Local(_) => self.local()?.create_branch(name)?,

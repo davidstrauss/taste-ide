@@ -482,6 +482,14 @@ pub struct CommitList {
 /// beyond this many it says how many more there are rather than list them.
 pub const COMMIT_LIST_CAP: usize = 50;
 
+/// A branch a remote has and this repository has no branch of its own by
+/// that name ([`GitWorkspace::remote_only_branches`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBranch {
+    pub remote: String,
+    pub name: String,
+}
+
 /// One commit whose message matched a search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitHit {
@@ -962,6 +970,75 @@ impl GitWorkspace {
             .collect();
         names.sort_by_key(|name| (Some(name) != current.as_ref(), name.clone()));
         Ok(names)
+    }
+
+    /// The branches a remote has that this repository has none of its own
+    /// by that name, as the last fetch left them under `refs/remotes/`:
+    /// each remote's `HEAD` alias left out, sorted by name and then remote.
+    pub fn remote_only_branches(&self) -> Result<Vec<RemoteBranch>> {
+        let remotes: Vec<String> = self
+            .repo
+            .remotes()?
+            .iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        let local: std::collections::HashSet<String> = self.local_branches()?.into_iter().collect();
+        let mut out = Vec::new();
+        for (branch, _) in self
+            .repo
+            .branches(Some(git2::BranchType::Remote))?
+            .flatten()
+        {
+            let reference = branch.get();
+            if reference.kind() == Some(git2::ReferenceType::Symbolic) {
+                continue;
+            }
+            let Some(short) = reference
+                .name()
+                .and_then(|name| name.strip_prefix("refs/remotes/"))
+            else {
+                continue;
+            };
+            // The longest remote name the ref starts with: a remote's name
+            // may itself hold a slash.
+            let Some(remote) = remotes
+                .iter()
+                .filter(|remote| {
+                    short
+                        .strip_prefix(remote.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .max_by_key(|remote| remote.len())
+            else {
+                continue;
+            };
+            let name = &short[remote.len() + 1..];
+            if name == "HEAD" || local.contains(name) {
+                continue;
+            }
+            out.push(RemoteBranch {
+                remote: remote.clone(),
+                name: name.to_string(),
+            });
+        }
+        out.sort_by(|a, b| (&a.name, &a.remote).cmp(&(&b.name, &b.remote)));
+        Ok(out)
+    }
+
+    /// Make a local branch of `remote`'s `name`, tracking it, and switch to
+    /// it. The tree is checked out first, so a change in the way refuses
+    /// before any branch is made.
+    pub fn track_branch(&self, remote: &str, name: &str) -> Result<()> {
+        let tip = self
+            .repo
+            .find_reference(&format!("refs/remotes/{remote}/{name}"))?
+            .peel_to_commit()?;
+        self.repo.checkout_tree(tip.as_object(), None)?;
+        let mut branch = self.repo.branch(name, &tip, false)?;
+        branch.set_upstream(Some(&format!("{remote}/{name}")))?;
+        self.repo.set_head(&format!("refs/heads/{name}"))?;
+        Ok(())
     }
 
     /// Check out an existing local branch. Fails (rather than clobbers)
@@ -1567,6 +1644,53 @@ mod tests {
         assert!(branches.contains(&original));
         ws.switch_branch(&original).unwrap();
         assert_eq!(ws.branch_name(), Some(original));
+    }
+
+    /// A clone lists the remote's branches it has none of its own of, the
+    /// remote's `HEAD` alias and its checked-out branch left out, and one of
+    /// them taken becomes a local branch tracking it, checked out.
+    #[test]
+    fn a_remote_branch_without_a_local_one_is_listed_and_taken() {
+        let (dir, ws) = temp_repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let main = ws.branch_name().unwrap();
+        ws.create_branch("feature/x").unwrap();
+        fs::write(dir.path().join("b.txt"), "two\n").unwrap();
+        ws.stage(Path::new("b.txt")).unwrap();
+        ws.commit("second").unwrap();
+        ws.switch_branch(&main).unwrap();
+
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = clone_dir.path().join("c");
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q"])
+            .arg(dir.path())
+            .arg(&clone)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let env = GitWorkspace::discover(&clone).unwrap();
+        assert_eq!(
+            env.remote_only_branches().unwrap(),
+            vec![RemoteBranch {
+                remote: "origin".into(),
+                name: "feature/x".into(),
+            }]
+        );
+
+        env.track_branch("origin", "feature/x").unwrap();
+        assert_eq!(env.branch_name().as_deref(), Some("feature/x"));
+        assert!(clone.join("b.txt").exists(), "checked out, not only named");
+        let repo = Repository::open(&clone).unwrap();
+        let upstream = repo
+            .find_branch("feature/x", git2::BranchType::Local)
+            .unwrap()
+            .upstream()
+            .unwrap();
+        assert_eq!(upstream.name().unwrap(), Some("origin/feature/x"));
+        assert_eq!(env.remote_only_branches().unwrap(), vec![]);
     }
 
     #[test]

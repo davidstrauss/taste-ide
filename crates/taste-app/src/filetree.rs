@@ -505,6 +505,9 @@ pub struct FileTree {
     canon_button: gtk::Button,
     _canon_hold: Rc<crate::holdbutton::HoldButton>,
     branch_popover: gtk::Popover,
+    /// What the branch switcher last listed, so it opens on that at once
+    /// while a fresh read runs off the main thread.
+    branch_lists: RefCell<Option<BranchLists>>,
     sync_label: gtk::Label,
     sync_button: gtk::Button,
     pull_button: gtk::Button,
@@ -1128,6 +1131,25 @@ fn submodule_names(moves: &[PathBuf]) -> String {
 }
 
 use crate::sync_card::{count, SyncCard};
+
+/// The branch switcher's two lists: the local branches, and the remotes'
+/// branches with no local one of the same name.
+type BranchLists = (Vec<String>, Vec<taste_git::RemoteBranch>);
+
+/// How many branches the switcher shows before its list scrolls.
+const BRANCH_ROWS_SHOWN: i32 = 12;
+
+/// What a row of the branch switcher does.
+#[derive(Debug, Clone)]
+enum BranchOp {
+    Switch(String),
+    Create(String),
+    /// A remote's branch made a local one tracking it.
+    Track {
+        remote: String,
+        name: String,
+    },
+}
 
 /// What a sync does once it has fetched: Fetch (⟳) nothing more; Pull's
 /// click moves the branch forward only, and says so when that was not
@@ -2209,6 +2231,7 @@ impl FileTree {
             canon_button: canon_button.clone(),
             _canon_hold: canon_hold.clone(),
             branch_popover: branch_popover.clone(),
+            branch_lists: RefCell::new(None),
             sync_label,
             sync_button: sync_button.clone(),
             pull_button: pull_button.clone(),
@@ -2456,7 +2479,7 @@ impl FileTree {
             tree.merged_bar.switch.connect_clicked(move |_| {
                 if let Some(tree) = weak.upgrade() {
                     if let Some(default) = tree.merged_bar.default_branch() {
-                        tree.run_branch_op(default, false);
+                        tree.run_branch_op(BranchOp::Switch(default));
                     }
                 }
             });
@@ -7598,21 +7621,55 @@ impl FileTree {
         gtk::Image::new()
     }
 
-    /// Fill the branch dropdown: every local branch (current checked,
-    /// activate to switch) plus a create-and-switch entry.
+    /// Open the branch dropdown on what it last listed, and read the
+    /// branches again off the main thread: refilled when they changed, or
+    /// filled for the first time.
     fn populate_branch_menu(self: &Rc<Self>) {
         if self.git.borrow().is_none() {
             return;
         }
+        let cached = self.branch_lists.borrow().clone();
+        if let Some(lists) = &cached {
+            self.fill_branch_menu(lists, String::new());
+        }
+        let root = self.refs_root();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let read = crate::runtime::runtime().spawn_blocking(move || {
+                let git = GitWorkspace::discover(&root)?;
+                Some((
+                    git.local_branches().unwrap_or_default(),
+                    git.remote_only_branches().unwrap_or_default(),
+                ))
+            });
+            let Ok(Some(lists)) = read.await else { return };
+            let Some(tree) = weak.upgrade() else { return };
+            if cached.as_ref() == Some(&lists) {
+                return;
+            }
+            *tree.branch_lists.borrow_mut() = Some(lists.clone());
+            if tree.branch_popover.is_visible() {
+                let typed = tree
+                    .branch_popover
+                    .child()
+                    .and_then(|content| content.first_child())
+                    .and_downcast::<gtk::SearchEntry>()
+                    .map(|filter| filter.text().to_string())
+                    .unwrap_or_default();
+                tree.fill_branch_menu(&lists, typed);
+            }
+        });
+    }
+
+    /// The branch dropdown: a filter over the branches when there is more
+    /// than one, every local branch (the current one checked, a click
+    /// switches), the remotes' branches this repository has none of its own
+    /// of in gray (a click makes a local branch tracking it), and a
+    /// create-and-switch field under them.
+    fn fill_branch_menu(self: &Rc<Self>, (local, remote): &BranchLists, typed: String) {
         // The branch checked out in the WORKING tree — the peer's may lag
         // it when the folder is dirty — is the one the status pass read.
         let current = self.status_branch.borrow().clone();
-        let branches = self
-            .git
-            .borrow()
-            .as_ref()
-            .and_then(|g| g.local_branches().ok())
-            .unwrap_or_default();
 
         // Under a query the menu lists the branches that match (all of
         // them, matches in bold, when the ghost is on): the button is the
@@ -7623,7 +7680,13 @@ impl FileTree {
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["navigation-sidebar"])
             .build();
-        for branch in &branches {
+        // Each row with the words the filter looks in.
+        let mut rows: Vec<(adw::ActionRow, String)> = Vec::new();
+        let entries = local
+            .iter()
+            .map(|name| (name, None))
+            .chain(remote.iter().map(|r| (&r.name, Some(&r.remote))));
+        for (branch, on_remote) in entries {
             let matched = query.is_empty() || query.matches(branch);
             if !matched && !query.ghost {
                 continue;
@@ -7641,17 +7704,44 @@ impl FileTree {
             if !matched {
                 row.add_css_class("search-dim");
             }
-            if Some(branch) == current.as_ref() {
-                row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
-            }
+            let op = match on_remote {
+                None => {
+                    if Some(branch) == current.as_ref() {
+                        row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+                    }
+                    BranchOp::Switch(branch.clone())
+                }
+                // Gray, and the remote named at the end: there to take,
+                // not yet a branch here.
+                Some(remote) => {
+                    row.add_css_class("dim-label");
+                    row.add_suffix(
+                        &gtk::Label::builder()
+                            .label(remote.as_str())
+                            .css_classes(["caption"])
+                            .build(),
+                    );
+                    row.set_tooltip_text(Some(&format!(
+                        "On {remote}, not yet a branch here · click to make one tracking it"
+                    )));
+                    BranchOp::Track {
+                        remote: remote.clone(),
+                        name: branch.clone(),
+                    }
+                }
+            };
             let weak = Rc::downgrade(self);
-            let name = branch.clone();
             row.connect_activated(move |_| {
                 let Some(tree) = weak.upgrade() else { return };
                 tree.branch_popover.popdown();
-                tree.run_branch_op(name.clone(), false);
+                tree.run_branch_op(op.clone());
             });
             list.append(&row);
+            let words = match on_remote {
+                Some(remote) => format!("{remote}/{branch}"),
+                None => branch.clone(),
+            };
+            rows.push((row, words.to_lowercase()));
         }
 
         let entry = gtk::Entry::builder()
@@ -7673,7 +7763,7 @@ impl FileTree {
                 }
                 let Some(tree) = weak.upgrade() else { return };
                 tree.branch_popover.popdown();
-                tree.run_branch_op(name, true);
+                tree.run_branch_op(BranchOp::Create(name));
             });
         }
         // Enter in the field is Create: a name typed is a name meant
@@ -7691,11 +7781,12 @@ impl FileTree {
         // Only the branches scroll: the create row stands under them,
         // whole, however many there are. Scrolled with them it was the
         // bottom of a 360px window over a taller list, cut through the
-        // field and the button.
+        // field and the button. Tall enough for BRANCH_ROWS_SHOWN rows,
+        // measured once the rows are in the popover and styled.
         let scroller = gtk::ScrolledWindow::builder()
             .child(&list)
             .propagate_natural_height(true)
-            .max_content_height(360)
+            .max_content_height(BRANCH_ROWS_SHOWN * 40)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
         let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -7703,37 +7794,107 @@ impl FileTree {
         content.set_widget_name("branch-menu");
         // Real menu width: branch names and the create entry need room.
         content.set_width_request(260);
+
+        // With more than one branch, a filter first, holding the keyboard:
+        // typed words narrow the rows, Enter takes the first left, Down
+        // goes into the list, and Escape closes.
+        let filter = (rows.len() > 1).then(|| {
+            let filter = gtk::SearchEntry::builder()
+                .placeholder_text("Filter branches")
+                .text(typed.as_str())
+                .build();
+            let rows = Rc::new(rows.clone());
+            let narrow = {
+                let rows = rows.clone();
+                move |text: &str| {
+                    let words = text.trim().to_lowercase();
+                    for (row, name) in rows.iter() {
+                        row.set_visible(words.is_empty() || name.contains(&words));
+                    }
+                }
+            };
+            narrow(&typed);
+            {
+                let narrow = narrow.clone();
+                filter.connect_search_changed(move |filter| narrow(&filter.text()));
+            }
+            let first_shown = {
+                let rows = rows.clone();
+                move || {
+                    rows.iter()
+                        .map(|(row, _)| row)
+                        .find(|row| row.is_visible())
+                        .cloned()
+                }
+            };
+            {
+                let first_shown = first_shown.clone();
+                filter.connect_activate(move |_| {
+                    if let Some(row) = first_shown() {
+                        adw::prelude::ActionRowExt::activate(&row);
+                    }
+                });
+            }
+            {
+                let popover = self.branch_popover.clone();
+                filter.connect_stop_search(move |_| popover.popdown());
+            }
+            let keys = gtk::EventControllerKey::new();
+            keys.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Down {
+                    if let Some(row) = first_shown() {
+                        row.grab_focus();
+                        return glib::Propagation::Stop;
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+            filter.add_controller(keys);
+            content.append(&filter);
+            filter
+        });
         content.append(&scroller);
         content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         content.append(&create_row);
         self.branch_popover.set_child(Some(&content));
+        if let Some((row, _)) = rows.first() {
+            let (_, natural, _, _) = row.measure(gtk::Orientation::Vertical, 260);
+            if natural > 0 {
+                scroller.set_max_content_height(natural * BRANCH_ROWS_SHOWN);
+            }
+        }
+        if let Some(filter) = filter {
+            filter.grab_focus();
+            filter.set_position(-1);
+        }
     }
 
-    /// Switch to (or create-and-switch to) a branch, off the main thread;
-    /// failures (e.g. conflicting working-tree changes) surface as toasts.
-    fn run_branch_op(self: &Rc<Self>, name: String, create: bool) {
+    /// Switch to, create and switch to, or take from a remote a branch, off
+    /// the main thread; failures (e.g. conflicting working-tree changes)
+    /// surface as toasts.
+    fn run_branch_op(self: &Rc<Self>, op: BranchOp) {
         let events = self.workspace.events.clone();
         let worktree = self.worktree();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let branch = name.clone();
-            let handle = crate::runtime::runtime().spawn_blocking(move || {
-                if create {
-                    worktree.create_branch(&branch).map_err(|e| e.to_string())
-                } else {
-                    worktree.switch_branch(&branch).map_err(|e| e.to_string())
+            let done = match &op {
+                BranchOp::Switch(name) => format!("Switched to {name}"),
+                BranchOp::Create(name) => format!("Created and switched to {name}"),
+                BranchOp::Track { remote, name } => {
+                    format!("Switched to {name}, tracking {remote}/{name}")
                 }
+            };
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                match &op {
+                    BranchOp::Switch(name) => worktree.switch_branch(name),
+                    BranchOp::Create(name) => worktree.create_branch(name),
+                    BranchOp::Track { remote, name } => worktree.track_branch(remote, name),
+                }
+                .map_err(|e| e.to_string())
             });
             let Ok(result) = handle.await else { return };
             match result {
-                Ok(()) => events.publish(Event::Toast(format!(
-                    "{} {name}",
-                    if create {
-                        "Created and switched to"
-                    } else {
-                        "Switched to"
-                    }
-                ))),
+                Ok(()) => events.publish(Event::Toast(done)),
                 Err(e) => events.publish(Event::Toast(format!("Branch: {e}"))),
             }
             if let Some(tree) = weak.upgrade() {
@@ -10211,13 +10372,29 @@ impl FileTree {
         }
         // `TASTE_PROBE_BRANCHES=1`: the branch switcher open, once, as a
         // click on the branch leaves it — a popover, which a shot has no
-        // pointer to open.
+        // pointer to open. Any other value is typed into its filter.
         static BRANCHES: std::sync::Once = std::sync::Once::new();
-        if std::env::var("TASTE_PROBE_BRANCHES").is_ok() && !BRANCHES.is_completed() {
+        if let (Ok(typed), false) = (
+            std::env::var("TASTE_PROBE_BRANCHES"),
+            BRANCHES.is_completed(),
+        ) {
             BRANCHES.call_once(|| {});
             let button = self.branch_label.clone();
+            let popover = self.branch_popover.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
                 button.popup();
+                if typed == "1" {
+                    return;
+                }
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
+                    if let Some(filter) = popover
+                        .child()
+                        .and_then(|content| content.first_child())
+                        .and_downcast::<gtk::SearchEntry>()
+                    {
+                        filter.set_text(&typed);
+                    }
+                });
             });
         }
         // `TASTE_PROBE_NAME_PROMPT=1`: the New file dialog opened as its
