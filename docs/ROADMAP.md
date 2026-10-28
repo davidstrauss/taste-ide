@@ -573,25 +573,38 @@ devcontainer that will not start.
    hooks, agents, and terminals in the environment, and the hook that
    failed today succeeds unchanged.
 
-10. **Start a parameterized task from the GUI** — wanted, not built
-    (David, 2026-10-11: "Put something into the roadmap about also
-    starting parameterized tasks from the GUI. Just don't build it yet").
-    The Tasks section's play button runs a task by name with no input and
-    no arguments, so `task gmail:add -- personal you@gmail.com` — arguments
+10. **Start a parameterized task from the GUI** — variables shipped;
+    arguments, input, and agents' variables not built (David, 2026-10-11:
+    "Put something into the roadmap about also starting parameterized
+    tasks from the GUI. Just don't build it yet").
+
+    > **SHIPPED (2026-10-26, `1132f8f`): variables.** A task's `requires:
+    > vars` is read from the Taskfile by the confined `taste-taskfile`
+    > helper, held to the pinned Task's `--dry` by
+    > `tests/against_task.rs`. A play on a task that requires anything
+    > asks for it first — a field per variable, or a choice where an
+    > `enum` lists the values — and runs it with `NAME=value` arguments
+    > (`TaskBoard::start_with`). A task whose `requires` names `FILE` is
+    > offered on a file's menu in the tree, `DIR` on a folder's, and
+    > `FILE_OR_DIR` on both, the path given absolute in the container.
+
+    Still missing: `task gmail:add -- personal you@gmail.com` — arguments
     after `--`, read as `{{.CLI_ARGS}}`, and a hidden password prompt — can
     only be started from a terminal or an agent's shell. Those runs are
-    now shown in the section (the IDE's `task` wrapper reports them over
-    the environment channel's `Tasks` service), so what is missing is the
-    starting. The shape to work out:
-    - **Arguments**: a field under the row (or a popover on the button)
-      for what follows `--`, remembered per task; Task's own `requires:
-      vars` and a task's `{{.CLI_ARGS}}` use say when one is wanted.
+    shown in the section (the IDE's `task` wrapper reports them over the
+    environment channel's `Tasks` service); starting them is what is left:
+    - **Arguments**: nothing reads or passes `CLI_ARGS`. The shape: a field
+      in the play's question for what follows `--`, remembered per task,
+      asked for when the task's commands use `{{.CLI_ARGS}}` — which the
+      reader would report, held to Task like the rest.
     - **Input**: a run that reads stdin or a password needs a terminal, so
       the GUI starts it in a terminal tab (VTE, the console's) rather than
       in the output tab, and the wrapper reports it as it does any other —
       one record of the run whichever face started it.
-    - **Agents**: `task_run` gains the same arguments, so an agent does not
-      fall back to `ide_exec` for a task that takes them.
+    - **Agents**: `task_run` takes only `name` and `wait_seconds`, so an
+      agent cannot give a task its variables, never mind its arguments,
+      and falls back to `ide_exec` for any task that takes either. It
+      gains both.
 
 ## 2026 bets (superlean, hyperfunctional)
 
