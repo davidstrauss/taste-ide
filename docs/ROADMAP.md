@@ -502,7 +502,10 @@ devcontainer that will not start.
    in the background; the user's own saves are the round trips through
    IAP, and David is not concerned by them (2026-10-03: "99% of the work
    is being done by the agent"). What is worth measuring is how far the
-   folder trails a busy agent.
+   folder trails a busy agent. Reaching environments from more than one
+   surface (David, 2026-10-29) would bring Personal along as its third
+   step: `docs/spikes/agent-host.md`, an agent host that owns the
+   sessions, with the desktop app as its first client.
 8. **Option: Personal always local, on the folder itself** — noted, not
    decided (David, 2026-10-04: "I am starting to doubt the wisdom of not
    special-casing the personal env to (1) always run locally and (2) use
