@@ -159,6 +159,11 @@ pub enum Event {
     /// environment registry as the download runs (throttled), and answered
     /// on demand from the disk when the header asks to freshen.
     GuestImage(GuestImageFetch),
+    /// The same, for a release fetched while the environments run: ahead
+    /// of the moves to it, or by a move before it stops anything. The
+    /// backlog's header draws it as it draws [`Event::GuestImage`]; the
+    /// startup page does not, being a start's, and nothing is starting.
+    GuestImageAhead(GuestImageFetch),
     /// One environment's devcontainer lifecycle moved to a new state.
     DevcontainerState {
         env: EnvironmentId,
@@ -487,6 +492,7 @@ impl Event {
             // sparkline every time a file changed anywhere.
             Event::GitStatusChanged
             | Event::GuestImage(_)
+            | Event::GuestImageAhead(_)
             | Event::FlatpakState(_)
             | Event::FlatpakLog(_)
             | Event::AgentSessionUpdate { .. }

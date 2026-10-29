@@ -3268,18 +3268,7 @@ impl EnvironmentRegistry {
                         });
                     }
                 }
-                let mut last = last.lock().unwrap();
-                let publish = match &*last {
-                    None => true,
-                    Some((at, previous)) => {
-                        previous.phase != fetch.phase
-                            || fetch.done == fetch.total
-                            || fetch.done.saturating_sub(previous.done) >= 4 * 1024 * 1024
-                            || at.elapsed() >= std::time::Duration::from_millis(500)
-                    }
-                };
-                if publish {
-                    *last = Some((std::time::Instant::now(), fetch.clone()));
+                if fetch_is_news(&last, &fetch) {
                     events.publish(Event::GuestImage(fetch));
                 }
             })
@@ -4412,10 +4401,9 @@ impl EnvironmentRegistry {
         }
         let sandboxed = self.substrate().target().sandboxed();
         let weak = Arc::downgrade(self);
+        let report = self.fetch_ahead_reporter();
         tokio::spawn(async move {
-            let outcome = image
-                .ensure_base(sandboxed, Arc::new(crate::substrate::report_download))
-                .await;
+            let outcome = image.ensure_base(sandboxed, report).await;
             if let Err(e) = outcome {
                 tracing::warn!(
                     "fetching guest release {} ahead of the moves: {e:#}",
@@ -4622,6 +4610,40 @@ impl EnvironmentRegistry {
             .collect()
     }
 
+    /// The app log's report of a fetch made while the environments run,
+    /// and the backlog header's ([`Event::GuestImageAhead`]), throttled as
+    /// the launch's fetch is. Until 2026-10-29 such a fetch went to the
+    /// log alone, and a move waiting on one showed nothing anywhere: the
+    /// agent said its container would stop, and for minutes nothing did
+    /// (David: "I don't see any rebuild happening").
+    fn fetch_ahead_reporter(&self) -> Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync> {
+        let events = self.events.clone();
+        let last = Mutex::new(None);
+        Arc::new(move |fetch: taste_core::GuestImageFetch| {
+            crate::substrate::report_download(fetch.clone());
+            if fetch_is_news(&last, &fetch) {
+                events.publish(Event::GuestImageAhead(fetch));
+            }
+        })
+    }
+
+    /// What a move does before anything stops, when that is a download:
+    /// said in the answer that starts it, so the agent does not tell the
+    /// user the container is stopping while it runs on for minutes.
+    fn fetched_first(migration: &crate::migration::Migration) -> Option<String> {
+        if migration.kind != crate::migration::Kind::Guest {
+            return None;
+        }
+        let image = crate::guest::image().ok()?;
+        (!image.base_is_present()).then(|| {
+            format!(
+                "Guest image {} downloads first (about 1 GiB; the backlog's header shows \
+                 it), and the container keeps running until it is in.",
+                image.release
+            )
+        })
+    }
+
     /// The environment's agent asks for its move. Recorded, and the
     /// coordinator asked to approve it — except for the primary, whose
     /// agent IS the coordinator, so asking is approving and it moves now.
@@ -4642,11 +4664,15 @@ impl EnvironmentRegistry {
             .insert(env.clone(), migration.clone());
         if env.is_primary() {
             self.spawn_relocate(env.clone(), "the coordinator asked for it".to_string());
-            return Ok(
-                "Reinstantiating now. Your container stops and this conversation resumes in a \
-                 few minutes."
+            return Ok(match Self::fetched_first(&migration) {
+                Some(first) => format!(
+                    "Reinstantiating now. {first} Then your container stops and this \
+                     conversation resumes a few minutes later."
+                ),
+                None => "Reinstantiating now. Your container stops and this conversation \
+                         resumes in a few minutes."
                     .to_string(),
-            );
+            });
         }
         let left = migration.forced_at().saturating_sub(now) / 60;
         self.events.publish(Event::MigrationNotice {
@@ -4666,9 +4692,12 @@ impl EnvironmentRegistry {
             format!("{env} has nothing to reinstantiate: it is on the current versions")
         })?;
         self.spawn_relocate(env.clone(), "the coordinator approved it".to_string());
+        let first = Self::fetched_first(&migration)
+            .map(|first| format!(" {first} Then"))
+            .unwrap_or_default();
         Ok(format!(
-            "Reinstantiating {env} now: {}. Its container stops for a few minutes; its agent \
-             resumes and is told when it is done.",
+            "Reinstantiating {env} now: {}.{first} Its container stops for a few minutes; its \
+             agent resumes and is told when it is done.",
             migration.row_words()
         ))
     }
@@ -5071,7 +5100,7 @@ impl EnvironmentRegistry {
                     );
                     let sandboxed = self.substrate().target().sandboxed();
                     image
-                        .ensure_base(sandboxed, Arc::new(crate::substrate::report_download))
+                        .ensure_base(sandboxed, self.fetch_ahead_reporter())
                         .await
                         .context("fetching the guest image the move needs")?;
                 }
@@ -6113,6 +6142,30 @@ fn guest_image_words(stream: &StreamRead, fetched: bool) -> Option<String> {
         words.push_str(&format!("; {}", facts.join(", ")));
     }
     Some(words)
+}
+
+/// Whether a guest image reading is worth a bus event: a new phase, the
+/// end, four MiB on, or half a second since the last one published. The
+/// bus reaches the GTK thread, and a gigabyte arrives in a great many
+/// chunks.
+fn fetch_is_news(
+    last: &Mutex<Option<(std::time::Instant, taste_core::GuestImageFetch)>>,
+    fetch: &taste_core::GuestImageFetch,
+) -> bool {
+    let mut last = last.lock().unwrap();
+    let news = match &*last {
+        None => true,
+        Some((at, previous)) => {
+            previous.phase != fetch.phase
+                || fetch.done == fetch.total
+                || fetch.done.saturating_sub(previous.done) >= 4 * 1024 * 1024
+                || at.elapsed() >= std::time::Duration::from_millis(500)
+        }
+    };
+    if news {
+        *last = Some((std::time::Instant::now(), fetch.clone()));
+    }
+    news
 }
 
 #[cfg(test)]

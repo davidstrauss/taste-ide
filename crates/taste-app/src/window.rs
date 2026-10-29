@@ -4581,6 +4581,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             startup.on_guest_image(&fetch);
                         }
                     }
+                    Event::GuestImageAhead(fetch) => filetree.backlog().set_guest_image(&fetch),
                     Event::ShowVmLog => open_log(primary_env.clone(), crate::logview::LogKind::Vm),
                     // The primary's working copy is in the VM now: the
                     // workspace's view root moves, and every pane that
