@@ -4341,9 +4341,8 @@ impl EnvironmentRegistry {
         let libvirt = pool.libvirt().clone();
         let sandboxed = self.substrate().target().sandboxed();
         let image = image.clone();
+        let report = self.fetch_ahead_reporter(None);
         tokio::spawn(async move {
-            let report: Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync> =
-                Arc::new(crate::substrate::report_download);
             let prepared = async {
                 let source = image.ensure_base(sandboxed, report.clone()).await?;
                 if source == image.golden_path() {
@@ -4401,7 +4400,7 @@ impl EnvironmentRegistry {
         }
         let sandboxed = self.substrate().target().sandboxed();
         let weak = Arc::downgrade(self);
-        let report = self.fetch_ahead_reporter();
+        let report = self.fetch_ahead_reporter(None);
         tokio::spawn(async move {
             let outcome = image.ensure_base(sandboxed, report).await;
             if let Err(e) = outcome {
@@ -4616,13 +4615,21 @@ impl EnvironmentRegistry {
     /// log alone, and a move waiting on one showed nothing anywhere: the
     /// agent said its container would stop, and for minutes nothing did
     /// (David: "I don't see any rebuild happening").
-    fn fetch_ahead_reporter(&self) -> Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync> {
+    /// `env` is the environment whose move waits on it, none for a fetch
+    /// ahead of the moves.
+    fn fetch_ahead_reporter(
+        &self,
+        env: Option<EnvironmentId>,
+    ) -> Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync> {
         let events = self.events.clone();
         let last = Mutex::new(None);
         Arc::new(move |fetch: taste_core::GuestImageFetch| {
             crate::substrate::report_download(fetch.clone());
             if fetch_is_news(&last, &fetch) {
-                events.publish(Event::GuestImageAhead(fetch));
+                events.publish(Event::GuestImageAhead {
+                    env: env.clone(),
+                    fetch,
+                });
             }
         })
     }
@@ -4816,10 +4823,24 @@ impl EnvironmentRegistry {
                     migration.row_words()
                 );
                 taste_core::app_log::push("warn", "environments", &note);
-                self.events.publish(Event::Toast(format!(
-                    "{env} could not be reinstantiated ({}); the app log says why",
-                    migration.row_words()
-                )));
+                self.events.publish(Event::Toast(match migration.kind {
+                    crate::migration::Kind::Guest => format!(
+                        "{env} could not be reinstantiated ({}); it runs on where it was, and \
+                         its Environment tab says why",
+                        migration.row_words()
+                    ),
+                    crate::migration::Kind::Packages => format!(
+                        "{env} could not be reinstantiated ({}); the app log says why",
+                        migration.row_words()
+                    ),
+                }));
+                if migration.kind == crate::migration::Kind::Guest {
+                    self.events.publish(Event::MoveFailed {
+                        env: env.clone(),
+                        reason: format!("{e:#}"),
+                        retry_minutes: crate::migration::RETRY_AFTER.as_secs() / 60,
+                    });
+                }
                 self.events.publish(Event::MigrationNotice {
                     env: env.clone(),
                     audience: taste_core::MigrationAudience::Coordinator,
@@ -5100,7 +5121,7 @@ impl EnvironmentRegistry {
                     );
                     let sandboxed = self.substrate().target().sandboxed();
                     image
-                        .ensure_base(sandboxed, self.fetch_ahead_reporter())
+                        .ensure_base(sandboxed, self.fetch_ahead_reporter(Some(env.clone())))
                         .await
                         .context("fetching the guest image the move needs")?;
                 }

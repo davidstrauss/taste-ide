@@ -160,10 +160,24 @@ pub enum Event {
     /// on demand from the disk when the header asks to freshen.
     GuestImage(GuestImageFetch),
     /// The same, for a release fetched while the environments run: ahead
-    /// of the moves to it, or by a move before it stops anything. The
-    /// backlog's header draws it as it draws [`Event::GuestImage`]; the
-    /// startup page does not, being a start's, and nothing is starting.
-    GuestImageAhead(GuestImageFetch),
+    /// of the moves to it (`env` none), or by `env`'s move before it stops
+    /// anything. The backlog's header draws it as it draws
+    /// [`Event::GuestImage`]; a move's is drawn on that environment's
+    /// startup page too, offered as a tab and never put in front, since
+    /// the environment runs on meanwhile.
+    GuestImageAhead {
+        env: Option<EnvironmentId>,
+        fetch: GuestImageFetch,
+    },
+    /// `env`'s move to a VM on the current release failed, and it runs on
+    /// where it was until the move is tried again in `retry_minutes`.
+    /// Drawn on its startup page, offered as a tab with the failure on it
+    /// rather than put in front.
+    MoveFailed {
+        env: EnvironmentId,
+        reason: String,
+        retry_minutes: u64,
+    },
     /// One environment's devcontainer lifecycle moved to a new state.
     DevcontainerState {
         env: EnvironmentId,
@@ -484,6 +498,7 @@ impl Event {
             // Nor is the IDE telling an agent the user wants a turn: the
             // tool call that carried it was the activity.
             Event::EnvironmentRemoved { .. }
+            | Event::MoveFailed { .. }
             | Event::EnvironmentReviewChanged { .. }
             | Event::NudgeDelivered(_)
             | Event::CheckoutMoved { .. } => None,
@@ -492,7 +507,7 @@ impl Event {
             // sparkline every time a file changed anywhere.
             Event::GitStatusChanged
             | Event::GuestImage(_)
-            | Event::GuestImageAhead(_)
+            | Event::GuestImageAhead { .. }
             | Event::FlatpakState(_)
             | Event::FlatpakLog(_)
             | Event::AgentSessionUpdate { .. }

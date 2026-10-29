@@ -263,6 +263,12 @@ const DOC_PREVIEW_ICON: &str = "x-office-document-symbolic";
 const DOC_SOURCE_ICON: &str = "text-x-generic-symbolic";
 const STARTUP_KEY: &str = "startup:primary";
 
+/// An environment's startup page offered as a tab rather than put in
+/// front (`Editor::offer_startup`), by environment.
+fn offered_startup_key(env: &taste_core::environment::EnvironmentId) -> PathBuf {
+    PathBuf::from(format!("startup-offered:{env}"))
+}
+
 /// `log:<env>/<kind>` — one tab per environment per log; the IDE's own log
 /// is one for the window and keys under `log:ide`.
 fn log_key(env: &taste_core::environment::EnvironmentId, kind: crate::logview::LogKind) -> PathBuf {
@@ -722,6 +728,9 @@ pub struct Editor {
     /// The startup page's tab while a start is on screen: the one the
     /// selection is held to (`show_startup`).
     startup_tab: RefCell<Option<adw::TabPage>>,
+    /// The environments whose offered startup tab the user closed
+    /// (`offer_startup`): progress does not bring it back, a failure does.
+    startup_dismissed: RefCell<std::collections::HashSet<taste_core::environment::EnvironmentId>>,
     /// Guards toggle updates driven by page switches from re-triggering.
     /// Edit ↔ changes-view toggle for the selected tab.
     /// Latest git states of uncommitted files (absolute paths), for the
@@ -911,6 +920,7 @@ impl Editor {
             on_prompt_task: RefCell::new(None),
             on_prompt_agent: RefCell::new(None),
             startup_tab: RefCell::new(None),
+            startup_dismissed: RefCell::new(std::collections::HashSet::new()),
             git_dirty: RefCell::new(HashMap::new()),
             git_refresh: crate::filetree::RefreshGate::default(),
             environments: RefCell::new(None),
@@ -1202,7 +1212,13 @@ impl Editor {
                 return glib::Propagation::Stop;
             }
             // A surface has nothing unsaved: it closes, and is forgotten.
-            if let Some((key, _)) = editor.surface_by_tab(page) {
+            if let Some((key, surface)) = editor.surface_by_tab(page) {
+                if key == offered_startup_key(&surface.env) {
+                    editor
+                        .startup_dismissed
+                        .borrow_mut()
+                        .insert(surface.env.clone());
+                }
                 editor.surfaces.borrow_mut().remove(&key);
                 editor.task_prompts.borrow_mut().remove(&key);
                 tabs.close_page_finish(page, true);
@@ -2627,6 +2643,10 @@ impl Editor {
     /// but in place (David, 2026-09-22: "Take over the main code
     /// view/editing panel/region, disabling but not hiding the tab bar").
     pub fn show_startup(self: &Rc<Self>, page: Rc<crate::startup::StartupPage>) {
+        // The page offered as a tab gives its widget to the one in front,
+        // and a tab closed before this start is offered again after it.
+        self.withdraw_offered_startup(&page);
+        self.startup_dismissed.borrow_mut().clear();
         if let Some(tab) = self.startup_tab.borrow().clone() {
             self.bring_into_strip(&tab);
             self.tabs().set_selected_page(&tab);
@@ -2661,6 +2681,94 @@ impl Editor {
         self.tab_bar().add_css_class("startup-locked");
         self.tabs().set_selected_page(&tab);
         self.sync_toggle_to_selection();
+    }
+
+    /// `env`'s startup page as a tab beside the others, the selection left
+    /// where it is: what its environment is doing while nothing is blocked
+    /// — a move getting ready while it runs on, or one that failed and
+    /// left it running where it was (David, 2026-10-29: "provide the tab,
+    /// not force a switch to it"). Its spinner says work is under way, and
+    /// a failure marks it for attention. Asked again as the work goes on,
+    /// it only restyles the tab; closed by the user, it comes back for a
+    /// failure and not for progress. Nothing while a start holds the strip.
+    pub fn offer_startup(
+        self: &Rc<Self>,
+        env: &taste_core::environment::EnvironmentId,
+        page: Rc<crate::startup::StartupPage>,
+    ) {
+        if self.startup_tab.borrow().is_some() {
+            return;
+        }
+        let failed = page.move_failed();
+        let key = offered_startup_key(env);
+        let existing = self.surfaces.borrow().get(&key).map(|s| s.tab.clone());
+        let tab = match existing {
+            Some(tab) => tab,
+            None => {
+                if failed {
+                    self.startup_dismissed.borrow_mut().remove(env);
+                } else if self.startup_dismissed.borrow().contains(env) {
+                    return;
+                }
+                let tab = self.tabs().append(&page.widget);
+                self.tabs().reorder_page(&tab, self.tabs().n_pinned_pages());
+                tab.set_title("Environment");
+                tab.set_icon(Some(&gtk::gio::ThemedIcon::new(STARTUP_ICON)));
+                self.surfaces.borrow_mut().insert(
+                    key,
+                    Rc::new(SurfaceEntry {
+                        tab: tab.clone(),
+                        env: env.clone(),
+                        kind: SurfaceKind::Startup(page.clone()),
+                    }),
+                );
+                tab
+            }
+        };
+        tab.set_tooltip(if failed {
+            "The environment's move failed; it runs on where it was"
+        } else {
+            "The environment getting ready to move; it runs on meanwhile"
+        });
+        tab.set_loading(page.preparing_move());
+        if failed && !tab.is_selected() {
+            tab.set_needs_attention(true);
+        }
+    }
+
+    /// The offered tab selected, as a click on it does: the probe's way to
+    /// see the page it offers.
+    #[doc(hidden)]
+    pub fn select_offered_startup_for_probe(&self, env: &taste_core::environment::EnvironmentId) {
+        let tab = self
+            .surfaces
+            .borrow()
+            .get(&offered_startup_key(env))
+            .map(|s| s.tab.clone());
+        if let Some(tab) = tab {
+            self.tabs().set_selected_page(&tab);
+        }
+    }
+
+    /// The offered tab that shows `page`, closed, wherever it is.
+    fn withdraw_offered_startup(&self, page: &Rc<crate::startup::StartupPage>) {
+        let offered: Vec<(PathBuf, adw::TabPage)> = self
+            .surfaces
+            .borrow()
+            .iter()
+            .filter(|(key, s)| {
+                **key == offered_startup_key(&s.env)
+                    && matches!(&s.kind, SurfaceKind::Startup(p) if Rc::ptr_eq(p, page))
+            })
+            .map(|(key, s)| (key.clone(), s.tab.clone()))
+            .collect();
+        for (key, tab) in offered {
+            // Forgotten first, so the close is not read as the user's.
+            self.surfaces.borrow_mut().remove(&key);
+            if let Some(view) = self.view_of(&tab) {
+                view.close_page(&tab);
+            }
+        }
     }
 
     /// The start is over: the tab goes and the strip is the user's again.

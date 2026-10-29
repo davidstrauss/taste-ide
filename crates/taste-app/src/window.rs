@@ -1694,6 +1694,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             if showing_other {
                 editor.hide_startup();
             }
+            // Nothing blocked: offered, not put in front.
+            if let Some(page) = page
+                .as_ref()
+                .filter(|p| p.preparing_move() || p.move_failed())
+            {
+                editor.offer_startup(env, page.clone());
+                return;
+            }
             if let (true, Some(page)) = (live, page) {
                 *startup_shown.borrow_mut() = env.clone();
                 editor.show_startup(page);
@@ -1705,9 +1713,30 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     }
     // `TASTE_PROBE_STARTUP=vm|image|novm|place|build|failed|noconfig|ready|move`: the page at
     // that stage, in front, which otherwise needs a start under way.
+    // `premove` and `premove-failed` are a move getting ready while the
+    // environment runs on, and that failing: offered as a tab, the
+    // selection left where it was; `:open` after either selects the tab,
+    // as a click would, to see the page.
     if let Ok(kind) = std::env::var("TASTE_PROBE_STARTUP") {
+        let (kind, open) = match kind.strip_suffix(":open") {
+            Some(kind) => (kind.to_string(), true),
+            None => (kind, false),
+        };
         startup.pose_for_probe(&kind);
-        editor.show_startup(startup.clone());
+        if kind.starts_with("premove") {
+            let primary = taste_core::environment::EnvironmentId::primary();
+            editor.offer_startup(&primary, startup.clone());
+            // After the view's own tabs, which take the selection as
+            // they open.
+            if open {
+                let editor = editor.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
+                    editor.select_offered_startup_for_probe(&primary);
+                });
+            }
+        } else {
+            editor.show_startup(startup.clone());
+        }
     }
     // `TASTE_PROBE_PENDING=i-0901`: the panes gone to an environment still
     // being made, as Start sends them — its own tab set, its chat's page,
@@ -4581,7 +4610,34 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             startup.on_guest_image(&fetch);
                         }
                     }
-                    Event::GuestImageAhead(fetch) => filetree.backlog().set_guest_image(&fetch),
+                    Event::GuestImageAhead { env, fetch } => {
+                        filetree.backlog().set_guest_image(&fetch);
+                        // A move's own, on its page, which is offered —
+                        // never put in front: the environment runs on.
+                        if let Some(env) = env.filter(|_| !probe_mode) {
+                            let page = startup_for(&env);
+                            page.on_move_fetch(&fetch);
+                            if filetree.aimed_environment() == env {
+                                editor.offer_startup(&env, page);
+                            }
+                        }
+                    }
+                    Event::MoveFailed {
+                        env,
+                        reason,
+                        retry_minutes,
+                    } => {
+                        let page = startup_for(&env);
+                        page.on_move_failed(&reason, retry_minutes);
+                        if filetree.aimed_environment() == env {
+                            // Running where it was: nothing to hold the
+                            // strip for, and the failure to come back to.
+                            if *startup_shown.borrow() == env {
+                                editor.hide_startup();
+                            }
+                            editor.offer_startup(&env, page);
+                        }
+                    }
                     Event::ShowVmLog => open_log(primary_env.clone(), crate::logview::LogKind::Vm),
                     // The primary's working copy is in the VM now: the
                     // workspace's view root moves, and every pane that
@@ -4705,7 +4761,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                     bring_forward();
                                 }
                                 S::Running { .. } => {
-                                    if page.underway() {
+                                    // Running on while its move gets ready
+                                    // is not the page's end.
+                                    if page.underway() && !page.preparing_move() {
                                         page.mark_settled();
                                         let page = page.clone();
                                         let editor = editor.clone();

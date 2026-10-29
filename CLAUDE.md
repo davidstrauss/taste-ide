@@ -357,7 +357,12 @@ git's progress as its detail —, `build`, `failed`, `noconfig`, `ready`, `move`
 the page as a move to a VM on the current release draws it, its work saved,
 its container stopped, its agent's home copied out, the new VM booted, and
 the home copied in partway, a minute and more along — folded to fit the
-default window's short strip (`Supervisor::begin_move`, `StartupPage::fit`) —)
+default window's short strip (`Supervisor::begin_move`, `StartupPage::fit`) —,
+`premove` — a move getting ready while the environment runs on, its guest
+image downloading partway, the page OFFERED as a tab beside the others and
+the selection left where it was (`Editor::offer_startup`) —, `premove-failed`
+— that download failing, the tab marked for attention —, either with `:open`
+to select the tab three seconds in, as a click does, to see its page)
 poses the environment's startup page — the checklist over the stripes,
 the log below, the safe-mode note on the fallback faces
 — pinned in front of the editor's strip as a real start puts it, which

@@ -373,6 +373,15 @@ pub struct StartupPage {
     /// What is drawn is a move to another VM rather than a start
     /// ([`StartupPage::on_move`]).
     moving: Cell<bool>,
+    /// What is drawn is a move getting ready while the environment runs
+    /// on — its guest image downloading ([`StartupPage::on_move_fetch`]):
+    /// nothing is blocked, so the page is offered as a tab, never put in
+    /// front, and the environment's Running is not this page's end.
+    preparing_move: Cell<bool>,
+    /// The page's last word is a move that failed
+    /// ([`StartupPage::on_move_failed`]), which stays up until the next
+    /// start or move.
+    move_failed: Cell<bool>,
     area: gtk::DrawingArea,
     offset: Cell<f64>,
     tick: RefCell<Option<gtk::TickCallbackId>>,
@@ -502,6 +511,8 @@ impl StartupPage {
             tick: RefCell::new(None),
             fit_queued: Cell::new(false),
             me: RefCell::new(std::rc::Weak::new()),
+            preparing_move: Cell::new(false),
+            move_failed: Cell::new(false),
         });
         {
             let weak = Rc::downgrade(&this);
@@ -567,6 +578,8 @@ impl StartupPage {
             .set_label(&format!("{} starting", self.subject.borrow()));
         // A start has nothing to leave; a move shows the step (`on_move`).
         self.moving.set(false);
+        self.preparing_move.set(false);
+        self.move_failed.set(false);
         for step in Step::MOVE_ONLY {
             self.row(step).row.set_visible(false);
         }
@@ -692,6 +705,16 @@ impl StartupPage {
             .iter()
             .map(|step| (*step, self.row(*step)))
             .filter(|(step, _)| self.moving.get() || !Step::MOVE_ONLY.contains(step))
+            // A move getting ready stops nothing to make room: that is the
+            // move's own, after the stop, and ticked off here it read as
+            // done.
+            .filter(|(step, row)| {
+                let skipped = self.preparing_move.get() && *step == Step::Sweep;
+                if skipped {
+                    row.row.set_visible(false);
+                }
+                !skipped
+            })
             .collect();
         let (mut done, mut later, mut pending_shown) = (0, 0, 0);
         for (_, row) in &shown {
@@ -873,8 +896,9 @@ impl StartupPage {
             }
             DevcontainerStateEvent::Building => self.activate(Step::Build, None),
             DevcontainerStateEvent::Starting => self.activate(Step::Start, None),
+            // Running on while its move gets ready is no start's end.
             DevcontainerStateEvent::Running { .. } => {
-                if self.underway.get() {
+                if self.underway.get() && !self.preparing_move.get() {
                     self.finish();
                 }
             }
@@ -959,7 +983,6 @@ impl StartupPage {
     /// The guest image's fetch, unpack, or check: the first step, once per
     /// machine.
     pub fn on_guest_image(self: &Rc<Self>, fetch: &taste_core::GuestImageFetch) {
-        use taste_core::GuestImagePhase as P;
         // The image is fetched inside the VM's bring-up — only a VM being
         // made needs it — so its phases arrive after that step is
         // announced. The VM is not booting while its disk's image is still
@@ -975,18 +998,7 @@ impl StartupPage {
             }
             return;
         }
-        let mib = |bytes: u64| bytes / (1024 * 1024);
-        let doing = match fetch.phase {
-            P::Fetching => "downloading",
-            P::Decompressing => "unpacking",
-            P::Preparing => "preparing the base VMs boot from",
-            _ => "verifying",
-        };
-        let detail = if fetch.total > 0 {
-            format!("{doing} · {} of {} MiB", mib(fetch.done), mib(fetch.total))
-        } else {
-            doing.to_string()
-        };
+        let detail = fetch_detail(fetch);
         for later in Step::ALL.iter().filter(|s| **s > Step::GuestImage) {
             let row = self.row(*later);
             if row.status.get() == Status::Active {
@@ -994,6 +1006,78 @@ impl StartupPage {
             }
         }
         self.activate(Step::GuestImage, Some(&detail));
+    }
+
+    /// Whether the page draws a move getting ready while its environment
+    /// runs on, which is offered as a tab and not put in front.
+    pub fn preparing_move(&self) -> bool {
+        self.preparing_move.get() && self.underway.get()
+    }
+
+    /// Whether the page's last word is a move that failed.
+    pub fn move_failed(&self) -> bool {
+        self.move_failed.get()
+    }
+
+    /// The guest image a move is waiting on, downloading while its
+    /// environment runs on: the move's first step, before anything stops
+    /// (`EnvironmentRegistry::relocate_inner`). Drawn as the start the
+    /// move becomes would draw it, under a heading and a note that say the
+    /// environment is still running; the stop that follows draws the move
+    /// itself ([`Self::on_move`]).
+    pub fn on_move_fetch(self: &Rc<Self>, fetch: &taste_core::GuestImageFetch) {
+        if !fetch.phase.active() {
+            if self.preparing_move() {
+                self.row(Step::GuestImage)
+                    .set(Status::Done, Some("fetched and verified"));
+            }
+            return;
+        }
+        if !self.preparing_move() {
+            self.begin();
+            self.preparing_move.set(true);
+            self.heading
+                .set_label(&format!("{} getting ready to move", self.subject.borrow()));
+            self.set_note(&format!(
+                "It keeps running while the guest image for Fedora CoreOS {} downloads. Its \
+                 container stops for the move only once the image is in.",
+                fetch.release
+            ));
+        }
+        self.activate(Step::GuestImage, Some(&fetch_detail(fetch)));
+    }
+
+    /// The move failed, and the environment runs on where it was until it
+    /// is tried again: said on the step it failed at — the download, or
+    /// the move's own step — with the reason, and the stripes stopped.
+    pub fn on_move_failed(self: &Rc<Self>, reason: &str, retry_minutes: u64) {
+        let first = reason.lines().next().unwrap_or(reason).trim().to_string();
+        let finished = self.current.get() == Some(Step::Ready);
+        if !self.underway.get() {
+            // Nothing drawn: it failed at the stop.
+            self.begin();
+            self.moving.set(true);
+            for step in Step::MOVE_ONLY {
+                self.row(step).row.set_visible(true);
+            }
+            self.row(Step::Leave).set(Status::Failed, Some(&first));
+        } else if !finished {
+            let failed = Step::ALL
+                .into_iter()
+                .find(|step| self.row(*step).status.get() == Status::Active)
+                .or(self.current.get())
+                .unwrap_or(Step::GuestImage);
+            self.row(failed).set(Status::Failed, Some(&first));
+        }
+        self.heading
+            .set_label(&format!("{} did not move", self.subject.borrow()));
+        self.set_note(&format!(
+            "The move failed: {first}. It runs on where it was, as it was, and the move is \
+             tried again in {retry_minutes} minutes."
+        ));
+        self.queue_fit();
+        self.end();
+        self.move_failed.set(true);
     }
 
     /// A line of the environment's build log: appended, and made the
@@ -1195,6 +1279,26 @@ impl StartupPage {
                 self.on_state(&DevcontainerStateEvent::NoConfig, false);
                 self.activate(Step::Build, Some("the safe-mode environment"));
             }
+            // A move getting ready while its environment runs on: the
+            // guest image downloading, partway; `premove-failed` is that
+            // download failing.
+            "premove" | "premove-failed" => {
+                let fetch = taste_core::GuestImageFetch {
+                    release: "44.20261012.3.1".into(),
+                    phase: taste_core::GuestImagePhase::Fetching,
+                    done: 612 * 1024 * 1024,
+                    total: 847 * 1024 * 1024,
+                };
+                self.on_move_fetch(&fetch);
+                if kind == "premove-failed" {
+                    self.on_move_failed(
+                        "fetching the guest image the move needs: downloading \
+                         fedora-coreos-44.20261012.3.1-qemu.x86_64.qcow2.xz: connection reset \
+                         by peer",
+                        15,
+                    );
+                }
+            }
             // The guest image arriving inside the VM's bring-up, as the
             // first VM on a machine has it; `novm` is the same bring-up
             // failing once the image is in, as a host with VT-x off in its
@@ -1268,6 +1372,24 @@ fn build_step_words(line: &str) -> Option<(u32, u32, &str)> {
         .unwrap_or(0);
     let words = after[digits..].trim_start_matches(':').trim();
     Some((n.trim().parse().ok()?, after[..digits].parse().ok()?, words))
+}
+
+/// A guest image reading as a step's detail: what is under way, and how
+/// far, where it has a measure.
+fn fetch_detail(fetch: &taste_core::GuestImageFetch) -> String {
+    use taste_core::GuestImagePhase as P;
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    let doing = match fetch.phase {
+        P::Fetching => "downloading",
+        P::Decompressing => "unpacking",
+        P::Preparing => "preparing the base VMs boot from",
+        _ => "verifying",
+    };
+    if fetch.total > 0 {
+        format!("{doing} · {} of {} MiB", mib(fetch.done), mib(fetch.total))
+    } else {
+        doing.to_string()
+    }
 }
 
 /// A duration as a conclusion says it: `41 s`, `3 min 2 s`.
