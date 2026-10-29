@@ -728,9 +728,6 @@ pub struct Editor {
     /// The startup page's tab while a start is on screen: the one the
     /// selection is held to (`show_startup`).
     startup_tab: RefCell<Option<adw::TabPage>>,
-    /// The environments whose offered startup tab the user closed
-    /// (`offer_startup`): progress does not bring it back, a failure does.
-    startup_dismissed: RefCell<std::collections::HashSet<taste_core::environment::EnvironmentId>>,
     /// Guards toggle updates driven by page switches from re-triggering.
     /// Edit ↔ changes-view toggle for the selected tab.
     /// Latest git states of uncommitted files (absolute paths), for the
@@ -920,7 +917,6 @@ impl Editor {
             on_prompt_task: RefCell::new(None),
             on_prompt_agent: RefCell::new(None),
             startup_tab: RefCell::new(None),
-            startup_dismissed: RefCell::new(std::collections::HashSet::new()),
             git_dirty: RefCell::new(HashMap::new()),
             git_refresh: crate::filetree::RefreshGate::default(),
             environments: RefCell::new(None),
@@ -1213,11 +1209,13 @@ impl Editor {
             }
             // A surface has nothing unsaved: it closes, and is forgotten.
             if let Some((key, surface)) = editor.surface_by_tab(page) {
-                if key == offered_startup_key(&surface.env) {
-                    editor
-                        .startup_dismissed
-                        .borrow_mut()
-                        .insert(surface.env.clone());
+                // Except an offered startup whose work is under way, which
+                // stays until that work is over (`offer_startup`).
+                if key == offered_startup_key(&surface.env)
+                    && matches!(&surface.kind, SurfaceKind::Startup(p) if p.preparing_move())
+                {
+                    tabs.close_page_finish(page, false);
+                    return glib::Propagation::Stop;
                 }
                 editor.surfaces.borrow_mut().remove(&key);
                 editor.task_prompts.borrow_mut().remove(&key);
@@ -2643,10 +2641,8 @@ impl Editor {
     /// but in place (David, 2026-09-22: "Take over the main code
     /// view/editing panel/region, disabling but not hiding the tab bar").
     pub fn show_startup(self: &Rc<Self>, page: Rc<crate::startup::StartupPage>) {
-        // The page offered as a tab gives its widget to the one in front,
-        // and a tab closed before this start is offered again after it.
+        // The page offered as a tab gives its widget to the one in front.
         self.withdraw_offered_startup(&page);
-        self.startup_dismissed.borrow_mut().clear();
         if let Some(tab) = self.startup_tab.borrow().clone() {
             self.bring_into_strip(&tab);
             self.tabs().set_selected_page(&tab);
@@ -2687,10 +2683,12 @@ impl Editor {
     /// where it is: what its environment is doing while nothing is blocked
     /// — a move getting ready while it runs on, or one that failed and
     /// left it running where it was (David, 2026-10-29: "provide the tab,
-    /// not force a switch to it"). Its spinner says work is under way, and
-    /// a failure marks it for attention. Asked again as the work goes on,
-    /// it only restyles the tab; closed by the user, it comes back for a
-    /// failure and not for progress. Nothing while a start holds the strip.
+    /// not force a switch to it"). While the work is under way it is
+    /// pinned, its spinner in the icon's place, and cannot be closed (David:
+    /// "Don't let the tab be closed if it's busy. You can even pin it if
+    /// you want"); a failure unpins it, marked for attention, to be read
+    /// and closed. Asked again as the work goes on, it only restyles the
+    /// tab. Nothing while a start holds the strip.
     pub fn offer_startup(
         self: &Rc<Self>,
         env: &taste_core::environment::EnvironmentId,
@@ -2705,11 +2703,6 @@ impl Editor {
         let tab = match existing {
             Some(tab) => tab,
             None => {
-                if failed {
-                    self.startup_dismissed.borrow_mut().remove(env);
-                } else if self.startup_dismissed.borrow().contains(env) {
-                    return;
-                }
                 let tab = self.tabs().append(&page.widget);
                 self.tabs().reorder_page(&tab, self.tabs().n_pinned_pages());
                 tab.set_title("Environment");
@@ -2730,7 +2723,17 @@ impl Editor {
         } else {
             "The environment getting ready to move; it runs on meanwhile"
         });
-        tab.set_loading(page.preparing_move());
+        let busy = page.preparing_move();
+        tab.set_loading(busy);
+        if tab.is_pinned() != busy {
+            if let Some(view) = self.view_of(&tab) {
+                view.set_page_pinned(&tab, busy);
+                // Unpinned, it leads the others rather than trailing them.
+                if !busy {
+                    view.reorder_page(&tab, view.n_pinned_pages());
+                }
+            }
+        }
         if failed && !tab.is_selected() {
             tab.set_needs_attention(true);
         }
@@ -2763,9 +2766,11 @@ impl Editor {
             .map(|(key, s)| (key.clone(), s.tab.clone()))
             .collect();
         for (key, tab) in offered {
-            // Forgotten first, so the close is not read as the user's.
+            // Forgotten first, so the close handler does not hold it for
+            // its work, and unpinned, since a pinned page does not close.
             self.surfaces.borrow_mut().remove(&key);
             if let Some(view) = self.view_of(&tab) {
+                view.set_page_pinned(&tab, false);
                 view.close_page(&tab);
             }
         }
