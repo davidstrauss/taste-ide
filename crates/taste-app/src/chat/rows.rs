@@ -846,7 +846,7 @@ impl ChatPane {
     pub(super) fn step_shown_title(step: &Step) -> String {
         match step.act {
             Some(kind) => act_headline(kind, step.input.as_ref(), step.act_output.as_ref()),
-            None => step_title(&step.title, step.input.as_ref(), step.output.as_ref())
+            None => step_title(step.key(), step.input.as_ref(), step.output.as_ref())
                 .unwrap_or_else(|| single_line(&step.title, 200)),
         }
     }
@@ -870,7 +870,7 @@ impl ChatPane {
         // 2026-10-09).
         title_label.set_tooltip_text(Some(&match step.act {
             Some(_) => shown.clone(),
-            None => step_title(&step.title, step.input.as_ref(), step.output.as_ref())
+            None => step_title(step.key(), step.input.as_ref(), step.output.as_ref())
                 .unwrap_or_else(|| step.title.clone()),
         }));
         crate::issue_pill::install_tooltips(&title_label, self.issues.clone());
@@ -902,9 +902,9 @@ impl ChatPane {
             header.append(&act_glyph);
         }
         // A command's step in the face its IN/OUT block is in.
-        let command = is_command_call(step.kind, &step.title);
+        let command = is_command_call(step.kind, step.key());
         let command_title = command
-            && match mcp_tool_name(&step.title).as_deref() {
+            && match mcp_tool_name(step.key()).as_deref() {
                 Some("ide_exec") => command_input_line("ide_exec", step.input.as_ref()).is_some(),
                 Some(_) => false,
                 None => true,
@@ -1028,7 +1028,7 @@ impl ChatPane {
     /// result.
     fn step_summary(&self, step: &Step) -> Option<String> {
         let content = step.content.as_ref()?;
-        if is_command_call(step.kind, &step.title) {
+        if is_command_call(step.kind, step.key()) {
             return crate::chatdoc::digest(&step_command_output(step, content));
         }
         let mut summary = None;
@@ -1071,10 +1071,10 @@ impl ChatPane {
         let Some(content) = step.content.as_ref() else {
             return;
         };
-        if is_command_call(step.kind, &step.title) {
+        if is_command_call(step.kind, step.key()) {
             // Claude Code's IN/OUT: IN is what was asked, OUT everything
             // printed (David, 2026-09-07; i-0016, i-0017).
-            let command = mcp_tool_name(&step.title)
+            let command = mcp_tool_name(step.key())
                 .filter(|name| is_ide_command_tool(name))
                 .and_then(|name| command_input_line(&name, step.input.as_ref()))
                 .unwrap_or_else(|| step.title.clone());
@@ -1213,7 +1213,7 @@ fn step_command_output(step: &Step, content: &[ToolCallContent]) -> String {
             output = text.clone();
         }
     }
-    mcp_tool_name(&step.title)
+    mcp_tool_name(step.key())
         .filter(|name| is_ide_command_tool(name))
         .and_then(|_| command_console_text(&output))
         .unwrap_or(output)
@@ -1224,7 +1224,7 @@ fn step_has_content(step: &Step) -> bool {
     let Some(content) = step.content.as_ref() else {
         return false;
     };
-    if is_command_call(step.kind, &step.title) {
+    if is_command_call(step.kind, step.key()) {
         return true;
     }
     content.iter().any(|item| match item {

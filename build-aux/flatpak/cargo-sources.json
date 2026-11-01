@@ -15,40 +15,40 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/agent-client-protocol/agent-client-protocol-2.0.0.crate",
-        "sha256": "6d87bc7769eba641753ba5dc52f73ec3765d51022c6753bf040967125ddc86a8",
-        "dest": "cargo/vendor/agent-client-protocol-2.0.0"
+        "url": "https://static.crates.io/crates/agent-client-protocol/agent-client-protocol-2.2.0.crate",
+        "sha256": "13f780597b2c88ab83d02509bcc3e86366751f86fa12114005e35c55ed691763",
+        "dest": "cargo/vendor/agent-client-protocol-2.2.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"6d87bc7769eba641753ba5dc52f73ec3765d51022c6753bf040967125ddc86a8\", \"files\": {}}",
-        "dest": "cargo/vendor/agent-client-protocol-2.0.0",
+        "contents": "{\"package\": \"13f780597b2c88ab83d02509bcc3e86366751f86fa12114005e35c55ed691763\", \"files\": {}}",
+        "dest": "cargo/vendor/agent-client-protocol-2.2.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/agent-client-protocol-derive/agent-client-protocol-derive-2.0.0.crate",
-        "sha256": "3abd4080f51e4f24f5042beb7fb7a66ede29a2dc1c2582c329532e1c27264ddc",
-        "dest": "cargo/vendor/agent-client-protocol-derive-2.0.0"
+        "url": "https://static.crates.io/crates/agent-client-protocol-derive/agent-client-protocol-derive-2.2.0.crate",
+        "sha256": "f4893bfb11e0e193aa5a64611a126ee87567acb1879556519c902722899229de",
+        "dest": "cargo/vendor/agent-client-protocol-derive-2.2.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"3abd4080f51e4f24f5042beb7fb7a66ede29a2dc1c2582c329532e1c27264ddc\", \"files\": {}}",
-        "dest": "cargo/vendor/agent-client-protocol-derive-2.0.0",
+        "contents": "{\"package\": \"f4893bfb11e0e193aa5a64611a126ee87567acb1879556519c902722899229de\", \"files\": {}}",
+        "dest": "cargo/vendor/agent-client-protocol-derive-2.2.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/agent-client-protocol-schema/agent-client-protocol-schema-1.5.0.crate",
-        "sha256": "d5c231915b4ab578c722eca2d1bd7df4d300bfd6cac3b8e9f0d1e3ddc95b187c",
-        "dest": "cargo/vendor/agent-client-protocol-schema-1.5.0"
+        "url": "https://static.crates.io/crates/agent-client-protocol-schema/agent-client-protocol-schema-1.9.1.crate",
+        "sha256": "1d595a79e1665d02c91c7dd1bedd118501e75cc0a3d5b1651b5150ec4c5c1e0d",
+        "dest": "cargo/vendor/agent-client-protocol-schema-1.9.1"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"d5c231915b4ab578c722eca2d1bd7df4d300bfd6cac3b8e9f0d1e3ddc95b187c\", \"files\": {}}",
-        "dest": "cargo/vendor/agent-client-protocol-schema-1.5.0",
+        "contents": "{\"package\": \"1d595a79e1665d02c91c7dd1bedd118501e75cc0a3d5b1651b5150ec4c5c1e0d\", \"files\": {}}",
+        "dest": "cargo/vendor/agent-client-protocol-schema-1.9.1",
         "dest-filename": ".cargo-checksum.json"
     },
     {

@@ -1946,7 +1946,23 @@ it, and carries its actions.
   `sed`, a `git checkout`, a build — arrives through the watcher, and an
   open file it changes is reloaded the same way, as one undoable step.
   - Permission requests (surfaced in the chat pane) and terminal creation
-    (surfaced as console tabs).
+    (surfaced as console tabs). A permission or questions the agent takes
+    back with `$/cancel_request` — the pinned adapter does when the call it
+    asked about stops mattering — come down unanswered and are logged as
+    withdrawn, never as refused (`SessionEvent::Withdrawn`).
+
+  A tool call is told apart by its programmatic `name` (stable in ACP since
+  2026-09-17) and by its title only when the agent sends none
+  (`chat.rs`, `call_key`): a title is words for people, which the adapter
+  chooses and the IDE itself rewrites for an edit, so a shell command titled
+  like one of the IDE's tools must not be read as that tool — not for its
+  card, and not for a standing answer.
+
+  `session/close` is not sent. Each chat's agent is a process of its own,
+  which ends with the chat's connection to it (the SDK closes its stdin and
+  kills its process group if it lingers), so there is nothing left for the
+  close to free; it is for an agent that serves several sessions, which an
+  agent host would (`docs/spikes/agent-host.md`).
 
   Both handlers run with the IDE's privileges, not the agent's, so each
   enforces the workspace boundary itself rather than assuming a mount does.

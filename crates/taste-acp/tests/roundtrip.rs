@@ -43,6 +43,7 @@ async fn full_session_roundtrip() {
             SessionEvent::Ready { .. } => unreachable!(),
             SessionEvent::Permission { .. } => "Permission".to_string(),
             SessionEvent::Elicitation { .. } => "Elicitation".to_string(),
+            SessionEvent::Withdrawn => "Withdrawn".to_string(),
             SessionEvent::ModeChangeFailed { message, .. } => {
                 format!("ModeChangeFailed({message})")
             }
@@ -432,6 +433,56 @@ async fn the_agents_questions_come_to_the_chat_and_the_answer_goes_back() {
         r#"ask {"action": "accept", "content": {"question_0": "Separate"}}"#
     );
     assert_eq!(ask(&client, None).await, r#"ask {"action": "cancel"}"#);
+}
+
+/// A question the agent takes back (`$/cancel_request`) is withdrawn from
+/// the chat: the client says so, the reply it was holding is closed — which
+/// is how the pane tells which card to take down — and the agent is
+/// answered `cancelled` without anybody having refused it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_the_agent_takes_back_is_withdrawn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client =
+        AgentClient::spawn_unconfined_for_tests(fake_agent_spec(), workspace.path().to_path_buf());
+    assert!(matches!(
+        next_event(&client).await,
+        SessionEvent::Ready { .. }
+    ));
+    client.prompt("/takeback").unwrap();
+    let mut held = None;
+    let mut withdrawn = false;
+    let answered = loop {
+        match next_event(&client).await {
+            SessionEvent::Permission { request, reply } => {
+                assert_eq!(request.tool_call.tool_call_id.to_string(), "toolu_takeback");
+                held = Some(reply);
+            }
+            SessionEvent::Withdrawn => {
+                let reply = held.as_ref().expect("withdrawn before it was asked");
+                assert!(
+                    reply.is_closed(),
+                    "the withdrawn question's reply is closed"
+                );
+                withdrawn = true;
+            }
+            SessionEvent::Update(SessionUpdate::AgentMessageChunk(chunk)) => {
+                let ContentBlock::Text(text) = &chunk.content else {
+                    panic!("expected text content");
+                };
+                break text.text.clone();
+            }
+            SessionEvent::Closed(error) => panic!("connection closed early: {error:?}"),
+            _ => {}
+        }
+    };
+    assert!(
+        withdrawn,
+        "the client never said the question was withdrawn"
+    );
+    assert_eq!(
+        answered,
+        r#"takeback {"outcome": {"outcome": "cancelled"}}"#
+    );
 }
 
 /// A prompt sent while a turn runs waits behind it and goes out after the

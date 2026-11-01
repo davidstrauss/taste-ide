@@ -97,6 +97,7 @@ fn describe(event: &SessionEvent) -> String {
         SessionEvent::QueuedTaken { ids } => format!("QueuedTaken({ids:?})"),
         SessionEvent::Permission { .. } => "Permission".into(),
         SessionEvent::Elicitation { .. } => "Elicitation".into(),
+        SessionEvent::Withdrawn => "Withdrawn".into(),
         SessionEvent::ModeChangeFailed { message, .. } => format!("ModeChangeFailed({message})"),
         SessionEvent::CommandFailed { message } => format!("CommandFailed({message})"),
         SessionEvent::PromptFailed { message } => format!("PromptFailed({message})"),

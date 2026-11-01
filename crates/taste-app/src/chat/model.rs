@@ -30,7 +30,7 @@ use agent_client_protocol::schema::v1::{
 };
 
 use super::{
-    act_kind, act_output_json, briefing_notes, content_text, edit_title, ide_edit_shape,
+    act_kind, act_output_json, briefing_notes, call_key, content_text, edit_title, ide_edit_shape,
     is_ide_edit_title, mcp_tool_name, replayed_attachment, step_title, task_notifications,
     thought_header, ActKind, PendingUserMessage, BRIEFING_TAIL, INTERRUPTED_THOUGHT,
 };
@@ -147,6 +147,9 @@ pub(super) struct Step {
     pub call: String,
     /// What the agent called the call, whole.
     pub title: String,
+    /// The tool it is, by the programmatic name the agent sent with it, if
+    /// it sent one: what [`Step::key`] reads before the title.
+    pub name: Option<String>,
     pub status: Option<ToolCallStatus>,
     pub kind: ToolKind,
     /// The call's content, as last reported: a snapshot of the whole.
@@ -174,6 +177,13 @@ pub(super) struct Step {
     pub permission: Option<(String, String)>,
     /// Opened onto its content.
     pub expanded: bool,
+}
+
+impl Step {
+    /// What this call is told apart by (`call_key`).
+    pub fn key(&self) -> &str {
+        call_key(self.name.as_deref(), &self.title)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,7 +237,7 @@ impl Row {
             Kind::User(user) => user.text.clone(),
             Kind::Answer(answer) => answer.text.clone(),
             Kind::Thought(thought) => thought.text.clone(),
-            Kind::Step(step) => step_title(&step.title, step.input.as_ref(), step.output.as_ref())
+            Kind::Step(step) => step_title(step.key(), step.input.as_ref(), step.output.as_ref())
                 .unwrap_or_else(|| step.title.clone()),
             Kind::Task(task) => task.title.clone(),
             Kind::Plan(plan) => plan
@@ -415,7 +425,7 @@ impl Model {
         let after_rebuild = matches!(
             before.map(|row| &row.kind),
             Some(Kind::Step(step))
-                if mcp_tool_name(&step.title).as_deref() == Some("devcontainer_reload")
+                if mcp_tool_name(step.key()).as_deref() == Some("devcontainer_reload")
         );
         if !(in_transition || after_rebuild) {
             return;
@@ -661,21 +671,20 @@ impl Model {
             }
             SessionUpdate::ToolCall(mut call) => {
                 let id = call.tool_call_id.to_string();
+                let key = call_key(call.name.as_deref(), &call.title).to_string();
                 // A step of work: what was said before it is not the answer
                 // the replies, if any, will be about. Offering them is not
                 // work.
-                if mcp_tool_name(&call.title).as_deref() != Some("suggest_replies") {
+                if mcp_tool_name(&key).as_deref() != Some("suggest_replies") {
                     self.turn_answers.clear();
                 }
                 // An edit through the IDE's tools reads as the edit it is.
-                if is_ide_edit_title(&call.title) {
-                    self.ide_edits.insert(id.clone(), call.title.clone());
+                if is_ide_edit_title(&key) {
+                    self.ide_edits.insert(id.clone(), key.clone());
                     call.kind = ToolKind::Edit;
-                    if let Some((content, path)) =
-                        ide_edit_shape(&call.title, call.raw_input.as_ref())
-                    {
+                    if let Some((content, path)) = ide_edit_shape(&key, call.raw_input.as_ref()) {
                         call.content = content;
-                        call.title = edit_title(&call.title, &path);
+                        call.title = edit_title(&key, &path);
                     }
                 }
                 // Narration after this call starts a new block below it.
@@ -684,6 +693,7 @@ impl Model {
                 self.upsert_step(
                     id,
                     Some(call.title.clone()),
+                    call.name,
                     Some(call.status),
                     Some(call.kind),
                     Some(call.content),
@@ -694,13 +704,15 @@ impl Model {
             }
             SessionUpdate::ToolCallUpdate(mut update) => {
                 let id = update.tool_call_id.to_string();
-                if let Some(title) = update
+                if let Some(key) = update
                     .fields
                     .title
                     .as_deref()
-                    .filter(|t| is_ide_edit_title(t))
+                    .map(|title| call_key(update.fields.name.as_deref(), title))
+                    .or(update.fields.name.as_deref())
+                    .filter(|key| is_ide_edit_title(key))
                 {
-                    self.ide_edits.insert(id.clone(), title.to_string());
+                    self.ide_edits.insert(id.clone(), key.to_string());
                 }
                 if let Some(title) = self.ide_edits.get(&id).cloned() {
                     update.fields.kind = Some(ToolKind::Edit);
@@ -722,6 +734,7 @@ impl Model {
                 self.upsert_step(
                     id,
                     update.fields.title,
+                    update.fields.name,
                     update.fields.status,
                     update.fields.kind,
                     update.fields.content,
@@ -762,6 +775,7 @@ impl Model {
         &mut self,
         call: String,
         title: Option<String>,
+        name: Option<String>,
         status: Option<ToolCallStatus>,
         kind: Option<ToolKind>,
         content: Option<Vec<ToolCallContent>>,
@@ -774,14 +788,19 @@ impl Model {
             Some(id) => *id,
             None => {
                 if let Some(title) = &title {
-                    let line = step_title(title, input.as_ref(), output.as_ref())
-                        .unwrap_or_else(|| title.clone());
+                    let line = step_title(
+                        call_key(name.as_deref(), title),
+                        input.as_ref(),
+                        output.as_ref(),
+                    )
+                    .unwrap_or_else(|| title.clone());
                     self.lines.push(("tool", line));
                 }
                 let id = self.push_step(
                     Kind::Step(Box::new(Step {
                         call: call.clone(),
                         title: String::new(),
+                        name: None,
                         status: None,
                         kind: ToolKind::Other,
                         content: None,
@@ -810,11 +829,14 @@ impl Model {
             ..
         }) = self.row_mut(id)
         {
+            if name.is_some() {
+                step.name = name;
+            }
             if let Some(title) = title {
                 step.title = title;
-                if step.act.is_none() {
-                    step.act = act_kind(&step.title);
-                }
+            }
+            if step.act.is_none() {
+                step.act = act_kind(step.key());
             }
             if let Some(kind) = kind {
                 step.kind = kind;
@@ -854,7 +876,7 @@ impl Model {
                 // agent lives in, and its call goes with it: "Connection
                 // closed" is that rebuild under way, not a failure of it.
                 step.rebuild_took_the_agent = status == ToolCallStatus::Failed
-                    && mcp_tool_name(&step.title).as_deref() == Some("devcontainer_reload")
+                    && mcp_tool_name(step.key()).as_deref() == Some("devcontainer_reload")
                     && (in_transition
                         || step.output.as_ref().is_some_and(|out| {
                             out.to_string()
@@ -1768,6 +1790,50 @@ mod tests {
         let mut model = Model::default();
         model.apply(SessionUpdate::AgentMessageChunk(text(LOST)), true);
         assert_eq!(answers(&model), 0);
+    }
+
+    /// A call is the tool its name says, whatever its title: the agent's
+    /// own shell titled like one of the IDE's acts is not that act, the act
+    /// titled in words is still the act, and an edit through the IDE's
+    /// tools titled in words is still drawn as the edit (`call_key`).
+    #[test]
+    fn a_named_call_is_read_by_its_name() {
+        let mut model = Model::default();
+        let mut shell = ToolCall::new("c1", "mcp__taste-ide__issue_create");
+        shell.name = Some("Bash".into());
+        shell.kind = ToolKind::Execute;
+        model.apply(SessionUpdate::ToolCall(shell), false);
+        let mut filed = ToolCall::new("c2", "Filing the fix");
+        filed.name = Some("mcp__taste-ide__issue_create".into());
+        model.apply(SessionUpdate::ToolCall(filed), false);
+        let mut edit = ToolCall::new("c3", "Changing a file");
+        edit.name = Some("mcp__taste-ide__ide_edit_file".into());
+        edit.raw_input = Some(serde_json::json!({
+            "path": "src/lib.rs", "old_string": "a", "new_string": "b",
+        }));
+        model.apply(SessionUpdate::ToolCall(edit), false);
+        // An update that says nothing of the name keeps the call's.
+        let mut fields = ToolCallUpdateFields::new();
+        fields.title = Some("Still filing".into());
+        fields.status = Some(ToolCallStatus::Completed);
+        model.apply(
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new("c2", fields)),
+            false,
+        );
+
+        let steps: Vec<&Step> = model
+            .rows()
+            .iter()
+            .filter_map(|row| match &row.kind {
+                Kind::Step(step) => Some(step.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps[0].act, None);
+        assert_eq!(steps[1].act, Some(ActKind::Filed));
+        assert_eq!(steps[1].key(), "mcp__taste-ide__issue_create");
+        assert_eq!(steps[2].kind, ToolKind::Edit);
+        assert_eq!(steps[2].title, "Edit src/lib.rs");
     }
 
     fn taken(prompt: &str, waited: Option<&str>) -> Record {

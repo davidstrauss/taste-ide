@@ -121,6 +121,11 @@ pub enum SessionEvent {
         request: CreateElicitationRequest,
         reply: ElicitationReply,
     },
+    /// The agent took back a permission request or questions it had asked
+    /// (`$/cancel_request`): their `reply` is closed now, which is how the
+    /// one taken back is told from the rest, and the card asking it comes
+    /// down unanswered.
+    Withdrawn,
     /// The prompt going out now carries this many more of the messages
     /// that waited behind the last turn, after its own (`join_waiting`):
     /// one turn for all of them, so a later turn ends after them all.
@@ -785,12 +790,31 @@ impl AgentClient {
                             .await
                             .is_ok();
                         // Answer out-of-band so the dispatch loop stays free
-                        // while the user decides.
+                        // while the user decides — or until the agent takes
+                        // the question back (`$/cancel_request`), which it
+                        // does when the call it asked about stopped
+                        // mattering: the card then comes down rather than
+                        // ask about a call that is no longer waiting on it.
+                        let cancellation = responder.cancellation();
+                        let events = events_for_perm.clone();
                         cx.spawn(async move {
                             let outcome = if forwarded {
-                                reply_rx
-                                    .await
-                                    .unwrap_or(RequestPermissionOutcome::Cancelled)
+                                // The receiver is gone once the select is,
+                                // so the pane told after it finds this
+                                // request's reply closed.
+                                let answer = tokio::select! {
+                                    answer = reply_rx => Some(answer),
+                                    () = cancellation.cancelled() => None,
+                                };
+                                match answer {
+                                    Some(answer) => {
+                                        answer.unwrap_or(RequestPermissionOutcome::Cancelled)
+                                    }
+                                    None => {
+                                        let _ = events.send(SessionEvent::Withdrawn).await;
+                                        RequestPermissionOutcome::Cancelled
+                                    }
+                                }
                             } else {
                                 RequestPermissionOutcome::Cancelled
                             };
@@ -819,11 +843,24 @@ impl AgentClient {
                             })
                             .await
                             .is_ok();
+                        // And taken back the same way a permission is.
+                        let cancellation = responder.cancellation();
+                        let events = events_for_elicit.clone();
                         cx.spawn(async move {
                             let cancelled =
                                 || CreateElicitationResponse::new(ElicitationAction::Cancel);
                             let response = if forwarded {
-                                reply_rx.await.unwrap_or_else(|_| cancelled())
+                                let answer = tokio::select! {
+                                    answer = reply_rx => Some(answer),
+                                    () = cancellation.cancelled() => None,
+                                };
+                                match answer {
+                                    Some(answer) => answer.unwrap_or_else(|_| cancelled()),
+                                    None => {
+                                        let _ = events.send(SessionEvent::Withdrawn).await;
+                                        cancelled()
+                                    }
+                                }
                             } else {
                                 cancelled()
                             };

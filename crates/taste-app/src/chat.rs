@@ -593,7 +593,8 @@ fn replayed_replies(records: &[model::Record]) -> (Vec<taste_core::Reply>, bool)
                 call = None;
             }
             SessionUpdate::ToolCall(tool)
-                if mcp_tool_name(&tool.title).as_deref() == Some("suggest_replies") =>
+                if mcp_tool_name(call_key(tool.name.as_deref(), &tool.title)).as_deref()
+                    == Some("suggest_replies") =>
             {
                 call = Some(tool.tool_call_id.to_string());
                 recover(&mut replies, tool.raw_input.as_ref(), Some(tool.status));
@@ -9411,6 +9412,7 @@ impl ChatPane {
             }
             SessionEvent::Permission { request, reply } => self.on_permission(request, reply),
             SessionEvent::Elicitation { request, reply } => self.on_questions(request, reply),
+            SessionEvent::Withdrawn => self.on_withdrawn(),
             SessionEvent::QueuedDropped { count } => self.withdraw_queued(count),
             SessionEvent::QueuedWithdrawn { ids } => self.withdraw_prompts(&ids),
             SessionEvent::QueuedTaken { ids } => self.taken_within_turn(&ids),
@@ -14158,19 +14160,27 @@ impl ChatPane {
         reply: taste_acp::PermissionReply,
     ) {
         self.finalize_stream();
+        // The question names its call by id, and may leave out the name the
+        // call was reported with: it is the step's, and every reading of the
+        // request below is by name when there is one (`call_key`).
+        if request.tool_call.fields.name.is_none() {
+            let call = request.tool_call.tool_call_id.to_string();
+            let model = self.model.borrow();
+            request.tool_call.fields.name = model
+                .step_row(&call)
+                .and_then(|id| model.row(id))
+                .and_then(|row| match &row.kind {
+                    model::Kind::Step(step) => step.name.clone(),
+                    _ => None,
+                });
+        }
         // An edit through the IDE's tools asks as an edit does: "Edit a
         // file?", with the file. Its title stays the tool's, which is what
         // a standing answer is kept by.
-        if let Some(title) = request
-            .tool_call
-            .fields
-            .title
-            .clone()
-            .filter(|t| is_ide_edit_title(t))
-        {
+        if let Some(key) = request_key(&request).filter(|key| is_ide_edit_title(key)) {
             request.tool_call.fields.kind = Some(ToolKind::Edit);
             if let Some((content, path)) =
-                ide_edit_shape(&title, request.tool_call.fields.raw_input.as_ref())
+                ide_edit_shape(&key, request.tool_call.fields.raw_input.as_ref())
             {
                 request.tool_call.fields.content = Some(content);
                 request.tool_call.fields.locations = Some(vec![
@@ -14822,6 +14832,64 @@ impl ChatPane {
     /// Take the question card down unanswered, and the questions waiting
     /// behind it: their replies dropped go back as `cancel`, which is what
     /// a turn that ended, or an agent that went, leaves them.
+    /// The agent took back a question it had asked (`$/cancel_request`):
+    /// the permission or the questions whose reply is closed now, on the card
+    /// or waiting behind it, come down unanswered, and the next one waiting
+    /// goes up. Nobody refused anything, and the log says so.
+    fn on_withdrawn(self: &Rc<Self>) {
+        let withdrawn = |request: &RequestPermissionRequest| {
+            self.workspace.ide.record_permission(
+                &single_line(&permission_title(request), 120),
+                "withdrawn",
+                "the agent took the question back before the user answered; nobody refused it",
+            );
+        };
+        let queued: std::collections::VecDeque<PendingPermission> = {
+            let mut queue = self.permission_queue.borrow_mut();
+            let (closed, open) = queue.drain(..).partition(|(_, reply)| reply.is_closed());
+            *queue = open;
+            closed
+        };
+        for (request, _) in &queued {
+            withdrawn(request);
+        }
+        self.question_queue
+            .borrow_mut()
+            .retain(|(_, reply)| !reply.is_closed());
+        let up = self
+            .pending_permission
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, reply)| reply.is_closed());
+        if up {
+            if let Some((request, _)) = self.pending_permission.borrow_mut().take() {
+                self.clear_notification("permission");
+                self.permission_bar.set_reveal_child(false);
+                self.mark_waiting(&request.tool_call.tool_call_id.to_string(), false);
+                withdrawn(&request);
+            }
+        }
+        let asked = self
+            .pending_questions
+            .borrow()
+            .as_ref()
+            .is_some_and(|pending| pending.reply.is_closed());
+        if asked {
+            if let Some(pending) = self.pending_questions.borrow_mut().take() {
+                self.clear_notification("question");
+                self.permission_bar.set_reveal_child(false);
+                if let Some(id) = &pending.form.tool_call {
+                    self.mark_waiting(id, false);
+                }
+            }
+        }
+        if up || asked {
+            self.note_activity();
+            self.sync_busy_row();
+            self.next_permission();
+        }
+    }
+
     fn drop_questions(&self) {
         if let Some(pending) = self.pending_questions.borrow_mut().take() {
             self.clear_notification("question");
@@ -15160,8 +15228,18 @@ fn standing_tool(request: &RequestPermissionRequest) -> Option<String> {
     if request.tool_call.fields.kind == Some(ToolKind::Execute) {
         return None;
     }
-    let title = request.tool_call.fields.title.as_deref()?;
-    mcp_tool_name(title).filter(|name| taste_mcp::is_ide_tool(name))
+    mcp_tool_name(&request_key(request)?).filter(|name| taste_mcp::is_ide_tool(name))
+}
+
+/// What a permission question's call is told apart by (`call_key`): the
+/// name it carries, or the one `ChatPane::on_permission` filled in from
+/// the call's step, before its title.
+fn request_key(request: &RequestPermissionRequest) -> Option<String> {
+    let fields = &request.tool_call.fields;
+    let title = fields.title.as_deref().unwrap_or_default();
+    Some(call_key(fields.name.as_deref(), title))
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
 }
 
 /// The line under the answers saying what a standing one would bind — or
@@ -15287,6 +15365,23 @@ enum ActKind {
     /// `environment_reinstantiate` — a move to a VM on the current guest
     /// release, or a rebuild on updated packages, approved.
     Migrated,
+}
+
+/// What a call is told apart by: its programmatic name when the agent sent
+/// one, its title when it did not.
+///
+/// ACP made a tool call's `name` stable on 2026-09-17, beside the title
+/// that is for people. A title is whatever the adapter chose to say — the
+/// IDE rewrites an edit's to "Edit <file>" itself — and a shell command
+/// may be titled anything at all, so a title that reads as one of the
+/// IDE's tools is a guess. A name is what the agent called: Claude Code's
+/// `mcp__taste-ide__issue_create` for ours, `Bash` or `Read` for its own,
+/// which no tool of ours is. Every reader of a call's identity
+/// ([`mcp_tool_name`] and what is built on it) takes this rather than the
+/// title, so an agent that names its calls is read by name throughout, and
+/// one that does not is read as before.
+fn call_key<'a>(name: Option<&'a str>, title: &'a str) -> &'a str {
+    name.filter(|name| !name.trim().is_empty()).unwrap_or(title)
 }
 
 /// The IDE tool this title IS, if it is one — in whichever dress the agent
@@ -16021,14 +16116,9 @@ fn permission_face(
     // give them — so `ide_exec` asked "Ide Exec (IDE)", with the command it
     // wanted to run nowhere on the card. Read by name, the way the
     // transcript's steps already are (`is_command_call`).
-    let raw_title = request
-        .tool_call
-        .fields
-        .title
-        .as_deref()
-        .unwrap_or_default();
+    let key = request_key(request).unwrap_or_default();
     let raw_input = request.tool_call.fields.raw_input.as_ref();
-    let ide_tool = mcp_tool_name(raw_title);
+    let ide_tool = mcp_tool_name(&key);
     if let Some(name) = ide_tool.as_deref().filter(|name| is_ide_command_tool(name)) {
         return PermissionFace {
             icon: "utilities-terminal-symbolic",
@@ -16037,7 +16127,7 @@ fn permission_face(
             code: Some(command_input_line(name, raw_input).unwrap_or(detail)),
         };
     }
-    let detail = tool_headline(raw_title, raw_input).unwrap_or(detail);
+    let detail = tool_headline(&key, raw_input).unwrap_or(detail);
     let (icon, question) = match request.tool_call.fields.kind {
         Some(ToolKind::Execute) => ("utilities-terminal-symbolic", Some("Run a command?")),
         Some(ToolKind::Edit) => ("document-edit-symbolic", Some("Edit a file?")),
@@ -16566,6 +16656,7 @@ fn session_event_label(event: &SessionEvent) -> String {
         }
         SessionEvent::Permission { .. } => "a permission request".into(),
         SessionEvent::Elicitation { .. } => "questions".into(),
+        SessionEvent::Withdrawn => "a question taken back".into(),
         SessionEvent::PromptFailed { .. } => "a failed prompt".into(),
         SessionEvent::Closed(_) => "the session closing".into(),
         _ => "a session event".into(),
@@ -17517,6 +17608,24 @@ mod tests {
         .unwrap();
         assert!(refusal.contains("Kept for this project"), "{refusal}");
         assert!(!refusal.contains("runs code"), "{refusal}");
+
+        // A call that carries its name is read by it, not by its title:
+        // the IDE's tool asked about in words is still the IDE's tool, and
+        // the agent's shell titled like one is not.
+        let named = |name: &str, title: &str| {
+            let mut request = ask(title, true);
+            request.tool_call.fields.name = Some(name.into());
+            request
+        };
+        assert_eq!(
+            standing_tool(&named(
+                "mcp__taste-ide__ide_search",
+                "Searching the project"
+            ))
+            .as_deref(),
+            Some("ide_search")
+        );
+        assert_eq!(standing_tool(&named("Bash", "ide_search")), None);
 
         // An agent's own tool has no grain the IDE can key on…
         assert_eq!(standing_tool(&ask("Bash", true)), None);

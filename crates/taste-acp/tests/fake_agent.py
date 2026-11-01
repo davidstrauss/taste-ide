@@ -40,6 +40,11 @@ with AskUserQuestion — an `elicitation/create` form, sent only to a client
 that advertised form elicitation — and replies with the client's answer as
 JSON, or "ask unsupported" when the capability is absent.
 
+"/takeback" asks the client for permission and then takes the question
+back with `$/cancel_request`, as the pinned Claude adapter does when the
+call it asked about stops mattering, and replies with the client's answer
+to the request it withdrew.
+
 "/termhold COMMAND" creates a terminal and returns its id WITHOUT waiting,
 so a test can watch a long-running command while it runs — the case the
 console's Kill button exists for. "/termstatus ID" and "/termrelease ID"
@@ -144,6 +149,22 @@ def call_client(method, params):
                 # generic JSON-RPC message.
                 return {"error": json.dumps(reply["error"])}
             return reply.get("result", {})
+
+
+def take_back(method, params):
+    """Send a request to the client, cancel it, and wait for its answer."""
+    request_id = next_request_id[0]
+    next_request_id[0] += 1
+    send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+    send({"jsonrpc": "2.0", "method": "$/cancel_request",
+          "params": {"requestId": request_id}})
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            sys.exit(0)
+        reply = json.loads(line) if line.strip() else None
+        if reply and reply.get("id") == request_id and "method" not in reply:
+            return reply.get("result", reply.get("error"))
 
 
 while True:
@@ -270,6 +291,17 @@ while True:
                 },
             })
             reply("ask " + json.dumps(answered, sort_keys=True))
+            continue
+        if prompt == "/takeback":
+            answered = take_back("session/request_permission", {
+                "sessionId": session_id,
+                "toolCall": {"toolCallId": "toolu_takeback", "title": "rm -rf build"},
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "deny", "name": "Reject", "kind": "reject_once"},
+                ],
+            })
+            reply("takeback " + json.dumps(answered, sort_keys=True))
             continue
         if prompt == "/termcap":
             # Exactly the check a real adapter makes before it prefers a
