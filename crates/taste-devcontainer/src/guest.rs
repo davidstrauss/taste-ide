@@ -67,17 +67,17 @@ pub const STREAM_URL: &str = "https://builds.coreos.fedoraproject.org/streams/st
 /// builds its first VM from. Moving it means moving the digests below with
 /// it, in the same commit, from the same stream document — and it needs
 /// moving only so that a fresh machine offline does not start far behind.
-pub const RELEASE: &str = "44.20260829.3.1";
+pub const RELEASE: &str = "44.20261012.3.1";
 
-const QCOW_URL_X86_64: &str = "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20260829.3.1/x86_64/fedora-coreos-44.20260829.3.1-qemu.x86_64.qcow2.xz";
-const QCOW_SHA256_X86_64: &str = "a0aa13c4c88519c9c3ee6a16101f84c9f4184fc4eb1e687779b31177e540c12e";
+const QCOW_URL_X86_64: &str = "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20261012.3.1/x86_64/fedora-coreos-44.20261012.3.1-qemu.x86_64.qcow2.xz";
+const QCOW_SHA256_X86_64: &str = "e416c392f0c7963584516881c3cd3fac096bbe4f208ca6290ba7616c77383395";
 const QCOW_UNCOMPRESSED_SHA256_X86_64: &str =
-    "46d90f2b792b17ea3b9105326ee068c6a2756d804757ebb8e4ea3aaf9e7ac75c";
-const QCOW_URL_AARCH64: &str = "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20260829.3.1/aarch64/fedora-coreos-44.20260829.3.1-qemu.aarch64.qcow2.xz";
+    "efe134f167e22b3e21d8c3cb643e59e814286202d2f0350b080eebbc23bc31d8";
+const QCOW_URL_AARCH64: &str = "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20261012.3.1/aarch64/fedora-coreos-44.20261012.3.1-qemu.aarch64.qcow2.xz";
 const QCOW_SHA256_AARCH64: &str =
-    "2451e271691faa49f6f7f3d9a87d5aabe8b52ffcbcd7cf8790d2b574c389c10a";
+    "776af148b069327c9a3b482d935955cd980114987b2998b6a217d6ed7f7259e1";
 const QCOW_UNCOMPRESSED_SHA256_AARCH64: &str =
-    "d526f511cd7bd48c6a369310d09f6e6598b7a1a90b5e6776e99f7cc223e1fcda";
+    "c45d1e8100569f8ff35f93a09dabdffc1fd6c56005e044f35c099f3c84edb030";
 
 /// One architecture's qemu image: the stream's current release, or the
 /// release compiled in when the stream has never been read.
@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn the_release_names_its_day_and_a_unix_time_its_date() {
         let image = pinned_for("x86_64").unwrap();
-        assert_eq!(image.release_date().as_deref(), Some("2026-08-29"));
+        assert_eq!(image.release_date().as_deref(), Some("2026-10-12"));
         assert_eq!(civil_date(0), "1970-01-01");
         assert_eq!(civil_date(1_789_000_000), "2026-09-10");
     }
@@ -1129,14 +1129,14 @@ mod tests {
         "x86_64": {
           "artifacts": {
             "qemu": {
-              "release": "44.20260829.3.1",
+              "release": "44.20261012.3.1",
               "formats": {
                 "qcow2.xz": {
                   "disk": {
-                    "location": "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20260829.3.1/x86_64/fedora-coreos-44.20260829.3.1-qemu.x86_64.qcow2.xz",
+                    "location": "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/44.20261012.3.1/x86_64/fedora-coreos-44.20261012.3.1-qemu.x86_64.qcow2.xz",
                     "signature": "https://example.invalid/sig",
-                    "sha256": "a0aa13c4c88519c9c3ee6a16101f84c9f4184fc4eb1e687779b31177e540c12e",
-                    "uncompressed-sha256": "46d90f2b792b17ea3b9105326ee068c6a2756d804757ebb8e4ea3aaf9e7ac75c"
+                    "sha256": "e416c392f0c7963584516881c3cd3fac096bbe4f208ca6290ba7616c77383395",
+                    "uncompressed-sha256": "efe134f167e22b3e21d8c3cb643e59e814286202d2f0350b080eebbc23bc31d8"
                   }
                 }
               }
@@ -1144,7 +1144,7 @@ mod tests {
           },
           "images": {
             "aws": { "regions": { "us-east-1": {}, "eu-west-1": {} } },
-            "gcp": { "image": "fedora-coreos-44-20260829-3-1-gcp-x86-64", "project": "fedora-coreos-cloud" },
+            "gcp": { "image": "fedora-coreos-44-20261012-3-1-gcp-x86-64", "project": "fedora-coreos-cloud" },
             "kubevirt": { "image": "quay.io/fedora/fedora-coreos-kubevirt:stable" }
           }
         }
@@ -1154,7 +1154,7 @@ mod tests {
     #[test]
     fn a_stream_document_yields_the_release_and_its_disk() {
         let stream = parse_stream(STREAM_FIXTURE, "x86_64").unwrap();
-        assert_eq!(stream.release, "44.20260829.3.1");
+        assert_eq!(stream.release, "44.20261012.3.1");
         assert!(
             stream.url.ends_with("qemu.x86_64.qcow2.xz"),
             "{}",
@@ -1162,7 +1162,7 @@ mod tests {
         );
         assert_eq!(
             stream.sha256,
-            "a0aa13c4c88519c9c3ee6a16101f84c9f4184fc4eb1e687779b31177e540c12e"
+            "e416c392f0c7963584516881c3cd3fac096bbe4f208ca6290ba7616c77383395"
         );
     }
 
@@ -1174,7 +1174,7 @@ mod tests {
         let platforms: Vec<&str> = stream.cloud.iter().map(|c| c.platform.as_str()).collect();
         assert_eq!(platforms, vec!["aws", "gcp", "kubevirt"]);
         let gcp = stream.cloud.iter().find(|c| c.platform == "gcp").unwrap();
-        assert!(gcp.image.contains("44-20260829-3-1"), "{}", gcp.image);
+        assert!(gcp.image.contains("44-20261012-3-1"), "{}", gcp.image);
         // AWS is per-region, so the answer is a count and says so.
         let aws = stream.cloud.iter().find(|c| c.platform == "aws").unwrap();
         assert_eq!(aws.image, "2 region(s)");
@@ -1246,12 +1246,12 @@ mod tests {
     /// A pin that is behind is reported, not acted on.
     #[test]
     fn an_older_pin_is_simply_not_current() {
-        let moved = STREAM_FIXTURE.replace("44.20260829.3.1", "44.20261002.3.0");
+        let moved = STREAM_FIXTURE.replace("44.20261012.3.1", "44.20261026.3.0");
         let stream = parse_stream(&moved, "x86_64").unwrap();
         assert!(!pin_is_current(&stream));
         // ...and the constants have not moved, because nothing here moves
         // them.
-        assert_eq!(RELEASE, "44.20260829.3.1");
+        assert_eq!(RELEASE, "44.20261012.3.1");
     }
 
     #[test]

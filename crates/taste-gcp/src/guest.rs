@@ -37,16 +37,17 @@ use crate::model::{ModelSpec, GOOGLE_APIS_ADDRESS, SERVER_PORT};
 use crate::signed::HOST;
 
 /// The llama.cpp server, CPU build, pinned by its amd64 manifest digest:
-/// release `b11371` (2026-10-03), after the GLM indexer work (#25407).
+/// release `b12030` (2026-11-01), the newest with a published server image;
+/// the GLM indexer work it first needed for (#25407, `b11371`) is in it.
 pub const SERVER_IMAGE: &str =
-    "ghcr.io/ggml-org/llama.cpp@sha256:5d58fdc8b2cadfad36c89ecf38b4a50069653500551a6842b0157a2d82d065f3";
+    "ghcr.io/ggml-org/llama.cpp@sha256:3944f77ce0553ebd2d5466871fa73d1de998b981be5442424e18157013fe62fd";
 
 /// That image's ID — the digest of its config, which `podman save` and
 /// `podman load` leave as it was, unlike the manifest's. Read from the
 /// registry's manifest for [`SERVER_IMAGE`] (its `config.digest`). Both
 /// guests check it: staging before it uploads, serving after it loads.
 pub const SERVER_IMAGE_ID: &str =
-    "400a06a24bc582ed4a8ae5bbaac185e1d16ae269e0dd206ce464022c54ccc69e";
+    "b8c163c47b0e664d0c7b370b87926f9825cb035c924dd14bbc34836e190f602b";
 
 /// The server image's name in the bucket.
 pub fn image_object() -> String {
@@ -60,7 +61,7 @@ pub const IMAGE_FILE: &str = "llama-server.tar";
 /// The Fedora CoreOS release the cloud guests boot: the local pool's own
 /// (`taste_devcontainer::guest::RELEASE`), held equal to it by a test in
 /// `taste-app`, so a guest in GCP and one under libvirt are one system.
-pub const FCOS_RELEASE: &str = "44.20260829.3.1";
+pub const FCOS_RELEASE: &str = "44.20261012.3.1";
 
 /// A stable hash of a guest's Ignition config, kept in the instance's
 /// metadata (`CONFIG_ATTRIBUTE`), so a VM booted from an older config is

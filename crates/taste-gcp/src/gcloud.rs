@@ -39,15 +39,15 @@ pub struct Sdk {
     pub bytes: u64,
 }
 
-/// Measured 2026-10-03: the archive runs in place with its bundled Python
-/// 3.14.7, offers `compute start-iap-tunnel` and impersonation through the
-/// environment, and with `CLOUDSDK_CONFIG` set writes nothing to
-/// `~/.config/gcloud`. Extracted, it is about 490 MB.
+/// Measured 2026-11-01, as 587.0.0 was on 2026-10-03: the archive runs in
+/// place with its bundled Python 3.14.9, offers `compute start-iap-tunnel`
+/// and impersonation through the environment, and with `CLOUDSDK_CONFIG`
+/// set writes nothing to the home directory. Extracted, it is about 490 MB.
 pub const SDK: Sdk = Sdk {
-    version: "587.0.0",
-    url: "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-587.0.0-linux-x86_64.tar.gz",
-    sha256: "57df2448d259c654796a3703af8e5b53a02d439715b2034d6bb811efc2d6dd7b",
-    bytes: 88_004_933,
+    version: "591.0.0",
+    url: "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-591.0.0-linux-x86_64.tar.gz",
+    sha256: "78c570f5fcfe58a9311bd98c06b75530595e3cae6277aad75a676a39e6ee7b63",
+    bytes: 94_410_079,
 };
 
 /// `$XDG_DATA_HOME/taste-ide/gcloud`, or `~/.local/share/taste-ide/gcloud`.
@@ -673,6 +673,7 @@ mod tests {
     fn the_pin_is_well_formed() {
         assert_eq!(SDK.sha256.len(), 64);
         assert!(SDK.url.contains(SDK.version));
-        assert!(binary(Path::new("/r"), &SDK).ends_with("587.0.0/google-cloud-sdk/bin/gcloud"));
+        assert!(binary(Path::new("/r"), &SDK)
+            .ends_with(format!("{}/google-cloud-sdk/bin/gcloud", SDK.version)));
     }
 }
