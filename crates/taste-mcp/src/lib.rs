@@ -8,13 +8,17 @@
 //! a unix socket in `$XDG_RUNTIME_DIR`. Agents connect through the stdio
 //! bridge (`taste-ide --mcp-bridge <socket>`), which the IDE registers in
 //! every agent session's MCP server list. The protocol surface is small and
-//! fixed, so it is implemented directly rather than through an SDK.
+//! fixed, so it is implemented directly rather than through an SDK: both
+//! revisions a client may speak, 2025-06-18 (an `initialize` handshake) and
+//! 2026-07-28 (stateless, each request saying its version), and on the
+//! second the tasks extension (`tasks.rs`).
 
 mod exec;
 mod lsp;
 mod orchestration;
 mod protocol;
 mod server;
+mod tasks;
 
 pub use server::{
     guidance, guidance_without_memory, socket_path, stdio_bridge, GitFetchOutcome, GitFetcher,

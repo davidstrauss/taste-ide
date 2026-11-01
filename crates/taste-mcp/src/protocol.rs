@@ -1,9 +1,22 @@
-//! Minimal MCP wire types (JSON-RPC 2.0, 2025-06-18 protocol revision).
+//! Minimal MCP wire types (JSON-RPC 2.0; protocol revisions 2025-06-18 and
+//! 2026-07-28).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The revision an `initialize` handshake agrees on.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// The stateless revision: no handshake, every request naming its version
+/// and the client's capabilities in its `_meta`, every result its
+/// `resultType`.
+pub const STATELESS_VERSION: &str = "2026-07-28";
+
+/// Every revision this server speaks, as `server/discover` lists them.
+pub const SUPPORTED_VERSIONS: [&str; 2] = [STATELESS_VERSION, PROTOCOL_VERSION];
+
+/// Where a stateless request names its revision.
+pub const VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -30,6 +43,8 @@ pub struct Response {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl Response {
@@ -50,8 +65,19 @@ impl Response {
             error: Some(RpcError {
                 code,
                 message: message.into(),
+                data: None,
             }),
         }
+    }
+
+    /// An error that carries what the client needs to act on it: the
+    /// versions to retry with, the capability to declare.
+    pub fn err_with(id: Value, code: i64, message: impl Into<String>, data: Value) -> Self {
+        let mut response = Self::err(id, code, message);
+        if let Some(error) = response.error.as_mut() {
+            error.data = Some(data);
+        }
+        response
     }
 }
 

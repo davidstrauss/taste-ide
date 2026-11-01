@@ -2122,6 +2122,45 @@ announces environments appearing and disappearing, so a clone restored at
 startup gets a socket exactly as a fresh one does and a destroyed
 environment loses both its socket and its per-environment services.
 
+**Two revisions, and tasks on the newer.** The server speaks MCP
+2025-06-18, whose `initialize` handshake agrees the version once, and
+2026-07-28, which is stateless: `server/discover` lists both, a request
+names its revision and the client's capabilities in its own `_meta` and
+is checked on arrival (`-32022` for one it does not speak), and every
+result says its `resultType`. A request that names no revision is the
+older one, answered as it always was. Claude Code's v2 MCP runtime asks a
+stdio server which it speaks and uses the newer where it can (Claude Code
+docs, MCP → "MCP client runtimes"); the SDK that runtime is built on,
+`@modelcontextprotocol/client` 2.4, was run against this server and
+negotiated 2026-07-28, listed and called tools, and fell back to the
+handshake when told to.
+
+On the newer revision the server offers the tasks extension
+(`io.modelcontextprotocol/tasks`, `taste-mcp/src/tasks.rs`). A
+`tools/call` that declares it and is still running after five seconds
+answers as a task, which the client follows with `tasks/get` until it
+ends, without the agent spending turns or being held; a quick call
+answers as a call. In a call that may become a task, the tools that wait —
+`ide_exec`, `ide_exec_output`, `wait`, `task_run`, `devcontainer_reload` —
+wait to the end of what they wait on, up to thirty minutes, rather than the
+two minutes a call holding the agent may take, so a cold build comes back
+as its result instead of a handle to poll. A task belongs to the
+environment whose socket started it, and every `tasks/*` request is
+answered on that socket only: another environment's agent is told it does
+not exist. The store is the server's, not a connection's, so an agent that
+dies with its container in a rebuild finds its task again when it comes
+back on the same socket. The task shapes were checked against the
+extension package's own guards (`@modelcontextprotocol/ext-tasks` 0.2).
+
+Whether Claude Code makes tasks of our calls is its decision, and its
+documentation names what it needs: Claude Code 2.1.304 or later, a
+session that fetches feature flags, and, for an Agent SDK session (which
+is what the ACP adapter runs), `CLAUDE_AUTO_BACKGROUND_TASKS=1`. The pinned
+adapter (`taste_core::orchestration::CLAUDE_CODE_ADAPTER`, 0.81.0) carries
+Claude Code 2.1.280, so until it moves, its agents call the IDE's tools as
+calls on whichever revision their runtime picks; the IDE side is ready for
+the move.
+
 Tools split in two, and the split is not arbitrary:
 
 - **Environment-facing** — they describe a world with a checkout, a

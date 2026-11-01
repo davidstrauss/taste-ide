@@ -38,7 +38,11 @@ use taste_git::{GitWorkspace, PublishMode, PublishOutcome, PublishStatus, RefUpd
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::protocol::{tool, tool_result, Request, Response, PROTOCOL_VERSION};
+use crate::protocol::{
+    tool, tool_result, Request, Response, PROTOCOL_VERSION, STATELESS_VERSION, SUPPORTED_VERSIONS,
+    VERSION_META,
+};
+use crate::tasks::{self, Tasks};
 
 pub use taste_core::mcp::socket_path;
 
@@ -181,6 +185,11 @@ pub struct McpServer {
     /// the strip their questions are asked on ([`McpServer::set_git_fetcher`]).
     /// Unset, the tool says the IDE cannot fetch for it.
     git_fetcher: Mutex<Option<GitFetcher>>,
+    /// The calls that answered as MCP tasks, every environment's
+    /// (`tasks.rs`): the server's rather than a connection's, so an agent
+    /// that comes back on its socket after a rebuild finds the task it
+    /// started before.
+    tasks: Tasks,
 }
 
 /// What a `git_fetch` came to, as the app's fetcher reports it.
@@ -221,6 +230,7 @@ impl McpServer {
             semantic: Mutex::new(None),
             listeners: Mutex::new(BTreeMap::new()),
             git_fetcher: Mutex::new(None),
+            tasks: Tasks::default(),
         })
     }
 
@@ -1008,23 +1018,7 @@ impl McpServer {
             let tools = tools.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let method = request.method.clone();
-                let tool = request.params["name"].as_str().map(str::to_string);
-                // A tool that never returns is a hung agent. Nothing here
-                // legitimately outlives this watchdog: the slow paths carry
-                // their own, smaller bounds.
-                let response = match tokio::time::timeout(
-                    TOOL_WATCHDOG,
-                    this.dispatch(&env, &tools, &request.method, request.params, id.clone()),
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(_) => Response::ok(
-                        id,
-                        tool_result(&json!({ "error": overran(&method, tool.as_deref()) }), true),
-                    ),
-                };
+                let response = this.answer(&env, &tools, request, id).await;
                 if let Ok(mut payload) = serde_json::to_vec(&response) {
                     payload.push(b'\n');
                     let _ = responses.send(payload);
@@ -1036,6 +1030,175 @@ impl McpServer {
         result
     }
 
+    /// One request's answer, in the revision it was asked in.
+    ///
+    /// A request that names its revision in `_meta` is in the stateless
+    /// one, 2026-07-28: there was no handshake to agree a version at, so it
+    /// is checked here, on every request, and every result says its
+    /// `resultType`. A request that names none is in the handshake revision
+    /// and answered as it always was. A stateless `tools/call` that
+    /// declares the tasks extension may answer as a task
+    /// ([`McpServer::call_as_task`]).
+    async fn answer(
+        self: &Arc<Self>,
+        env: &EnvironmentId,
+        tools: &Arc<Vec<Value>>,
+        request: Request,
+        id: Value,
+    ) -> Response {
+        let Request { method, params, .. } = request;
+        let stateless = match params["_meta"][VERSION_META].as_str() {
+            None => false,
+            Some(STATELESS_VERSION) => true,
+            Some(version) => {
+                return Response::err_with(
+                    id,
+                    -32022,
+                    "Unsupported protocol version",
+                    json!({ "supported": SUPPORTED_VERSIONS, "requested": version }),
+                );
+            }
+        };
+        if stateless && method == "tools/call" && tasks::declared(&params) && self.tasks.has_room()
+        {
+            return framed(self.call_as_task(env, tools, params, id).await);
+        }
+        let tool = params["name"].as_str().map(str::to_string);
+        // A tool that never returns is a hung agent. Nothing here
+        // legitimately outlives this watchdog: the slow paths carry their
+        // own, smaller bounds.
+        let response = match tokio::time::timeout(
+            TOOL_WATCHDOG,
+            self.dispatch(env, tools, &method, params, id.clone(), stateless),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => Response::ok(
+                id,
+                tool_result(&json!({ "error": overran(&method, tool.as_deref()) }), true),
+            ),
+        };
+        // Discovery is the stateless revision's own question, so it is
+        // answered in that revision whoever asks.
+        if stateless || method == "server/discover" {
+            framed(response)
+        } else {
+            response
+        }
+    }
+
+    /// A `tools/call` that may answer as an MCP task (`tasks.rs`).
+    ///
+    /// The call runs as it would, in [`tasks::scope`], where the tools that
+    /// wait wait to the end of what they wait on. If it ends within
+    /// [`tasks::PROMOTE_AFTER`] it answers as a call; if not, it becomes a
+    /// task, stored before the answer that names it, and runs on to its
+    /// end, which the client collects with `tasks/get`.
+    async fn call_as_task(
+        self: &Arc<Self>,
+        env: &EnvironmentId,
+        tools: &Arc<Vec<Value>>,
+        params: Value,
+        id: Value,
+    ) -> Response {
+        let tool = params["name"].as_str().unwrap_or_default().to_string();
+        let mut work = {
+            let this = self.clone();
+            let env = env.clone();
+            let tools = tools.clone();
+            let tool = tool.clone();
+            tokio::spawn(tasks::scope(async move {
+                match tokio::time::timeout(
+                    tasks::TASK_WATCHDOG,
+                    this.tool_call_result(&env, &tools, &params),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => tool_result(
+                        &json!({ "error": overran_task(&tool, tasks::TASK_WATCHDOG) }),
+                        true,
+                    ),
+                }
+            }))
+        };
+        let ended = match tokio::time::timeout(tasks::PROMOTE_AFTER, &mut work).await {
+            Ok(ended) => ended,
+            Err(_) => match self.tasks.create(env, &tool, work.abort_handle()) {
+                Some(task) => {
+                    let this = self.clone();
+                    let finished = task.clone();
+                    tokio::spawn(async move {
+                        match work.await {
+                            Ok(result) => this.tasks.complete(&finished, result),
+                            // Cancelled: the cancel already said so.
+                            Err(stopped) if stopped.is_cancelled() => {}
+                            Err(_) => this.tasks.fail(&finished, "the call stopped unexpectedly"),
+                        }
+                    });
+                    return Response::ok(id, tasks::created(&self.tasks, env, &task));
+                }
+                // The room went between the look and the take: this one
+                // answers as a call, in a call's bound.
+                None => match tokio::time::timeout(TOOL_WATCHDOG, &mut work).await {
+                    Ok(ended) => ended,
+                    Err(_) => {
+                        work.abort();
+                        let said = overran("tools/call", Some(&tool));
+                        return Response::ok(id, tool_result(&json!({ "error": said }), true));
+                    }
+                },
+            },
+        };
+        let result = ended.unwrap_or_else(|_| {
+            tool_result(&json!({ "error": "the call stopped unexpectedly" }), true)
+        });
+        Response::ok(id, self.nudged(env, result))
+    }
+
+    /// `tasks/get`, `tasks/update`, and `tasks/cancel`: for a client that
+    /// declared the extension on this request, about a task of this
+    /// environment's, which is the only kind it can be told about
+    /// (`tasks.rs`).
+    fn task_request(
+        &self,
+        env: &EnvironmentId,
+        method: &str,
+        params: &Value,
+        id: Value,
+    ) -> Response {
+        if !tasks::declared(params) {
+            return Response::err_with(
+                id,
+                -32021,
+                "Missing required client capability",
+                json!({ "requiredCapabilities": { "extensions": { tasks::EXTENSION: {} } } }),
+            );
+        }
+        let task = params["taskId"].as_str().unwrap_or_default();
+        let unknown = |id| Response::err(id, -32602, format!("no task {task}"));
+        match method {
+            "tasks/get" => match self.tasks.get(env, task) {
+                Some(mut detailed) => {
+                    // The ask for a turn rides on a result the agent reads
+                    // (`nudged`), and a task's is read here.
+                    if detailed["status"] == "completed" {
+                        let result = detailed["result"].take();
+                        detailed["result"] = self.nudged(env, result);
+                    }
+                    Response::ok(id, detailed)
+                }
+                None => unknown(id),
+            },
+            "tasks/cancel" if self.tasks.cancel(env, task) => Response::ok(id, json!({})),
+            // No task here asks for input, so every response is to a key
+            // that is not outstanding, which the extension says to ignore.
+            "tasks/update" if self.tasks.knows(env, task) => Response::ok(id, json!({})),
+            _ => unknown(id),
+        }
+    }
+
     async fn dispatch(
         &self,
         env: &EnvironmentId,
@@ -1043,6 +1206,7 @@ impl McpServer {
         method: &str,
         params: Value,
         id: Value,
+        stateless: bool,
     ) -> Response {
         match method {
             "initialize" => Response::ok(
@@ -1058,69 +1222,111 @@ impl McpServer {
                     "instructions": self.instructions(env),
                 }),
             ),
+            "server/discover" => Response::ok(
+                id,
+                json!({
+                    "supportedVersions": SUPPORTED_VERSIONS,
+                    "capabilities": {
+                        "tools": {},
+                        "extensions": { tasks::EXTENSION: {} },
+                    },
+                    "instructions": self.instructions(env),
+                    // The instructions follow the environment's state, so
+                    // nothing here is kept.
+                    "ttlMs": 0,
+                    "cacheScope": "private",
+                }),
+            ),
             "ping" => Response::ok(id, json!({})),
-            "tools/list" => Response::ok(id, json!({ "tools": tools })),
+            "tools/list" => {
+                let mut listed = json!({ "tools": tools });
+                if stateless {
+                    // A connection's catalog is fixed, but whose tools a
+                    // socket serves can move (the coordinator's), so the
+                    // client is not told to keep it.
+                    listed["ttlMs"] = json!(0);
+                    listed["cacheScope"] = json!("private");
+                }
+                Response::ok(id, listed)
+            }
             "tools/call" => {
-                let result = 'call: {
-                    let name = params["name"].as_str().unwrap_or_default().to_string();
-                    let args = params["arguments"].clone();
-                    // What a role was not listed is refused, not merely unseen:
-                    // hidden alone, a clone's socket could still call the
-                    // primary's screenshot, selection, and editor tools by name
-                    // (review, 2026-09-23). The four names `environment`
-                    // replaced stay callable, unlisted, as the listing says.
-                    const REPLACED: [&str; 4] = [
-                        "devcontainer_status",
-                        "devcontainer_logs",
-                        "devcontainer_resources",
-                        "ide_environment",
-                    ];
-                    // The tools with a refusal of their own, which says what
-                    // the caller can do instead, keep it.
-                    let own_gate = crate::orchestration::is_write(&name)
-                        || matches!(name.as_str(), "publish" | "update_from_main");
-                    let listed = tools
-                        .iter()
-                        .any(|t| t["name"].as_str() == Some(name.as_str()));
-                    if !listed
-                        && !own_gate
-                        && !REPLACED.contains(&name.as_str())
-                        && name != taste_core::nudge::TAKE_TOOL
-                    {
-                        break 'call tool_result(
-                            &json!({"error": format!("{name} is not a tool of this environment")}),
-                            true,
-                        );
-                    }
-                    // The non-JSON tools: a screenshot's payload, and an issue's
-                    // image attachment, are MCP image content blocks, not
-                    // JSON-as-text.
-                    if name == "ide_read_file" {
-                        break 'call match self.read_file_tool(env, &args).await {
-                            Ok(result) => result,
-                            Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
-                        };
-                    }
-                    if name == "ide_screenshot" || name == "issue_attachment" {
-                        let result = if name == "ide_screenshot" {
-                            self.screenshot_tool(args).await
-                        } else {
-                            self.issue_attachment_tool(args).await
-                        };
-                        break 'call match result {
-                            Ok(result) => result,
-                            Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
-                        };
-                    }
-                    match self.call_tool(env, &name, args).await {
-                        Ok(value) => tool_result(&value, false),
-                        Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
-                    }
-                };
-                Response::ok(id, self.nudged(env, self.withheld(env, result)))
+                let result = self.tool_call_result(env, tools, &params).await;
+                Response::ok(id, self.nudged(env, result))
+            }
+            "tasks/get" | "tasks/update" | "tasks/cancel" => {
+                self.task_request(env, method, &params, id)
             }
             _ => Response::err(id, -32601, format!("method not found: {method}")),
         }
+    }
+
+    /// What a `tools/call` answers, as a `CallToolResult`: refused when this
+    /// environment's socket does not serve the tool, and with the images
+    /// taken out when the agent cannot read them (`withheld`). The ask for
+    /// a turn is added where the result is handed over (`nudged`).
+    async fn tool_call_result(
+        &self,
+        env: &EnvironmentId,
+        tools: &[Value],
+        params: &Value,
+    ) -> Value {
+        let result = 'call: {
+            let name = params["name"].as_str().unwrap_or_default().to_string();
+            let args = params["arguments"].clone();
+            // What a role was not listed is refused, not merely unseen:
+            // hidden alone, a clone's socket could still call the
+            // primary's screenshot, selection, and editor tools by name
+            // (review, 2026-09-23). The four names `environment`
+            // replaced stay callable, unlisted, as the listing says.
+            const REPLACED: [&str; 4] = [
+                "devcontainer_status",
+                "devcontainer_logs",
+                "devcontainer_resources",
+                "ide_environment",
+            ];
+            // The tools with a refusal of their own, which says what
+            // the caller can do instead, keep it.
+            let own_gate = crate::orchestration::is_write(&name)
+                || matches!(name.as_str(), "publish" | "update_from_main");
+            let listed = tools
+                .iter()
+                .any(|t| t["name"].as_str() == Some(name.as_str()));
+            if !listed
+                && !own_gate
+                && !REPLACED.contains(&name.as_str())
+                && name != taste_core::nudge::TAKE_TOOL
+            {
+                break 'call tool_result(
+                    &json!({"error": format!("{name} is not a tool of this environment")}),
+                    true,
+                );
+            }
+            // The non-JSON tools: a screenshot's payload, and an issue's
+            // image attachment, are MCP image content blocks, not
+            // JSON-as-text.
+            if name == "ide_read_file" {
+                break 'call match self.read_file_tool(env, &args).await {
+                    Ok(result) => result,
+                    Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
+                };
+            }
+            if name == "ide_screenshot" || name == "issue_attachment" {
+                let result = if name == "ide_screenshot" {
+                    self.screenshot_tool(args).await
+                } else {
+                    self.issue_attachment_tool(args).await
+                };
+                break 'call match result {
+                    Ok(result) => result,
+                    Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
+                };
+            }
+            match self.call_tool(env, &name, args).await {
+                Ok(value) => tool_result(&value, false),
+                Err(e) => tool_result(&json!({"error": format!("{e:#}")}), true),
+            }
+        };
+        self.withheld(env, result)
     }
 
     /// Wait until `ready`, `timeout`, or a message from the user for `env`'s
@@ -1177,8 +1383,9 @@ impl McpServer {
             .as_array()
             .map(|items| items.iter().filter_map(Value::as_u64).collect())
             .unwrap_or_default();
-        let asked = args["seconds"].as_u64().unwrap_or(WAIT_MAX_SECS);
-        let seconds = asked.clamp(1, WAIT_MAX_SECS);
+        let asked = args["seconds"].as_u64();
+        // As a task, to the end of what it waits on (`tasks::wait_secs`).
+        let seconds = tasks::wait_secs(asked, WAIT_MAX_SECS, WAIT_MAX_SECS).max(1);
         let board = &self.workspace.tasks;
         for name in &tasks {
             if board.state(env, name) == RunState::Idle {
@@ -1242,8 +1449,8 @@ impl McpServer {
             },
             "waited_seconds": started.elapsed().as_secs(),
         });
-        if asked > WAIT_MAX_SECS {
-            out["capped_to"] = json!(WAIT_MAX_SECS);
+        if asked.is_some_and(|asked| asked > seconds) {
+            out["capped_to"] = json!(seconds);
         }
         if !task_rows.is_empty() {
             out["tasks"] = json!(task_rows);
@@ -2219,10 +2426,13 @@ impl McpServer {
                 // tool watchdog leaves room for. A cold image build outlives
                 // it, and the answer then says so and hands over to
                 // `environment` rather than reading as a failure.
-                let wait = arg(&args, &["wait_seconds", "wait"])
-                    .as_u64()
-                    .unwrap_or(0)
-                    .min(RELOAD_WAIT_MAX_SECS);
+                // As a task, it waits for the reload to settle: the agent
+                // is not held, and the result is how the reload ended.
+                let wait = tasks::wait_secs(
+                    arg(&args, &["wait_seconds", "wait"]).as_u64(),
+                    0,
+                    RELOAD_WAIT_MAX_SECS,
+                );
                 let settled = wait > 0
                     && tokio::time::timeout(std::time::Duration::from_secs(wait), reloading)
                         .await
@@ -2719,7 +2929,7 @@ impl McpServer {
                 } else {
                     (command, argv)
                 };
-                let timeout = args["timeout_seconds"].as_u64().unwrap_or(60).clamp(1, 120);
+                let timeout = tasks::wait_secs(args["timeout_seconds"].as_u64(), 60, 120).max(1);
                 // The gate is "is there a container", not "is this container
                 // mode". Safe mode runs the IDE's baseline environment, and
                 // commands run there quite legitimately — the repair loop
@@ -2820,7 +3030,7 @@ impl McpServer {
                 let handle = arg(&args, &["handle", "id"]).as_u64().context(
                     "this tool needs a `handle`: the number ide_exec returned with its output",
                 )?;
-                let wait = args["wait_seconds"].as_u64().unwrap_or(60).clamp(1, 120);
+                let wait = tasks::wait_secs(args["wait_seconds"].as_u64(), 60, 120).max(1);
                 // Handles are per environment, so one is meaningless in
                 // another's namespace — which is the point: two agents
                 // polling handle 1 collect their own builds.
@@ -3958,10 +4168,7 @@ impl McpServer {
                     .as_str()
                     .context("task_run needs `name`: a task as task_list names it")?
                     .to_string();
-                let wait = args["wait_seconds"]
-                    .as_u64()
-                    .unwrap_or(60)
-                    .min(WAIT_MAX_SECS);
+                let wait = tasks::wait_secs(args["wait_seconds"].as_u64(), 60, WAIT_MAX_SECS);
                 let supervisor = self.supervisor(env)?;
                 // Through the environment's `task` wrapper while its channel
                 // is up, so the run outlives the IDE (`TaskBoard::start`).
@@ -6417,6 +6624,37 @@ fn overran(method: &str, tool: Option<&str>) -> String {
     )
 }
 
+/// What a task's call says when it outlived even a task's ceiling.
+fn overran_task(tool: &str, ceiling: std::time::Duration) -> String {
+    format!(
+        "{tool} did not finish within {} minutes, and the IDE stopped waiting for it. What it \
+         started may still be running: look before calling it again.",
+        ceiling.as_secs() / 60
+    )
+}
+
+/// A result as the stateless revision has every one: saying what kind of
+/// result it is, and which server gave it. A result that says already — a
+/// task's `"task"` — keeps what it says.
+fn framed(mut response: Response) -> Response {
+    if let Some(result) = response.result.as_mut().and_then(Value::as_object_mut) {
+        result
+            .entry("resultType")
+            .or_insert_with(|| json!("complete"));
+        if let Some(meta) = result
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        {
+            meta.insert(
+                "io.modelcontextprotocol/serverInfo".into(),
+                json!({ "name": "taste-ide", "version": env!("CARGO_PKG_VERSION") }),
+            );
+        }
+    }
+    response
+}
+
 /// How many replies `suggest_replies` shows, and how long each may be:
 /// choices in a chat column, not a menu. A choice is a radio's row that
 /// wraps, not a button's face, so a reply may say what it chooses whole
@@ -6791,6 +7029,196 @@ mod tests {
         ] {
             assert!(!names.contains(&folded), "{folded} is still listed");
         }
+    }
+
+    /// A request in the stateless revision (2026-07-28), with what the
+    /// client declares for this request: tasks, or nothing.
+    fn stateless(id: u64, method: &str, params: Value, with_tasks: bool) -> Value {
+        let mut params = params;
+        let extensions = if with_tasks {
+            json!({ crate::tasks::EXTENSION: {} })
+        } else {
+            json!({})
+        };
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "1" },
+            "io.modelcontextprotocol/clientCapabilities": { "extensions": extensions },
+        });
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+
+    /// The stateless revision is offered beside the handshake one, checked
+    /// on every request, and every result in it says what it is; the
+    /// handshake revision's answers are as they were.
+    #[tokio::test]
+    async fn the_stateless_revision_is_discovered_and_framed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _workspace) = start_test_server(dir.path()).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let discover = roundtrip(
+            &mut stream,
+            stateless(1, "server/discover", json!({}), false),
+        )
+        .await["result"]
+            .clone();
+        assert_eq!(discover["resultType"], "complete");
+        assert_eq!(
+            discover["supportedVersions"],
+            json!(["2026-07-28", "2025-06-18"])
+        );
+        assert!(discover["capabilities"]["tools"].is_object());
+        assert!(discover["capabilities"]["extensions"][crate::tasks::EXTENSION].is_object());
+        assert!(discover["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("inside taste-ide"));
+        assert_eq!(discover["ttlMs"], 0);
+        assert_eq!(discover["cacheScope"], "private");
+        assert_eq!(
+            discover["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "taste-ide"
+        );
+
+        let list = roundtrip(&mut stream, stateless(2, "tools/list", json!({}), false)).await;
+        assert_eq!(list["result"]["resultType"], "complete");
+        assert_eq!(list["result"]["cacheScope"], "private");
+        assert!(!list["result"]["tools"].as_array().unwrap().is_empty());
+
+        // A quick call answers as a call even where a task was possible.
+        let quick = roundtrip(
+            &mut stream,
+            stateless(
+                3,
+                "tools/call",
+                json!({ "name": "ide_guide", "arguments": {} }),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(quick["result"]["resultType"], "complete");
+        assert_eq!(quick["result"]["isError"], false);
+
+        let mut wrong = stateless(4, "ping", json!({}), false);
+        wrong["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("1900-01-01");
+        let refused = roundtrip(&mut stream, wrong).await;
+        assert_eq!(refused["error"]["code"], -32022);
+        assert_eq!(refused["error"]["data"]["requested"], "1900-01-01");
+        assert_eq!(
+            refused["error"]["data"]["supported"],
+            json!(["2026-07-28", "2025-06-18"])
+        );
+
+        // Asking after a task without declaring tasks is the missing
+        // capability, whether or not the task exists.
+        let undeclared = roundtrip(
+            &mut stream,
+            stateless(5, "tasks/get", json!({ "taskId": "nope" }), false),
+        )
+        .await;
+        assert_eq!(undeclared["error"]["code"], -32021);
+        let unknown = roundtrip(
+            &mut stream,
+            stateless(6, "tasks/get", json!({ "taskId": "nope" }), true),
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], -32602);
+
+        // The handshake revision is untouched by any of it.
+        let init = roundtrip(
+            &mut stream,
+            json!({"jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {}}),
+        )
+        .await;
+        assert_eq!(init["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert!(init["result"].get("resultType").is_none());
+    }
+
+    /// A call still running after the promotion window answers as a task,
+    /// which the client follows to its result; only its own environment's
+    /// socket is told about it, and a cancel stops one.
+    #[tokio::test]
+    async fn a_slow_call_answers_as_a_task_its_environment_collects() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, workspace, _environments) = build_test_server(dir.path());
+        let socket = serve_on(
+            &server,
+            EnvironmentId::primary(),
+            dir.path().join("mcp.sock"),
+        )
+        .await;
+        let other = EnvironmentId::parse("i-0009").unwrap();
+        let elsewhere = serve_on(&server, other, dir.path().join("other.sock")).await;
+        // A UI that answers the geometry probe only when told to.
+        let requests = workspace.ui.requests();
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let geometry = json!({ "name": "ide_widget_geometry", "arguments": { "target": "chat" } });
+
+        let created = roundtrip(
+            &mut stream,
+            stateless(1, "tools/call", geometry.clone(), true),
+        )
+        .await["result"]
+            .clone();
+        assert_eq!(created["resultType"], "task", "{created}");
+        assert_eq!(created["status"], "working");
+        assert_eq!(created["ttlMs"], Value::Null);
+        assert!(created["pollIntervalMs"].as_u64().unwrap() >= 250);
+        let task = created["taskId"].as_str().unwrap().to_string();
+        let get = |id: u64| stateless(id, "tasks/get", json!({ "taskId": task }), true);
+
+        let working = roundtrip(&mut stream, get(2)).await["result"].clone();
+        assert_eq!(working["status"], "working");
+        assert_eq!(working["resultType"], "complete");
+        let mut theirs = UnixStream::connect(&elsewhere).await.unwrap();
+        assert_eq!(
+            roundtrip(&mut theirs, get(3)).await["error"]["code"],
+            -32602
+        );
+        let cancel = stateless(4, "tasks/cancel", json!({ "taskId": task }), true);
+        assert_eq!(
+            roundtrip(&mut theirs, cancel).await["error"]["code"],
+            -32602
+        );
+
+        let (_, reply) = requests.recv().await.unwrap();
+        reply
+            .send(taste_core::ui_probe::UiReply::Geometry(
+                json!({ "panes": "measured" }),
+            ))
+            .await
+            .unwrap();
+        let mut done = Value::Null;
+        for attempt in 0..50 {
+            done = roundtrip(&mut stream, get(10 + attempt)).await["result"].clone();
+            if done["status"] != "working" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["result"]["isError"], false);
+        assert!(done["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("measured"));
+
+        // And one cancelled while it works says so, and stays so.
+        let created = roundtrip(&mut stream, stateless(70, "tools/call", geometry, true)).await
+            ["result"]
+            .clone();
+        let task = created["taskId"].as_str().unwrap().to_string();
+        let cancel = stateless(71, "tasks/cancel", json!({ "taskId": task }), true);
+        assert_eq!(
+            roundtrip(&mut stream, cancel).await["result"]["resultType"],
+            "complete"
+        );
+        let get = stateless(72, "tasks/get", json!({ "taskId": task }), true);
+        assert_eq!(
+            roundtrip(&mut stream, get).await["result"]["status"],
+            "cancelled"
+        );
     }
 
     /// A tool that blocks must not take the agent's other tools with it:

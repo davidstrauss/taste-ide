@@ -12,6 +12,8 @@ taste-flatpak.workspace = true
 taste-git.workspace = true
 anyhow.workspace = true
 base64.workspace = true
+# A task's id is unguessable (`tasks.rs`).
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
