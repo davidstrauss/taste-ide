@@ -23,7 +23,7 @@ taste-semantic.workspace = true
 # The diagram helper is started confined (mermaid.rs).
 taste-confine.workspace = true
 
-agent-client-protocol = "2.2"
+agent-client-protocol = "3.6"
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_8"] }
 sourceview5 = "0.11"

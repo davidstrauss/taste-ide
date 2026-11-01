@@ -15,40 +15,40 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/agent-client-protocol/agent-client-protocol-2.2.0.crate",
-        "sha256": "13f780597b2c88ab83d02509bcc3e86366751f86fa12114005e35c55ed691763",
-        "dest": "cargo/vendor/agent-client-protocol-2.2.0"
+        "url": "https://static.crates.io/crates/agent-client-protocol/agent-client-protocol-3.6.0.crate",
+        "sha256": "89b41f18aeb4a6d1a463b994cb880cc562cdea7d616ea3e22f9c6f2a438fc4f6",
+        "dest": "cargo/vendor/agent-client-protocol-3.6.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"13f780597b2c88ab83d02509bcc3e86366751f86fa12114005e35c55ed691763\", \"files\": {}}",
-        "dest": "cargo/vendor/agent-client-protocol-2.2.0",
+        "contents": "{\"package\": \"89b41f18aeb4a6d1a463b994cb880cc562cdea7d616ea3e22f9c6f2a438fc4f6\", \"files\": {}}",
+        "dest": "cargo/vendor/agent-client-protocol-3.6.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/agent-client-protocol-derive/agent-client-protocol-derive-2.2.0.crate",
-        "sha256": "f4893bfb11e0e193aa5a64611a126ee87567acb1879556519c902722899229de",
-        "dest": "cargo/vendor/agent-client-protocol-derive-2.2.0"
+        "url": "https://static.crates.io/crates/agent-client-protocol-derive/agent-client-protocol-derive-3.6.0.crate",
+        "sha256": "5d2d255cb5d3afa4760084fbcaf87c7d214d316328546cd777d8736a8af6e368",
+        "dest": "cargo/vendor/agent-client-protocol-derive-3.6.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"f4893bfb11e0e193aa5a64611a126ee87567acb1879556519c902722899229de\", \"files\": {}}",
-        "dest": "cargo/vendor/agent-client-protocol-derive-2.2.0",
+        "contents": "{\"package\": \"5d2d255cb5d3afa4760084fbcaf87c7d214d316328546cd777d8736a8af6e368\", \"files\": {}}",
+        "dest": "cargo/vendor/agent-client-protocol-derive-3.6.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/agent-client-protocol-schema/agent-client-protocol-schema-1.9.1.crate",
-        "sha256": "1d595a79e1665d02c91c7dd1bedd118501e75cc0a3d5b1651b5150ec4c5c1e0d",
-        "dest": "cargo/vendor/agent-client-protocol-schema-1.9.1"
+        "url": "https://static.crates.io/crates/agent-client-protocol-schema/agent-client-protocol-schema-1.13.0.crate",
+        "sha256": "c7c7cee33b16d162a617d5ea7292471c542ab31b416a2c089228aa8a6d4d18fe",
+        "dest": "cargo/vendor/agent-client-protocol-schema-1.13.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"1d595a79e1665d02c91c7dd1bedd118501e75cc0a3d5b1651b5150ec4c5c1e0d\", \"files\": {}}",
-        "dest": "cargo/vendor/agent-client-protocol-schema-1.9.1",
+        "contents": "{\"package\": \"c7c7cee33b16d162a617d5ea7292471c542ab31b416a2c089228aa8a6d4d18fe\", \"files\": {}}",
+        "dest": "cargo/vendor/agent-client-protocol-schema-1.13.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -392,14 +392,14 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/blocking/blocking-1.6.2.crate",
-        "sha256": "e83f8d02be6967315521be875afa792a316e28d57b5a2d401897e2a7921b7f21",
-        "dest": "cargo/vendor/blocking-1.6.2"
+        "url": "https://static.crates.io/crates/blocking/blocking-1.7.0.crate",
+        "sha256": "a70e4329df6cb94385eed412ec92375c3cdd8a6e502493d1229b6414e4036dfa",
+        "dest": "cargo/vendor/blocking-1.7.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"e83f8d02be6967315521be875afa792a316e28d57b5a2d401897e2a7921b7f21\", \"files\": {}}",
-        "dest": "cargo/vendor/blocking-1.6.2",
+        "contents": "{\"package\": \"a70e4329df6cb94385eed412ec92375c3cdd8a6e502493d1229b6414e4036dfa\", \"files\": {}}",
+        "dest": "cargo/vendor/blocking-1.7.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -1978,14 +1978,14 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/hermit-abi/hermit-abi-0.5.2.crate",
-        "sha256": "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c",
-        "dest": "cargo/vendor/hermit-abi-0.5.2"
+        "url": "https://static.crates.io/crates/hermit-abi/hermit-abi-0.5.3.crate",
+        "sha256": "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284",
+        "dest": "cargo/vendor/hermit-abi-0.5.3"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c\", \"files\": {}}",
-        "dest": "cargo/vendor/hermit-abi-0.5.2",
+        "contents": "{\"package\": \"e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284\", \"files\": {}}",
+        "dest": "cargo/vendor/hermit-abi-0.5.3",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -4045,19 +4045,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/schemars_derive/schemars_derive-1.2.2.crate",
-        "sha256": "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba",
-        "dest": "cargo/vendor/schemars_derive-1.2.2"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba\", \"files\": {}}",
-        "dest": "cargo/vendor/schemars_derive-1.2.2",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/selectors/selectors-0.37.0.crate",
         "sha256": "2cfaaa6035167f0e604e42723c7650d59ee269ef220d7bbe0565602c8a0173b9",
         "dest": "cargo/vendor/selectors-0.37.0"
@@ -4131,19 +4118,6 @@
         "type": "inline",
         "contents": "{\"package\": \"e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348\", \"files\": {}}",
         "dest": "cargo/vendor/serde_derive-1.0.229",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/serde_derive_internals/serde_derive_internals-0.30.0.crate",
-        "sha256": "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd",
-        "dest": "cargo/vendor/serde_derive_internals-0.30.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd\", \"files\": {}}",
-        "dest": "cargo/vendor/serde_derive_internals-0.30.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
