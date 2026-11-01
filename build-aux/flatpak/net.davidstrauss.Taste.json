@@ -1,11 +1,11 @@
 {
     "app-id": "net.davidstrauss.Taste",
     "runtime": "org.gnome.Platform",
-    "runtime-version": "49",
+    "runtime-version": "51",
     "sdk": "org.gnome.Sdk",
     "sdk-extensions": [
         "org.freedesktop.Sdk.Extension.rust-stable",
-        "org.freedesktop.Sdk.Extension.llvm21"
+        "org.freedesktop.Sdk.Extension.llvm22"
     ],
     "command": "taste-ide",
     "finish-args": [
@@ -23,11 +23,11 @@
         "--filesystem=xdg-run/taste-ide:create"
     ],
     "build-options": {
-        "append-path": "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin",
-        "prepend-ld-library-path": "/usr/lib/sdk/llvm21/lib",
+        "append-path": "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin",
+        "prepend-ld-library-path": "/usr/lib/sdk/llvm22/lib",
         "env": {
             "CARGO_HOME": "/run/build/taste-ide/cargo",
-            "LIBCLANG_PATH": "/usr/lib/sdk/llvm21/lib"
+            "LIBCLANG_PATH": "/usr/lib/sdk/llvm22/lib"
         }
     },
     "modules": [
