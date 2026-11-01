@@ -123,9 +123,11 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.tiny-skia-path]
 opt-level = 3
-[profile.dev.package.rustybuzz]
+[profile.dev.package.harfrust]
 opt-level = 3
-[profile.dev.package.ttf-parser]
+[profile.dev.package.skrifa]
+opt-level = 3
+[profile.dev.package.read-fonts]
 opt-level = 3
 [profile.dev.package.fontdb]
 opt-level = 3

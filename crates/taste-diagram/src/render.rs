@@ -236,11 +236,19 @@ impl Face {
         })
         .or_else(|| db.faces().next().map(|face| face.id))?;
         let (data, index) = db.with_face_data(id, |data, index| (data.to_vec(), index))?;
-        let face = rustybuzz::Face::from_slice(&data, index)?;
+        // The metrics as usvg reads them: skrifa's, unscaled, at the
+        // default instance.
+        let metrics = {
+            use skrifa::MetadataProvider;
+            skrifa::FontRef::from_index(&data, index).ok()?.metrics(
+                skrifa::instance::Size::unscaled(),
+                skrifa::instance::LocationRef::default(),
+            )
+        };
         let (units_per_em, ascender, descender) = (
-            f64::from(face.units_per_em()),
-            f64::from(face.ascender()),
-            f64::from(face.descender()),
+            f64::from(metrics.units_per_em),
+            f64::from(metrics.ascent),
+            f64::from(metrics.descent),
         );
         Some(Self {
             id,
@@ -255,12 +263,15 @@ impl Face {
     /// The advance of `text` set at `size` pixels, shaped as resvg will
     /// shape it.
     fn advance(&self, text: &str, size: f64) -> f64 {
-        let Some(face) = rustybuzz::Face::from_slice(&self.data, self.index) else {
+        let Ok(font) = harfrust::FontRef::from_index(&self.data, self.index) else {
             return 0.0;
         };
-        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        let data = harfrust::ShaperData::new(&font);
+        let shaper = data.shaper(&font).build();
+        let mut buffer = harfrust::UnicodeBuffer::new();
         buffer.push_str(text);
-        let glyphs = rustybuzz::shape(&face, &[], buffer);
+        buffer.guess_segment_properties();
+        let glyphs = shaper.shape(buffer, harfrust::ShapeOptions::new());
         let units: i64 = glyphs
             .glyph_positions()
             .iter()
