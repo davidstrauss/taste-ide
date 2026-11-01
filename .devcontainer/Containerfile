@@ -1,7 +1,7 @@
 # Pinned by digest (the multi-arch index), like the baseline environment's
 # base image: a tag moves under you, a digest does not. Refresh with
 # `skopeo inspect --format '{{.Digest}}' docker://registry.fedoraproject.org/fedora:44`.
-FROM registry.fedoraproject.org/fedora:44@sha256:125c2106ffaa3b2035c5bb480355c6bee73f723bfab47012bb29269d97ec61e4
+FROM registry.fedoraproject.org/fedora:44@sha256:d68cae9185777603262e0a7094f792ffed9326b22e1a03e2d2a1731fc3f94733
 
 RUN dnf install -y \
     gcc gcc-c++ make cmake perl pkgconf-pkg-config \
