@@ -93,7 +93,7 @@ pub const AGENT_IDS: &[&str] = &["claude-code", "claude-code-custom", "copilot",
 /// (`taste_acp::registry::builtin_agents`) and what each VM has installed
 /// once for every container on it (`taste_devcontainer::agentnode`). Here
 /// so the two cannot disagree; bump it in this one place.
-pub const CLAUDE_CODE_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@0.81.0";
+pub const CLAUDE_CODE_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@0.99.1";
 
 pub fn coordinator_brief() -> String {
     String::from(

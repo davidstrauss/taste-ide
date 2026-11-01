@@ -2156,10 +2156,14 @@ Whether Claude Code makes tasks of our calls is its decision, and its
 documentation names what it needs: Claude Code 2.1.304 or later, a
 session that fetches feature flags, and, for an Agent SDK session (which
 is what the ACP adapter runs), `CLAUDE_AUTO_BACKGROUND_TASKS=1`. The pinned
-adapter (`taste_core::orchestration::CLAUDE_CODE_ADAPTER`, 0.81.0) carries
-Claude Code 2.1.280, so until it moves, its agents call the IDE's tools as
-calls on whichever revision their runtime picks; the IDE side is ready for
-the move.
+adapter (`taste_core::orchestration::CLAUDE_CODE_ADAPTER`, 0.99.1) carries
+Claude Code 2.1.312, and the relocated agent is started with the variable
+(`taste_acp::relocate`), which also moves a subagent running past about two
+minutes to the background. Nothing the IDE sets turns flag fetching off:
+the auth proxy's `ANTHROPIC_BASE_URL` is not among the things that do
+(Claude Code docs, environment variables → "Features that need
+feature-flag fetching"). Anthropic turns MCP tasks on per kind of session,
+which only a live session shows.
 
 Tools split in two, and the split is not arbitrary:
 

@@ -269,6 +269,7 @@ fn exec_in_environment(
             "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH".into(),
             CLAUDE_MCP_TEXT_LIMIT.into(),
         ));
+        env.push((CLAUDE_BACKGROUND_TASKS.into(), "1".into()));
     }
     // The spec's own environment last, so the auth proxy's placeholder
     // rides in. `ANTHROPIC_BASE_URL` is deliberately NOT filtered out here
@@ -349,6 +350,16 @@ pub const CLAUDE_ALLOWED_TOOLS: [&str; 6] = [
 /// backlog, the replies, the coordinator's brief, and the project's memory
 /// all past it (2026-10-05).
 const CLAUDE_MCP_TEXT_LIMIT: &str = "32768";
+
+/// Claude Code's documented switch for backgrounding long work in a
+/// session that is not a terminal's, which the adapter's Agent SDK session
+/// is: with it, a call to the IDE's tools that answers as an MCP task
+/// (`taste_mcp`'s tasks) is followed in the background while the agent
+/// works on, and a subagent running past about two minutes moves to the
+/// background too, reporting back as the chat's task cards draw it. Without
+/// it, Claude Code makes no MCP task of any call (Claude Code docs, MCP →
+/// "What a call needs to become an MCP task").
+const CLAUDE_BACKGROUND_TASKS: &str = "CLAUDE_AUTO_BACKGROUND_TASKS";
 
 /// A directory for the agent's `PATH`, as a prelude's argument: empty for
 /// none.

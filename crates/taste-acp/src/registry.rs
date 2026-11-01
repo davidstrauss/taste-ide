@@ -188,7 +188,8 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
     // OWN package, pinned like the adapter: the adapter runs on the Agent
     // SDK, which bundles no `claude` command, so `npx -p <adapter> claude`
     // was "claude: command not found" in the Sign In tab (2026-09-16).
-    const CLAUDE_CODE_CLI: &str = "@anthropic-ai/claude-code@2.1.273";
+    // The Claude Code the adapter carries, so the project has one.
+    const CLAUDE_CODE_CLI: &str = "@anthropic-ai/claude-code@2.1.312";
     const CLAUDE_CODE_TOKEN: &[&str] = &["-y", CLAUDE_CODE_CLI, "setup-token"];
     const CLAUDE_CODE_TOKEN_STEPS: &str =
         "sign in below, copy the token it prints, paste it into the Token row, and Save";
@@ -237,26 +238,37 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
             "gemini",
             "Gemini CLI",
             "npx",
-            &["-y", "@google/gemini-cli@0.58.0", "--acp"],
+            &["-y", "@google/gemini-cli@0.66.0", "--acp"],
             &[".gemini", ".npm"],
         )
         .with_login(
-            &["-y", "@google/gemini-cli@0.58.0"],
+            &["-y", "@google/gemini-cli@0.66.0"],
             &[("NO_BROWSER", "true")],
             "open the link below, paste the code back, then /quit; the chat reconnects",
         ),
         // `copilot login --device-code`: its own subcommand, which exits when
         // the token is stored — and the tab closes with it.
+        //
+        // Copilot updates itself: the package npx fetched at 1.0.82 ran as
+        // 1.0.105, the newer build it downloaded into its home (2026-11-01).
+        // A pin that does not hold is no pin, so both runs turn that off by
+        // its documented switches, the flag and `COPILOT_AUTO_UPDATE`.
         AgentSpec::new(
             "copilot",
             "GitHub Copilot",
             "npx",
-            &["-y", "@github/copilot@1.0.82", "--acp", "--stdio"],
+            &[
+                "-y",
+                "@github/copilot@1.0.105",
+                "--acp",
+                "--stdio",
+                "--no-auto-update",
+            ],
             &[".copilot", ".npm"],
         )
         .with_login(
-            &["-y", "@github/copilot@1.0.82", "login", "--device-code"],
-            &[],
+            &["-y", "@github/copilot@1.0.105", "login", "--device-code"],
+            &[("COPILOT_AUTO_UPDATE", "false")],
             "open the link below and enter the code it shows; the chat reconnects when it finishes",
         )
         // Copilot's ACP server advertises mcpCapabilities {http, sse} and

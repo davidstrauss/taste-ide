@@ -308,7 +308,13 @@ mod tests {
                 taste_core::orchestration::CLAUDE_CODE_ADAPTER
             )
             .unwrap(),
-            format!("{IN_CONTAINER}/agents/agentclientprotocol-claude-agent-acp-0.81.0/run")
+            format!(
+                "{IN_CONTAINER}/agents/{}/run",
+                taste_core::agent_runtime::agent_key(
+                    taste_core::orchestration::CLAUDE_CODE_ADAPTER
+                )
+                .unwrap()
+            )
         );
     }
 

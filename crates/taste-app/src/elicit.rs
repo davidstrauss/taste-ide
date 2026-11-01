@@ -120,6 +120,26 @@ pub fn form(request: &CreateElicitationRequest) -> Option<Form> {
             }
         }
     }
+    // The pinned adapter has marked them for JetBrains AIR alone since
+    // 0.9x, and sends everyone else the same box unmarked, as the field
+    // after its choice: `question_0` and `question_0_custom`, a plain
+    // string titled "Other". That shape, exactly, is read as the mark
+    // would be; anything looser stays a field of its own.
+    for key in schema.properties.keys() {
+        if companions.contains_key(key) {
+            continue;
+        }
+        let candidate = format!("{key}_custom");
+        let unmarked_other = matches!(
+            schema.properties.get(&candidate),
+            Some(ElicitationPropertySchema::String(string))
+                if string.one_of.is_none()
+                    && string.title.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("other"))
+        );
+        if unmarked_other {
+            companions.insert(key.clone(), candidate);
+        }
+    }
     let companion_keys: Vec<&String> = companions.values().collect();
     let mut fields = Vec::new();
     for (key, property) in &schema.properties {
@@ -375,9 +395,10 @@ pub fn summary(form: &Form, answers: &BTreeMap<String, Answer>) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// What the pinned adapter (0.81.0) sends for an AskUserQuestion of one
-    /// single-select question — its `askUserQuestionsToCreateRequest`, taken
-    /// as the wire has it.
+    /// What the adapter sends for an AskUserQuestion of one single-select
+    /// question — its `askUserQuestionsToCreateRequest`, taken as the wire
+    /// had it at 0.81.0, when every client got the "Other" box's mark (0.99
+    /// sends it to JetBrains AIR alone; the next test is that shape).
     fn ask_user_question() -> CreateElicitationRequest {
         serde_json::from_value(serde_json::json!({
             "mode": "form",
@@ -426,6 +447,51 @@ mod tests {
             Some("One site, one code path.")
         );
         assert_eq!(choices[1].description, None);
+    }
+
+    /// The same question as adapter 0.99 sends it to a client that is not
+    /// JetBrains AIR: the "Other" box unmarked. It is still the choice's
+    /// own box, for a single choice and a multiple one alike; a field that
+    /// only resembles one is left a field.
+    #[test]
+    fn an_unmarked_other_box_still_belongs_to_its_choice() {
+        let mut request = serde_json::to_value(ask_user_question()).unwrap();
+        let properties = &mut request["requestedSchema"]["properties"];
+        properties["question_0_custom"]
+            .as_object_mut()
+            .unwrap()
+            .remove("_meta");
+        properties["question_1"] = serde_json::json!({
+            "type": "array", "title": "Targets",
+            "items": {"anyOf": [{"const": "x86", "title": "x86"}, {"const": "arm", "title": "arm"}]}
+        });
+        properties["question_1_custom"] = serde_json::json!({"type": "string", "title": "Other"});
+        properties["notes"] = serde_json::json!({"type": "string", "title": "Notes"});
+        properties["notes_custom"] =
+            serde_json::json!({"type": "string", "title": "Anything else"});
+        let form = form(&serde_json::from_value(request).unwrap()).unwrap();
+        let other_of = |key: &str| {
+            form.fields
+                .iter()
+                .find(|field| field.key == key)
+                .map(|field| match &field.kind {
+                    Kind::One { other, .. } | Kind::Many { other, .. } => other.clone(),
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            other_of("question_0"),
+            Some(Some("question_0_custom".into()))
+        );
+        assert_eq!(
+            other_of("question_1"),
+            Some(Some("question_1_custom".into()))
+        );
+        assert_eq!(other_of("question_0_custom"), None, "drawn with its choice");
+        assert!(
+            other_of("notes_custom").is_some(),
+            "not an Other box: its own field"
+        );
     }
 
     #[test]
