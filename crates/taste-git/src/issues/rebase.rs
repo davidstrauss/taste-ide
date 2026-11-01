@@ -352,7 +352,7 @@ fn flatten(tree: &git2::Tree<'_>) -> Result<BTreeMap<String, Oid>> {
     let mut files = BTreeMap::new();
     tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
         if entry.kind() == Some(git2::ObjectType::Blob) {
-            if let Some(name) = entry.name() {
+            if let Ok(name) = entry.name() {
                 files.insert(format!("{dir}{name}"), entry.id());
             }
         }

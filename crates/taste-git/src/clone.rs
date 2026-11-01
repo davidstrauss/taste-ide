@@ -288,7 +288,7 @@ pub fn unpublished_work(clone: &Path, main: &Path) -> Result<Vec<UnpublishedBran
             tip: tip.id().to_string().chars().take(8).collect(),
             commits,
             truncated,
-            summary: tip.summary().unwrap_or("").to_string(),
+            summary: tip.summary().ok().flatten().unwrap_or("").to_string(),
         });
     }
     out.sort_by(|a, b| a.branch.cmp(&b.branch));
@@ -362,7 +362,11 @@ mod tests {
         );
         assert!(stripped.head().is_err(), "HEAD is unborn");
         assert_eq!(
-            stripped.find_reference("HEAD").unwrap().symbolic_target(),
+            stripped
+                .find_reference("HEAD")
+                .unwrap()
+                .symbolic_target()
+                .unwrap(),
             Some("refs/heads/taste-peer")
         );
         let ws = crate::GitWorkspace::discover(&peer_path).expect("still a workspace");

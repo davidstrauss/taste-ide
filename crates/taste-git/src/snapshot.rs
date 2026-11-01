@@ -118,7 +118,7 @@ impl GitWorkspace {
         // 2026-09-23).
         if let Some(previous) = &previous {
             if previous.tree_id() == tree_id
-                && previous.message().map(str::trim) == Some(message.as_str())
+                && previous.message().ok().map(str::trim) == Some(message.as_str())
             {
                 return Ok(Snapshot {
                     commit: previous.id(),

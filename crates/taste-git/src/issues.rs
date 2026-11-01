@@ -3152,8 +3152,8 @@ mod tests {
         git2::Repository::init(dir.path()).unwrap();
         let ws = GitWorkspace::discover(dir.path()).unwrap();
         let sig = ws.ref_signature().unwrap();
-        assert_eq!(sig.name(), Some(crate::NOBODY_NAME));
-        assert_eq!(sig.email(), Some(crate::NOBODY_EMAIL));
+        assert_eq!(sig.name().ok(), Some(crate::NOBODY_NAME));
+        assert_eq!(sig.email().ok(), Some(crate::NOBODY_EMAIL));
         let args = ws.identity_args().join(" ");
         assert!(args.contains("user.name=nobody"), "{args}");
         assert!(!args.contains("taste"), "{args}");

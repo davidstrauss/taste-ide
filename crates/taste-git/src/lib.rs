@@ -611,7 +611,7 @@ impl GitWorkspace {
         let statuses = self.repo.statuses(Some(&mut opts))?;
         let mut map = HashMap::new();
         for entry in statuses.iter() {
-            if let Some(path) = entry.path() {
+            if let Ok(path) = entry.path() {
                 if entry.status() == git2::Status::WT_MODIFIED && self.ident_unchanged(path) {
                     continue;
                 }
@@ -763,7 +763,7 @@ impl GitWorkspace {
                 let tree = untracked.tree()?;
                 tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
                     if entry.kind() == Some(git2::ObjectType::Blob) {
-                        if let Some(name) = entry.name() {
+                        if let Ok(name) = entry.name() {
                             paths.insert(PathBuf::from(format!("{dir}{name}")));
                         }
                     }
@@ -949,7 +949,12 @@ impl GitWorkspace {
             }
             out.push(CommitHit {
                 id: oid.to_string(),
-                summary: commit.summary().unwrap_or_default().to_string(),
+                summary: commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .to_string(),
                 message: message.to_string(),
                 when: commit.time().seconds(),
             });
@@ -980,7 +985,7 @@ impl GitWorkspace {
             .repo
             .remotes()?
             .iter()
-            .flatten()
+            .filter_map(|name| name.ok().flatten())
             .map(str::to_string)
             .collect();
         let local: std::collections::HashSet<String> = self.local_branches()?.into_iter().collect();
@@ -996,6 +1001,7 @@ impl GitWorkspace {
             }
             let Some(short) = reference
                 .name()
+                .ok()
                 .and_then(|name| name.strip_prefix("refs/remotes/"))
             else {
                 continue;
@@ -1102,7 +1108,9 @@ impl GitWorkspace {
             .submodules()
             .map(|subs| {
                 subs.iter()
-                    .filter_map(|sub| Some((sub.name()?.to_string(), sub.path().to_path_buf())))
+                    .filter_map(|sub| {
+                        Some((sub.name().ok()?.to_string(), sub.path().to_path_buf()))
+                    })
                     .filter(|(_, path)| inside(path))
                     .filter(|(_, path)| !beneath::passes_a_link(&self.workdir, path))
                     .collect()
@@ -1125,7 +1133,7 @@ impl GitWorkspace {
 
     pub fn branch_name(&self) -> Option<String> {
         let head = self.repo.head().ok()?;
-        head.shorthand().map(str::to_owned)
+        head.shorthand().ok().map(str::to_owned)
     }
 
     /// Push the current branch to its upstream (or origin by default).
@@ -1216,7 +1224,7 @@ impl GitWorkspace {
             .ok()
             .and_then(|name| {
                 // refs/remotes/<remote>/<branch> → <branch>
-                let name = name.as_str()?.to_string();
+                let name = name.as_str().ok()?.to_string();
                 let rest = name.strip_prefix("refs/remotes/")?;
                 let (_, branch) = rest.split_once('/')?;
                 Some(branch.to_string())
@@ -1280,7 +1288,13 @@ impl GitWorkspace {
             .repo
             .find_branch(&branch, git2::BranchType::Local)
             .ok()?;
-        branch.upstream().ok()?.get().name().map(str::to_string)
+        branch
+            .upstream()
+            .ok()?
+            .get()
+            .name()
+            .ok()
+            .map(str::to_string)
     }
 
     /// [`GitWorkspace::upstream_ref`] of `branch` rather than of HEAD: what
@@ -1291,7 +1305,13 @@ impl GitWorkspace {
             .repo
             .find_branch(branch, git2::BranchType::Local)
             .ok()?;
-        branch.upstream().ok()?.get().name().map(str::to_string)
+        branch
+            .upstream()
+            .ok()?
+            .get()
+            .name()
+            .ok()
+            .map(str::to_string)
     }
 
     /// The URL of the remote the current branch's upstream lives on, if
@@ -1304,9 +1324,9 @@ impl GitWorkspace {
             .repo
             .find_branch(&branch_name, git2::BranchType::Local)
             .ok()?;
-        let refname = branch.get().name()?.to_string();
+        let refname = branch.get().name().ok()?.to_string();
         let remote = self.repo.branch_upstream_remote(&refname).ok()?;
-        self.url_of_remote(remote.as_str()?)
+        self.url_of_remote(remote.as_str().ok()?)
     }
 
     /// The URL `branch`'s push goes to ([`GitWorkspace::push_target`]):
@@ -1320,7 +1340,7 @@ impl GitWorkspace {
     /// a URL directly (`gh pr checkout`).
     fn url_of_remote(&self, remote: &str) -> Option<String> {
         match self.repo.find_remote(remote) {
-            Ok(found) => found.url().map(str::to_string),
+            Ok(found) => found.url().ok().map(str::to_string),
             Err(_) => Some(remote.to_string()),
         }
     }

@@ -748,8 +748,8 @@ impl Hunk {
 /// for line and pads the shorter side, so the columns stay in step.
 pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
     let diff = TextDiff::from_lines(old, new);
-    let olds = diff.old_slices();
-    let news = diff.new_slices();
+    let olds = diff.old_lookup();
+    let news = diff.new_lookup();
     let line = |text: &str| text.trim_end_matches(['\n', '\r']).to_string();
     let mut out = Vec::new();
     for group in diff.grouped_ops(3) {
@@ -774,8 +774,8 @@ pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
                 } => {
                     for i in 0..len {
                         hunk.rows.push(Row {
-                            left: (Mark::Context, line(olds[old_index + i])),
-                            right: (Mark::Context, line(news[new_index + i])),
+                            left: (Mark::Context, line(&olds[old_index + i])),
+                            right: (Mark::Context, line(&news[new_index + i])),
                         });
                     }
                 }
@@ -784,7 +784,7 @@ pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
                 } => {
                     for i in 0..old_len {
                         hunk.rows.push(Row {
-                            left: (Mark::Removed, line(olds[old_index + i])),
+                            left: (Mark::Removed, line(&olds[old_index + i])),
                             right: (Mark::Pad, String::new()),
                         });
                     }
@@ -795,7 +795,7 @@ pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
                     for i in 0..new_len {
                         hunk.rows.push(Row {
                             left: (Mark::Pad, String::new()),
-                            right: (Mark::Added, line(news[new_index + i])),
+                            right: (Mark::Added, line(&news[new_index + i])),
                         });
                     }
                 }
@@ -808,12 +808,12 @@ pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
                     for i in 0..old_len.max(new_len) {
                         hunk.rows.push(Row {
                             left: if i < old_len {
-                                (Mark::Removed, line(olds[old_index + i]))
+                                (Mark::Removed, line(&olds[old_index + i]))
                             } else {
                                 (Mark::Pad, String::new())
                             },
                             right: if i < new_len {
-                                (Mark::Added, line(news[new_index + i]))
+                                (Mark::Added, line(&news[new_index + i]))
                             } else {
                                 (Mark::Pad, String::new())
                             },

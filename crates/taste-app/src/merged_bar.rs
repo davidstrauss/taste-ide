@@ -172,7 +172,7 @@ pub fn posed_for_probe() -> Option<MergedInto> {
     };
     Some(MergedInto {
         branch: "someone/partner-call-slides".into(),
-        tip: taste_git::Oid::zero(),
+        tip: taste_git::Oid::ZERO_SHA1,
         default_branch: "main".into(),
         tracking: "origin/main".into(),
         how,
@@ -187,7 +187,7 @@ mod tests {
     fn the_bar_says_how_the_branch_is_in_the_default() {
         let mut merged = MergedInto {
             branch: "topic".into(),
-            tip: taste_git::Oid::zero(),
+            tip: taste_git::Oid::ZERO_SHA1,
             default_branch: "main".into(),
             tracking: "origin/main".into(),
             how: Merged::Contained,

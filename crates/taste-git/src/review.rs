@@ -667,13 +667,17 @@ fn head_branch_of(repo_path: &Path) -> Result<String> {
     let head = repo
         .find_reference("HEAD")
         .context("this checkout has no HEAD")?;
-    head.symbolic_target().map(str::to_string).with_context(|| {
-        format!(
-            "{} has a detached HEAD, so there is no branch to publish — say which \
+    head.symbolic_target()
+        .ok()
+        .flatten()
+        .map(str::to_string)
+        .with_context(|| {
+            format!(
+                "{} has a detached HEAD, so there is no branch to publish — say which \
                  branch, or check one out",
-            repo_path.display()
-        )
-    })
+                repo_path.display()
+            )
+        })
 }
 
 fn as_head_ref(short: &str) -> String {

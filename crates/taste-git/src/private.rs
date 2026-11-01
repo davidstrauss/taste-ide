@@ -144,7 +144,7 @@ pub fn ensure_repository(folder: &Path) -> Result<bool> {
             );
         }
         for entry in statuses.iter() {
-            if let Some(path) = entry.path() {
+            if let Ok(path) = entry.path() {
                 index.add_path(Path::new(path))?;
             }
         }

@@ -51,22 +51,22 @@ tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "i
 async-channel = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sha2 = "0.10"
+sha2 = "0.11"
 notify = "8"
 json_comments = "0.2"
 # libgit2 for local repositories only: every fetch and clone it makes is
 # from a path, and fetch and push to a real remote go through the git CLI
 # with the user's keys. Its ssh and https transports, on by default, would
 # link libssh2 and OpenSSL into the IDE's process for nothing it calls.
-git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 ignore = "0.4"
 ec4rs = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
-base64 = "0.22"
-similar = "2"
+base64 = "0.23"
+similar = "3"
 # A game controller, straight off evdev (taste-app's controller.rs): GTK
 # has no gamepad API.
-evdev = "0.12"
+evdev = "0.13"
 # The auth proxy's HTTP stack. rustls, never openssl: the Flatpak runtime
 # ships no openssl and vendoring one would be a C build in the middle of a
 # Rust workspace. webpki roots rather than the host store, so the trust

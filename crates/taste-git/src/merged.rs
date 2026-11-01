@@ -56,7 +56,7 @@ impl GitWorkspace {
             .repo
             .find_reference(&format!("{prefix}HEAD"))
             .ok()
-            .and_then(|head| head.symbolic_target().map(str::to_string))
+            .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
             .filter(|target| self.repo.find_reference(target).is_ok());
         let tracking = named.or_else(|| {
             ["main", "master"]

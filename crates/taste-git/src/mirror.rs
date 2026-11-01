@@ -686,7 +686,7 @@ impl GitWorkspace {
             .read_ref(MIRROR_REF)?
             .and_then(|oid| self.repo.find_commit(oid).ok())
             .and_then(|c| {
-                let message = c.message()?.to_string();
+                let message = c.message().ok()?.to_string();
                 Some(
                     message
                         .strip_prefix(RECORDED_ON)?
@@ -830,7 +830,7 @@ impl GitWorkspace {
         );
         if let Some(oid) = self.read_ref(MIRROR_REF)? {
             let last = self.repo.find_commit(oid)?;
-            if last.tree_id() == tree && last.message() == Some(message.as_str()) {
+            if last.tree_id() == tree && last.message().ok() == Some(message.as_str()) {
                 return Ok(());
             }
         }
@@ -850,6 +850,7 @@ impl GitWorkspace {
         let last = self.repo.find_commit(oid)?;
         Ok(last
             .message()
+            .ok()
             .and_then(|m| m.strip_prefix(RECORDED_ON))
             .and_then(|m| m.lines().next())
             .and_then(|r| r.strip_prefix("refs/heads/"))
@@ -1127,7 +1128,7 @@ impl GitWorkspace {
             format!("{RECORDED_ON}{local}\n\nThe folder as the IDE last wrote it.{tip}{observed}");
         if let Some(oid) = self.read_ref(MIRROR_REF)? {
             let last = self.repo.find_commit(oid)?;
-            if last.tree_id() == tree && last.message() == Some(message.as_str()) {
+            if last.tree_id() == tree && last.message().ok() == Some(message.as_str()) {
                 return Ok(());
             }
         }

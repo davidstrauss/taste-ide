@@ -134,7 +134,7 @@ pub fn posed_for_probe() -> Option<Vec<SubmoduleSetup>> {
                 Some(SubmoduleSetup {
                     path: path.into(),
                     need,
-                    pin: taste_git::Oid::zero(),
+                    pin: taste_git::Oid::ZERO_SHA1,
                     url: None,
                 })
             })
@@ -150,7 +150,7 @@ mod tests {
         SubmoduleSetup {
             path: path.into(),
             need,
-            pin: taste_git::Oid::zero(),
+            pin: taste_git::Oid::ZERO_SHA1,
             url: None,
         }
     }

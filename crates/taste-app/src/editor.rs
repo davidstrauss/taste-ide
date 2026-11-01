@@ -541,7 +541,7 @@ fn apply_minimal(buffer: &sourceview5::Buffer, old: &str, new: &str) {
         return;
     }
     let diff = similar::TextDiff::from_lines(old, new);
-    let fresh = diff.new_slices();
+    let fresh = diff.new_lookup();
     let line_start = |line: usize| -> gtk::TextIter {
         i32::try_from(line)
             .ok()
@@ -558,7 +558,8 @@ fn apply_minimal(buffer: &sourceview5::Buffer, old: &str, new: &str) {
         let mut start = line_start(was.start);
         let mut end = line_start(was.end);
         buffer.delete(&mut start, &mut end);
-        buffer.insert(&mut start, &fresh[now].concat());
+        let text: String = now.clone().map(|line| &fresh[line]).collect();
+        buffer.insert(&mut start, &text);
     }
     buffer.end_user_action();
 }

@@ -320,7 +320,7 @@ impl GitWorkspace {
             if entry.kind() != Some(git2::ObjectType::Blob) {
                 return git2::TreeWalkResult::Ok;
             }
-            let Some(entry_name) = entry.name() else {
+            let Some(entry_name) = entry.name().ok() else {
                 return git2::TreeWalkResult::Ok;
             };
             match self.repo.find_blob(entry.id()) {
@@ -402,6 +402,8 @@ impl GitWorkspace {
             entry.id_new() == now
                 && entry
                     .message()
+                    .ok()
+                    .flatten()
                     .is_some_and(|message| message.starts_with("taste-ide"))
         }))
     }
@@ -422,7 +424,7 @@ impl GitWorkspace {
         let mut out = Vec::new();
         for reference in self.repo.references_glob(&format!("{prefix}*"))? {
             let reference = reference?;
-            if let (Some(name), Some(oid)) = (reference.name(), reference.target()) {
+            if let (Some(name), Some(oid)) = (reference.name().ok(), reference.target()) {
                 out.push((name.to_string(), oid));
             }
         }
@@ -487,7 +489,7 @@ impl GitWorkspace {
                 name,
                 oid: tip.id(),
                 last_commit_time: tip.time().seconds(),
-                summary: tip.summary().unwrap_or("").to_string(),
+                summary: tip.summary().ok().flatten().unwrap_or("").to_string(),
             });
         }
         out.sort_by(|a, b| {

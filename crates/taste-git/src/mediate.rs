@@ -371,7 +371,14 @@ impl GitWorkspace {
         self.remotes()
             .unwrap_or_default()
             .iter()
-            .filter_map(|name| self.repo.find_remote(name).ok()?.url().map(str::to_string))
+            .filter_map(|name| {
+                self.repo
+                    .find_remote(name)
+                    .ok()?
+                    .url()
+                    .ok()
+                    .map(str::to_string)
+            })
             .collect()
     }
 
@@ -380,7 +387,7 @@ impl GitWorkspace {
             .repo
             .remotes()?
             .iter()
-            .flatten()
+            .filter_map(|name| name.ok().flatten())
             .map(str::to_string)
             .collect())
     }
@@ -388,7 +395,7 @@ impl GitWorkspace {
     /// URL of a configured remote, if it has one.
     pub fn remote_url(&self, name: &str) -> Result<Option<String>> {
         let remote = self.repo.find_remote(name)?;
-        Ok(remote.url().map(str::to_string))
+        Ok(remote.url().ok().map(str::to_string))
     }
 
     /// Full ref name HEAD points at, for the "don't move the checked-out
@@ -397,7 +404,7 @@ impl GitWorkspace {
         let head = self.repo.find_reference("HEAD").ok()?;
         // Symbolic even on an unborn branch, which is exactly the case a
         // publish onto refs/heads/main must still refuse.
-        head.symbolic_target().map(str::to_string)
+        head.symbolic_target().ok().flatten().map(str::to_string)
     }
 }
 
@@ -630,7 +637,7 @@ mod tests {
             .references()
             .unwrap()
             .flatten()
-            .filter_map(|r| r.name().map(str::to_string))
+            .filter_map(|r| r.name().ok().map(str::to_string))
             .filter(|n| n.starts_with("refs/taste/staging/"))
             .collect();
         assert!(staging.is_empty(), "staging refs left behind: {staging:?}");

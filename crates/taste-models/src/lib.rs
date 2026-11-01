@@ -190,7 +190,11 @@ pub async fn fetch_pinned(
     file.flush().await?;
     drop(file);
 
-    let digest = format!("{:x}", hasher.finalize());
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let wrong_size = expected_bytes.is_some_and(|want| downloaded != want);
     if digest != sha256 || wrong_size {
         let _ = tokio::fs::remove_file(&part).await;

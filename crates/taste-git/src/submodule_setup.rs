@@ -69,6 +69,8 @@ impl GitWorkspace {
                 let need = need_of(&self.workdir.join(&path), entry.id)?;
                 let url = self.repo.find_submodule(&name).ok().and_then(|sub| {
                     sub.url()
+                        .ok()
+                        .flatten()
                         .map(|url| crate::transport::aligned(base.as_deref(), url))
                 });
                 Some(SubmoduleSetup {

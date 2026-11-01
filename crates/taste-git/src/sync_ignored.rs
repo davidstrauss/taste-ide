@@ -642,7 +642,9 @@ pub fn attribute_files_in_tree(repo: &git2::Repository, tree: git2::Oid) -> Vec<
         return files;
     };
     let _ = tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-        if entry.name() == Some(".gitattributes") && entry.kind() == Some(git2::ObjectType::Blob) {
+        if entry.name().ok() == Some(".gitattributes")
+            && entry.kind() == Some(git2::ObjectType::Blob)
+        {
             if let Ok(blob) = repo.find_blob(entry.id()) {
                 files.push((
                     PathBuf::from(dir.trim_end_matches('/')),
@@ -689,7 +691,7 @@ pub fn ignores_in_tree(repo: &git2::Repository, tree: git2::Oid) -> Ignores {
         return Ignores::default();
     };
     let _ = tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-        if entry.name() == Some(".gitignore") && entry.kind() == Some(git2::ObjectType::Blob) {
+        if entry.name().ok() == Some(".gitignore") && entry.kind() == Some(git2::ObjectType::Blob) {
             if let Ok(blob) = repo.find_blob(entry.id()) {
                 let mut builder = GitignoreBuilder::new("");
                 for line in String::from_utf8_lossy(blob.content()).lines() {
@@ -727,7 +729,7 @@ impl crate::GitWorkspace {
             .pathspec("*/.gitattributes");
         if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
             for entry in statuses.iter() {
-                if let Some(path) = entry.path() {
+                if let Ok(path) = entry.path() {
                     if Path::new(path)
                         .file_name()
                         .is_some_and(|n| n == ".gitattributes")
@@ -779,7 +781,9 @@ impl crate::GitWorkspace {
             if !entry.status().contains(git2::Status::IGNORED) {
                 continue;
             }
-            let Some(path) = entry.path() else { continue };
+            let Ok(path) = entry.path() else {
+                continue;
+            };
             let path = Path::new(path);
             if !rules.syncs(path) {
                 continue;

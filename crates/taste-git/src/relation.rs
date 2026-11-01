@@ -263,7 +263,7 @@ impl GitWorkspace {
         let target = self.push_target(branch);
         let local = self.repo.find_branch(branch, BranchType::Local).ok()?;
         if let Ok(upstream) = local.upstream() {
-            let name = upstream.get().name()?.to_string();
+            let name = upstream.get().name().ok()?.to_string();
             return (Some(&name) != target.tracking_ref().as_ref()).then_some(name);
         }
         let upstream_remote = self.config_string(&format!("branch.{branch}.remote"))?;
@@ -276,7 +276,7 @@ impl GitWorkspace {
             .repo
             .find_reference(&format!("refs/remotes/{}/HEAD", self.default_remote()))
             .ok()?;
-        head.symbolic_target().map(str::to_string)
+        head.symbolic_target().ok().flatten().map(str::to_string)
     }
 
     /// Make Personal's `branch` what an environment's `branch` pulls from,
@@ -294,7 +294,7 @@ impl GitWorkspace {
         const FETCH: &str = "+refs/taste/vm/*:refs/remotes/personal/*";
         let url = folder.to_string_lossy().to_string();
         match self.repo.find_remote(REMOTE) {
-            Ok(remote) if remote.url() == Some(url.as_str()) => {}
+            Ok(remote) if remote.url().ok() == Some(url.as_str()) => {}
             Ok(_) => self.repo.remote_set_url(REMOTE, &url)?,
             Err(_) => {
                 self.repo.remote_with_fetch(REMOTE, &url, FETCH)?;
@@ -386,7 +386,7 @@ impl GitWorkspace {
         };
         let mut entries = entries;
         while let Some(Ok(entry)) = entries.next() {
-            let (Some(name), Some(value)) = (entry.name(), entry.value()) else {
+            let (Some(name), Some(value)) = (entry.name().ok(), entry.value().ok()) else {
                 continue;
             };
             if !is_tracking_key(name) {
@@ -441,7 +441,7 @@ impl GitWorkspace {
             self.repo
                 .find_reference(&format!("refs/remotes/{remote}/HEAD"))
                 .ok()
-                .and_then(|head| head.symbolic_target().map(str::to_string))
+                .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
                 .or_else(|| {
                     ["main", "master"]
                         .iter()
@@ -727,7 +727,12 @@ impl GitWorkspace {
             (
                 author.email().unwrap_or_default().to_lowercase(),
                 author.name().unwrap_or_default().to_string(),
-                commit.summary().unwrap_or_default().to_string(),
+                commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .to_string(),
             )
         })
     }
@@ -1381,7 +1386,7 @@ impl GitWorkspace {
                 .head()
                 .ok()
                 .filter(|head| head.is_branch())
-                .and_then(|head| Some((head.shorthand()?.to_string(), head.target())));
+                .and_then(|head| Some((head.shorthand().ok()?.to_string(), head.target())));
             let chosen = match head {
                 Some((name, tip)) if holds(tip) => Some(name),
                 _ => sub

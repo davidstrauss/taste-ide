@@ -80,33 +80,33 @@ fn watch(events: EventBus) {
 fn is_gamepad(device: &evdev::Device) -> bool {
     let keys = device.supported_keys();
     let has_face = keys.is_some_and(|keys| {
-        keys.contains(evdev::Key::BTN_SOUTH) && keys.contains(evdev::Key::BTN_EAST)
+        keys.contains(evdev::KeyCode::BTN_SOUTH) && keys.contains(evdev::KeyCode::BTN_EAST)
     });
     let has_stick = device
         .supported_absolute_axes()
-        .is_some_and(|axes| axes.contains(evdev::AbsoluteAxisType::ABS_X));
+        .is_some_and(|axes| axes.contains(evdev::AbsoluteAxisCode::ABS_X));
     has_face && has_stick
 }
 
 /// The buttons the IDE answers to, by the kernel's names for the Xbox
 /// layout; anything else on the pad is not ours yet.
-fn button(key: evdev::Key) -> Option<ControllerButton> {
+fn button(key: evdev::KeyCode) -> Option<ControllerButton> {
     Some(match key {
-        evdev::Key::BTN_SOUTH => ControllerButton::A,
-        evdev::Key::BTN_EAST => ControllerButton::B,
-        evdev::Key::BTN_NORTH => ControllerButton::X,
-        evdev::Key::BTN_WEST => ControllerButton::Y,
-        evdev::Key::BTN_TL => ControllerButton::LeftShoulder,
-        evdev::Key::BTN_TR => ControllerButton::RightShoulder,
+        evdev::KeyCode::BTN_SOUTH => ControllerButton::A,
+        evdev::KeyCode::BTN_EAST => ControllerButton::B,
+        evdev::KeyCode::BTN_NORTH => ControllerButton::X,
+        evdev::KeyCode::BTN_WEST => ControllerButton::Y,
+        evdev::KeyCode::BTN_TL => ControllerButton::LeftShoulder,
+        evdev::KeyCode::BTN_TR => ControllerButton::RightShoulder,
         // Pads that report the triggers as buttons; xpad reports them as
         // axes (`ABS_Z`, `ABS_RZ`), read below.
-        evdev::Key::BTN_TL2 => ControllerButton::LeftTrigger,
-        evdev::Key::BTN_TR2 => ControllerButton::RightTrigger,
-        evdev::Key::BTN_START => ControllerButton::Start,
-        evdev::Key::BTN_MODE => ControllerButton::Guide,
+        evdev::KeyCode::BTN_TL2 => ControllerButton::LeftTrigger,
+        evdev::KeyCode::BTN_TR2 => ControllerButton::RightTrigger,
+        evdev::KeyCode::BTN_START => ControllerButton::Start,
+        evdev::KeyCode::BTN_MODE => ControllerButton::Guide,
         // Some pads report the D-pad as buttons…
-        evdev::Key::BTN_DPAD_UP => ControllerButton::Up,
-        evdev::Key::BTN_DPAD_DOWN => ControllerButton::Down,
+        evdev::KeyCode::BTN_DPAD_UP => ControllerButton::Up,
+        evdev::KeyCode::BTN_DPAD_DOWN => ControllerButton::Down,
         _ => return None,
     })
 }
@@ -119,7 +119,7 @@ fn read(mut device: evdev::Device, events: &EventBus) {
     // The triggers as axes: pressed past halfway is down, back below it is
     // up, and only the crossings are published — an analog value that
     // published every step would be a hundred presses per pull.
-    let halfway = |axis: evdev::AbsoluteAxisType| -> i32 {
+    let halfway = |axis: evdev::AbsoluteAxisCode| -> i32 {
         device
             .get_abs_state()
             .ok()
@@ -128,8 +128,8 @@ fn read(mut device: evdev::Device, events: &EventBus) {
             .unwrap_or(512)
     };
     let (left_half, right_half) = (
-        halfway(evdev::AbsoluteAxisType::ABS_Z),
-        halfway(evdev::AbsoluteAxisType::ABS_RZ),
+        halfway(evdev::AbsoluteAxisCode::ABS_Z),
+        halfway(evdev::AbsoluteAxisCode::ABS_RZ),
     );
     let (mut left_down, mut right_down) = (false, false);
     loop {
@@ -141,34 +141,36 @@ fn read(mut device: evdev::Device, events: &EventBus) {
             }
         };
         for event in batch {
-            match event.kind() {
-                evdev::InputEventKind::Key(key) => {
+            match event.destructure() {
+                evdev::EventSummary::Key(_, key, value) => {
                     let Some(button) = button(key) else { continue };
                     // 1 is down, 0 up; 2 is the kernel's key repeat, which
                     // a held button must not turn into a second press.
-                    let pressed = match event.value() {
+                    let pressed = match value {
                         1 => true,
                         0 => false,
                         _ => continue,
                     };
                     events.publish(Event::Controller { button, pressed });
                 }
-                evdev::InputEventKind::AbsAxis(
-                    axis @ (evdev::AbsoluteAxisType::ABS_Z | evdev::AbsoluteAxisType::ABS_RZ),
+                evdev::EventSummary::AbsoluteAxis(
+                    _,
+                    axis @ (evdev::AbsoluteAxisCode::ABS_Z | evdev::AbsoluteAxisCode::ABS_RZ),
+                    value,
                 ) => {
-                    let (button, half, down) = if axis == evdev::AbsoluteAxisType::ABS_Z {
+                    let (button, half, down) = if axis == evdev::AbsoluteAxisCode::ABS_Z {
                         (ControllerButton::LeftTrigger, left_half, &mut left_down)
                     } else {
                         (ControllerButton::RightTrigger, right_half, &mut right_down)
                     };
-                    let pressed = event.value() > half;
+                    let pressed = value > half;
                     if pressed != *down {
                         *down = pressed;
                         events.publish(Event::Controller { button, pressed });
                     }
                 }
-                evdev::InputEventKind::AbsAxis(evdev::AbsoluteAxisType::ABS_HAT0Y) => {
-                    let now = match event.value() {
+                evdev::EventSummary::AbsoluteAxis(_, evdev::AbsoluteAxisCode::ABS_HAT0Y, value) => {
+                    let now = match value {
                         v if v < 0 => Some(ControllerButton::Up),
                         v if v > 0 => Some(ControllerButton::Down),
                         _ => None,
