@@ -27,7 +27,7 @@ use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use serde::Deserialize;
 
 /// nomic-embed-text's documented prefixes: a document and a question are
@@ -92,10 +92,9 @@ impl Embedder {
         let tokenized = texts
             .iter()
             .map(|text| {
-                let mut tokens = self
-                    .model
-                    .str_to_token(text, AddBos::Always)
-                    .context("tokenising")?;
+                // With the beginning-of-sequence token and special tokens
+                // parsed, as `str_to_token` did before llama-cpp-2 0.1.160.
+                let mut tokens = self.model.vocab().tokenize(text.as_bytes(), true, true);
                 tokens.truncate(MAX_TOKENS);
                 Ok(tokens)
             })
