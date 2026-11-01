@@ -19,8 +19,8 @@
 # unpacked. Needs curl, openssl, base64, and tar; no node.
 set -euo pipefail
 
-VERSION=6.4.299
-INTEGRITY="sha512-AVl138zALtfaAPvADulE0PZThbYzCBS79nL4pOSL/6Sm/4AH5A21BD9VHt97OlCuzJuCpmeZtAtkinisF4Vb1g=="
+VERSION=6.5.438
+INTEGRITY="sha512-vg8Pw1x+AFKy4AMDvhuWl5cOYV8d698UoEANoFFhc79hqXDnZQqnOXoxw3HG907WHOg1JYOvLhP756boddFxpA=="
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 URL="https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-${VERSION}.tgz"

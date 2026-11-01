@@ -22,8 +22,8 @@
 # unpacked. Needs curl, openssl, base64, and tar; no node.
 set -euo pipefail
 
-VERSION=5.38.1
-INTEGRITY="sha512-14cFM4NJGdbuo68rIZTq9TSX0f5BtA6VF+eNX3zq23Z5NoEeVtM4Zn4PpZ0ERl++50jCBrywKFWXmOjbxf0xTA=="
+VERSION=5.40.0
+INTEGRITY="sha512-IrvgusbwtqxhUtVgUy0nToJcfN7CYVRdbBxKMfbo0vab9flVBHA5INZ9UiE5SgRj+PM6opCl5nn5TZdpm2UaxA=="
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 URL="https://registry.npmjs.org/material-icon-theme/-/material-icon-theme-${VERSION}.tgz"
