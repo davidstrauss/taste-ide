@@ -1277,7 +1277,7 @@ impl Supervisor {
                 "--filter".into(),
                 format!("label={LABEL_WORKSPACE}={key}"),
                 "--format".into(),
-                format!("{{{{.Names}}}}\t{{{{index .Labels \"{LABEL_PORTS}\"}}}}"),
+                format!("{{{{.Names}}}}\t{{{{.Label \"{LABEL_PORTS}\"}}}}"),
             ])
             .output()
             .await;
@@ -3831,7 +3831,7 @@ impl Supervisor {
                 &format!("label={LABEL_ENV}={}", self.env.id),
                 "--format",
                 &format!(
-                    r#"{{{{.Names}}}}|{{{{index .Labels "{LABEL_CONFIG_HASH}"}}}}|{{{{index .Labels "{LABEL_AUTHORITY}"}}}}|{{{{index .Labels "{LABEL_PORTS}"}}}}"#
+                    r#"{{{{.Names}}}}|{{{{.Label "{LABEL_CONFIG_HASH}"}}}}|{{{{.Label "{LABEL_AUTHORITY}"}}}}|{{{{.Label "{LABEL_PORTS}"}}}}"#
                 ),
             ])
             .output()

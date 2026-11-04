@@ -205,6 +205,13 @@ async fn capture(substrate: &Substrate, args: Vec<String>) -> Result<String> {
 }
 
 /// Every container podman knows about, with the labels a decision needs.
+///
+/// A label is read with `ps`'s own `.Label "key"` field, as every `ps`
+/// here reads one. `index .Labels "key"` worked while `.Labels` was a map,
+/// and podman 6 made it a list: every `ps` on a host that had moved to
+/// Fedora 45 failed its template, and no environment could start
+/// (2026-11-03). `podman images` still gives a map, so the image listings
+/// keep `index`.
 pub async fn list_containers(substrate: &Substrate) -> Result<Vec<ContainerEntry>> {
     let out = capture(
         substrate,
@@ -213,7 +220,7 @@ pub async fn list_containers(substrate: &Substrate) -> Result<Vec<ContainerEntry
             "-a".into(),
             "--format".into(),
             format!(
-                "{{{{.ID}}}}\t{{{{.Names}}}}\t{{{{index .Labels \"{}\"}}}}\t{{{{index .Labels \"{}\"}}}}",
+                "{{{{.ID}}}}\t{{{{.Names}}}}\t{{{{.Label \"{}\"}}}}\t{{{{.Label \"{}\"}}}}",
                 taste_core::environment::LABEL_WORKSPACE,
                 taste_core::environment::LABEL_ENV,
             ),

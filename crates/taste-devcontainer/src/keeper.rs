@@ -813,7 +813,7 @@ pub fn ensure_container(
             "--filter".into(),
             format!("name=^{name}$"),
             "--format".into(),
-            format!("{{{{.State}}}} {{{{index .Labels \"{KEEPER_LABEL}\"}}}}"),
+            format!("{{{{.State}}}} {{{{.Label \"{KEEPER_LABEL}\"}}}}"),
         ],
     )?;
     let (state, revision) = state.trim().split_once(' ').unwrap_or((state.trim(), ""));
