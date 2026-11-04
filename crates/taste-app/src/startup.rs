@@ -178,7 +178,6 @@ pub(crate) enum Status {
 pub(crate) struct StepRow {
     pub(crate) row: gtk::Box,
     icon: gtk::Image,
-    spinner: gtk::Spinner,
     title: gtk::Label,
     detail: gtk::Label,
     /// How long the active step has been at it, at the row's end.
@@ -207,7 +206,7 @@ impl StepRow {
             .icon_name("radio-symbolic")
             .pixel_size(16)
             .build();
-        let spinner = gtk::Spinner::new();
+        let spinner = crate::spinner::image(16);
         mark.add_named(&icon, Some("icon"));
         mark.add_named(&spinner, Some("spinner"));
         mark.set_visible_child_name("icon");
@@ -240,7 +239,6 @@ impl StepRow {
         let this = Self {
             row,
             icon,
-            spinner,
             title,
             detail,
             elapsed,
@@ -302,10 +300,8 @@ impl StepRow {
         self.icon.set_icon_name(Some(icon));
         if let Some(mark) = mark {
             if status == Status::Active {
-                self.spinner.start();
                 mark.set_visible_child_name("spinner");
             } else {
-                self.spinner.stop();
                 mark.set_visible_child_name("icon");
             }
         }

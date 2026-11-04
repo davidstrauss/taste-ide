@@ -74,6 +74,7 @@ mod runtime;
 mod search;
 mod semantic;
 mod sparkline;
+mod spinner;
 mod ssh_agent;
 mod stall;
 mod startup;

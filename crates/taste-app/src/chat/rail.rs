@@ -56,7 +56,7 @@ mod imp {
         pub content: glib::WeakRef<gtk::Widget>,
         /// The first line's centre inside the content, as last measured.
         pub mid: Cell<Option<i32>>,
-        pub spinner: RefCell<Option<gtk::Spinner>>,
+        pub spinner: RefCell<Option<gtk::Image>>,
     }
 
     #[glib::object_subclass]
@@ -241,7 +241,7 @@ impl Rail {
             return;
         }
         if running {
-            let spinner = gtk::Spinner::builder().spinning(true).build();
+            let spinner = crate::spinner::image(RAIL_SPINNER);
             spinner.set_parent(self);
             *imp.spinner.borrow_mut() = Some(spinner);
         } else if let Some(spinner) = imp.spinner.take() {

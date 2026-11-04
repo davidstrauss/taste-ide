@@ -1361,10 +1361,9 @@ fn sync_button_stack(face: &impl IsA<gtk::Widget>) -> gtk::Stack {
         .transition_type(gtk::StackTransitionType::None)
         .build();
     stack.add_named(face, Some("face"));
-    let spinner = gtk::Spinner::builder()
-        .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
-        .build();
+    let spinner = crate::spinner::image(16);
+    spinner.set_halign(gtk::Align::Center);
+    spinner.set_valign(gtk::Align::Center);
     stack.add_named(&spinner, Some("busy"));
     stack.set_visible_child_name("face");
     stack
@@ -1396,9 +1395,6 @@ fn sync_button_with_icon(icon: &str, tooltip: &str) -> gtk::Button {
 /// Show a button's spinner page until the operation ends.
 fn button_busy(button: &gtk::Button) {
     if let Some(stack) = button.child().and_downcast::<gtk::Stack>() {
-        if let Some(spinner) = stack.child_by_name("busy").and_downcast::<gtk::Spinner>() {
-            spinner.start();
-        }
         stack.set_visible_child_name("busy");
     }
     button.set_sensitive(false);
@@ -1604,9 +1600,6 @@ fn button_idle(button: &gtk::Button) {
     if let Some(stack) = button.child().and_downcast::<gtk::Stack>() {
         if stack.visible_child_name().as_deref() == Some("busy") {
             stack.set_visible_child_name("face");
-        }
-        if let Some(spinner) = stack.child_by_name("busy").and_downcast::<gtk::Spinner>() {
-            spinner.stop();
         }
     }
 }
@@ -4136,13 +4129,9 @@ impl FileTree {
                 while let Some(child) = slot.first_child() {
                     slot.remove(&child);
                 }
-                let spinner = gtk::Spinner::builder()
-                    .spinning(true)
-                    .width_request(12)
-                    .height_request(12)
-                    .valign(gtk::Align::Center)
-                    .tooltip_text("Running")
-                    .build();
+                let spinner = crate::spinner::image(12);
+                spinner.set_valign(gtk::Align::Center);
+                spinner.set_tooltip_text(Some("Running"));
                 spinner.set_hexpand(true);
                 spinner.set_halign(gtk::Align::Center);
                 slot.append(&spinner);

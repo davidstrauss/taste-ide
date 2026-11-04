@@ -770,7 +770,7 @@ pub struct ChatPane {
     permission_label: gtk::Label,
     permission_subtitle: gtk::Label,
     status_label: gtk::Label,
-    status_spinner: gtk::Spinner,
+    status_spinner: crate::spinner::Spinner,
     busy_row: gtk::Box,
     /// What the turn is doing, when the agent has said: the tool call in
     /// flight, or `BUSY_IDLE` between them.
@@ -3157,8 +3157,7 @@ impl ChatPane {
         // spinner pretending to be information — and it goes away entirely
         // while a permission card is up, because nothing is working then:
         // the turn is stopped, waiting on the person reading it.
-        let busy_spinner = gtk::Spinner::new();
-        busy_spinner.start();
+        let busy_spinner = crate::spinner::image(16);
         let busy_label = gtk::Label::builder()
             .label(BUSY_IDLE)
             .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -3306,8 +3305,7 @@ impl ChatPane {
                  comes back",
             )
             .build();
-        let status_spinner = gtk::Spinner::new();
-        status_spinner.set_size_request(16, 16);
+        let status_spinner = crate::spinner::Spinner::new(16);
         // Centred for the same reason, and so the size request is the size
         // it actually gets rather than being stretched to the row.
         status_spinner.set_valign(gtk::Align::Center);
@@ -3316,7 +3314,7 @@ impl ChatPane {
         // something holds the middle. Hidden, it let "Claude Code" drift
         // to wherever the tabs stopped.
         top_bar.append(&tab_box);
-        top_bar.append(&status_spinner);
+        top_bar.append(&*status_spinner);
         // The status line is not on the row any more; the gear's badge and
         // tooltip carry it. What stays is the row's slack, so the identity
         // and the gauge keep their place at the end.
