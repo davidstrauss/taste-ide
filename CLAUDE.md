@@ -266,7 +266,9 @@ last puts an ignored file the tree does not list in front, closes the
 folder that opened looking for it, refreshes, and prints whether it
 opened again (it must not);
 `TASTE_PROBE_NAME_PROMPT=1` opens the New file dialog and prints where
-the keyboard is;
+the keyboard is, and `=menu` opens it from the project folder's menu, its
+item clicked, since the popover closing around the dialog is what that
+path adds;
 `TASTE_PROBE_DROP=move:<path>:<folder>` (or `copy:` for a Ctrl-drag, or
 `in:<a path on this host>:<folder>` for a drop from outside; several,
 comma-separated, a second and a half apart from four seconds in), paths from the folder the

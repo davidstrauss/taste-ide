@@ -5732,6 +5732,46 @@ impl FileTree {
         dialog.present(Some(&self.widget));
     }
 
+    /// Ask for a name and make a file or a folder of it in `dir`: what the
+    /// New file… and New folder… rows at a folder's end do, and the same
+    /// items on a row's menu, through this one function.
+    ///
+    /// The selection is held while the name is asked for: a cancel gives it
+    /// back to the file in front, and a new file takes it, as it opens
+    /// (David, 2026-10-20: "it should go from 'New file...' selected to the
+    /// newly created file selected"). A folder opens no tab, so the
+    /// selection goes back to the file in front then too, as it does when
+    /// the create is refused or fails — and only once it exists does the
+    /// new file take it, or the row stayed lit over a failure (review,
+    /// 2026-10-20).
+    fn ask_create(self: &Rc<Self>, dir: PathBuf, create: Create) {
+        let (title, folder) = match create {
+            Create::File => ("New File", false),
+            Create::Folder => ("New Folder", true),
+        };
+        self.selection_held.set(true);
+        self.clone().prompt_name_or(
+            title,
+            "Create",
+            "",
+            move |tree, name| {
+                tree.selection_held.set(false);
+                let path = dir.join(name);
+                tree.create_file_then(&path.clone(), folder, move |tree, made| {
+                    if made && !folder {
+                        tree.select_file(path);
+                    } else {
+                        tree.restore_tree_selection();
+                    }
+                });
+            },
+            |tree| {
+                tree.selection_held.set(false);
+                tree.restore_tree_selection();
+            },
+        );
+    }
+
     fn prompt_name(
         self: Rc<Self>,
         heading: &str,
@@ -5811,12 +5851,9 @@ impl FileTree {
         dialog.present(Some(&self.widget));
     }
 
-    fn create_file(self: &Rc<Self>, path: &Path, is_dir: bool) {
-        self.create_file_then(path, is_dir, |_, _| {});
-    }
-
-    /// [`Self::create_file`], with `done` told whether it was made — after
-    /// the file exists and is open, or once it is refused or fails.
+    /// Make the file or folder at `path`, its parents with it, and open a
+    /// file once it exists; `done` is told whether it was made — after the
+    /// file exists and is open, or once it is refused or fails.
     fn create_file_then(
         self: &Rc<Self>,
         path: &Path,
@@ -5934,9 +5971,32 @@ impl FileTree {
         }
 
         let actions = gio::SimpleActionGroup::new();
+        // A choice runs once the menu is gone, never while it closes
+        // around it: a popover that closes gives the keyboard back to what
+        // it took it from, so a dialog a choice opened lost its field's
+        // focus to the folder's button the moment it had it (David,
+        // 2026-11-06: the New file dialog from the folder's menu "fails to
+        // focus the file name input, which the ghost new file does
+        // correctly"). Held until `closed`, or, when the menu closed first,
+        // run on the next idle.
+        let menu_open = Rc::new(Cell::new(true));
+        let chosen: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let after_close: Rc<dyn Fn(Rc<dyn Fn()>)> = {
+            let menu_open = menu_open.clone();
+            let chosen = chosen.clone();
+            Rc::new(move |run: Rc<dyn Fn()>| {
+                if menu_open.get() {
+                    *chosen.borrow_mut() = Some(run);
+                } else {
+                    glib::idle_add_local_once(move || run());
+                }
+            })
+        };
         let add_action = |name: &str, callback: Box<dyn Fn() + 'static>| {
             let action = gio::SimpleAction::new(name, None);
-            action.connect_activate(move |_, _| callback());
+            let callback: Rc<dyn Fn()> = callback.into();
+            let after_close = after_close.clone();
+            action.connect_activate(move |_, _| after_close(callback.clone()));
             actions.add_action(&action);
         };
 
@@ -5999,14 +6059,18 @@ impl FileTree {
                         Some(&info.name.replace('_', "__")),
                         Some(&format!("row.{action_name}")),
                     );
-                    let action = gio::SimpleAction::new(&action_name, None);
-                    action.set_enabled(runnable);
                     let tree = self.clone();
                     let given = vec![(var, value.clone())];
-                    action.connect_activate(move |_, _| {
-                        tree.ask_and_run_task(&info, given.clone());
-                    });
-                    actions.add_action(&action);
+                    add_action(
+                        &action_name,
+                        Box::new(move || tree.ask_and_run_task(&info, given.clone())),
+                    );
+                    if let Some(action) = actions
+                        .lookup_action(&action_name)
+                        .and_downcast::<gio::SimpleAction>()
+                    {
+                        action.set_enabled(runnable);
+                    }
                 }
                 menu.append_section(Some("Run Task"), &section);
             }
@@ -6025,33 +6089,12 @@ impl FileTree {
         create_section.append(Some("New file…"), Some("row.new-file"));
         create_section.append(Some("New folder…"), Some("row.new-folder"));
         menu.append_section(None, &create_section);
-        {
+        // The same ask as the New file… and New folder… rows at a folder's
+        // end, from the same function (`ask_create`).
+        for (name, create) in [("new-file", Create::File), ("new-folder", Create::Folder)] {
             let tree = self.clone();
             let dir = target_dir.clone();
-            add_action(
-                "new-file",
-                Box::new(move || {
-                    let dir = dir.clone();
-                    tree.clone()
-                        .prompt_name("New File", "Create", "", move |tree, name| {
-                            tree.create_file(&dir.join(name), false);
-                        });
-                }),
-            );
-        }
-        {
-            let tree = self.clone();
-            let dir = target_dir;
-            add_action(
-                "new-folder",
-                Box::new(move || {
-                    let dir = dir.clone();
-                    tree.clone()
-                        .prompt_name("New Folder", "Create", "", move |tree, name| {
-                            tree.create_file(&dir.join(name), true);
-                        });
-                }),
-            );
+            add_action(name, Box::new(move || tree.ask_create(dir.clone(), create)));
         }
 
         if !node.ghost {
@@ -6204,9 +6247,16 @@ impl FileTree {
         popover.set_widget_name("row-menu");
         popover.insert_action_group("row", Some(&actions));
         popover.set_parent(anchor);
-        popover.connect_closed(|popover| {
+        popover.connect_closed(move |popover| {
+            menu_open.set(false);
             let popover = popover.clone();
-            glib::idle_add_local_once(move || popover.unparent());
+            let run = chosen.borrow_mut().take();
+            glib::idle_add_local_once(move || {
+                popover.unparent();
+                if let Some(run) = run {
+                    run();
+                }
+            });
         });
         // Tracked so row rebinds (git status churn while an agent writes)
         // can close it before its anchor row is disposed under it.
@@ -9547,40 +9597,7 @@ impl FileTree {
                     .parent()
                     .map(Path::to_path_buf)
                     .unwrap_or_default();
-                let (title, folder) = match create {
-                    Create::File => ("New File", false),
-                    Create::Folder => ("New Folder", true),
-                };
-                // The row stays selected while its name is asked for: a
-                // cancel gives the selection back to the file in front, and a
-                // new file takes it, as it opens (David, 2026-10-20: "it
-                // should go from 'New file...' selected to the newly created
-                // file selected"). A folder opens no tab, so the selection
-                // goes back to the file in front then too, as it does when
-                // the create is refused or fails — and only once it exists
-                // does the new file take it, or the row stayed lit over a
-                // failure (review, 2026-10-20).
-                tree.selection_held.set(true);
-                tree.clone().prompt_name_or(
-                    title,
-                    "Create",
-                    "",
-                    move |tree, name| {
-                        tree.selection_held.set(false);
-                        let path = dir.join(name);
-                        tree.create_file_then(&path.clone(), folder, move |tree, made| {
-                            if made && !folder {
-                                tree.select_file(path);
-                            } else {
-                                tree.restore_tree_selection();
-                            }
-                        });
-                    },
-                    |tree| {
-                        tree.selection_held.set(false);
-                        tree.restore_tree_selection();
-                    },
-                );
+                tree.ask_create(dir, create);
             } else if node.is_dir || node.ghost {
                 // A ghost folder opens rather than appears: what it is for
                 // is the files in it, and creating one of them makes it.
@@ -10536,14 +10553,57 @@ impl FileTree {
         }
         // `TASTE_PROBE_NAME_PROMPT=1`: the New file dialog opened as its
         // row opens it, and a second later what holds the keyboard — the
-        // name field, or something a typed name would not reach.
+        // name field, or something a typed name would not reach. `=menu`
+        // opens it from the project folder's own menu instead, its New
+        // file… item clicked as a pointer clicks it, since the popover
+        // closing around the dialog is what that path adds.
         static NAME_PROMPT: std::sync::Once = std::sync::Once::new();
-        if std::env::var("TASTE_PROBE_NAME_PROMPT").is_ok() && !NAME_PROMPT.is_completed() {
+        if let (Ok(pose), false) = (
+            std::env::var("TASTE_PROBE_NAME_PROMPT"),
+            NAME_PROMPT.is_completed(),
+        ) {
             NAME_PROMPT.call_once(|| {});
             let tree = self.clone();
             let root = self.widget.root();
             glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
-                tree.prompt_name_or("New File", "Create", "", |_, _| {}, |_| {});
+                if pose == "menu" {
+                    let anchor = tree.root_label.parent().and_downcast::<gtk::Box>();
+                    let node = FileNode {
+                        path: tree.view_root(),
+                        is_dir: true,
+                        ghost: false,
+                        create: None,
+                    };
+                    if let Some(anchor) = anchor {
+                        tree.show_context_menu(&anchor, &node);
+                    }
+                    let menu = tree.open_menu.borrow().as_ref().and_then(|m| m.upgrade());
+                    let item = menu.and_then(|menu| {
+                        let mut stack = vec![menu.upcast::<gtk::Widget>()];
+                        while let Some(widget) = stack.pop() {
+                            if widget
+                                .downcast_ref::<gtk::Label>()
+                                .is_some_and(|label| label.label() == "New file…")
+                            {
+                                return widget.ancestor(glib::Type::from_name("GtkModelButton")?);
+                            }
+                            let mut child = widget.first_child();
+                            while let Some(c) = child {
+                                child = c.next_sibling();
+                                stack.push(c);
+                            }
+                        }
+                        None
+                    });
+                    match item {
+                        Some(item) => {
+                            item.activate();
+                        }
+                        None => println!("name prompt: no New file… item on the menu"),
+                    }
+                } else {
+                    tree.prompt_name_or("New File", "Create", "", |_, _| {}, |_| {});
+                }
                 glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
                     let focus = root.and_then(|root| root.focus());
                     println!(
