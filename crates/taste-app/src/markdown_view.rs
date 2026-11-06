@@ -408,6 +408,7 @@ fn layout(
                             code: code.trim_end_matches('\n').to_string(),
                             info: code_info.clone(),
                             open: false,
+                            whole: None,
                         });
                     }
                 }
@@ -583,11 +584,15 @@ enum Item {
         quote_depth: usize,
     },
     /// A block of code — a diagram when `info` names Mermaid and the
-    /// fence has closed (`open` while it has not).
+    /// fence has closed (`open` while it has not). `whole` is the block as
+    /// the document has it when what is drawn is less: a clipped answer's
+    /// head ends inside the block ([`Incremental::set_clipped`]), and the
+    /// copy button copies the block, not the part of it shown.
     Code {
         code: String,
         info: String,
         open: bool,
+        whole: Option<String>,
     },
     Table {
         alignments: Vec<pulldown_cmark::Alignment>,
@@ -678,8 +683,13 @@ fn build(item: &Item, context: &Context, readiness: Option<&Readiness>) -> Built
             // selected, clicked, and asked for tooltips above.
             crate::issue_pill::PillText::wrap(&label).upcast()
         }
-        Item::Code { code, info, open } => {
-            let card = code_card(code, true);
+        Item::Code {
+            code,
+            info,
+            open,
+            whole,
+        } => {
+            let card = code_card(code, whole.as_deref(), true);
             if !*open && crate::mermaid::is_mermaid(info) {
                 // The block as code stays the fallback: a diagram that does
                 // not parse is shown as written, with the reason under it.
@@ -772,6 +782,27 @@ impl Incremental {
             self.context.issues.as_ref(),
             self.context.images.as_ref(),
         );
+        self.set_items(items);
+    }
+
+    /// Draw `head`, the start of `whole` that a long answer is clipped to,
+    /// with each code block copying the block as `whole` has it: the head
+    /// may end inside one, closed there, and its copy button copied only
+    /// the lines shown (David, 2026-11-06: "This copy button should copy
+    /// the entire response").
+    pub fn set_clipped(&self, head: &str, whole: &str) {
+        let mut items = layout(
+            head,
+            self.context.issues.as_ref(),
+            self.context.images.as_ref(),
+        );
+        if head != whole {
+            with_whole_blocks(&mut items, &code_blocks(whole));
+        }
+        self.set_items(items);
+    }
+
+    fn set_items(&self, items: Vec<Item>) {
         let mut built = self.built.borrow_mut();
         let mut kept = built
             .iter()
@@ -807,6 +838,49 @@ impl Incremental {
             let made = build(item, &self.context, None);
             self.root.append(&made.widget);
             built.push(made);
+        }
+    }
+}
+
+/// The text of each code block in `text`, in order, as [`layout`] takes it.
+fn code_blocks(text: &str) -> Vec<String> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    let mut blocks = Vec::new();
+    let mut open: Option<String> = None;
+    for event in Parser::new_ext(text, options) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => open = Some(String::new()),
+            Event::Text(text) => {
+                if let Some(code) = open.as_mut() {
+                    code.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(code) = open.take() {
+                    blocks.push(code.trim_end_matches('\n').to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(code) = open {
+        blocks.push(code.trim_end_matches('\n').to_string());
+    }
+    blocks
+}
+
+/// Give each code block among `items` the same block of the whole
+/// document, `whole[i]` for the `i`th, where it is more than is drawn.
+fn with_whole_blocks(items: &mut [Item], whole: &[String]) {
+    let codes = items.iter_mut().filter_map(|item| match item {
+        Item::Code { code, whole, .. } => Some((code, whole)),
+        _ => None,
+    });
+    for ((code, slot), full) in codes.zip(whole) {
+        if full != code {
+            *slot = Some(full.clone());
         }
     }
 }
@@ -932,7 +1006,7 @@ fn picture(base: &DocumentBase, path: PathBuf, alt: &str, hold: Option<Hold>) ->
     holder.upcast()
 }
 
-fn code_card(code: &str, reflow: bool) -> gtk::Widget {
+fn code_card(code: &str, whole: Option<&str>, reflow: bool) -> gtk::Widget {
     let label = gtk::Label::builder()
         .label(code)
         .xalign(0.0)
@@ -967,14 +1041,18 @@ fn code_card(code: &str, reflow: bool) -> gtk::Widget {
     scroller.set_overlay_scrolling(reflow);
     let copy = gtk::Button::builder()
         .icon_name("edit-copy-symbolic")
-        .tooltip_text("Copy code block")
+        .tooltip_text(if whole.is_some() {
+            "Copy the whole code block, with the lines not shown"
+        } else {
+            "Copy code block"
+        })
         .css_classes(["flat", "circular"])
         .halign(gtk::Align::End)
         .valign(gtk::Align::Start)
         .margin_top(4)
         .margin_end(4)
         .build();
-    let code = code.to_string();
+    let code = whole.unwrap_or(code).to_string();
     let reset: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     copy.connect_clicked(move |button| {
         button.clipboard().set_text(&code);
@@ -1070,6 +1148,35 @@ pub(crate) fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverl
 
 #[cfg(test)]
 mod tests {
+    /// A clipped answer's head that ends inside a code block copies the
+    /// block whole; the blocks before it, already whole, copy themselves.
+    #[test]
+    fn a_clipped_code_block_copies_the_whole_block() {
+        let lines: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
+        let whole = format!(
+            "```sh\necho one\n```\nIntro.\n\n```text\n{}\n```\n",
+            lines.join("\n")
+        );
+        let (head, hidden) = crate::chatdoc::clip_prose(&whole, 10, 10_000);
+        assert!(hidden > 0, "the fixture is clipped: {head:?}");
+        let mut items = super::layout(&head, None, None);
+        super::with_whole_blocks(&mut items, &super::code_blocks(&whole));
+        let codes: Vec<(String, Option<String>)> = items
+            .into_iter()
+            .filter_map(|item| match item {
+                super::Item::Code { code, whole, .. } => Some((code, whole)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(codes[0], ("echo one".to_string(), None));
+        assert_eq!(codes[1].0, lines[..4].join("\n"), "drawn: the head's part");
+        assert_eq!(
+            codes[1].1.as_deref(),
+            Some(lines.join("\n").as_str()),
+            "copied: the block whole"
+        );
+    }
+
     use super::*;
 
     fn base() -> DocumentBase {

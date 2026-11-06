@@ -45,7 +45,8 @@ pub(super) struct AnswerView {
     /// Text waiting to be drawn, and whether a frame's drawing is asked
     /// for: a stream is hundreds of updates, each a few words, and they are
     /// drawn once a frame.
-    pending: RefCell<Option<String>>,
+    /// The head to draw, and the whole answer when the head is less.
+    pending: RefCell<Option<(String, Option<String>)>>,
     queued: Cell<bool>,
     /// Drawn at least once: a row built, or bound as the list scrolls to
     /// it, shows its text at once; only the updates after wait a frame.
@@ -63,9 +64,10 @@ impl ChatPane {
     pub(super) fn build_row(&self, row: &Row) -> RowView {
         let mut answer_view = None;
         let (inner, railed): (gtk::Widget, Option<Railed>) = match &row.kind {
-            Kind::User(user) if user.within_turn => {
-                (self.on_rail_line(&self.user_widget(row.id, user)), None)
-            }
+            Kind::User(user) if user.within_turn => (
+                self.on_rail_line(&self.user_widget(row.id, user), user.through),
+                None,
+            ),
             Kind::User(user) => (self.user_widget(row.id, user).upcast(), None),
             Kind::Answer(answer) => {
                 let (railed, view) = self.answer_widget(row, answer);
@@ -183,7 +185,10 @@ impl ChatPane {
         // how long it waited, or that it never went.
         let (label, tooltip): (String, Option<String>) = match &user.delivery {
             Delivery::Delivered | Delivery::Sent => return card,
-            Delivery::Queued => ("queued — sends when the current turn ends".into(), None),
+            Delivery::Queued => queued_badge(
+                taste_acp::relocate::reads_queued_within_turn(&self.agent_id()),
+                !user.attachments.is_empty(),
+            ),
             Delivery::Asking { told: false } => (
                 "queued — asking the agent to end its turn after its current step".into(),
                 None,
@@ -307,27 +312,31 @@ impl ChatPane {
         card
     }
 
-    /// `content` in the timeline's column with the line running past it
-    /// beside the content: a prompt waiting inside a turn, which goes on
-    /// below it (`User::within_turn`).
-    fn on_rail_line(&self, content: &impl IsA<gtk::Widget>) -> gtk::Widget {
+    /// `content` in the timeline's column, with the line running past it
+    /// beside the content when `line`: a prompt waiting inside a turn,
+    /// which goes on below it (`User::within_turn`). Without the line, the
+    /// column stays, so the card does not move when a step comes below it
+    /// and the line is drawn (`User::through`).
+    fn on_rail_line(&self, content: &impl IsA<gtk::Widget>, line: bool) -> gtk::Widget {
         let rail = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .width_request(RAIL_WIDTH)
             .hexpand(false)
             .build();
-        rail.append(
-            &gtk::Box::builder()
-                .css_classes(["rail-line"])
-                // On the rail's own pixel column, `(RAIL_WIDTH - 1) / 2`,
-                // where the step rail draws its line (rail.rs): centred,
-                // a 1px line in the 16px column fell between two pixels
-                // and smeared across both, half a pixel off the steps'.
-                .halign(gtk::Align::Start)
-                .margin_start((RAIL_WIDTH - 1) / 2)
-                .vexpand(true)
-                .build(),
-        );
+        if line {
+            rail.append(
+                &gtk::Box::builder()
+                    .css_classes(["rail-line"])
+                    // On the rail's own pixel column, `(RAIL_WIDTH - 1) / 2`,
+                    // where the step rail draws its line (rail.rs): centred,
+                    // a 1px line in the 16px column fell between two pixels
+                    // and smeared across both, half a pixel off the steps'.
+                    .halign(gtk::Align::Start)
+                    .margin_start((RAIL_WIDTH - 1) / 2)
+                    .vexpand(true)
+                    .build(),
+            );
+        }
         let row = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
         row.set_margin_start(ROW_OWN_SIDE);
         row.append(&rail);
@@ -642,18 +651,21 @@ impl ChatPane {
         } else {
             crate::chatdoc::clip_prose(&answer.text, PROSE_CLIP_LINES, PROSE_CLIP_CHARS)
         };
+        // The whole as well when the head is less: its code blocks copy
+        // the blocks whole (`Incremental::set_clipped`).
+        let whole = (hidden > 0).then(|| answer.text.clone());
         if answer.done || !view.drawn.replace(true) {
             view.pending.borrow_mut().take();
-            view.doc.set_text(&head);
+            draw_answer(&view.doc, &head, whole.as_deref());
         } else {
-            *view.pending.borrow_mut() = Some(head);
+            *view.pending.borrow_mut() = Some((head, whole));
             if !view.queued.replace(true) {
                 let weak = Rc::downgrade(view);
                 view.body.add_tick_callback(move |_, _| {
                     if let Some(view) = weak.upgrade() {
                         view.queued.set(false);
-                        if let Some(text) = view.pending.borrow_mut().take() {
-                            view.doc.set_text(&text);
+                        if let Some((head, whole)) = view.pending.borrow_mut().take() {
+                            draw_answer(&view.doc, &head, whole.as_deref());
                         }
                     }
                     glib::ControlFlow::Break
@@ -1234,8 +1246,56 @@ fn step_has_content(step: &Step) -> bool {
     })
 }
 
+/// An answer's head drawn, with the whole answer it was clipped from when
+/// there is more of it.
+fn draw_answer(doc: &crate::markdown_view::Incremental, head: &str, whole: Option<&str>) {
+    match whole {
+        Some(whole) => doc.set_clipped(head, whole),
+        None => doc.set_text(head),
+    }
+}
+
+/// A queued message's badge, and its tooltip: where it goes depends on
+/// whether the agent reads queued messages within its turn
+/// (`taste_acp::relocate::reads_queued_within_turn`), and a message with an
+/// attachment waits for the turn's end even then (`taste_core::nudge`).
+fn queued_badge(reads_within_turn: bool, attached: bool) -> (String, Option<String>) {
+    match (reads_within_turn, attached) {
+        (true, false) => (
+            "queued — the agent reads it at its next step, or when its turn ends".into(),
+            Some(
+                "Read after the agent's next tool call, within the turn it is in, or sent \
+                 when the turn ends if it makes none"
+                    .into(),
+            ),
+        ),
+        (true, true) => (
+            "queued — sends when the current turn ends".into(),
+            Some(
+                "A message with an attachment waits for the turn to end; words alone the \
+                 agent reads at its next step"
+                    .into(),
+            ),
+        ),
+        (false, _) => ("queued — sends when the current turn ends".into(), None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_queued_badge_says_when_the_agent_reads_it() {
+        let (within, _) = super::queued_badge(true, false);
+        assert!(within.contains("next step"), "{within}");
+        let (attached, why) = super::queued_badge(true, true);
+        assert!(
+            attached.contains("turn ends") && why.is_some(),
+            "{attached}"
+        );
+        let (other, _) = super::queued_badge(false, false);
+        assert_eq!(other, "queued — sends when the current turn ends");
+    }
+
     use gtk::prelude::*;
 
     /// A thought's body is as tall as its text at the width it is given,

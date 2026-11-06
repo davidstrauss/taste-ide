@@ -419,8 +419,12 @@ const QUESTION_TITLE_DROP: i32 = 4;
 const SEND_TOOLTIP: &str = "Send";
 /// The same contract while a turn is running. Saying "queued" up front
 /// matters: the alternative reading of a live Send button mid-turn is that
-/// it interrupts the answer being written.
+/// it interrupts the answer being written. Which of the two depends on the
+/// agent: Claude Code reads a queued message at its next step, within the
+/// turn (`taste_acp::relocate::reads_queued_within_turn`).
 const SEND_TOOLTIP_QUEUED: &str = "Queue — sends when the current turn ends";
+const SEND_TOOLTIP_QUEUED_WITHIN: &str =
+    "Queue — the agent reads it at its next step, or when its turn ends";
 
 /// What the working line says when the turn is between tool calls — the
 /// model is writing and there is genuinely nothing more specific to report.
@@ -8758,7 +8762,13 @@ impl ChatPane {
         // would be the dishonest choice here: the send genuinely works.
         if busy {
             self.send_button.set_label("Queue");
-            self.send_button.set_tooltip_text(Some(SEND_TOOLTIP_QUEUED));
+            self.send_button.set_tooltip_text(Some(
+                if taste_acp::relocate::reads_queued_within_turn(&self.agent_id()) {
+                    SEND_TOOLTIP_QUEUED_WITHIN
+                } else {
+                    SEND_TOOLTIP_QUEUED
+                },
+            ));
         } else {
             self.send_button.set_label("Send");
             self.send_button.set_tooltip_text(Some(SEND_TOOLTIP));

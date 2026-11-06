@@ -121,6 +121,13 @@ pub(super) struct User {
     /// line"). Seated as a prompt once the agent takes it
     /// ([`Model::prompt_taken`]).
     pub within_turn: bool,
+    /// The line is drawn past the card: a step of the turn has come below
+    /// it. Until one does, the line ends at the dot above, as a turn's last
+    /// step's does, rather than hanging below the card over nothing — the
+    /// working line under the transcript is not on it (David, 2026-11-06:
+    /// "The line cuts out halfway. It should either go the whole way to the
+    /// next spinner or end after the previous one").
+    pub through: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,6 +448,7 @@ impl Model {
                 rail.bottom = false;
             }
             self.changed(previous);
+            self.line_past_waiting(previous, false);
             self.last_step = Some(previous);
         }
     }
@@ -464,9 +472,39 @@ impl Model {
                 }
             }
             self.changed(previous);
+            self.line_past_waiting(previous, true);
         }
         self.last_step = Some(id);
         id
+    }
+
+    /// The cards waiting inside the turn just after step `above`, before
+    /// the next step: the line drawn past them, or not (`User::through`).
+    fn line_past_waiting(&mut self, above: RowId, through: bool) {
+        let Some(&at) = self.index.get(&above) else {
+            return;
+        };
+        let waiting: Vec<RowId> = self.rows[at + 1..]
+            .iter()
+            .take_while(|row| row.rail.is_none())
+            .filter(|row| {
+                matches!(
+                    &row.kind,
+                    Kind::User(user) if user.within_turn && user.through != through
+                )
+            })
+            .map(|row| row.id)
+            .collect();
+        for id in waiting {
+            if let Some(Row {
+                kind: Kind::User(user),
+                ..
+            }) = self.row_mut(id)
+            {
+                user.through = through;
+            }
+            self.changed(id);
+        }
     }
 
     /// The turn's timeline ends here: the last step's line stops at its
@@ -1191,6 +1229,7 @@ impl Model {
                         &row.kind,
                         Kind::User(User {
                             within_turn: true,
+                            through: true,
                             ..
                         })
                     )
@@ -1324,17 +1363,12 @@ impl Model {
         // goes on below it, so the line runs on past it.
         let within_turn = matches!(delivery, Delivery::Queued | Delivery::Asking { .. })
             && self.last_step.is_some();
+        // The step above runs its line down past the card only once the
+        // turn's next step is drawn below it (`push_step`, `User::through`).
         if !within_turn {
             self.plan = None;
             self.turn_answers.clear();
             self.end_steps();
-        } else if let Some(above) = self.last_step {
-            // The turn goes on past the card: the step above runs down
-            // into it.
-            if let Some(rail) = self.row_mut(above).and_then(|row| row.rail.as_mut()) {
-                rail.bottom = true;
-            }
-            self.changed(above);
         }
         self.lines.push(("you", text.clone()));
         let id = self.push(
@@ -1344,6 +1378,7 @@ impl Model {
                 prompt: prompt.clone(),
                 delivery,
                 within_turn,
+                through: false,
             }),
             None,
             Dot::Plain,
@@ -2004,7 +2039,8 @@ mod tests {
 
     /// A message sent during a turn waits inside it: the line runs on from
     /// the step above it to the step below, which is still that turn's
-    /// (David, 2026-10-19: "Discontinuity for the line"). Taken with
+    /// (David, 2026-10-19: "Discontinuity for the line") — once there is
+    /// one, and until then ends at the dot above (David, 2026-11-06). Taken with
     /// nothing drawn after it, it is seated where it stands: the turn's line
     /// ends at the dot above it, and the next step's runs up from its box.
     #[test]
@@ -2021,6 +2057,22 @@ mod tests {
             Vec::new(),
             Delivery::Queued,
         );
+        // Nothing of the turn below the card yet: the line ends at a's
+        // dot, and is not drawn past the card over nothing.
+        let rows = model.rows();
+        assert!(rows[1].rail.is_some_and(|rail| !rail.bottom), "a ends");
+        assert!(
+            matches!(
+                &rows[2].kind,
+                Kind::User(User {
+                    within_turn: true,
+                    through: false,
+                    ..
+                })
+            ),
+            "{:?}",
+            rows[2].kind
+        );
         model.read(step("b"));
         let rows = model.rows();
         assert!(rows[1].rail.is_some_and(|rail| rail.bottom), "a runs down");
@@ -2029,6 +2081,7 @@ mod tests {
                 &rows[2].kind,
                 Kind::User(User {
                     within_turn: true,
+                    through: true,
                     ..
                 })
             ),

@@ -390,6 +390,15 @@ const PATH_PRELUDE: &str = r#"[ -n "$1" ] && PATH="$1:$PATH"; [ -n "$2" ] && PAT
 /// tools, which still work, so a failure there does not stop the start.
 const CLAUDE_PRELUDE: &str = r#"[ -n "$1" ] && PATH="$1:$PATH"; [ -n "$2" ] && PATH="$PATH:$2"; export PATH; node -e "$3" || true; shift 3; exec "$@""#;
 
+/// Whether agent `agent_id` reads the user's queued messages within its
+/// turn, at its next tool call, rather than only once the turn ends:
+/// Claude Code, through the `PostToolUse` hook its settings are given here
+/// (`taste_core::nudge::TAKE_TOOL`). A message with an attachment still
+/// waits for the turn's end; other agents are asked to end the turn.
+pub fn reads_queued_within_turn(agent_id: &str) -> bool {
+    agent_id == crate::registry::CLAUDE_CODE || agent_id == crate::registry::CLAUDE_CODE_CUSTOM
+}
+
 fn is_claude_code(spec: &AgentSpec) -> bool {
     spec.id == crate::registry::CLAUDE_CODE || spec.id == crate::registry::CLAUDE_CODE_CUSTOM
 }
