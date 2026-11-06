@@ -1,0 +1,36 @@
+---
+title: Getting started
+---
+
+import { Callout } from '../components/callout'
+import { Chart } from '../components/chart'
+
+export const meta = {
+  section: 'guides',
+}
+
+# Getting started
+
+{/* Shown to readers who arrive from the install page; don't move it. */}
+
+Install the tool, then run it once from your project's folder.
+Press <Kbd>Ctrl</Kbd>+<Kbd>D</Kbd> to focus the composer.
+
+<Callout type="warn" title="Before you begin">
+You need **podman** and a kernel with Landlock ABI 3 or later.
+</Callout>
+
+<Chart
+  data={[3, 1, 4, 1, 5]}
+  title="Builds per day > 2"
+/>
+
+## A component in a fence stays
+
+```jsx
+import { Callout } from '../components/callout'
+
+<Callout type="info">This is an example, not a component.</Callout>
+```
+
+Copyright {new Date().getFullYear()}.

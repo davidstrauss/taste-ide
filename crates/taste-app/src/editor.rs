@@ -5358,6 +5358,13 @@ impl Editor {
                 .buffer
                 .text(&page.buffer.start_iter(), &page.buffer.end_iter(), true)
                 .to_string();
+            // An MDX document's Markdown, without what only its compiler
+            // could run (`crate::mdx`).
+            let text = if crate::mdx::is_mdx(path) {
+                crate::mdx::prose(&text)
+            } else {
+                text
+            };
             let events = self.workspace.events.clone();
             let on_link: std::rc::Rc<dyn Fn(&str)> = std::rc::Rc::new(move |url: &str| {
                 events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
@@ -5854,11 +5861,13 @@ fn is_html(path: &Path) -> bool {
     })
 }
 
+/// Markdown, or MDX, which is edited and previewed as Markdown
+/// (`crate::mdx`).
 fn is_markdown(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
         Some("md") | Some("markdown")
-    )
+    ) || crate::mdx::is_mdx(path)
 }
 
 fn jump_to_line(view: &sourceview5::View, buffer: &sourceview5::Buffer, line: u32) {

@@ -26,8 +26,14 @@ const LANGUAGES: &[(&str, &str)] = &[
 /// Extensions GtkSourceView's own definitions do not claim, and the
 /// language each is: CommonJS (`.cjs`) and its TypeScript forms (`.cts`,
 /// `.mts`) are JavaScript and TypeScript, and 5.20's `js.lang` names only
-/// `*.js` and `*.mjs` (David, 2026-10-25: "Add CJS syntax highlighting").
-const ALIASES: &[(&str, &str)] = &[("cjs", "js"), ("cts", "typescript"), ("mts", "typescript")];
+/// `*.js` and `*.mjs` (David, 2026-10-25: "Add CJS syntax highlighting");
+/// MDX is Markdown, whose definition takes its tags as HTML (`crate::mdx`).
+const ALIASES: &[(&str, &str)] = &[
+    ("cjs", "js"),
+    ("cts", "typescript"),
+    ("mts", "typescript"),
+    ("mdx", "markdown"),
+];
 
 /// The language `path` is highlighted as: GtkSourceView's guess from its
 /// name, else what [`ALIASES`] says its extension is.
@@ -87,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn commonjs_and_its_typescript_forms_are_highlighted() {
+    fn commonjs_its_typescript_forms_and_mdx_are_highlighted() {
         crate::gtk_test::on_gtk_thread("languages: no display — skipped", || {
             for (name, id) in [
                 ("server.cjs", "js"),
@@ -95,6 +101,7 @@ mod tests {
                 ("types.cts", "typescript"),
                 ("module.mts", "typescript"),
                 ("plain.js", "js"),
+                ("intro.mdx", "markdown"),
             ] {
                 let language = super::guess(std::path::Path::new(name))
                     .unwrap_or_else(|| panic!("no language for {name}"));

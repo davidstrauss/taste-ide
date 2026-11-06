@@ -421,7 +421,7 @@ pub mod symbols {
             "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => Language::JavaScript,
             "go" => Language::Go,
             "sh" | "bash" | "zsh" => Language::Shell,
-            "md" | "markdown" => Language::Markdown,
+            "md" | "markdown" | "mdx" => Language::Markdown,
             _ => return None,
         })
     }
