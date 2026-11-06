@@ -117,6 +117,23 @@ pub fn set_repo_identity(root: &Path, identity: &GitIdentity) -> Result<()> {
     Ok(())
 }
 
+/// Write `identity` into the git config file at `path` as `user.name` and
+/// `user.email`, making the file when there is none and keeping whatever
+/// else it holds. Only ever on the user's say-so: the author banner's
+/// choice of a `.gitconfig` above a project ([`gitconfigs_above`]).
+pub fn set_identity_in_file(path: &Path, identity: &GitIdentity) -> Result<()> {
+    // Made empty first, without truncating one that is there, so that
+    // opening it never depends on whether libgit2 makes a missing file.
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let mut config = git2::Config::open(path)?;
+    config.set_str("user.name", &identity.name)?;
+    config.set_str("user.email", &identity.email)?;
+    Ok(())
+}
+
 /// The project's author: the one the folder's repository at `root` sets
 /// ([`repo_identity`]), remembered in `record` — a git config file in the
 /// IDE's state for the workspace — or, when the folder sets none, the one
@@ -180,6 +197,237 @@ pub fn host_identity() -> Option<GitIdentity> {
     let name = config.get_string("user.name").ok()?;
     let email = config.get_string("user.email").ok()?;
     (!name.trim().is_empty() && !email.trim().is_empty()).then_some(GitIdentity { name, email })
+}
+
+/// The identity the author banner fills its fields with, for a project
+/// that names none of its own: a SUGGESTION, which reaches the project
+/// only through the user's own press of its button (`set_repo_identity`).
+///
+/// Read from the first of these that names it, each half on its own, so a
+/// file that sets only a work email still takes the name from further on
+/// (David, 2026-11-06: "look for an identity file at each path up the
+/// tree, using the first one found", and then "consult the other standard
+/// sources … The goal is to offer the most useful default"):
+///
+/// - a `.gitconfig` in each folder above `folder`, from its parent up to
+///   and including the home folder — so `~/Projects/work/.gitconfig`
+///   answers for everything under it, and `~/.gitconfig` for the rest;
+/// - the XDG one, `git/config` in the host's config folder;
+/// - the system one, the host's `/etc/gitconfig`.
+///
+/// Inside the Flatpak, the XDG and system files are the HOST's, not the
+/// sandbox's: `HOST_XDG_CONFIG_HOME` and `/run/host/etc`. A file's
+/// `include.path` is followed; an `includeIf` is not, since without a
+/// repository it has no gitdir to match. Halves left unnamed are empty.
+/// Blocking: file IO.
+pub fn suggested_identity(folder: &Path) -> GitIdentity {
+    let flatpak = std::env::var_os("FLATPAK_ID").is_some();
+    let home = home();
+    let config_home = std::env::var_os("HOST_XDG_CONFIG_HOME")
+        .or_else(|| {
+            (!flatpak)
+                .then(|| std::env::var_os("XDG_CONFIG_HOME"))
+                .flatten()
+        })
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.as_ref().map(|home| home.join(".config")));
+    let system = if flatpak {
+        PathBuf::from("/run/host/etc/gitconfig")
+    } else {
+        PathBuf::from("/etc/gitconfig")
+    };
+    identity_in(&suggestion_files(
+        folder,
+        home.as_deref(),
+        config_home.map(|dir| dir.join("git").join("config")),
+        Some(system),
+    ))
+}
+
+/// The `.gitconfig` in each folder from `folder`'s parent up to and
+/// including the home folder, nearest first, whether or not each exists:
+/// the files [`suggested_identity`] reads before the standard ones, and the
+/// ones the author banner offers to save into as well. Blocking: it
+/// resolves paths.
+pub fn gitconfigs_above(folder: &Path) -> Vec<PathBuf> {
+    walk_above(folder, home().as_deref())
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// [`gitconfigs_above`] for a given home, and on past it to the root when
+/// `folder` is not under it. Paths are compared resolved, so a home
+/// reached through a symlink (`/home` on an rpm-ostree host is
+/// `/var/home`) still ends the walk.
+fn walk_above(folder: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let resolve = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let folder = resolve(folder);
+    let home = home.map(resolve);
+    let mut files = Vec::new();
+    for dir in folder.ancestors().skip(1) {
+        files.push(dir.join(".gitconfig"));
+        if home.as_deref() == Some(dir) {
+            break;
+        }
+    }
+    files
+}
+
+/// The files [`suggested_identity`] reads, in order: [`walk_above`], then
+/// `xdg`, then `system`.
+fn suggestion_files(
+    folder: &Path,
+    home: Option<&Path>,
+    xdg: Option<PathBuf>,
+    system: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut files = walk_above(folder, home);
+    files.extend(xdg);
+    files.extend(system);
+    files
+}
+
+/// `user.name` and `user.email` from the first of `files` that sets each,
+/// trimmed; a file that is missing or will not parse is passed over.
+fn identity_in(files: &[PathBuf]) -> GitIdentity {
+    let mut found = GitIdentity {
+        name: String::new(),
+        email: String::new(),
+    };
+    for file in files {
+        if !found.name.is_empty() && !found.email.is_empty() {
+            break;
+        }
+        if !file.is_file() {
+            continue;
+        }
+        let Some(config) = git2::Config::open(file)
+            .ok()
+            .and_then(|mut config| config.snapshot().ok())
+        else {
+            continue;
+        };
+        for (key, slot) in [
+            ("user.name", &mut found.name),
+            ("user.email", &mut found.email),
+        ] {
+            if slot.is_empty() {
+                if let Ok(value) = config.get_string(key) {
+                    *slot = value.trim().to_string();
+                }
+            }
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// The walk starts at the folder's parent, stops at home, and goes on
+    /// to the XDG file and then the system one.
+    #[test]
+    fn the_walk_goes_up_to_home_and_then_to_the_standard_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let folder = home.join("work").join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let files = suggestion_files(
+            &folder,
+            Some(&home),
+            Some(root.join("xdg/git/config")),
+            Some(root.join("etc/gitconfig")),
+        );
+        assert_eq!(
+            files,
+            vec![
+                home.join("work/.gitconfig"),
+                home.join(".gitconfig"),
+                root.join("xdg/git/config"),
+                root.join("etc/gitconfig"),
+            ]
+        );
+    }
+
+    /// The nearest file wins, each half on its own: a work folder's file
+    /// that sets only an email still takes its name from home's.
+    #[test]
+    fn the_nearest_file_names_each_half() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let folder = home.join("work").join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        write(
+            &home.join("work/.gitconfig"),
+            "[user]\n\temail = ada@work.example\n",
+        );
+        write(
+            &home.join(".gitconfig"),
+            "[user]\n\tname = Ada Lovelace\n\temail = ada@home.example\n",
+        );
+        write(
+            &root.join("etc/gitconfig"),
+            "[user]\n\tname = System\n\temail = system@example\n",
+        );
+        let files = suggestion_files(&folder, Some(&home), None, Some(root.join("etc/gitconfig")));
+        assert_eq!(
+            identity_in(&files),
+            GitIdentity {
+                name: "Ada Lovelace".into(),
+                email: "ada@work.example".into(),
+            }
+        );
+    }
+
+    /// The banner's check box writes the identity in, into a new file or
+    /// beside what one already holds, and the suggestion reads it back.
+    #[test]
+    fn an_identity_written_above_is_suggested_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let folder = root.join("work").join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let above = root.join("work/.gitconfig");
+        let ada = GitIdentity {
+            name: "Ada Lovelace".into(),
+            email: "ada@work.example".into(),
+        };
+        set_identity_in_file(&above, &ada).unwrap();
+        let files = suggestion_files(&folder, Some(&root), None, None);
+        assert_eq!(identity_in(&files), ada);
+        write(&above, "[core]\n\tautocrlf = false\n");
+        set_identity_in_file(&above, &ada).unwrap();
+        let config = git2::Config::open(&above).unwrap().snapshot().unwrap();
+        assert!(!config.get_bool("core.autocrlf").unwrap());
+        assert_eq!(identity_in(&files), ada);
+    }
+
+    /// Nothing anywhere leaves both halves empty, for the user to fill in.
+    #[test]
+    fn nothing_found_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let files = suggestion_files(&folder, Some(dir.path()), None, None);
+        assert_eq!(
+            identity_in(&files),
+            GitIdentity {
+                name: String::new(),
+                email: String::new(),
+            }
+        );
+    }
 }
 
 #[cfg(test)]

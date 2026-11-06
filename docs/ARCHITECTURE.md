@@ -2062,9 +2062,15 @@ NoConfig → ConfigDetected → Building → Starting → Running
   re-clone that takes `.git/config` away does not lose it
   (`taste_git::project_identity`). Never the host's: `~/.gitconfig` is the
   user's machine state. In a project that names no author, the user's
-  commits refuse with git's "Author identity unknown" until the user copies
-  an author in from the file tree's banner, which names the identity it
-  would copy and copies nothing unasked; what the IDE must sign regardless
+  commits refuse with git's "Author identity unknown" until the user sets
+  one from the file tree's banner: a name and an email to edit, filled with
+  a suggestion — `user.name` and `user.email` from the nearest
+  `.gitconfig` in the folders above the project up to the home folder,
+  then the XDG and system files (`taste_git::suggested_identity`) — and
+  written nowhere unasked. Its menu saves to just this project or, as
+  well, to the `.gitconfig` of any folder above it up to the home folder,
+  so the projects under that folder are offered the same author next
+  time. What the IDE must sign regardless
   — the issue queue's commits, a rebase's committer, its own bookkeeping —
   is signed `nobody <nobody@localhost>` (`taste_git::NOBODY_NAME`), never
   with the IDE's name, since nothing pushed should carry its fingerprints. (Earlier versions copied the

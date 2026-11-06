@@ -1032,9 +1032,10 @@ struct StatusSnapshot {
     /// (`GitWorkspace::merged_into_default`), asked of the folder's refs
     /// as the sync status is.
     merged: Option<taste_git::merged::MergedInto>,
-    /// The user's identity, to be named on the author banner, when the
-    /// project names no author of its own (`author_bar.rs`).
-    author_offer: Option<taste_git::GitIdentity>,
+    /// The author the banner's fields are filled with, when the project
+    /// names none of its own (`author_bar.rs`, `taste_git::
+    /// suggested_identity`); its halves are empty when nothing named them.
+    author_offer: Option<crate::author_bar::AuthorOffer>,
     /// What syncs though git ignores it (`Worktree::sync_ignored`).
     sync_ignored: taste_devcontainer::worktree::SyncIgnored,
     /// What the sync counts' cards say of submodules.
@@ -2498,6 +2499,7 @@ impl FileTree {
                 let Some(identity) = tree.author_bar.offered() else {
                     return;
                 };
+                let above = tree.author_bar.also_above();
                 button.set_sensitive(false);
                 let root = tree.workspace.root().to_path_buf();
                 let events = tree.workspace.events.clone();
@@ -2509,10 +2511,22 @@ impl FileTree {
                     let handle = crate::runtime::runtime().spawn_blocking(move || {
                         taste_git::set_repo_identity(&root, &identity)?;
                         taste_devcontainer::supervisor::project_author(&root);
+                        // And above it, when the menu says so: a file the
+                        // next suggestion reads before the standard ones.
+                        if let Some(above) = above {
+                            anyhow::Context::with_context(
+                                taste_git::set_identity_in_file(&above, &identity),
+                                || format!("writing {}", above.display()),
+                            )?;
+                        }
                         anyhow::Ok(())
                     });
                     let result = handle.await;
-                    button.set_sensitive(true);
+                    // Back on only while the fields still make an author.
+                    button.set_sensitive(
+                        weak.upgrade()
+                            .is_some_and(|tree| tree.author_bar.offered().is_some()),
+                    );
                     match result {
                         Ok(Ok(())) => {
                             if let Some(tree) = weak.upgrade() {
@@ -6362,14 +6376,15 @@ impl FileTree {
                     _ => SubmoduleSync::default(),
                 };
                 // The project's own author, or none — in which case the
-                // user's identity is read only to be NAMED on the banner
-                // that asks whether to copy it (`author_bar.rs`).
-                let author_offer = crate::author_bar::posed_for_probe().or_else(|| {
-                    taste_devcontainer::supervisor::project_author(&project_root)
-                        .is_none()
-                        .then(taste_git::host_identity)
-                        .flatten()
-                });
+                // banner asks for one, its fields filled with a suggestion
+                // from the files above the folder and the standard ones,
+                // written only when the user says to (`author_bar.rs`).
+                let author_offer =
+                    crate::author_bar::posed_for_probe(&project_root).or_else(|| {
+                        taste_devcontainer::supervisor::project_author(&project_root)
+                            .is_none()
+                            .then(|| crate::author_bar::AuthorOffer::read(&project_root))
+                    });
                 Ok(StatusSnapshot {
                     submodule_sync,
                     merged,

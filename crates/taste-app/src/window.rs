@@ -3880,6 +3880,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // A file row's menu, its Run Task section among
                         // the rest: a popover, its own surface.
                         &["window", "filetree", "window.row-menu"]
+                    } else if std::env::var("TASTE_PROBE_AUTHOR").as_deref() == Ok("menu") {
+                        // The author banner's save menu: a popover, its own
+                        // surface.
+                        &["window", "window.author-menu"]
                     } else if std::env::var("TASTE_PROBE_BRANCHES").is_ok() {
                         // The branch switcher, opened by the file tree once
                         // its branches are read: a popover, its own surface.

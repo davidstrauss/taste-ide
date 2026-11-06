@@ -241,8 +241,10 @@ tree's banner for a branch already in the default branch
 (`merged_bar.rs`, `taste_git::merged`), with its Switch to main, since the
 folder a probe opens is on its own branch;
 `TASTE_PROBE_AUTHOR=1` poses the file tree's banner for a project that
-names no git author (`author_bar.rs`), naming a made-up identity rather
-than the photographer's own;
+names no git author (`author_bar.rs`), its name and email fields filled
+with a made-up identity rather than the photographer's own (`=edited`
+changes the email from it, `=above` chooses the nearest folder above on
+the save menu, and `=menu` opens that menu, shot as `window.author-menu`);
 `TASTE_PROBE_ALIGN=1` prints where the file tree header's folder, branch,
 and All rows start their icon and text, which stand in one column;
 `TASTE_PROBE_TREE_END=1` scrolls the file tree to the end of its listing,
