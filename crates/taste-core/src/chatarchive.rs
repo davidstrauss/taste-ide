@@ -88,6 +88,13 @@ pub struct ArchivedUpdate {
 /// The key of a session marker's payload.
 pub const SESSION_MARKER: &str = "tasteSession";
 
+/// The key of the record a trim leaves where it cut: its value is the
+/// `sessionUpdate` of the last update that went, or null. What was cut
+/// through is how a restore tells an answer whose start went with the
+/// rest — its chunks run on from one that went — from one that began
+/// after the cut, and marks the first rather than drawing it as whole.
+pub const TRIM_MARKER: &str = "tasteTrimmed";
+
 /// The session a record marks the start of, when it is a marker.
 pub fn marker_of(record: &ArchivedUpdate) -> Option<&str> {
     record.update.get(SESSION_MARKER)?.as_str()
@@ -261,13 +268,36 @@ impl ChatArchive {
                 .ok()
                 .is_some_and(|record| marker_of(&record).is_some())
         });
+        // Where the cut was, and what it cut through: the last record
+        // that went, by kind, so a restore can mark what ran on past it.
+        let last_gone = text[..start]
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<ArchivedUpdate>(line).ok());
+        let trim = ArchivedUpdate {
+            at: last_gone.as_ref().map_or_else(now_secs, |record| record.at),
+            update: serde_json::json!({
+                TRIM_MARKER: last_gone
+                    .as_ref()
+                    .and_then(|record| record.update.get("sessionUpdate"))
+                    .and_then(serde_json::Value::as_str),
+            }),
+        };
+        let trim = serde_json::to_string(&trim).context("serialising a trim's record")?;
         let kept = match marker {
-            Some(marker) => format!("{marker}\n{}", &text[start..]),
-            None => text[start..].to_string(),
+            Some(marker) => format!("{marker}\n{trim}\n{}", &text[start..]),
+            None => format!("{trim}\n{}", &text[start..]),
         };
         let staged = path.with_extension("jsonl.trim");
         std::fs::write(&staged, kept).with_context(|| format!("writing {}", staged.display()))?;
         std::fs::rename(&staged, path).with_context(|| format!("replacing {}", path.display()))
+    }
+
+    /// Cut `env`'s stash down to its newest `keep` bytes as a stash past
+    /// its cap is cut: for a probe that poses a trimmed conversation.
+    #[doc(hidden)]
+    pub fn trim_for_probe(&self, env: &EnvironmentId, keep: u64) -> Result<()> {
+        self.keep_newest(&self.path_for(env), keep)
     }
 
     /// Everything stashed for this environment, oldest first.
@@ -460,10 +490,37 @@ mod tests {
         let loaded = archive.load(&env);
         assert_eq!(loaded.skipped, 0, "only whole lines are kept");
         assert_eq!(loaded.updates.last().unwrap().update["n"], n + 1);
+        assert_eq!(
+            loaded.updates[0].update,
+            json!({ TRIM_MARKER: null }),
+            "the cut is marked where it was"
+        );
         assert!(
-            loaded.updates[0].update["n"].as_u64().unwrap() > 0,
+            loaded.updates[1].update["n"].as_u64().unwrap() > 0,
             "the oldest went"
         );
+    }
+
+    #[test]
+    fn a_trim_names_what_it_cut_through() {
+        let (_dir, archive) = archive();
+        let env = env("review");
+        let chunk = |n: u32| json!({ "sessionUpdate": "agent_message_chunk", "n": n });
+        archive.mark_session(&env, "s1").unwrap();
+        archive
+            .append_all(&env, (0..20).map(chunk).collect())
+            .unwrap();
+        let path = archive.path_for(&env);
+        archive.keep_newest(&path, 200).unwrap();
+        let kept = archive.load(&env);
+        let kept = kept.session("s1").expect("the session's marker stays");
+        assert_eq!(
+            kept[0].update,
+            json!({ TRIM_MARKER: "agent_message_chunk" }),
+            "the answer the cut went through is named"
+        );
+        assert_eq!(kept[1].update["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(kept.last().unwrap().update["n"], 19);
     }
 
     fn archive() -> (tempfile::TempDir, ChatArchive) {

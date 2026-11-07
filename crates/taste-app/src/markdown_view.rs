@@ -409,6 +409,7 @@ fn layout(
                             info: code_info.clone(),
                             open: false,
                             whole: None,
+                            cut: false,
                         });
                     }
                 }
@@ -593,6 +594,10 @@ enum Item {
         info: String,
         open: bool,
         whole: Option<String>,
+        /// Its start is not in the text: the document begins inside it
+        /// ([`Incremental::starts_inside_code`]), so it cannot be copied
+        /// whole.
+        cut: bool,
     },
     Table {
         alignments: Vec<pulldown_cmark::Alignment>,
@@ -685,8 +690,14 @@ fn build(item: &Item, context: &Context, readiness: Option<&Readiness>) -> Built
             info,
             open,
             whole,
+            cut,
         } => {
-            let card = code_card(code, whole.as_deref(), true);
+            let copies = if *cut {
+                Err(CUT_BLOCK.to_string())
+            } else {
+                Ok(whole.as_deref().unwrap_or(code).to_string())
+            };
+            let card = code_card(code, copies, true);
             if !*open && crate::mermaid::is_mermaid(info) {
                 // The block as code stays the fallback: a diagram that does
                 // not parse is shown as written, with the reason under it.
@@ -753,6 +764,9 @@ pub struct Incremental {
     pub root: gtk::Box,
     context: Context,
     built: RefCell<Vec<Built>>,
+    /// The text begins inside a code block whose start is not in it
+    /// ([`Incremental::starts_inside_code`]).
+    starts_cut: std::cell::Cell<bool>,
 }
 
 impl Incremental {
@@ -769,7 +783,15 @@ impl Incremental {
                 images,
             },
             built: RefCell::new(Vec::new()),
+            starts_cut: std::cell::Cell::new(false),
         }
+    }
+
+    /// The text this draws begins inside a code block, its opening fence
+    /// given back by the caller: that first block's copy refuses, since
+    /// what it holds is not the whole block.
+    pub fn starts_inside_code(&self, cut: bool) {
+        self.starts_cut.set(cut);
     }
 
     /// Draw `text`, keeping what is drawn of it already.
@@ -799,7 +821,12 @@ impl Incremental {
         self.set_items(items);
     }
 
-    fn set_items(&self, items: Vec<Item>) {
+    fn set_items(&self, mut items: Vec<Item>) {
+        if self.starts_cut.get() {
+            if let Some(Item::Code { cut, .. }) = items.first_mut() {
+                *cut = true;
+            }
+        }
         let mut built = self.built.borrow_mut();
         let mut kept = built
             .iter()
@@ -1003,7 +1030,12 @@ fn picture(base: &DocumentBase, path: PathBuf, alt: &str, hold: Option<Hold>) ->
     holder.upcast()
 }
 
-fn code_card(code: &str, whole: Option<&str>, reflow: bool) -> gtk::Widget {
+/// Why a code block whose start was not kept is not copied.
+const CUT_BLOCK: &str = "Not copied: this code block's start was not kept — the saved conversation outgrew its limit and its oldest part went";
+
+/// A code block's card, its copy button copying `copies` — the whole block
+/// — or refusing with the reason it cannot.
+fn code_card(code: &str, copies: Result<String, String>, reflow: bool) -> gtk::Widget {
     let label = gtk::Label::builder()
         .label(code)
         .xalign(0.0)
@@ -1038,10 +1070,10 @@ fn code_card(code: &str, whole: Option<&str>, reflow: bool) -> gtk::Widget {
     scroller.set_overlay_scrolling(reflow);
     let copy = gtk::Button::builder()
         .icon_name("edit-copy-symbolic")
-        .tooltip_text(if whole.is_some() {
-            "Copy the whole code block, with the lines not shown"
-        } else {
-            "Copy code block"
+        .tooltip_text(match &copies {
+            Err(_) => "This code block's start was not kept, so it cannot be copied whole",
+            Ok(whole) if whole != code => "Copy the whole code block, with the lines not shown",
+            Ok(_) => "Copy code block",
         })
         .css_classes(["flat", "circular"])
         .halign(gtk::Align::End)
@@ -1050,7 +1082,7 @@ fn code_card(code: &str, whole: Option<&str>, reflow: bool) -> gtk::Widget {
         .margin_end(4)
         .build();
     // The button confirms itself; no toast needed this close by.
-    crate::copy::button(&copy, whole.unwrap_or(code).to_string());
+    crate::copy::button(&copy, copies);
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&scroller));
     overlay.add_overlay(&copy);

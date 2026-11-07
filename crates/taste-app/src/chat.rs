@@ -11921,6 +11921,69 @@ impl ChatPane {
         self.replay_stash();
     }
 
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=trimmed`. The stash is
+    /// written, then cut by the archive's own trim just past an answer's
+    /// first chunk, and replayed as a restore replays it.
+    #[doc(hidden)]
+    fn seed_trimmed_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::ContentChunk;
+        let archive = self.chat_archive();
+        let said = |text: &str, user: bool| {
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+            let update = if user {
+                SessionUpdate::UserMessageChunk(chunk)
+            } else {
+                SessionUpdate::AgentMessageChunk(chunk)
+            };
+            serde_json::to_value(update).unwrap_or_default()
+        };
+        let kept = vec![
+            said(
+                "    while let Some(job) = queue.pop() {\n        if job.cancelled() {\n            \
+                 continue;\n        }\n",
+                false,
+            ),
+            said(
+                "        job.run();\n    }\n}\n```\n\nThe guard now runs before the job is \
+                 taken, so a cancelled job is never started.\n\n```sh\ncargo test -p queue\n```\n",
+                false,
+            ),
+            said("Good. And the docs?", true),
+            said("Updated in the same commit.\n", false),
+        ];
+        let suffix: usize = kept
+            .iter()
+            .map(|update| {
+                // Stamped as the archive stamps it: the line's length is
+                // what is measured, and a stamp is ten digits either way.
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let record = taste_core::chatarchive::ArchivedUpdate {
+                    at,
+                    update: update.clone(),
+                };
+                serde_json::to_string(&record).map_or(0, |line| line.len() + 1)
+            })
+            .sum();
+        let mut records = vec![
+            said("Move the cancellation guard up in drain().", true),
+            said(
+                "Here is the whole loop, with the guard moved up:\n\n```rust\nfn drain(queue: \
+                 &mut Queue) {\n",
+                false,
+            ),
+        ];
+        records.extend(kept);
+        let env = self.environment.clone();
+        let _ = archive.mark_session(&env, "probe");
+        let _ = archive.append_all(&env, records);
+        // The kept lines' bytes and one more: the cut lands on the newline
+        // before them, as a cap's cut lands on some newline.
+        let _ = archive.trim_for_probe(&env, suffix as u64 + 1);
+        self.replay_stash();
+    }
+
     /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=task`.
     #[doc(hidden)]
     fn seed_task_notifications_for_probe(self: &Rc<Self>) {
@@ -12012,6 +12075,13 @@ impl ChatPane {
         // lands in when it is restored from its archive.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("stash") {
             self.seed_stash_for_probe();
+            return;
+        }
+        // `TASTE_PROBE_CHAT=trimmed` is a stash the cap cut inside an
+        // answer, inside its code block: the answer drawn saying its start
+        // went, and that block's copy refusing.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("trimmed") {
+            self.seed_trimmed_for_probe();
             return;
         }
         // `TASTE_PROBE_CHAT=history` is a long conversation drawn from its

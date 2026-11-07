@@ -473,7 +473,7 @@ impl ChatPane {
                 .margin_top(4)
                 .margin_end(4)
                 .build();
-            crate::copy::button(&copy, text.to_string());
+            crate::copy::button(&copy, Ok(text.to_string()));
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             line.set_hexpand(true);
             let text_frame = crate::issue_pill::PillText::wrap(&label);
@@ -625,6 +625,20 @@ impl ChatPane {
         doc.root.set_spacing(6);
         let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
         body.set_hexpand(true);
+        if answer.begun_before {
+            // Above the words, which begin mid-answer: what they run on
+            // from is gone, and saying so is the only honest drawing.
+            body.append(
+                &gtk::Label::builder()
+                    .label(CUT_ANSWER)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .css_classes(["dim-label", "caption"])
+                    .margin_bottom(4)
+                    .build(),
+            );
+        }
         body.append(&doc.root);
         let more = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.append(&more);
@@ -647,14 +661,23 @@ impl ChatPane {
     /// the text is drawn at the next frame, once however many updates
     /// arrived; ended, at once.
     fn fill_answer(&self, view: &Rc<AnswerView>, id: super::model::RowId, answer: &Answer) {
+        // An answer whose start went may begin inside a code block: its
+        // fence given back, so what follows is not read inside out, and
+        // that block said to be cut rather than copied as though whole.
+        let mended = answer
+            .begun_before
+            .then(|| reopened_fence(&answer.text))
+            .flatten();
+        view.doc.starts_inside_code(mended.is_some());
+        let text = mended.as_deref().unwrap_or(&answer.text);
         let (head, hidden) = if answer.whole {
-            (answer.text.clone(), 0)
+            (text.to_string(), 0)
         } else {
-            crate::chatdoc::clip_prose(&answer.text, PROSE_CLIP_LINES, PROSE_CLIP_CHARS)
+            crate::chatdoc::clip_prose(text, PROSE_CLIP_LINES, PROSE_CLIP_CHARS)
         };
         // The whole as well when the head is less: its code blocks copy
         // the blocks whole (`Incremental::set_clipped`).
-        let whole = (hidden > 0).then(|| answer.text.clone());
+        let whole = (hidden > 0).then(|| text.to_string());
         if answer.done || !view.drawn.replace(true) {
             view.pending.borrow_mut().take();
             draw_answer(&view.doc, &head, whole.as_deref());
@@ -688,7 +711,7 @@ impl ChatPane {
                     "Open the whole response in the editor",
                     Document::Text {
                         title: stamp_now(),
-                        body: answer.text.clone(),
+                        body: text.to_string(),
                         markdown: true,
                         role: crate::chatdoc::TextRole::Response,
                     },
@@ -1247,6 +1270,45 @@ fn step_has_content(step: &Step) -> bool {
     })
 }
 
+/// What an answer whose start was not kept says above its words.
+const CUT_ANSWER: &str =
+    "… its start was not kept: the saved conversation outgrew its limit, and its oldest part went";
+
+/// `text`, an answer's words from a point after its start, with an opening
+/// fence put back when they begin inside a code block — or `None` when
+/// they do not. Told by the fences: a text that begins inside a block meets
+/// that block's closing fence first, bare, and then reads every fence after
+/// it the wrong way round, so either an opening fence (one with an info
+/// string) turns up where a closing one should, or a block is left open at
+/// the end of an answer that closed it.
+fn reopened_fence(text: &str) -> Option<String> {
+    let mut first: Option<(char, usize, bool)> = None;
+    let mut open: Option<(char, usize)> = None;
+    let mut inverted = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let Some((mark, length)) = crate::mdx::fence_of(trimmed) else {
+            continue;
+        };
+        let bare = trimmed.trim_start_matches(mark).trim().is_empty();
+        first.get_or_insert((mark, length, bare));
+        match open {
+            Some((m, l)) if m == mark && length >= l => {
+                if bare {
+                    open = None;
+                } else {
+                    inverted = true;
+                }
+            }
+            Some(_) => {}
+            None => open = Some((mark, length)),
+        }
+    }
+    let (mark, length, bare) = first?;
+    (bare && (inverted || open.is_some()))
+        .then(|| format!("{}\n{text}", mark.to_string().repeat(length)))
+}
+
 /// An answer's head drawn, with the whole answer it was clipped from when
 /// there is more of it.
 fn draw_answer(doc: &crate::markdown_view::Incremental, head: &str, whole: Option<&str>) {
@@ -1284,6 +1346,37 @@ fn queued_badge(reads_within_turn: bool, attached: bool) -> (String, Option<Stri
 
 #[cfg(test)]
 mod tests {
+    /// Words that begin inside a code block get its fence back; words that
+    /// begin in prose, however many blocks follow, are left as they are.
+    #[test]
+    fn a_cut_answer_inside_a_code_block_gets_its_fence_back() {
+        use super::reopened_fence;
+        // Cut mid-block, nothing after: the block is left open.
+        assert_eq!(
+            reopened_fence("let x = 1;\n```\nThat sets x.\n").as_deref(),
+            Some("```\nlet x = 1;\n```\nThat sets x.\n")
+        );
+        // Cut mid-block, a block after: its opening fence turns up where a
+        // closing one should.
+        assert_eq!(
+            reopened_fence("x = 1\n```\nThen:\n```rust\nlet y = 2;\n```\n")
+                .as_deref()
+                .map(|text| text.starts_with("```\nx = 1")),
+            Some(true)
+        );
+        // A longer fence is given back as long.
+        assert!(reopened_fence("a\n````\nb\n")
+            .unwrap()
+            .starts_with("````\na"));
+        // Begun in prose.
+        assert_eq!(
+            reopened_fence("and so on.\n```rust\nlet y = 2;\n```\n"),
+            None
+        );
+        assert_eq!(reopened_fence("and so on.\n```\nplain\n```\nDone.\n"), None);
+        assert_eq!(reopened_fence("no code at all"), None);
+    }
+
     #[test]
     fn a_queued_badge_says_when_the_agent_reads_it() {
         let (within, _) = super::queued_badge(true, false);

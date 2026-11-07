@@ -142,7 +142,10 @@ the frame; an opened thought once stood a screen tall, `rows::thought_body`),
 agent has none, which is where a workspace restored from its archive
 lands: a transcript long enough to be scrolled to the bottom, the line
 saying so where the restored part ends, seeded by writing the stash and reading it back through the
-real replay so the frame is a state the code can reach —, `history` — a
+real replay so the frame is a state the code can reach —, `trimmed` — the
+same as a stash past its cap leaves it, cut by the archive's own trim
+inside an answer's code block: the answer saying its start was not kept,
+the block's fence given back, and its copy refusing with why —, `history` — a
 conversation of `TASTE_PROBE_TURNS` turns (400) drawn from its record as a
 restore draws it, then read a page at a time up to its first message, a
 jump to the middle, and back down, printing the items and the rows drawn,

@@ -139,6 +139,11 @@ pub(super) struct Answer {
     /// Shown whole rather than clipped: the answer the turn's suggested
     /// replies choose from ([`Model::unclip_turn`]).
     pub whole: bool,
+    /// Its start went when the stash was trimmed (`chatarchive::TRIM_MARKER`):
+    /// what is here runs on from chunks no longer kept, so it is drawn
+    /// saying so, and never as the whole answer (David, 2026-11-06: "You
+    /// should mark answers cut that way").
+    pub begun_before: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +303,10 @@ pub(super) struct Model {
     /// mark — make it once.
     prompts: HashMap<PromptId, RowId>,
     prompt_notes: HashMap<PromptId, Vec<String>>,
+    /// What the record's trim cut through, until the next update is read:
+    /// an answer's chunk there makes the answer it starts one whose start
+    /// went.
+    cut_through: Option<String>,
 }
 
 impl Model {
@@ -647,6 +656,7 @@ impl Model {
                                     text: String::new(),
                                     done: false,
                                     whole: false,
+                                    begun_before: false,
                                 }),
                                 Dot::Plain,
                             );
@@ -1531,7 +1541,25 @@ impl Model {
     /// One entry of the record, read.
     pub fn read(&mut self, record: Record) {
         match record {
-            Record::Update(update) => self.apply(*update, false),
+            Record::Update(update) => {
+                let cut = self.cut_through.take();
+                let runs_on = cut.as_deref() == Some(ANSWER_CHUNK)
+                    && matches!(*update, SessionUpdate::AgentMessageChunk(_));
+                self.apply(*update, false);
+                if runs_on {
+                    if let Some(id) = self.answer {
+                        if let Some(Row {
+                            kind: Kind::Answer(answer),
+                            ..
+                        }) = self.row_mut(id)
+                        {
+                            answer.begun_before = true;
+                        }
+                        self.changed(id);
+                    }
+                }
+            }
+            Record::Trimmed { through } => self.cut_through = through,
             Record::Note { text, prompt } => match prompt {
                 Some(prompt) => {
                     self.prompt_note(&prompt, &text);
@@ -1584,7 +1612,16 @@ pub(super) enum Record {
         state: String,
         detail: Option<String>,
     },
+    /// Where the stash was trimmed, and the kind of the last update that
+    /// went (`chatarchive::TRIM_MARKER`).
+    Trimmed {
+        through: Option<String>,
+    },
 }
+
+/// An answer's chunk, by its `sessionUpdate`: what a trim that cut
+/// through one names.
+const ANSWER_CHUNK: &str = "agent_message_chunk";
 
 /// The key a record of a prompt's delivery is kept under, its id the value.
 pub(super) const DELIVERY_RECORD: &str = "tasteDelivery";
@@ -1618,6 +1655,11 @@ impl Record {
             return Some(Record::Note {
                 text: note,
                 prompt: text(NOTE_PROMPT),
+            });
+        }
+        if let Some(through) = value.get(taste_core::chatarchive::TRIM_MARKER) {
+            return Some(Record::Trimmed {
+                through: through.as_str().map(str::to_string),
             });
         }
         if let Some(prompt) = text(DELIVERY_RECORD) {
@@ -1683,6 +1725,52 @@ mod tests {
         records
     }
 
+    /// A record trimmed through an answer draws the answer that runs on
+    /// from the cut as begun before it; one that begins after the cut, and
+    /// a cut through anything else, draw whole.
+    #[test]
+    fn an_answer_cut_by_a_trim_is_marked() {
+        let trimmed = |through: Option<&str>| Record::Trimmed {
+            through: through.map(str::to_string),
+        };
+        let chunk = |words: &str| Record::update(SessionUpdate::AgentMessageChunk(text(words)));
+        let answers = |records: Vec<Record>| -> Vec<(String, bool)> {
+            Model::of_record(0, records)
+                .rows()
+                .iter()
+                .filter_map(|row| match &row.kind {
+                    Kind::Answer(answer) => Some((answer.text.clone(), answer.begun_before)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            answers(vec![
+                trimmed(Some(ANSWER_CHUNK)),
+                chunk("and so on."),
+                chunk(" The end."),
+                Record::update(SessionUpdate::UserMessageChunk(text("Next?"))),
+                chunk("A new answer."),
+            ]),
+            vec![
+                ("and so on. The end.".to_string(), true),
+                ("A new answer.".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            answers(vec![trimmed(Some("tool_call_update")), chunk("Whole.")]),
+            vec![("Whole.".to_string(), false)]
+        );
+        assert_eq!(
+            answers(vec![
+                trimmed(Some(ANSWER_CHUNK)),
+                Record::update(SessionUpdate::UserMessageChunk(text("Hi"))),
+                chunk("Whole."),
+            ]),
+            vec![("Whole.".to_string(), false)]
+        );
+    }
+
     /// A conversation lived record by record and the same record read back
     /// come to the same rows, the line and all.
     #[test]
@@ -1691,8 +1779,7 @@ mod tests {
         for record in conversation() {
             match record {
                 Record::Update(update) => live.apply(*update, false),
-                note @ Record::Note { .. } => live.read(note),
-                delivery @ Record::Delivery { .. } => live.read(delivery),
+                other => live.read(other),
             }
         }
         live.finalize();

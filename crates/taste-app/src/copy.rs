@@ -61,17 +61,26 @@ pub fn toast(widget: &gtk::Widget, message: &str) {
     }
 }
 
-/// Make `copy`, an icon button, copy `text` whole when clicked, and say
-/// on itself how that went: a check for a moment, or a warning whose
+/// Make `copy`, an icon button, copy `text` whole when clicked — or, when
+/// it is the reason the whole is not there to copy, refuse with that — and
+/// say on itself how that went: a check for a moment, or a warning whose
 /// tooltip is the reason, beside the toast saying it.
-pub fn button(copy: &gtk::Button, text: String) {
+pub fn button(copy: &gtk::Button, text: Result<String, String>) {
     let icon = copy
         .icon_name()
         .map_or_else(|| "edit-copy-symbolic".to_string(), |icon| icon.to_string());
     let tooltip = copy.tooltip_text();
     let reset: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
     copy.connect_clicked(move |button| {
-        let (shown, hold_ms) = match whole(button, &text) {
+        let copied = match &text {
+            Ok(text) => whole(button, text),
+            Err(why) => {
+                tracing::warn!("{why}");
+                toast(button.upcast_ref(), why);
+                Err(why.clone())
+            }
+        };
+        let (shown, hold_ms) = match copied {
             Ok(()) => {
                 button.set_tooltip_text(tooltip.as_deref());
                 ("object-select-symbolic", 1200)

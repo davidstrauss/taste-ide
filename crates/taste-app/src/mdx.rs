@@ -131,7 +131,7 @@ fn drop_span(keep: &mut [bool], chars: &[char], from: usize, to: usize) {
 }
 
 /// A code fence a line opens or closes with: its character and length.
-fn fence_of(trimmed: &str) -> Option<(char, usize)> {
+pub(crate) fn fence_of(trimmed: &str) -> Option<(char, usize)> {
     let mark = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
     let length = trimmed.chars().take_while(|c| *c == mark).count();
     (length >= 3).then_some((mark, length))
