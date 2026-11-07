@@ -570,7 +570,7 @@ impl PortPage {
         }
         page.address.connect_icon_press(|entry, position| {
             if position == gtk::EntryIconPosition::Secondary {
-                entry.clipboard().set_text(&entry.text());
+                let _ = crate::copy::whole(entry, &entry.text());
             }
         });
         {

@@ -462,17 +462,18 @@ impl ChatPane {
             // (David, 2026-09-16).
             let copy = gtk::Button::builder()
                 .icon_name("edit-copy-symbolic")
-                .tooltip_text("Copy prompt")
+                .tooltip_text(if hidden > 0 {
+                    "Copy the whole prompt, with the lines not shown"
+                } else {
+                    "Copy prompt"
+                })
                 .css_classes(["flat", "circular"])
                 .halign(gtk::Align::End)
                 .valign(gtk::Align::Start)
                 .margin_top(4)
                 .margin_end(4)
                 .build();
-            let prompt = text.to_string();
-            copy.connect_clicked(move |button| {
-                button.clipboard().set_text(&prompt);
-            });
+            crate::copy::button(&copy, text.to_string());
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             line.set_hexpand(true);
             let text_frame = crate::issue_pill::PillText::wrap(&label);

@@ -28,6 +28,7 @@ mod composer;
 mod console;
 mod controller;
 mod coordinator;
+mod copy;
 mod devcontainer_ui;
 mod editor;
 mod elicit;

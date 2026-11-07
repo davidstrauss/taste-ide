@@ -4167,7 +4167,7 @@ impl Console {
             let hovered_url = hovered_url.clone();
             copy_link_item.connect_clicked(move |button| {
                 if let Some(url) = hovered_url.borrow().as_deref() {
-                    button.clipboard().set_text(url);
+                    let _ = crate::copy::whole(button, url);
                 }
                 popover.popdown();
             });

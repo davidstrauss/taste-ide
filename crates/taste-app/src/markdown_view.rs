@@ -653,11 +653,8 @@ fn build(item: &Item, context: &Context, readiness: Option<&Readiness>) -> Built
                 let span_texts = span_texts.clone();
                 label.connect_activate_link(move |label, href| {
                     if is_copy_span(&span_texts.borrow(), href) {
-                        label.clipboard().set_text(href);
-                        if let Some(root) = label.root() {
-                            if let Some(overlay) = find_toast_overlay(root.upcast_ref()) {
-                                overlay.add_toast(adw::Toast::new("Copied"));
-                            }
+                        if crate::copy::whole(label, href).is_ok() {
+                            crate::copy::toast(label.upcast_ref(), "Copied");
                         }
                         return glib::Propagation::Stop;
                     }
@@ -1052,23 +1049,8 @@ fn code_card(code: &str, whole: Option<&str>, reflow: bool) -> gtk::Widget {
         .margin_top(4)
         .margin_end(4)
         .build();
-    let code = whole.unwrap_or(code).to_string();
-    let reset: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    copy.connect_clicked(move |button| {
-        button.clipboard().set_text(&code);
-        // The button confirms itself; no toast needed this close by.
-        button.set_icon_name("object-select-symbolic");
-        if let Some(previous) = reset.borrow_mut().take() {
-            previous.remove();
-        }
-        let button = button.clone();
-        let reset_slot = reset.clone();
-        let id = glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
-            button.set_icon_name("edit-copy-symbolic");
-            reset_slot.borrow_mut().take();
-        });
-        *reset.borrow_mut() = Some(id);
-    });
+    // The button confirms itself; no toast needed this close by.
+    crate::copy::button(&copy, whole.unwrap_or(code).to_string());
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&scroller));
     overlay.add_overlay(&copy);

@@ -6148,12 +6148,15 @@ fn open_url(url: &str, overlay: &adw::ToastOverlay) {
         gtk::gio::Cancellable::NONE,
         move |result| {
             if result.is_err() {
-                if let Some(display) = gtk::gdk::Display::default() {
-                    display.clipboard().set_text(&fallback);
-                }
-                overlay.add_toast(adw::Toast::new(
-                    "No browser here — link copied, paste it on the host",
-                ));
+                let copied = gtk::gdk::Display::default()
+                    .ok_or_else(|| {
+                        "No browser here, and no clipboard to copy the link to".to_string()
+                    })
+                    .and_then(|display| crate::copy::onto(&display.clipboard(), &fallback));
+                overlay.add_toast(adw::Toast::new(match &copied {
+                    Ok(()) => "No browser here — link copied, paste it on the host",
+                    Err(why) => why,
+                }));
             }
         },
     );
@@ -6256,7 +6259,7 @@ fn start_url_bridge(window: &adw::ApplicationWindow, root: &std::path::Path) {
             let copy_url = url.clone();
             let copy_window = window.clone();
             dialog.connect_response(Some("copy"), move |_, _| {
-                copy_window.clipboard().set_text(&copy_url);
+                let _ = crate::copy::whole(&copy_window, &copy_url);
             });
             dialog.present(Some(&window));
         }

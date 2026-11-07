@@ -2816,12 +2816,14 @@ impl BacklogPanel {
             // pill in the history").
             let copy_section = gio::Menu::new();
             copy_section.append(Some("Copy ID"), Some("row.copy-id"));
-            let clipboard = anchor.clipboard();
+            let anchor = anchor.clone();
             let id_text = id.to_string();
             add_action(
                 "copy-id",
                 true,
-                Box::new(move || clipboard.set_text(&id_text)),
+                Box::new(move || {
+                    let _ = crate::copy::whole(&anchor, &id_text);
+                }),
             );
             menu.append_section(None, &copy_section);
         }
