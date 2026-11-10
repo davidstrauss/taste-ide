@@ -61,7 +61,7 @@ pub const IMAGE_FILE: &str = "llama-server.tar";
 /// The Fedora CoreOS release the cloud guests boot: the local pool's own
 /// (`taste_devcontainer::guest::RELEASE`), held equal to it by a test in
 /// `taste-app`, so a guest in GCP and one under libvirt are one system.
-pub const FCOS_RELEASE: &str = "44.20261012.3.1";
+pub const FCOS_RELEASE: &str = "44.20261023.3.1";
 
 /// A stable hash of a guest's Ignition config, kept in the instance's
 /// metadata (`CONFIG_ATTRIBUTE`), so a VM booted from an older config is

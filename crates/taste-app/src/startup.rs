@@ -1325,7 +1325,7 @@ impl StartupPage {
             // download failing.
             "premove" | "premove-failed" => {
                 let fetch = taste_core::GuestImageFetch {
-                    release: "44.20261012.3.1".into(),
+                    release: "44.20261023.3.1".into(),
                     phase: taste_core::GuestImagePhase::Fetching,
                     done: 612 * 1024 * 1024,
                     total: 847 * 1024 * 1024,
@@ -1334,7 +1334,7 @@ impl StartupPage {
                 if kind == "premove-failed" {
                     self.on_move_failed(
                         "fetching the guest image the move needs: downloading \
-                         fedora-coreos-44.20261012.3.1-qemu.x86_64.qcow2.xz: connection reset \
+                         fedora-coreos-44.20261023.3.1-qemu.x86_64.qcow2.xz: connection reset \
                          by peer",
                         15,
                     );
