@@ -9,7 +9,8 @@
 //! search"). So the text views of documents — a file's buffer, a log's,
 //! a task's output — are watched here, and the visible lines of each one
 //! on screen are searched at every keystroke, with no delay: a screen of
-//! text is microseconds, whatever the file's length. They are searched
+//! text is microseconds, whatever the file's length. A Markdown file's
+//! preview is one of them, a text view too (`doc_text`). They are searched
 //! again when the view scrolls, its text changes, or it comes on screen,
 //! once a frame however often it is asked. The matches wear the search
 //! hue's wash, under the selected hit's solid (`palette::highlight_range`),
@@ -85,6 +86,17 @@ pub fn watch(view: &impl IsA<gtk::TextView>) {
     {
         let relight = relight.clone();
         view.buffer().connect_changed(move |_| relight());
+    }
+    // A view given a new buffer — a preview's next rendering takes the
+    // place of the last one whole (`doc_text::DocView`) — is lit in it,
+    // and kept lit as it changes.
+    {
+        let relight = relight.clone();
+        view.connect_notify_local(Some("buffer"), move |view, _| {
+            let on_change = relight.clone();
+            view.buffer().connect_changed(move |_| on_change());
+            relight();
+        });
     }
     // The vertical adjustment arrives with the scrolled window, and a view
     // moved to another one gets a new adjustment.

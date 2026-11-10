@@ -1,10 +1,13 @@
-//! Selecting across a rendered document. A preview, or a chat answer, is a
-//! column of labels — runs of prose, code blocks, table cells — and a
+//! Selecting across a rendered document drawn as labels. A chat answer is
+//! a column of labels — runs of prose, code blocks, table cells — and a
 //! GtkLabel selects only within itself, so a drag stopped at the edge of
 //! the label it began in, and the view did not scroll under it (David,
 //! 2026-11-09: "I can't select long spans of text"). A run is cut at a few
 //! thousand bytes for the drawing's sake (`markdown_view::layout`), which
 //! made the span a selection could reach a screen or so.
+//!
+//! An editor's Markdown preview is a text view instead (`crate::doc_text`),
+//! which selects as a whole by itself; this is for what is still labels.
 //!
 //! [`install`] puts a drag over the document's box that, once it has moved,
 //! takes the gesture from the label under it and selects through every
@@ -452,74 +455,6 @@ impl Selection {
         }
         (!out.is_empty()).then_some(out)
     }
-
-    /// TASTE_PROBE_SELECT=across: a press at the document's first line, the
-    /// pointer then held below the view for `hold` while the view scrolls
-    /// under it, and the release — the drag as this takes it, past the
-    /// gesture's own threshold, which a probe has no pointer to cross.
-    /// `done` is given what was selected and how far the view went.
-    #[doc(hidden)]
-    pub fn probe_drag(
-        self: &Rc<Self>,
-        hold: std::time::Duration,
-        done: impl FnOnce(String) + 'static,
-    ) {
-        let Some(root) = self.root() else { return };
-        let Some(scroller) = scroller_of(&root) else {
-            done("no scrolled window above the document".into());
-            return;
-        };
-        let scrolled_from = scroller.vadjustment().value();
-        self.begin(graphene::Point::new(20.0, 20.0));
-        self.start_drag();
-        let below = graphene::Point::new(
-            (scroller.width() / 2) as f32,
-            (scroller.height() + 30) as f32,
-        );
-        if let Some(at) = scroller.compute_point(&root, &below) {
-            self.follow(at);
-        }
-        let selection = self.clone();
-        glib::timeout_add_local_once(hold, move || {
-            selection.finish();
-            let range = selection.range.get();
-            let labels = selection.labels.borrow().len();
-            let lit = selection.painted.borrow().len();
-            let text = selection.text().unwrap_or_default();
-            let ends = |s: &str| s.chars().take(60).collect::<String>().replace('\n', "⏎");
-            let tail: String = {
-                let rev: String = text.chars().rev().take(60).collect();
-                rev.chars().rev().collect::<String>().replace('\n', "⏎")
-            };
-            done(format!(
-                "range {range:?}; {lit} of {labels} labels lit; scrolled {:.0} → {:.0}; \
-                 copies {} chars, from {:?} to {:?}",
-                scrolled_from,
-                scroller.vadjustment().value(),
-                text.chars().count(),
-                ends(&text),
-                tail,
-            ));
-        });
-    }
-}
-
-/// The selection installed on the document under `holder`, for a probe.
-#[doc(hidden)]
-pub fn find_under(holder: &gtk::Widget) -> Option<Rc<Selection>> {
-    let mut stack = vec![holder.clone()];
-    while let Some(widget) = stack.pop() {
-        // SAFETY: as in `of`.
-        if let Some(found) = unsafe { widget.data::<Rc<Selection>>(KEY) } {
-            return Some(unsafe { found.as_ref() }.clone());
-        }
-        let mut child = widget.first_child();
-        while let Some(c) = child {
-            child = c.next_sibling();
-            stack.push(c);
-        }
-    }
-    None
 }
 
 /// What stands between two labels' parts of a copied selection: a tab

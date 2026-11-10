@@ -77,8 +77,10 @@ struct EditorPage {
     stack: gtk::Stack,
     /// The changes face's content, rebuilt on each refresh.
     changes_holder: gtk::Box,
-    /// The rendered markdown preview face (rebuilt on refresh).
+    /// A notebook's rendered face (rebuilt on refresh).
     preview_holder: gtk::Box,
+    /// A Markdown document's preview: one read-only text.
+    doc: Rc<crate::doc_text::DocView>,
     /// Which rebuild of the preview is the latest: one overtaken by a newer
     /// edit before it was whole is dropped rather than shown late.
     preview_generation: Rc<Cell<u64>>,
@@ -3378,55 +3380,39 @@ impl Editor {
                     session.probe_drag();
                 }
             }
-            // `TASTE_PROBE_SELECT=1`: a selection grown across the
-            // preview's longest label, a step a frame as a drag grows one,
-            // with the frames timed (`select_bench`); `=nomap` with the
-            // overview strip hidden, which tells the label's cost apart
-            // from the strip's.
-            // `=across` drags from the document's first line to below the
-            // view and holds there, the view scrolling under it, and prints
-            // what came out selected (`doc_select::Selection::probe_drag`).
+            // `TASTE_PROBE_SELECT=1`: the preview's text selected from its
+            // start further each frame, as a drag grows a selection, with
+            // the frames timed (`doc_text::DocView::select_bench`); a
+            // notebook's face, which is widgets, its longest label instead
+            // (`select_bench`), and `=nomap` with its overview strip hidden.
             // `=focus` gives the preview the keyboard as a mode's toggle
             // does (`focus_document`) and prints where it went and whether
             // anything came out selected — nothing should.
             if let Ok(mode) = std::env::var("TASTE_PROBE_SELECT") {
                 let holder = page.preview_holder.clone();
+                let doc = page.doc.clone();
+                let markdown = !is_notebook(&path);
                 let weak = Rc::downgrade(&editor);
                 glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
                     if mode == "focus" {
                         let Some(editor) = weak.upgrade() else { return };
                         editor.focus_document();
                         let focus = editor.widget.root().and_then(|root| root.focus());
-                        let mut selected = 0;
-                        let mut stack = vec![holder.clone().upcast::<gtk::Widget>()];
-                        while let Some(widget) = stack.pop() {
-                            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
-                                selected += usize::from(label.selection_bounds().is_some());
-                            }
-                            let mut child = widget.first_child();
-                            while let Some(c) = child {
-                                child = c.next_sibling();
-                                stack.push(c);
-                            }
-                        }
                         println!(
-                            "select focus: the keyboard on {} (in the preview: {}); {selected} labels with a selection",
-                            focus.as_ref().map_or("nothing".into(), |w| w.type_().name().to_string()),
-                            focus.is_some_and(|w| w.is_ancestor(&holder)),
+                            "select focus: the keyboard on {} (in the preview: {}); selected: {}",
+                            focus
+                                .as_ref()
+                                .map_or("nothing".into(), |w| w.type_().name().to_string()),
+                            focus.is_some_and(|w| w == doc.view.clone().upcast::<gtk::Widget>()),
+                            doc.view.buffer().has_selection(),
                         );
                         return;
                     }
-                    if mode == "across" {
-                        match crate::doc_select::find_under(holder.upcast_ref()) {
-                            Some(selection) => selection
-                                .probe_drag(std::time::Duration::from_millis(2000), |said| {
-                                    println!("select across: {said}")
-                                }),
-                            None => println!("select across: no document selection"),
-                        }
-                        return;
+                    if markdown {
+                        doc.select_bench();
+                    } else {
+                        select_bench(&holder, mode == "nomap");
                     }
-                    select_bench(&holder, mode == "nomap");
                 });
             }
             // `TASTE_PROBE_PREVIEW_AT=<0..1>`: scrolled that far down once
@@ -3436,12 +3422,15 @@ impl Editor {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
             {
-                let holder = page.preview_holder.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
-                    if let Some(scroller) = holder
+                let scroller = if is_notebook(&path) {
+                    page.preview_holder
                         .ancestor(gtk::ScrolledWindow::static_type())
                         .and_downcast::<gtk::ScrolledWindow>()
-                    {
+                } else {
+                    Some(page.doc.scroller.clone())
+                };
+                glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
+                    if let Some(scroller) = scroller {
                         let adjustment = scroller.vadjustment();
                         let top = (adjustment.upper() - adjustment.page_size()).max(0.0);
                         adjustment.set_value(top * at.clamp(0.0, 1.0));
@@ -3526,7 +3515,7 @@ impl Editor {
             self.follow_to(existing.foreign_env.clone());
             self.select_tab(&existing.page);
             if let Some(line) = line {
-                jump_to_line(&existing.view, &existing.buffer, line);
+                self.jump_in(path, &existing, line);
             }
             if changes {
                 self.set_changes_view(path, &existing, true);
@@ -3609,7 +3598,7 @@ impl Editor {
                 Some(existing) => {
                     editor.select_tab(&existing.page);
                     if let Some(line) = line {
-                        jump_to_line(&existing.view, &existing.buffer, line);
+                        editor.jump_in(&path, &existing, line);
                     }
                 }
                 None => editor.create_page(&path, content, line, None, Some(prepared)),
@@ -4001,6 +3990,10 @@ impl Editor {
             &preview_scroller,
             map_width,
         ));
+        // A Markdown document's preview: one read-only text, with the
+        // source face's own map (`crate::doc_text`). The widget face above
+        // is a notebook's.
+        let doc = crate::doc_text::DocView::new(map_width);
         // A review tab says what it is comparing, because nothing else in
         // the frame can: the tab looks like every other diff, and the one
         // thing a reader must not have to assume is which two things they
@@ -4103,6 +4096,7 @@ impl Editor {
         stack.add_named(&edit_body, Some("edit"));
         stack.add_named(&changes_body, Some("changes"));
         stack.add_named(&preview_body, Some("preview"));
+        stack.add_named(&doc.body, Some("document"));
 
         // Conflict banner: disk changed under unsaved edits. Reload takes
         // the disk version; doing nothing keeps yours (save overwrites).
@@ -4199,10 +4193,15 @@ impl Editor {
             eol_override: Cell::new(None),
             bom: Cell::new(false),
             encoding: Cell::new(None),
-            // Markdown defaults to the editing interface (raw source);
-            // the preview is opt-in and read-only. A notebook opens as a
-            // notebook: its JSON is the face nobody reads first.
-            raw_source: Cell::new(!is_notebook(path)),
+            // Markdown opens on its preview (David, 2026-11-09: "Open
+            // markdown in preview by default"), and so does a notebook: the
+            // source is the face nobody reads first. Asked for at a line, it
+            // opens on its source, which is the face that has lines; and
+            // with nothing in it to preview, on the source to be written.
+            raw_source: Cell::new(
+                !is_notebook(path)
+                    && !(is_markdown(path) && line.is_none() && !content.trim().is_empty()),
+            ),
             plain: Cell::new(!highlighting_ok(path, &content)),
             suggestion: RefCell::new(None),
             restyle_queued: Cell::new(false),
@@ -4211,6 +4210,7 @@ impl Editor {
             stack,
             changes_holder,
             preview_holder,
+            doc,
             preview_generation: Rc::new(Cell::new(0)),
             svg: RefCell::new(None),
             svg_generation: Rc::new(Cell::new(0)),
@@ -4632,7 +4632,8 @@ impl Editor {
                 }
                 "web"
             }
-            (true, false) => "preview",
+            (true, false) if is_notebook(path) => "preview",
+            (true, false) => "document",
             _ => "edit",
         };
         page.stack.set_visible_child_name(name);
@@ -5358,6 +5359,18 @@ impl Editor {
             && page.buffer.char_count() <= MAX_WYSIWYG_CHARS
     }
 
+    /// Go to `line` of an open page: a document on its preview turns to
+    /// its source first, which is the face that has lines.
+    fn jump_in(self: &Rc<Self>, path: &Path, page: &Rc<EditorPage>, line: u32) {
+        if is_markdown(path) && !page.changes_view.get() && self.wysiwyg_active(path, page) {
+            page.raw_source.set(true);
+            self.set_changes_view(path, page, false);
+            self.refresh_markdown_mode(path, page);
+            self.sync_toggle_to_selection();
+        }
+        jump_to_line(&page.view, &page.buffer, line);
+    }
+
     /// Reconcile language + styling with the page's markdown mode.
     fn refresh_markdown_mode(&self, path: &Path, page: &EditorPage) {
         // Minimapping a plain-guard giant file would cost what the guard
@@ -5392,8 +5405,9 @@ impl Editor {
                 self.show_html(path, page);
             }
         } else if self.wysiwyg_active(path, page) {
-            // Full-quality preview: pulldown-cmark rendered into native
-            // widgets, with copy affordances on code spans and blocks.
+            // Full-quality preview: a Markdown document written into a
+            // read-only text view (`crate::doc_text`), a notebook into its
+            // cells' widgets.
             let text = page
                 .buffer
                 .text(&page.buffer.start_iter(), &page.buffer.end_iter(), true)
@@ -5432,12 +5446,16 @@ impl Editor {
             // clamped (David, 2026-10-09: "Ensure Markdown preview updates
             // get double-buffered to avoid jank"). The first rendering has
             // nothing to stand behind, and shows as it fills.
-            let (fresh, ready) = if is_notebook(path) {
-                self.notebook_session(path, page)
-                    .render(text, images, on_link)
-            } else {
-                crate::markdown_view::render_document_buffered(&text, on_link, images)
-            };
+            if !is_notebook(path) {
+                page.doc.present(&text, on_link, images, PREVIEW_SWAP_WAIT);
+                if !page.changes_view.get() {
+                    self.show_face(path, page);
+                }
+                return;
+            }
+            let (fresh, ready) = self
+                .notebook_session(path, page)
+                .render(text, images, on_link);
             let generation = page.preview_generation.get() + 1;
             page.preview_generation.set(generation);
             let holder = page.preview_holder.clone();

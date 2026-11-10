@@ -192,6 +192,8 @@ holds the place in the document rather than the pixel) opens it on its preview f
 which is how the preview's rendering — its pictures, its tables, its
 path links — gets looked at; `build-aux/headless/fixtures/markdown-table.md`
 is a short document with a table and path links for exactly that,
+`fixtures/markdown-flow.md` one of every block the preview's text holds
+— nested and hanging lists, a quote, a code block, and a rule —,
 `fixtures/sample.mdx` an MDX one — front matter, imports, a component
 around Markdown, a component alone, an inline tag, and a fenced example,
 which the preview draws as `crate::mdx` leaves them — and `fixtures/html/index.html` a page with a stylesheet, a picture, and a script beside it, and a picture and a fetch aimed at 127.0.0.1:8765, which the preview's policy must refuse — serve that port and see that nothing arrives, and `fixtures/archives/page.wacz` (or `page.warc.gz`, `page.mhtml`) the same page archived, which opens in a viewer tab of its own, its pages on the tab bar's drop-down (`sample.ipynb` and `figures.ipynb` beside it are notebooks, the second made by running real matplotlib and Seaborn cells through the kernel bridge: a PNG, a retina PNG, an SVG, and the objects interface, and `widgets.ipynb` real ipywidgets saved with their state, `interact` over a Seaborn plot among them; `TASTE_PROBE_NOTEBOOK=failed` poses the kernel-failed banner, `TASTE_PROBE_NOTEBOOK=drag` runs the notebook's cells for real and drags its first slider, printing what the widgets did (`build-aux/headless/notebook-drag.sh`, run on the host, is that against `widgets.ipynb` in this image plus Jupyter and Task, in a scratch workspace whose Taskfile defines the `jupyter:kernel` task the kernel is (`taste_core::kernel_task`): inside a container the container IS the environment, so no VM is needed), and `TASTE_PROBE_PREVIEW_AT=0.5` scrolls any preview that far down before the shot), and
@@ -810,15 +812,11 @@ put through what could move it — rows added below, a row above the view
 grown taller, a row above it built again, hundreds more rows below —
 `held` or `MOVED` for each. `TASTE_PROBE_SELECT=1` (with
 `TASTE_PROBE_PREVIEW=<a long .md>`) grows a selection across the preview's
-longest label a step a frame, as a drag does, and prints its frames;
-`=nomap` hides the overview strip first, which tells the label's cost apart
-from the strip's; `=across` presses at the document's first line and holds
-the pointer below the view for two seconds, the view scrolling under it,
-and prints the span selected, the labels it is painted on, how far the view
-went, and what a copy of it carries (`doc_select.rs`, the drag past its
-threshold, which a probe has no pointer to cross); `=focus` gives the
-preview the keyboard as a mode's toggle does and prints where it went and
-how many labels came out selected, which must be none. `TASTE_PROBE_EXPAND=<folder>` expands that folder of the
+whole text a step a frame, as a drag does, and prints its frames (a
+notebook's face, which is widgets, its longest label instead, and `=nomap`
+hides that face's strip first); `=focus` gives the preview the keyboard as
+a mode's toggle does and prints where it went and whether anything came out
+selected, which must be nothing. `TASTE_PROBE_EXPAND=<folder>` expands that folder of the
 file tree and prints the longest the main thread was held while its rows
 landed (`TASTE_PROBE_EXPAND_PENDING=<file>` with a tab's selection waiting
 on a file in it); open a scratch repository with a folder of thousands of

@@ -52,7 +52,10 @@ impl DocumentBase {
     /// `path:12`, or a PDF's `path#page=3` (`taste_core::anchor`).
     /// Resolved like an image source, against the document's directory or
     /// the root for a leading slash.
-    fn resolve_link(&self, href: &str) -> Option<(PathBuf, Option<taste_core::anchor::Anchor>)> {
+    pub(crate) fn resolve_link(
+        &self,
+        href: &str,
+    ) -> Option<(PathBuf, Option<taste_core::anchor::Anchor>)> {
         if href.contains("://") || href.starts_with("mailto:") {
             return None;
         }
@@ -68,7 +71,7 @@ impl DocumentBase {
 
     /// The file a markdown image source names, or `None` when it is not a
     /// file of this checkout: a URL, or a path that leaves the root.
-    fn resolve(&self, source: &str) -> Option<PathBuf> {
+    pub(crate) fn resolve(&self, source: &str) -> Option<PathBuf> {
         if source.contains("://") || source.starts_with("data:") {
             return None;
         }
@@ -175,22 +178,6 @@ impl Drop for Hold {
             }
         }
     }
-}
-
-/// [`render`] for a document with a place: its relative images are read
-/// from beside it and shown (the editor's preview).
-///
-/// Returned with what its pictures and diagrams have still to do: the
-/// editor's preview builds the next rendering beside the one on screen
-/// and swaps them once this says the next is whole.
-pub fn render_document_buffered(
-    text: &str,
-    on_link: Rc<dyn Fn(&str)>,
-    images: DocumentBase,
-) -> (gtk::Widget, Readiness) {
-    let readiness = Readiness::default();
-    let widget = render_full(text, on_link, None, Some(images), Some(&readiness));
-    (widget, readiness)
 }
 
 /// [`render`] with issue references drawn as pills when an index is
@@ -959,7 +946,12 @@ fn heading_type(level: HeadingLevel) -> (&'static str, u16) {
 /// widget takes the texture when it lands. Scaled down to the column,
 /// never up; the alt text is the tooltip, and the whole caption when the
 /// file cannot be read or is not an image.
-fn picture(base: &DocumentBase, path: PathBuf, alt: &str, hold: Option<Hold>) -> gtk::Widget {
+pub(crate) fn picture(
+    base: &DocumentBase,
+    path: PathBuf,
+    alt: &str,
+    hold: Option<Hold>,
+) -> gtk::Widget {
     // The picture fills the column and scales down to it, never up: a
     // 1440px screenshot in a 600px column is the column wide and keeps
     // its aspect. Its minimum height is zero (it can shrink), so the
@@ -1038,7 +1030,7 @@ const CUT_BLOCK: &str = "Not copied: this code block's start was not kept — th
 
 /// A code block's card, its copy button copying `copies` — the whole block
 /// — or refusing with the reason it cannot.
-fn code_card(code: &str, copies: Result<String, String>, reflow: bool) -> gtk::Widget {
+pub(crate) fn code_card(code: &str, copies: Result<String, String>, reflow: bool) -> gtk::Widget {
     let label = gtk::Label::builder()
         .label(code)
         .xalign(0.0)
@@ -1106,7 +1098,10 @@ fn code_card(code: &str, copies: Result<String, String>, reflow: bool) -> gtk::W
 /// Laid out by [`crate::table::Table`], not a `GtkGrid`: the grid measured
 /// its height as though every column were a word wide, and a transcript row
 /// kept the difference as a page of empty space.
-fn table_card(alignments: &[pulldown_cmark::Alignment], rows: &[Vec<String>]) -> gtk::Widget {
+pub(crate) fn table_card(
+    alignments: &[pulldown_cmark::Alignment],
+    rows: &[Vec<String>],
+) -> gtk::Widget {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0) as i32;
     let mut cells: Vec<Vec<gtk::Widget>> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
