@@ -4153,6 +4153,9 @@ impl ChatPane {
                 return;
             }
             pane.reset_session(true);
+            // Another agent's session starts empty, though it is not spawned
+            // until the next prompt.
+            pane.empty_context();
             // The tab is labelled with its agent, and the stored session id
             // belonged to the old one.
             pane.persisted_session.borrow_mut().take();
@@ -6896,6 +6899,17 @@ impl ChatPane {
         *self.quota_fade.borrow_mut() = Some(armed);
     }
 
+    /// A fresh session's context holds nothing yet: the gauge, its
+    /// tooltip, the badge, and the Utilization tab all say so now, rather
+    /// than keeping the last session's fill until the first turn reports
+    /// (David, 2026-11-10: "If I reset the agent session, the assumed
+    /// context window fill should reset to 0%").
+    fn empty_context(&self) {
+        self.context_used.set(0);
+        self.set_context_gauge(0, None);
+        self.refresh_usage();
+    }
+
     fn refresh_usage(&self) {
         let limit = self.context_limit.get().max(1);
         let used = self.context_used.get();
@@ -8179,7 +8193,11 @@ impl ChatPane {
         // What the session left streaming and running is over: the rows
         // stay, settled, and the next session's start fresh under them.
         self.update_model(|model| model.end_session());
-        self.context_used.set(0);
+        // The context's fill is NOT zeroed here: it belongs to the
+        // conversation, and most endings resume it (`session/load` after a
+        // disconnect, a relocation, a respawn), whose agent says nothing of
+        // the fill until its next turn. A session that starts fresh empties
+        // it (`empty_context`).
         self.session_usage.borrow_mut().take();
         self.session_cost.borrow_mut().take();
     }
@@ -9291,6 +9309,11 @@ impl ChatPane {
         if self.client.borrow().is_some() {
             return;
         }
+        if resume.is_none() {
+            // Said the moment a fresh session is asked for, not when its
+            // agent is up, which can be a container's bring-up later.
+            self.empty_context();
+        }
         tracing::info!(
             "chat {}: spawning its agent (resume={})",
             self.environment,
@@ -9501,6 +9524,9 @@ impl ChatPane {
                 // a resumed one's history is the record, drawn from it.
                 let replay = std::mem::take(&mut *self.replay_record.borrow_mut());
                 if !restored {
+                    // ...including the fresh session a failed restore falls
+                    // back to, which held the old fill until now.
+                    self.empty_context();
                     self.mark_session(&session_id);
                 } else {
                     // Events wait from here until the history is drawn
