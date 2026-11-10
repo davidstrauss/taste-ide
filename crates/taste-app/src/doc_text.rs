@@ -130,9 +130,18 @@ impl DocView {
         let view = DocTextView::new();
         view.set_hexpand(true);
         view.set_vexpand(true);
+        // EXTERNAL, not NEVER: never sideways either way, but NEVER makes
+        // the scroller's minimum width the view's, and the view's is its
+        // widest widget's — a picture, a table, a code block's head, each
+        // the column wide, so as wide as the view already is. That held
+        // the editor at whatever width it last had: a window could not
+        // shrink it, nor the chat's divider move into it (David,
+        // 2026-11-09: "I can't even resize the chat area"). EXTERNAL asks
+        // nothing of the view's width and gives it the viewport's, so the
+        // columns follow the pane rather than holding it.
         let scroller = gtk::ScrolledWindow::builder()
             .child(&view)
-            .hscrollbar_policy(gtk::PolicyType::Never)
+            .hscrollbar_policy(gtk::PolicyType::External)
             .hexpand(true)
             .vexpand(true)
             .build();

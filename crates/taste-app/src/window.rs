@@ -2771,9 +2771,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // 400px window is held to below the last breakpoint.
             ("gadget", gadget.widget.clone().upcast()),
         ];
+        // ...and the dividers' ranges, which are what those minimums do to
+        // a drag: a divider moves only between its two children's
+        // minimums, so a pane whose minimum grows to its own width pins the
+        // divider beside it (2026-11-09: a preview's text view held the
+        // editor at its width, and the chat's divider could not move).
+        let dividers: Vec<(&str, gtk::Paned)> = vec![
+            ("flank|rest", outer.clone()),
+            ("center|chat", center_and_chat.clone()),
+            ("editor|console", center.clone()),
+        ];
         let app = app.clone();
         window.connect_map(move |_| {
             let report = report.clone();
+            let dividers = dividers.clone();
             let app = app.clone();
             // `TASTE_MEASURE_DELAY_MS` moves the moment: a minimum that
             // grows only after a probe view has posed itself (the gadget
@@ -2800,6 +2811,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 for (name, widget) in &report {
                     let (min, natural, _, _) = widget.measure(axis, -1);
                     println!("{axis_word} {name}: min={min} nat={natural}");
+                }
+                for (name, paned) in &dividers {
+                    println!(
+                        "divider {name}: at {} of {}, movable {}..{}",
+                        paned.position(),
+                        paned.width(),
+                        paned.min_position(),
+                        paned.max_position()
+                    );
                 }
                 // ...and where each pane's number comes FROM. A pane's
                 // minimum is a sum of somebody's floor plus a label that

@@ -471,9 +471,17 @@ and attributes it down the widget tree (`TASTE_MEASURE_FLOOR` moves the
 reporting cutoff; `TASTE_MEASURE_DELAY_MS` moves the moment, since a
 minimum that grows only after a view has posed itself is invisible at the
 default 400ms), which is where a minimum that grew gets pinned on a
-label that stopped ellipsizing. Under `TASTE_MEASURE_MIN` alone the chat
+label that stopped ellipsizing. It prints each divider's position too,
+and the range a drag can move it in: `movable 750..750` is a divider a
+pane's minimum has pinned. Under `TASTE_MEASURE_MIN` alone the chat
 shows its empty page; add `TASTE_PROBE_CHECK=1 TASTE_PROBE_CHAT=busy` to
-measure against a transcript.
+measure against a transcript. A file a probe opens
+(`TASTE_PROBE_PREVIEW`) is open only with `TASTE_PROBE_CHECK=1` and a
+`TASTE_PROBE_DELAY_MS` past `TASTE_MEASURE_DELAY_MS` — without them the
+editor measured is the empty one, which is how a preview pinning the
+editor at 750px measured 152 (2026-11-09) — and the same goes for
+`TASTE_PROBE_WALK`, which stands down the probe that opens files, so a
+walk passes whatever a document's face does to the minimums.
 `build-aux/headless/near-miss.py <probe-run.log> [pane…]` reads the
 geometry dumps a probe run prints and lists every pair of column-spanning
 edges that differ by a few pixels without being equal — a card inset 12
