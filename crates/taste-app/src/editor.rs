@@ -3383,9 +3383,49 @@ impl Editor {
             // with the frames timed (`select_bench`); `=nomap` with the
             // overview strip hidden, which tells the label's cost apart
             // from the strip's.
+            // `=across` drags from the document's first line to below the
+            // view and holds there, the view scrolling under it, and prints
+            // what came out selected (`doc_select::Selection::probe_drag`).
+            // `=focus` gives the preview the keyboard as a mode's toggle
+            // does (`focus_document`) and prints where it went and whether
+            // anything came out selected — nothing should.
             if let Ok(mode) = std::env::var("TASTE_PROBE_SELECT") {
                 let holder = page.preview_holder.clone();
+                let weak = Rc::downgrade(&editor);
                 glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
+                    if mode == "focus" {
+                        let Some(editor) = weak.upgrade() else { return };
+                        editor.focus_document();
+                        let focus = editor.widget.root().and_then(|root| root.focus());
+                        let mut selected = 0;
+                        let mut stack = vec![holder.clone().upcast::<gtk::Widget>()];
+                        while let Some(widget) = stack.pop() {
+                            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                                selected += usize::from(label.selection_bounds().is_some());
+                            }
+                            let mut child = widget.first_child();
+                            while let Some(c) = child {
+                                child = c.next_sibling();
+                                stack.push(c);
+                            }
+                        }
+                        println!(
+                            "select focus: the keyboard on {} (in the preview: {}); {selected} labels with a selection",
+                            focus.as_ref().map_or("nothing".into(), |w| w.type_().name().to_string()),
+                            focus.is_some_and(|w| w.is_ancestor(&holder)),
+                        );
+                        return;
+                    }
+                    if mode == "across" {
+                        match crate::doc_select::find_under(holder.upcast_ref()) {
+                            Some(selection) => selection
+                                .probe_drag(std::time::Duration::from_millis(2000), |said| {
+                                    println!("select across: {said}")
+                                }),
+                            None => println!("select across: no document selection"),
+                        }
+                        return;
+                    }
                     select_bench(&holder, mode == "nomap");
                 });
             }

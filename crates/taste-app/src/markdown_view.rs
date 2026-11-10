@@ -644,6 +644,7 @@ fn build(item: &Item, context: &Context, readiness: Option<&Readiness>) -> Built
                 .xalign(0.0)
                 .selectable(true)
                 .build();
+            crate::doc_select::copies_across(&label);
             if *quote_depth > 0 {
                 label.set_margin_start(14 * *quote_depth as i32);
                 label.add_css_class("dim-label");
@@ -727,6 +728,8 @@ fn document_box() -> gtk::Box {
     root.set_margin_bottom(16);
     root.set_margin_start(16);
     root.set_margin_end(16);
+    // A selection runs through all of it, not one label's worth.
+    crate::doc_select::install(&root);
     root
 }
 
@@ -1051,6 +1054,7 @@ fn code_card(code: &str, copies: Result<String, String>, reflow: bool) -> gtk::W
         .margin_start(10)
         .margin_end(10)
         .build();
+    crate::doc_select::copies_across(&label);
     let scroller = gtk::ScrolledWindow::builder()
         .child(&label)
         .vscrollbar_policy(gtk::PolicyType::Never)
@@ -1130,6 +1134,7 @@ fn table_card(alignments: &[pulldown_cmark::Alignment], rows: &[Vec<String>]) ->
                     vec!["markdown-table-cell"]
                 })
                 .build();
+            crate::doc_select::copies_across(&label);
             line.push(label.upcast());
         }
         cells.push(line);

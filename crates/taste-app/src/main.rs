@@ -30,6 +30,7 @@ mod controller;
 mod coordinator;
 mod copy;
 mod devcontainer_ui;
+mod doc_select;
 mod editor;
 mod elicit;
 mod env_channel;
@@ -1384,6 +1385,12 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
     let settings = gtk::Settings::for_display(display);
+    // A label given the keyboard does not select all of itself. GTK's
+    // default does, so a preview handed the keyboard on opening showed its
+    // first section selected, and a transcript the same (David,
+    // 2026-11-09: "Whenever I preview a markdown file, the first section
+    // is always selected as text").
+    settings.set_gtk_label_select_on_focus(false);
     font.load_from_string(&whole_font_css(&settings));
     for property in ["gtk-font-name", "gtk-xft-dpi"] {
         let font = font.clone();

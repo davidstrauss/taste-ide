@@ -812,7 +812,13 @@ grown taller, a row above it built again, hundreds more rows below —
 `TASTE_PROBE_PREVIEW=<a long .md>`) grows a selection across the preview's
 longest label a step a frame, as a drag does, and prints its frames;
 `=nomap` hides the overview strip first, which tells the label's cost apart
-from the strip's. `TASTE_PROBE_EXPAND=<folder>` expands that folder of the
+from the strip's; `=across` presses at the document's first line and holds
+the pointer below the view for two seconds, the view scrolling under it,
+and prints the span selected, the labels it is painted on, how far the view
+went, and what a copy of it carries (`doc_select.rs`, the drag past its
+threshold, which a probe has no pointer to cross); `=focus` gives the
+preview the keyboard as a mode's toggle does and prints where it went and
+how many labels came out selected, which must be none. `TASTE_PROBE_EXPAND=<folder>` expands that folder of the
 file tree and prints the longest the main thread was held while its rows
 landed (`TASTE_PROBE_EXPAND_PENDING=<file>` with a tab's selection waiting
 on a file in it); open a scratch repository with a folder of thousands of
