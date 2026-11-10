@@ -369,6 +369,13 @@ pub struct ChatEntry {
     /// asked for it.
     #[serde(default)]
     pub restart_when_silent: bool,
+    /// Whether the IDE compacts this conversation when it has sat idle
+    /// long enough that its prompt cache is about to expire
+    /// (`crate::idle_compact`). On unless the user turns it off, as
+    /// Claude Code's own `idleCompaction` is, and so on for a file from
+    /// before the switch.
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub compact_while_away: bool,
     /// The environment this chat's agent works in — its clone, its
     /// devcontainer, its exec target.
     ///
@@ -386,6 +393,14 @@ pub struct ChatEntry {
     pub guidance_seen: u32,
 }
 
+fn on() -> bool {
+    true
+}
+
+fn is_on(value: &bool) -> bool {
+    *value
+}
+
 impl Default for ChatEntry {
     /// A chat of the user's own environment, talking to the default agent.
     /// Hand-written rather than derived because a chat's environment has no
@@ -399,6 +414,7 @@ impl Default for ChatEntry {
             config_values: Default::default(),
             auto_approve: false,
             restart_when_silent: false,
+            compact_while_away: true,
             environment: EnvironmentId::primary(),
             guidance_seen: 0,
         }
@@ -870,6 +886,36 @@ mod tests {
         });
         save_to(base.path(), root, &state).unwrap();
         assert!(load_from(base.path(), root).chats()[0].restart_when_silent);
+    }
+
+    /// Compacting while away is on for a fresh chat and for one saved
+    /// before the switch existed, and off stays off across a save.
+    #[test]
+    fn compacting_while_away_is_on_until_turned_off() {
+        assert!(ChatEntry::default().compact_while_away);
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/away");
+        std::fs::create_dir_all(base.path()).unwrap();
+        std::fs::write(
+            file_for(base.path(), root),
+            format!(
+                r#"{{"version":{STATE_VERSION},
+                     "chats":[{{"agent_id":"claude-code","session_id":"s"}}]}}"#
+            ),
+        )
+        .unwrap();
+        assert!(load_from(base.path(), root).chats()[0].compact_while_away);
+
+        let mut state = WorkspaceState {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
+        state.set_chat(ChatEntry {
+            compact_while_away: false,
+            ..chat("claude-code", "s")
+        });
+        save_to(base.path(), root, &state).unwrap();
+        assert!(!load_from(base.path(), root).chats()[0].compact_while_away);
     }
 
     /// The agent's session options the user chose — effort, fast mode —

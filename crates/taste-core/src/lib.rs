@@ -19,6 +19,7 @@ pub mod event;
 pub mod exec;
 pub mod files;
 pub mod ide_state;
+pub mod idle_compact;
 pub mod imageless;
 pub mod instance;
 pub mod kernel_task;

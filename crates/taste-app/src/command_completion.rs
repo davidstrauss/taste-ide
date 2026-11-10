@@ -289,12 +289,38 @@ impl CommandProvider {
     pub fn set_commands(&self, commands: Vec<Command>) {
         self.imp().commands.replace(commands);
     }
+
+    /// Whether `text` is one of the offered commands, as a prompt says it:
+    /// its first word, the slash and the name, and nothing or arguments
+    /// after it. A path such as `/var/home/me` is not one.
+    pub fn invokes(&self, text: &str) -> bool {
+        let Some(rest) = text.trim_start().strip_prefix('/') else {
+            return false;
+        };
+        let name = rest.split_whitespace().next().unwrap_or_default();
+        self.imp()
+            .commands
+            .borrow()
+            .iter()
+            .any(|command| command.name == name)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_prompt_invokes_an_offered_command_by_its_first_word() {
+        let provider = CommandProvider::default();
+        provider.set_commands(commands());
+        assert!(provider.invokes("/compact"));
+        assert!(provider.invokes("  /compact focus on the auth bug"));
+        assert!(!provider.invokes("/compactly"));
+        assert!(!provider.invokes("/var/home/me/notes.md says so"));
+        assert!(!provider.invokes("please /compact"));
+    }
 
     fn commands() -> Vec<Command> {
         ["compact", "context", "clear", "review"]
