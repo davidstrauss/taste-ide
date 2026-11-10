@@ -3382,9 +3382,9 @@ impl Editor {
             }
             // `TASTE_PROBE_SELECT=1`: the preview's text selected from its
             // start further each frame, as a drag grows a selection, with
-            // the frames timed (`doc_text::DocView::select_bench`); a
-            // notebook's face, which is widgets, its longest label instead
-            // (`select_bench`), and `=nomap` with its overview strip hidden.
+            // the frames timed (`doc_text::DocView::select_bench`), or a
+            // notebook's face's longest label (`select_bench`); `=nomap`
+            // with the overview strip hidden.
             // `=focus` gives the preview the keyboard as a mode's toggle
             // does (`focus_document`) and prints where it went and whether
             // anything came out selected — nothing should.
@@ -3409,7 +3409,7 @@ impl Editor {
                         return;
                     }
                     if markdown {
-                        doc.select_bench();
+                        doc.select_bench(mode == "nomap");
                     } else {
                         select_bench(&holder, mode == "nomap");
                     }

@@ -813,8 +813,9 @@ grown taller, a row above it built again, hundreds more rows below —
 `held` or `MOVED` for each. `TASTE_PROBE_SELECT=1` (with
 `TASTE_PROBE_PREVIEW=<a long .md>`) grows a selection across the preview's
 whole text a step a frame, as a drag does, and prints its frames (a
-notebook's face, which is widgets, its longest label instead, and `=nomap`
-hides that face's strip first); `=focus` gives the preview the keyboard as
+notebook's face, which is widgets, its longest label instead), and
+`=nomap` hides the overview strip first, which tells the strip's cost
+apart from the text's; `=focus` gives the preview the keyboard as
 a mode's toggle does and prints where it went and whether anything came out
 selected, which must be nothing. `TASTE_PROBE_EXPAND=<folder>` expands that folder of the
 file tree and prints the longest the main thread was held while its rows

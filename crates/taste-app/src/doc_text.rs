@@ -15,9 +15,18 @@
 //! draws only the lines on screen, so a long document no longer has to be
 //! cut into short labels to be selected in quickly.
 //!
-//! The overview strip beside it is GtkSourceView's map, the same strip
-//! the source face has, which is why the view is a `sourceview5::View`:
-//! a subclass of one, [`DocSourceView`], which draws a code block's card
+//! The overview strip beside it is the document as it is drawn, scaled
+//! to the strip (`crate::preview_map`), painted from a second view of the
+//! same buffer at the preview's width and its whole height, which nobody
+//! sees: its pictures, diagrams, and tables are the preview's own, painted
+//! again ([`Mirror`]). GtkSourceView's map was tried first and is the
+//! wrong tool here: it sets the buffer in a one-point font in a column a
+//! few dozen pixels wide, so every paragraph char-wrapped into a streak of
+//! dots, the code's margins pushed it off the strip, and a picture was a
+//! line (David, 2026-11-09: "the sourcemap on this is highly broken").
+//!
+//! The view is a subclass of GTK's, [`DocTextView`], which draws a code
+//! block's card
 //! and a quote's bar behind the text, as GtkSourceView draws its own
 //! highlights — a paragraph's background starts at its own margin, so a
 //! code block's text could not stand in from the card it is on.
@@ -30,7 +39,6 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -57,7 +65,7 @@ enum Action {
 
 /// A document written into a buffer, not yet shown.
 pub struct Rendering {
-    buffer: sourceview5::Buffer,
+    buffer: gtk::TextBuffer,
     decor: Vec<Decor>,
     actions: HashMap<gtk::TextTag, Action>,
     children: Vec<(gtk::TextChildAnchor, Column)>,
@@ -95,14 +103,19 @@ impl Styles {
 struct Shown {
     actions: HashMap<gtk::TextTag, Action>,
     children: Vec<(gtk::TextChildAnchor, Column)>,
+    /// Each child's stand-in in the strip's view.
+    mirrors: Vec<Mirror>,
     styles: Styles,
 }
 
 /// The preview's face: the text view and its map, side by side.
 pub struct DocView {
     pub body: gtk::Box,
-    pub view: DocSourceView,
+    pub view: DocTextView,
     pub scroller: gtk::ScrolledWindow,
+    /// The view the strip paints: the same buffer, the whole of it.
+    ghost: DocTextView,
+    map: crate::preview_map::PreviewMap,
     shown: RefCell<Option<Shown>>,
     /// Which rendering is the latest: one overtaken by a newer edit before
     /// it was whole is dropped rather than shown late.
@@ -112,37 +125,34 @@ pub struct DocView {
 }
 
 impl DocView {
-    /// The face, empty, with a map `map_width` wide beside it.
+    /// The face, empty, with a strip `map_width` wide beside it.
     pub fn new(map_width: i32) -> Rc<Self> {
-        let buffer = sourceview5::Buffer::new(None);
-        let view: DocSourceView = glib::Object::new();
-        view.set_buffer(Some(&buffer));
-        view.set_editable(false);
-        view.set_cursor_visible(false);
-        view.set_monospace(false);
-        view.set_show_line_numbers(false);
-        view.set_highlight_current_line(false);
-        view.set_wrap_mode(gtk::WrapMode::WordChar);
-        view.set_left_margin(MARGIN);
-        view.set_right_margin(MARGIN);
-        view.set_top_margin(MARGIN);
-        view.set_bottom_margin(MARGIN);
-        view.set_pixels_inside_wrap(2);
+        let view = DocTextView::new();
         view.set_hexpand(true);
         view.set_vexpand(true);
-        view.add_css_class("document-preview");
         let scroller = gtk::ScrolledWindow::builder()
             .child(&view)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .hexpand(true)
             .vexpand(true)
             .build();
-        // After the scroller: the map takes the view's adjustment once,
-        // when it is given the view (as the source face's does).
-        let map = sourceview5::Map::new();
-        map.set_view(&view);
-        map.set_highlight_current_line(false);
-        map.set_width_request(map_width);
+        // The strip's view: not scrolled, so as tall as the document; the
+        // preview's width, so its lines break where the preview's do; and
+        // out of reach of the pointer, the keyboard, and a screen reader.
+        let ghost = DocTextView::new();
+        ghost.set_can_target(false);
+        ghost.set_can_focus(false);
+        ghost.update_state(&[gtk::accessible::State::Hidden(true)]);
+        let width_of = {
+            let view = view.downgrade();
+            Rc::new(move || view.upgrade().map_or(1, |view| view.width().max(1)))
+        };
+        let map = crate::preview_map::PreviewMap::with_ghost(
+            ghost.upcast_ref(),
+            width_of,
+            &scroller,
+            map_width,
+        );
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         body.append(&scroller);
         body.append(&map);
@@ -150,6 +160,8 @@ impl DocView {
             body,
             view,
             scroller,
+            ghost,
+            map,
             shown: RefCell::new(None),
             generation: Cell::new(0),
             on_link: RefCell::new(None),
@@ -168,9 +180,11 @@ impl DocView {
                     if width.replace(now) == now {
                         return;
                     }
+                    // The strip's view follows the preview's width.
                     let weak = weak.clone();
                     glib::idle_add_local_once(move || {
                         if let Some(this) = weak.upgrade() {
+                            this.map.queue_allocate();
                             this.measure_children();
                         }
                     });
@@ -180,22 +194,15 @@ impl DocView {
             let weak = Rc::downgrade(&this);
             adw::StyleManager::default().connect_dark_notify(move |_| {
                 if let Some(this) = weak.upgrade() {
-                    crate::editor::apply_scheme_for_style(&this.buffer());
                     if let Some(shown) = this.shown.borrow().as_ref() {
                         shown.styles.paint();
                     }
+                    this.map.refresh();
                 }
             });
         }
         crate::viewport_matches::watch(&this.view);
         this
-    }
-
-    fn buffer(&self) -> sourceview5::Buffer {
-        self.view
-            .buffer()
-            .downcast()
-            .expect("a source view's buffer is a source buffer")
     }
 
     /// Show `text`. The first rendering shows at once and fills in; a
@@ -262,6 +269,9 @@ impl DocView {
             for (_, child) in shown.children {
                 self.view.remove(&child);
             }
+            for mirror in shown.mirrors {
+                self.ghost.remove(&mirror);
+            }
         }
         let Rendering {
             buffer,
@@ -270,16 +280,23 @@ impl DocView {
             children,
             styles,
         } = rendering;
-        crate::editor::apply_scheme_for_style(&buffer);
         styles.paint();
         self.view.set_buffer(Some(&buffer));
-        *self.view.imp().decor.borrow_mut() = decor;
+        self.ghost.set_buffer(Some(&buffer));
+        self.follow_in_strip(&buffer);
+        *self.view.imp().decor.borrow_mut() = decor.clone();
+        *self.ghost.imp().decor.borrow_mut() = decor;
+        let mut mirrors = Vec::with_capacity(children.len());
         for (anchor, child) in &children {
             self.view.add_child_at_anchor(child, anchor);
+            let mirror = Mirror::new(child);
+            self.ghost.add_child_at_anchor(&mirror, anchor);
+            mirrors.push(mirror);
         }
         *self.shown.borrow_mut() = Some(Shown {
             actions,
             children,
+            mirrors,
             styles,
         });
         if let Some(line) = place.filter(|line| *line > 0) {
@@ -291,6 +308,30 @@ impl DocView {
         }
     }
 
+    /// The strip drawn again when what the ghost shows of `buffer` changes:
+    /// its text, its tags (the find's marks, a widget's line laid out
+    /// again), or its selection. Nothing draws the ghost but the strip, so
+    /// nothing else would say so.
+    fn follow_in_strip(&self, buffer: &gtk::TextBuffer) {
+        let map = self.map.downgrade();
+        let refresh = move || {
+            if let Some(map) = map.upgrade() {
+                map.refresh();
+            }
+        };
+        let on = refresh.clone();
+        buffer.connect_changed(move |_| on());
+        let on = refresh.clone();
+        buffer.connect_apply_tag(move |_, _, _, _| on());
+        let on = refresh.clone();
+        buffer.connect_remove_tag(move |_, _, _, _| on());
+        buffer.connect_mark_set(move |buffer, _, mark| {
+            if *mark == buffer.selection_bound() || *mark == buffer.get_insert() {
+                refresh();
+            }
+        });
+    }
+
     /// Have the view measure its widgets again: the column's width
     /// changed, or what they hold came in.
     fn measure_children(&self) {
@@ -298,6 +339,9 @@ impl DocView {
         let Some(shown) = shown.as_ref() else { return };
         let buffer = self.view.buffer();
         let nudge = buffer.tag_table().lookup(NUDGE);
+        for mirror in &shown.mirrors {
+            mirror.queue_resize();
+        }
         for (anchor, child) in &shown.children {
             child.queue_resize();
             // A line is laid out again when its tags change, and its
@@ -416,8 +460,11 @@ impl DocView {
     /// grows a selection, with each frame's work and the time between
     /// frames printed (`TASTE_PROBE_SELECT`).
     #[doc(hidden)]
-    pub fn select_bench(&self) {
+    pub fn select_bench(&self, no_map: bool) {
         use std::time::Instant;
+        if no_map {
+            self.map.set_visible(false);
+        }
         let buffer = self.view.buffer();
         let Some(clock) = self.view.frame_clock() else {
             println!("select bench: no frame clock");
@@ -494,15 +541,8 @@ impl DocView {
 const NUDGE: &str = "taste-doc-nudge";
 
 /// Write `text` into a buffer of its own, as `view` will show it.
-fn render(
-    view: &DocSourceView,
-    text: &str,
-    base: &DocumentBase,
-    readiness: &Readiness,
-) -> Rendering {
-    let buffer = sourceview5::Buffer::new(None);
-    buffer.set_highlight_syntax(false);
-    buffer.set_highlight_matching_brackets(false);
+fn render(view: &DocTextView, text: &str, base: &DocumentBase, readiness: &Readiness) -> Rendering {
+    let buffer = gtk::TextBuffer::new(None);
     buffer.set_enable_undo(false);
     let mut writer = Writer::new(&buffer, view.upcast_ref(), Some(base), Some(readiness));
     writer.write(text);
@@ -579,6 +619,16 @@ impl Column {
         this
     }
 
+    /// Draw what this holds into `snapshot`, as this draws it: for its
+    /// mirror in the strip's view. Nothing until it has been laid out.
+    fn draw_into(&self, snapshot: &gtk::Snapshot) {
+        if let Some(child) = self.imp().child.borrow().as_ref() {
+            if child.width() > 0 && child.height() > 0 {
+                self.snapshot_child(child, snapshot);
+            }
+        }
+    }
+
     fn column_width(&self) -> i32 {
         let width = self
             .imp()
@@ -599,7 +649,7 @@ impl Column {
 /// paragraph, a heading, a list item, a line of code), each line's tags
 /// saying how it stands, and the inline styles as tags over its text.
 struct Writer<'a> {
-    buffer: sourceview5::Buffer,
+    buffer: gtk::TextBuffer,
     view: &'a gtk::TextView,
     base: Option<&'a DocumentBase>,
     readiness: Option<&'a Readiness>,
@@ -728,7 +778,7 @@ impl Tags {
 
 impl<'a> Writer<'a> {
     fn new(
-        buffer: &sourceview5::Buffer,
+        buffer: &gtk::TextBuffer,
         view: &'a gtk::TextView,
         base: Option<&'a DocumentBase>,
         readiness: Option<&'a Readiness>,
@@ -1261,25 +1311,23 @@ enum Decor {
 
 mod view_imp {
     use super::*;
-    use sourceview5::subclass::prelude::*;
 
     #[derive(Default)]
-    pub struct DocSourceView {
+    pub struct DocTextView {
         pub(super) decor: RefCell<Vec<Decor>>,
     }
 
     #[glib::object_subclass]
-    impl ObjectSubclass for DocSourceView {
-        const NAME: &'static str = "TasteDocSourceView";
-        type Type = super::DocSourceView;
-        type ParentType = sourceview5::View;
+    impl ObjectSubclass for DocTextView {
+        const NAME: &'static str = "TasteDocTextView";
+        type Type = super::DocTextView;
+        type ParentType = gtk::TextView;
     }
 
-    impl ObjectImpl for DocSourceView {}
-    impl WidgetImpl for DocSourceView {}
-    impl ViewImpl for DocSourceView {}
+    impl ObjectImpl for DocTextView {}
+    impl WidgetImpl for DocTextView {}
 
-    impl TextViewImpl for DocSourceView {
+    impl TextViewImpl for DocTextView {
         fn snapshot_layer(&self, layer: gtk::TextViewLayer, snapshot: gtk::Snapshot) {
             self.parent_snapshot_layer(layer, snapshot.clone());
             if layer == gtk::TextViewLayer::BelowText {
@@ -1290,14 +1338,29 @@ mod view_imp {
 }
 
 glib::wrapper! {
-    /// The preview's text view: a source view, for the map, that draws
+    /// The preview's text view, read-only, that draws
     /// code blocks' cards and quotes' bars behind its text.
-    pub struct DocSourceView(ObjectSubclass<view_imp::DocSourceView>)
-        @extends sourceview5::View, gtk::TextView, gtk::Widget,
+    pub struct DocTextView(ObjectSubclass<view_imp::DocTextView>)
+        @extends gtk::TextView, gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Scrollable;
 }
 
-impl DocSourceView {
+impl DocTextView {
+    /// A view for a document: read-only, its cursor hidden, wrapping.
+    fn new() -> Self {
+        let view: Self = glib::Object::new();
+        view.set_editable(false);
+        view.set_cursor_visible(false);
+        view.set_wrap_mode(gtk::WrapMode::WordChar);
+        view.set_left_margin(MARGIN);
+        view.set_right_margin(MARGIN);
+        view.set_top_margin(MARGIN);
+        view.set_bottom_margin(MARGIN);
+        view.set_pixels_inside_wrap(2);
+        view.add_css_class("document-preview");
+        view
+    }
+
     /// Draw `decor` where it falls in view, in buffer coordinates.
     fn draw_decor(&self, snapshot: &gtk::Snapshot, decor: &[Decor]) {
         let buffer = self.buffer();
@@ -1348,13 +1411,70 @@ impl DocSourceView {
     }
 }
 
+/// A widget of the preview, again, in the strip's view: as large as the
+/// one it stands for, and drawn as it is drawn — its column draws its child
+/// into the mirror's frame — so a picture is not decoded twice nor a
+/// diagram drawn twice. A widget lives in one view only, and each view
+/// needs one at an anchor. Not a `GtkWidgetPaintable`: that shows what a
+/// frame last drew of a widget, and a text view draws only the widgets on
+/// screen, so a picture below the fold was blank in the strip.
+mod mirror_imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct Mirror {
+        pub(super) original: RefCell<Option<Column>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Mirror {
+        const NAME: &'static str = "TasteDocMirror";
+        type Type = super::Mirror;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for Mirror {}
+
+    impl WidgetImpl for Mirror {
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            match self.original.borrow().as_ref() {
+                Some(original) => {
+                    let (min, natural, _, _) = original.measure(orientation, for_size);
+                    (min, natural, -1, -1)
+                }
+                None => (0, 0, -1, -1),
+            }
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            if let Some(original) = self.original.borrow().as_ref() {
+                original.draw_into(snapshot);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct Mirror(ObjectSubclass<mirror_imp::Mirror>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl Mirror {
+    fn new(original: &Column) -> Self {
+        let this: Self = glib::Object::new();
+        *this.imp().original.borrow_mut() = Some(original.clone());
+        this
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn written(text: &str) -> (String, Rendering) {
-        let view: DocSourceView = glib::Object::new();
-        let buffer = sourceview5::Buffer::new(None);
+        let view = DocTextView::new();
+        let buffer = gtk::TextBuffer::new(None);
         let mut writer = Writer::new(&buffer, view.upcast_ref(), None, None);
         writer.write(text);
         let rendering = writer.finish();
