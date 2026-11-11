@@ -52,6 +52,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+/// What a snapshot of a branch with no commit yet says it is against, here
+/// and in the script the checkout runs (`script_avoiding`).
+pub(crate) const UNBORN_SNAPSHOT: &str = "taste snapshot against an unborn branch";
+
 use anyhow::{bail, Context, Result};
 use git2::Oid;
 
@@ -108,7 +112,7 @@ impl GitWorkspace {
         // its parent.
         let message = match &head {
             Some(commit) => format!("taste snapshot against {}", commit.id()),
-            None => "taste snapshot against an unborn branch".to_string(),
+            None => UNBORN_SNAPSHOT.to_string(),
         };
         // Unchanged only when the tree AND the commit under it are: a
         // commit that leaves the working copy as it was (part of the

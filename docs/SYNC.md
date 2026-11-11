@@ -247,6 +247,23 @@ removals emptied stayed in the checkout until 096b680 (P11).
   the VM was already marked as safe to delete"). A VM whose marker was
   taken back (the re-check before the shutdown found something moved)
   keeps the rules above.
+- **Before the first commit, too.** A branch with no commit on either
+  side — a folder fresh from `git init`, placed in the VM as "a fresh
+  repository on main" — has no tip for a pass to stand on, and the sync
+  used to return there without a pass or a word: a file dropped into the
+  folder never reached Personal, and the agent's `.devcontainer/` never
+  reached the folder (David, 2026-11-10). Now the two working copies are
+  mirrored as any are, the archive empty the first time, with HEAD left
+  on the branch and the snapshot required to say it was taken against an
+  unborn branch, since one that names a commit is of a later state
+  (`mirror::mirror_unborn_within`). The first commit then crosses whole,
+  whichever side makes it: the checkout's into the folder by
+  `adopt_first_commit`, and the folder's into the checkout by
+  `peer::SYNC_SCRIPT`, which sets the index to it and writes each of its
+  files the checkout lacks, overwriting none. Moving only the branch
+  would read every file the commit has and the other side lacks as
+  deleted. Both sides on no commit but on different branches is said in
+  the note, not settled.
 - **Never partway through an operation.** A pass stands down while
   either side is in the middle of a rebase, a merge, a cherry-pick, a
   revert, or a bisect, as git's own files in the git directory say

@@ -1481,6 +1481,41 @@ fn sync_primary_peer_pass(
             }
         }
     }
+    // Personal's branch with no commit yet, and the folder's with some:
+    // the folder's first commits go there, as any commits the folder is
+    // ahead by do. The loop above walks only the branches Personal has,
+    // so it never saw this one, and the folder's commits sat here.
+    if let Some(branch) = checkout_branch.as_deref() {
+        let local = format!("refs/heads/{branch}");
+        let fetched = git.read_ref(&format!("{VM_BRANCH_NAMESPACE}{branch}"))?;
+        if fetched.is_none() && git.read_ref(&local)?.is_some() {
+            commits_unsettled = true;
+            say(&format!(
+                "sending this folder's {branch} to Personal, where it has no commit yet"
+            ));
+            let folder_tree = working_tree_id(peer);
+            match push_ahead_into_checkout(
+                peer,
+                vm,
+                keys,
+                files,
+                path,
+                branch,
+                Arrival {
+                    folder_tree: folder_tree.as_deref(),
+                    rewrite_from: None,
+                },
+            ) {
+                Ok(_) => sync.pushed = true,
+                Err(e) => {
+                    sync.note = Some(format!(
+                        "this folder's {branch} would not go to Personal, where it has no commit \
+                         yet: {e:#}"
+                    ))
+                }
+            }
+        }
+    }
     // The branch each side is on, by the same rule as everything else:
     // compared with the branch the two last agreed on, the side that moved
     // is followed by the other. Personal switching is followed by the
@@ -1865,6 +1900,30 @@ fn mirror_into_folder(
     };
     let vm_ref = format!("{VM_BRANCH_NAMESPACE}{branch}");
     let Some(tip) = git.read_ref(&vm_ref)? else {
+        // Personal's branch has no commit yet. With the folder on it with
+        // none either, the two working copies are mirrored as they are;
+        // otherwise the folder's first commit is on its way there
+        // (`sync_primary_peer_with`), and until it lands this says why
+        // nothing moves, where it once said nothing at all.
+        let here = git.unborn_branch();
+        if here.as_deref() != Some(branch) {
+            let here = here
+                .map(|other| format!("{other}, with no commit yet either"))
+                .or_else(|| git.checked_out().map(|head| head.describe()))
+                .unwrap_or_else(|| "something else".into());
+            sync.note = Some(format!(
+                "Personal is on {branch}, with no commit yet, and this folder on {here}; the \
+                 two are mirrored once they are on one branch"
+            ));
+            return Ok(());
+        }
+        let Some(snapshot) = git.read_ref(&taste_git::snapshot_ref("primary"))? else {
+            return Ok(());
+        };
+        let outcome = git
+            .mirror_unborn_within(branch, snapshot, resolve, &checkout, &room)
+            .context("mirroring the checkout into this folder")?;
+        settle_mirror(outcome, Some(branch), sync);
         return Ok(());
     };
     // The mirror moves the folder's copy of the branch to the checkout's
@@ -2161,6 +2220,20 @@ superseded() {
     [ "$found" = 1 ] || exit 1
   done
 }
+# The checkout's branch with no commit yet: the folder's first arrives
+# whole, as the folder takes Personal's (`adopt_first_commit`) — the index
+# set to it and each of its files the checkout lacks written, and none it
+# has overwritten, so a version of the checkout's own shows as a change.
+# Moving the branch alone would read every file the commit has and the
+# checkout lacks as one the checkout deleted.
+if ! git rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+  git update-ref "refs/heads/$branch" "$staging" ""
+  if [ "$(git symbolic-ref -q HEAD)" = "refs/heads/$branch" ]; then
+    git reset -q
+    git ls-files -z --deleted | git checkout-index -q -z --stdin
+  fi
+  cleanup; exit 0
+fi
 if [ -n "$expected" ]; then
   # A rewrite is taken only from where the two last agreed: a checkout that
   # has moved since holds work of its own, and this would drop it.
@@ -3043,6 +3116,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// The folder's first commit, into a checkout whose branch has none:
+    /// the branch made there at it, each of its files the checkout lacks
+    /// written, a version of the checkout's own kept as a change, and an
+    /// untracked file of its own left alone — nothing read as deleted.
+    #[test]
+    fn a_first_commit_arrives_whole_where_the_branch_has_none() {
+        let dir = std::env::temp_dir().join(format!("taste-sync-unborn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        std::fs::create_dir_all(dir.join("checkout")).unwrap();
+        let pair = Pair { dir };
+        pair.git("folder", &["init", "-q", "-b", "main"]);
+        pair.git("checkout", &["init", "-q", "-b", "main"]);
+        pair.write("folder", "a.txt", "one\n");
+        pair.write("folder", "b.txt", "the folder's\n");
+        pair.git("folder", &["add", "-A"]);
+        pair.commit("folder", "first");
+        pair.write("checkout", "b.txt", "the checkout's\n");
+        pair.write("checkout", "mine.txt", "untracked\n");
+        assert_eq!(pair.sync(), 0);
+        assert_eq!(
+            pair.git("checkout", &["rev-parse", "main"]),
+            pair.git("folder", &["rev-parse", "main"])
+        );
+        assert_eq!(
+            std::fs::read_to_string(pair.dir.join("checkout/a.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pair.dir.join("checkout/b.txt")).unwrap(),
+            "the checkout's\n"
+        );
+        assert_eq!(
+            // Trimmed, as `Pair::git` gives it: " M b.txt" first.
+            pair.git("checkout", &["status", "--porcelain"]),
+            "M b.txt\n?? mine.txt"
+        );
     }
 
     #[test]

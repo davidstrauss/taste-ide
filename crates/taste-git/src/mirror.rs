@@ -367,7 +367,36 @@ impl GitWorkspace {
         if !git2::Reference::is_valid_name(&local) {
             bail!("{branch} is not a branch name");
         }
-        self.mirror_at(Some(&local), tip, snapshot, resolve, checkout, room)
+        self.mirror_at(Some(&local), Some(tip), snapshot, resolve, checkout, room)
+    }
+
+    /// [`Self::mirror_from_within`] for a branch with no commit yet on
+    /// either side: the checkout's HEAD on `branch` and unborn, and the
+    /// folder's too. Nothing is committed for either to stand on, so the
+    /// working copies are mirrored as they are, against an empty archive
+    /// the first time, and HEAD is left where it is; the first commit,
+    /// made on either side, is carried by the peer sync, and the passes
+    /// after it are [`Self::mirror_from_within`]'s.
+    ///
+    /// Without this, a project opened before its first commit synced
+    /// nothing either way, and said nothing (David, 2026-11-10: a PDF
+    /// dropped into a fresh `git init`'s folder never reached Personal).
+    pub fn mirror_unborn_within(
+        &self,
+        branch: &str,
+        snapshot: Oid,
+        resolve: Option<&Resolve>,
+        checkout: &dyn CheckoutWriter,
+        room: &dyn Fn(u64) -> Option<String>,
+    ) -> Result<Mirror> {
+        let local = format!("refs/heads/{branch}");
+        if !git2::Reference::is_valid_name(&local) {
+            bail!("{branch} is not a branch name");
+        }
+        if self.unborn_branch().as_deref() != Some(branch) {
+            bail!("this folder is not on {branch} with no commit yet");
+        }
+        self.mirror_at(Some(&local), None, snapshot, resolve, checkout, room)
     }
 
     /// [`Self::mirror_from_within`] for a checkout whose HEAD is detached
@@ -380,28 +409,33 @@ impl GitWorkspace {
         checkout: &dyn CheckoutWriter,
         room: &dyn Fn(u64) -> Option<String>,
     ) -> Result<Mirror> {
-        self.mirror_at(None, tip, snapshot, resolve, checkout, room)
+        self.mirror_at(None, Some(tip), snapshot, resolve, checkout, room)
     }
 
     /// The pass itself, onto the branch `local` names or — `None` — onto
     /// `tip` with no branch: the three working copies observed, every path
     /// decided (`crate::plan`), each write landed only where its side
     /// still holds what the pass observed, and the archive recorded per
-    /// path for what landed.
+    /// path for what landed. No `tip` is a branch with no commit yet on
+    /// either side ([`Self::mirror_unborn_within`]), which always names
+    /// one.
     fn mirror_at(
         &self,
         local: Option<&str>,
-        tip: Oid,
+        tip: Option<Oid>,
         snapshot: Oid,
         resolve: Option<&Resolve>,
         checkout: &dyn CheckoutWriter,
         room: &dyn Fn(u64) -> Option<String>,
     ) -> Result<Mirror> {
         let branch = local.map(|l| l.trim_start_matches("refs/heads/").to_string());
-        let tip_commit = self
-            .repo
-            .find_commit(tip)
-            .with_context(|| format!("finding the checkout's tip {tip}"))?;
+        let tip_commit = tip
+            .map(|tip| {
+                self.repo
+                    .find_commit(tip)
+                    .with_context(|| format!("finding the checkout's tip {tip}"))
+            })
+            .transpose()?;
         let snap = self
             .repo
             .find_commit(snapshot)
@@ -412,8 +446,17 @@ impl GitWorkspace {
         // A list of held paths an earlier version kept; nothing reads it.
         let _ = std::fs::remove_file(self.repo.path().join(RETIRED_HELD_FILE));
         let target = snap.tree()?;
-        let based_on_tip = snapshot_base(snap.message().unwrap_or("")) == Some(tip);
-        if !based_on_tip && target.id() != tip_commit.tree_id() {
+        let message = snap.message().unwrap_or("");
+        let current = match &tip_commit {
+            Some(tip_commit) => {
+                snapshot_base(message) == Some(tip_commit.id())
+                    || target.id() == tip_commit.tree_id()
+            }
+            // A snapshot taken before the checkout's first commit, and only
+            // one: after it, the snapshot names the commit.
+            None => message.trim() == crate::snapshot::UNBORN_SNAPSHOT,
+        };
+        if !current {
             return Ok(Mirror::Stale);
         }
         // The snapshot the last pass decided on, when that pass wrote into
@@ -574,8 +617,10 @@ impl GitWorkspace {
         // HEAD moved. An index the user staged in, at the tip already, is
         // theirs and stays.
         let on_branch = self.head_ref_name().as_deref() == local;
-        let at_tip = self.repo.head().ok().and_then(|h| h.target()) == Some(tip);
-        if !(on_branch && at_tip) {
+        let at_tip = self.repo.head().ok().and_then(|h| h.target()) == tip;
+        // With no tip there is nowhere to move to: the folder is on the
+        // branch already ([`Self::mirror_unborn_within`]), with no commit.
+        if let (Some(tip), Some(tip_commit), false) = (tip, &tip_commit, on_branch && at_tip) {
             match (local, branch.as_deref()) {
                 (Some(local), Some(branch)) => {
                     self.set_ref(local, tip)?;
@@ -715,7 +760,7 @@ impl GitWorkspace {
     /// `tip`, as [`Self::record_switch`] does for a branch.
     pub fn record_switch_detached(&self, tip: Oid) -> Result<()> {
         let tree = self.repo.find_commit(tip)?.tree_id();
-        self.record_at(tree, None, tip)
+        self.record_at(tree, None, Some(tip))
     }
 
     /// What the folder's HEAD names: its branch, or the commit it is
@@ -764,7 +809,7 @@ impl GitWorkspace {
 
     /// [`Self::record_mirror`] for either position: the branch `local`
     /// names, or — `None` — a HEAD detached at `tip`.
-    fn record_at(&self, tree: Oid, local: Option<&str>, tip: Oid) -> Result<()> {
+    fn record_at(&self, tree: Oid, local: Option<&str>, tip: Option<Oid>) -> Result<()> {
         self.record_observed(tree, local, tip, None)
     }
 
@@ -775,7 +820,7 @@ impl GitWorkspace {
         &self,
         tree: Oid,
         local: Option<&str>,
-        tip: Oid,
+        tip: Option<Oid>,
         observed: Option<(Oid, bool)>,
     ) -> Result<()> {
         let observed = observed
@@ -788,9 +833,10 @@ impl GitWorkspace {
                 format!("\n\n{RECORDED_SNAPSHOT}{snapshot}{wrote}")
             })
             .unwrap_or_default();
-        match local {
-            Some(local) => self.record_mirror(tree, local, &observed),
-            None => self.record_mirror_detached(tree, tip, &observed),
+        match (local, tip) {
+            (Some(local), _) => self.record_mirror(tree, local, &observed),
+            (None, Some(tip)) => self.record_mirror_detached(tree, tip, &observed),
+            (None, None) => bail!("a detached HEAD is always at a commit"),
         }
     }
 
@@ -2162,6 +2208,98 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(ws.read_ref(RETIRED_SENT_REF).unwrap(), None);
+    }
+
+    /// Before either side's first commit, the two working copies are
+    /// mirrored as they are: a file dropped into the folder goes to the
+    /// checkout and the checkout's comes here, HEAD stays on the branch with
+    /// no commit, and the checkout's first commit, once the folder has
+    /// taken it, leaves nothing to write.
+    #[test]
+    fn a_branch_with_no_commit_on_either_side_is_mirrored() {
+        let (dir, ws) = repo();
+        let branch = ws.unborn_branch().unwrap();
+        fs::write(dir.path().join("report.pdf"), "%PDF\n").unwrap();
+        let vm = tempfile::tempdir().unwrap();
+        let theirs = git2::Repository::init(vm.path()).unwrap();
+        theirs.set_head(&format!("refs/heads/{branch}")).unwrap();
+        let mut config = theirs.config().unwrap();
+        config.set_str("user.name", "Test").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+        drop(theirs);
+        let theirs = GitWorkspace::discover(vm.path()).unwrap();
+        fs::create_dir_all(vm.path().join(".devcontainer")).unwrap();
+        fs::write(vm.path().join(".devcontainer/devcontainer.json"), "{}\n").unwrap();
+        let fetch = |refspecs: &[&str]| {
+            let folder = git2::Repository::open(dir.path()).unwrap();
+            let mut remote = folder
+                .remote_anonymous(vm.path().to_str().unwrap())
+                .unwrap();
+            remote.fetch(refspecs, None, None).unwrap();
+        };
+        let snapshot = |theirs: &GitWorkspace| {
+            let snap = theirs
+                .snapshot_worktree("refs/taste/snapshot/primary")
+                .unwrap()
+                .commit;
+            fetch(&["+refs/taste/snapshot/*:refs/taste/snapshot/*"]);
+            snap
+        };
+        let snap = snapshot(&theirs);
+        let took = Took::default();
+        let pass = done(
+            ws.mirror_unborn_within(&branch, snap, None, &took, &|_| None)
+                .unwrap(),
+        );
+        assert_eq!((pass.sent, pass.received, pass.switched), (1, 1, false));
+        assert_eq!(
+            took.sent(),
+            vec![("report.pdf".into(), Some("%PDF\n".into()))]
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".devcontainer/devcontainer.json")).unwrap(),
+            "{}\n"
+        );
+        assert_eq!(ws.unborn_branch().as_deref(), Some(branch.as_str()));
+
+        // The checkout as it now is: the two agree, and nothing moves.
+        fs::write(vm.path().join("report.pdf"), "%PDF\n").unwrap();
+        let snap = snapshot(&theirs);
+        let took = Took::default();
+        assert_eq!(
+            done(
+                ws.mirror_unborn_within(&branch, snap, None, &took, &|_| None)
+                    .unwrap()
+            ),
+            Pass::default()
+        );
+
+        // A snapshot that names a commit is not of this branch-without-one.
+        theirs
+            .stage(Path::new(".devcontainer/devcontainer.json"))
+            .unwrap();
+        theirs.commit("first").unwrap();
+        let snap = snapshot(&theirs);
+        assert_eq!(
+            ws.mirror_unborn_within(&branch, snap, None, &Took::default(), &|_| None)
+                .unwrap(),
+            Mirror::Stale
+        );
+
+        // The first commit taken here, the passes after it are the usual
+        // ones, and find the two already agreeing.
+        fetch(&["+refs/heads/*:refs/taste/vm/*"]);
+        let tip = theirs.repo.head().unwrap().target().unwrap();
+        ws.adopt_first_commit(&branch, tip).unwrap();
+        let took = Took::default();
+        assert_eq!(
+            done(ws.mirror_from(&branch, tip, snap, None, &took).unwrap()),
+            Pass::default()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("report.pdf")).unwrap(),
+            "%PDF\n"
+        );
     }
 
     #[test]
