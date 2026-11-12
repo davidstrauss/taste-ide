@@ -1894,7 +1894,13 @@ it, and carries its actions.
   drop-down that lists them all"). A chat's remembered model is one agent's
   value: re-applied only if the session advertises it, and forgotten
   otherwise, so switching a tab to another agent runs that agent's default
-  instead of sending it a model id it has never heard of.
+  instead of sending it a model id it has never heard of. The agent's own
+  `/model`, typed in the chat, is a choice the same way: the model the
+  session reports after it is remembered as a pick from the drop-down is.
+  Kept only on the session, it lasted until the next respawn, which put
+  the old choice back (David, 2026-11-11). Only after the user's `/model`:
+  a switch the agent makes on its own, a fallback from a model that
+  refused, is the session's and not the chat's.
 
 ## ACP client (`taste-acp`)
 

@@ -1050,6 +1050,12 @@ pub struct ChatPane {
     /// the agent's default. Per chat, not per project: the tab owns its
     /// session settings.
     model_value: RefCell<Option<String>>,
+    /// The last prompt sent was the agent's own `/model`: the model the
+    /// session reports next is the user's choice, and is remembered as
+    /// one picked from the drop-down is ([`Self::adopt_model`]). Any other
+    /// prompt clears it, so a switch the agent makes on its own — a
+    /// fallback from a model that refused — is never taken for a choice.
+    model_command: Cell<bool>,
     /// This chat's permission mode (an ACP session mode id), or None for
     /// [`DEFAULT_PERMISSION_MODE`]. Re-applied to every session this chat
     /// connects, so the setting survives restarts and respawns.
@@ -1729,6 +1735,27 @@ impl ModelOutcome {
 /// precisely the case that has to be refused — `opus` and `fable` are both
 /// plausible-looking misses for a list holding `opus[1m]` and
 /// `claude-fable-5-1[1m]`.
+/// Whether `prompt` is the agent's `/model` command, which switches the
+/// session's model when given one.
+fn is_model_command(prompt: &str) -> bool {
+    prompt
+        .trim_start()
+        .strip_prefix("/model")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+/// The model a session's options say is running: the current value of its
+/// `model` select.
+fn reported_model(options: &[SessionConfigOption]) -> Option<String> {
+    options
+        .iter()
+        .find(|o| o.id.to_string().eq_ignore_ascii_case("model"))
+        .and_then(|o| match &o.kind {
+            SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
+            _ => None,
+        })
+}
+
 pub fn resolve_model(
     wanted: Option<&str>,
     advertised: &[(String, String)],
@@ -3691,6 +3718,7 @@ impl ChatPane {
             persisted_session: RefCell::new(None),
             pending_restore: RefCell::new(None),
             model_value: RefCell::new(None),
+            model_command: Cell::new(false),
             permission_mode: RefCell::new(None),
             config_values: RefCell::new(Default::default()),
             mode_config: RefCell::new(None),
@@ -7470,6 +7498,7 @@ impl ChatPane {
         written: Option<taste_core::queued::Queued>,
     ) -> anyhow::Result<()> {
         let mut records = prompt_records(prompt, &blocks);
+        self.model_command.set(is_model_command(prompt));
         *self.holding.borrow_mut() = Some(Holding {
             prompt: prompt.to_string(),
             records: Vec::new(),
@@ -11022,23 +11051,28 @@ impl ChatPane {
                 };
                 match result {
                     Ok(()) => {
-                        // Per-chat persistence: this choice survives
-                        // restarts and re-applies to this tab's future
-                        // sessions.
-                        pane.context_limit.set(context_limit_for(&value));
-                        *pane.model_value.borrow_mut() = Some(value.clone());
-                        // The user picked it off this session's own list, so
-                        // it is in force by construction — and it answers
-                        // whatever an earlier session refused.
-                        *pane.model_outcome.borrow_mut() = Some(ModelOutcome::InForce(value));
-                        pane.model_refused.borrow_mut().take();
+                        pane.adopt_model(value);
                         row.set_subtitle("");
-                        pane.notify_persist();
                     }
                     Err(e) => pane.meta_row(&format!("error: {e}")),
                 }
             });
         }
+    }
+
+    /// `value` is this chat's model from now on: in force on this session,
+    /// remembered across restarts and respawns, and re-applied to every
+    /// session the chat connects after. A pick from the drop-down, or the
+    /// session reporting the user's own `/model`
+    /// (`ConfigOptionUpdate`).
+    fn adopt_model(&self, value: String) {
+        self.context_limit.set(context_limit_for(&value));
+        *self.model_value.borrow_mut() = Some(value.clone());
+        // Off this session's own list, so in force by construction — and it
+        // answers whatever an earlier session refused.
+        *self.model_outcome.borrow_mut() = Some(ModelOutcome::InForce(value));
+        self.model_refused.borrow_mut().take();
+        self.notify_persist();
     }
 
     /// An expanded exclusive-choice group: every option visible, one click
@@ -11714,6 +11748,24 @@ impl ChatPane {
                     }
                 }
                 let modes = self.last_modes.borrow().clone();
+                // The user's `/model`, switching the session's model: the
+                // choice is this chat's from now on, as a pick from the
+                // drop-down is. Kept only on the session, it lasted until
+                // the next respawn, which put the remembered model, or the
+                // default, back (David, 2026-11-11: a chat switched to
+                // Mythos was on Opus again after a rebuild). The controls
+                // are drawn again for it, so the drop-down shows it and does
+                // not re-apply the old choice over it.
+                if self.model_command.get() && !self.on_custom_upstream() {
+                    if let Some(value) = reported_model(&update.config_options) {
+                        if self.model_value.borrow().as_deref() != Some(value.as_str()) {
+                            self.model_command.set(false);
+                            self.adopt_model(value);
+                            self.build_controls(modes, update.config_options);
+                            return;
+                        }
+                    }
+                }
                 let signature = Self::options_signature(&modes, &update.config_options);
                 if self.controls_signature.borrow().as_ref() == Some(&signature) {
                     // Value-only echo (usually our own change coming back):
@@ -18734,6 +18786,44 @@ mod tests {
             away_note(612_400, 108_300, false),
             "compacting while you were away did not finish"
         );
+    }
+
+    /// `/model` with a model, or alone, is the command; a word that only
+    /// starts the same, or the command quoted inside prose, is not.
+    #[test]
+    fn a_model_command_is_told_from_prose() {
+        assert!(is_model_command("/model claude-mythos-5-2[1m]"));
+        assert!(is_model_command("  /model opus"));
+        assert!(is_model_command("/model"));
+        assert!(!is_model_command("/models"));
+        assert!(!is_model_command("/compact"));
+        assert!(!is_model_command("switch with /model opus"));
+    }
+
+    /// The model a session's options report: its `model` select's value,
+    /// and nothing for options without one.
+    #[test]
+    fn the_running_model_is_read_from_the_options() {
+        use agent_client_protocol::schema::v1::{SessionConfigOption, SessionConfigSelectOption};
+        let choice =
+            |value: &str, name: &str| SessionConfigSelectOption::new(value.to_string(), name);
+        let options = vec![
+            SessionConfigOption::boolean("fast", "Fast mode", false),
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "claude-mythos-5-2[1m]",
+                vec![
+                    choice("default", "Default (recommended)"),
+                    choice("claude-mythos-5-2[1m]", "claude-mythos-5-2[1m]"),
+                ],
+            ),
+        ];
+        assert_eq!(
+            reported_model(&options).as_deref(),
+            Some("claude-mythos-5-2[1m]")
+        );
+        assert_eq!(reported_model(&options[..1]), None);
     }
 
     #[test]
