@@ -99,6 +99,12 @@ struct EditorPage {
     /// cleanliness — the user may have typed since) is what tells an echo
     /// from a real external change.
     saved_hash: Cell<Option<u64>>,
+    /// How many times this page has been saved. A read of the disk that a
+    /// save overtook is of the file as it was before that save, and judged
+    /// against the new [`Self::saved_hash`] it reads as somebody else's
+    /// change: the page reloaded its own older text, and the next save
+    /// wrote that over the file (`Editor::on_file_changed`).
+    saves: Cell<u64>,
     /// A warning icon (conflict, failed save) occupies the tab's indicator
     /// slot, which the git dirty-dot also uses; this flag keeps the two
     /// from clobbering each other.
@@ -4217,6 +4223,7 @@ impl Editor {
             html: RefCell::new(None),
             conflict_bar,
             saved_hash: Cell::new(None),
+            saves: Cell::new(0),
             warned: Cell::new(false),
             scroller: scroller.clone(),
             foreign_env: owner.as_ref().map(|(env, _, _)| env.clone()),
@@ -5059,7 +5066,12 @@ impl Editor {
             });
             return;
         }
-        let Some(files) = self.pages.borrow().get(path).map(|page| page.files.clone()) else {
+        let Some((files, saves)) = self
+            .pages
+            .borrow()
+            .get(path)
+            .map(|page| (page.files.clone(), page.saves.get()))
+        else {
             return;
         };
         let weak = Rc::downgrade(self);
@@ -5075,6 +5087,20 @@ impl Editor {
             let Some(page) = editor.pages.borrow().get(&path).cloned() else {
                 return; // closed meanwhile
             };
+            // Saved while this read was out: what it read may be the file
+            // from before that save, and it says nothing about the file
+            // now. It is read again. Judged as it stood, it read as a
+            // change from outside, the page reloaded its own older text,
+            // and the next save — an agent's edit to the same file, a
+            // second later — wrote that over the edit between. An agent
+            // editing a document open in a tab, a few edits a second, each
+            // reported as made, found three of them gone the next day
+            // (David, 2026-11-11: "What kind of lost edits? I haven't made
+            // any changes").
+            if page.saves.get() != saves {
+                editor.on_file_changed(&path);
+                return;
+            }
             if page.saved_hash.get() == Some(content_hash(&raw)) {
                 // Our own last save echoing back — or an external write that
                 // restored exactly those bytes. Either way disk equals the
@@ -5237,6 +5263,7 @@ impl Editor {
             Ok(hash) => {
                 page.buffer.set_modified(false);
                 page.saved_hash.set(Some(hash));
+                page.saves.set(page.saves.get() + 1);
                 // Saving resolves a disk conflict in your favor.
                 page.conflict_bar.set_revealed(false);
                 if page.warned.replace(false) {
