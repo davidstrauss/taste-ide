@@ -996,7 +996,7 @@ async fn the_listing_is_read_on_the_first_turn_that_goes_through() {
     // the upstream is never reached.
     let placeholder = handle.issue_placeholder("primary");
     let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(handle.models(), None);
     assert_eq!(upstream.hits(), 0);
@@ -1100,7 +1100,7 @@ async fn an_unprovisioned_project_is_told_once_in_its_chat() {
     let placeholder = handle.issue_placeholder("i-0042");
     for _ in 0..3 {
         let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
     {
         let said = said.lock().unwrap();
@@ -1134,7 +1134,7 @@ async fn a_credential_that_cannot_be_read_fails_the_request_not_the_proxy() {
     let placeholder = handle.issue_placeholder("primary");
 
     let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(upstream.hits(), 0);
 
     // The proxy is still serving: a later request with a working
@@ -1405,7 +1405,7 @@ async fn two_projects_resolve_two_credentials_and_neither_lends_to_the_other() {
     let unprovisioned = proxy_for(fresh);
     let placeholder = unprovisioned.issue_placeholder("primary");
     let response = get(&unprovisioned, "/v1/messages", Some(&placeholder)).await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(upstream.hits(), forwarded, "nothing was forwarded");
     assert_eq!(unprovisioned.credential_label(), None);
 

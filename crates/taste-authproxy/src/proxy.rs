@@ -1349,9 +1349,16 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
                             .to_string(),
                     );
                 }
+                // A 401, the API's own answer to a request with no key, and
+                // not a 502: the agent retries a server error, ten times
+                // with backoff, and none of the ways this fails — no file,
+                // one that cannot be read, an empty or expired token — is
+                // one a retry outlasts. A 401 it does not retry; it asks for
+                // a sign-in, which here is the chat's own Sign In, and that
+                // provisions this project's credential.
                 return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
                     &format!("taste-ide auth proxy has no usable credential: {e}"),
                 );
             }
