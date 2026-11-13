@@ -1994,8 +1994,10 @@ impl FileTree {
         logs_body.append(&logs_results.widget);
         let ports_results = crate::results::ResultsPanel::new();
         ports_results.widget.set_widget_name("ports-results");
-        let (ports_section, ports_list, ports_body) =
-            section(crate::portview::PORT_ICON, "Ports + Their Tasks");
+        let (ports_section, ports_list, ports_body) = section(
+            crate::portview::PORT_ICON,
+            "Ports + Associated Task Control",
+        );
         // A ghost row like the other panels' (David, 2026-09-08: "For
         // ports … show a 'ghost row' just like for other panels. Except,
         // have a port with a slash through it as the icon"; then: "To add
