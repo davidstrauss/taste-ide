@@ -2553,10 +2553,16 @@ impl Supervisor {
         resolved
     }
 
-    /// Remember why the project's config was passed over, and say so once
-    /// per distinct reason: in the log, and as a toast, since the row's
-    /// state does not otherwise move — the baseline was running and the
-    /// baseline still is.
+    /// Remember why the project's config was passed over, and log it once
+    /// per distinct reason. Not a toast: the environment's row says
+    /// "devcontainer.json passed over" with the reason, and its startup
+    /// page does when it is in front, which is the one place a rebuild's
+    /// outcome is told (CLAUDE.md → "Configuration authority"). A toast
+    /// fired at every build that failed while an agent worked through its
+    /// config — three in a quarter of an hour, each fixed within the
+    /// minute, so the user saw a warning with nothing wrong (David,
+    /// 2026-11-12: "Why did I just get a 'devcontainer was passed over'
+    /// toast when everything looks fine?").
     fn note_passed_over(&self, reason: Option<String>) {
         let changed = {
             let mut slot = self.passed_over.lock().unwrap();
@@ -2568,15 +2574,9 @@ impl Supervisor {
             return;
         }
         match reason {
-            Some(reason) => {
-                self.log(format!(
-                    "the project's configuration was passed over: {reason}"
-                ));
-                self.events.publish(Event::Toast(format!(
-                    "{}: devcontainer.json was passed over, so safe mode stays — {reason}",
-                    self.env.id
-                )));
-            }
+            Some(reason) => self.log(format!(
+                "the project's configuration was passed over: {reason}"
+            )),
             None => self.log("the project's configuration is in force".to_string()),
         }
     }
