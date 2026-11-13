@@ -46,6 +46,10 @@ pub struct TaskInfo {
     /// as the Taskfile reader found it (`taste-taskfile`): `None` until
     /// read, or when it could not be.
     pub requires: Option<Vec<Required>>,
+    /// The port it serves, which makes it the service of that forwarded
+    /// port: its own `env`'s literal `PORT`, as the Taskfile reader found
+    /// it (`taste-taskfile`). `None` when it sets none, or until read.
+    pub port: Option<u16>,
 }
 
 impl TaskInfo {
@@ -56,6 +60,7 @@ impl TaskInfo {
             desc: desc.into(),
             location: None,
             requires: None,
+            port: None,
         }
     }
 

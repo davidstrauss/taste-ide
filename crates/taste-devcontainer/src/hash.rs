@@ -64,9 +64,10 @@ pub fn build_hash(config: &DevcontainerConfig) -> Result<String> {
 }
 
 /// The config file, less what is this IDE's alone: its
-/// `customizations.taste-ide` block says which tasks are services
-/// (`crate::config::ServiceSpec`) and changes nothing the container is
-/// built or run from, so editing it must not make the container stale. A
+/// `customizations.taste-ide` block changes nothing the container is built
+/// or run from (it once said which tasks were services, which the
+/// Taskfile now says itself), so editing or removing it must not make the
+/// container stale. A
 /// config without the block hashes as its bytes, as it always has, so no
 /// existing image's tag moves; one with it hashes as its JSON without it.
 fn hash_config(hasher: &mut Sha256, name: &Path, path: &Path) {
@@ -112,7 +113,7 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The IDE's own block — which tasks are services — rebuilds nothing:
+    /// The IDE's own block rebuilds nothing:
     /// adding it, or changing it, leaves the hash where the rest of the
     /// config puts it; changing anything else still moves it.
     #[test]

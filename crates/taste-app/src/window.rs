@@ -2408,14 +2408,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     .get(&env)
                     .map(|supervisor| supervisor.ports())
                     .unwrap_or_default();
-                // The project's services, read again each tick: editing
-                // them rebuilds nothing, so nothing else announces it.
-                filetree.set_services(
-                    environments
-                        .get(&env)
-                        .map(|supervisor| supervisor.services())
-                        .unwrap_or_default(),
-                );
                 filetree.set_ports(port_rows(&specs, &env, &port_facts.borrow()));
                 filetree.set_port_traffic(&environments.port_traffic(&env));
                 let tick = ticks.get().wrapping_add(1);
@@ -6580,17 +6572,19 @@ fn forwarded_list(specs: &[taste_devcontainer::config::PortSpec]) -> String {
 }
 
 /// For a connection to `port` (the container's) in `env`: start the
-/// service its config links to that port, as the port row's play starts
-/// it, when the service is not running and nothing in the container
-/// serves the port — and hold the connection until something does, up to
-/// a minute, so the page that asked loads rather than failing. Nothing
-/// when no service is linked, or when the port is served already, by the
-/// service or by a server started by hand; a port found served is not
-/// asked about again for ten seconds, since a browser opens connections by
-/// the dozen and each look is an exec into the container. One connection
-/// at a time does the starting: the others wait for it and then find the
-/// port served (David, 2026-10-24: "auto-start the service if it's linked
-/// to the port").
+/// task that serves that port (its own `env`'s `PORT`, `TaskInfo::port`),
+/// as the port row's play starts it, when the task is not running and
+/// nothing in the container serves the port — and hold the connection
+/// until something does, up to a minute, so the page that asked loads
+/// rather than failing. Nothing when no task serves the port, or when the
+/// port is served already, by the task or by a server started by hand. A
+/// port found served, or found to have no task, is not asked about again
+/// for ten seconds, since a browser opens connections by the dozen and
+/// each look is an exec into the container — and the tasks are listed
+/// only once the port is found unserved, since that is a listing and a
+/// read of the Taskfiles. One connection at a time does the starting: the
+/// others wait for it and then find the port served (David, 2026-10-24:
+/// "auto-start the service if it's linked to the port").
 async fn activate_service(
     environments: std::sync::Arc<EnvironmentRegistry>,
     task_runs: taste_core::tasks::TaskBoard,
@@ -6617,14 +6611,6 @@ async fn activate_service(
         return;
     }
     let Some(supervisor) = environments.get(&env) else {
-        return;
-    };
-    let Some(task) = supervisor
-        .services()
-        .into_iter()
-        .find(|(_, service)| service.port == Some(port))
-        .map(|(name, _)| name)
-    else {
         return;
     };
     let gate = GATES
@@ -6656,6 +6642,37 @@ async fn activate_service(
         None => return,
         Some(false) => {}
     }
+    let listed = {
+        let exec = exec.clone();
+        let files = supervisor.files();
+        let root = supervisor.checkout().path().to_path_buf();
+        runtime()
+            .spawn_blocking(move || {
+                let mut listing = crate::tasks::list(&exec, &files, &root);
+                crate::taskfile::annotate(
+                    &mut listing,
+                    &files,
+                    &root,
+                    exec.container_workdir().as_deref(),
+                );
+                listing
+            })
+            .await
+    };
+    let task = match listed {
+        Ok(crate::tasks::Listing::Tasks { tasks, .. }) => tasks
+            .into_iter()
+            .find(|task| task.port == Some(port))
+            .map(|task| task.name),
+        _ => None,
+    };
+    let Some(task) = task else {
+        served
+            .lock()
+            .unwrap()
+            .insert(key, std::time::Instant::now());
+        return;
+    };
     if task_runs.state(&env, &task) != crate::tasks::RunState::Running {
         let wrapper = supervisor
             .channel_paths()

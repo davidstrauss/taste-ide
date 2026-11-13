@@ -839,7 +839,7 @@ pub(crate) fn author_prompt() -> String {
      and add the notebook kernel's task to the Taskfile. ",
     );
     text.push_str(&taste_core::kernel_task::convention());
-    text.push_str("\nIf the project runs servers, workers, or watchers as tasks: ");
+    text.push_str("\nIf the project runs servers as tasks: ");
     text.push_str(taste_core::conventions::SERVICES);
     text.push_str("\nIf the project keeps data — a database, uploads, a cache worth keeping: ");
     text.push_str(taste_core::conventions::STATE);

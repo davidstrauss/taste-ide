@@ -45,16 +45,17 @@ fn confined_it_answers() {
         "root": "/w/Taskfile.yml",
         "files": {
             "/w/Taskfile.yml":
-                "version: '3'\ntasks:\n  fmt:\n    requires:\n      vars:\n        - FILE\n",
+                "version: '3'\ntasks:\n  fmt:\n    env: {PORT: 3000}\n    requires:\n      vars:\n        - FILE\n",
         },
         "tasks": [{"name": "fmt", "taskfile": "/w/Taskfile.yml", "line": 3, "column": 3}],
     });
     let reply = ask(request.to_string().as_bytes());
     assert_eq!(
-        reply["tasks"]["fmt"]["vars"][0],
+        reply["tasks"]["fmt"]["read"]["vars"][0],
         serde_json::json!({"name": "FILE", "allowed": "any"}),
         "{reply}"
     );
+    assert_eq!(reply["tasks"]["fmt"]["read"]["port"], 3000, "{reply}");
     let reply = ask(b"not json");
     assert!(
         reply["error"].as_str().unwrap().contains("bad request"),

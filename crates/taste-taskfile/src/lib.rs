@@ -1,16 +1,30 @@
-//! What each task of a Taskfile asks to be given: the variables its
+//! What each task of a Taskfile says beyond its name: the variables its
 //! `requires` names that nothing else gives a value, and the values each
 //! may take — for the Tasks section's play, which asks for them, and the
 //! file tree's menus, which offer a task that takes `FILE` on a file, one
-//! that takes `DIR` on a folder, and one that takes `FILE_OR_DIR` on both.
+//! that takes `DIR` on a folder, and one that takes `FILE_OR_DIR` on both
+//! — and the port it serves, which pairs it with that forwarded port.
 //!
 //! **Read from the Taskfile, held to Task.** `task --list-all --json`
 //! names every task, the file it is in, and where, but says nothing of
-//! `requires`. The Taskfile is a documented format with a published
-//! schema, so it is read here directly (CLAUDE.md → intended interfaces);
-//! what the reading must agree with is Task's own behavior, and
-//! `tests/against_task.rs` runs the pinned Task (`--dry`) on the same
-//! fixtures and compares, variable by variable.
+//! `requires` or `env`. The Taskfile is a documented format with a
+//! published schema, so it is read here directly (CLAUDE.md → intended
+//! interfaces); what the reading must agree with is Task's own behavior,
+//! and `tests/against_task.rs` runs the pinned Task on the same fixtures
+//! and compares: `--dry`, variable by variable, and each task said to
+//! serve a port, run, for the `PORT` its commands are given.
+//!
+//! **A task's port is its own `env`'s `PORT`**, a literal number: the
+//! twelve-factor convention, which Rails, most Node frameworks, and many
+//! Python servers read themselves, so the pairing is the setting the
+//! server runs with rather than a note beside it that can drift from it,
+//! and any tool that reads the Taskfile reads it the same way — VS Code's
+//! as well as this IDE's (David, 2026-11-13, of the
+//! `customizations.taste-ide.services` block it replaces: "encode the
+//! port:task mapping without having it be custom data specific to Taste
+//! IDE"). A `PORT` the Taskfile's own `env` gives every task is not one:
+//! it would make every task a server. A template or a `sh:` is not one
+//! either, since only Task knows its value.
 //!
 //! **What counts as given**, as Task counts it: a value from the task's own
 //! `vars`, from its Taskfile's `vars`, from the `vars` of every include on
@@ -93,12 +107,21 @@ pub struct Required {
     pub allowed: Allowed,
 }
 
+/// What was read of one task.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Task {
+    /// The variables it needs given; empty when it needs none.
+    pub vars: Vec<Required>,
+    /// The port it serves: its own `env`'s literal `PORT`.
+    pub port: Option<u16>,
+}
+
 /// What was found for one task.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Found {
-    /// The variables it needs given; empty when it needs none.
-    Vars(Vec<Required>),
+    /// What it says.
+    Read(Task),
     /// Why it could not be read.
     Unknown(String),
 }
@@ -315,7 +338,22 @@ fn find(
             vars.push(Required { name, allowed });
         }
     }
-    Found::Vars(vars)
+    Found::Read(Task {
+        vars,
+        port: port(task),
+    })
+}
+
+/// The port a task serves: its own `env`'s `PORT`, when that is a number
+/// from 1 to 65535, written as one or as a string of one.
+fn port(task: &Value) -> Option<u16> {
+    let value = task.get("env")?.get("PORT")?;
+    let number = match value {
+        Value::Number(n) => n.as_u64()?,
+        Value::String(s) => s.trim().parse().ok()?,
+        _ => return None,
+    };
+    u16::try_from(number).ok().filter(|port| *port > 0)
 }
 
 /// Whether `at` — a line from a key's column on — starts with `key`, bare
@@ -388,16 +426,19 @@ mod tests {
         );
         assert_eq!(
             found["fmt"],
-            Found::Vars(vec![
-                Required {
-                    name: "FILE".into(),
-                    allowed: Allowed::Any
-                },
-                Required {
-                    name: "MODE".into(),
-                    allowed: Allowed::OneOf(vec!["check".into(), "write".into()])
-                },
-            ])
+            Found::Read(Task {
+                vars: vec![
+                    Required {
+                        name: "FILE".into(),
+                        allowed: Allowed::Any
+                    },
+                    Required {
+                        name: "MODE".into(),
+                        allowed: Allowed::OneOf(vec!["check".into(), "write".into()])
+                    },
+                ],
+                port: None,
+            })
         );
     }
 
@@ -418,10 +459,13 @@ mod tests {
         );
         assert_eq!(
             found["rs:fmt"],
-            Found::Vars(vec![Required {
-                name: "FILE".into(),
-                allowed: Allowed::Any
-            }])
+            Found::Read(Task {
+                vars: vec![Required {
+                    name: "FILE".into(),
+                    allowed: Allowed::Any
+                }],
+                port: None,
+            })
         );
     }
 
@@ -432,6 +476,36 @@ mod tests {
             &[("rs:fmt", "/w/sub/Taskfile.yml", 3)],
         );
         assert!(matches!(found["rs:fmt"], Found::Unknown(_)));
+    }
+
+    /// A task's port is its own `env`'s `PORT`, a number or a string of
+    /// one; the file's `env`, a template, a `sh:`, and a number no port
+    /// can be are not one.
+    #[test]
+    fn a_task_serves_the_port_its_own_env_gives() {
+        let text = "version: '3'\nenv:\n  PORT: 9999\ntasks:\n  \
+                    a:\n    env: {PORT: 3000}\n  \
+                    b:\n    env: {PORT: '8808'}\n  \
+                    c:\n    cmds: [true]\n  \
+                    d:\n    env: {PORT: '{{.P}}'}\n  \
+                    e:\n    env: {PORT: {sh: echo 1}}\n  \
+                    f:\n    env: {PORT: 70000}\n  \
+                    g:\n    env: {PORT: 0}\n";
+        let names = ["a", "b", "c", "d", "e", "f", "g"];
+        let sites: Vec<(&str, &str, usize)> = names
+            .iter()
+            .map(|name| (*name, "/w/Taskfile.yml", 1))
+            .collect();
+        let found = ask(&[("/w/Taskfile.yml", text)], &sites);
+        let port = |name: &str| match &found[name] {
+            Found::Read(task) => task.port,
+            Found::Unknown(why) => panic!("{name}: {why}"),
+        };
+        assert_eq!(port("a"), Some(3000));
+        assert_eq!(port("b"), Some(8808));
+        for name in ["c", "d", "e", "f", "g"] {
+            assert_eq!(port(name), None, "{name}");
+        }
     }
 
     #[test]

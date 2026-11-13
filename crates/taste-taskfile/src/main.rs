@@ -1,5 +1,5 @@
-//! `taste-taskfile`: what a project's tasks require, read in a process of
-//! its own.
+//! `taste-taskfile`: what a project's tasks require, and the port each
+//! serves, read in a process of its own.
 //!
 //! A Taskfile is YAML a repository wrote, and the YAML parser is someone
 //! else's code, while the IDE's own process holds the user's home, the
@@ -15,8 +15,8 @@
 //! Protocol: one request on stdin, then its close —
 //! `{"root": …, "files": {path: text}, "tasks": [{"name", "taskfile",
 //! "line", "column"}]}` (`taste_taskfile::Request`) — and one line on
-//! stdout: `{"tasks": {name: {"vars": [{"name", "allowed"}]} | {"unknown":
-//! why}}}`, or `{"error": why}`.
+//! stdout: `{"tasks": {name: {"read": {"vars": [{"name", "allowed"}],
+//! "port": n | null}} | {"unknown": why}}}`, or `{"error": why}`.
 
 use std::io::{Read, Write};
 

@@ -6,12 +6,18 @@
 //! which way it went: 0 to run, 206 for a variable missing, 207 for a
 //! value not allowed. Only the status is read, never Task's wording.
 //!
+//! The ports are held to Task by running the tasks of `fixtures/ports`,
+//! each of which prints the `PORT` its commands are given: a task said to
+//! serve a port is given that port.
+//!
 //! Task is in the devcontainer image at `IDE_TASK_VERSION`
 //! (`.devcontainer/Containerfile`), so this runs wherever the gate does;
 //! `TASTE_TASK_BIN` names another.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use std::collections::BTreeMap;
 
 use taste_taskfile::{Allowed, Found, Request, Site};
 
@@ -73,6 +79,47 @@ fn the_task_is_the_pinned_one() {
     );
 }
 
+/// The tasks of the fixture copied to `dir`, as the pinned Task lists
+/// them, and the reader's answer for each, read as the IDE reads them: the
+/// files the listing names, and the root.
+fn listed_and_read(dir: &Path) -> (Vec<Site>, BTreeMap<String, Found>) {
+    let listed = task(dir, &["--list-all".into(), "--json".into()]);
+    assert!(
+        listed.status.success(),
+        "{}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let root = listed["location"].as_str().unwrap().to_string();
+    let sites: Vec<Site> = listed["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| Site {
+            name: task["name"].as_str().unwrap().into(),
+            taskfile: task["location"]["taskfile"].as_str().unwrap().into(),
+            line: task["location"]["line"].as_u64().unwrap() as usize,
+            column: task["location"]["column"].as_u64().unwrap() as usize,
+        })
+        .collect();
+    let mut files = BTreeMap::new();
+    for path in sites
+        .iter()
+        .map(|s| s.taskfile.clone())
+        .chain([root.clone()])
+    {
+        let text = std::fs::read_to_string(&path).unwrap();
+        files.insert(path, text);
+    }
+    let answers = taste_taskfile::answer(&Request {
+        root,
+        files,
+        tasks: sites.clone(),
+    });
+    (sites, answers)
+}
+
 #[test]
 fn every_fixture_reads_as_task_runs_it() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -83,41 +130,7 @@ fn every_fixture_reads_as_task_runs_it() {
         let fixture = fixture.unwrap().path();
         let dir = scratch.path().join(fixture.file_name().unwrap());
         copy_dir(&fixture, &dir);
-
-        let listed = task(&dir, &["--list-all".into(), "--json".into()]);
-        assert!(
-            listed.status.success(),
-            "{}: {}",
-            fixture.display(),
-            String::from_utf8_lossy(&listed.stderr)
-        );
-        let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
-        let root = listed["location"].as_str().unwrap().to_string();
-        let sites: Vec<Site> = listed["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|task| Site {
-                name: task["name"].as_str().unwrap().into(),
-                taskfile: task["location"]["taskfile"].as_str().unwrap().into(),
-                line: task["location"]["line"].as_u64().unwrap() as usize,
-                column: task["location"]["column"].as_u64().unwrap() as usize,
-            })
-            .collect();
-        let mut files = std::collections::BTreeMap::new();
-        for path in sites
-            .iter()
-            .map(|s| s.taskfile.clone())
-            .chain([root.clone()])
-        {
-            let text = std::fs::read_to_string(&path).unwrap();
-            files.insert(path, text);
-        }
-        let answers = taste_taskfile::answer(&Request {
-            root,
-            files,
-            tasks: sites.clone(),
-        });
+        let (sites, answers) = listed_and_read(&dir);
 
         for site in &sites {
             let name = format!(
@@ -126,7 +139,7 @@ fn every_fixture_reads_as_task_runs_it() {
                 site.name
             );
             let vars = match answers.get(&site.name) {
-                Some(Found::Vars(vars)) => vars,
+                Some(Found::Read(task)) => &task.vars,
                 Some(Found::Unknown(why)) => {
                     differ.push(format!("{name}: not read: {why}"));
                     continue;
@@ -190,4 +203,50 @@ fn every_fixture_reads_as_task_runs_it() {
         "the reader and Task differ:\n{}",
         differ.join("\n")
     );
+}
+
+/// Each task of `fixtures/ports` the reader says serves a port is given
+/// that `PORT` when Task runs it; and the reader says so of exactly the
+/// tasks whose own `env` sets one — not of a task the file's `env` reaches,
+/// nor of one whose `PORT` is a template.
+#[test]
+fn every_port_is_the_one_task_gives() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ports");
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = scratch.path().join("ports");
+    copy_dir(&fixture, &dir);
+    let (sites, answers) = listed_and_read(&dir);
+    let mut ports = BTreeMap::new();
+    for site in &sites {
+        match &answers[&site.name] {
+            Found::Read(read) => {
+                ports.insert(site.name.clone(), read.port);
+            }
+            Found::Unknown(why) => panic!("{}: not read: {why}", site.name),
+        }
+    }
+    assert_eq!(
+        ports,
+        BTreeMap::from([
+            ("build".to_string(), None),
+            ("docs".to_string(), Some(8808)),
+            ("server".to_string(), Some(3000)),
+            ("templated".to_string(), None),
+            ("web:serve".to_string(), Some(7000)),
+        ])
+    );
+    for (name, port) in &ports {
+        let Some(port) = port else { continue };
+        let out = task(&dir, &["--silent".into(), name.clone()]);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            port.to_string(),
+            "{name}: Task gives its commands another PORT"
+        );
+    }
 }

@@ -724,12 +724,11 @@ pub struct FileTree {
     tasks_note: gtk::Label,
     tasks_empty: gtk::Box,
     tasks_ghost_label: gtk::Label,
+    /// The tasks, why they cannot be run when they cannot, and whether
+    /// there is a Taskfile. A task that serves a port (`TaskInfo::port`)
+    /// is that port's service: its row says so, and its port's row runs
+    /// and stops it.
     tasks: RefCell<(Vec<TaskRow>, Option<String>, bool)>,
-    /// The aimed environment's services (`taste_devcontainer::config::
-    /// ServiceSpec`): which tasks run something long-lived, and the port
-    /// each serves — a service's row says so, and its port's row runs and
-    /// stops it.
-    services: RefCell<std::collections::BTreeMap<String, taste_devcontainer::config::ServiceSpec>>,
     task_in_front: RefCell<Option<String>>,
     /// The file whose tab is in front, when the tab in front is a file's:
     /// the one row the tree may light (`select_for_editor`).
@@ -2300,7 +2299,6 @@ impl FileTree {
             tasks_empty,
             tasks_ghost_label,
             tasks: RefCell::new((Vec::new(), None, false)),
-            services: RefCell::new(std::collections::BTreeMap::new()),
             task_in_front: RefCell::new(None),
             file_in_front: RefCell::new(None),
             task_hits: RefCell::new(HashMap::new()),
@@ -3818,7 +3816,13 @@ impl FileTree {
         *self.tasks.borrow_mut() = next;
         self.render_tasks();
         // A service's state is its port's button too.
-        if !self.services.borrow().is_empty() {
+        if self
+            .tasks
+            .borrow()
+            .0
+            .iter()
+            .any(|row| row.info.port.is_some())
+        {
             self.render_ports();
         }
     }
@@ -4083,14 +4087,7 @@ impl FileTree {
             .flatten();
         let desc = kernel_note.as_deref().unwrap_or(row.info.desc.as_str());
         // A service says it is one, and the port it serves.
-        let service =
-            self.services
-                .borrow()
-                .get(&row.info.name)
-                .map(|service| match service.port {
-                    Some(port) => format!("service on {port}"),
-                    None => "service".to_string(),
-                });
+        let service = row.info.port.map(|port| format!("service on {port}"));
         let desc = match (service, desc) {
             (Some(service), "") => service,
             (Some(service), desc) => format!("{service} · {desc}"),
@@ -4614,20 +4611,6 @@ impl FileTree {
     /// ports and what the window's probe knows about each. Rebuilt only
     /// when something changed, which on the once-a-second tick is almost
     /// never.
-    /// The aimed environment's services, as its config says them now;
-    /// redrawn when they moved.
-    pub fn set_services(
-        self: &Rc<Self>,
-        services: std::collections::BTreeMap<String, taste_devcontainer::config::ServiceSpec>,
-    ) {
-        if *self.services.borrow() == services {
-            return;
-        }
-        *self.services.borrow_mut() = services;
-        self.render_tasks();
-        self.render_ports();
-    }
-
     pub fn set_ports(self: &Rc<Self>, rows: Vec<PortRow>) {
         if *self.ports.borrow() == rows {
             return;
@@ -4687,10 +4670,11 @@ impl FileTree {
         let rows = self.ports.borrow();
         let mut total = 0usize;
         let any_service = rows.iter().any(|row| {
-            self.services
+            self.tasks
                 .borrow()
-                .values()
-                .any(|service| service.port == Some(row.spec.port))
+                .0
+                .iter()
+                .any(|task| task.info.port == Some(row.spec.port))
         });
         for row in rows.iter() {
             // The word is the short one: this row has an address after
@@ -4785,19 +4769,13 @@ impl FileTree {
     /// Run or stop the task that serves `port` — `None` when no service
     /// is paired with it, or the Taskfile has no such task.
     fn port_service_button(self: &Rc<Self>, port: u16) -> Option<gtk::Button> {
-        let name = self
-            .services
-            .borrow()
-            .iter()
-            .find(|(_, service)| service.port == Some(port))
-            .map(|(name, _)| name.clone())?;
-        let state = self
+        let (name, state) = self
             .tasks
             .borrow()
             .0
             .iter()
-            .find(|row| row.info.name == name)
-            .map(|row| row.state)?;
+            .find(|row| row.info.port == Some(port))
+            .map(|row| (row.info.name.clone(), row.state))?;
         let running = state == crate::tasks::RunState::Running;
         let runnable = self.tasks.borrow().1.is_none();
         let button = gtk::Button::builder()
@@ -5061,7 +5039,15 @@ impl FileTree {
                 on_ext("rustfmt", "Format a Rust file", "FILE_RS", RunState::Idle),
                 row("dev", "Build for dev", RunState::Idle),
                 row("dev:init", "Seed the dev database", RunState::Failed),
-                row("dev:serve", "Serve on :3000", RunState::Idle),
+                // The first port's service: its play button there, and
+                // "service on 3000" on its own row.
+                TaskRow {
+                    info: TaskInfo {
+                        port: Some(3000),
+                        ..TaskInfo::named("dev:serve", "Serve the app")
+                    },
+                    state: RunState::Idle,
+                },
                 row("db:migrate:up", "Apply migrations", RunState::Idle),
             ],
             None,
@@ -5098,12 +5084,6 @@ impl FileTree {
             }
             self.port_traffic_seed.borrow_mut().insert(3000, traffic);
         }
-        // The seeded `dev:serve` task serves the first port: its play
-        // button there, and "service on 3000" on its own row.
-        self.set_services(std::collections::BTreeMap::from([(
-            "dev:serve".to_string(),
-            taste_devcontainer::config::ServiceSpec { port: Some(3000) },
-        )]));
         self.set_ports(vec![
             PortRow {
                 spec: PortSpec {

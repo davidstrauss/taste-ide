@@ -1,0 +1,8 @@
+version: '3'
+
+tasks:
+  serve:
+    env:
+      PORT: 7000
+    cmds:
+      - echo "$PORT"

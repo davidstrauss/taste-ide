@@ -78,24 +78,31 @@ pub const VS_CODE: &str = "The config must also come up in VS Code and Codespace
      create a database, user, or file only when it is missing. They may use only what the \
      image installs.";
 
-/// Which tasks are services, for an agent: the `customizations.taste-ide`
-/// block in devcontainer.json that taste-devcontainer's `ServiceSpec`
-/// reads. A task runs something long-lived or does a job and exits, and
-/// Taskfile cannot say which.
-pub const SERVICES: &str = "A task that runs something long-lived — a server, a worker, a \
-     watcher, the notebooks' kernel — rather than doing a job and exiting is a service. Name \
-     each in .devcontainer/devcontainer.json under customizations.taste-ide.services, with the \
-     forwarded port it serves when it serves one:\n\n\
-     ```json\n\
-     \"customizations\": { \"taste-ide\": { \"services\": {\n\
-     \x20 \"dev\": { \"port\": 3000 },\n\
-     \x20 \"jupyter:kernel\": {}\n\
-     } } }\n\
+/// Which task serves which forwarded port, for an agent: the task's own
+/// `env`'s `PORT` in the Taskfile, which `taste-taskfile` reads. It is the
+/// setting the server runs with (the twelve-factor `PORT`), and a file any
+/// tool reads, VS Code's included — not a block of this IDE's own (David,
+/// 2026-11-13), which is why `customizations.taste-ide.services`, where it
+/// was said before, is no longer read.
+pub const SERVICES: &str = "A task that runs a server sets the port it serves as PORT in its \
+     own env in the Taskfile, and the server listens on that port (Rails, most Node \
+     frameworks, and many Python servers read PORT themselves; otherwise pass $PORT on the \
+     command line):\n\n\
+     ```yaml\n\
+     server:\n\
+     \x20 desc: Run the app\n\
+     \x20 env:\n\
+     \x20   PORT: 3000\n\
+     \x20 cmds:\n\
+     \x20   - bin/rails server -b 0.0.0.0\n\
      ```\n\n\
-     The user's Tasks section marks a service as one, and a forwarded port's row gets its \
-     service's play and stop. The key is each task's name as task_list gives it. Editing this \
-     block rebuilds nothing and is in force at once; any other edit to devcontainer.json still \
-     needs devcontainer_reload.";
+     Write the number itself, not a template, and on the task, not at the Taskfile's top \
+     level. That task is then the service of forwarded port 3000: the port's row in the \
+     user's Ports section starts and stops it, and a connection to the port starts it when \
+     nothing serves the port. The port goes in devcontainer.json's forwardPorts as well. A \
+     change to the Taskfile is in force at once and rebuilds nothing. The IDE no longer reads \
+     customizations.taste-ide.services in devcontainer.json: where you find that block, move \
+     each port into its task's env and delete the block.";
 
 /// Where data that must outlive a container goes, for an agent: a named
 /// volume, which taste-devcontainer gives each environment its own copy
@@ -310,13 +317,15 @@ mod tests {
         );
     }
 
+    /// The services text shows a task's own env giving PORT, which is
+    /// what the Taskfile reader reads, and says the old block is gone.
     #[test]
-    fn the_services_text_shows_the_block() {
-        assert!(SERVICES.contains("customizations.taste-ide.services"));
+    fn the_services_text_shows_the_port_on_the_task() {
         assert!(
-            SERVICES.contains("\n  \"dev\": { \"port\": 3000 },\n"),
+            SERVICES.contains("\n  env:\n    PORT: 3000\n"),
             "{SERVICES}"
         );
+        assert!(SERVICES.contains("no longer reads"));
     }
 
     #[test]

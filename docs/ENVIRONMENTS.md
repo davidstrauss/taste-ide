@@ -4683,8 +4683,11 @@ where a tunnel left by a killed IDE once held 8000 until a sweep killed
 it under the next one. **A connection to a port nothing serves starts
 its service**: before relaying, the app's hook
 (`taste_devcontainer::activation`, `window::activate_service`) looks for
-the task the config links to the port (`customizations.taste-ide.
-services`), and when it is not running and the container has no
+the task that serves the port — the task whose own `env` in the Taskfile
+sets `PORT` to it, the twelve-factor convention the server itself reads,
+which any tool can read where a block of this IDE's own in
+devcontainer.json could only be read here (`taste-taskfile`; David,
+2026-11-13) — and when it is not running and the container has no
 listener on the port, starts it as the row's play does and holds the
 connection until the server listens, up to a minute, so the page that
 asked loads (David, 2026-10-24). A tunnel is no longer restarted when a

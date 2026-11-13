@@ -1,7 +1,11 @@
-//! What each listed task asks to be given, read from the Taskfiles by the
-//! confined `taste-taskfile` helper: the Tasks section's play asks for it,
-//! and the file tree's menus offer a task that takes `FILE` on a file, one
-//! that takes `DIR` on a folder, and one that takes `FILE_OR_DIR` on both (`taste_core::tasks::FILE_VAR`).
+//! What each listed task asks to be given, and the port it serves, read
+//! from the Taskfiles by the confined `taste-taskfile` helper: the Tasks
+//! section's play asks for what it needs, the file tree's menus offer a
+//! task that takes `FILE` on a file, one that takes `DIR` on a folder, and
+//! one that takes `FILE_OR_DIR` on both (`taste_core::tasks::FILE_VAR`),
+//! and a task that serves a forwarded port is that port's service — its
+//! row's play and stop, and started when a connection finds the port
+//! unserved.
 //!
 //! **Read in the helper, never here.** A Taskfile is YAML a repository
 //! wrote, and the parser is someone else's code, so it runs in a process
@@ -15,8 +19,8 @@
 //! **`task` still says what the tasks are.** Only the files its listing
 //! names are read, and only the tasks it listed are asked about; the helper
 //! adds what `--json` leaves out. A helper that cannot start, or a reply
-//! that does not check out, leaves every task's `requires` unknown, and
-//! the play runs a task by name as it did before.
+//! that does not check out, leaves every task's `requires` and port
+//! unknown: the play runs a task by name, and no port has a service.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
@@ -41,11 +45,14 @@ const MAX_REPLY: u64 = 4 * 1024 * 1024;
 const MAX_VALUES: usize = 256;
 const MAX_VALUE: usize = 1024;
 
+/// What was read of one task: what it requires, and the port it serves.
+type TaskRead = (Vec<Required>, Option<u16>);
+
 /// The last request's answer, by the request's text: the listing comes
 /// again on many events, and the Taskfiles seldom change between them.
-static LAST: Mutex<Option<(String, BTreeMap<String, Option<Vec<Required>>>)>> = Mutex::new(None);
+static LAST: Mutex<Option<(String, BTreeMap<String, Option<TaskRead>>)>> = Mutex::new(None);
 
-/// Fill in each listed task's `requires`. `root` is the checkout as the
+/// Fill in each listed task's `requires` and port. `root` is the checkout as the
 /// files service has it, and `workdir` the same place in the container,
 /// where `task` named the files. Blocking: file reads and a process.
 pub fn annotate(listing: &mut Listing, files: &Files, root: &Path, workdir: Option<&str>) {
@@ -126,7 +133,9 @@ pub fn annotate(listing: &mut Listing, files: &Files, root: &Path, workdir: Opti
         }
     };
     for task in tasks.iter_mut() {
-        task.requires = answer.get(&task.name).cloned().flatten();
+        let read = answer.get(&task.name).cloned().flatten();
+        task.port = read.as_ref().and_then(|(_, port)| *port);
+        task.requires = read.map(|(vars, _)| vars);
     }
 }
 
@@ -191,7 +200,7 @@ fn ask(request: &str) -> Result<serde_json::Value, String> {
 fn checked(
     reply: &serde_json::Value,
     asked: &HashSet<&str>,
-) -> Result<BTreeMap<String, Option<Vec<Required>>>, String> {
+) -> Result<BTreeMap<String, Option<TaskRead>>, String> {
     if let Some(why) = reply.get("error").and_then(serde_json::Value::as_str) {
         return Err(why.to_string());
     }
@@ -204,15 +213,28 @@ fn checked(
         if !asked.contains(name.as_str()) {
             return Err(format!("the reply names {name}, which was not asked about"));
         }
-        let Some(vars) = found.get("vars").and_then(serde_json::Value::as_array) else {
+        let Some(read) = found.get("read") else {
             answer.insert(name.clone(), None);
             continue;
         };
+        let vars = read
+            .get("vars")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(format!("{name}'s variables are missing"))?;
         let mut required = Vec::new();
         for var in vars {
             required.push(checked_var(var).ok_or(format!("{name}'s variables do not check out"))?);
         }
-        answer.insert(name.clone(), Some(required));
+        let port = match read.get("port") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(port) => Some(
+                port.as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .filter(|port| *port > 0)
+                    .ok_or(format!("{name}'s port is not one"))?,
+            ),
+        };
+        answer.insert(name.clone(), Some((required, port)));
     }
     Ok(answer)
 }
@@ -260,15 +282,16 @@ mod tests {
     fn a_reply_is_believed_only_as_far_as_it_checks_out() {
         let asked: HashSet<&str> = ["fmt", "build"].into_iter().collect();
         let reply = serde_json::json!({"tasks": {
-            "fmt": {"vars": [
+            "fmt": {"read": {"vars": [
                 {"name": "FILE", "allowed": "any"},
                 {"name": "MODE", "allowed": {"one_of": ["check", "write"]}},
                 {"name": "LEVEL", "allowed": "unresolved"},
-            ]},
+            ], "port": 3000}},
             "build": {"unknown": "not read"},
         }});
         let answer = checked(&reply, &asked).unwrap();
-        let fmt = answer["fmt"].as_ref().unwrap();
+        let (fmt, port) = answer["fmt"].as_ref().unwrap();
+        assert_eq!(*port, Some(3000));
         assert_eq!(fmt[0].allowed, Allowed::Any);
         assert_eq!(
             fmt[1].allowed,
@@ -277,12 +300,21 @@ mod tests {
         assert_eq!(fmt[2].allowed, Allowed::Unresolved);
         assert_eq!(answer["build"], None);
 
-        let stranger = serde_json::json!({"tasks": {"rm": {"vars": []}}});
+        let stranger = serde_json::json!({"tasks": {"rm": {"read": {"vars": []}}}});
         assert!(checked(&stranger, &asked).is_err());
-        let bad_name = serde_json::json!({"tasks": {"fmt": {"vars": [
+        let bad_name = serde_json::json!({"tasks": {"fmt": {"read": {"vars": [
             {"name": "A B", "allowed": "any"}
-        ]}}});
+        ]}}}});
         assert!(checked(&bad_name, &asked).is_err());
+        for port in [
+            serde_json::json!(70000),
+            serde_json::json!(0),
+            serde_json::json!("80"),
+        ] {
+            let bad_port =
+                serde_json::json!({"tasks": {"fmt": {"read": {"vars": [], "port": port}}}});
+            assert!(checked(&bad_port, &asked).is_err(), "{port}");
+        }
         let said = serde_json::json!({"error": "bad request"});
         assert_eq!(checked(&said, &asked).unwrap_err(), "bad request");
     }

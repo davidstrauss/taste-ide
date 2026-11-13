@@ -1,0 +1,37 @@
+# The port each task serves, as the reader reads it and Task gives it: a
+# task's own env's PORT, a number or a string of one. Every task prints the
+# PORT its commands are given, which is what against_task.rs compares.
+version: '3'
+
+env:
+  PORT: 9999
+
+includes:
+  web: ./web
+
+tasks:
+  server:
+    env:
+      PORT: 3000
+    cmds:
+      - echo "$PORT"
+
+  docs:
+    env:
+      PORT: '8808'
+    cmds:
+      - echo "$PORT"
+
+  # The file's PORT reaches it, and is not its own: no port.
+  build:
+    cmds:
+      - echo "$PORT"
+
+  # A template's value is Task's to work out: no port.
+  templated:
+    vars:
+      P: 5000
+    env:
+      PORT: '{{.P}}'
+    cmds:
+      - echo "$PORT"
