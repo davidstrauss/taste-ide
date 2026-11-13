@@ -106,18 +106,25 @@ pub fn mount_arg() -> String {
 /// the command `npx` would have run: the package's own bin, or its only
 /// one. Its npm cache is the scratch directory's, gone with it. One that
 /// does not arrive says so on stderr, as Task's does.
+///
+/// And Compose (`crate::compose::VERSION`, arguments ten to twelve), into
+/// `compose-v<version>/docker-compose`: not for containers, which never
+/// see it, but for the IDE, which brings a Compose environment up with it
+/// over ssh. One that does not arrive says so on stderr, as Task's does.
 const FETCH: &str = r#"set -eu
-dir="$1"; ver="$2"; tver="$5"; pkg="${8:-}"; key="${9:-}"
+dir="$1"; ver="$2"; tver="$5"; pkg="${8:-}"; key="${9:-}"; cver="${10:-}"
 mkdir -p "$dir"
 case "$(uname -m)" in
-  x86_64) arch=x64; sum="$3"; tarch=amd64; tsum="$6" ;;
-  aarch64) arch=arm64; sum="$4"; tarch=arm64; tsum="$7" ;;
+  x86_64) arch=x64; sum="$3"; tarch=amd64; tsum="$6"; carch=x86_64; csum="${11:-}" ;;
+  aarch64) arch=arm64; sum="$4"; tarch=arm64; tsum="$7"; carch=aarch64; csum="${12:-}" ;;
   *) echo "no node build for $(uname -m)" >&2; exit 3 ;;
 esac
 name="node-v$ver-linux-$arch"
 tname="task-v$tver-linux-$tarch"
+cname="compose-v$cver"
 if [ -x "$dir/$name/bin/node" ] && [ -x "$dir/$tname/task" ] &&
-  { [ -z "$key" ] || [ -x "$dir/agents/$key/run" ]; }; then echo "$name"; exit 0; fi
+  { [ -z "$key" ] || [ -x "$dir/agents/$key/run" ]; } &&
+  { [ -z "$cver" ] || [ -x "$dir/$cname/docker-compose" ]; }; then echo "$name"; exit 0; fi
 tmp=$(mktemp -d "$dir/.fetch.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 if [ ! -x "$dir/$name/bin/node" ]; then
@@ -134,6 +141,15 @@ if [ ! -x "$dir/$tname/task" ]; then
     tar -xzf "$tmp/task.tar.gz" -C "$tmp/$tname" task &&
     { mv "$tmp/$tname" "$dir/$tname" || [ -x "$dir/$tname/task" ]; } ||
     echo "task $tver was not deployed" >&2
+fi
+if [ -n "$cver" ] && [ ! -x "$dir/$cname/docker-compose" ]; then
+  mkdir -p "$tmp/$cname" &&
+    curl -fsSL --retry 3 -o "$tmp/$cname/docker-compose" \
+      "https://github.com/docker/compose/releases/download/v$cver/docker-compose-linux-$carch" &&
+    echo "$csum  $tmp/$cname/docker-compose" | sha256sum -c --quiet - &&
+    chmod +x "$tmp/$cname/docker-compose" &&
+    { mv "$tmp/$cname" "$dir/$cname" || [ -x "$dir/$cname/docker-compose" ]; } ||
+    echo "compose $cver was not deployed" >&2
 fi
 if [ -n "$key" ] && [ ! -x "$dir/agents/$key/run" ]; then
   mkdir -p "$dir/agents" "$tmp/agent" &&
@@ -173,6 +189,9 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Opt
         IDE_TASK_SHA256_ARM64,
         adapter,
         &key,
+        crate::compose::VERSION,
+        crate::compose::SHA256_X86_64,
+        crate::compose::SHA256_AARCH64,
     ] {
         if !token
             .chars()
@@ -196,6 +215,9 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Opt
             IDE_TASK_SHA256_ARM64.into(),
             adapter.into(),
             key,
+            crate::compose::VERSION.into(),
+            crate::compose::SHA256_X86_64.into(),
+            crate::compose::SHA256_AARCH64.into(),
         ],
     );
     let mut child = Command::new(program)
@@ -342,7 +364,16 @@ mod tests {
         let key = "pkg-1.0.0";
         let run = dir.path().join("agents").join(key);
         std::fs::create_dir_all(&run).unwrap();
-        for exe in [bin.join("node"), task_dir.join("task"), run.join("run")] {
+        let compose = dir
+            .path()
+            .join(format!("compose-v{}", crate::compose::VERSION));
+        std::fs::create_dir_all(&compose).unwrap();
+        for exe in [
+            bin.join("node"),
+            task_dir.join("task"),
+            run.join("run"),
+            compose.join("docker-compose"),
+        ] {
             std::fs::write(&exe, "#!/bin/sh\n").unwrap();
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -358,6 +389,9 @@ mod tests {
                 IDE_TASK_SHA256_ARM64,
                 "pkg@1.0.0",
                 key,
+                crate::compose::VERSION,
+                crate::compose::SHA256_X86_64,
+                crate::compose::SHA256_AARCH64,
             ])
             // No network in this test: a fetch would fail, which is the
             // point — none is made.

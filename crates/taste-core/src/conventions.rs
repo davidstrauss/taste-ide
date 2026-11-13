@@ -66,7 +66,10 @@ pub const STATE: &str = "Your environment's container is made again from its con
      packages are the same: put them in the image, a RUN line in .devcontainer/'s \
      Containerfile (the build runs as root), then devcontainer_reload. The container's own \
      user is usually not root, so dnf, apt and the like fail inside it, and ide_exec refuses \
-     them there; even as root, what they install goes with the container.";
+     them there; even as root, what they install goes with the container. In a Compose \
+     config (\"dockerComposeFile\"), a database or cache runs as its own service from its \
+     official image, and a named volume in the Compose file on that service keeps its data \
+     the same way.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Convention {

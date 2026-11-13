@@ -808,12 +808,29 @@ pub(crate) fn author_prompt() -> String {
      HOW TO WORK\n\
      1. Learn what the project needs with your file tools: its README, build files, \
      lockfiles, and CI configuration name the languages, tools, and versions.\n\
-     2. Write .devcontainer/Containerfile that installs them, and \
-     .devcontainer/devcontainer.json that builds it with \
-     \"build\": {\"dockerfile\": \"Containerfile\"}. Keep it usable by VS Code and \
+     2. Choose the shape, preferring images that already exist over building them.\n\
+     - If the stack has parts that official images already provide (a database such as \
+     postgres or mariadb, a cache such as redis or valkey, a queue, a search engine), use \
+     Docker Compose: write .devcontainer/compose.yaml with one service per part, each from \
+     its official image, and a service you work in, from the official image of the \
+     project's language (ruby, node, python, golang, and so on) or built FROM it when it \
+     needs more. In that service, mount the repository with \
+     `- ..:/workspaces/${localWorkspaceFolderBasename}` under volumes, and keep it running \
+     with `command: sleep infinity`. Write .devcontainer/devcontainer.json with \
+     \"dockerComposeFile\": \"compose.yaml\", \"service\": the service you work in, and \
+     \"workspaceFolder\": \"/workspaces/${localWorkspaceFolderBasename}\". Services reach \
+     each other by service name (host `db`, for example). Do not publish ports with \
+     `ports:`; list the ports to reach from the user's machine in devcontainer.json's \
+     \"forwardPorts\". The IDE refuses host networking, devices, added capabilities, \
+     external volumes and networks, and binds outside the checkout.\n\
+     - Otherwise, write .devcontainer/Containerfile FROM the official image closest to \
+     what the project needs, installing the rest, and .devcontainer/devcontainer.json that \
+     builds it with \"build\": {\"dockerfile\": \"Containerfile\"}.\n\
+     Either way, build nothing from source that an image or a package already provides. \
+     Keep the config usable by VS Code and \
      Codespaces, and no more: add no customizations.vscode (extensions, settings) or \
      anything else only an editor reads. This IDE does not apply devcontainer features: install tools in the \
-     Containerfile instead. Do not install Task (taskfile.dev): the IDE provides it in \
+     image instead. Do not install Task (taskfile.dev): the IDE provides it in \
      every container.\n\
      If the checkout has Jupyter notebooks (.ipynb files): install ipykernel, which brings \
      jupyter_client, into the Python the project uses, and the packages the notebooks import, \

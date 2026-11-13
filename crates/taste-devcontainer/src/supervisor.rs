@@ -629,6 +629,9 @@ pub struct Supervisor {
     /// has looked. An agent's commit there fails with "Author identity
     /// unknown", and the situation says so before it tries ([`Situation`]).
     authorless: Mutex<Option<bool>>,
+    /// The volumes the last Compose start made for this environment, by
+    /// their names here: its own, for [`Self::env_volumes`].
+    compose_volumes: Mutex<Vec<String>>,
     /// The project config whose image would not build or pull, by the
     /// hash of the whole setup, with podman's word for why. While the
     /// files on disk are the ones that failed, resolution passes them over
@@ -1075,6 +1078,7 @@ impl Supervisor {
             published_ports: Mutex::new(std::collections::HashMap::new()),
             passed_over: Mutex::new(None),
             authorless: Mutex::new(None),
+            compose_volumes: Mutex::new(Vec::new()),
             build_failed: Mutex::new(None),
             failed_build_log: Mutex::new(None),
             hook_failure: Mutex::new(None),
@@ -1852,6 +1856,26 @@ impl Supervisor {
             let dir = root.join(".devcontainer");
             if files.is_dir(&dir) {
                 mirror_tree(files, &dir, &mirror.join(".devcontainer"), 0)?;
+            }
+            // A Compose config's files, wherever in the checkout they are:
+            // `../docker-compose.yml` at the repository's root is common,
+            // and what is not copied here neither hashes nor validates.
+            if let Ok(Some(config)) = DevcontainerConfig::discover(&mirror) {
+                for file in config.compose_files() {
+                    let Ok(relative) = file.strip_prefix(&mirror) else {
+                        continue;
+                    };
+                    let copy = mirror.join(relative);
+                    if copy.exists() {
+                        continue;
+                    }
+                    if let Ok(bytes) = files.read(&root.join(relative)) {
+                        if let Some(parent) = copy.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&copy, bytes)?;
+                    }
+                }
             }
             Ok(())
         })
@@ -4663,255 +4687,265 @@ impl Supervisor {
             ])
             .await;
 
-        // Build or pull the image.
-        let image = if let Some(dockerfile) = config.dockerfile_path() {
-            let tag = self.image_tag(&config)?;
-            // Build from a STAGED copy, never from the live directory.
-            // Validation alone cannot hold here: the config scope is the
-            // one thing an agent may write in either mode, so a directory
-            // checked at parse can be a symlink by the time podman reads
-            // it. Staging closes that window by construction — walk it
-            // once, refuse symlinks on the way, build from bytes already
-            // ours.
-            let staged = stage_build_context(&config.build_context(), &name)?;
-            let staged_dockerfile = dockerfile
-                .file_name()
-                .map(|f| staged.join(f))
-                .unwrap_or_else(|| staged.join("Containerfile"));
-            // The argument list is `crate::image::build_args`, shared with
-            // the keeper's build of the baseline in a VM: the decisions in
-            // it — what a build is denied, the memory ceiling, the label —
-            // live in one place and this is not it.
-            let mut args = crate::image::build_args(
-                &config,
-                &tag,
-                &staged_dockerfile,
-                &staged,
-                &self.workspace_key(),
-            );
-            let reuse = self.reuse_image.swap(false, Ordering::SeqCst)
-                && self
-                    .run_captured(vec!["image".into(), "exists".into(), tag.clone()])
-                    .await
-                    .is_ok();
-            if reuse {
-                self.log(format!(
-                    "starting on {tag} as it stands: another environment rebuilt it with \
-                     updated packages today"
-                ));
-                args.clear();
-            } else if self.fresh_build.swap(false, Ordering::SeqCst) {
-                self.log("building from nothing: the base image pulled, no layer cached, so every package is current".to_string());
-                args.splice(1..1, ["--no-cache".to_string(), "--pull=newer".to_string()]);
-            }
-            let built = if args.is_empty() {
-                Ok(())
-            } else {
-                self.run_logged(args).await
-            };
-            built.inspect_err(|e| {
-                if authority == ConfigAuthority::Project {
-                    self.remember_build_failure(&config, e);
-                }
-                self.say_build_failed(e);
-            })?;
-            tag
+        // Any services an earlier start left beside the container: a
+        // Compose config's, or one's that is a single container now.
+        self.remove_services().await;
+        // The working folder, with the spec's variables in it said: a
+        // Compose config's is usually `/workspaces/${localWorkspaceFolderBasename}`.
+        let workdir = self.expand_workspace_vars(config.workspace_folder());
+        let container_id = if config.is_compose() && authority == ConfigAuthority::Project {
+            self.start_compose(&config, authority, &hash, &name).await?
         } else {
-            let image = config.image.clone().unwrap();
-            self.run_logged(vec!["pull".into(), image.clone()])
-                .await
-                .inspect_err(|e| {
+            // Build or pull the image.
+            let image = if let Some(dockerfile) = config.dockerfile_path() {
+                let tag = self.image_tag(&config)?;
+                // Build from a STAGED copy, never from the live directory.
+                // Validation alone cannot hold here: the config scope is the
+                // one thing an agent may write in either mode, so a directory
+                // checked at parse can be a symlink by the time podman reads
+                // it. Staging closes that window by construction — walk it
+                // once, refuse symlinks on the way, build from bytes already
+                // ours.
+                let staged = stage_build_context(&config.build_context(), &name)?;
+                let staged_dockerfile = dockerfile
+                    .file_name()
+                    .map(|f| staged.join(f))
+                    .unwrap_or_else(|| staged.join("Containerfile"));
+                // The argument list is `crate::image::build_args`, shared with
+                // the keeper's build of the baseline in a VM: the decisions in
+                // it — what a build is denied, the memory ceiling, the label —
+                // live in one place and this is not it.
+                let mut args = crate::image::build_args(
+                    &config,
+                    &tag,
+                    &staged_dockerfile,
+                    &staged,
+                    &self.workspace_key(),
+                );
+                let reuse = self.reuse_image.swap(false, Ordering::SeqCst)
+                    && self
+                        .run_captured(vec!["image".into(), "exists".into(), tag.clone()])
+                        .await
+                        .is_ok();
+                if reuse {
+                    self.log(format!(
+                        "starting on {tag} as it stands: another environment rebuilt it with \
+                         updated packages today"
+                    ));
+                    args.clear();
+                } else if self.fresh_build.swap(false, Ordering::SeqCst) {
+                    self.log("building from nothing: the base image pulled, no layer cached, so every package is current".to_string());
+                    args.splice(1..1, ["--no-cache".to_string(), "--pull=newer".to_string()]);
+                }
+                let built = if args.is_empty() {
+                    Ok(())
+                } else {
+                    self.run_logged(args).await
+                };
+                built.inspect_err(|e| {
                     if authority == ConfigAuthority::Project {
                         self.remember_build_failure(&config, e);
                     }
                     self.say_build_failed(e);
                 })?;
-            image
-        };
-
-        // Start the container.
-        self.set_state(SupervisorState::Starting);
-        let workdir = config.workspace_folder().to_string();
-        let mut args: Vec<String> = vec![
-            "run".into(),
-            "-d".into(),
-            "--name".into(),
-            name.clone(),
-            "--label".into(),
-            format!("{LABEL_CONFIG_HASH}={hash}"),
-            "--label".into(),
-            format!("{LABEL_AUTHORITY}={}", authority.label()),
-            "--workdir".into(),
-            workdir.clone(),
-        ];
-        args.extend(self.resource_labels());
-        // `${localWorkspaceFolder}` means THIS environment's checkout — the
-        // clone, for a non-primary environment. The whole config is
-        // evaluated against this environment's checkout, which is what
-        // makes one config serve N environments without a single
-        // conditional — and a checkout in a VM is bound at ITS path there,
-        // since the podman doing the binding is the VM's.
-        let local_workspace_folder = self.checkout().path().display().to_string();
-        // A repo's mount that asks for a private label (`Z`) is written for
-        // a host, where it keeps one environment's files from another
-        // container. In a VM the keeper is another container over the same
-        // files by design, and a private label locked it out: every `git`
-        // it ran in the checkout failed with EACCES the moment the
-        // project's container came up (2026-09-21). So the label is shared
-        // there, as `workspace_bind_flags` already makes the IDE's own.
-        let in_vm = !self.checkout().is_local();
-        let repo_mount = |mount: &str| -> String {
-            let expanded = mount.replace("${localWorkspaceFolder}", &local_workspace_folder);
-            if in_vm {
-                share_label_in_vm(&expanded)
+                tag
             } else {
-                expanded
-            }
-        };
-        match &config.workspace_mount {
-            Some(mount) => {
-                args.push("--mount".into());
-                args.push(self.namespaced_mount(&repo_mount(mount)));
-            }
-            None => {
-                args.push("-v".into());
-                args.push(format!(
-                    "{local_workspace_folder}:{workdir}:{}",
-                    workspace_bind_flags(authority, !self.checkout().is_local())
-                ));
-            }
-        }
-        for mount in &config.mounts {
-            if let Some(m) = mount.as_str() {
-                args.push("--mount".into());
-                args.push(self.namespaced_mount(&repo_mount(m)));
-            }
-        }
+                let image = config.image.clone().unwrap();
+                self.run_logged(vec!["pull".into(), image.clone()])
+                    .await
+                    .inspect_err(|e| {
+                        if authority == ConfigAuthority::Project {
+                            self.remember_build_failure(&config, e);
+                        }
+                        self.say_build_failed(e);
+                    })?;
+                image
+            };
 
-        // The bind source for the config the agent may write (`ide_mounts`):
-        // a bind needs one, and a project with no config has none yet.
-        if authority == ConfigAuthority::Baseline {
-            let config_dir = self.checkout().path().join(".devcontainer");
-            // On this host. A checkout in a VM has the directory made over
-            // there, by the files service, before the run.
-            if let Err(e) = self.make_dir_in_checkout(&config_dir) {
-                tracing::warn!(
-                    "could not make {} for the agent to write its config into: {e}",
-                    config_dir.display()
-                );
-            }
-        }
-        args.extend(self.ide_mounts(&config, authority));
-        for (k, v) in &config.container_env {
-            args.push("-e".into());
-            args.push(format!("{k}={v}"));
-        }
-        // forwardPorts: published on localhost only — services in the
-        // container become reachable from the host without exposing them
-        // to the network.
-        // A tunnel an earlier IDE left holds the ports it forwarded on this
-        // machine; gone first, or this container's land one above them.
-        if !self.checkout().is_local() {
-            let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
-            if keys.reap_orphan_tunnels() > 0 {
-                // A moment for the kernel to let the ports go.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
-        let taken = self.ports_taken_elsewhere().await;
-        let published = self.publish_ports(&config, &taken);
-        for (port, host) in &published {
-            args.push("-p".into());
-            args.push(format!("127.0.0.1:{host}:{port}"));
-        }
-        if !published.is_empty() {
-            args.push("--label".into());
-            args.push(format!("{LABEL_PORTS}={}", ports_label(&published)));
-        }
-        // The user namespace, when the config does not choose one. Rootless
-        // podman maps the host user to container ROOT by default, so a
-        // bind-mounted checkout shows as root's inside, and an image whose
-        // user is not root — this one's `agent`, uid 1000 — cannot write a
-        // byte of it: the agent reported ".devcontainer is mounted
-        // read-only" of a read-write mount (David, 2026-09-16: "Shouldn't
-        // this be writable?"). `keep-id` with that user's uid maps the host
-        // user onto it instead, which is what the baseline's own template
-        // has always passed. The uid is the image's word, asked of the
-        // image; a root user needs no mapping, and a config with its own
-        // `--userns` is left alone.
-        if let Some(flag) = self.userns_flag_for(&config, &image).await {
-            self.log(format!(
-                "{flag}: mapping your uid onto the container's user, so the checkout is \
-                 writable inside"
-            ));
-            args.push(flag);
-        }
-        // The list `security` validated, entry for entry.
-        args.extend(crate::security::run_args_to_pass(&config));
-        let nesting = crate::security::privileged_run_args(&config);
-        if !nesting.is_empty() {
-            self.log(format!(
-                "privileged: not passed as asked; granted as what running podman inside the \
-                 container needs ({})",
-                nesting.join(" ")
-            ));
-            args.extend(nesting);
-        }
-        // The grant's memory, enforced: what the pool placed this
-        // environment by is what its container may use. Swap equal to
-        // memory, so the ceiling is a ceiling; the guest delegates the cpu
-        // and memory controllers to rootless podman (verified on the guest,
-        // 2026-09-21). After the config's own runArgs, because podman takes
-        // the last `--memory` it is given: before them, a config's
-        // `--memory=64g` raised its own ceiling past what it was placed by,
-        // on a VM its neighbours share. The CPUs follow the memory
-        // (`Grant::cpu_ceiling`): a build sizes its jobs from the CPUs it
-        // sees, and its jobs are what take the memory.
-        let grant = self.grant_for(&config, authority);
-        args.push("--cpus".into());
-        args.push(grant.cpu_ceiling().to_string());
-        args.push("--memory".into());
-        args.push(format!("{}m", grant.memory_mib));
-        args.push("--memory-swap".into());
-        args.push(format!("{}m", grant.memory_mib));
-        args.extend(priority_args(self.env.id.is_primary(), grant));
-        *self.applied_grant.lock().unwrap() = Some(grant);
-        args.push(image);
-        if config.override_command != Some(false) {
-            args.push("sleep".into());
-            args.push("infinity".into());
-        }
-        // The bind sources the config reads from the workspace, made
-        // before the run: podman refuses a missing one ("statfs …: no
-        // such file or directory"), and a project that binds its vendor
-        // folder has none until its first install (2026-09-16).
-        if authority == ConfigAuthority::Project {
-            for source in crate::security::bind_sources(&config, self.checkout().path()) {
-                if self.exists_in_checkout(&source) {
-                    continue;
+            // Start the container.
+            self.set_state(SupervisorState::Starting);
+            let mut args: Vec<String> = vec![
+                "run".into(),
+                "-d".into(),
+                "--name".into(),
+                name.clone(),
+                "--label".into(),
+                format!("{LABEL_CONFIG_HASH}={hash}"),
+                "--label".into(),
+                format!("{LABEL_AUTHORITY}={}", authority.label()),
+                "--workdir".into(),
+                workdir.clone(),
+            ];
+            args.extend(self.resource_labels());
+            // `${localWorkspaceFolder}` means THIS environment's checkout — the
+            // clone, for a non-primary environment. The whole config is
+            // evaluated against this environment's checkout, which is what
+            // makes one config serve N environments without a single
+            // conditional — and a checkout in a VM is bound at ITS path there,
+            // since the podman doing the binding is the VM's.
+            let local_workspace_folder = self.checkout().path().display().to_string();
+            // A repo's mount that asks for a private label (`Z`) is written for
+            // a host, where it keeps one environment's files from another
+            // container. In a VM the keeper is another container over the same
+            // files by design, and a private label locked it out: every `git`
+            // it ran in the checkout failed with EACCES the moment the
+            // project's container came up (2026-09-21). So the label is shared
+            // there, as `workspace_bind_flags` already makes the IDE's own.
+            let in_vm = !self.checkout().is_local();
+            let repo_mount = |mount: &str| -> String {
+                let expanded = mount.replace("${localWorkspaceFolder}", &local_workspace_folder);
+                if in_vm {
+                    share_label_in_vm(&expanded)
+                } else {
+                    expanded
                 }
-                match self.make_dir_in_checkout(&source) {
-                    Ok(()) => self.log(format!(
-                        "created {} for the config's bind mount",
-                        source.display()
-                    )),
-                    Err(e) => self.log(format!(
-                        "could not create {} for the config's bind mount: {e}",
-                        source.display()
-                    )),
+            };
+            match &config.workspace_mount {
+                Some(mount) => {
+                    args.push("--mount".into());
+                    args.push(self.namespaced_mount(&repo_mount(mount)));
+                }
+                None => {
+                    args.push("-v".into());
+                    args.push(format!(
+                        "{local_workspace_folder}:{workdir}:{}",
+                        workspace_bind_flags(authority, !self.checkout().is_local())
+                    ));
                 }
             }
-        }
-        let container_id = self.run_captured(args).await.inspect_err(|e| {
-            // A run that fails is the config's fault as much as a build
-            // that does: remembered, so the baseline follows.
+            for mount in &config.mounts {
+                if let Some(m) = mount.as_str() {
+                    args.push("--mount".into());
+                    args.push(self.namespaced_mount(&repo_mount(m)));
+                }
+            }
+
+            // The bind source for the config the agent may write (`ide_mounts`):
+            // a bind needs one, and a project with no config has none yet.
+            if authority == ConfigAuthority::Baseline {
+                let config_dir = self.checkout().path().join(".devcontainer");
+                // On this host. A checkout in a VM has the directory made over
+                // there, by the files service, before the run.
+                if let Err(e) = self.make_dir_in_checkout(&config_dir) {
+                    tracing::warn!(
+                        "could not make {} for the agent to write its config into: {e}",
+                        config_dir.display()
+                    );
+                }
+            }
+            args.extend(self.ide_mounts(&config, authority));
+            for (k, v) in &config.container_env {
+                args.push("-e".into());
+                args.push(format!("{k}={v}"));
+            }
+            // forwardPorts: published on localhost only — services in the
+            // container become reachable from the host without exposing them
+            // to the network.
+            // A tunnel an earlier IDE left holds the ports it forwarded on this
+            // machine; gone first, or this container's land one above them.
+            if !self.checkout().is_local() {
+                let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+                if keys.reap_orphan_tunnels() > 0 {
+                    // A moment for the kernel to let the ports go.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            let taken = self.ports_taken_elsewhere().await;
+            let published = self.publish_ports(&config, &taken);
+            for (port, host) in &published {
+                args.push("-p".into());
+                args.push(format!("127.0.0.1:{host}:{port}"));
+            }
+            if !published.is_empty() {
+                args.push("--label".into());
+                args.push(format!("{LABEL_PORTS}={}", ports_label(&published)));
+            }
+            // The user namespace, when the config does not choose one. Rootless
+            // podman maps the host user to container ROOT by default, so a
+            // bind-mounted checkout shows as root's inside, and an image whose
+            // user is not root — this one's `agent`, uid 1000 — cannot write a
+            // byte of it: the agent reported ".devcontainer is mounted
+            // read-only" of a read-write mount (David, 2026-09-16: "Shouldn't
+            // this be writable?"). `keep-id` with that user's uid maps the host
+            // user onto it instead, which is what the baseline's own template
+            // has always passed. The uid is the image's word, asked of the
+            // image; a root user needs no mapping, and a config with its own
+            // `--userns` is left alone.
+            if let Some(flag) = self.userns_flag_for(&config, &image).await {
+                self.log(format!(
+                    "{flag}: mapping your uid onto the container's user, so the checkout is \
+                     writable inside"
+                ));
+                args.push(flag);
+            }
+            // The list `security` validated, entry for entry.
+            args.extend(crate::security::run_args_to_pass(&config));
+            let nesting = crate::security::privileged_run_args(&config);
+            if !nesting.is_empty() {
+                self.log(format!(
+                    "privileged: not passed as asked; granted as what running podman inside the \
+                     container needs ({})",
+                    nesting.join(" ")
+                ));
+                args.extend(nesting);
+            }
+            // The grant's memory, enforced: what the pool placed this
+            // environment by is what its container may use. Swap equal to
+            // memory, so the ceiling is a ceiling; the guest delegates the cpu
+            // and memory controllers to rootless podman (verified on the guest,
+            // 2026-09-21). After the config's own runArgs, because podman takes
+            // the last `--memory` it is given: before them, a config's
+            // `--memory=64g` raised its own ceiling past what it was placed by,
+            // on a VM its neighbours share. The CPUs follow the memory
+            // (`Grant::cpu_ceiling`): a build sizes its jobs from the CPUs it
+            // sees, and its jobs are what take the memory.
+            let grant = self.grant_for(&config, authority);
+            args.push("--cpus".into());
+            args.push(grant.cpu_ceiling().to_string());
+            args.push("--memory".into());
+            args.push(format!("{}m", grant.memory_mib));
+            args.push("--memory-swap".into());
+            args.push(format!("{}m", grant.memory_mib));
+            args.extend(priority_args(self.env.id.is_primary(), grant));
+            *self.applied_grant.lock().unwrap() = Some(grant);
+            args.push(image);
+            if config.override_command != Some(false) {
+                args.push("sleep".into());
+                args.push("infinity".into());
+            }
+            // The bind sources the config reads from the workspace, made
+            // before the run: podman refuses a missing one ("statfs …: no
+            // such file or directory"), and a project that binds its vendor
+            // folder has none until its first install (2026-09-16).
             if authority == ConfigAuthority::Project {
-                self.remember_build_failure(&config, e);
+                for source in crate::security::bind_sources(&config, self.checkout().path()) {
+                    if self.exists_in_checkout(&source) {
+                        continue;
+                    }
+                    match self.make_dir_in_checkout(&source) {
+                        Ok(()) => self.log(format!(
+                            "created {} for the config's bind mount",
+                            source.display()
+                        )),
+                        Err(e) => self.log(format!(
+                            "could not create {} for the config's bind mount: {e}",
+                            source.display()
+                        )),
+                    }
+                }
             }
-            self.set_state(SupervisorState::Failed {
-                message: e.to_string(),
-            })
-        })?;
+            let container_id = self.run_captured(args).await.inspect_err(|e| {
+                // A run that fails is the config's fault as much as a build
+                // that does: remembered, so the baseline follows.
+                if authority == ConfigAuthority::Project {
+                    self.remember_build_failure(&config, e);
+                }
+                self.set_state(SupervisorState::Failed {
+                    message: e.to_string(),
+                })
+            })?;
+            container_id
+        };
         self.log(format!("container started: {container_id}"));
 
         // Git identity: the project's own, settled BEFORE the lifecycle
@@ -5078,6 +5112,339 @@ impl Supervisor {
             gaps.extend(gap);
         }
         *self.capability_gaps.lock().unwrap() = gaps;
+    }
+
+    /// `folder` with the spec's workspace variables in it said:
+    /// `${localWorkspaceFolderBasename}` is the name of the folder the user
+    /// opened, and `${localWorkspaceFolder}` this environment's checkout,
+    /// as a mount's is (`repo_mount`).
+    fn expand_workspace_vars(&self, folder: &str) -> String {
+        let basename = self
+            .env
+            .workspace_root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        folder
+            .replace("${localWorkspaceFolderBasename}", &basename)
+            .replace(
+                "${localWorkspaceFolder}",
+                &self.checkout().path().display().to_string(),
+            )
+    }
+
+    /// The services of this environment that are not its container — a
+    /// Compose config's others — removed, by their label. Every start does
+    /// it before its own, so a config that stopped being Compose leaves
+    /// none behind; `stop` and `nuke` do too. Their network goes with the
+    /// project's `down`. How many there were.
+    async fn remove_services(&self) -> usize {
+        let ids = self
+            .run_captured(vec![
+                "ps".into(),
+                "-aq".into(),
+                "--filter".into(),
+                format!("label={LABEL_WORKSPACE}={}", self.workspace_key()),
+                "--filter".into(),
+                format!("label={}={}", crate::compose::LABEL_SERVICE_OF, self.env.id),
+            ])
+            .await
+            .unwrap_or_default();
+        let ids: Vec<String> = ids.split_whitespace().map(str::to_string).collect();
+        if ids.is_empty() {
+            return 0;
+        }
+        let mut args: Vec<String> = vec!["rm".into(), "-f".into(), "-t".into(), "2".into()];
+        args.extend(ids.iter().cloned());
+        let _ = self.run_captured(args).await;
+        // The project's network, and anything else Compose made for it.
+        let _ = self
+            .compose(vec!["down".into(), "--remove-orphans".into()], None, false)
+            .await;
+        ids.len()
+    }
+
+    /// Run the pinned Compose (`crate::compose::VERSION`) in this
+    /// environment's VM, against the VM's podman, as project
+    /// [`Self::container_name`]: `tail` after `docker compose -p <project>`,
+    /// `stdin` piped to it when given. What it prints on stdout comes back;
+    /// what it says on stderr goes to the build log when `logged`, and its
+    /// last line is the error when it fails.
+    async fn compose(
+        &self,
+        tail: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        logged: bool,
+    ) -> Result<String> {
+        let Some(vm) = self.substrate().vm_details().cloned() else {
+            bail!("a Compose environment runs in a VM, and this one has none");
+        };
+        let binary = crate::agentnode::guest_dir()
+            .join(format!("compose-v{}", crate::compose::VERSION))
+            .join("docker-compose");
+        let mut words: Vec<String> = vec![
+            "env".into(),
+            format!(
+                "DOCKER_HOST=unix://{}",
+                crate::provision::GUEST_PODMAN_SOCKET
+            ),
+            binary.display().to_string(),
+            "-p".into(),
+            self.container_name(),
+        ];
+        words.extend(tail);
+        if logged {
+            self.log(format!("$ docker compose {}", words[3..].join(" ")));
+        }
+        // ssh hands the guest's shell one line: every word quoted, since
+        // service names and paths are the repository's.
+        let line = words
+            .iter()
+            .map(|w| crate::compose::shell_word(w))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+        let (program, args) = keys.ssh_argv(vm.ssh_port, [line]);
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("running ssh to reach Compose in the VM")?;
+        if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            use tokio::io::AsyncWriteExt;
+            pipe.write_all(&bytes).await?;
+            drop(pipe);
+        }
+        let stdout = child.stdout.take().context("ssh took no stdout")?;
+        let stderr = child.stderr.take().context("ssh took no stderr")?;
+        let reading = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut out = String::new();
+            let mut stdout = stdout;
+            let _ = stdout.read_to_string(&mut out).await;
+            out
+        });
+        let mut said = BufReader::new(stderr).lines();
+        let mut last = String::new();
+        while let Some(line) = said.next_line().await? {
+            if !line.trim().is_empty() {
+                last = line.clone();
+            }
+            if logged {
+                self.log(line);
+            }
+        }
+        let status = child.wait().await?;
+        let out = reading.await.unwrap_or_default();
+        if !status.success() {
+            bail!("docker compose failed: {}", last.trim());
+        }
+        Ok(out)
+    }
+
+    /// Bring this environment up from its Compose config: Compose's own
+    /// reading of the files, the IDE's model made from it
+    /// (`crate::compose::plan`), its images pulled and built, the dev
+    /// service's user asked of its image for the user mapping, and the
+    /// project up. The dev service's container is the environment's, by
+    /// its name, so what follows a start is the same as a single
+    /// container's. Its id back.
+    async fn start_compose(
+        &self,
+        config: &DevcontainerConfig,
+        authority: ConfigAuthority,
+        hash: &str,
+        name: &str,
+    ) -> Result<String> {
+        let failed = |e: anyhow::Error| -> anyhow::Error {
+            self.remember_build_failure(config, &e);
+            self.say_build_failed(&e);
+            e
+        };
+        let checkout = self.checkout().path().to_path_buf();
+        // The files where they are in the VM: the config was read from the
+        // mirror, whose root is the checkout's.
+        let mut tail: Vec<String> = Vec::new();
+        for file in config.compose_files() {
+            let relative = file.strip_prefix(&config.root).unwrap_or(&file);
+            tail.push("-f".into());
+            tail.push(checkout.join(relative).display().to_string());
+        }
+        let mut reading = tail.clone();
+        reading.extend(["config".into(), "--format".into(), "json".into()]);
+        let model = self
+            .compose(reading, None, false)
+            .await
+            .context("Compose could not read the files")
+            .map_err(failed)?;
+        let model: serde_json::Value = serde_json::from_str(&model)
+            .context("Compose's reading of the files is not JSON")
+            .map_err(failed)?;
+
+        if !self.checkout().is_local() {
+            let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+            if keys.reap_orphan_tunnels() > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        let taken = self.ports_taken_elsewhere().await;
+        let published = self.publish_ports(config, &taken);
+        let ports: Vec<(u16, u16)> = published
+            .iter()
+            .map(|(port, host)| (*host, *port))
+            .collect();
+        let grant = self.grant_for(config, authority);
+        *self.applied_grant.lock().unwrap() = Some(grant);
+        let mut dev_labels = std::collections::BTreeMap::from([
+            (LABEL_CONFIG_HASH.to_string(), hash.to_string()),
+            (LABEL_AUTHORITY.to_string(), authority.label().to_string()),
+            (LABEL_WORKSPACE.to_string(), self.workspace_key()),
+            (LABEL_ENV.to_string(), self.env.id.to_string()),
+        ]);
+        if !published.is_empty() {
+            dev_labels.insert(LABEL_PORTS.to_string(), ports_label(&published));
+        }
+        let service_labels = std::collections::BTreeMap::from([
+            (LABEL_WORKSPACE.to_string(), self.workspace_key()),
+            (
+                crate::compose::LABEL_SERVICE_OF.to_string(),
+                self.env.id.to_string(),
+            ),
+        ]);
+        let ide = self.ide_mounts(config, authority);
+        let files = self.files();
+        let path_check = |path: &Path| {
+            crate::security::bind_stays_inside(&files, &checkout, path).map_err(|e| e.to_string())
+        };
+        let volume_name = |declared: &str| self.namespaced_volume(declared);
+        let image_prefix = environment::env_image_tag(&build_hash(config)?);
+        let primary = self.env.id.is_primary();
+        let service = config.service.clone().unwrap_or_default();
+        let plan_with = |userns: Option<String>| {
+            crate::compose::plan(
+                &model,
+                &crate::compose::Context {
+                    project: name,
+                    service: &service,
+                    run_services: &config.run_services,
+                    checkout: &checkout,
+                    folder: &self.env.workspace_root,
+                    container_name: name,
+                    image_prefix: &image_prefix,
+                    dev_labels: dev_labels.clone(),
+                    service_labels: service_labels.clone(),
+                    ide_mounts: &ide,
+                    userns,
+                    ports: &ports,
+                    memory_mib: grant.memory_mib,
+                    cpus: grant.cpu_ceiling(),
+                    cpu_shares: if primary { 1024 } else { 256 },
+                    memory_reservation_mib: primary.then_some(grant.memory_mib),
+                    oom_score_adj: (!primary).then_some(500),
+                    override_command: config.override_command == Some(true),
+                    volume_name: &volume_name,
+                    path_check: &path_check,
+                },
+            )
+            .map_err(|refusal| anyhow::anyhow!("the Compose files were refused: {refusal}"))
+        };
+        let first = plan_with(None).map_err(failed)?;
+        for note in &first.notes {
+            self.log(note.clone());
+        }
+        let ide_volumes = crate::compose::ide_volumes(&ide);
+        let model_bytes = |plan: &crate::compose::Plan| -> Result<Vec<u8>> {
+            let mut plan = plan.clone();
+            crate::compose::declare_ide_volumes(&mut plan, &ide_volumes);
+            Ok(serde_json::to_vec(&plan.model)?)
+        };
+        // The agent's home, which the model names as external: made here,
+        // as `podman run` would have made it.
+        for volume in &ide_volumes {
+            let _ = self
+                .run_captured(vec![
+                    "volume".into(),
+                    "create".into(),
+                    "--ignore".into(),
+                    volume.clone(),
+                ])
+                .await;
+        }
+
+        // Images first, so the dev service's can be asked who it runs as.
+        let fresh = self.fresh_build.swap(false, Ordering::SeqCst);
+        let mut pull: Vec<String> = vec!["-f".into(), "-".into(), "pull".into()];
+        pull.extend(["--ignore-buildable".into(), "--policy".into()]);
+        pull.push(if fresh { "always" } else { "missing" }.into());
+        self.compose(pull, Some(model_bytes(&first)?), true)
+            .await
+            .map_err(failed)?;
+        let mut build: Vec<String> = vec!["-f".into(), "-".into(), "build".into()];
+        if fresh {
+            self.log("building from nothing: base images pulled, no layer cached".to_string());
+            build.extend(["--no-cache".into(), "--pull".into()]);
+        }
+        self.compose(build, Some(model_bytes(&first)?), true)
+            .await
+            .map_err(failed)?;
+        let dev_image = first.model["services"][service.as_str()]["image"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let userns = match self.userns_flag_for(config, &dev_image).await {
+            Some(flag) => {
+                self.log(format!(
+                    "{flag}: mapping your uid onto the container's user, so the checkout is \
+                     writable inside"
+                ));
+                flag.strip_prefix("--userns=").map(str::to_string)
+            }
+            None => None,
+        };
+        let plan = plan_with(userns).map_err(failed)?;
+        *self.compose_volumes.lock().unwrap() = plan.model["volumes"]
+            .as_object()
+            .map(|volumes| {
+                volumes
+                    .values()
+                    .filter_map(|v| v["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.set_state(SupervisorState::Starting);
+        let mut up: Vec<String> = vec![
+            "-f".into(),
+            "-".into(),
+            "up".into(),
+            "-d".into(),
+            "--remove-orphans".into(),
+            "--no-build".into(),
+        ];
+        up.extend(plan.services.iter().cloned());
+        self.compose(up, Some(model_bytes(&plan)?), true)
+            .await
+            .inspect_err(|e| {
+                self.remember_build_failure(config, e);
+                self.set_state(SupervisorState::Failed {
+                    message: e.to_string(),
+                })
+            })?;
+        self.run_captured(vec![
+            "inspect".into(),
+            "--format".into(),
+            "{{.Id}}".into(),
+            name.to_string(),
+        ])
+        .await
+        .map(|id| id.trim().to_string())
     }
 
     /// The `--userns` flag the run wants, if the config chose none and the
@@ -5432,6 +5799,7 @@ impl Supervisor {
                 name,
             ])
             .await;
+        self.remove_services().await;
         *self.running_hash.lock().unwrap() = None;
         *self.git_exec.lock().unwrap() = None;
         self.set_state(SupervisorState::Stopped);
@@ -5499,6 +5867,7 @@ impl Supervisor {
                 name,
             ])
             .await;
+        self.remove_services().await;
         if let Some(tag) = self.current_image_tag() {
             if let Err(e) = self.run_captured(vec!["rmi".into(), tag.clone()]).await {
                 self.log(format!(
@@ -5531,6 +5900,11 @@ impl Supervisor {
                     .iter()
                     .map(|declared| self.namespaced_volume(declared)),
             );
+        }
+        for volume in self.compose_volumes.lock().unwrap().iter() {
+            if !volumes.contains(volume) {
+                volumes.push(volume.clone());
+            }
         }
         volumes
     }

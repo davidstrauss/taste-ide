@@ -307,6 +307,14 @@ pub struct DevcontainerConfig {
     /// `taste-ide` key ([`DevcontainerConfig::services`]).
     #[serde(default)]
     pub customizations: serde_json::Value,
+    /// The spec's `dockerComposeFile`: one Compose file or a list,
+    /// relative to the config's directory (`crate::compose`).
+    pub docker_compose_file: Option<OneOrMany>,
+    /// The Compose service the IDE works in, which a Compose config names.
+    pub service: Option<String>,
+    /// The Compose services to start with it; all of them when empty.
+    #[serde(default)]
+    pub run_services: Vec<String>,
     pub on_create_command: Option<serde_json::Value>,
     pub post_create_command: Option<serde_json::Value>,
     pub post_start_command: Option<serde_json::Value>,
@@ -324,6 +332,41 @@ pub struct DevcontainerConfig {
     /// `.devcontainer/` — happens to sit on disk.
     #[serde(skip)]
     pub root: PathBuf,
+}
+
+/// A spec value that is one string or a list of them.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    pub fn items(&self) -> Vec<String> {
+        match self {
+            OneOrMany::One(one) => vec![one.clone()],
+            OneOrMany::Many(many) => many.clone(),
+        }
+    }
+}
+
+/// `path` with its `.` and `..` taken out by name, never through the disk:
+/// `None` when a `..` would climb above where it starts.
+pub fn lexical_normal(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 /// Spec'd discovery locations, in priority order.
@@ -437,9 +480,41 @@ impl DevcontainerConfig {
         self.config_dir.clone()
     }
 
+    /// Whether this config defines its environment with Compose.
+    pub fn is_compose(&self) -> bool {
+        self.docker_compose_file.is_some()
+    }
+
+    /// The Compose files, in the order given, resolved against the config's
+    /// directory by name: a list Compose merges in that order.
+    pub fn compose_files(&self) -> Vec<PathBuf> {
+        self.docker_compose_file
+            .as_ref()
+            .map(OneOrMany::items)
+            .unwrap_or_default()
+            .iter()
+            .map(|file| {
+                let joined = self.config_dir.join(file);
+                lexical_normal(&joined).unwrap_or(joined)
+            })
+            .collect()
+    }
+
     /// Files whose content defines this configuration, for change hashing.
+    /// A Compose config's are its Compose files and every file under its
+    /// own directory — the Dockerfiles and init scripts its services name
+    /// usually sit beside it, and which ones they are is Compose's to say.
     pub fn hash_inputs(&self) -> Vec<PathBuf> {
         let mut v = vec![self.config_path.clone()];
+        if self.is_compose() {
+            v.extend(self.compose_files());
+            let mut beside = Vec::new();
+            files_under(&self.config_dir, &mut beside, 0);
+            beside.retain(|path| !v.contains(path));
+            beside.sort();
+            v.extend(beside);
+            return v;
+        }
         if let Some(df) = self.dockerfile_path() {
             v.push(df);
         }
@@ -550,6 +625,31 @@ impl DevcontainerConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.is_compose() {
+            if self.service.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                bail!(
+                    "{}: a Compose config names the service to work in (\"service\")",
+                    self.config_path.display()
+                );
+            }
+            let files = self.compose_files();
+            if files.is_empty() {
+                bail!(
+                    "{}: \"dockerComposeFile\" names no file",
+                    self.config_path.display()
+                );
+            }
+            for file in files {
+                if !file.starts_with(&self.root) {
+                    bail!(
+                        "{}: the Compose file {} is outside the checkout",
+                        self.config_path.display(),
+                        file.display()
+                    );
+                }
+            }
+            return Ok(());
+        }
         if self.image.is_none() && self.dockerfile_path().is_none() {
             bail!(
                 "{}: needs either \"image\" or a build dockerfile",
@@ -557,6 +657,24 @@ impl DevcontainerConfig {
             );
         }
         Ok(())
+    }
+}
+
+/// Every file under `dir`, a few levels down, for the hash.
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => out.push(path),
+            Ok(kind) if kind.is_dir() => files_under(&path, out, depth + 1),
+            _ => {}
+        }
     }
 }
 

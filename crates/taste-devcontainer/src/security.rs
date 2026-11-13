@@ -99,7 +99,7 @@ pub const NESTING_RUN_ARGS: &[&str] = &[
 
 /// The `--security-opt` values a config may state: the nesting set, and
 /// the two other spellings podman-in-podman guides give it.
-const ALLOWED_SECURITY_OPTS: &[&str] = &[
+pub(crate) const ALLOWED_SECURITY_OPTS: &[&str] = &[
     "label=type:container_engine_t",
     "unmask=ALL",
     "label=disable",
@@ -111,11 +111,11 @@ const ALLOWED_SECURITY_OPTS: &[&str] = &[
 /// `/dev/net/tun` for pasta, which gives a nested container its network
 /// ("Failed to open() /dev/net/tun" without it). The guest has both, and
 /// neither reaches anything outside the VM.
-const ALLOWED_DEVICES: &[&str] = &["/dev/fuse", "/dev/net/tun"];
+pub(crate) const ALLOWED_DEVICES: &[&str] = &["/dev/fuse", "/dev/net/tun"];
 
 /// The `--cap-add` values a config may state: nesting's one, for
 /// `sethostname` in a nested container (see [`NESTING_RUN_ARGS`]).
-const ALLOWED_CAPS: &[&str] = &["SYS_ADMIN", "CAP_SYS_ADMIN"];
+pub(crate) const ALLOWED_CAPS: &[&str] = &["SYS_ADMIN", "CAP_SYS_ADMIN"];
 
 /// Flags accepted for cross-ecosystem compatibility but never passed to
 /// podman as they are. Docker needs `--privileged` for systemd-in-container
@@ -521,74 +521,73 @@ fn validate_mount(
                      inside the workspace (the repo is untrusted)"
                 );
             }
-            // Lexical containment is not enough: the repo can commit a
-            // symlink pointing anywhere. Resolve and re-check. A source
-            // that does not exist yet is fine — the IDE makes the directory
-            // before `podman run` (`bind_sources`; podman itself refuses
-            // with "statfs …: no such file or directory"), and a config
-            // that binds `${localWorkspaceFolder}/vendor` before anything
-            // has installed into it is the ordinary first day of a project
-            // (refusing it as "bind source does not exist" left a fresh
-            // devcontainer.json passed over with nothing on screen saying
-            // so, 2026-09-16) — so what is resolved is its nearest existing
-            // ancestor, which is where a symlink could sit.
-            if !files.is_local() {
-                // Where the files are, component by component: a symlink
-                // anywhere under the root on the way to the source is the
-                // repo pointing the bind elsewhere, and is refused by
-                // name; a component that does not exist ends the walk,
-                // since nothing below it can be a link yet.
-                let mut probe = workspace_root.to_path_buf();
-                for component in path
-                    .strip_prefix(workspace_root)
-                    .unwrap_or(path)
-                    .components()
-                {
-                    probe.push(component);
-                    match files.stat(&probe) {
-                        Ok(stat) if stat.kind == taste_core::files::Kind::Symlink => bail!(
-                            "devcontainer.json mount \"{mount}\": {} is a symlink, so the \
-                             source could resolve outside the workspace (the repo is untrusted)",
-                            probe.display()
-                        ),
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                        Err(e) => bail!(
-                            "devcontainer.json mount \"{mount}\": bind source cannot be \
-                             resolved: {e}"
-                        ),
-                    }
-                }
-                return Ok(());
-            }
-            let canonical_root = workspace_root
-                .canonicalize()
-                .unwrap_or_else(|_| workspace_root.to_path_buf());
-            let mut probe = path.to_path_buf();
-            while !probe.exists() {
-                match probe.parent() {
-                    Some(parent) => probe = parent.to_path_buf(),
-                    None => bail!(
-                        "devcontainer.json mount \"{mount}\": bind source has no existing \
-                         ancestor"
-                    ),
-                }
-            }
-            match probe.canonicalize() {
-                Ok(resolved) if resolved.starts_with(&canonical_root) => Ok(()),
-                Ok(resolved) => bail!(
-                    "devcontainer.json mount \"{mount}\": source resolves to {} — \
-                     outside the workspace (the repo is untrusted)",
-                    resolved.display()
-                ),
-                Err(e) => {
-                    bail!(
-                        "devcontainer.json mount \"{mount}\": bind source cannot be resolved: {e}"
-                    )
-                }
-            }
+            bind_stays_inside(files, workspace_root, path)
+                .map_err(|e| anyhow::anyhow!("devcontainer.json mount \"{mount}\": {e}"))
         }
         _ => Ok(()),
+    }
+}
+
+/// Whether `path`, already lexically under `workspace_root`, stays there
+/// on disk: no symlink on the way to it that could point a bind, a build,
+/// or a file read elsewhere. Lexical containment is not enough: the repo
+/// can commit a symlink pointing anywhere. A path that does not exist yet
+/// is fine — the IDE makes a bind's directory before `podman run`
+/// (`bind_sources`; podman itself refuses with "statfs …: no such file or
+/// directory"), and a config that binds `${localWorkspaceFolder}/vendor`
+/// before anything has installed into it is the ordinary first day of a
+/// project (refusing it as "bind source does not exist" left a fresh
+/// devcontainer.json passed over with nothing on screen saying so,
+/// 2026-09-16) — so what is resolved is its nearest existing ancestor,
+/// which is where a symlink could sit.
+pub fn bind_stays_inside(
+    files: &taste_core::files::Files,
+    workspace_root: &Path,
+    path: &Path,
+) -> Result<()> {
+    if !files.is_local() {
+        // Where the files are, component by component: a symlink anywhere
+        // under the root on the way to the source is the repo pointing it
+        // elsewhere, and is refused by name; a component that does not
+        // exist ends the walk, since nothing below it can be a link yet.
+        let mut probe = workspace_root.to_path_buf();
+        for component in path
+            .strip_prefix(workspace_root)
+            .unwrap_or(path)
+            .components()
+        {
+            probe.push(component);
+            match files.stat(&probe) {
+                Ok(stat) if stat.kind == taste_core::files::Kind::Symlink => bail!(
+                    "{} is a symlink, so the source could resolve outside the workspace (the \
+                     repo is untrusted)",
+                    probe.display()
+                ),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => bail!("{} cannot be resolved: {e}", path.display()),
+            }
+        }
+        return Ok(());
+    }
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut probe = path.to_path_buf();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) => probe = parent.to_path_buf(),
+            None => bail!("{} has no existing ancestor", path.display()),
+        }
+    }
+    match probe.canonicalize() {
+        Ok(resolved) if resolved.starts_with(&canonical_root) => Ok(()),
+        Ok(resolved) => bail!(
+            "{} resolves to {} — outside the workspace (the repo is untrusted)",
+            path.display(),
+            resolved.display()
+        ),
+        Err(e) => bail!("{} cannot be resolved: {e}", path.display()),
     }
 }
 

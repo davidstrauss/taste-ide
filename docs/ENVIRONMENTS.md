@@ -3706,6 +3706,30 @@ asked about and ruled out of scope (David, same day):
   2026-10-10 and measured against podman 5.8.7
   (docs/spikes/sandbox-tightening.md). The pool's grant is the last
   `--memory` and `--cpus` podman sees, so a config cannot raise its own.
+- **A Compose config is held to the same rules, service by service**
+  (2026-11-12; David: "Same rules, every service"). A `dockerComposeFile`
+  config is read by Compose itself — the pinned `docker compose`
+  (`taste_devcontainer::compose::VERSION`, fetched into the VM beside
+  Task, digest checked), run over ssh against the VM's podman socket —
+  and its `config --format json` is what is checked, so the IDE never
+  parses YAML and never disagrees with Compose about a file. Each
+  service's keys are a list (`compose::SERVICE_KEYS`), and one off it
+  refuses the config by name: no host network, PID, IPC, or UTS
+  namespace, no sysctls, `cap_add`, `devices`, and `security_opt` only
+  from nesting's set, `privileged` turned into that set, no external
+  volumes or networks, no volume `driver_opts` (the local driver's bind
+  any path of the VM), no network driver but bridge, and binds, build
+  contexts, Dockerfiles, and secret files only inside the checkout,
+  checked on disk for symlinks as a `mounts` bind is
+  (`security::bind_stays_inside`). A bind of a folder ABOVE the
+  checkout — the Codespaces convention mounts `../..` at `/workspaces` —
+  is narrowed to the checkout, at the path the repository has under it
+  (`/workspaces/<folder>`): the folder above a checkout in the VM holds
+  the workspace's other environments (David: "Narrow to the
+  checkout"). Published ports are dropped — every environment of a VM
+  would publish the same ones — and `forwardPorts` is published on
+  loopback on the service whose network the dev service shares. Every
+  service gets the environment's memory and CPUs.
 - **Nested podman is granted, and only as much of it as it needs**
   (2026-09-23). Projects that run podman themselves — a build in a
   container, a test that starts one — are ordinary, and a devcontainer

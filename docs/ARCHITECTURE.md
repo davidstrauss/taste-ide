@@ -2083,6 +2083,22 @@ NoConfig → ConfigDetected → Building → Starting → Running
   with `--userns=keep-id`, bind-mounting the workspace) implementing the
   core devcontainer spec: image/Containerfile/compose, mounts, env,
   runArgs, remoteUser, lifecycle hooks (onCreate/postCreate/postStart).
+  A Compose config (`dockerComposeFile`, `service`, `runServices`;
+  2026-11-12) is brought up by the pinned `docker compose` in the VM,
+  from a model the IDE makes out of Compose's own `config --format json`
+  (`taste_devcontainer::compose`): the project is the environment's
+  (`taste-<workspace>-<env>`), the dev service's container is named and
+  labeled as a single container is and given its mounts, user mapping,
+  and limits, so exec, the agent's channel, hooks, and every lookup by
+  name are unchanged, and the other services are
+  `taste-<workspace>-<env>-<service>`, labeled `taste.env-service`
+  rather than `taste.env`. Every start, stop, and nuke removes those by
+  their label and takes the project down. The rules it is held to are
+  ENVIRONMENTS → "A Compose config is held to the same rules". Agents
+  are told to prefer it when the stack's parts have official images
+  (David, 2026-11-12: "Prefer using it when there are ready-made
+  containers for components in the stack"), rather than one Debian
+  image built up by hand.
   Before the hooks run, the checkout is given the **project's** git
   author — the `user.name`/`user.email` the folder's repository sets, which
   the IDE also remembers in the workspace's state (`git-author`), so a

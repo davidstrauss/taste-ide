@@ -15,6 +15,7 @@ pub mod agentnode;
 pub mod baseline;
 pub mod channel;
 pub mod cloud;
+pub mod compose;
 pub mod config;
 pub mod configwatch;
 pub mod console;
