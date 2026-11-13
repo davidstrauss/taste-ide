@@ -827,15 +827,17 @@ pub(crate) fn author_prompt() -> String {
      what the project needs, installing the rest, and .devcontainer/devcontainer.json that \
      builds it with \"build\": {\"dockerfile\": \"Containerfile\"}.\n\
      Either way, build nothing from source that an image or a package already provides. \
-     Keep the config usable by VS Code and \
-     Codespaces, and no more: add nothing only an editor reads but the Task extension \
-     step 5 names. This IDE does not apply devcontainer features: install tools in the \
-     image instead. Do not install Task (taskfile.dev): the IDE provides it in \
-     every container.\n\
+     This IDE does not apply devcontainer features: install tools in the image \
+     instead.\n"
+        .to_string();
+    text.push_str(taste_core::conventions::VS_CODE);
+    text.push_str(
+        " Step 5 writes a Taskfile for any project with commands to run, so install Task \
+     now for such a project, whether or not it has a Taskfile yet.\n\
      If the checkout has Jupyter notebooks (.ipynb files): install ipykernel, which brings \
      jupyter_client, into the Python the project uses, and the packages the notebooks import, \
-     and add the notebook kernel's task to the Taskfile. "
-        .to_string();
+     and add the notebook kernel's task to the Taskfile. ",
+    );
     text.push_str(&taste_core::kernel_task::convention());
     text.push_str("\nIf the project runs servers, workers, or watchers as tasks: ");
     text.push_str(taste_core::conventions::SERVICES);
@@ -862,10 +864,7 @@ pub(crate) fn author_prompt() -> String {
      for each command a developer runs here — build, test, lint, each server — taken from \
      the README, build files, and CI configuration you read in step 1. Check it with \
      task_list. The user's Tasks section lists and runs these tasks. Skip this step when \
-     the project has nothing to run. ");
-    text.push_str(taste_core::conventions::TASK_EXTENSION);
-    text.push_str(
-        "\n\
+     the project has nothing to run.\n\
      6. Finish with one short paragraph: what the environment provides, and why.",
     );
     text
@@ -1006,23 +1005,28 @@ mod tests {
     }
 
     /// A project set up without a Taskfile gets one once its own
-    /// environment runs, where the root is writable, and Task is never
-    /// installed for it: the IDE provides Task in every container.
+    /// environment runs, where the root is writable — and its image
+    /// installs Task before that, since VS Code brings none of its own.
     #[test]
-    fn the_authoring_prompt_asks_for_a_taskfile_and_never_for_task() {
+    fn the_authoring_prompt_asks_for_a_taskfile_and_task_in_the_image() {
         let prompt = author_prompt();
         assert!(prompt.contains("write Taskfile.yml at its root"));
-        assert!(prompt.contains("Do not install Task"));
-        assert!(!prompt.contains("go-task"));
+        assert!(prompt.contains("install Task (taskfile.dev) in the image"));
+        assert!(prompt.contains("so install Task now"));
+        assert!(!prompt.contains("Do not install Task"));
     }
 
-    /// A project with a Taskfile lists VS Code's Task extension, the one
-    /// editor customization the authoring prompt asks for.
+    /// The config is written to come up in VS Code too: the Task
+    /// extension and no other editor customization, a built Compose
+    /// service's image under localhost/, and lifecycle commands that
+    /// survive a second run.
     #[test]
-    fn the_authoring_prompt_adds_the_task_extension_and_no_other() {
+    fn the_authoring_prompt_writes_for_vs_code_too() {
         let prompt = author_prompt();
         assert!(prompt.contains("\"task.vscode-task\""));
         assert!(prompt.contains("add no other customizations.vscode entry"));
+        assert!(prompt.contains("`image:` under localhost/"));
+        assert!(prompt.contains("must succeed when run a second time"));
     }
 
     #[test]

@@ -20,18 +20,44 @@ pub const TASKFILE_NAMES: [&str; 8] = [
     "taskfile.dist.yaml",
 ];
 
-/// The one editor customization an agent adds to a devcontainer config:
-/// VS Code's Task extension, where the project has a Taskfile, so the
-/// tasks the IDE's Tasks section runs are a click away in VS Code and
-/// Codespaces too (David, 2026-11-13: "an exception to the general rule
-/// to not add or remove VSCode extensions to the devcontainer config").
-/// Every other `customizations.vscode` entry stays as the project has it.
-pub const TASK_EXTENSION: &str =
-    "When the project has a Taskfile, .devcontainer/devcontainer.json \
-     lists VS Code's Task extension, adding it beside any extensions already listed: \
-     `\"customizations\": { \"vscode\": { \"extensions\": [\"task.vscode-task\"] } }`. That \
-     is the one editor customization to add; add no other customizations.vscode entry \
-     (extension or setting), and remove none that is there.";
+/// What keeps a devcontainer config working in VS Code and Codespaces,
+/// which run it without this IDE, for an agent writing one. Each rule is a
+/// failure a config written here met there:
+///
+/// - **Task in the image.** The IDE brings its own Task to every container
+///   (`taste_core::tasks::IDE_TASK_VERSION`), and VS Code brings none, so a
+///   config that relied on the IDE's had no `task` in VS Code — and VS
+///   Code's Task extension, the one editor customization an agent adds
+///   (David, 2026-11-13: "an exception to the general rule to not add or
+///   remove VSCode extensions to the devcontainer config"), does nothing
+///   without one. The image's own Task is the one the IDE runs first.
+/// - **A built Compose service names its image under `localhost/`.**
+///   VS Code on podman builds its user-mapping layer FROM `localhost/<the
+///   image>` for any image name without a registry, and Compose through
+///   the Docker API had tagged it `docker.io/library/<the image>`, so the
+///   FROM found nothing (good_job, 2026-11-13). The IDE replaces a built
+///   service's `image` with its own tag, so the name costs it nothing.
+/// - **Lifecycle commands run twice.** A new container runs them again
+///   while its named volumes keep their data: good_job's setup created its
+///   test database a second time and failed (2026-11-13).
+pub const VS_CODE: &str = "The config must also come up in VS Code and Codespaces, which run \
+     it without this IDE and have none of what the IDE adds to a container: its Task, its \
+     /home/agent, its user mapping. So:\n\
+     - When the project has a Taskfile, or you are writing one, install Task (taskfile.dev) \
+     in the image, pinned: on Fedora `dnf install go-task`, elsewhere the release tarball \
+     from github.com/go-task/task with its sha256 checked. List VS Code's Task extension in \
+     .devcontainer/devcontainer.json, beside any extensions already listed: \
+     `\"customizations\": { \"vscode\": { \"extensions\": [\"task.vscode-task\"] } }`. \
+     That is the one editor customization to add: add no other customizations.vscode entry \
+     (extension or setting), and remove none that is there.\n\
+     - In a Compose file, give every service that has `build:` an `image:` under localhost/, \
+     named `localhost/<project>-<service>` (for example `image: localhost/shop-app`): VS Code \
+     on podman looks for the built image there and fails to start without it. Write no \
+     top-level `version:` key.\n\
+     - Lifecycle commands (postCreateCommand and the rest) run again in every new container \
+     while named volumes keep their data, so each must succeed when run a second time: \
+     create a database, user, or file only when it is missing. They may use only what the \
+     image installs.";
 
 /// Which tasks are services, for an agent: the `customizations.taste-ide`
 /// block in devcontainer.json that taste-devcontainer's `ServiceSpec`

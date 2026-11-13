@@ -274,7 +274,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 22;
+pub const GUIDANCE_REVISION: u32 = 23;
 
 /// `result` with each image block replaced by
 /// [`taste_core::imageless::WITHHELD`].
@@ -397,9 +397,11 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              show them the list. Follow-up work you find while working an issue is a new \
              issue, not a detour.\n\n\
              TASKS. `task` (Task, taskfile.dev) is always there in your environment's \
-             container: the image's own when it has one, otherwise the IDE's, which it \
-             puts on your PATH and on ide_exec's. Do not install Task, link go-task to \
-             task, or change the devcontainer to provide it. task_list and task_run run \
+             container: the image's own when it has one (Fedora's go-task counts; do not \
+             link it to task), otherwise the IDE's, which it puts on your PATH and on \
+             ide_exec's. VS Code has no Task of its own, so a devcontainer installs it \
+             (DEVCONTAINER below); add it when you are changing the devcontainer anyway, \
+             never in a rebuild of its own. task_list and task_run run \
              the project's Taskfile where the user sees it, and so does any `task` run in your \
              shell or ide_exec, or in the user's terminal: each is shown in the user's Tasks \
              section with its output. A task that takes arguments after `--` or asks for \
@@ -421,7 +423,7 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              only an editor reads. Leave what is already there as it is, editor \
              customizations included. ",
         );
-    text.push_str(taste_core::conventions::TASK_EXTENSION);
+    text.push_str(taste_core::conventions::VS_CODE);
     text.push_str(
         "\n\n\
              PORTS. A service the user's own programs should reach (a browser, a \
@@ -2726,7 +2728,7 @@ impl McpServer {
                         portable to VS Code and GitHub Codespaces. Portable, not \
                         furnished: add nothing else only an editor reads, and leave what \
                         is already there as it is. {}",
-                        taste_core::conventions::TASK_EXTENSION
+                        taste_core::conventions::VS_CODE
                     ),
                     "act_accordingly": if safe_mode {
                         "Focus on authoring or fixing the devcontainer configuration \
@@ -6945,8 +6947,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "35f4a9a03abafef824f1e7eb8d589ce008817e84b43e44bb34105284b24e8a9a";
-        const AT_REVISION: u32 = 22;
+            "eba28174e8c34b030afd0c35a8f7389f8591e60eac4c6bb7fd757ffce2a3efce";
+        const AT_REVISION: u32 = 23;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

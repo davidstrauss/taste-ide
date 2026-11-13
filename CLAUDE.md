@@ -574,10 +574,16 @@ to.
   compatibility like extensions. Nor should the agent remove them if
   present, though"). One exception: a project with a Taskfile lists VS
   Code's Task extension, `task.vscode-task` (David, 2026-11-13: "an
-  exception to the general rule"). Agents are told all of this in
+  exception to the general rule"). Compatible means it comes UP there,
+  not only that VS Code can parse it — VS Code has none of what the IDE
+  adds to a container — so the image installs Task itself (the IDE's
+  bundled Task stays, as the fallback for images that do not), a built
+  Compose service names its image under `localhost/`, and lifecycle
+  commands succeed when run a second time; each is a failure good_job's
+  config met in VS Code on 2026-11-13. Agents are told all of this in
   `taste_mcp::guidance`, the environment tool's conventions, and
   `devcontainer_ui::author_prompt`, each from
-  `taste_core::conventions::TASK_EXTENSION`. Compose runs through
+  `taste_core::conventions::VS_CODE`. Compose runs through
   `docker compose` on both sides; `podman compose` is not supported
   (David, 2026-11-13: "it's basically deprecated").
 - **Credentials are the project's, and never imported from the machine.**
