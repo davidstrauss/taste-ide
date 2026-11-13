@@ -578,9 +578,14 @@ to.
   not only that VS Code can parse it — VS Code has none of what the IDE
   adds to a container — so the image installs Task itself (the IDE's
   bundled Task stays, as the fallback for images that do not), a built
-  Compose service names its image under `localhost/`, and lifecycle
-  commands succeed when run a second time; each is a failure good_job's
-  config met in VS Code on 2026-11-13. Agents are told all of this in
+  Compose service names its image under `localhost/`, the service you
+  work in states `security_opt: [label=disable]` and `userns_mode:
+  ${DEVCONTAINER_USERNS:-}` (VS Code gives a single container both on
+  podman and a Compose service neither; the variable is set on the
+  user's own machine for VS Code, never needed by the IDE, which picks
+  every service's user namespace itself), and lifecycle commands succeed
+  when run a second time; each is a failure good_job's config met in VS
+  Code on 2026-11-13. Agents are told all of this in
   `taste_mcp::guidance`, the environment tool's conventions, and
   `devcontainer_ui::author_prompt`, each from
   `taste_core::conventions::VS_CODE`. Compose runs through

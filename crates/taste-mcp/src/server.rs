@@ -274,7 +274,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 23;
+pub const GUIDANCE_REVISION: u32 = 24;
 
 /// `result` with each image block replaced by
 /// [`taste_core::imageless::WITHHELD`].
@@ -6947,8 +6947,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "eba28174e8c34b030afd0c35a8f7389f8591e60eac4c6bb7fd757ffce2a3efce";
-        const AT_REVISION: u32 = 23;
+            "16349cda4fb9f1e5b5cf73d170779b954cae868584c38e2fce173d64c9ce18a2";
+        const AT_REVISION: u32 = 24;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

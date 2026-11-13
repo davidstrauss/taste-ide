@@ -132,6 +132,11 @@ const SERVICE_KEYS: &[&str] = &[
     "ports",
     "privileged",
     "security_opt",
+    // A user namespace is the IDE's to choose: the dev service gets the
+    // one that maps the user onto its image's user, and the others the
+    // VM's default. A config states one for VS Code on rootless podman,
+    // whose Compose path adds none (`VS_CODE` in taste_core::conventions).
+    "userns_mode",
 ];
 
 /// A build key the IDE takes as it is.
@@ -432,6 +437,10 @@ fn service(
         }
         out.insert("volumes".into(), Value::Array(kept));
     }
+
+    // The user namespace: stated for VS Code on rootless podman, chosen
+    // here (the dev service's below; the others keep the VM's default).
+    out.remove("userns_mode");
 
     // Limits: the environment's, for every service.
     for key in [
@@ -1009,6 +1018,24 @@ mod tests {
         assert!(
             m["networks"]["default"].get("name").is_none(),
             "named by Compose after the project"
+        );
+    }
+
+    /// A user namespace a config states for VS Code on rootless podman
+    /// is accepted and chosen here: the dev service's is the IDE's
+    /// mapping, and another service keeps the VM's default.
+    #[test]
+    fn a_stated_user_namespace_is_the_ides_to_choose() {
+        let mut model = good_job();
+        model["services"]["app"]["userns_mode"] = json!("keep-id");
+        model["services"]["db"]["userns_mode"] = json!("keep-id");
+        let plan = planned(&model).unwrap();
+        let services = &plan.model["services"];
+        assert_eq!(services["app"]["userns_mode"], "keep-id:uid=1000,gid=1000");
+        assert!(
+            services["db"].get("userns_mode").is_none(),
+            "{}",
+            services["db"]
         );
     }
 

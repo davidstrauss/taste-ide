@@ -37,6 +37,19 @@ pub const TASKFILE_NAMES: [&str; 8] = [
 ///   the Docker API had tagged it `docker.io/library/<the image>`, so the
 ///   FROM found nothing (good_job, 2026-11-13). The IDE replaces a built
 ///   service's `image` with its own tag, so the name costs it nothing.
+/// - **The service you work in states its podman options itself.** VS
+///   Code's CLI, on podman on Linux, gives a single container
+///   `--security-opt label=disable` and, for a user other than root,
+///   `--userns=keep-id`, and gives a Compose service neither: good_job's
+///   checkout was unreadable to every user in the container under SELinux,
+///   and its files root's, so the image's user could not write them
+///   (2026-11-13). `label=disable` is portable, and goes in as it is.
+///   `keep-id` is podman's alone — Docker and Codespaces refuse it — so it
+///   comes from `DEVCONTAINER_USERNS`, which a podman user sets for VS Code
+///   on their own machine and everyone else leaves unset. The IDE sets
+///   neither: it chooses every service's user namespace itself
+///   (`taste_devcontainer::compose`), and the variable is not set in its
+///   VMs.
 /// - **Lifecycle commands run twice.** A new container runs them again
 ///   while its named volumes keep their data: good_job's setup created its
 ///   test database a second time and failed (2026-11-13).
@@ -53,7 +66,13 @@ pub const VS_CODE: &str = "The config must also come up in VS Code and Codespace
      - In a Compose file, give every service that has `build:` an `image:` under localhost/, \
      named `localhost/<project>-<service>` (for example `image: localhost/shop-app`): VS Code \
      on podman looks for the built image there and fails to start without it. Write no \
-     top-level `version:` key.\n\
+     top-level `version:` key. On the service you work in, write these two lines as they \
+     are, so VS Code on rootless podman can read and write the checkout (Docker and \
+     Codespaces ignore them):\n\
+     ```yaml\n\
+     security_opt: [label=disable]\n\
+     userns_mode: ${DEVCONTAINER_USERNS:-}\n\
+     ```\n\
      - Lifecycle commands (postCreateCommand and the rest) run again in every new container \
      while named volumes keep their data, so each must succeed when run a second time: \
      create a database, user, or file only when it is missing. They may use only what the \

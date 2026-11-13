@@ -1027,6 +1027,8 @@ mod tests {
         assert!(prompt.contains("add no other customizations.vscode entry"));
         assert!(prompt.contains("`image:` under localhost/"));
         assert!(prompt.contains("must succeed when run a second time"));
+        assert!(prompt.contains("security_opt: [label=disable]"));
+        assert!(prompt.contains("userns_mode: ${DEVCONTAINER_USERNS:-}"));
     }
 
     #[test]
