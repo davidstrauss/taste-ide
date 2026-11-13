@@ -581,6 +581,10 @@ pub struct Supervisor {
     /// cache — which is how an image's packages are refreshed
     /// (`crate::migration`, `Kind::Packages`). Consumed by that build.
     fresh_build: AtomicBool,
+    /// How many containers the start under way, or the last one, brings
+    /// up: one for a single container, a Compose project's services
+    /// otherwise ([`Self::containers`]).
+    containers: AtomicU64,
     /// The next start skips the image build when its tag is already there:
     /// how an environment restarts on the image another environment just
     /// rebuilt from nothing, rather than building it again. Consumed by
@@ -1065,6 +1069,7 @@ impl Supervisor {
             probing: AtomicBool::new(false),
             agent_reload: AtomicBool::new(false),
             fresh_build: AtomicBool::new(false),
+            containers: AtomicU64::new(1),
             reuse_image: AtomicBool::new(false),
             channel: tokio::sync::Mutex::new(None),
             channel_services: Mutex::new(None),
@@ -2731,6 +2736,14 @@ impl Supervisor {
     /// sentences, and the two prompts an agent gets.
     pub fn build_failed(&self) -> bool {
         self.build_failed.lock().unwrap().is_some()
+    }
+
+    /// How many containers this environment's start brings up, which is
+    /// how its startup page words the step ("Start container" or "Start
+    /// containers"): set before the state says `Starting`, and one until
+    /// a Compose project has said otherwise.
+    pub fn containers(&self) -> usize {
+        self.containers.load(Ordering::SeqCst) as usize
     }
 
     /// The lifecycle command that failed on the last start, if one did:
@@ -4787,6 +4800,7 @@ impl Supervisor {
             };
 
             // Start the container.
+            self.containers.store(1, Ordering::SeqCst);
             self.set_state(SupervisorState::Starting);
             let mut args: Vec<String> = vec![
                 "run".into(),
@@ -5467,6 +5481,9 @@ impl Supervisor {
         };
         let plan = plan_with(userns).map_err(failed)?;
 
+        let services = plan.model["services"].as_object().map_or(1, |m| m.len());
+        self.containers
+            .store(services.max(1) as u64, Ordering::SeqCst);
         self.set_state(SupervisorState::Starting);
         let mut up: Vec<String> = vec![
             "-f".into(),

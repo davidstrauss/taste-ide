@@ -97,8 +97,12 @@ impl Step {
         Step::Ready,
     ];
 
-    fn title(self) -> &'static str {
+    /// The step's name, for an environment of `containers` containers:
+    /// a Compose project starts and stops several.
+    fn title(self, containers: usize) -> &'static str {
         match self {
+            Step::Leave if containers > 1 => "Stop containers and save work",
+            Step::Start if containers > 1 => "Start containers",
             Step::Leave => "Stop container and save work",
             Step::CarryOut => "Copy volumes out of the old VM",
             Step::CarryIn => "Copy volumes into the new VM",
@@ -192,7 +196,7 @@ pub(crate) struct StepRow {
 
 impl StepRow {
     fn new(step: Step) -> Self {
-        Self::titled(step.title())
+        Self::titled(step.title(1))
     }
 
     pub(crate) fn titled(name: &str) -> Self {
@@ -360,6 +364,9 @@ pub struct StartupPage {
     /// The image build's step count and how many of them the cache
     /// answered, read off its log.
     build_steps: Cell<(u32, u32)>,
+    /// How many containers the environment starts
+    /// ([`Self::set_containers`]).
+    containers: Cell<usize>,
     /// Whether a start is under way: set by the first transitional state,
     /// cleared when the page is reset for the next start.
     underway: Cell<bool>,
@@ -499,6 +506,7 @@ impl StartupPage {
             current: Cell::new(None),
             since: Cell::new(None),
             build_steps: Cell::new((0, 0)),
+            containers: Cell::new(1),
             underway: Cell::new(false),
             settled: Cell::new(false),
             moving: Cell::new(false),
@@ -743,6 +751,18 @@ impl StartupPage {
         say(&self.folded_later, later, " more");
     }
 
+    /// How many containers the environment starts — one, or a Compose
+    /// project's services (`Supervisor::containers`) — which the rows that
+    /// name the container say in the singular or the plural.
+    pub fn set_containers(&self, containers: usize) {
+        if self.containers.replace(containers) == containers {
+            return;
+        }
+        for step in [Step::Leave, Step::Start] {
+            self.row(step).title.set_label(step.title(containers));
+        }
+    }
+
     fn row(&self, step: Step) -> &StepRow {
         &self.rows[Step::ALL.iter().position(|s| *s == step).unwrap_or(0)]
     }
@@ -814,7 +834,10 @@ impl StartupPage {
                 (of, 0) => format!("Built in {took}: {of} steps."),
                 (of, cached) => format!("Built in {took}: {of} steps, {cached} from the cache."),
             },
-            Step::Start => format!("Container up in {took}."),
+            Step::Start => match self.containers.get() {
+                1 => format!("Container up in {took}."),
+                n => format!("{n} containers up in {took}."),
+            },
             // A copy ends on what its last line said — "Carried its agent's
             // home out: 1.4 GiB in 21 s" — and the move's other rows on how
             // long they took.
@@ -1271,6 +1294,16 @@ impl StartupPage {
                     self.on_build_line(line);
                 }
             }
+            // A Compose project's start: its services' containers coming
+            // up, which the step names in the plural.
+            "compose" => {
+                self.set_containers(3);
+                self.activate(Step::Vm, None);
+                self.activate(Step::Files, None);
+                self.activate(Step::Place, None);
+                self.activate(Step::Build, None);
+                self.activate(Step::Start, None);
+            }
             "failed" => {
                 self.activate(Step::Vm, None);
                 self.activate(Step::Files, None);
@@ -1574,6 +1607,22 @@ mod tests {
             assert_eq!(page.row(Step::Files).status.get(), Status::Done);
             assert_eq!(page.row(Step::Place).status.get(), Status::Active);
         });
+    }
+
+    /// A Compose project starts and stops several containers, and the
+    /// rows that name the container say so; every other row reads the
+    /// same either way.
+    #[test]
+    fn the_container_rows_are_plural_for_a_compose_project() {
+        assert_eq!(Step::Start.title(1), "Start container");
+        assert_eq!(Step::Start.title(3), "Start containers");
+        assert_eq!(Step::Leave.title(1), "Stop container and save work");
+        assert_eq!(Step::Leave.title(2), "Stop containers and save work");
+        for step in Step::ALL {
+            if !matches!(step, Step::Start | Step::Leave) {
+                assert_eq!(step.title(1), step.title(3), "{step:?}");
+            }
+        }
     }
 
     #[test]

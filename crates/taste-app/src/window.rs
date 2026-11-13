@@ -4753,9 +4753,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         if !probe_mode {
                             use taste_core::event::DevcontainerStateEvent as S;
                             let page = startup_for(&env);
-                            let baseline = environments_for_events.get(&env).is_some_and(|s| {
+                            let supervisor = environments_for_events.get(&env);
+                            let baseline = supervisor.as_ref().is_some_and(|s| {
                                 s.config_authority() == taste_core::ConfigAuthority::Baseline
                             });
+                            if let Some(s) = &supervisor {
+                                page.set_containers(s.containers());
+                            }
                             page.on_state(&state, baseline);
                             // Forward only for the environment the panes are
                             // aimed at — one still being made included,

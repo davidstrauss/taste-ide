@@ -367,7 +367,8 @@ as a host with VT-x off does —, `service` — the files service's image buildi
 in the VM, its podman step as the row's detail —, `place` — the checkout's seed partway,
 git's progress as its detail —, `build`, `failed`, `waiting` — a build that could not reach
 the network trying again, the wait on its row —, `offline` — the same after its last try,
-the page saying the network was the reason —, `noconfig`, `ready`, `move` —
+the page saying the network was the reason —, `noconfig`, `ready`, `compose` —
+the start of a Compose project of three services, its step in the plural —, `move` —
 the page as a move to a VM on the current release draws it, its work saved,
 its container stopped, its agent's home copied out, the new VM booted, and
 the home copied in partway, a minute and more along — folded to fit the
