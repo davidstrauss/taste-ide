@@ -236,8 +236,8 @@ pub fn validate_security_via(
 ) -> Result<()> {
     validate_run_args(&run_args_to_pass(config))?;
     validate_build(config)?;
-    for port in &config.forward_ports {
-        if *port < 1024 {
+    for port in config.forward_ports.iter().map(|p| p.port) {
+        if port < 1024 {
             bail!(
                 "devcontainer.json forwardPorts: {port} is privileged;                  only ports ≥ 1024 are published (the repo is untrusted)"
             );

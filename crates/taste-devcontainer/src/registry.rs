@@ -3105,7 +3105,7 @@ impl EnvironmentRegistry {
 
         // Its volumes, named while its config is still there to name them
         // (`Supervisor::remove_owned_volume`).
-        let volumes = supervisor.env_volumes();
+        let volumes = supervisor.owned_volumes().await;
         // Container next: a running container holds the clone's mount.
         let _ = supervisor.stop().await;
         // A checkout in a VM goes after its container, through the files
@@ -5347,8 +5347,13 @@ impl EnvironmentRegistry {
             None => format!("volume {volume}"),
         };
         let mut tars = CarriedFiles::default();
-        let mut carried: Vec<(String, PathBuf)> = Vec::new();
-        for (n, volume) in supervisor.env_volumes().into_iter().enumerate() {
+        let mut carried: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+        for (n, volume) in supervisor
+            .owned_volumes_on(old_substrate)
+            .await
+            .into_iter()
+            .enumerate()
+        {
             let began = std::time::Instant::now();
             let tar = self.env_dir(env).join(format!("volume-{n}.tar"));
             tars.0.push(tar.clone());
@@ -5365,7 +5370,11 @@ impl EnvironmentRegistry {
             };
             if let Some(bytes) = exported {
                 self.carried(env, &format!("carried {} out", what(&volume)), bytes, began);
-                carried.push((volume, tar));
+                // Its labels go with it: Compose finds a project's volumes
+                // by them, and so does `Supervisor::owned_volumes`, which
+                // a volume made bare in the new VM would be lost to.
+                let labels = volume_labels(old_substrate, &volume).await;
+                carried.push((volume, tar, labels));
             }
         }
 
@@ -5411,7 +5420,7 @@ impl EnvironmentRegistry {
             &target.domain,
             format!("{env}: moving in from VM {old_domain}"),
         );
-        for (volume, tar) in carried {
+        for (volume, tar, labels) in carried {
             let began = std::time::Instant::now();
             let step = format!("carrying {} in", what(&volume));
             self.move_step(env, supervisor, moving, &step);
@@ -5419,9 +5428,11 @@ impl EnvironmentRegistry {
             let substrate = target_substrate.clone();
             let report = self.carry_reporter(env, step, Some(size));
             let name = volume.clone();
-            tokio::task::spawn_blocking(move || import_volume(&substrate, &name, &tar, &*report))
-                .await
-                .context("importing a volume did not finish")??;
+            tokio::task::spawn_blocking(move || {
+                import_volume(&substrate, &name, &labels, &tar, &*report)
+            })
+            .await
+            .context("importing a volume did not finish")??;
             self.carried(env, &format!("carried {} in", what(&volume)), size, began);
         }
         drop(tars);
@@ -5911,17 +5922,50 @@ fn size_words(bytes: u64) -> String {
     }
 }
 
-/// A tar file on this host into a podman volume of `substrate`, made for it.
+/// A volume's labels in `substrate`'s podman, each as `key=value`, for
+/// making it again elsewhere; none when it will not say.
+async fn volume_labels(substrate: &Substrate, volume: &str) -> Vec<String> {
+    let json = crate::reconcile::capture(
+        substrate,
+        vec![
+            "volume".into(),
+            "inspect".into(),
+            "--format".into(),
+            "{{json .Labels}}".into(),
+            volume.to_string(),
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    serde_json::from_str::<std::collections::BTreeMap<String, String>>(json.trim())
+        .map(|labels| {
+            labels
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A tar file on this host into a podman volume of `substrate`, made for it
+/// with `labels`.
 fn import_volume(
     substrate: &Substrate,
     volume: &str,
+    labels: &[String],
     from: &Path,
     progress: &(dyn Fn(u64) + Send + Sync),
 ) -> Result<()> {
     use std::io::{Read, Write};
+    let mut create: Vec<String> = vec!["volume".into(), "create".into(), "--ignore".into()];
+    for label in labels {
+        create.push("--label".into());
+        create.push(label.clone());
+    }
+    create.push(volume.to_string());
     let _ = substrate
         .std_command(&[])
-        .args(["volume", "create", "--ignore", volume])
+        .args(&create)
         .stdin(std::process::Stdio::null())
         .output();
     let mut file =

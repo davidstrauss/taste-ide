@@ -629,9 +629,6 @@ pub struct Supervisor {
     /// has looked. An agent's commit there fails with "Author identity
     /// unknown", and the situation says so before it tries ([`Situation`]).
     authorless: Mutex<Option<bool>>,
-    /// The volumes the last Compose start made for this environment, by
-    /// their names here: its own, for [`Self::env_volumes`].
-    compose_volumes: Mutex<Vec<String>>,
     /// The project config whose image would not build or pull, by the
     /// hash of the whole setup, with podman's word for why. While the
     /// files on disk are the ones that failed, resolution passes them over
@@ -1078,7 +1075,6 @@ impl Supervisor {
             published_ports: Mutex::new(std::collections::HashMap::new()),
             passed_over: Mutex::new(None),
             authorless: Mutex::new(None),
-            compose_volumes: Mutex::new(Vec::new()),
             build_failed: Mutex::new(None),
             failed_build_log: Mutex::new(None),
             hook_failure: Mutex::new(None),
@@ -5296,9 +5292,18 @@ impl Supervisor {
         }
         let taken = self.ports_taken_elsewhere().await;
         let published = self.publish_ports(config, &taken);
-        let ports: Vec<(u16, u16)> = published
+        let named: std::collections::HashMap<u16, Option<String>> = config
+            .ports()
+            .into_iter()
+            .map(|spec| (spec.port, spec.service))
+            .collect();
+        let ports: Vec<crate::compose::Forward> = published
             .iter()
-            .map(|(port, host)| (*host, *port))
+            .map(|(port, host)| crate::compose::Forward {
+                service: named.get(port).cloned().flatten(),
+                target: *port,
+                published: *host,
+            })
             .collect();
         let grant = self.grant_for(config, authority);
         *self.applied_grant.lock().unwrap() = Some(grant);
@@ -5409,15 +5414,6 @@ impl Supervisor {
             None => None,
         };
         let plan = plan_with(userns).map_err(failed)?;
-        *self.compose_volumes.lock().unwrap() = plan.model["volumes"]
-            .as_object()
-            .map(|volumes| {
-                volumes
-                    .values()
-                    .filter_map(|v| v["name"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
 
         self.set_state(SupervisorState::Starting);
         let mut up: Vec<String> = vec![
@@ -5901,9 +5897,45 @@ impl Supervisor {
                     .map(|declared| self.namespaced_volume(declared)),
             );
         }
-        for volume in self.compose_volumes.lock().unwrap().iter() {
-            if !volumes.contains(volume) {
-                volumes.push(volume.clone());
+        volumes
+    }
+
+    /// [`Self::env_volumes`], and the volumes podman holds for this
+    /// environment's Compose project: each named in the Compose files, so
+    /// only Compose's reading of them knows the names, and Compose labels
+    /// every volume it makes with its project, which is this
+    /// environment's alone ([`Self::container_name`]). Asked of podman
+    /// rather than remembered from the last start, so a destroy or a move
+    /// after the IDE restarted still finds the database's data (an
+    /// earlier version kept them in memory, and left them behind then).
+    pub async fn owned_volumes(&self) -> Vec<String> {
+        self.owned_volumes_on(&self.substrate()).await
+    }
+
+    /// [`Self::owned_volumes`], asked of `substrate`'s podman: the one a
+    /// move is carrying them out of.
+    pub async fn owned_volumes_on(&self, substrate: &crate::substrate::Substrate) -> Vec<String> {
+        let mut volumes = self.env_volumes();
+        let listed = crate::reconcile::capture(
+            substrate,
+            vec![
+                "volume".into(),
+                "ls".into(),
+                "--filter".into(),
+                format!(
+                    "label={}={}",
+                    crate::compose::LABEL_PROJECT,
+                    self.container_name()
+                ),
+                "--format".into(),
+                "{{.Name}}".into(),
+            ],
+        )
+        .await
+        .unwrap_or_default();
+        for name in listed.lines().map(str::trim).filter(|n| !n.is_empty()) {
+            if !volumes.iter().any(|v| v == name) {
+                volumes.push(name.to_string());
             }
         }
         volumes
@@ -5914,7 +5946,7 @@ impl Supervisor {
     /// environment, not podman at large, and certainly not a sibling
     /// environment's cache.
     pub async fn remove_volume(&self, volume: &str) -> Result<()> {
-        if !self.env_volumes().iter().any(|v| v == volume) {
+        if !self.owned_volumes().await.iter().any(|v| v == volume) {
             bail!(
                 "volume {volume} does not belong to environment {}",
                 self.env.id
@@ -6101,7 +6133,7 @@ impl Supervisor {
             usage.unmeasured = self.env_volumes().len();
             return usage;
         }
-        for volume in self.env_volumes() {
+        for volume in self.owned_volumes().await {
             let mountpoint = self
                 .run_captured(vec![
                     "volume".into(),
@@ -6220,7 +6252,7 @@ impl Supervisor {
             }
         }
 
-        for volume in self.env_volumes() {
+        for volume in self.owned_volumes().await {
             let exists = self
                 .run_captured(vec![
                     "volume".into(),

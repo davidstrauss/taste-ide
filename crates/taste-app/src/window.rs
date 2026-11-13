@@ -370,6 +370,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 taste_devcontainer::config::PortSpec {
                     port,
                     host: port,
+                    service: None,
                     label: None,
                     protocol: None,
                 },
@@ -3371,6 +3372,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 taste_devcontainer::config::PortSpec {
                     port: 3000,
                     host: 3000,
+                    service: None,
                     label: Some("App".into()),
                     protocol: None,
                 },
@@ -4419,6 +4421,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 let spec = taste_devcontainer::config::PortSpec {
                     port,
                     host: port,
+                    service: None,
                     label: None,
                     protocol: None,
                 };

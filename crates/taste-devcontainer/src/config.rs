@@ -107,6 +107,9 @@ pub struct PortSpec {
     /// of one project forward the same numbers). The supervisor fills it
     /// in; a spec straight from the config says `port`.
     pub host: u16,
+    /// The Compose service whose port it is, when `forwardPorts` names one
+    /// (`"db:5432"`); `None` for the dev service's own.
+    pub service: Option<String>,
     /// `portsAttributes.<port>.label`, when the config gives one.
     pub label: Option<String>,
     /// `portsAttributes.<port>.protocol`: `http` or `https` per the spec,
@@ -294,9 +297,10 @@ pub struct DevcontainerConfig {
     #[serde(default)]
     pub remote_env: std::collections::BTreeMap<String, String>,
     /// Ports published to the host (localhost-only) when the container
-    /// starts — the spec's `forwardPorts`.
-    #[serde(default)]
-    pub forward_ports: Vec<u16>,
+    /// starts — the spec's `forwardPorts`: a number, or `"host:port"`,
+    /// where a host other than `localhost` is a Compose service.
+    #[serde(default, deserialize_with = "forward_ports")]
+    pub forward_ports: Vec<ForwardPort>,
     /// `hostRequirements`: see [`Grant`].
     pub host_requirements: Option<HostRequirements>,
     /// The spec's `portsAttributes`: labels and protocols, keyed by the
@@ -332,6 +336,63 @@ pub struct DevcontainerConfig {
     /// `.devcontainer/` — happens to sit on disk.
     #[serde(skip)]
     pub root: PathBuf,
+}
+
+/// One entry of `forwardPorts`: a port of the dev container, or of the
+/// Compose service it names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ForwardPort {
+    pub service: Option<String>,
+    pub port: u16,
+}
+
+impl ForwardPort {
+    /// An entry as the spec writes it: `3000`, `"3000"`, `"localhost:3000"`,
+    /// or `"db:5432"`.
+    pub fn parse(value: &serde_json::Value) -> Option<Self> {
+        if let Some(port) = value.as_u64() {
+            return u16::try_from(port).ok().map(|port| ForwardPort {
+                service: None,
+                port,
+            });
+        }
+        let text = value.as_str()?.trim();
+        let (host, port) = match text.rsplit_once(':') {
+            Some((host, port)) => (Some(host.trim()), port.trim()),
+            None => (None, text),
+        };
+        let port: u16 = port.parse().ok()?;
+        let service = match host {
+            None | Some("localhost") | Some("127.0.0.1") | Some("") => None,
+            Some(host) => Some(host.to_string()),
+        };
+        Some(ForwardPort { service, port })
+    }
+
+    /// As the spec writes it, for a message.
+    pub fn spelled(&self) -> String {
+        match &self.service {
+            Some(service) => format!("{service}:{}", self.port),
+            None => self.port.to_string(),
+        }
+    }
+}
+
+fn forward_ports<'de, D>(deserializer: D) -> std::result::Result<Vec<ForwardPort>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values: Vec<serde_json::Value> = Deserialize::deserialize(deserializer)?;
+    values
+        .iter()
+        .map(|value| {
+            ForwardPort::parse(value).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "forwardPorts: {value} is not a port, \"host:port\", or \"service:port\""
+                ))
+            })
+        })
+        .collect()
 }
 
 /// A spec value that is one string or a list of them.
@@ -526,15 +587,19 @@ impl DevcontainerConfig {
     /// deduplicated.
     pub fn ports(&self) -> Vec<PortSpec> {
         let mut ports = self.forward_ports.clone();
-        ports.sort_unstable();
-        ports.dedup();
+        ports.sort_by_key(|p| (p.port, p.service.clone()));
+        ports.dedup_by_key(|p| p.port);
         ports
             .into_iter()
-            .map(|port| {
-                let attributes = self.ports_attributes.get(&port.to_string());
+            .map(|forward| {
+                let attributes = self
+                    .ports_attributes
+                    .get(&forward.spelled())
+                    .or_else(|| self.ports_attributes.get(&forward.port.to_string()));
                 PortSpec {
-                    port,
-                    host: port,
+                    port: forward.port,
+                    host: forward.port,
+                    service: forward.service,
                     label: attributes.and_then(|a| a.label.clone()),
                     protocol: attributes.and_then(|a| a.protocol.clone()),
                 }
@@ -639,7 +704,7 @@ impl DevcontainerConfig {
                     self.config_path.display()
                 );
             }
-            for file in files {
+            for file in &files {
                 if !file.starts_with(&self.root) {
                     bail!(
                         "{}: the Compose file {} is outside the checkout",
@@ -648,7 +713,33 @@ impl DevcontainerConfig {
                     );
                 }
             }
+            // A port is one row, one tab, and one forward on this machine,
+            // keyed by its number: the same number from two services would
+            // be two of them in one place.
+            for (i, a) in self.forward_ports.iter().enumerate() {
+                if let Some(b) = self.forward_ports[i + 1..]
+                    .iter()
+                    .find(|b| b.port == a.port && b.service != a.service)
+                {
+                    bail!(
+                        "{}: forwardPorts names port {} twice ({} and {}); forward one, or \
+                         have one service listen on another port",
+                        self.config_path.display(),
+                        a.port,
+                        a.spelled(),
+                        b.spelled()
+                    );
+                }
+            }
             return Ok(());
+        }
+        if let Some(named) = self.forward_ports.iter().find(|p| p.service.is_some()) {
+            bail!(
+                "{}: forwardPorts names {}, and a service is a Compose config's; this config \
+                 is a single container, whose ports are named by number",
+                self.config_path.display(),
+                named.spelled()
+            );
         }
         if self.image.is_none() && self.dockerfile_path().is_none() {
             bail!(
@@ -891,6 +982,73 @@ mod tests {
         assert_eq!(services["odd"].port, None);
         assert_eq!(services["bad"].port, None);
         assert!(services_from(&serde_json::Value::Null).is_empty());
+    }
+
+    fn config_of(json: &str) -> (tempfile::TempDir, DevcontainerConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let dc = dir.path().join(".devcontainer");
+        std::fs::create_dir(&dc).unwrap();
+        std::fs::write(dc.join("devcontainer.json"), json).unwrap();
+        let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
+        (dir, config)
+    }
+
+    /// `forwardPorts` takes the spec's every spelling: a number, a
+    /// numeral, `localhost:` one, and a Compose service's `name:port`,
+    /// which carries its attributes by either key.
+    #[test]
+    fn forward_ports_are_read_in_every_spelling() {
+        let (_dir, config) = config_of(
+            r#"{
+                "dockerComposeFile": "compose.yaml", "service": "app",
+                "forwardPorts": [3000, "4000", "localhost:5000", "db:5432"],
+                "portsAttributes": { "db:5432": { "label": "Database" } }
+            }"#,
+        );
+        let specs = config.ports();
+        let summary: Vec<(u16, Option<String>, Option<String>)> = specs
+            .into_iter()
+            .map(|p| (p.port, p.service, p.label))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (3000, None, None),
+                (4000, None, None),
+                (5000, None, None),
+                (5432, Some("db".into()), Some("Database".into())),
+            ]
+        );
+        config.validate().unwrap();
+    }
+
+    /// A service's port in a single container's config, or one port number
+    /// from two services, is refused by name; a word that is no port makes
+    /// the config unreadable, saying which.
+    #[test]
+    fn a_named_port_needs_compose_and_a_port_is_forwarded_once() {
+        let (_dir, single) = config_of(r#"{ "image": "img", "forwardPorts": ["db:5432"] }"#);
+        let refused = single.validate().unwrap_err().to_string();
+        assert!(refused.contains("db:5432"), "{refused}");
+        let (_dir, twice) = config_of(
+            r#"{ "dockerComposeFile": "c.yaml", "service": "app",
+                 "forwardPorts": ["db:5432", "replica:5432"] }"#,
+        );
+        let refused = twice.validate().unwrap_err().to_string();
+        assert!(refused.contains("port 5432 twice"), "{refused}");
+        let dir = tempfile::tempdir().unwrap();
+        let dc = dir.path().join(".devcontainer");
+        std::fs::create_dir(&dc).unwrap();
+        std::fs::write(
+            dc.join("devcontainer.json"),
+            r#"{ "image": "img", "forwardPorts": ["web"] }"#,
+        )
+        .unwrap();
+        let unread = format!(
+            "{:#}",
+            DevcontainerConfig::discover(dir.path()).unwrap_err()
+        );
+        assert!(unread.contains("\"web\""), "{unread}");
     }
 
     #[test]

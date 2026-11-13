@@ -3728,8 +3728,15 @@ asked about and ruled out of scope (David, same day):
   the workspace's other environments (David: "Narrow to the
   checkout"). Published ports are dropped — every environment of a VM
   would publish the same ones — and `forwardPorts` is published on
-  loopback on the service whose network the dev service shares. Every
-  service gets the environment's memory and CPUs.
+  loopback on the service whose network the port's service shares: the
+  dev service's, or the one an entry names (`"db:5432"`, the spec's
+  `host:port` form). A port is keyed by its number on this machine — its
+  row, its tab, its forward — so one number from two services refuses the
+  config, as a named port in a single container's config does. Every
+  service gets the environment's memory and CPUs. An environment's
+  Compose volumes are found by Compose's own project label, which is the
+  environment's name, so a destroy or a move finds them after a restart
+  too, and a move carries each volume's labels into the new VM with it.
 - **Nested podman is granted, and only as much of it as it needs**
   (2026-09-23). Projects that run podman themselves — a build in a
   container, a test that starts one — are ordinary, and a devcontainer

@@ -186,7 +186,7 @@ pub(crate) fn podman(substrate: &Substrate, args: &[String]) -> tokio::process::
     substrate.command(args)
 }
 
-async fn capture(substrate: &Substrate, args: Vec<String>) -> Result<String> {
+pub(crate) async fn capture(substrate: &Substrate, args: Vec<String>) -> Result<String> {
     let output = podman(substrate, &args)
         .stdin(std::process::Stdio::null())
         .output()

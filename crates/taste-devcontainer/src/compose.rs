@@ -52,6 +52,11 @@ pub const SHA256_AARCH64: &str = "42cfa75f51ad0ccf290bad37899e0038a8c10a0069e852
 /// says a container IS the environment, and is what finds it.
 pub const LABEL_SERVICE_OF: &str = "taste.env-service";
 
+/// The label Compose puts on everything it makes for a project — its
+/// containers, networks, and volumes — naming the project, which is an
+/// environment's own (`Supervisor::owned_volumes`).
+pub const LABEL_PROJECT: &str = "com.docker.compose.project";
+
 /// `word` as one word for a POSIX shell: as it is when it can only be
 /// one, single-quoted otherwise.
 pub fn shell_word(word: &str) -> String {
@@ -172,7 +177,7 @@ pub struct Context<'a> {
     /// The dev service's user mapping, as `--userns` takes it.
     pub userns: Option<String>,
     /// `forwardPorts`, each with the port it is published on in the VM.
-    pub ports: &'a [(u16, u16)],
+    pub ports: &'a [Forward],
     /// The environment's memory, in MiB, and CPUs: every service's limit.
     pub memory_mib: u64,
     pub cpus: u32,
@@ -191,6 +196,15 @@ pub struct Context<'a> {
     /// Whether a path under the checkout may be bound, read, or built
     /// from: no symlink on the way out of it (`security::bind_stays_inside`).
     pub path_check: &'a dyn Fn(&Path) -> Result<(), String>,
+}
+
+/// One of `forwardPorts`: the service it names (the dev service's own
+/// when none), its port there, and the port it is published on in the VM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    pub service: Option<String>,
+    pub target: u16,
+    pub published: u16,
 }
 
 /// What to bring up.
@@ -260,21 +274,27 @@ pub fn plan(model: &Value, cx: &Context) -> Result<Plan, String> {
             self::service(name, service, dev, cx, &mut notes)?,
         );
     }
-    // forwardPorts, on whichever service owns the dev service's network.
-    if !cx.ports.is_empty() {
-        let owner = network_owner(&rewritten, cx.service)?;
-        let ports: Vec<Value> = cx
-            .ports
-            .iter()
-            .map(|(published, target)| {
-                json!({
-                    "target": target,
-                    "published": published.to_string(),
-                    "host_ip": "127.0.0.1",
-                    "protocol": "tcp",
-                })
-            })
-            .collect();
+    // forwardPorts, each on whichever service owns the network of the
+    // service it names — the dev service's when it names none.
+    let mut published: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for forward in cx.ports {
+        let named = forward.service.as_deref().unwrap_or(cx.service);
+        if !rewritten.contains_key(named) {
+            return Err(format!(
+                "forwardPorts names {named}:{}, and the Compose files define no service \
+                 \"{named}\"",
+                forward.target
+            ));
+        }
+        let owner = network_owner(&rewritten, named)?;
+        published.entry(owner).or_default().push(json!({
+            "target": forward.target,
+            "published": forward.published.to_string(),
+            "host_ip": "127.0.0.1",
+            "protocol": "tcp",
+        }));
+    }
+    for (owner, ports) in published {
         if let Some(service) = rewritten.get_mut(&owner).and_then(Value::as_object_mut) {
             service.insert("ports".into(), Value::Array(ports));
         }
@@ -844,9 +864,35 @@ mod tests {
         with_using(&[], &|_| Ok(()), edit)
     }
 
+    /// The forwarded ports [`with`] gives a plan.
+    fn default_ports() -> Vec<Forward> {
+        vec![
+            Forward {
+                service: None,
+                target: 3000,
+                published: 3000,
+            },
+            Forward {
+                service: None,
+                target: 5432,
+                published: 15432,
+            },
+        ]
+    }
+
     /// [`with`], the services to start and the check on disk given.
     fn with_using<T>(
         run_services: &[String],
+        path_check: &dyn Fn(&Path) -> Result<(), String>,
+        edit: impl FnOnce(&mut Context) -> T,
+    ) -> T {
+        with_ports(run_services, &default_ports(), path_check, edit)
+    }
+
+    /// [`with_using`], the forwarded ports given too.
+    fn with_ports<T>(
+        run_services: &[String],
+        ports: &[Forward],
         path_check: &dyn Fn(&Path) -> Result<(), String>,
         edit: impl FnOnce(&mut Context) -> T,
     ) -> T {
@@ -871,7 +917,7 @@ mod tests {
             service_labels: BTreeMap::from([(LABEL_SERVICE_OF.into(), "primary".into())]),
             ide_mounts: &ide,
             userns: Some("keep-id:uid=1000,gid=1000".into()),
-            ports: &[(3000, 3000), (15432, 5432)],
+            ports,
             memory_mib: 4096,
             cpus: 4,
             cpu_shares: 1024,
@@ -964,6 +1010,40 @@ mod tests {
             m["networks"]["default"].get("name").is_none(),
             "named by Compose after the project"
         );
+    }
+
+    /// A port forwarded from a service by name (`"cache:6379"`) is
+    /// published on that service, or on the one whose network it shares;
+    /// a name the files do not define refuses the config.
+    #[test]
+    fn a_port_named_by_service_is_published_on_it() {
+        let mut model = good_job();
+        model["services"]["cache"] = json!({ "image": "redis:7" });
+        let forwards = [
+            Forward {
+                service: Some("cache".into()),
+                target: 6379,
+                published: 16379,
+            },
+            Forward {
+                service: None,
+                target: 3000,
+                published: 3000,
+            },
+        ];
+        let planned = with_ports(&[], &forwards, &|_| Ok(()), |cx| plan(&model, cx)).unwrap();
+        let services = &planned.model["services"];
+        assert_eq!(services["cache"]["ports"][0]["target"], 6379);
+        assert_eq!(services["cache"]["ports"][0]["published"], "16379");
+        // The app shares the database's network, so its port is there.
+        assert_eq!(services["db"]["ports"][0]["target"], 3000);
+        let missing = [Forward {
+            service: Some("search".into()),
+            target: 9200,
+            published: 9200,
+        }];
+        let refused = with_ports(&[], &missing, &|_| Ok(()), |cx| plan(&model, cx)).unwrap_err();
+        assert!(refused.contains("\"search\""), "{refused}");
     }
 
     /// Every way out of the VM's own sandbox refuses the config by name.
@@ -1159,7 +1239,11 @@ mod tests {
                 service_labels: BTreeMap::from([(LABEL_SERVICE_OF.into(), "primary".into())]),
                 ide_mounts: &ide,
                 userns: Some("keep-id:uid=1000,gid=1000".into()),
-                ports: &[(18080, 8080)],
+                ports: &[Forward {
+                    service: None,
+                    target: 8080,
+                    published: 18080,
+                }],
                 memory_mib: 1024,
                 cpus: 2,
                 cpu_shares: 1024,
