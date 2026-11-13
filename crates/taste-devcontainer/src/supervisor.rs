@@ -5311,7 +5311,7 @@ impl Supervisor {
                 ));
             }
         }
-        self.carry_repo_identity(name, user).await;
+        self.carry_repo_identity().await;
     }
 
     /// The project's author carried into this environment's checkout now,
@@ -5319,9 +5319,9 @@ impl Supervisor {
     /// the file tree's banner, so a commit there need not wait for a
     /// restart. Nothing when the container is not running.
     pub async fn carry_project_author(&self) {
-        let running = self.git_exec.lock().unwrap().clone();
-        if let Some((name, user)) = running {
-            self.carry_repo_identity(&name, user.as_deref()).await;
+        let running = self.git_exec.lock().unwrap().is_some();
+        if running {
+            self.carry_repo_identity().await;
         }
     }
 
@@ -5333,51 +5333,33 @@ impl Supervisor {
     /// envs"). On every start rather than at the clone, so environments
     /// made before this, and a change to the project's author since, are
     /// carried too. Never fatal.
-    async fn carry_repo_identity(&self, name: &str, user: Option<&str>) {
+    async fn carry_repo_identity(&self) {
         let root = self.workspace_root().to_path_buf();
         let Ok(Some(identity)) = tokio::task::spawn_blocking(move || project_author(&root)).await
         else {
             return;
         };
-        let checkout = self.checkout().path().display().to_string();
-        let exec = |tail: &[&str]| {
-            let mut args: Vec<String> = vec!["exec".into()];
-            if let Some(user) = user {
-                args.push("--user".into());
-                args.push(user.to_string());
-            }
-            args.push(name.to_string());
-            args.extend(["git".to_string(), "-C".into(), checkout.clone()]);
-            args.extend(tail.iter().map(|s| s.to_string()));
-            args
-        };
-        let current = (
-            self.run_captured(exec(&["config", "--local", "--get", "user.name"]))
-                .await
-                .unwrap_or_default(),
-            self.run_captured(exec(&["config", "--local", "--get", "user.email"]))
-                .await
-                .unwrap_or_default(),
-        );
-        if current.0.trim() == identity.name && current.1.trim() == identity.email {
-            return;
+        // Through the files service, which keeps the checkout in the VM,
+        // and not through the container: safe mode's baseline binds the
+        // checkout read-only, so `git config` run in it could not lock
+        // `.git/config`, and a project in safe mode never got its author
+        // ("could not lock config file .git/config: Read-only file
+        // system", 2026-11-12). Writing it is the IDE's act, not the
+        // agent's, and the read-only mount is about the agent's shell.
+        let files = self.files();
+        let checkout = self.checkout().path().to_path_buf();
+        let wanted = identity.clone();
+        let carried =
+            tokio::task::spawn_blocking(move || carry_identity(&files, &checkout, &wanted)).await;
+        match carried {
+            Ok(Ok(true)) => self.log(format!(
+                "the project's git author carried into the checkout: {} <{}>",
+                identity.name, identity.email
+            )),
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => self.log(format!("the project's git author not carried ({e})")),
+            Err(e) => self.log(format!("the project's git author not carried: {e}")),
         }
-        for (key, value) in [
-            ("user.name", &identity.name),
-            ("user.email", &identity.email),
-        ] {
-            if let Err(e) = self
-                .run_captured(exec(&["config", "--local", key, value]))
-                .await
-            {
-                self.log(format!("the project's git author not carried ({key}): {e}"));
-                return;
-            }
-        }
-        self.log(format!(
-            "the project's git author carried into the checkout: {} <{}>",
-            identity.name, identity.email
-        ));
     }
 
     /// Stop and remove the container; execution falls back to the host.
@@ -5889,6 +5871,42 @@ pub(crate) fn stage_build_context(source: &Path, name: &str) -> Result<PathBuf> 
 /// workspace's state (`git-author`) so a re-clone of the folder does not
 /// hand every environment the host's identity
 /// (`taste_git::project_identity`). Blocking: file IO on both sides.
+/// `identity` written into the repository at `checkout` as its own author,
+/// by `git config --local` run where `files` runs commands: `Ok(true)` when
+/// it was written, `Ok(false)` when the checkout already named it.
+fn carry_identity(
+    files: &taste_core::files::Files,
+    checkout: &Path,
+    identity: &taste_git::GitIdentity,
+) -> Result<bool, String> {
+    let git = |tail: &[&str]| {
+        let mut argv: Vec<String> = vec!["git".into(), "config".into(), "--local".into()];
+        argv.extend(tail.iter().map(|s| s.to_string()));
+        files.exec(checkout, &argv)
+    };
+    let current = |key: &str| {
+        git(&["--get", key])
+            .ok()
+            .filter(|out| out.success())
+            .map(|out| out.stdout_utf8().trim().to_string())
+    };
+    if current("user.name").as_deref() == Some(identity.name.as_str())
+        && current("user.email").as_deref() == Some(identity.email.as_str())
+    {
+        return Ok(false);
+    }
+    for (key, value) in [
+        ("user.name", &identity.name),
+        ("user.email", &identity.email),
+    ] {
+        let out = git(&[key, value]).map_err(|e| format!("{key}: {e}"))?;
+        if !out.success() {
+            return Err(format!("{key}: {}", out.stderr_utf8().trim()));
+        }
+    }
+    Ok(true)
+}
+
 pub fn project_author(workspace_root: &Path) -> Option<taste_git::GitIdentity> {
     taste_git::project_identity(
         workspace_root,
@@ -7282,6 +7300,35 @@ mod tests {
 
     fn env(slug: &str) -> EnvironmentId {
         EnvironmentId::parse(slug).unwrap()
+    }
+
+    /// The project's author goes into a checkout by `git config` run where
+    /// the files service runs commands, needing no container: written once,
+    /// and left alone when the checkout already names it.
+    #[test]
+    fn the_project_author_is_carried_without_a_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let identity = taste_git::GitIdentity {
+            name: "Ada Example".into(),
+            email: "ada@example.com".into(),
+        };
+        let files = taste_core::files::Files::Local;
+        assert_eq!(carry_identity(&files, dir.path(), &identity), Ok(true));
+        let config = git2::Repository::open(dir.path())
+            .unwrap()
+            .config()
+            .unwrap();
+        let local = config.open_level(git2::ConfigLevel::Local).unwrap();
+        assert_eq!(local.get_string("user.name").unwrap(), "Ada Example");
+        assert_eq!(local.get_string("user.email").unwrap(), "ada@example.com");
+        assert_eq!(carry_identity(&files, dir.path(), &identity), Ok(false));
     }
 
     fn write_config(root: &std::path::Path) {
