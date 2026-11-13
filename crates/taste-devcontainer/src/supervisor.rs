@@ -5163,9 +5163,11 @@ impl Supervisor {
     /// Run the pinned Compose (`crate::compose::VERSION`) in this
     /// environment's VM, against the VM's podman, as project
     /// [`Self::container_name`]: `tail` after `docker compose -p <project>`,
-    /// `stdin` piped to it when given. What it prints on stdout comes back;
-    /// what it says on stderr goes to the build log when `logged`, and its
-    /// last line is the error when it fails.
+    /// `stdin` piped to it when given. When `logged`, everything it prints
+    /// goes to the build log as it comes — a build's own output, each
+    /// step's and the failing command's, is on stdout, and only Compose's
+    /// summary of it on stderr — and a failure says both its last lines.
+    /// Otherwise what it prints on stdout comes back, for reading.
     async fn compose(
         &self,
         tail: Vec<String>,
@@ -5184,13 +5186,16 @@ impl Supervisor {
                 "DOCKER_HOST=unix://{}",
                 crate::provision::GUEST_PODMAN_SOCKET
             ),
+            // The classic builder, which is the one podman serves; said, so
+            // Compose does not warn at every build that it fell back to it.
+            "DOCKER_BUILDKIT=0".into(),
             binary.display().to_string(),
-            "-p".into(),
-            self.container_name(),
         ];
+        let shown = words.len();
+        words.extend(["-p".to_string(), self.container_name()]);
         words.extend(tail);
         if logged {
-            self.log(format!("$ docker compose {}", words[3..].join(" ")));
+            self.log(format!("$ docker compose {}", words[shown..].join(" ")));
         }
         // ssh hands the guest's shell one line: every word quoted, since
         // service names and paths are the repository's.
@@ -5220,27 +5225,46 @@ impl Supervisor {
         }
         let stdout = child.stdout.take().context("ssh took no stdout")?;
         let stderr = child.stderr.take().context("ssh took no stderr")?;
-        let reading = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut out = String::new();
-            let mut stdout = stdout;
-            let _ = stdout.read_to_string(&mut out).await;
-            out
-        });
-        let mut said = BufReader::new(stderr).lines();
-        let mut last = String::new();
-        while let Some(line) = said.next_line().await? {
-            if !line.trim().is_empty() {
-                last = line.clone();
-            }
-            if logged {
-                self.log(line);
+        let mut out_lines = BufReader::new(stdout).lines();
+        let mut err_lines = BufReader::new(stderr).lines();
+        let mut out = String::new();
+        let (mut last_out, mut last_err) = (String::new(), String::new());
+        let (mut out_done, mut err_done) = (false, false);
+        while !(out_done && err_done) {
+            tokio::select! {
+                line = out_lines.next_line(), if !out_done => match line? {
+                    Some(line) => {
+                        if !line.trim().is_empty() {
+                            last_out = line.trim().to_string();
+                        }
+                        if logged {
+                            self.log(line);
+                        } else {
+                            out.push_str(&line);
+                            out.push('\n');
+                        }
+                    }
+                    None => out_done = true,
+                },
+                line = err_lines.next_line(), if !err_done => match line? {
+                    Some(line) => {
+                        if !line.trim().is_empty() {
+                            last_err = line.trim().to_string();
+                        }
+                        if logged {
+                            self.log(line);
+                        }
+                    }
+                    None => err_done = true,
+                },
             }
         }
         let status = child.wait().await?;
-        let out = reading.await.unwrap_or_default();
         if !status.success() {
-            bail!("docker compose failed: {}", last.trim());
+            bail!(
+                "docker compose failed: {}",
+                failure_words(&last_err, &last_out, logged)
+            );
         }
         Ok(out)
     }
@@ -6994,6 +7018,23 @@ fn free_port() -> Option<u16> {
 }
 
 /// `LABEL_PORTS`'s value for these pairs: `container:host`, comma-joined.
+/// What a failed Compose run is said to have failed with: Compose's own
+/// last word, and, for a run whose output was the build's, that output's
+/// last line — the failing command's own, which Compose's summary of the
+/// step ("exit status 127") leaves out: "apt-key: not found" is the
+/// reason, and the status is only its number.
+fn failure_words(last_err: &str, last_out: &str, logged: bool) -> String {
+    match (
+        last_err.is_empty(),
+        logged && !last_out.is_empty() && last_out != last_err,
+    ) {
+        (false, true) => format!("{last_err} — {last_out}"),
+        (false, false) => last_err.to_string(),
+        (true, _) if !last_out.is_empty() => last_out.to_string(),
+        (true, _) => "it said nothing".to_string(),
+    }
+}
+
 fn ports_label(pairs: &[(u16, u16)]) -> String {
     pairs
         .iter()
@@ -7732,6 +7773,24 @@ mod tests {
 
     fn env(slug: &str) -> EnvironmentId {
         EnvironmentId::parse(slug).unwrap()
+    }
+
+    /// A failed build is said with the failing command's own last line
+    /// beside Compose's summary of the step, which has only its status.
+    #[test]
+    fn a_failed_compose_build_says_what_the_command_said() {
+        assert_eq!(
+            failure_words(
+                "building at STEP \"RUN apt-key add k\": while running runtime: exit status 127",
+                "/bin/sh: 1: apt-key: not found",
+                true,
+            ),
+            "building at STEP \"RUN apt-key add k\": while running runtime: exit status 127 \
+             — /bin/sh: 1: apt-key: not found"
+        );
+        // A reading's stdout is its answer, not a reason.
+        assert_eq!(failure_words("no such file", "{", false), "no such file");
+        assert_eq!(failure_words("", "only this", true), "only this");
     }
 
     /// The situation says the project names no author only once a carry
