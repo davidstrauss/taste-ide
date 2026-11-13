@@ -815,7 +815,7 @@ pub(crate) fn author_prompt() -> String {
      its official image, and a service you work in, from the official image of the \
      project's language (ruby, node, python, golang, and so on) or built FROM it when it \
      needs more. In that service, mount the repository with \
-     `- ..:/workspaces/${localWorkspaceFolderBasename}` under volumes, and keep it running \
+     `- ..:/workspaces/${localWorkspaceFolderBasename}:z` under volumes, and keep it running \
      with `command: sleep infinity`. Write .devcontainer/devcontainer.json with \
      \"dockerComposeFile\": \"compose.yaml\", \"service\": the service you work in, and \
      \"workspaceFolder\": \"/workspaces/${localWorkspaceFolderBasename}\". Services reach \
@@ -1027,8 +1027,11 @@ mod tests {
         assert!(prompt.contains("add no other customizations.vscode entry"));
         assert!(prompt.contains("`image:` under localhost/"));
         assert!(prompt.contains("must succeed when run a second time"));
-        assert!(prompt.contains("security_opt: [label=disable]"));
-        assert!(prompt.contains("userns_mode: ${DEVCONTAINER_USERNS:-}"));
+        assert!(
+            prompt.contains("- ..:/workspaces/${localWorkspaceFolderBasename}:z`, never `../..`")
+        );
+        assert!(prompt.contains("`\"remoteUser\": \"root\"`"));
+        assert!(!prompt.contains("DEVCONTAINER_USERNS"));
     }
 
     #[test]

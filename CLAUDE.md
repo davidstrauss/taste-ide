@@ -578,13 +578,12 @@ to.
   not only that VS Code can parse it — VS Code has none of what the IDE
   adds to a container — so the image installs Task itself (the IDE's
   bundled Task stays, as the fallback for images that do not), a built
-  Compose service names its image under `localhost/`, the service you
-  work in states `security_opt: [label=disable]` and `userns_mode:
-  ${DEVCONTAINER_USERNS:-}` (VS Code gives a single container both on
-  podman and a Compose service neither; the variable is set on the
-  user's own machine for VS Code, never needed by the IDE, which picks
-  every service's user namespace itself), and lifecycle commands succeed
-  when run a second time; each is a failure good_job's config met in VS
+  Compose service names its image under `localhost/`, a Compose project
+  works as root on a bind of the repository alone with `:z` (VS Code on
+  podman gives a single container `label=disable` and `keep-id` itself
+  and a Compose service neither; root in a rootless container is the
+  user, and `z` is Docker's own syntax — David, 2026-11-13: "avoid these
+  Podman-isms"), and lifecycle commands succeed when run a second time; each is a failure good_job's config met in VS
   Code on 2026-11-13. Agents are told all of this in
   `taste_mcp::guidance`, the environment tool's conventions, and
   `devcontainer_ui::author_prompt`, each from
