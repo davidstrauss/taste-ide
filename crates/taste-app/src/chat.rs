@@ -8056,6 +8056,9 @@ impl ChatPane {
                  the build output.\n"
             ));
         }
+        if let Some(author) = situation.author {
+            text.push_str(&format!("Git author: {author}\n"));
+        }
         text.push_str(&format!(
             "Next: {}\n\
              Tools: the IDE's MCP tools (start with environment) and your file tools. \

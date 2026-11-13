@@ -657,6 +657,7 @@ impl McpServer {
             "config_passed_over": supervisor.config_passed_over(),
             "lifecycle_failed": supervisor.hook_failure(),
             "failure": situation.failure,
+            "git_author": situation.author,
             "next": situation.next,
             "ide": {
                 "name": "taste-ide",
@@ -6670,14 +6671,26 @@ const MAX_REPLY_DESCRIPTION_CHARS: usize = 240;
 /// there is no reading under which a partial run looks like a passing one.
 fn exec_result(handle: u64, snapshot: crate::exec::Snapshot) -> Value {
     match snapshot.exit_code {
-        Some(exit_code) => json!({
-            "command": snapshot.command,
-            "exit_code": exit_code,
-            "stdout": snapshot.stdout,
-            "stderr": snapshot.stderr,
-            "output_truncated": snapshot.truncated,
-            "failure": snapshot.failure,
-        }),
+        Some(exit_code) => {
+            // Git's refusal to commit without an author comes with its own
+            // advice, to set one: what the project needs is said beside it
+            // instead (`NO_AUTHOR`).
+            let authorless = [&snapshot.stdout, &snapshot.stderr]
+                .iter()
+                .any(|out| out.contains("Author identity unknown"));
+            let mut result = json!({
+                "command": snapshot.command,
+                "exit_code": exit_code,
+                "stdout": snapshot.stdout,
+                "stderr": snapshot.stderr,
+                "output_truncated": snapshot.truncated,
+                "failure": snapshot.failure,
+            });
+            if authorless {
+                result["next"] = json!(taste_devcontainer::supervisor::NO_AUTHOR);
+            }
+            result
+        }
         None => json!({
             "command": snapshot.command,
             "running": true,
@@ -6883,6 +6896,27 @@ mod tests {
     }
 
     use super::*;
+
+    /// Git's refusal to commit without an author comes back with what the
+    /// project needs said beside it, and nothing else does.
+    #[test]
+    fn a_commit_refused_for_want_of_an_author_says_what_to_do() {
+        let snapshot = |stderr: &str| crate::exec::Snapshot {
+            command: "git commit -m x".into(),
+            stdout: String::new(),
+            stderr: stderr.into(),
+            exit_code: Some(128),
+            failure: None,
+            truncated: false,
+        };
+        let refused = exec_result(
+            1,
+            snapshot("Author identity unknown\n\n*** Please tell me who you are."),
+        );
+        assert_eq!(refused["next"], taste_devcontainer::supervisor::NO_AUTHOR);
+        let other = exec_result(1, snapshot("fatal: not a git repository"));
+        assert!(other.get("next").is_none(), "{other}");
+    }
 
     /// The guidance's high-water mark moves with its text: a change to
     /// what agents are told, as a coordinator or an environment's agent,

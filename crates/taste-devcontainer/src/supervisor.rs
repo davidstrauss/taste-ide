@@ -299,7 +299,17 @@ pub struct Situation {
     pub failure: Option<String>,
     /// What to do next, in one or two sentences naming the tool.
     pub next: String,
+    /// Said when the project names no git author: a commit will fail, and
+    /// the agent must not set one of its own.
+    pub author: Option<&'static str>,
 }
+
+/// What an agent is told when the project names no git author: up front in
+/// its situation, and again beside git's own refusal (`taste_mcp`'s
+/// `ide_exec`), whose advice is to set one. An author the agent makes up is
+/// the project's history signed by nobody who chose it, and it is pushed
+/// under the user's keys later.
+pub const NO_AUTHOR: &str = "this project names no git author, so git commit fails with     \"Author identity unknown\". Do not set user.name or user.email yourself, in any     config. Tell the user: the banner above the file tree sets the project's author, and     commits work from then on.";
 
 impl SupervisorState {
     /// Whether this environment is spending the machine right now: a
@@ -607,13 +617,18 @@ pub struct Supervisor {
     /// (`LABEL_PORTS`). Empty means each on its own number.
     published_ports: Mutex<std::collections::HashMap<u16, u16>>,
     /// Why the project's config was passed over at the last resolution,
-    /// when a config exists and was: what the row, a toast, and
+    /// when a config exists and was: what the row and
     /// `devcontainer_status` say, because a checkout whose devcontainer.json
     /// is refused otherwise looks exactly like one with none — the
     /// baseline runs either way and nothing drifts — and the user who just
     /// wrote the file waits for a prompt that never comes (David,
     /// 2026-09-16: "the IDE didn't reload into it or even ask me").
     passed_over: Mutex<Option<String>>,
+    /// Whether the project names no git author, as the last carry into
+    /// the checkout found ([`Self::carry_repo_identity`]): `None` until one
+    /// has looked. An agent's commit there fails with "Author identity
+    /// unknown", and the situation says so before it tries ([`Situation`]).
+    authorless: Mutex<Option<bool>>,
     /// The project config whose image would not build or pull, by the
     /// hash of the whole setup, with podman's word for why. While the
     /// files on disk are the ones that failed, resolution passes them over
@@ -1059,6 +1074,7 @@ impl Supervisor {
             declared_services: Mutex::new(std::collections::BTreeMap::new()),
             published_ports: Mutex::new(std::collections::HashMap::new()),
             passed_over: Mutex::new(None),
+            authorless: Mutex::new(None),
             build_failed: Mutex::new(None),
             failed_build_log: Mutex::new(None),
             hook_failure: Mutex::new(None),
@@ -2686,6 +2702,7 @@ impl Supervisor {
             writable,
             failure,
             next,
+            author: (*self.authorless.lock().unwrap() == Some(true)).then_some(NO_AUTHOR),
         }
     }
 
@@ -5322,6 +5339,12 @@ impl Supervisor {
         let running = self.git_exec.lock().unwrap().is_some();
         if running {
             self.carry_repo_identity().await;
+        } else {
+            // Carried at the next start; what the situation says is true now.
+            let root = self.workspace_root().to_path_buf();
+            if let Ok(found) = tokio::task::spawn_blocking(move || project_author(&root)).await {
+                *self.authorless.lock().unwrap() = Some(found.is_none());
+            }
         }
     }
 
@@ -5335,8 +5358,11 @@ impl Supervisor {
     /// carried too. Never fatal.
     async fn carry_repo_identity(&self) {
         let root = self.workspace_root().to_path_buf();
-        let Ok(Some(identity)) = tokio::task::spawn_blocking(move || project_author(&root)).await
-        else {
+        let Ok(found) = tokio::task::spawn_blocking(move || project_author(&root)).await else {
+            return;
+        };
+        *self.authorless.lock().unwrap() = Some(found.is_none());
+        let Some(identity) = found else {
             return;
         };
         // Through the files service, which keeps the checkout in the VM,
@@ -7300,6 +7326,23 @@ mod tests {
 
     fn env(slug: &str) -> EnvironmentId {
         EnvironmentId::parse(slug).unwrap()
+    }
+
+    /// The situation says the project names no author only once a carry
+    /// has found none: not before anything looked, and not once one is
+    /// named.
+    #[test]
+    fn the_situation_says_when_the_project_names_no_author() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = make_env(
+            dir.path(),
+            EnvironmentIdentity::cloned(dir.path(), env("calm-1")),
+        );
+        assert_eq!(supervisor.situation().author, None);
+        *supervisor.authorless.lock().unwrap() = Some(true);
+        assert_eq!(supervisor.situation().author, Some(NO_AUTHOR));
+        *supervisor.authorless.lock().unwrap() = Some(false);
+        assert_eq!(supervisor.situation().author, None);
     }
 
     /// The project's author goes into a checkout by `git config` run where
