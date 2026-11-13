@@ -3386,8 +3386,16 @@ is shouted, but nothing runs either. The rows say what is missing, and
   removes a guest image's download once its base image is verified,
   since a damaged base is fetched again rather than unpacked from a kept
   copy (`guest::drop_unpacked_downloads`).
-  `Pool::stale` still only reports a VM whose folder is gone: with no
-  folder there is nothing to have held its work against.
+  A VM whose folder is gone (`Pool::stale`) is decided by the same
+  marker (`disposable::clear_strays`). Marked, it held nothing the folder
+  lacked when its window last closed, so whether the folder was deleted
+  or moved, what was on the VM is in it or went with it on purpose: the
+  VM is removed at launch, and the log says so. Unmarked, it may hold
+  work found nowhere else, so each is a notice of its own — the folder,
+  the space, and that it may hold work — with Remove…, which asks first,
+  says what goes, and removes only a VM whose folder is still gone. Those
+  were once one line naming the domains and a `virsh undefine` to type
+  (David, 2026-11-13: "Not helpful").
 
 ### What did not change, and why that is the result
 

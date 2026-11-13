@@ -5195,6 +5195,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                 }
                             });
                         }
+                        if let Some(domain) =
+                            action.strip_prefix(taste_devcontainer::registry::STRAY_ACTION)
+                        {
+                            // A VM made for a folder that is gone: asked
+                            // about by what it holds and frees, and removed
+                            // only on the user's answer.
+                            let domain = domain.to_string();
+                            let environments = environments_for_events.clone();
+                            let overlay = toast_overlay.clone();
+                            toast.connect_button_clicked(move |_| {
+                                remove_stray_vm(&environments, &overlay, domain.clone());
+                            });
+                        }
                         toast_overlay.add_toast(toast);
                     }
                     // The MCP server binds and unbinds that environment's
@@ -6816,6 +6829,55 @@ fn is_included_taskfile(path: &std::path::Path) -> bool {
 
 fn plain_toast(text: &str) -> adw::Toast {
     adw::Toast::new(&glib::markup_escape_text(text))
+}
+
+/// The Remove… of a stray VM's notice: the VM looked up again, since the
+/// notice was put up at startup and its folder may have come back; asked
+/// about, by its folder, what it frees, and what goes with it; and removed
+/// only on Remove, with what happened said either way. Libvirt is asked
+/// off the main thread.
+fn remove_stray_vm(
+    environments: &std::sync::Arc<taste_devcontainer::EnvironmentRegistry>,
+    overlay: &adw::ToastOverlay,
+    domain: String,
+) {
+    let (environments, overlay) = (environments.clone(), overlay.clone());
+    glib::spawn_future_local(async move {
+        let lookup = {
+            let (environments, domain) = (environments.clone(), domain.clone());
+            crate::runtime::runtime().spawn(async move { environments.stray_vm(&domain).await })
+        };
+        let Ok(Some(stray)) = lookup.await else {
+            overlay.add_toast(plain_toast(
+                "That VM's folder is back on this machine, or the VM is already gone; nothing \
+                 was removed.",
+            ));
+            return;
+        };
+        let (heading, body) = stray.question();
+        let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+        dialog.add_responses(&[("keep", "Keep"), ("remove", "Remove")]);
+        dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("keep"));
+        dialog.set_close_response("keep");
+        if dialog.choose_future(Some(&overlay)).await != "remove" {
+            return;
+        }
+        let removal = {
+            let (environments, domain) = (environments.clone(), domain.clone());
+            crate::runtime::runtime()
+                .spawn(async move { environments.remove_stray_vm(&domain).await })
+        };
+        let said = match removal.await {
+            Ok(Ok(())) => format!("Removed the VM for {}", stray.folder.display()),
+            Ok(Err(e)) => format!(
+                "The VM for {} was not removed: {e:#}",
+                stray.folder.display()
+            ),
+            Err(e) => format!("The VM for {} was not removed: {e}", stray.folder.display()),
+        };
+        overlay.add_toast(plain_toast(&said));
+    });
 }
 
 /// Ask which side keeps the paths the folder and Personal's checkout both

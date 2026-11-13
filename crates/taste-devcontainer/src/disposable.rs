@@ -712,6 +712,90 @@ pub async fn retire_idle(libvirt: &LibvirtSession, opening: &Path) -> Vec<(Strin
     retired
 }
 
+/// A VM whose workspace folder is gone, kept for the user to decide on:
+/// nothing marked it as holding only what the folder had, so it may hold
+/// work that is nowhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stray {
+    pub domain: String,
+    /// The folder it was made for, which is no longer on this machine.
+    pub folder: std::path::PathBuf,
+    /// What its disk takes, in bytes.
+    pub bytes: u64,
+}
+
+impl Stray {
+    /// The toast that offers its removal.
+    pub fn notice(&self) -> String {
+        format!(
+            "A VM made for {} is still on this machine, taking {:.1} GiB, and that folder is \
+             gone. It may hold work that never reached the folder.",
+            self.folder.display(),
+            gib(self.bytes)
+        )
+    }
+
+    /// The question its Remove asks, heading and body.
+    pub fn question(&self) -> (String, String) {
+        (
+            format!("Remove the VM for {}?", folder_name(&self.folder)),
+            format!(
+                "{} is no longer on this machine. Removing its VM frees {:.1} GiB and deletes \
+                 what is only on its disk: changes that never reached the folder, and its \
+                 agents' conversations. If you moved the folder, move it back and open it \
+                 first: the VM syncs only with the folder it was made for.",
+                self.folder.display(),
+                gib(self.bytes)
+            ),
+        )
+    }
+}
+
+/// The VMs of `strays` — each made for a folder no longer on this
+/// machine — that hold nothing the folder lacked when it last closed
+/// (`may_clear`), removed: whether the folder was deleted or moved, what
+/// was on the VM was in it. What each freed, by domain and folder. The
+/// rest are left, for [`Stray`]'s question, since only the user knows
+/// whether what is on them matters (David, 2026-11-13, of a notice that
+/// named a stray VM and a `virsh` command: "Not helpful").
+pub async fn clear_strays(
+    libvirt: &LibvirtSession,
+    strays: Vec<Vm>,
+) -> (Vec<(String, std::path::PathBuf, u64)>, Vec<Stray>) {
+    let mut cleared = Vec::new();
+    let mut kept = Vec::new();
+    for vm in strays {
+        let bytes = allocated(&vm);
+        if may_clear(&vm) {
+            match libvirt.destroy(&vm).await {
+                Ok(()) => {
+                    libvirt.say(
+                        &vm.domain,
+                        format!(
+                            "removed: {} is no longer on this machine, and this VM held \
+                             nothing it lacked when its window last closed ({:.1} GiB)",
+                            vm.workspace_root.display(),
+                            gib(bytes)
+                        ),
+                    );
+                    cleared.push((vm.domain, vm.workspace_root, bytes));
+                    continue;
+                }
+                Err(e) => tracing::warn!("{}: could not be removed: {e:#}", vm.domain),
+            }
+        }
+        kept.push(Stray {
+            domain: vm.domain,
+            folder: vm.workspace_root,
+            bytes,
+        });
+    }
+    if !cleared.is_empty() {
+        crate::guest::prune_unused_bases();
+    }
+    (cleared, kept)
+}
+
 fn folder_name(root: &Path) -> String {
     root.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -759,6 +843,24 @@ fn kept_summary(vms: &[Vm]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stray VM's notice names its folder and the room it takes, and its
+    /// question what goes with it and the one way back for a moved folder.
+    #[test]
+    fn a_stray_vm_is_named_by_its_folder_and_its_room() {
+        let stray = Stray {
+            domain: "taste-abc-x1".into(),
+            folder: "/home/u/Projects/gone".into(),
+            bytes: 12 * (1 << 30),
+        };
+        let notice = stray.notice();
+        assert!(notice.contains("/home/u/Projects/gone"), "{notice}");
+        assert!(notice.contains("12.0 GiB"), "{notice}");
+        assert!(!notice.contains("virsh"), "{notice}");
+        let (heading, body) = stray.question();
+        assert_eq!(heading, "Remove the VM for gone?");
+        assert!(body.contains("move it back and open it first"), "{body}");
+    }
 
     /// The least recently used VM is cleared first, whatever its size.
     #[test]

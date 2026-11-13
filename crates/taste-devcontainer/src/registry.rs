@@ -359,6 +359,11 @@ struct VmMeter {
     usage: VmUsage,
 }
 
+/// The action a stray VM's notice carries, before its domain: the
+/// window's Remove… asks the user (`Stray::question`), then
+/// [`EnvironmentRegistry::remove_stray_vm`].
+pub const STRAY_ACTION: &str = "remove-stray-vm:";
+
 pub struct EnvironmentRegistry {
     workspace_root: PathBuf,
     events: EventBus,
@@ -3398,7 +3403,20 @@ impl EnvironmentRegistry {
         // anything.
         if substrate.vm_details().is_some() || crate::pool::Pool::provisioning_allowed() {
             if let Ok(stale) = pool.stale().await {
-                swept.stale_vms = stale.into_iter().map(|vm| vm.domain).collect();
+                let (cleared, kept) = crate::disposable::clear_strays(pool.libvirt(), stale).await;
+                for (domain, folder, bytes) in cleared {
+                    taste_core::app_log::push(
+                        "info",
+                        "substrate",
+                        &format!(
+                            "removed VM {domain}: {} is no longer on this machine, and the VM \
+                             held nothing it lacked when its window last closed ({:.1} GiB)",
+                            folder.display(),
+                            bytes as f64 / f64::from(1u32 << 30)
+                        ),
+                    );
+                }
+                swept.stray_vms = kept;
             }
             match pool.libvirt().sweep_orphan_disks().await {
                 Ok(removed) if !removed.is_empty() => taste_core::app_log::push(
@@ -3812,7 +3830,60 @@ impl EnvironmentRegistry {
             taste_core::app_log::push("warn", "environments", &message);
             self.events.publish(Event::Toast(message));
         }
+        for stray in &report.swept.stray_vms {
+            let message = stray.notice();
+            taste_core::app_log::push("warn", "environments", &message);
+            self.events.publish(Event::ToastAction {
+                message,
+                label: "Remove…".into(),
+                action: format!("{STRAY_ACTION}{}", stray.domain),
+                // Until it is answered: removing a disk is a decision, and a
+                // notice gone in five seconds is no way to be asked one.
+                timeout_seconds: 0,
+            });
+        }
         report
+    }
+
+    /// A VM made for a folder no longer on this machine, as the notice
+    /// about it named it (`STRAY_ACTION`), when it still is one: its
+    /// question can be asked of it.
+    pub async fn stray_vm(&self, domain: &str) -> Option<crate::disposable::Stray> {
+        let stale = self.pool().stale().await.ok()?;
+        let vm = stale.into_iter().find(|vm| vm.domain == domain)?;
+        Some(crate::disposable::Stray {
+            domain: vm.domain.clone(),
+            folder: vm.workspace_root.clone(),
+            bytes: std::fs::metadata(vm.disk_path())
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.blocks() * 512
+                })
+                .unwrap_or(0),
+        })
+    }
+
+    /// Remove the VM `domain`, made for a folder no longer on this machine,
+    /// on the user's word: the domain, its disk, and the rest of it
+    /// (`LibvirtSession::destroy`). Refused when its folder has come back
+    /// since the notice — it is that folder's VM again.
+    pub async fn remove_stray_vm(&self, domain: &str) -> Result<()> {
+        let pool = self.pool();
+        let stale = pool.stale().await?;
+        let Some(vm) = stale.into_iter().find(|vm| vm.domain == domain) else {
+            bail!("{domain} is no longer a VM of a folder that is gone; it was left as it is");
+        };
+        pool.libvirt().destroy(&vm).await?;
+        crate::guest::prune_unused_bases();
+        taste_core::app_log::push(
+            "info",
+            "substrate",
+            &format!(
+                "removed VM {domain}, made for {}, on the user's word",
+                vm.workspace_root.display()
+            ),
+        );
+        Ok(())
     }
 
     /// Environments whose clone directory survived a restart. The directory

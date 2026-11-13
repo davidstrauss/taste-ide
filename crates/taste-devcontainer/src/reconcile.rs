@@ -43,38 +43,22 @@ pub struct SweepReport {
     pub containers: Vec<String>,
     pub images: Vec<String>,
     /// VMs the IDE made for workspaces whose folders are no longer on this
-    /// machine. Named, not removed: a VM's disk may hold work, and the
-    /// failure mode of a provisioned VM is a bill, so the user reads the
-    /// name before anything is undefined (ENVIRONMENTS → "Provisioned VMs
-    /// are labelled and reconciled").
-    pub stale_vms: Vec<String>,
+    /// machine, which may hold work and so are the user's to remove
+    /// (`disposable::clear_strays`): each its own notice, with Remove.
+    pub stray_vms: Vec<crate::disposable::Stray>,
 }
 
 impl SweepReport {
+    /// Whether there is anything to say in one sentence: the strays are
+    /// said each on its own, with its own button.
     pub fn is_empty(&self) -> bool {
-        self.containers.is_empty() && self.images.is_empty() && self.stale_vms.is_empty()
+        self.containers.is_empty() && self.images.is_empty()
     }
 
     /// One sentence, said once. A silent reset looks like a bug; a reset
     /// explained once is alpha.
     pub fn summary(&self) -> String {
-        let removed = self.removed_summary();
-        let stale = (!self.stale_vms.is_empty()).then(|| {
-            format!(
-                "VM{} {} belong{} to a workspace no longer on this machine; \
-                 remove with `virsh -c qemu:///session undefine <name>` and delete \
-                 the disk under ~/.local/share/taste-ide/guests/machines/.",
-                plural(self.stale_vms.len()),
-                self.stale_vms.join(", "),
-                if self.stale_vms.len() == 1 { "s" } else { "" }
-            )
-        });
-        match (removed, stale) {
-            (Some(removed), Some(stale)) => format!("{removed} {stale}"),
-            (Some(removed), None) => removed,
-            (None, Some(stale)) => stale,
-            (None, None) => String::new(),
-        }
+        self.removed_summary().unwrap_or_default()
     }
 
     fn removed_summary(&self) -> Option<String> {
@@ -460,7 +444,7 @@ mod tests {
         let report = SweepReport {
             containers: vec!["taste-f4ef24a9f365".into()],
             images: vec!["localhost/taste-f4ef24a9f365-image".into()],
-            stale_vms: Vec::new(),
+            stray_vms: Vec::new(),
         };
         let summary = report.summary();
         assert!(summary.contains("taste-f4ef24a9f365"), "{summary}");
