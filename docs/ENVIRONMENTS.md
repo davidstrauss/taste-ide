@@ -3386,6 +3386,13 @@ is shouted, but nothing runs either. The rows say what is missing, and
   removes a guest image's download once its base image is verified,
   since a damaged base is fetched again rather than unpacked from a kept
   copy (`guest::drop_unpacked_downloads`).
+  A running VM's disk that is short and has no room to grow makes room
+  the same way (`disposable::clear_for_growth`): growth once only asked,
+  so a Rails project's image build filled a 12 GiB disk with 386 GiB
+  free on the host, every gibibyte of it held for fourteen other disks
+  to grow into (2026-11-13). Still short, it says which unmarked VMs
+  hold the room, and a build that ran out of space says that first
+  rather than leaving the Dockerfile's last step looking at fault.
   A VM whose folder is gone (`Pool::stale`) is decided by the same
   marker (`disposable::clear_strays`). Marked, it held nothing the folder
   lacked when its window last closed, so whether the folder was deleted

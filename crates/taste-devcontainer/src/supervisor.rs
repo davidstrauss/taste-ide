@@ -2972,6 +2972,10 @@ impl Supervisor {
             Some(line) => format!("the build could not reach the network — {line}"),
             None => reason,
         };
+        let reason = match self.space_note(&reason, &log) {
+            Some(note) => format!("{note} — {reason}"),
+            None => reason,
+        };
         *self.build_failed.lock().unwrap() = Some((hash, reason));
         *self.failed_build_log.lock().unwrap() = Some(log);
     }
@@ -2990,7 +2994,31 @@ impl Supervisor {
             Some(line) => format!("the build could not reach the network — {line}"),
             None => error.to_string(),
         };
+        let message = match self.space_note(&message, &[]) {
+            Some(note) => format!("{note} — {message}"),
+            None => message,
+        };
         self.set_state(SupervisorState::Failed { message });
+    }
+
+    /// When a build failed for want of room — "no space left on device" in
+    /// its error or its log — that said first, with why the VM's disk did
+    /// not grow when it knows: the Dockerfile is not the fault, and its
+    /// last command is only where the room ran out.
+    fn space_note(&self, error: &str, log: &[String]) -> Option<String> {
+        const FULL: &str = "no space left on device";
+        let full = error.contains(FULL) || log.iter().any(|line| line.contains(FULL));
+        if !full {
+            return None;
+        }
+        let why = self
+            .substrate()
+            .vm_details()
+            .and_then(|vm| crate::provision::disk_short_reason(&vm.domain));
+        Some(match why {
+            Some(why) => format!("the VM's disk filled up, and {why}"),
+            None => "the VM's disk filled up".to_string(),
+        })
     }
 
     /// Wait for the network to come back, then build the project's
@@ -7791,6 +7819,26 @@ mod tests {
         // A reading's stdout is its answer, not a reason.
         assert_eq!(failure_words("no such file", "{", false), "no such file");
         assert_eq!(failure_words("", "only this", true), "only this");
+    }
+
+    /// A build that ran out of room says so first, from its error or its
+    /// log, and nothing else does.
+    #[test]
+    fn a_build_out_of_room_says_the_disk_filled() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = make_env(
+            dir.path(),
+            EnvironmentIdentity::cloned(dir.path(), env("calm-1")),
+        );
+        let full = "writing blob: unpacking failed: open /usr/share/x.mo: no space left on device";
+        assert_eq!(
+            supervisor.space_note(full, &[]).as_deref(),
+            Some("the VM's disk filled up")
+        );
+        assert!(supervisor
+            .space_note("exit status 1", &[full.to_string()])
+            .is_some());
+        assert_eq!(supervisor.space_note("exit status 127", &[]), None);
     }
 
     /// The situation says the project names no author only once a carry

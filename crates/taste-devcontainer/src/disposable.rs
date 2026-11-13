@@ -658,6 +658,81 @@ pub async fn clear_for_room(libvirt: &LibvirtSession, retiring: Option<&str>) ->
     }
 }
 
+/// The size `vm`'s disk of `current` bytes, whose guest has `guest_free`
+/// bytes free, grows to ([`crate::sizing::grown_disk_gib`]), making room
+/// first when the host has none to give, as [`clear_for_room`] does for a
+/// new VM: marked VMs that may go ([`may_clear`]) — shut off, held by no
+/// open window — removed, least recently used first, until it can grow.
+/// Growth never did, so a running VM whose build filled its disk stayed
+/// short while marked VMs nobody was using held the room it needed
+/// (2026-11-13: a Rails project's image build ran out of space with 386
+/// GiB free on the host, every gibibyte of it held for the growth of
+/// fourteen other disks). `Err` says why it still cannot grow: the VMs
+/// that were kept, and what would mark them.
+pub async fn clear_for_growth(
+    libvirt: &LibvirtSession,
+    vm: &Vm,
+    current: u64,
+    guest_free: u64,
+) -> std::result::Result<u64, String> {
+    let dir = disks_dir();
+    let target = || {
+        let free = taste_core::environment::free_bytes(&dir)?;
+        let unclaimed = crate::sizing::unclaimed_bytes(&dir, None);
+        crate::sizing::grown_disk_gib(current, guest_free, free, unclaimed)
+    };
+    if let Some(gib) = target() {
+        return Ok(gib);
+    }
+    let mut vms = libvirt.list_all().await.unwrap_or_default();
+    oldest_first(&mut vms, last_used);
+    let mut cleared = false;
+    let mut grown = None;
+    for other in vms.iter().filter(|o| o.domain != vm.domain && may_clear(o)) {
+        let size = allocated(other);
+        match libvirt.destroy(other).await {
+            Ok(()) => {
+                cleared = true;
+                libvirt.say(
+                    &other.domain,
+                    format!(
+                        "removed to make room for {}'s disk to grow: {:.1} GiB, and nothing on \
+                         it that this machine lacks — its window marked it so when it closed \
+                         ({})",
+                        folder_name(&vm.workspace_root),
+                        gib(size),
+                        folder_name(&other.workspace_root)
+                    ),
+                );
+            }
+            Err(e) => tracing::warn!("{}: could not be removed to make room: {e:#}", other.domain),
+        }
+        grown = target();
+        if grown.is_some() {
+            break;
+        }
+    }
+    if cleared {
+        crate::guest::prune_unused_bases();
+    }
+    if let Some(gib) = grown.or_else(target) {
+        return Ok(gib);
+    }
+    let others: Vec<Vm> = libvirt
+        .list_all()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|o| o.domain != vm.domain)
+        .collect();
+    Err(match kept_summary(&others) {
+        Some(kept) => format!("the room is held for other VMs' disks to grow into, {kept}"),
+        None => {
+            "no other VM's room can be given to it, and the host has no more to spare".to_string()
+        }
+    })
+}
+
 /// How long a marked VM sits unused before any IDE's launch removes it,
 /// room or no room. Room alone never came: a host with a hundred gigabytes
 /// free kept every VM it had ever made, and the disk filled with machines

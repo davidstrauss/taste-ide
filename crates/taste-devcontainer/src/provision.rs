@@ -2020,27 +2020,33 @@ impl LibvirtSession {
         };
         let unclaimed = crate::sizing::unclaimed_bytes(&dir, None);
         const GIB: u64 = 1024 * 1024 * 1024;
-        let Some(target) = crate::sizing::grown_disk_gib(current, guest_free, free, unclaimed)
-        else {
-            let short = guest_free < crate::sizing::DISK_LOW_GIB * GIB;
-            let mut told = SHORT_TOLD.lock().unwrap();
-            if !short {
-                told.remove(&vm.domain);
-            } else if told.insert(vm.domain.clone()) {
-                self.say(
-                    &vm.domain,
-                    format!(
+        let short = guest_free < crate::sizing::DISK_LOW_GIB * GIB;
+        let grown = if short {
+            crate::disposable::clear_for_growth(self, vm, current, guest_free).await
+        } else {
+            Err(String::new())
+        };
+        let target = match grown {
+            Ok(target) => target,
+            Err(why) => {
+                let mut told = SHORT_TOLD.lock().unwrap();
+                if !short {
+                    told.remove(&vm.domain);
+                } else if !told.contains_key(&vm.domain) {
+                    let said = format!(
                         "its guest has {:.1} GiB free and its disk cannot grow: this host has \
                          {:.1} GiB free, the VMs' disks could still grow into {:.1} GiB of it, \
-                         and {} GiB is kept free for the desktop",
+                         and {} GiB is kept free for the desktop; {why}",
                         guest_free as f64 / GIB as f64,
                         free as f64 / GIB as f64,
                         unclaimed as f64 / GIB as f64,
                         taste_core::environment::MIN_FREE_DISK_BYTES / GIB,
-                    ),
-                );
+                    );
+                    self.say(&vm.domain, said.clone());
+                    told.insert(vm.domain.clone(), said);
+                }
+                return Ok(());
             }
-            return Ok(());
         };
         SHORT_TOLD.lock().unwrap().remove(&vm.domain);
         self.say(
@@ -2270,8 +2276,15 @@ async fn disk_budget() -> Option<DiskBudget> {
 
 /// The VMs whose guest is short with no room to grow, already said so
 /// ([`LibvirtSession::grow_disk`]): said once, not at every check.
-static SHORT_TOLD: std::sync::Mutex<std::collections::BTreeSet<String>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static SHORT_TOLD: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Why `domain`'s disk could not grow when its guest last ran short, while
+/// it still is: what a build that ran out of space quotes, since "no space
+/// left on device" alone sends the reader to the project's Dockerfile.
+pub fn disk_short_reason(domain: &str) -> Option<String> {
+    SHORT_TOLD.lock().unwrap().get(domain).cloned()
+}
 
 /// Bytes a file actually occupies — the sparse answer, which for a qcow2
 /// overlay is the only honest one.
