@@ -274,7 +274,7 @@ impl McpServer {
 /// once, when its session starts, and a conversation outlives the IDE that
 /// briefed it. Raise it whenever what [`guidance`] says changes — the test
 /// `the_guidance_revision_moves_with_its_text` fails until it is.
-pub const GUIDANCE_REVISION: u32 = 21;
+pub const GUIDANCE_REVISION: u32 = 22;
 
 /// `result` with each image block replaced by
 /// [`taste_core::imageless::WITHHELD`].
@@ -417,10 +417,13 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              these. To check on something every few minutes, call wait again with the \
              same set: each return says where everything it watched stands.\n\n\
              DEVCONTAINER. .devcontainer/ stays usable by VS Code and Codespaces, and \
-             holds only what building and running the project needs: add no \
-             `customizations.vscode` (extensions, settings) and nothing else only an \
-             editor reads. Leave what is already there as it is, editor customizations \
-             included.\n\n\
+             holds only what building and running the project needs, and nothing else \
+             only an editor reads. Leave what is already there as it is, editor \
+             customizations included. ",
+        );
+    text.push_str(taste_core::conventions::TASK_EXTENSION);
+    text.push_str(
+        "\n\n\
              PORTS. A service the user's own programs should reach (a browser, a \
              database client, a debugger) is a port in .devcontainer/devcontainer.json \
              `forwardPorts`, with a `portsAttributes` entry giving its `label` and \
@@ -469,7 +472,7 @@ fn compose_guidance(env: &EnvironmentId, memory: Option<&str>) -> String {
              The IDE's notes at the top of a prompt say when the user pushed or pulled your \
              branch; trust them over your memory of the conversation.\n\n\
              SERVICES. ",
-        );
+    );
     text.push_str(taste_core::conventions::SERVICES);
     text.push_str("\n\nSTATE. ");
     text.push_str(taste_core::conventions::STATE);
@@ -2706,7 +2709,7 @@ impl McpServer {
                         of the workspace is readable context. The home directory is never \
                         writable, and remote git is the IDE's to reach (git_fetch), never \
                         yours, in every mode.",
-                    "conventions": "Devcontainer house style: base the image on a \
+                    "conventions": format!("Devcontainer house style: base the image on a \
                         Containerfile in .devcontainer/; no --userns argument is needed, \
                         the IDE maps the user onto the image's user itself; \
                         named volumes, in the string form, for caches and for data that \
@@ -2721,9 +2724,10 @@ impl McpServer {
                         cleanly, and clients never race the daemon. Keep unit files in the \
                         repo and install them in the Containerfile so the config stays \
                         portable to VS Code and GitHub Codespaces. Portable, not \
-                        furnished: add no customizations.vscode (extensions, settings) or \
-                        anything else only an editor reads, and leave what is already \
-                        there as it is.",
+                        furnished: add nothing else only an editor reads, and leave what \
+                        is already there as it is. {}",
+                        taste_core::conventions::TASK_EXTENSION
+                    ),
                     "act_accordingly": if safe_mode {
                         "Focus on authoring or fixing the devcontainer configuration \
                          following the conventions above; call environment with include \
@@ -6941,8 +6945,8 @@ mod tests {
     fn the_guidance_revision_moves_with_its_text() {
         use sha2::Digest;
         const GUIDANCE_SHA256: &str =
-            "67b17df23a2dcec62de94c453c229b060eba31eb9980b2fcd375e643550950c5";
-        const AT_REVISION: u32 = 21;
+            "35f4a9a03abafef824f1e7eb8d589ce008817e84b43e44bb34105284b24e8a9a";
+        const AT_REVISION: u32 = 22;
         let root = tempfile::tempdir().unwrap();
         let text = guidance(root.path(), &EnvironmentId::primary())
             + "\u{0}"

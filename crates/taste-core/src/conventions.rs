@@ -20,6 +20,19 @@ pub const TASKFILE_NAMES: [&str; 8] = [
     "taskfile.dist.yaml",
 ];
 
+/// The one editor customization an agent adds to a devcontainer config:
+/// VS Code's Task extension, where the project has a Taskfile, so the
+/// tasks the IDE's Tasks section runs are a click away in VS Code and
+/// Codespaces too (David, 2026-11-13: "an exception to the general rule
+/// to not add or remove VSCode extensions to the devcontainer config").
+/// Every other `customizations.vscode` entry stays as the project has it.
+pub const TASK_EXTENSION: &str =
+    "When the project has a Taskfile, .devcontainer/devcontainer.json \
+     lists VS Code's Task extension, adding it beside any extensions already listed: \
+     `\"customizations\": { \"vscode\": { \"extensions\": [\"task.vscode-task\"] } }`. That \
+     is the one editor customization to add; add no other customizations.vscode entry \
+     (extension or setting), and remove none that is there.";
+
 /// Which tasks are services, for an agent: the `customizations.taste-ide`
 /// block in devcontainer.json that taste-devcontainer's `ServiceSpec`
 /// reads. A task runs something long-lived or does a job and exits, and

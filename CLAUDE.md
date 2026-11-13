@@ -571,8 +571,14 @@ to.
   settings — and nothing of that kind already there is taken out (David,
   2026-10-22: "I don't want stuff added that is unnecessary for
   compatibility like extensions. Nor should the agent remove them if
-  present, though"). Agents are told so in `taste_mcp::guidance`, the
-  environment tool's conventions, and `devcontainer_ui::author_prompt`.
+  present, though"). One exception: a project with a Taskfile lists VS
+  Code's Task extension, `task.vscode-task` (David, 2026-11-13: "an
+  exception to the general rule"). Agents are told all of this in
+  `taste_mcp::guidance`, the environment tool's conventions, and
+  `devcontainer_ui::author_prompt`, each from
+  `taste_core::conventions::TASK_EXTENSION`. Compose runs through
+  `docker compose` on both sides; `podman compose` is not supported
+  (David, 2026-11-13: "it's basically deprecated").
 - **Credentials are the project's, and never imported from the machine.**
   A project is provisioned with its own file or it is unprovisioned;
   nothing reads a machine-wide credential, and nothing offers to copy one

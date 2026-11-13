@@ -828,8 +828,8 @@ pub(crate) fn author_prompt() -> String {
      builds it with \"build\": {\"dockerfile\": \"Containerfile\"}.\n\
      Either way, build nothing from source that an image or a package already provides. \
      Keep the config usable by VS Code and \
-     Codespaces, and no more: add no customizations.vscode (extensions, settings) or \
-     anything else only an editor reads. This IDE does not apply devcontainer features: install tools in the \
+     Codespaces, and no more: add nothing only an editor reads but the Task extension \
+     step 5 names. This IDE does not apply devcontainer features: install tools in the \
      image instead. Do not install Task (taskfile.dev): the IDE provides it in \
      every container.\n\
      If the checkout has Jupyter notebooks (.ipynb files): install ipykernel, which brings \
@@ -862,8 +862,11 @@ pub(crate) fn author_prompt() -> String {
      for each command a developer runs here — build, test, lint, each server — taken from \
      the README, build files, and CI configuration you read in step 1. Check it with \
      task_list. The user's Tasks section lists and runs these tasks. Skip this step when \
-     the project has nothing to run.\n\
-     6. Finish with one short paragraph: what the environment provides, and why."
+     the project has nothing to run. ");
+    text.push_str(taste_core::conventions::TASK_EXTENSION);
+    text.push_str(
+        "\n\
+     6. Finish with one short paragraph: what the environment provides, and why.",
     );
     text
 }
@@ -1011,6 +1014,15 @@ mod tests {
         assert!(prompt.contains("write Taskfile.yml at its root"));
         assert!(prompt.contains("Do not install Task"));
         assert!(!prompt.contains("go-task"));
+    }
+
+    /// A project with a Taskfile lists VS Code's Task extension, the one
+    /// editor customization the authoring prompt asks for.
+    #[test]
+    fn the_authoring_prompt_adds_the_task_extension_and_no_other() {
+        let prompt = author_prompt();
+        assert!(prompt.contains("\"task.vscode-task\""));
+        assert!(prompt.contains("add no other customizations.vscode entry"));
     }
 
     #[test]
