@@ -2205,8 +2205,8 @@ Whether Claude Code makes tasks of our calls is its decision, and its
 documentation names what it needs: Claude Code 2.1.304 or later, a
 session that fetches feature flags, and, for an Agent SDK session (which
 is what the ACP adapter runs), `CLAUDE_AUTO_BACKGROUND_TASKS=1`. The pinned
-adapter (`taste_core::orchestration::CLAUDE_CODE_ADAPTER`, 0.99.1) carries
-Claude Code 2.1.312, and the relocated agent is started with the variable
+adapter (`taste_core::orchestration::CLAUDE_CODE_ADAPTER`, 0.107.0) carries
+Claude Code 2.1.323, and the relocated agent is started with the variable
 (`taste_acp::relocate`), which also moves a subagent running past about two
 minutes to the background. Nothing the IDE sets turns flag fetching off:
 the auth proxy's `ANTHROPIC_BASE_URL` is not among the things that do

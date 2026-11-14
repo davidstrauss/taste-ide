@@ -412,8 +412,12 @@ fn is_claude_code(spec: &AgentSpec) -> bool {
 /// directory in this one environment's home, in the VM. It also empties
 /// Claude Code's commit and pull request attribution (`attribution`), so
 /// no Co-Authored-By trailer or "Generated with" line goes into the
-/// user's history: the commits are theirs. A file that does not parse is
-/// left alone rather than replaced.
+/// user's history: the commits are theirs. And it turns the adapter's own
+/// idle compaction off (`idleCompaction`): the adapter compacts a quiet
+/// session 54 minutes after its last request since 0.101.0, under the
+/// conditions the IDE's own does at 55 (`taste_core::idle_compact`), whose
+/// transcript says what it freed and why; two would race for the same
+/// minute. A file that does not parse is left alone rather than replaced.
 ///
 /// And it installs the IDE's message hook ([`CLAUDE_MESSAGE_HOOK`]) beside
 /// the settings, run after every tool call: the user's messages waiting
@@ -437,7 +441,7 @@ fn claude_settings_script(socket: &Path) -> String {
          if(fs.existsSync(f)){{try{{s=JSON.parse(fs.readFileSync(f,'utf8'))}}catch(e){{process.exit(0)}}}}\
          const p=s.permissions=s.permissions||{{}};\
          const add=(k,v)=>{{p[k]=[...new Set([...(p[k]||[]),...v])]}};\
-         add('deny',{deny});add('allow',{allow});s.autoMemoryEnabled=false;\
+         add('deny',{deny});add('allow',{allow});s.autoMemoryEnabled=false;s.idleCompaction=false;\
          s.attribution={{...s.attribution,commit:'',pr:''}};\
          const hooks=s.hooks=s.hooks||{{}};\
          const ours=g=>(g.hooks||[]).some(h=>String(h.command||'').includes({file}));\
@@ -1016,6 +1020,7 @@ mod tests {
             "mcp__taste-ide__ide_read_file"
         );
         assert_eq!(merged["autoMemoryEnabled"], false);
+        assert_eq!(merged["idleCompaction"], false);
         assert_eq!(
             merged["attribution"],
             serde_json::json!({"commit": "", "pr": ""})

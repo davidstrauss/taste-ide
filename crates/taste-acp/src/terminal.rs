@@ -512,7 +512,7 @@ fn signal_name(signal: i32) -> String {
 /// # Why this exists at all
 ///
 /// The pinned Claude Code adapter (`@agentclientprotocol/claude-agent-acp`
-/// 0.99.1, as 0.73.0 and 0.81.0 before it) **never sends `terminal/create`** — the
+/// 0.107.0, as 0.73.0, 0.81.0, and 0.99.1 before it) **never sends `terminal/create`** — the
 /// string does not appear in the package. It runs Bash inside its own
 /// process and, when the client advertises
 /// `clientCapabilities._meta["terminal_output"]`, *reports* what it ran:
@@ -955,7 +955,8 @@ mod tests {
 
     /// The pinned Claude Code adapter's shape, replayed exactly as it
     /// emits it (`toolInfoFromToolUse` → `toolUpdateFromToolResult` in
-    /// `@agentclientprotocol/claude-agent-acp` 0.81.0, unchanged in 0.99.1): a Bash tool call
+    /// `@agentclientprotocol/claude-agent-acp` 0.81.0, unchanged in 0.99.1 and in 0.107.0's
+    /// `tool-calls/renderer.js` for a client without `terminal_output_delta`): a Bash tool call
     /// whose content is a terminal reference and whose title is the
     /// command, then a result update carrying the output and exit in
     /// `_meta`. Getting a console tab out of that is the only way the

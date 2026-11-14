@@ -189,7 +189,7 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
     // SDK, which bundles no `claude` command, so `npx -p <adapter> claude`
     // was "claude: command not found" in the Sign In tab (2026-09-16).
     // The Claude Code the adapter carries, so the project has one.
-    const CLAUDE_CODE_CLI: &str = "@anthropic-ai/claude-code@2.1.312";
+    const CLAUDE_CODE_CLI: &str = "@anthropic-ai/claude-code@2.1.323";
     const CLAUDE_CODE_TOKEN: &[&str] = &["-y", CLAUDE_CODE_CLI, "setup-token"];
     const CLAUDE_CODE_TOKEN_STEPS: &str =
         "sign in below, copy the token it prints, paste it into the Token row, and Save";

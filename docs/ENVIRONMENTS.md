@@ -5138,8 +5138,8 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    VTE tabs for a while; it does not any more (see above) — the transcript
    was already saying it, and the roster remains as the data half.
    **One assumption did not survive contact.** The pinned Claude Code
-   adapter (`@agentclientprotocol/claude-agent-acp` 0.99.1, as 0.73.0
-   and 0.81.0 before it) never sends `terminal/create` — the string is not
+   adapter (`@agentclientprotocol/claude-agent-acp` 0.107.0, as 0.73.0,
+   0.81.0, and 0.99.1 before it) never sends `terminal/create` — the string is not
    in the package. It runs Bash in its
    own process and *reports* what it ran, as
    `ToolCallContent::Terminal { terminal_id }` plus `_meta.terminal_info` /

@@ -8,7 +8,10 @@
 //! more from the cache, and the next message sends the summary instead.
 //! Claude Code does this itself in its terminal, its VS Code panel, and the
 //! desktop app (its `idleCompaction` setting), and not under the Agent SDK,
-//! which is how the IDE runs it. So the IDE does it, by sending the
+//! which is how the IDE runs it. (The adapter does it too since 0.101.0;
+//! the IDE turns that off in the agent's settings, `taste_acp::relocate`,
+//! so one compaction, this one, is the one the transcript explains.) So
+//! the IDE does it, by sending the
 //! agent's own `/compact` when a chat has been quiet long enough, under the
 //! same conditions Claude Code documents: on the one-hour cache, past
 //! 200,000 tokens of context, and about an hour idle (David, 2026-11-10:
