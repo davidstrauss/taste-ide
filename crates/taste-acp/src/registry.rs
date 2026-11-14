@@ -238,11 +238,11 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
             "gemini",
             "Gemini CLI",
             "npx",
-            &["-y", "@google/gemini-cli@0.66.0", "--acp"],
+            &["-y", "@google/gemini-cli@0.68.0", "--acp"],
             &[".gemini", ".npm"],
         )
         .with_login(
-            &["-y", "@google/gemini-cli@0.66.0"],
+            &["-y", "@google/gemini-cli@0.68.0"],
             &[("NO_BROWSER", "true")],
             "open the link below, paste the code back, then /quit; the chat reconnects",
         ),
@@ -259,7 +259,7 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
             "npx",
             &[
                 "-y",
-                "@github/copilot@1.0.105",
+                "@github/copilot@1.0.112",
                 "--acp",
                 "--stdio",
                 "--no-auto-update",
@@ -267,7 +267,7 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
             &[".copilot", ".npm"],
         )
         .with_login(
-            &["-y", "@github/copilot@1.0.105", "login", "--device-code"],
+            &["-y", "@github/copilot@1.0.112", "login", "--device-code"],
             &[("COPILOT_AUTO_UPDATE", "false")],
             "open the link below and enter the code it shows; the chat reconnects when it finishes",
         )

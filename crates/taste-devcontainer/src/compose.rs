@@ -43,9 +43,9 @@ use serde_json::{json, Map, Value};
 
 /// The pinned Compose: its release, and each architecture's binary's
 /// SHA-256 as the release's `checksums.txt` gives it.
-pub const VERSION: &str = "5.6.1";
-pub const SHA256_X86_64: &str = "47737f4236e6d3ccea7291995203f8f018058783b4c3a9469119811a0b5db8c0";
-pub const SHA256_AARCH64: &str = "42cfa75f51ad0ccf290bad37899e0038a8c10a0069e85233ecc1d53e3ff1347d";
+pub const VERSION: &str = "5.7.1";
+pub const SHA256_X86_64: &str = "af426722a8af5de812fcee30cc1c39f0639f5f723cbadefb25e5d4db054064cf";
+pub const SHA256_AARCH64: &str = "f2f49f903240895fa764c0dca3a14548b754ad9426f6b609ccaf55ec5a3aa2a5";
 
 /// The label that marks a Compose service as one of an environment's,
 /// beside its container: the environment's id. Not `taste.env`, which

@@ -62,11 +62,11 @@ use anyhow::{bail, Context, Result};
 
 /// The node the agent runs on: the current LTS when pinned. Bump it with
 /// both sums below, from `https://nodejs.org/dist/v<version>/SHASUMS256.txt`.
-pub const NODE_VERSION: &str = "24.22.2";
-/// `node-v24.22.2-linux-x64.tar.gz`.
-const NODE_SHA256_X64: &str = "361718c444e49af2ca5a110c83ba6a8901143f23ab285ebbef0341f391f482a9";
-/// `node-v24.22.2-linux-arm64.tar.gz`.
-const NODE_SHA256_ARM64: &str = "95c264150aceb7f3437a29fd6984924f5f8d1511ea3cbd6c508b83f6c555dae2";
+pub const NODE_VERSION: &str = "26.13.1";
+/// `node-v26.13.1-linux-x64.tar.gz`.
+const NODE_SHA256_X64: &str = "518674de2b621728a5e4486f5fb3b7d2900bb3cc4aa97969edaa463db99f9778";
+/// `node-v26.13.1-linux-arm64.tar.gz`.
+const NODE_SHA256_ARM64: &str = "80a330b35415382878df18d41afbd106ea89bfb3be0087d6608e289a14c5cc7d";
 
 /// Where the runtime directory is mounted in an environment's container.
 pub const IN_CONTAINER: &str = taste_core::agent_runtime::IN_CONTAINER;
@@ -248,7 +248,7 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Opt
 /// node, when it is mounted and actually runs there, printed; exit 1
 /// otherwise. Running it is the test, because a build this C library
 /// cannot load is present and useless.
-pub const PROBE: &str = r#"for d in /opt/taste-agent/node-v24.22.2-linux-*; do
+pub const PROBE: &str = r#"for d in /opt/taste-agent/node-v26.13.1-linux-*; do
   if [ -x "$d/bin/node" ] && "$d/bin/node" --version >/dev/null 2>&1; then echo "$d/bin"; exit 0; fi
 done
 exit 1"#;

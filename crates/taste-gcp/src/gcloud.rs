@@ -39,15 +39,15 @@ pub struct Sdk {
     pub bytes: u64,
 }
 
-/// Measured 2026-11-01, as 587.0.0 was on 2026-10-03: the archive runs in
+/// Measured 2026-11-14, as 591.0.0 was on 2026-11-01: the archive runs in
 /// place with its bundled Python 3.14.9, offers `compute start-iap-tunnel`
 /// and impersonation through the environment, and with `CLOUDSDK_CONFIG`
 /// set writes nothing to the home directory. Extracted, it is about 490 MB.
 pub const SDK: Sdk = Sdk {
-    version: "591.0.0",
-    url: "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-591.0.0-linux-x86_64.tar.gz",
-    sha256: "78c570f5fcfe58a9311bd98c06b75530595e3cae6277aad75a676a39e6ee7b63",
-    bytes: 94_410_079,
+    version: "593.0.0",
+    url: "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-593.0.0-linux-x86_64.tar.gz",
+    sha256: "42c32b7553c712f71fcf6f124546c0519437f53755f47f9bd0c957998cd6b826",
+    bytes: 94_726_966,
 };
 
 /// `$XDG_DATA_HOME/taste-ide/gcloud`, or `~/.local/share/taste-ide/gcloud`.
