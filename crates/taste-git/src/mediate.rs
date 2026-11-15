@@ -365,7 +365,6 @@ impl GitWorkspace {
         Ok(updates)
     }
 
-    /// Configured remote names (read-only; nothing here creates remotes).
     /// Every configured remote's fetch URL: what a `fetch --all` reaches.
     pub fn remote_urls(&self) -> Vec<String> {
         self.remotes()
@@ -382,6 +381,26 @@ impl GitWorkspace {
             .collect()
     }
 
+    /// Every URL the file tree's Fetch reaches: each remote's (`fetch
+    /// --all`), and each cloned submodule's remotes, which its submodule
+    /// fetches go to. Deduplicated, in that order. What the keys and the
+    /// prompts a fetch may need are prepared for, so a URL left out here
+    /// is a fetch that meets its key unprepared — a branch with no
+    /// upstream once sent the whole Fetch to the desktop's agent, which
+    /// could not ask for a security key's touch (2026-11-14).
+    pub fn fetch_urls(&self) -> Vec<String> {
+        let mut urls = self.remote_urls();
+        for (_, sub) in self.submodules() {
+            if let Some(sub) = GitWorkspace::discover(&self.workdir().join(&sub)) {
+                urls.extend(sub.remote_urls());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        urls.retain(|url| seen.insert(url.clone()));
+        urls
+    }
+
+    /// Configured remote names (read-only; nothing here creates remotes).
     pub fn remotes(&self) -> Result<Vec<String>> {
         Ok(self
             .repo
@@ -466,6 +485,37 @@ mod tests {
         clone_local(hub_dir.path(), &clone_path).unwrap();
         let hub = GitWorkspace::discover(hub_dir.path()).unwrap();
         (hub_dir, hub, clone_dir, clone_path)
+    }
+
+    #[test]
+    fn a_fetch_reaches_every_remote_and_each_submodules_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        commit(&repo, "base", "base\n");
+        // No upstream for the branch: what a fetch reaches is still every
+        // remote, which is what the keys are prepared for.
+        repo.remote("origin", "git@github.com:example/app.git")
+            .unwrap();
+        repo.remote("fork", "ssh://git@example.org/me/app.git")
+            .unwrap();
+        let mut sub = repo
+            .submodule("git@github.com:example/lib.git", Path::new("lib"), true)
+            .unwrap();
+        let sub_repo = sub.open().unwrap();
+        // The same URL as the parent's fork: listed once.
+        sub_repo
+            .remote("mine", "ssh://git@example.org/me/app.git")
+            .unwrap();
+        sub.add_finalize().ok();
+        let git = GitWorkspace::discover(dir.path()).unwrap();
+        assert_eq!(
+            git.fetch_urls(),
+            [
+                "ssh://git@example.org/me/app.git",
+                "git@github.com:example/app.git",
+                "git@github.com:example/lib.git",
+            ]
+        );
     }
 
     const AGENT_REF: &str = "refs/heads/agents/env-1/topic";

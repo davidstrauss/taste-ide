@@ -8724,7 +8724,11 @@ impl FileTree {
                 }
                 before = now;
                 for (setup, (program, args)) in found {
-                    let envs = crate::ssh_agent::network_env(root.clone(), setup.url.clone()).await;
+                    let envs = crate::ssh_agent::network_env(
+                        root.clone(),
+                        setup.url.iter().cloned().collect(),
+                    )
+                    .await;
                     let handle = crate::runtime::runtime().spawn(run_git_step_within(
                         program,
                         args,
@@ -8760,7 +8764,7 @@ impl FileTree {
         // base it rebases onto and the fork it pushes to. What moves the
         // branch is the button's: ↓ its own copy on the remote, ⇊ the
         // canonical branch ([`PullFrom`]).
-        let Some((fetch, (fetch_issues, fetch_legacy_issues), move_command, remote, upstream)) =
+        let Some((fetch, (fetch_issues, fetch_legacy_issues), move_command, urls, upstream)) =
             self.git.borrow().as_ref().map(|git| {
                 let target = match (&branch, from) {
                     (Some(branch), PullFrom::Own) => git.own_target_of(branch),
@@ -8779,7 +8783,10 @@ impl FileTree {
                         Pull::FastForward => Some(git.fast_forward_onto_command(onto)),
                         Pull::Fetch => None,
                     },
-                    git.upstream_remote_url(),
+                    // Every URL the fetch reaches, not the upstream's
+                    // alone: a branch with none fetched all the same,
+                    // through keys nobody had prepared (`ssh_agent`).
+                    git.fetch_urls(),
                     target,
                 )
             })
@@ -8808,7 +8815,7 @@ impl FileTree {
             // IDE's strip rather than a terminal nobody is watching, and
             // through the IDE's own agent, whose touch notices land on the
             // same strip (`ssh_agent`).
-            let envs = crate::ssh_agent::network_env(root.clone(), remote).await;
+            let envs = crate::ssh_agent::network_env(root.clone(), urls).await;
             let mut failed = false;
             // How far behind the branch was once the fetch had landed — the
             // commits the rebase is about to take — for the toast at the
@@ -9163,12 +9170,13 @@ impl FileTree {
         // rather than once, because the key comes and goes with the agent
         // (David, 2026-09-16: "I don't want background polling to pop open
         // modals telling me to tap the key").
-        // Every remote `fetch --all` reaches, not only the branch's
-        // upstream, which a detached HEAD does not even have.
+        // Every remote `fetch --all` reaches, and each submodule's, not
+        // only the branch's upstream, which a detached HEAD does not even
+        // have.
         let check_root = self.refs_root();
         let check = crate::runtime::runtime().spawn_blocking(move || {
             let urls = taste_git::GitWorkspace::discover(&check_root)
-                .map(|git| git.remote_urls())
+                .map(|git| git.fetch_urls())
                 .unwrap_or_else(|| remote.into_iter().collect());
             taste_git::presence::any_needs_presence(urls.iter().map(String::as_str))
         });
@@ -11113,7 +11121,11 @@ impl FileTree {
                                     push.args.iter().map(String::as_str).collect();
                                 exec.resolve(&push.program, &arg_refs, false)
                             };
-                            let envs = crate::ssh_agent::network_env(root.clone(), push.url).await;
+                            let envs = crate::ssh_agent::network_env(
+                                root.clone(),
+                                push.url.into_iter().collect(),
+                            )
+                            .await;
                             let handle = crate::runtime::runtime().spawn(run_git_step(
                                 spec.program,
                                 spec.args,
@@ -11143,7 +11155,8 @@ impl FileTree {
                     return;
                 }
             }
-            let envs = crate::ssh_agent::network_env(root.clone(), remote).await;
+            let envs =
+                crate::ssh_agent::network_env(root.clone(), remote.into_iter().collect()).await;
             let handle =
                 crate::runtime::runtime().spawn(run_git_step(spec.program, spec.args, envs));
             match handle.await {

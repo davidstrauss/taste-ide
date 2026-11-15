@@ -61,29 +61,50 @@ fn socket_for(workspace_root: &Path) -> PathBuf {
 }
 
 /// The environment a deliberate network step runs with: the askpass
-/// helper's, and the IDE's agent when the remote is reached over SSH. Off
-/// the GTK thread: it may start a process, and adding a key with a
-/// passphrase waits for the user's answer.
-pub async fn network_env(
-    workspace_root: PathBuf,
-    remote_url: Option<String>,
-) -> Vec<(String, String)> {
+/// helper's, and the IDE's agent in place of the desktop's. `urls` are
+/// every remote the step reaches — a `fetch --all` reaches each remote and
+/// each submodule's, not only the branch's upstream — and the identities
+/// ssh would offer each one reached over SSH are added to the agent first.
+///
+/// `SSH_AUTH_SOCK` is ALWAYS replaced: by the IDE's agent when one is up,
+/// and by nothing otherwise, so ssh reads its key files itself and asks
+/// through the helper. The desktop's agent is never what a deliberate
+/// step signs through: it was, for a branch with no upstream, and a
+/// security key's touch then had nobody to ask it — the toast said "agent
+/// refused operation" while the strip stood empty (2026-11-14). Off the
+/// GTK thread: it may start a process, and adding a key with a passphrase
+/// waits for the user's answer.
+pub async fn network_env(workspace_root: PathBuf, urls: Vec<String>) -> Vec<(String, String)> {
     let run = crate::runtime::runtime().spawn_blocking(move || {
         let mut envs = crate::askpass::env_for(&workspace_root);
-        let Some(target) = remote_url
-            .as_deref()
-            .and_then(taste_git::presence::ssh_target)
-        else {
-            return envs;
+        let mut targets: Vec<String> = urls
+            .iter()
+            .filter_map(|url| taste_git::presence::ssh_target(url))
+            .collect();
+        targets.sort();
+        targets.dedup();
+        let socket = if targets.is_empty() {
+            None
+        } else {
+            ensure_agent(&workspace_root, &envs)
         };
-        let Some(socket) = ensure_agent(&workspace_root, &envs) else {
-            return envs;
-        };
-        load_identities(&socket, &target, &envs);
-        envs.push(("SSH_AUTH_SOCK".to_string(), socket.display().to_string()));
+        if let Some(socket) = &socket {
+            for target in &targets {
+                load_identities(socket, target, &envs);
+            }
+        }
+        envs.push((
+            "SSH_AUTH_SOCK".to_string(),
+            socket
+                .map(|socket| socket.display().to_string())
+                .unwrap_or_default(),
+        ));
         envs
     });
-    run.await.unwrap_or_default()
+    run.await.unwrap_or_else(|_| {
+        // The setup panicked: still keep the desktop's agent out of it.
+        vec![("SSH_AUTH_SOCK".to_string(), String::new())]
+    })
 }
 
 /// The workspace's agent, started if it is not running.

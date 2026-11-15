@@ -42,24 +42,17 @@ async fn fetch(
         let root = root.clone();
         tokio::task::spawn_blocking(move || {
             let git = taste_git::GitWorkspace::discover(&root)?;
-            let remote = git.upstream_remote_url();
             // Every URL the fetch reaches, not only the branch's upstream:
             // `fetch --all` goes to each remote, and each submodule's fetch
-            // to its own, any of which could ask for a touch.
+            // to its own, any of which could ask for a touch — and each of
+            // which the agent's keys are prepared for when it may.
+            let urls = git.fetch_urls();
             let held = (!ask_user)
-                .then(|| {
-                    let mut urls = git.remote_urls();
-                    for (_, sub) in git.submodules() {
-                        if let Some(sub) = taste_git::GitWorkspace::discover(&root.join(&sub)) {
-                            urls.extend(sub.remote_urls());
-                        }
-                    }
-                    taste_git::presence::any_needs_presence(urls.iter().map(String::as_str))
-                })
+                .then(|| taste_git::presence::any_needs_presence(urls.iter().map(String::as_str)))
                 .flatten();
             Some((
                 git.fetch_all_command(),
-                remote,
+                urls,
                 held,
                 git.refs_under("refs/remotes/").unwrap_or_default(),
             ))
@@ -68,7 +61,7 @@ async fn fetch(
         .ok()
         .flatten()
     };
-    let Some(((program, args), remote, held, before)) = prepared else {
+    let Some(((program, args), urls, held, before)) = prepared else {
         return GitFetchOutcome {
             error: Some("the user's folder is not a git repository".to_string()),
             ..GitFetchOutcome::default()
@@ -81,7 +74,7 @@ async fn fetch(
         };
     }
     let envs = if ask_user {
-        crate::ssh_agent::network_env(root.clone(), remote).await
+        crate::ssh_agent::network_env(root.clone(), urls).await
     } else {
         taste_git::non_interactive_env()
     };
