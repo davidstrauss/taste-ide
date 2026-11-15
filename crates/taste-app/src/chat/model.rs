@@ -187,8 +187,120 @@ pub(super) struct Step {
     pub waiting: bool,
     /// How its permission was answered: an icon and what it says.
     pub permission: Option<(String, String)>,
+    /// The question it put to the user, and what the user chose: drawn
+    /// under its title whether or not it is open, so what was offered and
+    /// what was picked stay in the log once the card is gone (David,
+    /// 2026-11-14: "When I answer a question, the options and my answer
+    /// should show in the chat log").
+    pub answered: Option<Answered>,
     /// Opened onto its content.
     pub expanded: bool,
+}
+
+/// A question put to the user — the agent's suggested replies, or a field
+/// of its form (AskUserQuestion) — as the log keeps it: what it asked, what
+/// it offered, and what was chosen. Its record (`ANSWER_RECORD`) is this,
+/// as JSON, so a restore draws what the answer drew.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Asked {
+    /// Its short name: AskUserQuestion's header ("Install shape").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// What it asked, when the question's words are not already in the
+    /// log above it (the suggested replies' are the agent's answer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default)]
+    pub options: Vec<Offered>,
+    /// Any number could be chosen: drawn as checkboxes, not radios.
+    #[serde(default)]
+    pub several: bool,
+    /// What the user wrote of their own, instead of an option or besides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own: Option<String>,
+}
+
+/// One option a question offered, and whether it was chosen.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Offered {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub chosen: bool,
+}
+
+/// How a step's questions went: each as answered, or the whole passed on
+/// with Skip. A step whose suggested replies a later prompt went past
+/// unanswered has them all here with nothing chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Answered {
+    #[serde(default)]
+    pub questions: Vec<Asked>,
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+impl Asked {
+    /// The suggested replies `replies` as a question, nothing chosen yet.
+    pub fn replies(replies: &[taste_core::Reply], several: bool) -> Asked {
+        Asked {
+            title: None,
+            question: None,
+            options: replies
+                .iter()
+                .map(|reply| Offered {
+                    label: reply.label.clone(),
+                    description: reply.description.clone(),
+                    chosen: false,
+                })
+                .collect(),
+            several,
+            own: None,
+        }
+    }
+}
+
+impl Answered {
+    /// The answer as the record keeps it, for the questions `call` asked
+    /// (`ANSWER_RECORD`).
+    pub fn record(&self, call: Option<&str>) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        value[ANSWER_RECORD] = call.into();
+        value
+    }
+
+    /// The answer as lines of text — "Install shape: Separate target" —
+    /// for search, and the transcript's mirror.
+    pub fn text(&self) -> String {
+        if self.skipped {
+            return "Skipped".to_string();
+        }
+        self.questions
+            .iter()
+            .filter_map(|asked| {
+                let mut said: Vec<&str> = asked
+                    .options
+                    .iter()
+                    .filter(|option| option.chosen)
+                    .map(|option| option.label.as_str())
+                    .collect();
+                said.extend(asked.own.as_deref());
+                if said.is_empty() {
+                    return None;
+                }
+                let said = said.join(", ");
+                Some(match &asked.title {
+                    Some(title) => format!("{title}: {said}"),
+                    None => said,
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl Step {
@@ -218,6 +330,10 @@ pub(super) enum Kind {
     Task(Task),
     Plan(PlanCard),
     Note(String),
+    /// Questions the user answered that belong to no step — a form an MCP
+    /// server put up outside any tool call — drawn on the line as a step's
+    /// answer is drawn under it.
+    Answered(Answered),
     /// Where a prompt was typed, which the agent took further down: the
     /// line runs through it when there are steps either side.
     Marker {
@@ -259,6 +375,7 @@ impl Row {
                 .collect::<Vec<_>>()
                 .join("\n"),
             Kind::Note(text) => text.clone(),
+            Kind::Answered(answered) => answered.text(),
             Kind::Marker { .. } => String::new(),
         }
     }
@@ -295,6 +412,12 @@ pub(super) struct Model {
     last_prompt: Option<RowId>,
     /// Permission answers for calls with no row yet.
     marks: HashMap<String, (String, String)>,
+    /// Answers to calls' questions, for calls with no row yet.
+    answers: HashMap<String, Answered>,
+    /// The last `suggest_replies` call: what the suggested replies on the
+    /// card answer, and what a prompt that goes past them unanswered
+    /// leaves showing what they offered.
+    last_offer: Option<String>,
     /// The answers since the turn's last step of work: what its suggested
     /// replies choose between, shown whole when they are offered.
     turn_answers: Vec<RowId>,
@@ -723,7 +846,9 @@ impl Model {
                 // A step of work: what was said before it is not the answer
                 // the replies, if any, will be about. Offering them is not
                 // work.
-                if mcp_tool_name(&key).as_deref() != Some("suggest_replies") {
+                if mcp_tool_name(&key).as_deref() == Some("suggest_replies") {
+                    self.last_offer = Some(id.clone());
+                } else {
                     self.turn_answers.clear();
                 }
                 // An edit through the IDE's tools reads as the edit it is.
@@ -862,6 +987,7 @@ impl Model {
                         rebuild_took_the_agent: false,
                         waiting: false,
                         permission: None,
+                        answered: None,
                         expanded: false,
                     })),
                     Dot::Plain,
@@ -872,6 +998,7 @@ impl Model {
         };
         let terminal = self.terminals.get(&call).cloned();
         let mark = self.marks.remove(&call);
+        let answered = self.answers.remove(&call);
         if let Some(Row {
             kind: Kind::Step(step),
             ..
@@ -940,6 +1067,9 @@ impl Model {
             }
             if let Some(mark) = mark {
                 step.permission = Some(mark);
+            }
+            if answered.is_some() {
+                step.answered = answered;
             }
         }
         self.changed(id);
@@ -1380,6 +1510,7 @@ impl Model {
             self.turn_answers.clear();
             self.end_steps();
         }
+        self.pass_offer();
         self.lines.push(("you", text.clone()));
         let id = self.push(
             Kind::User(User {
@@ -1484,6 +1615,75 @@ impl Model {
         self.changed(id);
     }
 
+    /// The `suggest_replies` call the suggested replies came from, if the
+    /// conversation has made one.
+    pub fn last_offer(&self) -> Option<&str> {
+        self.last_offer.as_deref()
+    }
+
+    /// How the questions `call` asked were answered — or, with no call,
+    /// questions that belong to no step, drawn on the line as their own row.
+    /// Kept until the call's row exists, since the answer can be given
+    /// before the update that creates it.
+    pub fn answer(&mut self, call: Option<&str>, answered: Answered) {
+        let Some(call) = call else {
+            self.finalize();
+            self.lines.push(("note", answered.text()));
+            self.push_step(Kind::Answered(answered), Dot::Note);
+            return;
+        };
+        let Some(id) = self.steps.get(call).copied() else {
+            self.answers.insert(call.to_string(), answered);
+            return;
+        };
+        if let Some(Row {
+            kind: Kind::Step(step),
+            ..
+        }) = self.row_mut(id)
+        {
+            step.answered = Some(answered);
+        }
+        self.changed(id);
+    }
+
+    /// A prompt went out past the last suggested replies without
+    /// answering them — typed into Dispatch, or a new turn begun: the step
+    /// shows what they offered, nothing chosen, so the log still says what
+    /// was on the table. Replies the IDE's server refused offered nothing.
+    fn pass_offer(&mut self) {
+        let Some(id) = self
+            .last_offer
+            .as_ref()
+            .and_then(|call| self.steps.get(call))
+            .copied()
+        else {
+            return;
+        };
+        let Some(Row {
+            kind: Kind::Step(step),
+            ..
+        }) = self.row_mut(id)
+        else {
+            return;
+        };
+        if step.answered.is_some() || step.status == Some(ToolCallStatus::Failed) {
+            return;
+        }
+        let Some(input) = step.input.as_ref() else {
+            return;
+        };
+        let offered = taste_core::Reply::offered(input);
+        if offered.is_empty() {
+            return;
+        }
+        let several = input["several"].as_bool() == Some(true);
+        step.answered = Some(Answered {
+            questions: vec![Asked::replies(&offered, several)],
+            skipped: false,
+        });
+        self.changed(id);
+    }
+
     /// The turn's answers shown whole: its suggested replies are offered.
     pub fn unclip_turn(&mut self) {
         for id in std::mem::take(&mut self.turn_answers) {
@@ -1576,6 +1776,7 @@ impl Model {
                 self.finalize();
                 self.delivery_record(&prompt, &state, detail);
             }
+            Record::Answer { call, answered } => self.answer(call.as_deref(), answered),
         }
     }
 
@@ -1612,6 +1813,13 @@ pub(super) enum Record {
         state: String,
         detail: Option<String>,
     },
+    /// How the user answered the questions a call put to them — its
+    /// suggested replies, or its form — or, with no call, a form that
+    /// belongs to no step.
+    Answer {
+        call: Option<String>,
+        answered: Answered,
+    },
     /// Where the stash was trimmed, and the kind of the last update that
     /// went (`chatarchive::TRIM_MARKER`).
     Trimmed {
@@ -1627,6 +1835,12 @@ const ANSWER_CHUNK: &str = "agent_message_chunk";
 pub(super) const DELIVERY_RECORD: &str = "tasteDelivery";
 /// The key the prompt a note is about is kept under, beside the note.
 pub(super) const NOTE_PROMPT: &str = "tastePrompt";
+/// The key a record of an answer to a call's questions is kept under, the
+/// call's id the value (`null` for questions of no call), beside the
+/// [`Answered`] it was: `{"tasteAnswer": "toolu_01…", "questions": [{
+/// "title": "Install shape", "options": [{"label": "Separate target",
+/// "chosen": true}, …], "several": false, "own": "…"}], "skipped": false}`.
+pub(super) const ANSWER_RECORD: &str = "tasteAnswer";
 
 impl Record {
     pub fn update(update: SessionUpdate) -> Record {
@@ -1642,7 +1856,7 @@ impl Record {
     }
 
     /// A record's JSON as an entry: an update, the IDE's note, where a
-    /// prompt got to, or `None` for what draws nothing (a session's marker)
+    /// prompt got to, how a question was answered, or `None` for what draws nothing (a session's marker)
     /// or does not parse.
     pub fn parse(value: serde_json::Value, note_key: &str) -> Option<Record> {
         let text = |key: &str| {
@@ -1661,6 +1875,12 @@ impl Record {
             return Some(Record::Trimmed {
                 through: through.as_str().map(str::to_string),
             });
+        }
+        if let Some(call) = value.get(ANSWER_RECORD) {
+            let call = call.as_str().map(str::to_string);
+            return serde_json::from_value::<Answered>(value)
+                .ok()
+                .map(|answered| Record::Answer { call, answered });
         }
         if let Some(prompt) = text(DELIVERY_RECORD) {
             return Some(Record::Delivery {
@@ -1818,6 +2038,7 @@ mod tests {
                     Kind::Plan(_) => "plan",
                     Kind::Answer(_) => "answer",
                     Kind::Note(_) => "note",
+                    Kind::Answered(_) => "answered",
                     Kind::Marker { .. } => "marker",
                     Kind::Task(_) => "task",
                 };
@@ -2250,5 +2471,231 @@ mod tests {
         // call undelivered.
         let stranded = Model::of_record(0, vec![said(&withdrawn, "Hello?")]);
         assert_eq!(stranded.in_flight(), vec![withdrawn]);
+    }
+
+    /// The agent's `suggest_replies` call, offering `labels`, with `status`.
+    fn offer(id: &str, labels: &[&str], status: ToolCallStatus) -> Record {
+        let mut call = ToolCall::new(id.to_string(), "mcp__taste-ide__suggest_replies");
+        call.status = status;
+        call.raw_input = Some(serde_json::json!({ "replies": labels }));
+        Record::update(SessionUpdate::ToolCall(call))
+    }
+
+    /// The suggested replies `labels`, answered with the `chosen`th, as the
+    /// card's Send records it.
+    fn replied(call: &str, labels: &[&str], chosen: usize) -> Record {
+        let replies: Vec<taste_core::Reply> = labels
+            .iter()
+            .map(|label| taste_core::Reply {
+                label: label.to_string(),
+                description: None,
+            })
+            .collect();
+        let mut asked = Asked::replies(&replies, false);
+        asked.options[chosen].chosen = true;
+        let answered = Answered {
+            questions: vec![asked],
+            skipped: false,
+        };
+        Record::parse(answered.record(Some(call)), "tasteNote").expect("an answer record")
+    }
+
+    /// What the step for `call` shows of its question: each option, `*`
+    /// for one chosen, and the user's own words.
+    fn shown_answer(model: &Model, call: &str) -> Option<Vec<String>> {
+        let id = model.step_row(call)?;
+        let Kind::Step(step) = &model.row(id)?.kind else {
+            return None;
+        };
+        let answered = step.answered.as_ref()?;
+        let mut out: Vec<String> = answered
+            .questions
+            .iter()
+            .flat_map(|asked| {
+                asked
+                    .options
+                    .iter()
+                    .map(|option| {
+                        format!("{}{}", if option.chosen { "*" } else { "" }, option.label)
+                    })
+                    .chain(asked.own.iter().map(|own| format!("own {own}")))
+            })
+            .collect();
+        if answered.skipped {
+            out.push("skipped".into());
+        }
+        Some(out)
+    }
+
+    /// An answer's record reads back as the answer it was, the call it
+    /// answers and all; one of no call reads back as one of no call.
+    #[test]
+    fn an_answer_record_reads_back_as_it_was_written() {
+        let answered = Answered {
+            questions: vec![Asked {
+                title: Some("Install shape".into()),
+                question: Some("Replace the install, or sit beside it?".into()),
+                options: vec![
+                    Offered {
+                        label: "Replace install".into(),
+                        description: Some("One site, one code path.".into()),
+                        chosen: false,
+                    },
+                    Offered {
+                        label: "Separate target".into(),
+                        description: None,
+                        chosen: true,
+                    },
+                ],
+                several: false,
+                own: Some("and keep both".into()),
+            }],
+            skipped: false,
+        };
+        let value = answered.record(Some("toolu_1"));
+        assert_eq!(value[ANSWER_RECORD], "toolu_1");
+        assert_eq!(value["questions"][0]["options"][1]["chosen"], true);
+        match Record::parse(value, "tasteNote") {
+            Some(Record::Answer {
+                call,
+                answered: read,
+            }) => {
+                assert_eq!(call.as_deref(), Some("toolu_1"));
+                assert_eq!(read, answered);
+            }
+            other => panic!("{other:?}"),
+        }
+        match Record::parse(Answered::default().record(None), "tasteNote") {
+            Some(Record::Answer { call: None, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A suggested reply chosen on the card stays on the step that offered
+    /// it — every option, the one picked marked — live and restored alike,
+    /// with the reply under it as the user's prompt.
+    #[test]
+    fn a_chosen_reply_stays_on_its_step() {
+        let labels = ["File it", "Change the title first"];
+        let prompt = format!("{PROMPT_PREFIX}1");
+        let records = vec![
+            said(&format!("{PROMPT_PREFIX}0"), "Which?"),
+            offer("o1", &labels, ToolCallStatus::Completed),
+            replied("o1", &labels, 1),
+            said(&prompt, "Change the title first"),
+        ];
+        let mut live = Model::default();
+        for record in records.clone() {
+            match record {
+                Record::Update(update) => live.apply(*update, false),
+                Record::Answer { call, answered } => live.answer(call.as_deref(), answered),
+                other => live.read(other),
+            }
+        }
+        live.finalize();
+        live.settle_running();
+        let restored = Model::of_record(0, records);
+        let strip = |model: &Model| -> Vec<Row> {
+            model
+                .rows()
+                .iter()
+                .cloned()
+                .map(|mut row| {
+                    row.at = 0;
+                    row
+                })
+                .collect()
+        };
+        assert_eq!(strip(&live), strip(&restored));
+        assert_eq!(
+            shown_answer(&restored, "o1"),
+            Some(vec!["File it".into(), "*Change the title first".into()])
+        );
+        assert!(restored.prompt_row(&prompt).is_some());
+    }
+
+    /// Suggested replies a later prompt went past unanswered show what they
+    /// offered, nothing marked; ones still waiting for an answer, and ones
+    /// the server refused, show nothing yet.
+    #[test]
+    fn replies_passed_by_show_what_was_offered() {
+        let labels = ["Yes", "No"];
+        let passed = Model::of_record(
+            0,
+            vec![
+                offer("o1", &labels, ToolCallStatus::Completed),
+                said(&format!("{PROMPT_PREFIX}1"), "Something else entirely."),
+            ],
+        );
+        assert_eq!(
+            shown_answer(&passed, "o1"),
+            Some(vec!["Yes".into(), "No".into()])
+        );
+        let waiting = Model::of_record(0, vec![offer("o1", &labels, ToolCallStatus::Completed)]);
+        assert_eq!(shown_answer(&waiting, "o1"), None);
+        let refused = Model::of_record(
+            0,
+            vec![
+                offer("o1", &labels, ToolCallStatus::Failed),
+                said(&format!("{PROMPT_PREFIX}1"), "Hm."),
+            ],
+        );
+        assert_eq!(shown_answer(&refused, "o1"), None);
+        // Answered on the card after a prompt went past them: the answer.
+        let late = Model::of_record(
+            0,
+            vec![
+                offer("o1", &labels, ToolCallStatus::Completed),
+                said(&format!("{PROMPT_PREFIX}1"), "Wait."),
+                replied("o1", &labels, 0),
+            ],
+        );
+        assert_eq!(
+            shown_answer(&late, "o1"),
+            Some(vec!["*Yes".into(), "No".into()])
+        );
+    }
+
+    /// An answer given before its call's update lands on the step when the
+    /// step comes; a form of no call is a row of its own on the line.
+    #[test]
+    fn an_answer_waits_for_its_step_or_stands_alone() {
+        let skipped = Answered {
+            questions: vec![Asked {
+                title: Some("Gadgets".into()),
+                question: None,
+                options: vec![Offered {
+                    label: "ui_icons".into(),
+                    description: None,
+                    chosen: false,
+                }],
+                several: true,
+                own: None,
+            }],
+            skipped: true,
+        };
+        let model = Model::of_record(
+            0,
+            vec![
+                Record::Answer {
+                    call: Some("ask".into()),
+                    answered: skipped.clone(),
+                },
+                step("ask"),
+                Record::Answer {
+                    call: None,
+                    answered: skipped.clone(),
+                },
+            ],
+        );
+        assert_eq!(
+            shown_answer(&model, "ask"),
+            Some(vec!["ui_icons".into(), "skipped".into()])
+        );
+        let last = model.rows().last().expect("a row");
+        assert_eq!(last.kind, Kind::Answered(skipped));
+        assert_eq!(last.dot, Dot::Note);
+        assert!(last.rail.is_some_and(|rail| rail.top), "on the line");
+        assert_eq!(last.text(), "Skipped");
     }
 }

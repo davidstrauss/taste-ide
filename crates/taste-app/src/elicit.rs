@@ -340,57 +340,6 @@ pub fn decline() -> CreateElicitationResponse {
     CreateElicitationResponse::new(ElicitationAction::Decline)
 }
 
-/// What was answered, a line per field, for the transcript: the field's
-/// title and what was chosen or typed, by the choices' own titles.
-pub fn summary(form: &Form, answers: &BTreeMap<String, Answer>) -> Vec<String> {
-    let title_of = |choices: &[Choice], value: &str| {
-        choices
-            .iter()
-            .find(|choice| choice.value == value)
-            .map(|choice| choice.title.clone())
-            .unwrap_or_else(|| value.to_string())
-    };
-    form.fields
-        .iter()
-        .filter_map(|field| {
-            let said = match (&field.kind, answers.get(&field.key)?) {
-                (Kind::One { choices, .. }, Answer::One(picked, typed)) => {
-                    let mut parts: Vec<String> = picked
-                        .iter()
-                        .map(|value| title_of(choices, value))
-                        .collect();
-                    if !typed.trim().is_empty() {
-                        parts.push(typed.trim().to_string());
-                    }
-                    parts.join(" — ")
-                }
-                (Kind::Many { choices, .. }, Answer::Many(picked, typed)) => {
-                    let mut parts: Vec<String> = picked
-                        .iter()
-                        .map(|value| title_of(choices, value))
-                        .collect();
-                    if !typed.trim().is_empty() {
-                        parts.push(typed.trim().to_string());
-                    }
-                    parts.join(", ")
-                }
-                (_, Answer::Text(text) | Answer::Number(text)) => text.trim().to_string(),
-                (_, Answer::Toggle(on)) => if *on { "yes" } else { "no" }.to_string(),
-                _ => String::new(),
-            };
-            if said.is_empty() {
-                return None;
-            }
-            let name = field
-                .title
-                .clone()
-                .or_else(|| field.description.clone())
-                .unwrap_or_else(|| form.message.clone());
-            Some(format!("{name}: {said}"))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,10 +454,6 @@ mod tests {
         assert_eq!(response["action"], "accept");
         assert_eq!(response["content"]["question_0"], "Separate target");
         assert_eq!(response["content"]["question_0_custom"], "keep both");
-        assert_eq!(
-            summary(&form, &answers),
-            ["Install shape: Separate target — keep both"]
-        );
     }
 
     #[test]
@@ -517,7 +462,6 @@ mod tests {
         let answers = BTreeMap::from([("question_0".to_string(), Answer::One(None, "".into()))]);
         let response = serde_json::to_value(accept(&form, &answers).unwrap()).unwrap();
         assert_eq!(response["content"], serde_json::json!({}));
-        assert!(summary(&form, &answers).is_empty());
         assert_eq!(
             serde_json::to_value(decline()).unwrap()["action"],
             "decline"
@@ -585,15 +529,6 @@ mod tests {
         assert_eq!(
             response["content"],
             serde_json::json!({"count": 3, "dry": false, "langs": ["rs", "py"], "name": "demo"})
-        );
-        assert_eq!(
-            summary(&form, &answers),
-            [
-                "Count: 3",
-                "Dry run: no",
-                "Languages: Rust, Python",
-                "Name: demo"
-            ]
         );
     }
 

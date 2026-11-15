@@ -563,6 +563,89 @@ fn pin_text(text: &str, attachments: &[(String, ContentBlock)]) -> String {
     }
 }
 
+/// What a suggested reply sends, from the card as it was answered: the one
+/// chosen, or what the user wrote instead; with replies that combine, every
+/// one ticked and the user's own last, as one list. Empty for nothing
+/// chosen, which sends nothing.
+fn reply_text(asked: &model::Asked) -> String {
+    let mut chosen: Vec<&str> = asked
+        .options
+        .iter()
+        .filter(|option| option.chosen)
+        .map(|option| option.label.as_str())
+        .collect();
+    chosen.extend(asked.own.as_deref());
+    match chosen.as_slice() {
+        [] => String::new(),
+        [one] => one.to_string(),
+        many => many
+            .iter()
+            .map(|reply| format!("- {reply}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// The agent's form as the log keeps it, answered with `answers` — or,
+/// with none, skipped: each field a question, its choices the options with
+/// the ones picked chosen, and what was written in its "Other" box, or a
+/// field that is not a choice, as the user's own (`model::Answered`).
+fn form_answered(
+    form: &crate::elicit::Form,
+    answers: Option<&std::collections::BTreeMap<String, crate::elicit::Answer>>,
+) -> model::Answered {
+    use crate::elicit::{Answer, Kind};
+    let alone = form.fields.len() == 1;
+    let own = |typed: &str| Some(typed.trim().to_string()).filter(|typed| !typed.is_empty());
+    let questions = form
+        .fields
+        .iter()
+        .map(|field| {
+            let answer = answers.and_then(|answers| answers.get(&field.key));
+            let (choices, several) = match &field.kind {
+                Kind::One { choices, .. } => (choices.as_slice(), false),
+                Kind::Many { choices, .. } => (choices.as_slice(), true),
+                _ => (&[][..], false),
+            };
+            let picked: Vec<&str> = match answer {
+                Some(Answer::One(Some(value), _)) => vec![value.as_str()],
+                Some(Answer::Many(values, _)) => values.iter().map(String::as_str).collect(),
+                _ => Vec::new(),
+            };
+            let written = match (&field.kind, answer) {
+                (Kind::One { other: Some(_), .. }, Some(Answer::One(_, typed)))
+                | (Kind::Many { other: Some(_), .. }, Some(Answer::Many(_, typed))) => own(typed),
+                (_, Some(Answer::Text(text) | Answer::Number(text))) => own(text),
+                (_, Some(Answer::Toggle(on))) => Some(if *on { "Yes" } else { "No" }.to_string()),
+                _ => None,
+            };
+            model::Asked {
+                title: field.title.clone(),
+                // A form of one asks its question in its message.
+                question: field
+                    .description
+                    .clone()
+                    .or_else(|| alone.then(|| form.message.clone()))
+                    .filter(|words| !words.trim().is_empty()),
+                options: choices
+                    .iter()
+                    .map(|choice| model::Offered {
+                        label: choice.title.clone(),
+                        description: choice.description.clone(),
+                        chosen: picked.contains(&choice.value.as_str()),
+                    })
+                    .collect(),
+                several,
+                own: written,
+            }
+        })
+        .collect();
+    model::Answered {
+        questions,
+        skipped: answers.is_none(),
+    }
+}
+
 /// The replies a restored conversation's last question offered, read back
 /// from its `suggest_replies` call's input: they reach a live chat as the
 /// IDE's own event, which nothing replays, so a question left unanswered
@@ -640,6 +723,7 @@ fn row_kind_name(kind: &model::Kind) -> &'static str {
         model::Kind::Task(_) => "task",
         model::Kind::Plan(_) => "plan",
         model::Kind::Note(_) => "note",
+        model::Kind::Answered(_) => "answered",
         model::Kind::Marker { .. } => "marker",
     }
 }
@@ -8890,44 +8974,21 @@ impl ChatPane {
             .build();
         let go: Rc<dyn Fn()> = {
             let (weak, own, entry) = (Rc::downgrade(self), own.clone(), entry.clone());
+            let replies = replies.clone();
             Rc::new(move || {
                 let Some(pane) = weak.upgrade() else { return };
+                // The card as answered: every reply, the ones picked
+                // chosen, and what was written in the box while its own
+                // radio is the one picked.
+                let mut asked = model::Asked::replies(&replies, several);
+                for (option, (button, _)) in asked.options.iter_mut().zip(&picks) {
+                    option.chosen = button.is_active();
+                }
                 let typed = entry.text().trim().to_string();
-                let reply = if several {
-                    // Every one ticked, the user's own last, as one list.
-                    let mut chosen: Vec<String> = picks
-                        .iter()
-                        .filter(|(button, _)| button.is_active())
-                        .map(|(_, reply)| reply.clone())
-                        .collect();
-                    if own.is_active() && !typed.is_empty() {
-                        chosen.push(typed);
-                    }
-                    match chosen.len() {
-                        0 => String::new(),
-                        1 => chosen.remove(0),
-                        _ => chosen
-                            .iter()
-                            .map(|reply| format!("- {reply}"))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    }
-                } else if own.is_active() {
-                    typed
-                } else {
-                    picks
-                        .iter()
-                        .find(|(button, _)| button.is_active())
-                        .map(|(_, reply)| reply.clone())
-                        .unwrap_or_default()
-                };
-                if reply.is_empty() {
-                    return;
+                if own.is_active() && !typed.is_empty() {
+                    asked.own = Some(typed);
                 }
-                pane.clear_replies();
-                if let Err(why) = pane.send_from(reply, Vec::new()) {
-                    pane.meta_row(&format!("the reply was not sent: {why}"));
-                }
+                pane.send_reply(asked);
             })
         };
         {
@@ -8937,6 +8998,48 @@ impl ChatPane {
         send.connect_clicked(move |_| go());
         self.replies_box.append(&send);
         self.replies_bar.set_reveal_child(!replies.is_empty());
+    }
+
+    /// The suggested replies answered as `asked` says, and the reply sent
+    /// the way Dispatch sends a typed one. Nothing chosen sends nothing.
+    fn send_reply(self: &Rc<Self>, asked: model::Asked) {
+        let Some(reply) = self.take_reply(asked) else {
+            return;
+        };
+        if let Err(why) = self.send_from(reply, Vec::new()) {
+            self.meta_row(&format!("the reply was not sent: {why}"));
+        }
+    }
+
+    /// The suggested replies answered as `asked` says: the card down, and
+    /// the answer kept on the step that offered them, so the log says what
+    /// was on the table and what was picked. The reply to send, or `None`
+    /// for nothing chosen, which leaves the card up.
+    fn take_reply(&self, asked: model::Asked) -> Option<String> {
+        let reply = reply_text(&asked);
+        if reply.is_empty() {
+            return None;
+        }
+        self.clear_replies();
+        let call = self.model.borrow().last_offer().map(str::to_string);
+        if let Some(call) = call {
+            self.answered(
+                Some(&call),
+                model::Answered {
+                    questions: vec![asked],
+                    skipped: false,
+                },
+            );
+        }
+        Some(reply)
+    }
+
+    /// How the questions `call` asked were answered, in the record and on
+    /// the call's step — or, with no call, on a row of their own
+    /// (`model::Record::Answer`).
+    fn answered(&self, call: Option<&str>, answered: model::Answered) {
+        self.record(answered.record(call));
+        self.update_model(|model| model.answer(call, answered));
     }
 
     /// Take the replies down: a turn began, or one was chosen.
@@ -12674,9 +12777,12 @@ impl ChatPane {
             // answers under it as buttons (`suggest_replies`). `restored`:
             // the same conversation as a restore replays it, where the
             // buttons come back from the call's input rather than the
-            // IDE's event.
-            Ok(variant @ ("replies" | "restored")) => {
+            // IDE's event. `answered`: the same turn with the second reply
+            // picked on the card and sent, the step that offered them
+            // keeping every option and the pick.
+            Ok(variant @ ("replies" | "restored" | "answered")) => {
                 let restored = variant == "restored";
+                let answered = variant == "answered";
                 // As an agent offers them: a label alone, and labels with
                 // what choosing them does, which draw lighter under them.
                 let offered_input = serde_json::json!({ "replies": [
@@ -12763,7 +12869,7 @@ impl ChatPane {
                     ),
                 )))];
                 emit(self, SessionUpdate::ToolCall(offered));
-                if !restored {
+                if !restored && !answered {
                     self.expand_tool_card_for_probe("probe-replies");
                 }
                 emit(
@@ -12786,6 +12892,23 @@ impl ChatPane {
                         pane.expand_tool_card_for_probe("probe-replies");
                         pane.settle_replayed_replies(true);
                     });
+                } else if answered {
+                    // Picked on the card and sent: the answer kept the way
+                    // Send keeps it, and the reply sent as a prompt is, the
+                    // agent taking it up.
+                    self.offer_replies(offers.clone(), false);
+                    let mut asked = model::Asked::replies(&offers, false);
+                    asked.options[1].chosen = true;
+                    if let Some(reply) = self.take_reply(asked) {
+                        self.send_for_probe(&reply);
+                    }
+                    self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                        ContentBlock::Text(TextContent::new(
+                            "Retitled it **Deck template pieces**, and filed it.",
+                        )),
+                    )));
+                    self.finalize_stream();
+                    self.set_busy(false);
                 } else {
                     // `TASTE_PROBE_REPLIES=several`: replies that combine,
                     // as checkboxes.
@@ -12841,6 +12964,40 @@ impl ChatPane {
             Ok("standing") => self.seed_standing_for_probe(),
             Ok("table") => self.seed_table_for_probe(),
             Ok("ask") => self.seed_questions_for_probe(),
+            // `ask-answered`: the same questions answered on the card — the
+            // first with words of the user's own, both of the second's
+            // boxes ticked — and the step keeping them once the card is
+            // gone.
+            Ok("ask-answered") => {
+                self.seed_questions_for_probe();
+                self.answer_card_for_probe(
+                    &[3, 4],
+                    Some("Neither — pin it in the TPM only after enrollment"),
+                );
+                let mut fields = ToolCallUpdateFields::new();
+                fields.status = Some(ToolCallStatus::Completed);
+                fields.content = Some(vec![ToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new(
+                        "User has answered your questions: \"Should the exploitable stack \
+                         replace the clean install, or sit alongside it?\"=\"Neither — pin it \
+                         in the TPM only after enrollment\", \"Which gadget modules go in?\"=\
+                         \"ui_icons 2.0.0, gadget_chain\". You can now continue with the \
+                         user's answers in mind.",
+                    )),
+                ))]);
+                self.render_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "probe-ask",
+                    fields,
+                )));
+                self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(
+                        "Then the install stays clean, and both gadget modules go in.",
+                    )),
+                )));
+                self.finalize_stream();
+                self.stop_button.set_visible(false);
+                self.set_busy(false);
+            }
             // `ask-other`: the same, with an answer of the user's own typed
             // into the first question's box — which selects its radio.
             Ok("ask-other") => {
@@ -13468,7 +13625,65 @@ impl ChatPane {
         live(self, SessionUpdate::AgentMessageChunk(text("Both noted.")));
         end_turn(self);
         self.pending_prompts.borrow_mut().clear();
-        // Turn 4, live: mid-answer, a step still running.
+        // Turn 4: replies offered, the first picked on the card and sent
+        // as the user's reply (`take_reply`, which Send goes through).
+        send(self, "Should the docs move with it?");
+        let offered = serde_json::json!({ "replies": [
+            "Move them",
+            {"label": "Leave them", "description": "They stay where they are."}
+        ]});
+        let mut offer = ToolCall::new("r1", "mcp__taste-ide__suggest_replies");
+        offer.kind = ToolKind::Other;
+        offer.status = ToolCallStatus::Completed;
+        offer.raw_input = Some(offered.clone());
+        live(self, SessionUpdate::ToolCall(offer));
+        live(
+            self,
+            SessionUpdate::AgentMessageChunk(text("Move them, or leave them?")),
+        );
+        end_turn(self);
+        let mut asked = model::Asked::replies(&taste_core::Reply::offered(&offered), false);
+        asked.options[0].chosen = true;
+        if let Some(reply) = self.take_reply(asked) {
+            send(self, &reply);
+        }
+        // Turn 5: the agent's questions (AskUserQuestion), answered on
+        // their card — words of the user's own for the first, a box of the
+        // second ticked.
+        let mut ask = ToolCall::new("q1", "Asking for your input");
+        ask.kind = ToolKind::Other;
+        ask.status = ToolCallStatus::InProgress;
+        live(self, SessionUpdate::ToolCall(ask));
+        let (reply, _) = tokio::sync::oneshot::channel();
+        self.handle_event(SessionEvent::Elicitation {
+            request: probe_questions("q1"),
+            reply,
+        });
+        self.answer_card_for_probe(&[3], Some("Only after enrollment"));
+        let mut fields = ToolCallUpdateFields::new();
+        fields.status = Some(ToolCallStatus::Completed);
+        live(
+            self,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new("q1".to_string(), fields)),
+        );
+        live(
+            self,
+            SessionUpdate::AgentMessageChunk(text("Moved, and noted.")),
+        );
+        end_turn(self);
+        // Turn 6: replies offered, and a prompt typed past them.
+        send(self, "What next?");
+        let mut offer = ToolCall::new("r2", "mcp__taste-ide__suggest_replies");
+        offer.kind = ToolKind::Other;
+        offer.status = ToolCallStatus::Completed;
+        offer.raw_input =
+            Some(serde_json::json!({ "replies": ["Tests", "Docs"], "several": true }));
+        live(self, SessionUpdate::ToolCall(offer));
+        end_turn(self);
+        send(self, "Neither; leave it for now.");
+        live(self, SessionUpdate::AgentMessageChunk(text("Leaving it.")));
+        end_turn(self);
+        // Turn 7, live: mid-answer, a step still running.
         send(self, "And the docs?");
         step(
             self,
@@ -13551,7 +13766,26 @@ impl ChatPane {
         glib::spawn_future_local(async move {
             glib::timeout_future(std::time::Duration::from_millis(1500)).await;
             let live = {
-                let rows = pane.model.borrow().rows().to_vec();
+                // A restore settles the steps its record left running, since
+                // the agent that ran them is gone (`Model::settle_running`):
+                // the live turn's running step is compared as a restore
+                // leaves it, and is seen to go on below.
+                let rows: Vec<model::Row> = pane
+                    .model
+                    .borrow()
+                    .rows()
+                    .iter()
+                    .cloned()
+                    .map(|mut row| {
+                        if let model::Kind::Step(step) = &mut row.kind {
+                            if step.running {
+                                step.running = false;
+                                step.tone = "cut";
+                            }
+                        }
+                        row
+                    })
+                    .collect();
                 snapshot(&pane, &rows, &pane.items())
             };
             pane.flush_stash();
@@ -13948,54 +14182,62 @@ impl ChatPane {
         ask.kind = ToolKind::Other;
         ask.status = ToolCallStatus::InProgress;
         self.render_update(SessionUpdate::ToolCall(ask));
-        let other = |question: &str| {
-            serde_json::json!({
-                "type": "string",
-                "title": "Other",
-                "_meta": {"_askUserQuestionCustomAnswer":
-                    {"questionId": question, "isCustomAnswer": true}}
-            })
-        };
-        let request = serde_json::from_value(serde_json::json!({
-            "mode": "form",
-            "sessionId": "probe-session",
-            "toolCallId": "probe-ask",
-            "message": "Please answer the following questions.",
-            "requestedSchema": {
-                "type": "object",
-                "properties": {
-                    "question_0": {
-                        "type": "string",
-                        "title": "Install shape",
-                        "description": "Should the exploitable stack replace the clean install, \
-                                        or sit alongside it?",
-                        "oneOf": [
-                            {"const": "Replace install", "title": "Replace install",
-                             "description": "task install builds the vulnerable stack behind \
-                                             the WAF. One site, one code path."},
-                            {"const": "Separate target", "title": "Separate target",
-                             "description": "Keep task install clean and add \
-                                             task install:vulnerable beside it."}
-                        ]
-                    },
-                    "question_0_custom": other("question_0"),
-                    "question_1": {
-                        "type": "array",
-                        "title": "Gadgets",
-                        "description": "Which gadget modules go in?",
-                        "items": {"anyOf": [
-                            {"const": "ui_icons", "title": "ui_icons 2.0.0"},
-                            {"const": "gadget_chain", "title": "gadget_chain",
-                             "description": "The deserialization chain the rule blocks."}
-                        ]}
-                    },
-                    "question_1_custom": other("question_1")
-                }
-            }
-        }))
-        .expect("the probe's form is well formed");
         let (reply, _) = tokio::sync::oneshot::channel();
-        self.handle_event(SessionEvent::Elicitation { request, reply });
+        self.handle_event(SessionEvent::Elicitation {
+            request: probe_questions("probe-ask"),
+            reply,
+        });
+    }
+
+    /// TASTE_PROBE_CHECK only: the question card answered as a person
+    /// answers it — the card's indicators at `ticks`, by their place on it,
+    /// turned on, `own` typed into its first box, which picks that box's
+    /// own option — and then Answer.
+    fn answer_card_for_probe(self: &Rc<Self>, ticks: &[usize], own: Option<&str>) {
+        fn walk(
+            widget: &gtk::Widget,
+            checks: &mut Vec<gtk::CheckButton>,
+            entries: &mut Vec<gtk::Entry>,
+        ) {
+            if let Some(check) = widget.downcast_ref::<gtk::CheckButton>() {
+                checks.push(check.clone());
+            }
+            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                entries.push(entry.clone());
+                return;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                walk(&current, checks, entries);
+                child = current.next_sibling();
+            }
+        }
+        let (mut checks, mut entries) = (Vec::new(), Vec::new());
+        if let Some(card) = self.permission_bar.child() {
+            walk(&card, &mut checks, &mut entries);
+        }
+        for &at in ticks {
+            if let Some(check) = checks.get(at) {
+                check.set_active(true);
+            }
+        }
+        if let (Some(own), Some(entry)) = (own, entries.first()) {
+            entry.set_text(own);
+        }
+        self.answer_questions(true);
+    }
+
+    /// TASTE_PROBE_CHECK only: `words` sent as the user's prompt and taken
+    /// by the agent, recorded as a send records it — the probe has no agent
+    /// to send to.
+    fn send_for_probe(self: &Rc<Self>, words: &str) {
+        self.finalize_stream();
+        let id = new_prompt_id();
+        self.show_prompt(&id, words, &[], model::Delivery::Sent);
+        for record in prompt_records(&id, &[ContentBlock::Text(TextContent::new(words))]) {
+            self.record(record);
+        }
+        self.take_prompt(&id, None);
     }
 
     /// TASTE_PROBE_CHECK only: put a real permission request on screen.
@@ -15154,9 +15396,7 @@ impl ChatPane {
             let answers = (pending.read)();
             if accept {
                 match crate::elicit::accept(&pending.form, &answers) {
-                    Ok(response) => {
-                        Some((response, crate::elicit::summary(&pending.form, &answers)))
-                    }
+                    Ok(response) => Some((response, answers)),
                     Err(why) => {
                         self.permission_scope.set_label(&why);
                         self.permission_scope.add_css_class("error");
@@ -15179,23 +15419,14 @@ impl ChatPane {
             self.mark_waiting(id, false);
         }
         self.note_activity();
-        let (response, said) = match response {
-            Some((response, lines)) if !lines.is_empty() => (response, lines.join("\n")),
-            Some((response, _)) => (response, "Answered with nothing filled in".to_string()),
-            None => (crate::elicit::decline(), "Skipped".to_string()),
+        // The questions as answered, kept on AskUserQuestion's step — what
+        // each offered and what was picked, or that they were skipped — or
+        // on a row of their own for a form of no call.
+        let (response, answered) = match response {
+            Some((response, answers)) => (response, form_answered(&pending.form, Some(&answers))),
+            None => (crate::elicit::decline(), form_answered(&pending.form, None)),
         };
-        match &pending.form.tool_call {
-            Some(id) => self.note_permission(
-                id.clone(),
-                if accept {
-                    "dialog-question-symbolic"
-                } else {
-                    "action-unavailable-symbolic"
-                },
-                said,
-            ),
-            None => self.meta_row(&said),
-        }
+        self.answered(pending.form.tool_call.as_deref(), answered);
         let _ = pending.reply.send(response);
         self.next_permission();
     }
@@ -17221,6 +17452,58 @@ fn working_line(
     }
 }
 
+/// TASTE_PROBE_CHECK only: the probe's AskUserQuestion, as the adapter
+/// sends it for call `call` — two questions, one a single choice and one a
+/// multiple, each with its "Other" box.
+fn probe_questions(call: &str) -> agent_client_protocol::schema::v1::CreateElicitationRequest {
+    let other = |question: &str| {
+        serde_json::json!({
+            "type": "string",
+            "title": "Other",
+            "_meta": {"_askUserQuestionCustomAnswer":
+                {"questionId": question, "isCustomAnswer": true}}
+        })
+    };
+    serde_json::from_value(serde_json::json!({
+    "mode": "form",
+    "sessionId": "probe-session",
+    "toolCallId": call,
+        "message": "Please answer the following questions.",
+        "requestedSchema": {
+            "type": "object",
+            "properties": {
+                "question_0": {
+                    "type": "string",
+                    "title": "Install shape",
+                    "description": "Should the exploitable stack replace the clean install, \
+                                    or sit alongside it?",
+                    "oneOf": [
+                        {"const": "Replace install", "title": "Replace install",
+                         "description": "task install builds the vulnerable stack behind \
+                                         the WAF. One site, one code path."},
+                        {"const": "Separate target", "title": "Separate target",
+                         "description": "Keep task install clean and add \
+                                         task install:vulnerable beside it."}
+                    ]
+                },
+                "question_0_custom": other("question_0"),
+                "question_1": {
+                    "type": "array",
+                    "title": "Gadgets",
+                    "description": "Which gadget modules go in?",
+                    "items": {"anyOf": [
+                        {"const": "ui_icons", "title": "ui_icons 2.0.0"},
+                        {"const": "gadget_chain", "title": "gadget_chain",
+                         "description": "The deserialization chain the rule blocks."}
+                    ]}
+                },
+                "question_1_custom": other("question_1")
+            }
+        }
+    }))
+    .expect("the probe's form is well formed")
+}
+
 /// One option of a question — the question card's, and the suggested
 /// replies', which are the same choice (David, 2026-10-20: "The chat radio
 /// question interface is nicer than the chat button answer interface") —
@@ -17444,6 +17727,112 @@ fn present_image_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, texture: &g
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A suggested reply sends the one chosen, or what was written
+    /// instead; replies that combine send every one ticked, the user's own
+    /// last, as a list; nothing chosen sends nothing.
+    #[test]
+    fn a_reply_sends_what_was_chosen() {
+        let replies: Vec<taste_core::Reply> = ["File it", "Retitle it", "Both"]
+            .iter()
+            .map(|label| taste_core::Reply {
+                label: label.to_string(),
+                description: None,
+            })
+            .collect();
+        let mut one = model::Asked::replies(&replies, false);
+        assert_eq!(reply_text(&one), "");
+        one.options[1].chosen = true;
+        assert_eq!(reply_text(&one), "Retitle it");
+        let mut own = model::Asked::replies(&replies, false);
+        own.own = Some("Neither".into());
+        assert_eq!(reply_text(&own), "Neither");
+        let mut several = model::Asked::replies(&replies, true);
+        several.options[0].chosen = true;
+        several.options[2].chosen = true;
+        several.own = Some("and push".into());
+        assert_eq!(reply_text(&several), "- File it\n- Both\n- and push");
+    }
+
+    /// AskUserQuestion's form, as the log keeps it once answered: each
+    /// question with every option it offered, the ones picked chosen, and
+    /// the "Other" box's words as the user's own; skipped, the same
+    /// options, none chosen.
+    #[test]
+    fn a_form_is_kept_with_its_options_and_what_was_picked() {
+        use crate::elicit::Answer;
+        let request = serde_json::from_value(serde_json::json!({
+            "mode": "form",
+            "sessionId": "s",
+            "toolCallId": "toolu_1",
+            "message": "Please answer the following questions.",
+            "requestedSchema": {"type": "object", "properties": {
+                "question_0": {"type": "string", "title": "Install shape",
+                    "description": "Replace the install, or sit beside it?",
+                    "oneOf": [
+                        {"const": "replace", "title": "Replace install",
+                         "description": "One site, one code path."},
+                        {"const": "separate", "title": "Separate target"}]},
+                "question_0_custom": {"type": "string", "title": "Other"},
+                "question_1": {"type": "array", "title": "Gadgets",
+                    "items": {"anyOf": [
+                        {"const": "ui_icons", "title": "ui_icons 2.0.0"},
+                        {"const": "chain", "title": "gadget_chain"}]}},
+                "question_1_custom": {"type": "string", "title": "Other"}
+            }}
+        }))
+        .unwrap();
+        let form = crate::elicit::form(&request).unwrap();
+        let answers = std::collections::BTreeMap::from([
+            (
+                "question_0".to_string(),
+                Answer::One(None, " Neither, for now ".into()),
+            ),
+            (
+                "question_1".to_string(),
+                Answer::Many(vec!["ui_icons".into(), "chain".into()], String::new()),
+            ),
+        ]);
+        let answered = form_answered(&form, Some(&answers));
+        assert!(!answered.skipped);
+        let [shape, gadgets] = answered.questions.as_slice() else {
+            panic!("{answered:?}")
+        };
+        assert_eq!(shape.title.as_deref(), Some("Install shape"));
+        assert_eq!(
+            shape.question.as_deref(),
+            Some("Replace the install, or sit beside it?")
+        );
+        assert!(!shape.several);
+        assert_eq!(
+            shape.options[0].description.as_deref(),
+            Some("One site, one code path.")
+        );
+        assert!(shape.options.iter().all(|option| !option.chosen));
+        assert_eq!(shape.own.as_deref(), Some("Neither, for now"));
+        assert!(gadgets.several);
+        assert!(gadgets.options.iter().all(|option| option.chosen));
+        assert_eq!(gadgets.own, None);
+        assert_eq!(
+            answered.text(),
+            "Install shape: Neither, for now\nGadgets: ui_icons 2.0.0, gadget_chain"
+        );
+        let skipped = form_answered(&form, None);
+        assert!(skipped.skipped);
+        assert_eq!(skipped.questions.len(), 2);
+        assert!(skipped
+            .questions
+            .iter()
+            .all(|asked| asked.own.is_none() && asked.options.iter().all(|o| !o.chosen)));
+        // A form of one asks its question in its message.
+        let mut one = form.clone();
+        one.fields.truncate(1);
+        one.fields[0].description = None;
+        assert_eq!(
+            form_answered(&one, None).questions[0].question.as_deref(),
+            Some("Please answer the following questions.")
+        );
+    }
 
     /// A NUL in what the agent sent reaches the pane as ␀, wherever in the
     /// update it is, and an update without one comes through as it was.

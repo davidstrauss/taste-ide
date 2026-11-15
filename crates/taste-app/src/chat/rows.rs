@@ -15,7 +15,8 @@ use agent_client_protocol::schema::v1::{
 };
 
 use super::model::{
-    Answer, Delivery, Dot, Kind, PlanCard, Rail, Row, RowId, Step, Task, Thought, User,
+    Answer, Answered, Asked, Delivery, Dot, Kind, PlanCard, Rail, Row, RowId, Step, Task, Thought,
+    User,
 };
 use super::*;
 
@@ -79,6 +80,11 @@ impl ChatPane {
             Kind::Task(task) => self.railed(self.task_widget(row, task)),
             Kind::Plan(plan) => self.railed(self.plan_widget(row, plan)),
             Kind::Note(text) => self.railed(self.note_widget(row, text)),
+            Kind::Answered(answered) => {
+                let answers = answered_widget(answered);
+                answers.set_margin_top(2);
+                self.railed(self.on_rail(&answers, row.rail.unwrap_or_default(), row.dot))
+            }
             Kind::Marker { prompt, through } => (self.marker_widget(prompt, *through), None),
         };
         // The row's own box, which wears the blue while its document is
@@ -976,7 +982,12 @@ impl ChatPane {
         }
         let head = gtk::Box::new(gtk::Orientation::Vertical, 0);
         head.append(&header);
-        if let Some(text) = self.step_summary(step).filter(|_| !step.expanded) {
+        // An answered question's options say more than "2 fields": they
+        // stand in for the summary, under the header.
+        if let Some(text) = self
+            .step_summary(step)
+            .filter(|_| !step.expanded && step.answered.is_none())
+        {
             let summary = gtk::Label::builder()
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -1029,6 +1040,14 @@ impl ChatPane {
             body.append(&head_row);
         } else {
             body.append(&toggle);
+        }
+        // The question it asked, as answered: shown open or closed, and
+        // not part of the toggle, since it is read rather than clicked.
+        if let Some(answered) = &step.answered {
+            let answers = answered_widget(answered);
+            answers.set_margin_top(4);
+            answers.set_margin_bottom(2);
+            body.append(&answers);
         }
         if step.expanded && has_content {
             let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -1203,6 +1222,151 @@ impl ChatPane {
             }
         }
     }
+}
+
+/// A question's answer, as the log keeps it: each question's name and
+/// words, if it has them, and its options as the card drew them — the
+/// chosen ones with their radio filled or their box ticked, in the body's
+/// colour, and the rest empty and dim — then what the user wrote of their
+/// own, which was an option too. A skipped form says so under its options,
+/// none of them chosen. Read, not used: the indicators are the card's own
+/// check buttons, out of reach of the pointer and the keyboard.
+fn answered_widget(answered: &Answered) -> gtk::Box {
+    let questions = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    questions.add_css_class("answered");
+    for asked in &answered.questions {
+        questions.append(&asked_widget(asked));
+    }
+    if answered.skipped {
+        questions.append(
+            &gtk::Label::builder()
+                .label("Skipped")
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+    }
+    questions
+}
+
+/// One question of [`answered_widget`].
+fn asked_widget(asked: &Asked) -> gtk::Box {
+    let group = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    if let Some(title) = &asked.title {
+        group.append(
+            &gtk::Label::builder()
+                .label(title)
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["caption-heading"])
+                .build(),
+        );
+    }
+    if let Some(question) = &asked.question {
+        let words = gtk::Label::builder()
+            .label(question)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .attributes(&no_hyphens())
+            .margin_bottom(2)
+            .build();
+        group.append(&words);
+    }
+    let mut leader: Option<gtk::CheckButton> = None;
+    let mut indicator = |chosen: bool| {
+        let button = gtk::CheckButton::builder()
+            .active(chosen)
+            .can_target(false)
+            .can_focus(false)
+            .build();
+        if !asked.several {
+            match &leader {
+                Some(leader) => button.set_group(Some(leader)),
+                None => leader = Some(button.clone()),
+            }
+            // Joining a group can take the mark from the leader.
+            button.set_active(chosen);
+        }
+        button
+    };
+    for option in &asked.options {
+        group.append(&answered_option(
+            &indicator(option.chosen),
+            &option.label,
+            option.description.as_deref(),
+            option.chosen,
+        ));
+    }
+    if let Some(own) = &asked.own {
+        // Without options, what was written is the whole answer: no
+        // indicator beside it, since there was nothing to choose from.
+        if asked.options.is_empty() {
+            group.append(
+                &gtk::Label::builder()
+                    .label(own)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .attributes(&no_hyphens())
+                    .build(),
+            );
+        } else {
+            group.append(&answered_option(
+                &indicator(true),
+                own,
+                Some("Your own answer"),
+                true,
+            ));
+        }
+    }
+    group
+}
+
+/// An option of an answered question: the card's option row
+/// (`question_option`), its indicator set and out of reach, and dim unless
+/// it was chosen.
+fn answered_option(
+    button: &gtk::CheckButton,
+    title: &str,
+    description: Option<&str>,
+    chosen: bool,
+) -> gtk::Box {
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text.set_hexpand(true);
+    text.set_margin_top(QUESTION_TITLE_DROP);
+    let label = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .attributes(&no_hyphens())
+        .build();
+    text.append(&label);
+    if let Some(description) = description {
+        let under = gtk::Label::builder()
+            .label(description)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .attributes(&no_hyphens())
+            .css_classes(["caption"])
+            .build();
+        // The row's own dimming covers an option not chosen; a chosen
+        // one's description is dim on its own, as the card has it.
+        if chosen {
+            under.add_css_class("dim-label");
+        }
+        text.append(&under);
+    }
+    button.set_valign(gtk::Align::Start);
+    button.update_relation(&[gtk::accessible::Relation::LabelledBy(&[label.upcast_ref()])]);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("question-option");
+    row.add_css_class(if chosen { "chosen" } else { "dim-label" });
+    row.append(button);
+    row.append(&text);
+    row
 }
 
 /// A thought's text, as it shows opened: a label, not a text view. A
