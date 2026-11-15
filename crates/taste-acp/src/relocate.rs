@@ -415,7 +415,10 @@ fn is_claude_code(spec: &AgentSpec) -> bool {
 /// user's history: the commits are theirs. And it takes out the
 /// `idleCompaction: false` an earlier IDE wrote there to keep the adapter's
 /// idle compaction off while the IDE ran its own: the adapter's is the one
-/// now, and on, as Claude Code ships it. A file that does not parse is left
+/// now, and on, as Claude Code ships it. That deletion is a migration with
+/// a date: by 2027-05-14 every environment has started on a build that
+/// makes it, and it comes out then (the test
+/// `the_idle_compaction_migration_is_removed_on_time` fails from that day). A file that does not parse is left
 /// alone rather than replaced.
 ///
 /// And it installs the IDE's message hook ([`CLAUDE_MESSAGE_HOOK`]) beside
@@ -972,6 +975,32 @@ mod tests {
     /// The merge, run by node against a home of its own: the rules join
     /// whatever the file holds, twice is once, and a file that does not
     /// parse is left as it was.
+    /// When the settings merge stops deleting `idleCompaction` (2027-05-14,
+    /// UTC, as Unix seconds): six months after the IDE's own idle
+    /// compaction was removed (David, 2026-11-14: "Remove it in 6 months").
+    const IDLE_COMPACTION_MIGRATION_ENDS: u64 = 1_810_252_800;
+
+    /// The `delete s.idleCompaction` in [`claude_settings_script`] has
+    /// done its work by [`IDLE_COMPACTION_MIGRATION_ENDS`]: from that day
+    /// this fails until it, its assertion in the test below, the sentence
+    /// about it in the script's doc, the constant, and this test are
+    /// removed.
+    #[test]
+    fn the_idle_compaction_migration_is_removed_on_time() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            now < IDLE_COMPACTION_MIGRATION_ENDS,
+            "2027-05-14 has passed: remove `delete s.idleCompaction` from the Claude settings \
+             merge, with its doc sentence, its assertion, IDLE_COMPACTION_MIGRATION_ENDS, \
+             and this test"
+        );
+        assert!(claude_settings_script(Path::new("/run/taste/mcp.sock"))
+            .contains("delete s.idleCompaction;"));
+    }
+
     #[test]
     fn the_settings_merge_keeps_what_is_there() {
         if std::process::Command::new("node")
