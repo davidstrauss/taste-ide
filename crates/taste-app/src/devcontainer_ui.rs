@@ -785,13 +785,13 @@ impl DevcontainerBanner {
     }
 }
 
-/// The touch notice with its countdown: "about N s to touch" while the
+/// The touch notice with its countdown: "about N s left" while the
 /// window is thought open, and "still waiting" once it has passed — the
 /// key may yet take the touch, and the step ends the notice when it gives
 /// up.
 fn touch_countdown(base: &str, elapsed_secs: u64) -> String {
     match TOUCH_WINDOW_SECS.checked_sub(elapsed_secs) {
-        Some(left) if left > 0 => format!("{base} · about {left} s to touch"),
+        Some(left) if left > 0 => format!("{base} · about {left} s left"),
         _ => format!("{base} · still waiting"),
     }
 }
@@ -1038,11 +1038,11 @@ mod tests {
     fn the_touch_countdown_counts_down_and_then_waits() {
         assert_eq!(
             touch_countdown("Touch your security key", 0),
-            "Touch your security key · about 30 s to touch"
+            "Touch your security key · about 30 s left"
         );
         assert_eq!(
             touch_countdown("Touch your security key", 29),
-            "Touch your security key · about 1 s to touch"
+            "Touch your security key · about 1 s left"
         );
         assert_eq!(
             touch_countdown("Touch your security key", 30),

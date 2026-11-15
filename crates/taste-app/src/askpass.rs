@@ -140,7 +140,7 @@ pub fn run(prompt: &str) -> glib::ExitCode {
     let kind = kind_of(prompt, std::env::var("SSH_ASKPASS_PROMPT").ok().as_deref());
     // Said here, in the helper's own process, because naming the key reads
     // its `.pub`, and the IDE's GTK thread reads no files.
-    let named = passphrase_prompt(prompt);
+    let named = passphrase_prompt(prompt).or_else(|| presence_prompt(prompt));
     let prompt = named.as_deref().unwrap_or(prompt);
     if let Some(socket) = std::env::var_os("TASTE_ASKPASS_SOCKET") {
         match ask_ide(Path::new(&socket), prompt, kind) {
@@ -220,6 +220,52 @@ fn passphrase_prompt(prompt: &str) -> Option<String> {
     Some(key.say("PIN", again))
 }
 
+/// A security key's touch notice in the IDE's words, the key named as
+/// [`passphrase_prompt`] names it: "Touch security key amutable-nitro"
+/// where ssh said "Confirm user presence for key ED25519-SK SHA256:…",
+/// a fingerprint nobody knows their key by (David, 2026-11-15: "Could we
+/// name the key?"). OpenSSH's wordings: ssh's and ssh-keygen's "Confirm
+/// user presence for key <TYPE> <fingerprint>", and the agent's, which may
+/// go on with the host it signs for; what follows the fingerprint is kept.
+/// A fingerprint no `.pub` in `~/.ssh` has is shown as it is.
+fn presence_prompt(prompt: &str) -> Option<String> {
+    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".ssh");
+    presence_prompt_in(prompt, &dir)
+}
+
+/// [`presence_prompt`] with the keys looked for in `dir`.
+fn presence_prompt_in(prompt: &str, dir: &Path) -> Option<String> {
+    let rest = prompt
+        .trim()
+        .strip_prefix("Confirm user presence for key ")?;
+    let (kind, rest) = rest.split_once(' ')?;
+    let (fingerprint, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    let fingerprint = fingerprint.trim_end_matches(':');
+    if !fingerprint.starts_with("SHA256:") {
+        return None;
+    }
+    let key = key_by_fingerprint_in(dir, fingerprint).unwrap_or(Key {
+        security: kind.to_ascii_uppercase().ends_with("-SK"),
+        name: fingerprint.to_string(),
+        path: None,
+    });
+    let tail = tail.trim().trim_end_matches(':');
+    let tail = if tail.is_empty() {
+        String::new()
+    } else {
+        format!(" {tail}")
+    };
+    let kind = if key.security {
+        "security key"
+    } else {
+        "SSH key"
+    };
+    Some(match &key.path {
+        Some(path) => format!("Touch {kind} {}{tail}\n{}", key.name, path.display()),
+        None => format!("Touch {kind} {}{tail}", key.name),
+    })
+}
+
 /// A key as the strip names it.
 struct Key {
     security: bool,
@@ -270,6 +316,11 @@ fn key_by_path(path: &Path) -> Option<Key> {
 /// names a key it asks a PIN for.
 fn key_by_fingerprint(fingerprint: &str) -> Option<Key> {
     let dir = PathBuf::from(std::env::var_os("HOME")?).join(".ssh");
+    key_by_fingerprint_in(&dir, fingerprint)
+}
+
+/// [`key_by_fingerprint`] in `dir`.
+fn key_by_fingerprint_in(dir: &Path, fingerprint: &str) -> Option<Key> {
     std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
         let public = entry.path();
         if public.extension().is_none_or(|ext| ext != "pub") {
@@ -517,6 +568,76 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The touch notice names the key by its comment, keeps the host the
+    /// agent adds, and shows a fingerprint it cannot place as it is.
+    #[test]
+    fn a_touch_notice_names_the_key_its_owner_named() {
+        let dir = std::env::temp_dir().join(format!("taste-presence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("id_ed25519");
+        let _ = std::fs::remove_file(&key);
+        let made = std::process::Command::new("ssh-keygen")
+            .args([
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "amutable-nitro",
+                "-f",
+            ])
+            .arg(&key)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let listed = std::process::Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(key.with_extension("pub"))
+            .output()
+            .unwrap();
+        let fingerprint = String::from_utf8_lossy(&listed.stdout)
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            presence_prompt_in(
+                &format!("Confirm user presence for key ED25519 {fingerprint}"),
+                &dir
+            )
+            .as_deref(),
+            Some(format!("Touch SSH key amutable-nitro\n{}", key.display()).as_str())
+        );
+        assert_eq!(
+            presence_prompt_in(
+                &format!(
+                    "Confirm user presence for key ED25519 {fingerprint} to authenticate to \
+                     github.com"
+                ),
+                &dir
+            )
+            .as_deref(),
+            Some(
+                format!(
+                    "Touch SSH key amutable-nitro to authenticate to github.com\n{}",
+                    key.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            presence_prompt_in(
+                "Confirm user presence for key ED25519-SK SHA256:nothingHere",
+                &dir
+            )
+            .as_deref(),
+            Some("Touch security key SHA256:nothingHere")
+        );
+        assert_eq!(presence_prompt_in("User presence confirmed", &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_passphrase_prompt_names_the_key_its_owner_named() {
