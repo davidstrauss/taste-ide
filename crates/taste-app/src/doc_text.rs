@@ -65,6 +65,11 @@ const LEVEL_INDENT: i32 = 22;
 /// as the source editor puts a line it jumps to.
 const REVEAL_ALIGN: f32 = 0.1;
 
+/// The priority of the work a text view does laying its lines out in the
+/// gaps between frames, `GTK_TEXT_VIEW_PRIORITY_VALIDATE`, which GTK does
+/// not export: drawing's, and five below it.
+const TEXT_VIEW_VALIDATE: i32 = gtk::gdk::PRIORITY_REDRAW as i32 + 5;
+
 /// What a click on a span does.
 #[derive(Clone, Debug, PartialEq)]
 enum Action {
@@ -83,6 +88,9 @@ pub struct Rendering {
     styles: Styles,
     /// Where the source's lines landed (`crate::doc_source`).
     source: SourceMap,
+    /// The source it was written from: what the next one's lines are
+    /// followed back to.
+    text: String,
 }
 
 /// The tags whose colours follow the style: set again when it turns dark
@@ -120,6 +128,39 @@ struct Shown {
     mirrors: Vec<Mirror>,
     styles: Styles,
     source: SourceMap,
+    text: String,
+}
+
+/// How a held place is put in view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hold {
+    /// A line asked for: a tenth of the way down the view.
+    Revealed,
+    /// The reader's own place, kept through a refresh: the character
+    /// `chars` past the line's place — the first of the display line the
+    /// view's top edge is in — with its display line's top `above` pixels
+    /// above that edge. `line_above` is how far the line's own place is
+    /// above the edge, for when the line was changed and its characters
+    /// are not what they were.
+    Kept {
+        chars: i32,
+        above: i32,
+        line_above: i32,
+    },
+}
+
+/// A place in the document, as a line of its source.
+#[derive(Clone, Copy, Debug)]
+struct Place {
+    /// 0-based.
+    line: u32,
+    hold: Hold,
+}
+
+/// A place held in view, at a mark in the shown rendering's buffer.
+struct Held {
+    mark: gtk::TextMark,
+    place: Place,
 }
 
 /// A source line asked for before the rendering that has it is shown.
@@ -149,10 +190,23 @@ pub struct DocView {
     base: RefCell<Option<DocumentBase>>,
     /// A line asked for that waits on its rendering.
     wanted: RefCell<Option<Wanted>>,
-    /// The place a line asked for landed, held there while what is above
-    /// it is laid out again — a picture or a diagram come in, the column's
-    /// width settled — until the reader scrolls, clicks, or types.
-    target: RefCell<Option<gtk::TextMark>>,
+    /// The place a line asked for landed, or the reader's place kept
+    /// through a refresh, held there while what is above it is laid out
+    /// again — a picture or a diagram come in, the column's width settled
+    /// — until the reader scrolls, clicks, or types.
+    target: RefCell<Option<Held>>,
+    /// A kept place is put again whenever the view moves or the
+    /// document's height changes, while the text view lays out the lines
+    /// above it (`converge`).
+    armed: Cell<bool>,
+    /// A kept place is being put: the view moving is this.
+    settling: Cell<bool>,
+    /// A kept place's mark is in a buffer just shown, whose first screen
+    /// the text view is still to lay out: where anything stands in it is
+    /// not yet known, so nothing is put until it is (`settle_soon`).
+    fresh: Cell<bool>,
+    /// TASTE_PROBE_KEEP only: a wait in place of the editor's.
+    wait_for_probe: Cell<Option<std::time::Duration>>,
 }
 
 impl DocView {
@@ -209,9 +263,51 @@ impl DocView {
             base: RefCell::new(None),
             wanted: RefCell::new(None),
             target: RefCell::new(None),
+            armed: Cell::new(false),
+            settling: Cell::new(false),
+            fresh: Cell::new(false),
+            wait_for_probe: Cell::new(None),
         });
         this.install_links();
         this.install_letting_go();
+        // While a kept place is being put (`converge`), wherever the text
+        // view moves the view to — its first line on screen held in place
+        // as the lines above it are laid out, or not quite — the place is
+        // put back its pixels above the top edge in the same turn; and
+        // when what is laid out changes the document's height and not
+        // where the view is, before the next frame.
+        {
+            let weak = Rc::downgrade(&this);
+            this.scroller.vadjustment().connect_value_changed(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    if this.armed.get() {
+                        this.settle();
+                    }
+                }
+            });
+            let weak = Rc::downgrade(&this);
+            this.scroller.vadjustment().connect_changed(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    if this.armed.get() {
+                        this.settle_soon();
+                    }
+                }
+            });
+        }
+        // A new width lays every line out again: the reader's place is
+        // read before at the width they read it at, and put back after.
+        {
+            let weak = Rc::downgrade(&this);
+            *this.view.imp().on_width.borrow_mut() = Some(Box::new(move |laid_out| {
+                if let Some(this) = weak.upgrade() {
+                    if laid_out {
+                        this.follow_target();
+                    } else {
+                        this.hold_through_width();
+                    }
+                }
+            }));
+        }
         // The pictures, diagrams, and tables are the column wide: when the
         // column's width changes they are measured again.
         {
@@ -264,6 +360,7 @@ impl DocView {
     ) {
         *self.on_link.borrow_mut() = Some(on_link);
         *self.base.borrow_mut() = Some(base.clone());
+        let wait = self.wait_for_probe.get().unwrap_or(wait);
         let readiness = Readiness::default();
         let rendering = render(&self.view, text, &base, &readiness);
         let generation = self.generation.get() + 1;
@@ -346,61 +443,223 @@ impl DocView {
     }
 
     fn land(self: &Rc<Self>, line: u32) {
+        self.land_at(Place {
+            line: line.saturating_sub(1),
+            hold: Hold::Revealed,
+        });
+    }
+
+    /// Put `place` in view, in the rendering just shown or shown already,
+    /// and hold it there.
+    fn land_at(self: &Rc<Self>, place: Place) {
+        let Some(mark) = self.mark_for(place) else {
+            return;
+        };
+        self.let_go();
+        *self.target.borrow_mut() = Some(Held { mark, place });
+        match place.hold {
+            Hold::Revealed => {
+                self.follow_target();
+                // Once the lines around it are laid out, as they are
+                // drawn: a widget measured at its column's width for the
+                // first time moves what is under it.
+                let frames = Cell::new(0);
+                let weak = Rc::downgrade(self);
+                self.view.add_tick_callback(move |_, _| {
+                    frames.set(frames.get() + 1);
+                    if frames.get() < 3 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if let Some(this) = weak.upgrade() {
+                        this.follow_target();
+                    }
+                    glib::ControlFlow::Break
+                });
+            }
+            Hold::Kept { .. } => {
+                // A fresh buffer is laid out from its first line, a
+                // screen of it before the first frame; where the rest
+                // stands is estimated until it is laid out. The place is
+                // put once that screen is (`settle_soon`), at its place
+                // as estimated, which puts it and the lines after it on
+                // screen, laid out; and again as the lines above it are
+                // laid out too (`converge`).
+                self.fresh.set(true);
+                self.settle_soon();
+                self.converge();
+            }
+        }
+    }
+
+    /// A mark at `place` in the shown rendering's buffer.
+    fn mark_for(&self, place: Place) -> Option<gtk::TextMark> {
         let offset = {
             let shown = self.shown.borrow();
-            let Some(shown) = shown.as_ref() else { return };
-            shown.source.place(line.saturating_sub(1))
+            shown.as_ref()?.source.place(place.line)
         };
         let buffer = self.view.buffer();
-        let mut iter = buffer.iter_at_offset(offset);
+        let mut iter = match place.hold {
+            Hold::Kept { chars, .. } => buffer.iter_at_offset(offset + chars),
+            Hold::Revealed => buffer.iter_at_offset(offset),
+        };
         // A widget — a table, a picture, a diagram — is put with the end
         // of the line before it where a line of text is put: a text view
         // places a place's whole height in the view, and one taller than
         // a tenth of it would otherwise come out at its top edge, flush,
         // or wherever its height left it.
-        if iter.child_anchor().is_some() {
+        if place.hold == Hold::Revealed && iter.child_anchor().is_some() {
             iter.backward_char();
         }
-        let mark = buffer.create_mark(None, &iter, true);
-        self.let_go();
-        *self.target.borrow_mut() = Some(mark);
-        self.follow_target();
-        // Once the lines around it are laid out, as they are drawn: a
-        // widget measured at its column's width for the first time moves
-        // what is under it.
-        let frames = Cell::new(0);
-        let weak = Rc::downgrade(self);
-        self.view.add_tick_callback(move |_, _| {
-            frames.set(frames.get() + 1);
-            if frames.get() < 3 {
-                return glib::ControlFlow::Continue;
+        Some(buffer.create_mark(None, &iter, true))
+    }
+
+    /// Put the held place where it is held again, if one is: what is laid
+    /// out again above it — a widget measured, a picture or a diagram come
+    /// in, the column's width settled — is what this answers.
+    fn follow_target(self: &Rc<Self>) {
+        let (mark, hold) = match self.target.borrow().as_ref() {
+            Some(held) if !held.mark.is_deleted() => (held.mark.clone(), held.place.hold),
+            _ => return,
+        };
+        match hold {
+            Hold::Revealed => {
+                self.view
+                    .scroll_to_mark(&mark, 0.0, true, 0.0, f64::from(REVEAL_ALIGN))
             }
+            Hold::Kept { .. } => {
+                self.settle();
+                self.settle_soon();
+                self.converge();
+            }
+        }
+    }
+
+    /// Move the view so a kept place stands its pixels above the top edge,
+    /// where the lines around it are laid out now. Whether it moved.
+    fn settle(&self) -> bool {
+        if self.settling.get() || self.fresh.get() {
+            return false;
+        }
+        let (mark, above) = match self.target.borrow().as_ref() {
+            Some(Held {
+                mark,
+                place:
+                    Place {
+                        hold: Hold::Kept { above, .. },
+                        ..
+                    },
+            }) if !mark.is_deleted() => (mark.clone(), *above),
+            _ => return false,
+        };
+        let iter = self.view.buffer().iter_at_mark(&mark);
+        let off = self.view.iter_location(&iter).y() + above - self.view.visible_rect().y();
+        if off == 0 {
+            return false;
+        }
+        self.settling.set(true);
+        let adjustment = self.scroller.vadjustment();
+        let was = adjustment.value();
+        adjustment.set_value(was + f64::from(off));
+        self.settling.set(false);
+        adjustment.value() != was
+    }
+
+    /// [`Self::settle`] once the text view has laid out the lines on
+    /// screen, and before the next frame is drawn: after its own idle that
+    /// does (`GTK_PRIORITY_RESIZE - 2`), before the frame clock's
+    /// (`GDK_PRIORITY_REDRAW`).
+    fn settle_soon(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let priority = glib::Priority::from(gtk::PRIORITY_RESIZE as i32 - 1);
+        glib::idle_add_local_full(priority, move || {
             if let Some(this) = weak.upgrade() {
-                this.follow_target();
+                this.fresh.set(false);
+                this.settle();
             }
             glib::ControlFlow::Break
         });
     }
 
-    /// Scroll to the held place again, if one is held: a text view puts a
-    /// mark where it asks once the lines around it are laid out, and what
-    /// is laid out later above it is what this answers.
-    fn follow_target(&self) {
-        if let Some(mark) = self.target.borrow().as_ref() {
-            if !mark.is_deleted() {
-                self.view
-                    .scroll_to_mark(mark, 0.0, true, 0.0, f64::from(REVEAL_ALIGN));
-            }
+    /// Settle a kept place whenever the view moves or the document's
+    /// height changes, until the text view has laid out the whole of the
+    /// document: it lays out the rest of a fresh one in the gaps between
+    /// frames, and holds the line at the view's top in place as it does,
+    /// but not to the pixel — a line laid out above the place, taller or
+    /// shorter than it was estimated, moves it.
+    fn converge(self: &Rc<Self>) {
+        if self.armed.replace(true) {
+            return;
         }
+        // Done when the text view's layout is: an idle just below its own
+        // (`GTK_TEXT_VIEW_PRIORITY_VALIDATE`) runs only once that has
+        // nothing left to do.
+        let weak = Rc::downgrade(self);
+        let priority = glib::Priority::from(TEXT_VIEW_VALIDATE + 1);
+        glib::idle_add_local_full(priority, move || {
+            if let Some(this) = weak.upgrade() {
+                if this.armed.replace(false) {
+                    this.settle();
+                }
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     /// Stop holding a place.
     fn let_go(&self) {
-        if let Some(mark) = self.target.borrow_mut().take() {
-            if let Some(buffer) = mark.buffer() {
-                buffer.delete_mark(&mark);
+        self.armed.set(false);
+        self.fresh.set(false);
+        if let Some(held) = self.target.borrow_mut().take() {
+            if let Some(buffer) = held.mark.buffer() {
+                buffer.delete_mark(&held.mark);
             }
         }
+    }
+
+    /// Where the reader is, as a place to keep through a refresh: a line
+    /// asked for and still held, or the source line at the view's top, the
+    /// character the top display line starts with, and how far into that
+    /// line the top edge is. None at the very top, which a refresh leaves
+    /// at the top.
+    fn reading(&self) -> Option<Place> {
+        if let Some(held) = self.target.borrow().as_ref() {
+            // A kept place not yet put is where the reader is.
+            if held.place.hold == Hold::Revealed || self.fresh.get() {
+                return Some(held.place);
+            }
+        }
+        if self.scroller.vadjustment().value() <= 0.0 {
+            return None;
+        }
+        let shown = self.shown.borrow();
+        let shown = shown.as_ref()?;
+        let (top, above) = self.top_display_line();
+        let (line, at) = shown.source.line_at(top.offset()).unwrap_or((0, 0));
+        let place = self.view.buffer().iter_at_offset(at);
+        let line_above = self.view.visible_rect().y() - self.view.iter_location(&place).y();
+        Some(Place {
+            line,
+            hold: Hold::Kept {
+                chars: top.offset() - at,
+                above,
+                line_above,
+            },
+        })
+    }
+
+    /// Before the column is laid out at a new width: the reader's place
+    /// held, read at the width it was read at, unless a line asked for is
+    /// held already.
+    fn hold_through_width(&self) {
+        let Some(place) = self.reading() else { return };
+        if place.hold == Hold::Revealed {
+            return;
+        }
+        let Some(mark) = self.mark_for(place) else {
+            return;
+        };
+        self.let_go();
+        *self.target.borrow_mut() = Some(Held { mark, place });
     }
 
     /// The reader's own scroll, click, or key — in the text or on the
@@ -486,14 +745,84 @@ impl DocView {
         )
     }
 
+    /// The display line the view's top edge is in: its first character,
+    /// and how far the top edge is below that line's top.
+    fn top_display_line(&self) -> (gtk::TextIter, i32) {
+        let top = self.view.visible_rect().y();
+        let (mut iter, _) = self.view.line_at_y(top);
+        let line = iter.line();
+        let mut next = iter;
+        while self.view.forward_display_line(&mut next)
+            && next.line() == line
+            && self.view.iter_location(&next).y() <= top
+        {
+            iter = next;
+        }
+        let y = self.view.iter_location(&iter).y();
+        (iter, top - y)
+    }
+
+    /// TASTE_PROBE_KEEP only: the display line at the view's top, as text,
+    /// how far into it the top edge is, and how far the view is scrolled.
+    #[doc(hidden)]
+    pub fn top_for_probe(&self) -> String {
+        let (start, into) = self.top_display_line();
+        let mut end = start;
+        self.view.forward_display_line_end(&mut end);
+        let text = start.slice(&end).replace('\u{fffc}', "[widget]");
+        let text: String = text.chars().take(48).collect();
+        let adjustment = self.scroller.vadjustment();
+        format!(
+            "«{text}» +{into}px (scrolled {:.0} of {:.0})",
+            adjustment.value(),
+            adjustment.upper() - adjustment.page_size()
+        )
+    }
+
+    /// TASTE_PROBE_KEEP only: the 0-based source line at the view's top.
+    #[doc(hidden)]
+    pub fn top_line_for_probe(&self) -> Option<u32> {
+        let (top, _) = self.top_display_line();
+        let shown = self.shown.borrow();
+        Some(shown.as_ref()?.source.line_at(top.offset())?.0)
+    }
+
+    /// TASTE_PROBE_KEEP only: scroll `at` of the way down, as a reader
+    /// would, and on into the display line found there, so the top edge
+    /// is partway through a line rather than on its boundary.
+    #[doc(hidden)]
+    pub fn scroll_for_probe(&self, at: f64) {
+        self.let_go();
+        let adjustment = self.scroller.vadjustment();
+        let end = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        adjustment.set_value(end * at.clamp(0.0, 1.0));
+        if at > 0.0 && at < 1.0 {
+            let (_, into) = self.top_display_line();
+            if into < 4 {
+                adjustment.set_value(adjustment.value() + f64::from(9 - into));
+            }
+        }
+    }
+
+    /// TASTE_PROBE_KEEP only: how long a rendering waits for its pictures
+    /// and diagrams before it is shown, in place of the editor's — none,
+    /// for a picture that comes in after its rendering is up.
+    #[doc(hidden)]
+    pub fn set_wait_for_probe(&self, wait: Option<std::time::Duration>) {
+        self.wait_for_probe.set(wait);
+    }
+
     /// Put `rendering` in place of what is shown, keeping the reader's
-    /// place by line when `keep_place`.
-    fn swap(&self, rendering: Rendering, keep_place: bool) {
-        let place = keep_place.then(|| {
-            let rect = self.view.visible_rect();
-            let (top, _) = self.view.line_at_y(rect.y());
-            top.line()
-        });
+    /// place when `keep_place`: the source line at the view's top, found
+    /// in the new text through the edit (`doc_source::follow_line`), its
+    /// character at the top the same pixels above the top edge as it was
+    /// — its own place, where the line was changed — or a line asked for
+    /// and still held, at the place a line asked for is put. An edit above
+    /// the view, below it, or in the very paragraph at its top moves
+    /// nothing on screen, and a view at its top stays there.
+    fn swap(self: &Rc<Self>, rendering: Rendering, keep_place: bool) {
+        let place = keep_place.then(|| self.reading()).flatten();
+        let mut old_text = String::new();
         if let Some(shown) = self.shown.borrow_mut().take() {
             for (_, child) in shown.children {
                 self.view.remove(&child);
@@ -501,6 +830,7 @@ impl DocView {
             for mirror in shown.mirrors {
                 self.ghost.remove(&mirror);
             }
+            old_text = shown.text;
         }
         // A place held in the last rendering's buffer is that buffer's.
         self.let_go();
@@ -511,7 +841,32 @@ impl DocView {
             children,
             styles,
             source,
+            text,
         } = rendering;
+        let place = place.map(|place| {
+            let moved = crate::doc_source::follow_line(&old_text, &text, place.line);
+            use crate::doc_source::Fate;
+            let hold = match (place.hold, moved.fate) {
+                // A line changed: its own place, as far above the edge as
+                // it was.
+                (Hold::Kept { line_above, .. }, Fate::Changed) => Hold::Kept {
+                    chars: 0,
+                    above: line_above,
+                    line_above,
+                },
+                // A line deleted outright: what follows it, from its top.
+                (Hold::Kept { .. }, Fate::Gone) => Hold::Kept {
+                    chars: 0,
+                    above: 0,
+                    line_above: 0,
+                },
+                (hold, _) => hold,
+            };
+            Place {
+                line: moved.line,
+                hold,
+            }
+        });
         styles.paint();
         self.view.set_buffer(Some(&buffer));
         self.ghost.set_buffer(Some(&buffer));
@@ -531,13 +886,10 @@ impl DocView {
             mirrors,
             styles,
             source,
+            text,
         });
-        if let Some(line) = place.filter(|line| *line > 0) {
-            if let Some(iter) = buffer.iter_at_line(line) {
-                let mark = buffer.create_mark(None, &iter, true);
-                self.view.scroll_to_mark(&mark, 0.0, true, 0.0, 0.0);
-                buffer.delete_mark(&mark);
-            }
+        if let Some(place) = place {
+            self.land_at(place);
         }
     }
 
@@ -567,7 +919,7 @@ impl DocView {
 
     /// Have the view measure its widgets again: the column's width
     /// changed, or what they hold came in.
-    fn measure_children(&self) {
+    fn measure_children(self: &Rc<Self>) {
         self.measure_each_child();
         // A held place stays where it was put as they take their sizes.
         self.follow_target();
@@ -785,7 +1137,10 @@ fn render(view: &DocTextView, text: &str, base: &DocumentBase, readiness: &Readi
     buffer.set_enable_undo(false);
     let mut writer = Writer::new(&buffer, view.upcast_ref(), Some(base), Some(readiness));
     writer.write(text);
-    writer.finish()
+    Rendering {
+        text: text.to_string(),
+        ..writer.finish()
+    }
 }
 
 /// A widget at an anchor, as wide as the text column less `inset`: a text
@@ -1094,6 +1449,7 @@ impl<'a> Writer<'a> {
             children: self.children,
             styles,
             source: SourceMap::new(self.points),
+            text: String::new(),
         }
     }
 
@@ -1613,6 +1969,11 @@ mod view_imp {
     #[derive(Default)]
     pub struct DocTextView {
         pub(super) decor: RefCell<Vec<Decor>>,
+        /// The width it was last laid out at.
+        pub(super) width: Cell<i32>,
+        /// Told before a new width is laid out (`false`), and after
+        /// (`true`).
+        pub(super) on_width: RefCell<Option<Box<dyn Fn(bool)>>>,
     }
 
     #[glib::object_subclass]
@@ -1623,7 +1984,24 @@ mod view_imp {
     }
 
     impl ObjectImpl for DocTextView {}
-    impl WidgetImpl for DocTextView {}
+
+    impl WidgetImpl for DocTextView {
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            let was = self.width.replace(width);
+            let told = was > 0 && was != width;
+            if told {
+                if let Some(on_width) = self.on_width.borrow().as_ref() {
+                    on_width(false);
+                }
+            }
+            self.parent_size_allocate(width, height, baseline);
+            if told {
+                if let Some(on_width) = self.on_width.borrow().as_ref() {
+                    on_width(true);
+                }
+            }
+        }
+    }
 
     impl TextViewImpl for DocTextView {
         fn snapshot_layer(&self, layer: gtk::TextViewLayer, snapshot: gtk::Snapshot) {

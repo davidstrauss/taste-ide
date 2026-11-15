@@ -3470,6 +3470,153 @@ impl Editor {
                     }
                 });
             }
+            // `TASTE_PROBE_KEEP=<case,…>`: the reader's place through each
+            // kind of refresh, before and after (`keep_probe`).
+            if let Ok(cases) = std::env::var("TASTE_PROBE_KEEP") {
+                let cases: Rc<Vec<String>> =
+                    Rc::new(cases.split(',').map(str::to_string).collect());
+                let weak = Rc::downgrade(&editor);
+                let page = page.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(3000), move || {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.keep_probe(page, cases, 0);
+                    }
+                });
+            }
+        });
+    }
+
+    /// TASTE_PROBE_KEEP only: the reader put partway into a line of the
+    /// previewed document in front, the document refreshed as `cases[index]`
+    /// says, and the top of the view printed before and after; then the
+    /// document put back, and the next case. `above` inserts a heading and
+    /// a paragraph a dozen source lines above the view, `deleted` deletes
+    /// two blocks there, `below` inserts them well below it, `same` edits
+    /// the source line at the view's top, `picture` and `diagram` insert a
+    /// picture or a Mermaid diagram above it, shown before it is drawn and
+    /// coming in after, `width` narrows the window, `still` presents the
+    /// same text again, `top` inserts above the view scrolled to its top,
+    /// and `grow` appends to the document with the view at its end. A
+    /// case's `@0.6` scrolls that far down instead. The last case's change
+    /// is left in place, for the shot.
+    #[doc(hidden)]
+    fn keep_probe(self: &Rc<Self>, page: Rc<EditorPage>, cases: Rc<Vec<String>>, index: usize) {
+        let Some(spec) = cases.get(index).cloned() else {
+            println!("keep probe: done");
+            return;
+        };
+        let (case, at) = match spec.split_once('@') {
+            Some((case, at)) => (case.to_string(), at.parse::<f64>().ok()),
+            None => (spec, None),
+        };
+        let original = page
+            .buffer
+            .text(&page.buffer.start_iter(), &page.buffer.end_iter(), true)
+            .to_string();
+        page.doc.scroll_for_probe(at.unwrap_or(match case.as_str() {
+            "top" => 0.0,
+            "grow" => 1.0,
+            _ => 0.45,
+        }));
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+            let Some(editor) = weak.upgrade() else { return };
+            let before = page.doc.top_for_probe();
+            let line = page.doc.top_line_for_probe().unwrap_or(0) as usize;
+            let lines: Vec<&str> = original.split('\n').collect();
+            let blank = |n: usize| lines.get(n).is_some_and(|l| l.trim().is_empty());
+            let blank_before = |n: usize| (0..=n).rev().find(|&n| blank(n)).unwrap_or(0);
+            let blank_after = |n: usize| (n..lines.len()).find(|&n| blank(n));
+            let buffer = page.buffer.clone();
+            let insert = |at: usize, text: &str| {
+                let mut iter = buffer
+                    .iter_at_line(at as i32)
+                    .unwrap_or_else(|| buffer.end_iter());
+                buffer.insert(&mut iter, text);
+            };
+            let block = "## An inserted heading\n\nAn inserted paragraph, its first line,\n\
+                         its second line,\nand its third.\n\n";
+            let window = editor.widget.root().and_downcast::<gtk::Window>();
+            let mut size = None;
+            match case.as_str() {
+                "above" => insert(blank_before(line.saturating_sub(12)) + 1, block),
+                "top" => insert(blank_after(1).unwrap_or(0) + 1, block),
+                "picture" | "diagram" => {
+                    page.doc.set_wait_for_probe(Some(std::time::Duration::ZERO));
+                    let figure = if case == "picture" {
+                        "![The logo](html/logo.svg)\n\n"
+                    } else {
+                        "```mermaid\nflowchart TD\n  A[One] --> B[Two]\n  B --> C[Three]\n\
+                         \x20 C --> D[Four]\n```\n\n"
+                    };
+                    insert(blank_before(line.saturating_sub(12)) + 1, figure);
+                }
+                "deleted" => {
+                    let last = blank_before(line.saturating_sub(10));
+                    let first =
+                        blank_before(blank_before(last.saturating_sub(1)).saturating_sub(1));
+                    if let (Some(mut start), Some(mut end)) = (
+                        buffer.iter_at_line(first as i32 + 1),
+                        buffer.iter_at_line(last as i32 + 1),
+                    ) {
+                        buffer.delete(&mut start, &mut end);
+                    }
+                }
+                "below" => insert(blank_after(line + 40).map_or(lines.len(), |n| n + 1), block),
+                "same" => insert(line, "Edited at the top, "),
+                "grow" => buffer.insert(&mut buffer.end_iter(), &format!("\n\n{block}")),
+                "still" => buffer.set_text(&original),
+                "width" => {
+                    if let Some(window) = &window {
+                        size = Some((window.width(), window.height()));
+                        window.set_default_size(window.width() - 360, window.height());
+                    }
+                }
+                other => println!("keep probe: no case {other:?}"),
+            }
+            let weak = Rc::downgrade(&editor);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(3000), move || {
+                let Some(editor) = weak.upgrade() else { return };
+                let after = page.doc.top_for_probe();
+                // The top line's text, and how far into it the top edge
+                // is: held when both are as they were.
+                let place = |said: &str| -> (String, String) {
+                    let said = said.split(" (scrolled").next().unwrap_or("");
+                    let (text, into) = said.rsplit_once(' ').unwrap_or((said, ""));
+                    (text.trim_matches(['«', '»']).to_string(), into.to_string())
+                };
+                // Rewrapped, the line the top character is on starts a word
+                // or two before it, or after.
+                let ((was, was_into), (now, now_into)) = (place(&before), place(&after));
+                let key: String = was.chars().take(16).collect();
+                let same_line = was == now
+                    || (!now.is_empty() && was.starts_with(&now))
+                    || (key.chars().count() == 16 && now.contains(&key));
+                println!(
+                    "keep probe: {case}: {}\n  before {before}\n  after  {after}",
+                    if same_line && was_into == now_into {
+                        "held"
+                    } else {
+                        "MOVED"
+                    }
+                );
+                page.doc.set_wait_for_probe(None);
+                // The last case's refresh is left as it is, for the shot.
+                if index + 1 == cases.len() {
+                    println!("keep probe: done");
+                    return;
+                }
+                match (size, window) {
+                    (Some((width, height)), Some(window)) => window.set_default_size(width, height),
+                    _ => page.buffer.set_text(&original),
+                }
+                let weak = Rc::downgrade(&editor);
+                glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.keep_probe(page, cases, index + 1);
+                    }
+                });
+            });
         });
     }
 

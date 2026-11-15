@@ -318,6 +318,22 @@ comma-separated, open three seconds apart, which is how a line asked of a
 tab already open is posed (`build-aux/headless/fixtures/markdown-long.md`
 has a paragraph's middle line at 48, a list item at 85, a code block's
 line at 143, and a table's row at 195, each below the first screen);
+`TASTE_PROBE_KEEP=above,deleted,below,…` (with `TASTE_PROBE_PREVIEW=<a
+long .md>`, `markdown-long.md` the one it is checked against) scrolls the
+preview partway into a line, refreshes the document as each case says,
+and prints the display line at the top and how far into it the top edge
+is, before and after, `held` or `MOVED` (`doc_text::DocView::swap`, which
+keeps the reader's place by source line through the edit): `above`
+inserts a heading and a paragraph a dozen source lines above the view,
+`deleted` deletes two blocks there, `below` inserts them well below it,
+`same` edits the source line at the top (its text comes out changed, at
+the same pixel), `picture` and `diagram` insert a picture or a Mermaid
+diagram above the view and show the rendering before it comes in,
+`width` narrows the window, `still` presents the same text again, `top`
+inserts above a view at its top, and `grow` appends to a view at its
+end; `case@0.7` scrolls that far down instead of 0.45, and the last
+case's change is left in place for the shot — give it
+`TASTE_PROBE_DELAY_MS` of about six seconds a case;
 `TASTE_PROBE_FOCUS=1` (with `TASTE_PROBE_PREVIEW`) uses a control at the
 tab bar's end — the zoom menu opened and closed where the tab has one,
 else another mode's toggle — and prints where the keyboard is after,
