@@ -39,7 +39,7 @@
 //! resource exhaustion on the desktop, specifically on disk").
 //!
 //! What that leaves open is how the room is handed out. A disk made at
-//! [`DISK_GIB`], or grown to it at every boot, held its whole share of the
+//! a fixed 64 GiB, or grown to it at every boot, held its whole share of the
 //! room whether or not the guest ever wrote it, and four VMs holding 175
 //! GiB they had written 68 of left a fifth nothing to start with
 //! (2026-10-19). So a VM starts at [`DISK_START_GIB`] — the guest OS, its
@@ -51,6 +51,14 @@
 //! VMs might want between them is overcommitted; what they hold is not:
 //! the room is given to whichever needs it first, and a disk that cannot
 //! grow says so.
+//!
+//! The room is the only limit. A disk once stopped at 64 GiB whatever the
+//! host had: a project's `target/` filled its guest with 352 GiB free on
+//! this host, and the IDE cleared six other projects' VMs to make room the
+//! cap then refused to use (2026-11-15; David: "I never asked you to set
+//! that as a hard limit"). The ceilings together still never promise more
+//! than the disk has, which is the protection the desktop needs; one VM's
+//! share of it is not the IDE's to cap.
 
 use std::path::Path;
 
@@ -70,10 +78,6 @@ pub const VCPU_HOST_RESERVE: u32 = 2;
 pub const MEMORY_MIN_MIB: u64 = 4096;
 /// The most it will commit to one VM.
 pub const MEMORY_MAX_MIB: u64 = 16384;
-/// The largest virtual size a VM's disk grows to. Sparse; a ceiling and
-/// not a cost — but a ceiling the guest can reach, which is why a disk
-/// gets there only by filling ([`grown_disk_gib`]).
-pub const DISK_GIB: u64 = 64;
 /// The virtual size a VM's disk is made at, and the least a new VM is
 /// made with. The base image is a 10 GiB disk, so an overlay on it is no
 /// smaller; a VM that had run a project's container for a week held 7.7
@@ -188,7 +192,7 @@ pub fn may_be_short(virtual_size: u64, allocated: u64) -> bool {
 /// `guest_free` bytes free grows to, when it is short: by
 /// [`DISK_GROW_STEP_GIB`], or by what is left once the floor, what every
 /// disk — this one included — could still grow into, and a new VM's
-/// [`DISK_START_GIB`] are set aside, capped at [`DISK_GIB`]. Holding a new
+/// [`DISK_START_GIB`] are set aside. Holding a new
 /// VM's start back means a workspace with no VM yet can still have one
 /// (2026-10-13: a disk that took that last share left another project's
 /// VM nothing to start with). `None` when it is not short, or there is no
@@ -204,9 +208,7 @@ pub fn grown_disk_gib(current: u64, guest_free: u64, free: u64, unclaimed: u64) 
         .saturating_sub(unclaimed)
         .saturating_sub(DISK_START_GIB * GIB)
         / GIB;
-    let target = current_gib
-        .saturating_add(DISK_GROW_STEP_GIB.min(room_gib))
-        .min(DISK_GIB);
+    let target = current_gib.saturating_add(DISK_GROW_STEP_GIB.min(room_gib));
     (target > current_gib).then_some(target)
 }
 
@@ -338,14 +340,9 @@ mod tests {
             "the other disks' room is not grown into"
         );
         assert_eq!(
-            grown_disk_gib(DISK_GIB * GIB, 0, floor + 500 * GIB, 0),
-            None,
-            "at the ceiling"
-        );
-        assert_eq!(
-            grown_disk_gib((DISK_GIB - 3) * GIB, 0, floor + 500 * GIB, 0),
-            Some(DISK_GIB),
-            "up to the ceiling"
+            grown_disk_gib(64 * GIB, 0, floor + 500 * GIB, 0),
+            Some(72),
+            "no size of its own stops a disk the host has room for"
         );
     }
 

@@ -2391,8 +2391,10 @@ writes, and each of these is a way those bytes reach this disk:
   the floor, less what the VMs already made could still grow into, does not
   cover that (`sizing::disk_for_new_vm`, which reads each disk's virtual
   size from its qcow2 header). It grows by 8 GiB whenever its guest has
-  under 6 GiB free, into the same room, up to 64 GiB
-  (`sizing::grown_disk_gib`, checked at boot and every fifteen seconds).
+  under 6 GiB free, into the same room, with no size of its own to stop
+  at (`sizing::grown_disk_gib`, checked at boot and every fifteen
+  seconds; a 64 GiB cap stood there until 2026-11-15, when it stopped a
+  Rust project's `target/` with 352 GiB free on the host).
   What the VMs might want together is overcommitted; what their ceilings
   hold is not (David, 2026-10-19: "size these smaller but leverage the
   upsizing mechanism more readily"). The VMs together can then never

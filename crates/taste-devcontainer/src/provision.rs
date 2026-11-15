@@ -2209,8 +2209,8 @@ impl LibvirtSession {
                 .ok()
                 .and_then(|v| v.get("virtual-size")?.as_u64())
                 .map(|bytes| bytes / (1024 * 1024 * 1024))
-                .unwrap_or(crate::sizing::DISK_GIB),
-            Err(_) => crate::sizing::DISK_GIB,
+                .unwrap_or(crate::sizing::DISK_START_GIB),
+            Err(_) => crate::sizing::DISK_START_GIB,
         };
         Ok(facts_from_dominfo(&info, ceiling, allocated_bytes(&disk)))
     }

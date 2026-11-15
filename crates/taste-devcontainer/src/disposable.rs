@@ -1,8 +1,8 @@
 //! **A VM's disk, marked as holding nothing this machine lacks.**
 //!
 //! A VM is left on disk when its window closes, so the next launch is a
-//! warm boot rather than a fresh one. Each of those disks is up to
-//! [`crate::sizing::DISK_GIB`] of the host's, though, and the capacity
+//! warm boot rather than a fresh one. Each of those disks is as large as
+//! its guest has grown it, though, and the capacity
 //! check counts what every one could still grow into — so a few projects
 //! opened once, weeks ago, are enough for a new one to be refused a VM
 //! (2026-10-11: 43.9 GiB free, 274.2 GiB claimed by five VMs, four of them
