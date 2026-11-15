@@ -1642,6 +1642,14 @@ impl LibvirtSession {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+        // The disk before podman: a guest whose disk filled cannot start
+        // podman at all (its socket hits systemd's trigger limit within a
+        // minute), so a growth that waited for podman to answer never came,
+        // and a full VM could not be brought up again (2026-11-15). Growing
+        // needs only ssh and the host.
+        if let Err(e) = self.grow_disk(vm).await {
+            self.say(&vm.domain, format!("its disk could not be grown: {e:#}"));
+        }
         self.say(
             &vm.domain,
             "sshd answers; registering the podman connection and waiting for podman in the guest",
@@ -1654,9 +1662,6 @@ impl LibvirtSession {
                     self.say(&vm.domain, "podman in the guest answers; the VM is ready");
                     if let Err(e) = self.tune_guest_shutdown(vm).await {
                         tracing::debug!("{}: guest stop timeouts not set: {e:#}", vm.domain);
-                    }
-                    if let Err(e) = self.grow_disk(vm).await {
-                        self.say(&vm.domain, format!("its disk could not be grown: {e:#}"));
                     }
                     return Ok(());
                 }
@@ -2087,6 +2092,23 @@ impl LibvirtSession {
             &vm.domain,
             format!("its disk is {target} GiB, and the guest's filesystem with it"),
         );
+        let (program, argv) = keys.ssh_argv(vm.ssh_port, [GUEST_PODMAN_RESTART]);
+        let restarted = tokio::process::Command::new(&program)
+            .args(&argv)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await;
+        if let Err(e) = restarted.as_ref().map_err(|e| e.to_string()).and_then(|o| {
+            o.status
+                .success()
+                .then_some(())
+                .ok_or_else(|| String::from_utf8_lossy(&o.stderr).trim().to_string())
+        }) {
+            self.say(
+                &vm.domain,
+                format!("its podman socket could not be started again: {e}"),
+            );
+        }
         Ok(())
     }
 
@@ -2333,6 +2355,14 @@ done
 growpart "/dev/$disk" "$part" >/dev/null 2>&1 || [ $? -eq 1 ]
 xfs_growfs "$(findmnt -rn -S "$src" -O rw -o TARGET | head -1)" >/dev/null
 "#;
+
+/// What [`LibvirtSession::grow_disk`] runs as the guest's user once the
+/// room is there: its podman socket started again. A disk that filled left
+/// podman unable to start, and the socket, activated by probes that got
+/// nothing, hit systemd's trigger limit and stayed down with the room back
+/// (2026-11-15). A socket already listening is left as it is.
+const GUEST_PODMAN_RESTART: &str =
+    "systemctl --user reset-failed podman.socket podman.service; systemctl --user start podman.socket";
 
 /// The script `tune_guest_shutdown` runs as root in the guest: every
 /// file the Ignition would have written — the stop timeouts, the idle
