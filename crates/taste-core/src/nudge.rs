@@ -50,8 +50,15 @@ pub const NOTE: &str = "[The user has a message waiting for you. Finish the step
 pub const TAKE_TOOL: &str = "take_user_messages";
 
 /// What a wait that a message ended says, in place of what it waited for.
-pub const WOKEN: &str = "The user sent you a message while you waited. End your turn now: it \
-                         arrives as your next prompt.";
+/// Never "end your turn" alone: Claude Code has the message beside this
+/// very result (the hook above), and told to end its turn it answered the
+/// user's question and stopped the work it was waiting on (2026-11-15;
+/// David: "This is not good behavior"). A message is something to answer,
+/// not an order to stop; the turn ends only for an agent the message has
+/// not reached, since ending it is the one way the message can arrive.
+pub const WOKEN: &str = "The user sent you a message while you waited. If it is beside this \
+                         result, answer it and carry on with your work, unless it asks you to \
+                         stop. If it is not, end your turn: it arrives as your next prompt.";
 
 #[derive(Debug, Default)]
 struct Inner {
