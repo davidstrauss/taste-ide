@@ -369,13 +369,6 @@ pub struct ChatEntry {
     /// asked for it.
     #[serde(default)]
     pub restart_when_silent: bool,
-    /// Whether the IDE compacts this conversation when it has sat idle
-    /// long enough that its prompt cache is about to expire
-    /// (`crate::idle_compact`). On unless the user turns it off, as
-    /// Claude Code's own `idleCompaction` is, and so on for a file from
-    /// before the switch.
-    #[serde(default = "on", skip_serializing_if = "is_on")]
-    pub compact_while_away: bool,
     /// The environment this chat's agent works in — its clone, its
     /// devcontainer, its exec target.
     ///
@@ -393,14 +386,6 @@ pub struct ChatEntry {
     pub guidance_seen: u32,
 }
 
-fn on() -> bool {
-    true
-}
-
-fn is_on(value: &bool) -> bool {
-    *value
-}
-
 impl Default for ChatEntry {
     /// A chat of the user's own environment, talking to the default agent.
     /// Hand-written rather than derived because a chat's environment has no
@@ -414,7 +399,6 @@ impl Default for ChatEntry {
             config_values: Default::default(),
             auto_approve: false,
             restart_when_silent: false,
-            compact_while_away: true,
             environment: EnvironmentId::primary(),
             guidance_seen: 0,
         }
@@ -888,11 +872,11 @@ mod tests {
         assert!(load_from(base.path(), root).chats()[0].restart_when_silent);
     }
 
-    /// Compacting while away is on for a fresh chat and for one saved
-    /// before the switch existed, and off stays off across a save.
+    /// A file from when the IDE compacted idle conversations itself, with
+    /// its switch off, still loads: the adapter compacts them now, and the
+    /// switch is gone with the IDE's own.
     #[test]
-    fn compacting_while_away_is_on_until_turned_off() {
-        assert!(ChatEntry::default().compact_while_away);
+    fn a_chat_saved_with_the_old_away_switch_still_loads() {
         let base = tempfile::tempdir().unwrap();
         let root = Path::new("/work/away");
         std::fs::create_dir_all(base.path()).unwrap();
@@ -900,22 +884,17 @@ mod tests {
             file_for(base.path(), root),
             format!(
                 r#"{{"version":{STATE_VERSION},
-                     "chats":[{{"agent_id":"claude-code","session_id":"s"}}]}}"#
+                     "chats":[{{"agent_id":"claude-code","session_id":"s",
+                                "compact_while_away":false}}]}}"#
             ),
         )
         .unwrap();
-        assert!(load_from(base.path(), root).chats()[0].compact_while_away);
-
-        let mut state = WorkspaceState {
-            root: root.to_path_buf(),
-            ..Default::default()
-        };
-        state.set_chat(ChatEntry {
-            compact_while_away: false,
-            ..chat("claude-code", "s")
-        });
-        save_to(base.path(), root, &state).unwrap();
-        assert!(!load_from(base.path(), root).chats()[0].compact_while_away);
+        assert_eq!(
+            load_from(base.path(), root).chats()[0]
+                .session_id
+                .as_deref(),
+            Some("s")
+        );
     }
 
     /// The agent's session options the user chose — effort, fast mode —

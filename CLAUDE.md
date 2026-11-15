@@ -135,7 +135,7 @@ offered them keeping every option under its title, the pick's radio filled
 and the rest dim, and the reply under it as the user's prompt (the answer is
 the chat's `tasteAnswer` record, `chat/model.rs`, so a restore draws it the
 same; a reply typed into Dispatch instead leaves the options there, none
-picked) —, `reseat` — a prompt sent mid-turn and taken after it, the marker left where it was typed with the rail running through it, the prompt seated below the turn —, `noted` — a message that waited behind a turn as a replay reads it back, the note it went out after (`taste_core::queued`) drawn as its card's badge, and two more that waited behind the same turn and went out together in one prompt, back as their own cards —, `stopped` — the same turn stopped, the steps it left running settled on their hollow "never reported finishing" dot —, `away` — a conversation the IDE compacted while the user was away, the compaction step titled by what it freed and the note under it (`taste_core::idle_compact`) —, `table` — a finished answer with a three-column table of sentence-long cells in a reply long enough to clip, the row that once stood a page tall under its last line (`table.rs`) —, `ask` — the agent's questions on the card above the composer, two as the adapter sends an AskUserQuestion of them (an ACP form elicitation: described options, a multi-select, the "Other" boxes; `elicit.rs`) —, `ask-other` — the same with an answer of the user's own typed into the first question's box, which selects that box's own radio —, `ask-answered` — the same questions
+picked) —, `reseat` — a prompt sent mid-turn and taken after it, the marker left where it was typed with the rail running through it, the prompt seated below the turn —, `noted` — a message that waited behind a turn as a replay reads it back, the note it went out after (`taste_core::queued`) drawn as its card's badge, and two more that waited behind the same turn and went out together in one prompt, back as their own cards —, `stopped` — the same turn stopped, the steps it left running settled on their hollow "never reported finishing" dot —, `away` — a conversation the adapter compacted while the user was away, its compaction step titled by what it freed and why (`trigger: "idle"`) —, `table` — a finished answer with a three-column table of sentence-long cells in a reply long enough to clip, the row that once stood a page tall under its last line (`table.rs`) —, `ask` — the agent's questions on the card above the composer, two as the adapter sends an AskUserQuestion of them (an ACP form elicitation: described options, a multi-select, the "Other" boxes; `elicit.rs`) —, `ask-other` — the same with an answer of the user's own typed into the first question's box, which selects that box's own radio —, `ask-answered` — the same questions
 answered on the card, the first with words of the user's own and both of the
 second's boxes ticked, and AskUserQuestion's step keeping them, options and
 picks, once the card is gone —, `rebuild` — the agent's own rebuild call coming back as the connection closing, drawn finished rather than failed, the IDE's note under it —, `task` — two background subagents reporting back into a turn, one
@@ -569,6 +569,14 @@ to.
   it"). A reader of one is held to the tool's own behavior by a test
   that runs the tool on the same fixtures and compares, never to the
   schema's text alone.
+- **What an adapter implements, the IDE uses — and drops its own.** A
+  feature the pinned adapter provides is removed from the IDE, not kept
+  beside it as a second implementation that differs by a detail; when an
+  adapter bump brings one, the IDE's copy goes in the same batch (David,
+  2026-11-14: "maximize use of what these adaptors implement, eagerly
+  removing junk from the IDE codebase where possible"; of keeping the IDE's
+  idle compaction over the adapter's: "One minute of different is a
+  terrible reason to keep a different implementation").
 - **Reach for a lighter subagent.** Sonnet or the default weight for
   scoped fixes, resolvers, screenshots, and documentation; Opus only for
   design-heavy work or an unknown mechanism. A heavyweight agent on a

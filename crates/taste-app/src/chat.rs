@@ -825,22 +825,6 @@ pub struct ChatPane {
     /// goes unanswered in silence (`crate::coordinator`). Only shown on the
     /// primary's chat, because only that one is ever woken; off by default.
     restart_picker: adw::SwitchRow,
-    /// Whether the IDE compacts this conversation when it has sat idle
-    /// until its prompt cache is about to expire (`taste_core::idle_compact`).
-    /// On by default, as Claude Code's own `idleCompaction` is.
-    away_picker: adw::SwitchRow,
-    /// When the conversation last made a request: its last turn's end, by
-    /// the wall clock, which a machine asleep does not stop (the cache's
-    /// hour runs on regardless).
-    last_request: Cell<Option<std::time::SystemTime>>,
-    /// The timer that asks [`taste_core::idle_compact::verdict`] when the
-    /// conversation is due.
-    away_timer: RefCell<Option<glib::SourceId>>,
-    /// While the IDE's own `/compact` runs: the context it started from,
-    /// for the note its end writes.
-    compacting_away: Cell<Option<u64>>,
-    /// The agent advertises `/compact`.
-    compact_advertised: Cell<bool>,
     /// Agent-provided controls (permission mode, model, …), per session:
     /// switches for booleans, expanded radio lists for exclusive choices —
     /// every option a single click away.
@@ -2677,17 +2661,6 @@ impl ChatPane {
             )
             .visible(environment.is_primary())
             .build();
-        // Claude Code's own idle compaction, which it does not do under the
-        // SDK the IDE runs it through (`taste_core::idle_compact`). On, as
-        // Claude Code ships it.
-        let away_picker = adw::SwitchRow::builder()
-            .title("Compact while away")
-            .subtitle(
-                "Past 200k tokens and idle 55 minutes, summarize the conversation while its \
-                 prompt cache is still warm, so the next message sends the summary",
-            )
-            .active(true)
-            .build();
         let session_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
@@ -2722,7 +2695,6 @@ impl ChatPane {
         session_list.append(&agent_picker);
         session_list.append(&approval_picker);
         session_list.append(&restart_picker);
-        session_list.append(&away_picker);
         session_list.append(&new_session_row);
         // The questions this PROJECT has settled — the "don't ask again"s,
         // which are not this chat's and say so in every row's subtitle.
@@ -3705,11 +3677,6 @@ impl ChatPane {
             agent_picker,
             approval_picker,
             restart_picker,
-            away_picker,
-            last_request: Cell::new(None),
-            away_timer: RefCell::new(None),
-            compacting_away: Cell::new(None),
-            compact_advertised: Cell::new(false),
             controls,
             auth_box,
             options_panel: controls_scroller.clone(),
@@ -4226,17 +4193,6 @@ impl ChatPane {
             }
             pane.notify_persist();
         });
-        // ...and so does compacting while away, which asks again at once:
-        // turned back on, a conversation already idle is due on schedule.
-        let weak = Rc::downgrade(&pane);
-        pane.away_picker.connect_active_notify(move |_| {
-            let Some(pane) = weak.upgrade() else { return };
-            pane.arm_away();
-            if pane.syncing.get() {
-                return;
-            }
-            pane.notify_persist();
-        });
 
         // The empty page names its agent whether the change came from the
         // user or from a restored tab, so this sits OUTSIDE the `syncing`
@@ -4389,121 +4345,6 @@ impl ChatPane {
                 }
             }
         }
-    }
-
-    // --- compacting while away ---------------------------------------------
-
-    /// Ask [`taste_core::idle_compact::verdict`] again when this
-    /// conversation could next be due, replacing whatever was asked
-    /// before. Called when a turn ends and when the switch moves.
-    fn arm_away(self: &Rc<Self>) {
-        if let Some(timer) = self.away_timer.borrow_mut().take() {
-            timer.remove();
-        }
-        use taste_core::idle_compact::Verdict;
-        let wait = match taste_core::idle_compact::verdict(&self.away_facts()) {
-            Verdict::Wait(wait) => wait,
-            // Due already: the switch turned back on late in the hour.
-            Verdict::Compact => std::time::Duration::ZERO,
-            Verdict::Skip(_) => return,
-        };
-        let weak = Rc::downgrade(self);
-        // A second's slack, so the wait has run out by the clock it is
-        // read against when the timer fires.
-        let timer =
-            glib::timeout_add_local_once(wait + std::time::Duration::from_secs(1), move || {
-                let Some(pane) = weak.upgrade() else { return };
-                pane.away_timer.borrow_mut().take();
-                match taste_core::idle_compact::verdict(&pane.away_facts()) {
-                    Verdict::Compact => pane.compact_while_away(),
-                    Verdict::Wait(_) => pane.arm_away(),
-                    Verdict::Skip(why) => {
-                        tracing::debug!("{}: not compacting while away: {why:?}", pane.environment);
-                    }
-                }
-            });
-        *self.away_timer.borrow_mut() = Some(timer);
-    }
-
-    /// What [`taste_core::idle_compact::verdict`] decides from, as this
-    /// chat stands.
-    fn away_facts(&self) -> taste_core::idle_compact::Facts {
-        let now = std::time::SystemTime::now();
-        // The one-hour cache is a Claude subscription's, within its plan:
-        // the pool has seen a plan window and it is not used up. An API key
-        // reports per-minute limits and no plan, and its cache lasts five
-        // minutes; another upstream's is not Anthropic's at all.
-        let hour_cache = self.agent_id() == taste_acp::CLAUDE_CODE && {
-            let pool = self.pool.borrow();
-            let quota = &pool.quota;
-            let plan = [quota.session.used(), quota.weekly.used()]
-                .into_iter()
-                .flatten()
-                .fold(None, |most: Option<f64>, used| {
-                    Some(most.map_or(used, |most| most.max(used)))
-                });
-            plan.is_some_and(|used| used < 1.0) && quota.current_exhaustion(now).is_none()
-        };
-        taste_core::idle_compact::Facts {
-            enabled: self.away_picker.is_active(),
-            advertised: self.compact_advertised.get(),
-            hour_cache,
-            context: self.context_used.get(),
-            idle: self
-                .last_request
-                .get()
-                .map(|at| now.duration_since(at).unwrap_or_default()),
-            quiet: self.client.borrow().is_some()
-                && !self.busy.get()
-                && self.pending_prompts.borrow().is_empty()
-                && self.revive_queue.borrow().is_empty()
-                && self.pending_permission.borrow().is_none()
-                && self.pending_questions.borrow().is_none(),
-        }
-    }
-
-    /// Send the agent its own `/compact`, as the IDE's act rather than the
-    /// user's: no card of the user's, no briefing in front of it (which
-    /// would stop it being a command), and a note in the transcript where
-    /// the card would be. A message the user sends meanwhile waits behind
-    /// it, as behind any turn.
-    fn compact_while_away(self: &Rc<Self>) {
-        let command = format!("/{}", taste_core::idle_compact::COMMAND);
-        let before = self.context_used.get();
-        self.finalize_stream();
-        let id = new_prompt_id();
-        self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-            unfinished: Unfinished::Nothing,
-            prompt: id,
-            text: command.clone(),
-            attachments: Vec::new(),
-            queued: None,
-            joined: false,
-            // There is no card for the agent to take.
-            taken: true,
-        });
-        let sent = match self.client.borrow().as_ref() {
-            Some(client) => client.prompt(command),
-            None => Err(anyhow::anyhow!("no agent to send to")),
-        };
-        match sent {
-            Ok(()) => {
-                self.compacting_away.set(Some(before));
-                self.stop_button.set_visible(true);
-                self.set_busy(true);
-                self.set_status("compacting while you were away…");
-            }
-            Err(e) => {
-                self.pending_prompts.borrow_mut().pop_back();
-                tracing::warn!("{}: compacting while away: {e:#}", self.environment);
-            }
-        }
-    }
-
-    /// The IDE's own compaction has ended: what it freed, said where the
-    /// user will look when they are back, with where to turn it off.
-    fn compacted_away(&self, before: u64, finished: bool) {
-        self.meta_row(&away_note(before, self.context_used.get(), finished));
     }
 
     // --- orchestration ----------------------------------------------------
@@ -6510,7 +6351,6 @@ impl ChatPane {
             config_values: self.config_values.borrow().clone(),
             auto_approve: self.approval_picker.is_active(),
             restart_when_silent: self.restart_picker.is_active(),
-            compact_while_away: self.away_picker.is_active(),
             environment: self.environment.clone(),
             guidance_seen: self.guidance_seen.get(),
         }
@@ -6547,7 +6387,6 @@ impl ChatPane {
         self.syncing.set(true);
         self.approval_picker.set_active(entry.auto_approve);
         self.restart_picker.set_active(entry.restart_when_silent);
-        self.away_picker.set_active(entry.compact_while_away);
         self.syncing.set(false);
         if let (Some(agent_id), Some(session_id)) = (&entry.agent_id, &entry.session_id) {
             *self.persisted_session.borrow_mut() = Some((agent_id.clone(), session_id.clone()));
@@ -6701,7 +6540,6 @@ impl ChatPane {
             .set_active(from.approval_picker.is_active());
         self.restart_picker
             .set_active(from.restart_picker.is_active());
-        self.away_picker.set_active(from.away_picker.is_active());
         self.agent_picker.set_selected(from.agent_picker.selected());
         self.syncing.set(false);
     }
@@ -9772,9 +9610,6 @@ impl ChatPane {
                 if taste_core::imageless::refuses_images(&message) {
                     self.images_refused_later(message.clone(), self.turn_prompt());
                 }
-                if self.compacting_away.take().is_some() {
-                    self.meta_row(&format!("compacting while you were away failed: {message}"));
-                }
                 self.end_nudge();
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
@@ -9834,12 +9669,6 @@ impl ChatPane {
                 }
                 self.turns.set(self.turns.get() + 1);
                 self.touch();
-                // The conversation's last request, which starts the prompt
-                // cache's hour (`taste_core::idle_compact`).
-                self.last_request.set(Some(std::time::SystemTime::now()));
-                // The IDE's own compaction, ending: nobody asked for this
-                // turn, so nobody is told it ended.
-                let away = self.compacting_away.take();
                 self.finalize_stream();
                 self.settle_running_steps();
                 // A turn asked for is a turn given: whatever ask is still
@@ -9909,7 +9738,7 @@ impl ChatPane {
                          refused it",
                     );
                 }
-                if !more_queued && away.is_none() {
+                if !more_queued {
                     self.notify(crate::notify::Moment::TurnEnded {
                         chat: self.notify_chat(),
                     });
@@ -9948,12 +9777,6 @@ impl ChatPane {
                 }
                 if let Some((captured, on_done)) = self.capture.borrow_mut().take() {
                     on_done(captured);
-                }
-                if let Some(before) = away {
-                    self.compacted_away(before, reason == StopReason::EndTurn);
-                }
-                if !more_queued {
-                    self.arm_away();
                 }
             }
             SessionEvent::ModeChangeFailed { mode, message } => {
@@ -11804,12 +11627,6 @@ impl ChatPane {
                 self.refresh_usage();
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
-                self.compact_advertised.set(
-                    update
-                        .available_commands
-                        .iter()
-                        .any(|command| command.name == taste_core::idle_compact::COMMAND),
-                );
                 self.command_provider.set_commands(
                     update
                         .available_commands
@@ -12917,20 +12734,19 @@ impl ChatPane {
                 }
             }
             // `away`: the conversation compacted while the user was away —
-            // the adapter's compaction step, titled by what it freed, and the
-            // IDE's note under it (`taste_core::idle_compact`).
+            // the adapter's own idle compaction, its step titled by what it
+            // freed and why, as `claude-agent-acp` reports it.
             Ok("away") => {
                 let mut compact = ToolCall::new("probe-compact", "Compact conversation");
                 compact.kind = ToolKind::Think;
                 compact.status = ToolCallStatus::Completed;
                 compact.raw_output = Some(serde_json::json!({
-                    "trigger": "manual",
+                    "trigger": "idle",
                     "preTokens": 612_400,
                     "postTokens": 108_300,
                     "durationMs": 41_000,
                 }));
                 self.render_update(SessionUpdate::ToolCall(compact));
-                self.meta_row(&away_note(612_400, 108_300, true));
                 self.stop_button.set_visible(false);
                 self.set_busy(false);
             }
@@ -16066,8 +15882,11 @@ fn step_title(
 
 /// A compaction's step, once it has finished, by what it did: the Claude
 /// Code adapter reports one as a step titled "Compact conversation" whose
-/// output holds `trigger` ("automatic" or "manual"), `preTokens`, and
-/// `postTokens` (`claude-agent-acp`'s `compactionToolCall`, for a client
+/// output holds `trigger` ("automatic", "manual", or "idle" — the
+/// adapter's own, sent shortly before the prompt cache's hour runs out, so
+/// the next message sends the summary rather than the whole conversation
+/// uncached), `preTokens`, and `postTokens` (`claude-agent-acp`'s
+/// `compactionToolCall`, for a client
 /// that does not take ACP's compaction updates). `None` until those
 /// counts are there, which leaves the adapter's own title on a running one.
 fn compaction_headline(title: &str, output: Option<&serde_json::Value>) -> Option<String> {
@@ -16081,6 +15900,7 @@ fn compaction_headline(title: &str, output: Option<&serde_json::Value>) -> Optio
     // what was freed of what, and nothing a hover has to finish.
     let how = match output.get("trigger").and_then(serde_json::Value::as_str) {
         Some("automatic") => "Auto-compacted",
+        Some("idle") => "Compacted while away",
         _ => "Compacted",
     };
     Some(match count("postTokens").filter(|after| *after < before) {
@@ -17600,21 +17420,6 @@ fn round_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
-}
-
-/// The note an idle compaction leaves: why it happened and where it is
-/// turned off, or that it did not finish.
-fn away_note(before: u64, after: u64, finished: bool) -> String {
-    if !finished || after >= before {
-        return "compacting while you were away did not finish".into();
-    }
-    // The step above it says what was freed; this says why it happened
-    // and how to stop it, in that order, since a note shows its first line
-    // and the rest on a hover.
-    "compacted while you were away, before its prompt cache expired, so the next message \
-     sends the summary instead of the whole conversation · Compact while away, in this \
-     chat's settings, turns it off"
-        .into()
 }
 
 /// Tokens, at a glance: "1.2M", "18.4k", "42".
@@ -19151,7 +18956,7 @@ mod tests {
     /// The `x[1m]` convention is the only thing a value says about its
     /// window before the session reports one.
     /// A compaction's step says what it freed once the adapter reports
-    /// it, and the idle one's note says why, unless it did not finish.
+    /// it, and why when it was not asked for.
     #[test]
     fn a_compaction_reads_as_what_it_freed() {
         let done = serde_json::json!({
@@ -19169,14 +18974,13 @@ mod tests {
         // Running, and anybody else's step of that shape, keep their title.
         assert_eq!(compaction_headline("Compact conversation", None), None);
         assert_eq!(compaction_headline("Bash", Some(&done)), None);
-        assert!(away_note(612_400, 108_300, true).starts_with("compacted while you were away,"));
+        // The adapter's own, sent before the prompt cache expired.
+        let away = serde_json::json!({
+            "trigger": "idle", "preTokens": 612_400, "postTokens": 108_300,
+        });
         assert_eq!(
-            away_note(612_400, 612_400, true),
-            "compacting while you were away did not finish"
-        );
-        assert_eq!(
-            away_note(612_400, 108_300, false),
-            "compacting while you were away did not finish"
+            compaction_headline("Compact conversation", Some(&away)).as_deref(),
+            Some("Compacted while away · 504k of 612k tokens freed")
         );
     }
 

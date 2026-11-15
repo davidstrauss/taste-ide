@@ -1495,27 +1495,23 @@ it, and carries its actions.
   quotas (5-hour/weekly limits) are not modeled by ACP; agents announce
   those in-band. (Behind the crate's `unstable_end_turn_token_usage`
   feature until it stabilizes.)
-- **A conversation left idle is compacted before its cache goes cold**
-  (`taste_core::idle_compact`, 2026-11-10). Claude Code compacts a large
-  conversation the user has stepped away from just before its one-hour
-  prompt cache expires, so the next message sends a summary instead of
-  reading the whole conversation again uncached — its `idleCompaction`,
-  which its docs give to the terminal, the VS Code panel, and the desktop
-  app, and not to the Agent SDK the IDE runs it through. So the chat does
-  it, through the agent's own advertised `/compact`, on Claude Code's
-  documented conditions: a subscription within its plan (the pool has
-  seen a plan window, which an API key's five-minute cache never shows),
-  past 200,000 tokens of context, 55 minutes after the last request by
-  the wall clock (a machine that slept through the hour wakes to a cold
-  cache, and compacting then saves nothing), and nothing under way. It is
-  the IDE's act, not the user's: no card, no briefing (a briefing in
-  front of a slash command makes it prose, which is why no command a
-  prompt starts with is ever briefed), no turn-ended notification, and a
-  note under the compaction step saying why it happened and that "Compact
-  while away", a per-chat switch on by default, turns it off. The step
-  itself reads by what it freed ("Compacted · 504k of 612k tokens
-  freed"), from the counts the adapter reports for every compaction,
-  automatic or asked for.
+- **A conversation left idle is compacted before its cache goes cold —
+  by the adapter.** `claude-agent-acp` (since 0.101.0) compacts a quiet
+  session shortly before its one-hour prompt cache expires, so the next
+  message sends a summary instead of reading the whole conversation again
+  uncached: Claude Code's own `idleCompaction`, which Claude Code arms only
+  for attended sessions and so never under the SDK. The adapter decides it
+  from what only it sees — the cache's TTL off each response's usage, the
+  rate-limit status, a timer that lapsed while the machine slept — and the
+  IDE does nothing but draw it. From 2026-11-10 to 2026-11-14 the IDE ran
+  its own copy of the feature and turned the adapter's off; that is gone,
+  and the settings merge (`taste_acp::relocate`) takes the `idleCompaction:
+  false` it wrote back out of every agent's home (David, 2026-11-14: "One
+  minute of different is a terrible reason to keep a different
+  implementation"). A compaction step reads by what it freed, from the
+  counts the adapter reports in its `rawOutput` for every compaction
+  ("Compacted · 504k of 612k tokens freed"), and the adapter's own idle one
+  as "Compacted while away", by its `trigger: "idle"`.
 - Agent picker (Claude Code / Gemini / Copilot / custom command) is a
   dropdown; switching agents starts a new session, never a new window.
 - **One composer — Dispatch — under the chat, for everything the user
