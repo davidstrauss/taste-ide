@@ -1,14 +1,14 @@
 # Pinned by digest (the multi-arch index), like the baseline environment's
 # base image: a tag moves under you, a digest does not. Refresh with
-# `skopeo inspect --format '{{.Digest}}' docker://registry.fedoraproject.org/fedora:44`.
-FROM registry.fedoraproject.org/fedora:44@sha256:d68cae9185777603262e0a7094f792ffed9326b22e1a03e2d2a1731fc3f94733
+# `skopeo inspect --format '{{.Digest}}' docker://registry.fedoraproject.org/fedora:45`.
+FROM registry.fedoraproject.org/fedora:45@sha256:ea6d638d83c7bf2f4dd082e804c4a125feee764ba82e3e7798148673e445a496
 
 RUN dnf install -y \
     gcc gcc-c++ make cmake perl pkgconf-pkg-config \
     rust cargo clippy rustfmt rust-analyzer \
     gtk4-devel libadwaita-devel gtksourceview5-devel vte291-gtk4-devel \
     webkitgtk6.0-devel \
-    git openssl-devel libssh2-devel libgit2-devel \
+    git openssl-devel libssh2-devel 'pkgconfig(libgit2)' \
     desktop-file-utils libappstream-glib \
     nodejs npm bubblewrap python3 socat bash-completion \
     default-fonts-core-sans default-fonts-core-mono default-fonts-core-emoji \
