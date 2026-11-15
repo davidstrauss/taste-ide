@@ -374,6 +374,24 @@ fn main() -> glib::ExitCode {
             monitor.connect_network_metered_notify(move |monitor| {
                 say(monitor.is_network_metered());
             });
+            // What it reaches, for the auth proxy's word when the API
+            // cannot be reached: a captive portal is the user's to sign in
+            // to, and the proxy says so (`taste_core::network::Reach`).
+            let reach = |monitor: &gtk::gio::NetworkMonitor| {
+                use gtk::gio::NetworkConnectivity as C;
+                use taste_core::network::Reach;
+                let reach = match monitor.connectivity() {
+                    C::Portal => Reach::Portal,
+                    C::Limited => Reach::Limited,
+                    C::Local => Reach::Local,
+                    _ => Reach::Full,
+                };
+                if taste_core::network::set_reach(reach) {
+                    tracing::info!("the network reaches: {reach:?}");
+                }
+            };
+            reach(&monitor);
+            monitor.connect_connectivity_notify(reach);
         }
         // Battery or mains, likewise (`power.rs`).
         crate::power::watch();

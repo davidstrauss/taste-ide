@@ -94,9 +94,13 @@ impl Body for ChannelBody {
 /// Messages-shaped body carrying `usage`, under the rate-limit headers the
 /// API documents.
 async fn start_upstream() -> Upstream {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
+    start_upstream_on("127.0.0.1:0".parse().unwrap()).await
+}
+
+/// The mock upstream on `addr`: a test that needs it to come up late, on
+/// an address it chose beforehand.
+async fn start_upstream_on(addr: SocketAddr) -> Upstream {
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
     let hits = Arc::new(AtomicU64::new(0));
@@ -1468,4 +1472,90 @@ async fn the_custom_model_file_is_this_projects_too() {
     let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(upstream.hits(), 0, "and nothing fell back to the API");
+}
+
+/// A turn sent while the network is gone is held, the chat told, until the
+/// API answers again, and then answered with an error the agent retries at
+/// once — which goes through. A captive portal is minutes of this
+/// (2026-11-15), far past the agent's own retries.
+#[tokio::test]
+async fn a_request_the_network_drops_is_held_until_the_api_answers_again() {
+    // Another loopback address than the other tests' servers, so nothing
+    // else can be listening on the port chosen while it is closed.
+    let probe = std::net::TcpListener::bind("127.0.0.3:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let upstream_uri: Uri = format!("http://{addr}").parse().unwrap();
+    let handle = AuthProxy::spawn(upstream_uri, Arc::new(StaticKey::api_key("real"))).unwrap();
+    handle.set_outage_timing(Duration::from_secs(20), Duration::from_millis(50));
+    let said = Arc::new(Mutex::new(
+        Vec::<(Option<String>, Option<String>, String)>::new(),
+    ));
+    let recorder = said.clone();
+    handle.set_notice(Arc::new(move |env, key, text| {
+        recorder
+            .lock()
+            .unwrap()
+            .push((env.map(str::to_string), key.map(str::to_string), text));
+    }));
+    let placeholder = handle.issue_placeholder("i-0031");
+
+    let late = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        start_upstream_on(addr).await
+    });
+    let started = Instant::now();
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        started.elapsed() >= Duration::from_millis(350),
+        "held, not failed at once"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("answers again"));
+    {
+        let said = said.lock().unwrap();
+        let first = said.first().expect("the chat was told");
+        assert_eq!(first.0.as_deref(), Some("i-0031"));
+        assert_eq!(first.1.as_deref(), Some("offline:127.0.0.3"));
+        assert!(first.2.contains("cannot be reached"), "{said:?}");
+        let last = said.last().unwrap();
+        assert_eq!(last.1, first.1, "one row, ending on the news");
+        assert!(last.2.contains("answering again"), "{said:?}");
+    }
+
+    // The agent's retry goes straight through.
+    let upstream = late.await.unwrap();
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(upstream.last().uri, "/v1/messages");
+}
+
+/// A network that does not come back in the hold fails the request with
+/// how long it waited, and says the same in the chat.
+#[tokio::test]
+async fn a_request_held_past_the_hold_fails_with_how_long_it_waited() {
+    let handle = AuthProxy::spawn(
+        "http://127.0.0.2:9".parse().unwrap(),
+        Arc::new(StaticKey::api_key("k")),
+    )
+    .unwrap();
+    handle.set_outage_timing(Duration::from_millis(200), Duration::from_millis(50));
+    let said = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorder = said.clone();
+    handle.set_notice(Arc::new(move |_env, _key, text| {
+        recorder.lock().unwrap().push(text);
+    }));
+    let placeholder = handle.issue_placeholder("i-0032");
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("could not be reached for"), "{text}");
+    assert!(said
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .contains("could not be reached for"));
 }

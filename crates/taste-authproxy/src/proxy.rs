@@ -115,6 +115,16 @@ const PLACEHOLDER_PREFIX: &str = "sk-ant-taste-";
 /// for *headers*, after which the body streams for as long as it likes.
 const HEADERS_TIMEOUT: Duration = Duration::from_secs(600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a request is held for an upstream this machine cannot reach
+/// before it fails. A network can take minutes to come back — a captive
+/// portal waits for the user to find its page and sign in — and the agent's
+/// own retries (ten, with backoff) were spent long before that, ending the
+/// turn on a 502 (2026-11-15; David: "This isn't resilient to captive
+/// portals"). Under Claude Code's ten-minute request timeout, so the hold
+/// ends with the proxy's word rather than the agent's.
+const OUTAGE_HOLD: Duration = Duration::from_secs(9 * 60);
+/// How often a held request asks whether the upstream answers again.
+const OUTAGE_PROBE_EVERY: Duration = Duration::from_secs(3);
 
 /// How long a streaming response may go without a byte before the proxy
 /// ends it with an error the agent can read.
@@ -322,6 +332,12 @@ struct ProxyState {
     stream_idle: Mutex<Duration>,
     /// [`crate::wake::WAKE_WAIT`], unless a test shortened it.
     wake_wait: Mutex<Duration>,
+    /// Per host, since when it has not been reachable from this machine:
+    /// requests to it are held until it answers ([`hold_for_upstream`]).
+    outages: Mutex<HashMap<String, std::time::Instant>>,
+    /// [`OUTAGE_HOLD`] and [`OUTAGE_PROBE_EVERY`], unless a test shortened
+    /// them.
+    outage_timing: Mutex<(Duration, Duration)>,
     /// Per host, the wake-ups sent since it last answered. What the one
     /// counting line in the chat reads, and what decides when the IDE
     /// stops trying (`crate::wake::GIVE_UP_AFTER`, `GIVE_UP_ATTEMPTS`).
@@ -432,6 +448,33 @@ impl ProxyState {
                 crate::wake::humanize(since)
             ),
         );
+    }
+
+    /// Since when `host` has been out of reach, if it is.
+    fn outage_since(&self, host: &str) -> Option<std::time::Instant> {
+        self.outages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(host)
+            .copied()
+    }
+
+    /// `host` could not be reached: the outage starts now, unless one has.
+    fn outage_begin(&self, host: &str) -> std::time::Instant {
+        *self
+            .outages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(host.to_string())
+            .or_insert_with(std::time::Instant::now)
+    }
+
+    /// `host` answers again.
+    fn outage_end(&self, host: &str) {
+        self.outages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(host);
     }
 
     fn wake_wait(&self) -> Duration {
@@ -702,6 +745,15 @@ impl Handle {
     pub fn set_wake_wait(&self, wait: Duration) {
         if let Ok(mut slot) = self.state.wake_wait.lock() {
             *slot = wait;
+        }
+    }
+
+    /// Shorten how long a request is held for an upstream that cannot be
+    /// reached ([`OUTAGE_HOLD`]), and how often it is asked again
+    /// ([`OUTAGE_PROBE_EVERY`]). For tests.
+    pub fn set_outage_timing(&self, hold: Duration, every: Duration) {
+        if let Ok(mut slot) = self.state.outage_timing.lock() {
+            *slot = (hold, every);
         }
     }
 
@@ -1019,6 +1071,8 @@ impl AuthProxy {
             stream_idle: Mutex::new(STREAM_IDLE_TIMEOUT),
             wake_wait: Mutex::new(crate::wake::WAKE_WAIT),
             wakes: Mutex::new(HashMap::new()),
+            outages: Mutex::new(HashMap::new()),
+            outage_timing: Mutex::new((OUTAGE_HOLD, OUTAGE_PROBE_EVERY)),
             notice: Mutex::new(None),
             seed,
             counter: AtomicU64::new(0),
@@ -1058,6 +1112,98 @@ impl AuthProxy {
             _accept: Arc::new(AbortOnDrop(accept)),
         })
     }
+}
+
+/// Hold a request for `target` until it answers again, saying so in
+/// `env`'s chat on one row that ends on the news: `Ok` once it answers,
+/// `Err` with the sentence to fail on when [`OUTAGE_HOLD`] runs out first.
+/// What the row says names a captive portal when the desktop has seen one
+/// (`taste_core::network::Reach`), since signing in is the user's to do.
+async fn hold_for_upstream(
+    state: &ProxyState,
+    env: &str,
+    target: &Uri,
+) -> std::result::Result<(), String> {
+    let host = target.host().unwrap_or("the API").to_string();
+    let key = format!("offline:{host}");
+    let since = state.outage_begin(&host);
+    let (hold, every) = state
+        .outage_timing
+        .lock()
+        .map(|timing| *timing)
+        .unwrap_or((OUTAGE_HOLD, OUTAGE_PROBE_EVERY));
+    let mut said = None;
+    loop {
+        let reach = taste_core::network::reach();
+        if said != Some(reach) {
+            said = Some(reach);
+            state.notify(Some(env), Some(&key), outage_note(&host, reach, hold));
+        }
+        if upstream_answers(target).await {
+            state.outage_end(&host);
+            state.notify(
+                Some(env),
+                Some(&key),
+                format!(
+                    "{host} is answering again, after {}; the turn goes on",
+                    crate::wake::humanize(since.elapsed())
+                ),
+            );
+            return Ok(());
+        }
+        if since.elapsed() >= hold {
+            let note = format!(
+                "{host} could not be reached for {}; send again once the network is back",
+                crate::wake::humanize(since.elapsed())
+            );
+            state.notify(Some(env), Some(&key), note.clone());
+            return Err(note);
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// What the chat is told while a request is held for `host`.
+fn outage_note(host: &str, reach: taste_core::network::Reach, hold: Duration) -> String {
+    use taste_core::network::Reach;
+    let wait = crate::wake::humanize(hold);
+    match reach {
+        Reach::Portal => format!(
+            "This network wants a sign-in before it reaches the internet (a captive portal). \
+             Sign in from a browser; the turn is held and goes on by itself once {host} \
+             answers, for up to {wait}."
+        ),
+        Reach::Local | Reach::Limited => format!(
+            "This machine is not on the internet, so {host} cannot be reached. The turn is \
+             held and goes on by itself once it is, for up to {wait}."
+        ),
+        Reach::Full => format!(
+            "{host} cannot be reached from this machine: the network may be down, or asking \
+             for a sign-in. The turn is held and goes on by itself once it answers, for up to \
+             {wait}."
+        ),
+    }
+}
+
+/// Whether `target` answers an HTTP request at all, its certificate checked:
+/// any status counts. A connection alone does not, since a captive portal
+/// takes the connection and answers it with its own page under a
+/// certificate that is not the upstream's. No credential goes with it.
+async fn upstream_answers(target: &Uri) -> bool {
+    let Ok(root) = "/".parse::<Uri>() else {
+        return false;
+    };
+    let Ok(uri) = upstream_uri(target, &root) else {
+        return false;
+    };
+    let Ok(request) = Request::get(uri).body(http_body_util::Empty::<Bytes>::new()) else {
+        return false;
+    };
+    let client = build_client::<http_body_util::Empty<Bytes>>();
+    matches!(
+        tokio::time::timeout(CONNECT_TIMEOUT, client.request(request)).await,
+        Ok(Ok(_))
+    )
 }
 
 /// `GET /v1/models` with the real credential — the one request the proxy
@@ -1483,6 +1629,19 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         }
     }
 
+    // An upstream already known to be out of reach: the request waits,
+    // unsent, for it to answer, and then goes as if nothing happened.
+    let host = target.host().unwrap_or("the API").to_string();
+    if state.outage_since(&host).is_some() {
+        if let Err(note) = hold_for_upstream(&state, &env_id, &target).await {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                &format!("taste-ide auth proxy: {note}"),
+            );
+        }
+    }
+
     let (mut parts, body) = req.into_parts();
     let uri = match upstream_uri(&target, &parts.uri) {
         Ok(uri) => uri,
@@ -1513,6 +1672,30 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
     let sent = tokio::time::timeout(HEADERS_TIMEOUT, state.client.request(outbound)).await;
     let upstream = match sent {
         Ok(Ok(response)) => response,
+        Ok(Err(e)) if e.is_connect() => {
+            // Nothing of the request went out, and its body went with the
+            // attempt, so this one cannot be sent again. It is held instead
+            // until the upstream answers, and then answered with an error
+            // the agent retries at once — a retry that goes through, where
+            // ten spent against a network that was not there ended the turn.
+            tracing::warn!("auth proxy could not connect upstream: {e}");
+            state.outage_begin(&host);
+            return match hold_for_upstream(&state, &env_id, &target).await {
+                Ok(()) => error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    &format!(
+                        "taste-ide auth proxy: {host} could not be reached and answers again; \
+                         send the request again"
+                    ),
+                ),
+                Err(note) => error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    &format!("taste-ide auth proxy: {note}"),
+                ),
+            };
+        }
         Ok(Err(e)) => {
             tracing::warn!("auth proxy upstream request failed: {e}");
             return error_response(

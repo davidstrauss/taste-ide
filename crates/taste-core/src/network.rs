@@ -1,5 +1,5 @@
-//! Whether this machine's connection is metered, and whether it has an
-//! IPv6 loopback.
+//! Whether this machine's connection is metered, what the desktop says it
+//! reaches, and whether it has an IPv6 loopback.
 //!
 //! A metered connection — a phone's hotspot, a capped plan — is one where
 //! the IDE waits with what it would download by its own choice: a guest
@@ -13,7 +13,7 @@
 //! inside the Flatpak). GIO is the app's to hold, so the app keeps this flag
 //! current and everything below it reads the flag.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 static METERED: AtomicBool = AtomicBool::new(false);
 
@@ -25,6 +25,45 @@ pub fn metered() -> bool {
 /// What the desktop says now. True when that changed the answer.
 pub fn set_metered(metered: bool) -> bool {
     METERED.swap(metered, Ordering::Relaxed) != metered
+}
+
+/// What the desktop says the connection reaches: GIO's connectivity
+/// levels, read the same way as [`metered`]. What the auth proxy names when
+/// the API cannot be reached, since a network held behind a sign-in page
+/// (a captive portal) wants the user to sign in, which nothing else does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The internet, as far as the desktop can tell.
+    Full,
+    /// A network that asks for a sign-in before it reaches anything.
+    Portal,
+    /// A network, but not the internet.
+    Limited,
+    /// No network but this machine's own.
+    Local,
+}
+
+static REACH: AtomicU8 = AtomicU8::new(0);
+
+/// What the connection reaches, as the desktop last said.
+pub fn reach() -> Reach {
+    match REACH.load(Ordering::Relaxed) {
+        1 => Reach::Portal,
+        2 => Reach::Limited,
+        3 => Reach::Local,
+        _ => Reach::Full,
+    }
+}
+
+/// What the desktop says now. True when that changed the answer.
+pub fn set_reach(reach: Reach) -> bool {
+    let value = match reach {
+        Reach::Full => 0,
+        Reach::Portal => 1,
+        Reach::Limited => 2,
+        Reach::Local => 3,
+    };
+    REACH.swap(value, Ordering::Relaxed) != value
 }
 
 /// Whether this machine has an IPv6 loopback to listen on: a bind to

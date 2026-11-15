@@ -1286,6 +1286,20 @@ work, and a project with none does not inherit another's.
   the API can go away too. Meanwhile the chat's working line says how
   long the session has been quiet from twenty seconds on, and names Stop
   after a minute, which covers the silences the proxy cannot see.
+- **A network that is gone holds the turn rather than ending it.** A
+  request whose connection to the upstream fails — no network, or a
+  captive portal waiting for a sign-in — is held, and the chat told on
+  one row (naming the portal when the desktop's network monitor has seen
+  one, `taste_core::network::Reach`), while the proxy asks the upstream
+  every three seconds with its certificate checked, since a portal takes
+  the connection itself. When it answers, the held request is answered
+  with a 503 the agent retries at once, and that retry goes through;
+  requests sent meanwhile wait unsent and then go as usual. After nine
+  minutes, under Claude Code's ten-minute request timeout, it fails with
+  how long it waited (`taste_authproxy::proxy::OUTAGE_HOLD`). The agent's
+  own ten retries were spent in a minute or two, which ended the turn on
+  a 502 behind a portal (David, 2026-11-15: "This isn't resilient to
+  captive portals").
 - **A sleeping machine is woken, not reported unreachable.** Before a
   request goes to the custom endpoint the proxy checks that something is
   listening; if nothing is, it sends a Wake-on-LAN packet to the machine
