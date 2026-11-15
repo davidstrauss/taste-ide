@@ -332,6 +332,151 @@ fn flush_wanted(facts: SendFacts) -> bool {
     !facts.awaiting_container && !facts.environment_in_transition && facts.live_agent
 }
 
+/// What a chat whose agent is not up yet is waiting on, said in the
+/// middle of an empty transcript (or on the working line, over a
+/// conversation already drawn) until its session is live or something
+/// final stops it. Before this, the only "Connecting…" was the gear's
+/// tooltip, and a chat waiting on its container read as a chat with
+/// nothing in it (David, 2026-11-15: "This really needs to show that the
+/// chat is loading more prominently").
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Loading {
+    /// The IDE getting the environment somewhere to run, `what` the step
+    /// in its supervisor's words ("bringing up the workspace's VM").
+    Preparing(String),
+    /// A move to another VM, in its state's words.
+    Moving(String),
+    /// The environment's container is being built.
+    Building,
+    /// ...or started.
+    StartingContainer,
+    /// Not up, and not yet saying it is on its way: at a launch, before
+    /// the IDE has said what it is doing.
+    Container,
+    /// Up, and being asked whether it can host the agent.
+    Hosting,
+    /// Up and able to host it, its channel to the IDE being opened.
+    Channel,
+    /// The agent's process spawned, its session not yet open.
+    Agent { in_container: bool },
+    /// A `session/load`, or the record being drawn once it answers.
+    Conversation,
+    /// The agent stopped before it was ready, and is being started again.
+    Again,
+}
+
+impl Loading {
+    /// The phase in plain words, lower-case: the page capitalizes it, and
+    /// the working line puts it after a dash.
+    fn words(&self) -> String {
+        match self {
+            Loading::Preparing(what) => what.clone(),
+            Loading::Moving(moving) => moving.clone(),
+            Loading::Building => "waiting for the environment's container to build".into(),
+            Loading::StartingContainer => "waiting for the environment's container to start".into(),
+            Loading::Container => "waiting for the environment's container".into(),
+            Loading::Hosting => "asking the container whether it can run the agent".into(),
+            Loading::Channel => "opening the container's channel to the IDE".into(),
+            // Under "Starting Claude Code", what is left to say is the
+            // session: the process is up, and `initialize` and
+            // `session/new` are what it waits on.
+            Loading::Agent { in_container: true } => {
+                "opening a session in the environment's container".into()
+            }
+            Loading::Agent {
+                in_container: false,
+            } => "opening a session".into(),
+            Loading::Conversation => "loading the conversation".into(),
+            Loading::Again => "trying again after the agent stopped".into(),
+        }
+    }
+
+    /// For the page's description, which is a sentence.
+    fn sentence(&self) -> String {
+        let words = self.words();
+        let mut chars = words.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().chain(chars).collect(),
+            None => words,
+        }
+    }
+}
+
+/// Everything [`loading`] is allowed to look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadingFacts {
+    /// Sign-in stands in the way: the invitation says so, and no wait
+    /// ends it.
+    needs_auth: bool,
+    /// `Ready` has come: a session is open.
+    session_live: bool,
+    /// A restored session's record is being made into rows.
+    drawing_history: bool,
+    /// A process is running.
+    client_live: bool,
+    /// ...resuming a conversation rather than opening a fresh one.
+    resuming: bool,
+    /// ...inside its environment's container.
+    relocated: bool,
+    /// A reconnect is armed and has not fired yet.
+    reconnect_due: bool,
+    wait: ContainerWait,
+    /// A launch was refused and is held for the container.
+    refused_launch: bool,
+    /// What the container is doing that an agent waiting on it can still
+    /// expect something from, or `None` when nothing about it is coming:
+    /// stopped, failed, unable to host the agent, no supervisor at all, or
+    /// up with nothing left to ask.
+    container: Option<Loading>,
+    /// A respawn follows this environment settling (`retopologize`
+    /// resumes a conversation it has).
+    agent_owed: bool,
+}
+
+/// Whether the chat is loading, and on what: pulled out of the pane so the
+/// cases can be pinned by a test.
+///
+/// The rule is that a wait shows and a final answer does not. Every
+/// `None` below is a state something else already says — the sign-in
+/// invitation, a note naming why the launch was refused, a parked chat's
+/// "sending will start it" — or a chat with nothing on its way.
+fn loading(facts: &LoadingFacts) -> Option<Loading> {
+    if facts.needs_auth {
+        return None;
+    }
+    if facts.session_live {
+        // The session is open; its history may still be being drawn,
+        // and an empty page between the two is the stutter this avoids.
+        return facts.drawing_history.then_some(Loading::Conversation);
+    }
+    if facts.client_live {
+        return Some(if facts.resuming {
+            Loading::Conversation
+        } else {
+            Loading::Agent {
+                in_container: facts.relocated,
+            }
+        });
+    }
+    if facts.reconnect_due {
+        return Some(Loading::Again);
+    }
+    match facts.wait {
+        // Held for the container, which `hold_for_container` asked for
+        // or found on its way: always a wait, whatever it says now.
+        ContainerWait::Waiting => {
+            return Some(facts.container.clone().unwrap_or(Loading::Container));
+        }
+        // Looked at, never started: nothing is coming until a send.
+        ContainerWait::Parked => return None,
+        ContainerWait::Idle | ContainerWait::GaveUp => {}
+    }
+    if facts.refused_launch || facts.agent_owed {
+        return facts.container.clone();
+    }
+    None
+}
+
 /// Whether a dropped connection is worth another spawn.
 ///
 /// A session id is the ordinary reason: the conversation outlives the
@@ -1106,6 +1251,25 @@ pub struct ChatPane {
     restore_notice: gtk::Label,
     /// The empty-transcript page, whose title names the selected agent.
     placeholder: adw::StatusPage,
+    /// The page an empty transcript shows instead while the agent is on
+    /// its way: a spinner, "Starting <agent>", and what it waits on.
+    loading_page: adw::StatusPage,
+    /// What this chat is loading on, as [`loading`] last said it, so the
+    /// transcript's page and the working line can be chosen per row
+    /// without asking the environment again (`sync_loading`).
+    loading: RefCell<Option<Loading>>,
+    /// The working line is saying the loading phase rather than a turn's
+    /// activity, and gives the activity back when it stops.
+    loading_line_shown: Cell<bool>,
+    /// The phase a probe poses (`TASTE_PROBE_CHAT=loading`), in place of
+    /// the facts a probe's machine has.
+    probe_loading: RefCell<Option<Loading>>,
+    /// A reconnect is armed and has not fired: the chat is loading again.
+    reconnect_due: Cell<bool>,
+    /// This settled state's reopen of a channel that was down has failed:
+    /// nothing more is coming from that container for a held launch, and
+    /// its note says so.
+    channel_failed: Cell<bool>,
     /// The (agent, session) pair this chat is worth restoring FROM — the
     /// live one once it has content, or the one it was restored with until
     /// then. Persisted; a sterile fresh session never displaces it.
@@ -3614,6 +3778,15 @@ impl ChatPane {
         // The empty chat's page until there is a row, then the transcript.
         let transcript_stack = gtk::Stack::new();
         transcript_stack.add_named(&placeholder, Some("empty"));
+        // ...or, while the agent is on its way, the page that says so: the
+        // empty page's own shape (a compact status page), its glyph a
+        // spinner, so the one becoming the other moves nothing but the
+        // words. No stack transition: a restore clears the rows and puts
+        // them back within one dispatch, and a crossfade started there
+        // would flash this page over the conversation it is drawing.
+        let loading_page = adw::StatusPage::builder().css_classes(["compact"]).build();
+        loading_page.set_paintable(Some(&adw::SpinnerPaintable::new(Some(&loading_page))));
+        transcript_stack.add_named(&loading_page, Some("loading"));
         let stick_to_bottom = Rc::new(Cell::new(true));
         let reader_scrolled: Rc<Cell<Option<std::time::Instant>>> = Rc::new(Cell::new(None));
         let row_bar = {
@@ -3780,6 +3953,12 @@ impl ChatPane {
             on_busy: RefCell::new(None),
             restore_notice,
             placeholder,
+            loading_page,
+            loading: RefCell::new(None),
+            loading_line_shown: Cell::new(false),
+            probe_loading: RefCell::new(None),
+            reconnect_due: Cell::new(false),
+            channel_failed: Cell::new(false),
             session_has_content: Cell::new(false),
             guidance_seen: Cell::new(0),
             clear_on_replay: Cell::new(false),
@@ -5388,15 +5567,20 @@ impl ChatPane {
             AgentHosting::Yes => {}
             // `Unknown` is not `No`: the probe simply has not come back, and
             // the environment republishes `Running` when it does, which is
-            // when this chat gets its second look. The gate holds a spawn
-            // for it (`container_gate`), so reaching here is rare — and
-            // said, because an agent outside its container sees an empty,
-            // read-only stand-in where its checkout should be, and its
-            // answers read as file permission errors.
+            // when this chat gets its second look. The gate holds every
+            // spawn for it (`ensure_client` asks `container_gate`), because
+            // an agent outside its container sees an empty, read-only
+            // stand-in where its checkout should be, and its answers read
+            // as file permission errors. What still reaches here is a live
+            // agent's topology being weighed, where nothing starts at all,
+            // or a chat that gave up on its container — so it is logged,
+            // not a row: "starts outside it" was untrue in the first, and
+            // in both a transient written into the record for good.
             AgentHosting::Unknown => {
-                self.report_hosting_refusal(
-                    "its container has not yet answered whether it can host an agent, \
-                     so this agent starts outside it and moves in when it does",
+                tracing::info!(
+                    "chat {}: not relocated — its container has not yet answered whether it \
+                     can host an agent",
+                    self.environment
                 );
                 return None;
             }
@@ -5593,7 +5777,10 @@ impl ChatPane {
     fn sync_revive_bar(&self) {
         // The probe's pose of this line holds against the environment's
         // own state, which in a probe is not starting.
-        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("starting") {
+        if matches!(
+            std::env::var("TASTE_PROBE_CHAT").as_deref(),
+            Ok("starting" | "loading-sent")
+        ) {
             return;
         }
         let Some(supervisor) = self.environments.get(&self.environment) else {
@@ -5603,7 +5790,16 @@ impl ChatPane {
         let state = supervisor.state();
         let queued = self.revive_queue.borrow().len();
         let name = &self.environment;
-        let text = if self.environment_in_transition() {
+        // With nothing held, the loading page (or the working line) is
+        // already saying what the environment is doing, and saying it
+        // twice — "primary is starting…" under "Starting the
+        // environment's container" — is noise. A held message keeps the
+        // line: when it goes is the fact it adds.
+        let loading = self.loading.borrow().is_some();
+        let text = if queued == 0 && loading {
+            self.revive_bar.set_reveal_child(false);
+            return;
+        } else if self.environment_in_transition() {
             // A move says it is one: "starting" over an environment that
             // was running a minute ago, and is minutes from running again,
             // explained nothing.
@@ -6017,8 +6213,7 @@ impl ChatPane {
         let Some(supervisor) = self.environments.get(&self.environment) else {
             return;
         };
-        let note = self.launch_refusal_note();
-        self.note_keyed(LAUNCH_NOTE, &note);
+        self.say_held_launch();
         if !supervisor.exec().has_exec_target() {
             return;
         }
@@ -6038,6 +6233,10 @@ impl ChatPane {
                     match result {
                         Ok(Ok(())) => pane.retopologize(),
                         Ok(Err(e)) => {
+                            // Final for this settled state: the page
+                            // stops waiting, and the note says why.
+                            pane.channel_failed.set(true);
+                            pane.sync_loading();
                             let error = pane.refused_error.borrow().clone();
                             pane.note_keyed(
                                 LAUNCH_NOTE,
@@ -6051,6 +6250,25 @@ impl ChatPane {
                     }
                 });
             }
+        }
+    }
+
+    /// A refused launch's note, where it belongs. While the container is
+    /// still coming (`container_loading`), the wait is the loading
+    /// page's to say, and the refusal goes to the log: a row saying the
+    /// launch was refused, under a page saying it is starting, was two
+    /// stories about one wait, and the row outlived the wait as the
+    /// transcript's first words (David, 2026-11-15). Once nothing more is
+    /// coming the note is the plain failure. A note already in the
+    /// transcript is rewritten either way, so it never goes stale.
+    fn say_held_launch(&self) {
+        let note = self.launch_refusal_note();
+        let shown = self.keyed_notes.borrow().contains_key(LAUNCH_NOTE);
+        let waiting = self.refused_outside.get() && self.container_loading().is_some();
+        if shown || !waiting {
+            self.note_keyed(LAUNCH_NOTE, &note);
+        } else {
+            tracing::info!("chat {}: {note}", self.environment);
         }
     }
 
@@ -6101,12 +6319,15 @@ impl ChatPane {
         // respawn that follows writes the line again from `Ready`.
         self.sync_ready_status();
         if matches!(state, S::Building | S::Starting | S::Preparing { .. }) {
+            // ...and the loading page's words, which follow every step.
+            self.sync_loading();
             return;
         }
         // A settled state is a fresh chance to say why relocation was
         // declined, if it still is.
         self.hosting_refusal.borrow_mut().take();
         self.channel_retried.set(false);
+        self.channel_failed.set(false);
         // A container this chat cannot move into until it is asked: one
         // adopted by a recheck the registry did not follow with a probe —
         // the config watcher's, the VM's change watcher's — published
@@ -6143,7 +6364,8 @@ impl ChatPane {
                 // It settled without an exec target: say so once, and let
                 // the agent start outside rather than never.
                 self.note(&format!(
-                    "{} did not come up, so this agent starts outside its container —                      it can read, write and think, but has no shell there",
+                    "{} did not come up, so this agent starts outside its container — \
+                     it can read, write and think, but has no shell there",
                     self.environment
                 ));
                 ContainerWait::GaveUp
@@ -6153,6 +6375,7 @@ impl ChatPane {
         // ...and the first moment a message held while it was down has
         // somewhere real to go.
         self.flush_revive_queue();
+        self.sync_loading();
     }
 
     /// A reload this chat's agent asked for has finished. The agent lived
@@ -6438,6 +6661,47 @@ impl ChatPane {
     /// before this — and `retopologize` still moves it in if the container
     /// appears later.
     fn hold_for_container(self: &Rc<Self>, may_start: bool) -> bool {
+        let (supervisor, facts) = self.gate_facts();
+        match container_gate(facts) {
+            Gate::Spawn => {
+                self.container_wait.set(ContainerWait::Idle);
+                false
+            }
+            Gate::GiveUp => {
+                self.container_wait.set(ContainerWait::GaveUp);
+                false
+            }
+            Gate::StartThenHold if !may_start => {
+                self.container_wait.set(ContainerWait::Parked);
+                self.sync_revive_bar();
+                self.sync_loading();
+                true
+            }
+            gate @ (Gate::StartThenHold | Gate::Hold) => {
+                if gate == Gate::StartThenHold {
+                    if let Some(supervisor) = &supervisor {
+                        self.start_container(supervisor);
+                    }
+                }
+                self.container_wait.set(ContainerWait::Waiting);
+                self.sync_revive_bar();
+                // A hold on a container that is up is a hold on its hosting
+                // answer, which only a probe gives.
+                self.ask_hosting();
+                self.sync_loading();
+                true
+            }
+        }
+    }
+
+    /// What [`container_gate`] is asked, read now, with the supervisor it
+    /// was read from.
+    fn gate_facts(
+        &self,
+    ) -> (
+        Option<std::sync::Arc<taste_devcontainer::Supervisor>>,
+        GateFacts,
+    ) {
         let supervisor = self.environments.get(&self.environment);
         let facts = GateFacts {
             primary: self.environment.is_primary(),
@@ -6460,34 +6724,7 @@ impl ChatPane {
                 ),
             }),
         };
-        match container_gate(facts) {
-            Gate::Spawn => {
-                self.container_wait.set(ContainerWait::Idle);
-                false
-            }
-            Gate::GiveUp => {
-                self.container_wait.set(ContainerWait::GaveUp);
-                false
-            }
-            Gate::StartThenHold if !may_start => {
-                self.container_wait.set(ContainerWait::Parked);
-                self.sync_revive_bar();
-                true
-            }
-            gate @ (Gate::StartThenHold | Gate::Hold) => {
-                if gate == Gate::StartThenHold {
-                    if let Some(supervisor) = &supervisor {
-                        self.start_container(supervisor);
-                    }
-                }
-                self.container_wait.set(ContainerWait::Waiting);
-                self.sync_revive_bar();
-                // A hold on a container that is up is a hold on its hosting
-                // answer, which only a probe gives.
-                self.ask_hosting();
-                true
-            }
-        }
+        (supervisor, facts)
     }
 
     /// Whether the agent is being held back for its container — what the
@@ -7211,6 +7448,9 @@ impl ChatPane {
             "not connected".to_string()
         };
         let tooltip = format!("Settings — {word}");
+        // Every status word is a step of the link's, and whether the chat
+        // is loading is the same story told in the transcript.
+        self.sync_loading();
         self.options_toggle.set_icon_name(glyph);
         self.options_toggle.set_tooltip_text(Some(&tooltip));
         if let Some(hook) = self.on_link_state.borrow().as_ref() {
@@ -7233,6 +7473,8 @@ impl ChatPane {
     fn refresh_placeholder(&self) {
         self.placeholder
             .set_title(&format!("Ask {}", self.agent_name()));
+        self.loading_page
+            .set_title(&format!("Starting {}", self.agent_name()));
     }
 
     /// The sign-in TUI ended. On success, drop the latch optimistically
@@ -8154,6 +8396,10 @@ impl ChatPane {
         // it (`empty_context`).
         self.session_usage.borrow_mut().take();
         self.session_cost.borrow_mut().take();
+        // No process: whatever comes next — a respawn, a reconnect, or
+        // nothing — says so itself, and an ending that is followed by
+        // nothing must not leave a loading page waiting on it.
+        self.sync_loading();
     }
 
     // --- transcript --------------------------------------------------------
@@ -8479,10 +8725,122 @@ impl ChatPane {
     /// The empty chat's page while there is no row, the transcript once
     /// there is.
     fn sync_placeholder(&self) {
-        let name = if !self.has_rows() { "empty" } else { "list" };
+        let name = if self.has_rows() {
+            "list"
+        } else if self.loading.borrow().is_some() {
+            "loading"
+        } else {
+            "empty"
+        };
         if self.transcript_stack.visible_child_name().as_deref() != Some(name) {
             self.transcript_stack.set_visible_child_name(name);
+            // The first row in, or the last out, moves the loading phase
+            // between the page and the working line.
+            self.sync_busy_row();
         }
+    }
+
+    /// Re-read whether this chat is loading, and say it: the page in an
+    /// empty transcript, the working line over one with rows in it, and
+    /// the line above the composer stood down where it would only say the
+    /// same. Cheap — a lookup and a lock or two — and called wherever the
+    /// facts it reads change: the link's status (`sync_link_badge`), the
+    /// environment's state, a hold, a spawn, a reconnect, a history drawn.
+    fn sync_loading(&self) {
+        let probe = self.probe_loading.borrow().clone();
+        let now = probe.or_else(|| loading(&self.loading_facts()));
+        if *self.loading.borrow() != now {
+            if let Some(phase) = &now {
+                tracing::debug!("chat {}: loading — {}", self.environment, phase.words());
+            }
+            *self.loading.borrow_mut() = now.clone();
+        }
+        if let Some(phase) = &now {
+            self.loading_page
+                .set_title(&format!("Starting {}", self.agent_name()));
+            self.loading_page.set_description(Some(&phase.sentence()));
+        }
+        self.sync_placeholder();
+        self.sync_revive_bar();
+        self.sync_busy_row();
+    }
+
+    /// The facts [`loading`] decides from, read now.
+    fn loading_facts(&self) -> LoadingFacts {
+        LoadingFacts {
+            needs_auth: self.needs_auth.get(),
+            session_live: self.session_info.borrow().is_some(),
+            drawing_history: self.drawing_history.get(),
+            client_live: self.client.borrow().is_some(),
+            resuming: self.replaying.get(),
+            relocated: self.relocated.get(),
+            reconnect_due: self.reconnect_due.get(),
+            wait: self.container_wait.get(),
+            refused_launch: self.refused_launch.borrow().is_some(),
+            container: self.container_loading(),
+            agent_owed: self.persisted_session.borrow().is_some(),
+        }
+    }
+
+    /// What this chat's container is doing that an agent waiting on it
+    /// can still expect something from — or `None` when nothing about it
+    /// is coming. The one predicate both the loading state and a refused
+    /// launch's note ask, so the page never waits on what the note calls
+    /// final, and the note never lands while the page is still waiting.
+    fn container_loading(&self) -> Option<Loading> {
+        use taste_devcontainer::{AgentHosting, SupervisorState};
+        if taste_acp::sandbox::inside_container() {
+            return None;
+        }
+        let supervisor = self.environments.get(&self.environment)?;
+        if let Some(moving) = self.moving_words() {
+            return Some(Loading::Moving(moving));
+        }
+        let state = supervisor.state();
+        match &state {
+            SupervisorState::Preparing { what } => return Some(Loading::Preparing(what.clone())),
+            SupervisorState::Building => return Some(Loading::Building),
+            SupervisorState::Starting => return Some(Loading::StartingContainer),
+            _ => {}
+        }
+        if supervisor.exec().has_exec_target() {
+            return match supervisor.agent_hosting() {
+                AgentHosting::Unknown => Some(Loading::Hosting),
+                AgentHosting::Yes
+                    if supervisor.channel_paths().is_none() && !self.channel_failed.get() =>
+                {
+                    Some(Loading::Channel)
+                }
+                AgentHosting::Yes | AgentHosting::No { .. } => None,
+            };
+        }
+        // Not up and not on its way. Stopped or failed, nothing is coming;
+        // short of those, the user's own environment is — the IDE brings
+        // its container up on its own, and at a launch it reads as not
+        // started yet (`container_gate`). Anyone else's waits on a Start.
+        match state {
+            SupervisorState::Stopped | SupervisorState::Failed { .. } => None,
+            _ if self.environment.is_primary() => Some(Loading::Container),
+            _ => None,
+        }
+    }
+
+    /// The working line's words while the agent is loading under a
+    /// transcript that already has rows — a conversation still on screen
+    /// from before, or a message sent while waiting — where the page
+    /// would hide them. Not while the line above the composer is up: a
+    /// held message's "sends when it is up" already says the wait.
+    fn loading_line(&self) -> Option<String> {
+        if !self.has_rows() || self.revive_bar.reveals_child() {
+            return None;
+        }
+        let loading = self.loading.borrow();
+        let phase = loading.as_ref()?;
+        Some(format!(
+            "Starting {} — {}…",
+            self.agent_name(),
+            phase.words()
+        ))
     }
 
     /// Restoring a conversation's state from its record, as opposed to
@@ -8953,7 +9311,30 @@ impl ChatPane {
     /// row goes away rather than spinning beside it.
     fn sync_busy_row(&self) {
         let waiting = self.card_up();
-        self.busy_row.set_visible(self.busy.get() && !waiting);
+        let working = self.busy.get() && !waiting;
+        // ...or the agent coming up under rows already drawn, which is the
+        // same line saying the same kind of thing: something is under way
+        // and nothing needs the user (`loading_line`). A turn outranks it.
+        let line = if self.busy.get() {
+            None
+        } else {
+            self.loading_line()
+        };
+        match &line {
+            Some(text) => {
+                if self.busy_label.label() != text.as_str() {
+                    self.busy_label.set_label(text);
+                }
+                self.loading_line_shown.set(true);
+            }
+            None => {
+                if self.loading_line_shown.replace(false) {
+                    let activity = self.activity.borrow().clone();
+                    self.busy_label.set_label(&activity);
+                }
+            }
+        }
+        self.busy_row.set_visible(working || line.is_some());
     }
 
     /// Name what the turn is doing, from the tool call that just started.
@@ -9282,6 +9663,32 @@ impl ChatPane {
         if self.client.borrow().is_some() {
             return;
         }
+        // The gate holds every spawn, not only the ones `activate` makes.
+        // A settled state's `retopologize`, a reconnect's timer, a sign-in
+        // finishing, and a new session all came here directly, so a chat
+        // with a conversation to resume spawned the moment its container
+        // published `Running` — before anyone had asked whether it could
+        // host the agent — outside it, and on a machine with no `npx` was
+        // refused, leaving "agent not relocated" and "agent launch
+        // refused" as the transcript's only rows while the container was
+        // still being asked (David, 2026-11-15). Only a hold is acted on here:
+        // starting a container, or parking for one, is `activate`'s to do.
+        if container_gate(self.gate_facts().1) == Gate::Hold {
+            tracing::info!(
+                "chat {}: its agent waits for its container (resume={})",
+                self.environment,
+                resume.as_deref().unwrap_or("none")
+            );
+            // The activation the environment's next settled state makes
+            // takes this up (`on_environment_state`).
+            if resume.is_some() {
+                *self.pending_restore.borrow_mut() = resume;
+            }
+            self.container_wait.set(ContainerWait::Waiting);
+            self.ask_hosting();
+            self.sync_loading();
+            return;
+        }
         if resume.is_none() {
             // Said the moment a fresh session is asked for, not when its
             // agent is up, which can be a container's bring-up later.
@@ -9376,9 +9783,9 @@ impl ChatPane {
                 // word under an agent that is up.
                 *self.refused_error.borrow_mut() = e.to_string();
                 self.refused_outside.set(!relocating);
-                let note = self.launch_refusal_note();
-                self.note_keyed(LAUNCH_NOTE, &note);
                 *self.refused_launch.borrow_mut() = Some(resume_for_retry);
+                self.say_held_launch();
+                self.sync_loading();
                 return;
             }
         };
@@ -9400,6 +9807,7 @@ impl ChatPane {
         *self.client.borrow_mut() = Some(client);
         let generation = self.client_generation.get() + 1;
         self.client_generation.set(generation);
+        self.sync_loading();
 
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -9940,6 +10348,7 @@ impl ChatPane {
                 // on screen, just disabled.
                 self.reset_session(false);
                 self.schedule_reconnect(resume);
+                self.sync_loading();
             }
         }
     }
@@ -10008,13 +10417,16 @@ impl ChatPane {
             2 => 5,
             _ => 15,
         });
-        self.set_status("reconnecting… ({attempt}/{MAX_ATTEMPTS})");
+        self.reconnect_due.set(true);
+        self.set_status(&format!("reconnecting… ({attempt}/{MAX_ATTEMPTS})"));
         let weak = Rc::downgrade(self);
         glib::timeout_add_local_once(delay, move || {
             let Some(pane) = weak.upgrade() else { return };
+            pane.reconnect_due.set(false);
             // Something started a session while we waited (the user sent a
             // prompt, or switched agents): leave it alone.
             if pane.client.borrow().is_some() {
+                pane.sync_loading();
                 return;
             }
             // `None` is a fresh session, which is what a chat that died
@@ -11120,6 +11532,10 @@ impl ChatPane {
     /// replies its last question offered are pending again.
     async fn draw_history(self: Rc<Self>, records: Vec<serde_json::Value>) {
         self.drawing_history.set(true);
+        // The rows are made off the main thread, which for a long record
+        // is a moment worth saying: the empty page meanwhile read as a
+        // conversation lost.
+        self.sync_loading();
         let state: Vec<serde_json::Value> = ["usage_update", "available_commands_update"]
             .iter()
             .filter_map(|kind| {
@@ -11155,6 +11571,7 @@ impl ChatPane {
             .await;
         let Ok((mut history, replies)) = made else {
             self.drawing_history.set(false);
+            self.sync_loading();
             return;
         };
         let made_in = started.elapsed();
@@ -11214,6 +11631,7 @@ impl ChatPane {
         // A message sent while the record was being read is after it.
         self.reattach_pending_cards();
         self.drawing_history.set(false);
+        self.sync_loading();
         self.scroll_to_end();
     }
 
@@ -12233,6 +12651,62 @@ impl ChatPane {
         self.finalize_stream();
     }
 
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=loading`, `loading-sent`,
+    /// and `loading-kept`. The phase is posed — a probe's machine brings
+    /// up no container and spawns no agent — and everything else is drawn
+    /// as the running app draws it from that phase (`sync_loading`).
+    #[doc(hidden)]
+    fn seed_loading_for_probe(self: &Rc<Self>, variant: &str) {
+        use agent_client_protocol::schema::v1::ContentChunk;
+        let phase = match std::env::var("TASTE_PROBE_LOADING").as_deref() {
+            Ok("vm") => Loading::Preparing("bringing up the workspace's VM".into()),
+            Ok("hosting") => Loading::Hosting,
+            Ok("agent") => Loading::Agent { in_container: true },
+            Ok("conversation") => Loading::Conversation,
+            Ok("container") => Loading::StartingContainer,
+            _ if variant == "loading-kept" => Loading::Conversation,
+            _ => Loading::StartingContainer,
+        };
+        *self.probe_loading.borrow_mut() = Some(phase);
+        match variant {
+            // A message sent while the container comes up: its card, held,
+            // and the line above the composer saying when it goes — the
+            // `starting` pose's line, which this one stands beside.
+            "loading-sent" => {
+                let environment = self.environment.to_string();
+                self.show_prompt(
+                    &new_prompt_id(),
+                    "Run the migration tests once the container is up.",
+                    &[],
+                    model::Delivery::Held(holding_label(&environment, true)),
+                );
+                self.revive_label.set_label(&format!(
+                    "{environment} is starting — your message sends when it is up"
+                ));
+                self.revive_bar.set_reveal_child(true);
+            }
+            // The conversation a reconnect keeps on screen until the
+            // replay replaces it (`clear_on_replay`).
+            "loading-kept" => {
+                self.render_update(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(
+                        "Why does the Dirty filter lose its place on refresh?",
+                    )),
+                )));
+                self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(
+                        "The refresh rebuilds the list model from scratch, so the selection \
+                         and the scroll offset go with the old one. Keeping the model and \
+                         splicing the changed rows in would hold both.",
+                    )),
+                )));
+                self.finalize_stream();
+            }
+            _ => {}
+        }
+        self.sync_loading();
+    }
+
     pub fn seed_transcript_for_probe(self: &Rc<Self>) {
         // `TASTE_PROBE_CHAT=empty` leaves the transcript alone, so the other
         // face of the pane — the empty page, and the composer wearing the
@@ -12243,6 +12717,16 @@ impl ChatPane {
             glib::idle_add_local_once(move || {
                 entry.grab_focus();
             });
+            return;
+        }
+        // `TASTE_PROBE_CHAT=loading` is a chat whose agent is on its way:
+        // the loading page, in the phase `TASTE_PROBE_LOADING` names.
+        // `loading-sent` adds a message sent while waiting, and
+        // `loading-kept` a conversation still on screen while its agent
+        // comes back, where the phase is the working line's.
+        let chat = std::env::var("TASTE_PROBE_CHAT").unwrap_or_default();
+        if matches!(chat.as_str(), "loading" | "loading-sent" | "loading-kept") {
+            self.seed_loading_for_probe(&chat);
             return;
         }
         // `TASTE_PROBE_CHAT=acts` is the coordinator's transcript: the
@@ -17946,6 +18430,158 @@ mod tests {
         assert!(
             none_at_all.contains("no model choice at all"),
             "{none_at_all}"
+        );
+    }
+
+    /// A chat with nothing under way, its container up and settled.
+    fn idle_chat() -> LoadingFacts {
+        LoadingFacts {
+            needs_auth: false,
+            session_live: false,
+            drawing_history: false,
+            client_live: false,
+            resuming: false,
+            relocated: false,
+            reconnect_due: false,
+            wait: ContainerWait::Idle,
+            refused_launch: false,
+            container: None,
+            agent_owed: false,
+        }
+    }
+
+    #[test]
+    fn a_chat_loads_from_its_first_wait_to_its_session() {
+        // Nothing asked for, nothing shown: the empty page invites a send.
+        assert_eq!(loading(&idle_chat()), None);
+        // Held for its container, which says what it is doing; one that
+        // says nothing yet is still waited on.
+        let held = LoadingFacts {
+            wait: ContainerWait::Waiting,
+            container: Some(Loading::StartingContainer),
+            ..idle_chat()
+        };
+        assert_eq!(loading(&held), Some(Loading::StartingContainer));
+        assert_eq!(
+            loading(&LoadingFacts {
+                container: None,
+                ..held.clone()
+            }),
+            Some(Loading::Container)
+        );
+        // Up, and asked whether it can host the agent.
+        assert_eq!(
+            loading(&LoadingFacts {
+                container: Some(Loading::Hosting),
+                ..held.clone()
+            }),
+            Some(Loading::Hosting)
+        );
+        // The process spawned, fresh or resuming, in or out.
+        let spawned = LoadingFacts {
+            client_live: true,
+            relocated: true,
+            ..idle_chat()
+        };
+        assert_eq!(
+            loading(&spawned),
+            Some(Loading::Agent { in_container: true })
+        );
+        let resuming = LoadingFacts {
+            resuming: true,
+            ..spawned.clone()
+        };
+        assert_eq!(loading(&resuming), Some(Loading::Conversation));
+        // Ready: loading until the record is drawn, and not after.
+        let ready = LoadingFacts {
+            session_live: true,
+            drawing_history: true,
+            ..spawned
+        };
+        assert_eq!(loading(&ready), Some(Loading::Conversation));
+        assert_eq!(
+            loading(&LoadingFacts {
+                drawing_history: false,
+                ..ready
+            }),
+            None
+        );
+        // A reconnect armed is the agent coming again.
+        assert_eq!(
+            loading(&LoadingFacts {
+                reconnect_due: true,
+                ..idle_chat()
+            }),
+            Some(Loading::Again)
+        );
+    }
+
+    #[test]
+    fn a_final_answer_ends_the_loading_state() {
+        // Sign-in stands in the way, whatever else is under way.
+        assert_eq!(
+            loading(&LoadingFacts {
+                needs_auth: true,
+                client_live: true,
+                ..idle_chat()
+            }),
+            None
+        );
+        // A refused launch waits while its container is still coming —
+        // David's case, a machine with no `npx` and a container being
+        // asked — and stops waiting once nothing more is: stopped, failed,
+        // unable to host it, or a channel that would not open, each of
+        // which `container_loading` reads as `None`.
+        let refused = LoadingFacts {
+            refused_launch: true,
+            container: Some(Loading::Hosting),
+            ..idle_chat()
+        };
+        assert_eq!(loading(&refused), Some(Loading::Hosting));
+        assert_eq!(
+            loading(&LoadingFacts {
+                container: None,
+                ..refused
+            }),
+            None
+        );
+        // Parked — looked at, never started — waits on a send, not on
+        // anything under way.
+        assert_eq!(
+            loading(&LoadingFacts {
+                wait: ContainerWait::Parked,
+                container: Some(Loading::Container),
+                agent_owed: true,
+                ..idle_chat()
+            }),
+            None
+        );
+        // A conversation to resume when its environment settles waits on
+        // it while it comes, and not once it has settled down.
+        let owed = LoadingFacts {
+            agent_owed: true,
+            container: Some(Loading::Building),
+            ..idle_chat()
+        };
+        assert_eq!(loading(&owed), Some(Loading::Building));
+        assert_eq!(
+            loading(&LoadingFacts {
+                container: None,
+                ..owed
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_loading_phase_is_a_sentence_on_the_page() {
+        assert_eq!(
+            Loading::Preparing("bringing up the workspace's VM".into()).sentence(),
+            "Bringing up the workspace's VM"
+        );
+        assert_eq!(
+            Loading::Hosting.sentence(),
+            "Asking the container whether it can run the agent"
         );
     }
 

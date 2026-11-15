@@ -126,7 +126,16 @@ Unstash and held trash in the frame, against the checkout's own stash)
 and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `quiet` — `busy` silent for over a minute, the
 working line saying for how long and naming Stop —, `queued` — `busy` with a message sent during the turn waiting behind it, its fast-forward (a click asks for a turn, `taste_core::nudge`; a two-second hold stops the turn and sends it alone) and its trash can at the badge's end —, `refused` — `busy` with a message the agent refused, kept where it was sent and marked so —, `starting` — the line above the composer while the environment comes up,
-a message waiting on it —, `replies` — the turn over on a question, the agent's suggested replies
+a message waiting on it —, `loading` — a chat whose agent is not up yet:
+a spinner in the middle of the empty transcript over "Starting Claude
+Code" and the phase it waits on, `TASTE_PROBE_LOADING` naming which
+(`container`, the default — its container starting —, `vm`, `hosting` —
+the container being asked whether it can run the agent, the wait a
+spawn is now held for —, `agent`, or `conversation`; `chat.rs`'s
+`loading`) —, `loading-sent` — the same with a message sent while
+waiting, its held card and the `starting` line under it —,
+`loading-kept` — a conversation still on screen while its agent comes
+back, the phase said on the working line rather than over the rows —, `replies` — the turn over on a question, the agent's suggested replies
 under it as the question card's radios and Send (`TASTE_PROBE_REPLIES=several`: replies that combine, as checkboxes) —, `restored` — the same conversation as a restore
 replays it, the buttons read back from the `suggest_replies` call's input
 because the IDE's own event is not part of any replay —, `answered` — the
