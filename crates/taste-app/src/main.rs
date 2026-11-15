@@ -31,6 +31,7 @@ mod coordinator;
 mod copy;
 mod devcontainer_ui;
 mod doc_select;
+mod doc_source;
 mod doc_text;
 mod editor;
 mod elicit;

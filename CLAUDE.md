@@ -310,7 +310,14 @@ section among the rest (a row the listing has drawn; `.` is the project
 folder's own, on its header, which a folder's `FILE_OR_DIR` task is on);
 `TASTE_PROBE_LINK=<path#fragment>` opens a reference as a clicked link
 opens it (`taste_core::anchor`: `#L12` a line, a PDF's `#page=3`), and
-for a PDF prints the page in view once it is up;
+for a PDF prints the page in view once it is up, and for a Markdown
+document the line asked for, the face it is on, and its preview's display
+lines at the top and where a line is put, with how far down the view the
+line's place came out (`doc_text::DocView::reveal_line`) — several,
+comma-separated, open three seconds apart, which is how a line asked of a
+tab already open is posed (`build-aux/headless/fixtures/markdown-long.md`
+has a paragraph's middle line at 48, a list item at 85, a code block's
+line at 143, and a table's row at 195, each below the first screen);
 `TASTE_PROBE_FOCUS=1` (with `TASTE_PROBE_PREVIEW`) uses a control at the
 tab bar's end — the zoom menu opened and closed where the tab has one,
 else another mode's toggle — and prints where the keyboard is after,

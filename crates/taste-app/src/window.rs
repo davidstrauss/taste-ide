@@ -3640,12 +3640,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 }
                 // `TASTE_PROBE_LINK=<path#fragment>`: a reference opened as
                 // a clicked link opens it (`taste_core::anchor`), and for a
-                // PDF the page in view printed once it is up.
-                if let Ok(link) = std::env::var("TASTE_PROBE_LINK") {
-                    let (path, at) = taste_core::anchor::split_reference(&link);
-                    let path = std::env::current_dir().unwrap_or_default().join(path);
-                    editor_for_probe.open_anchored(&path, at);
-                    editor_for_probe.say_page_for_probe();
+                // PDF the page in view printed once it is up, for a
+                // Markdown document the line asked for and what its preview
+                // shows. Several, comma-separated, open three seconds apart,
+                // which is how a line asked of a tab already open is posed.
+                if let Ok(spec) = std::env::var("TASTE_PROBE_LINK") {
+                    for (index, link) in spec.split(',').enumerate() {
+                        let editor = editor_for_probe.clone();
+                        let link = link.to_string();
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(3000 * index as u64),
+                            move || {
+                                let (path, at) = taste_core::anchor::split_reference(&link);
+                                let path = std::env::current_dir().unwrap_or_default().join(path);
+                                let line = at.and_then(taste_core::anchor::Anchor::line);
+                                editor.open_anchored(&path, at);
+                                editor.say_page_for_probe(line);
+                            },
+                        );
+                    }
                 }
                 if view_for_open == "port" {
                     editor_for_probe.select_port_for_probe(

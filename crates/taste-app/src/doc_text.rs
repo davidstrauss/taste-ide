@@ -34,6 +34,11 @@
 //! A table stays a widget: cells that wrap each in its own column are not
 //! something a buffer's lines can hold. A selection through one leaves its
 //! cells out of what it copies; each cell selects on its own.
+//!
+//! A line of the source asked for — a search result's, a link's `#L12` —
+//! is put in view from where each block, and each line of a paragraph or
+//! a code block, landed as the document was written (`crate::doc_source`,
+//! [`DocView::reveal_line`]); a line of a table is the table.
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -43,6 +48,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::doc_source::{LineIndex, SourceMap};
 use crate::markdown_view::{DocumentBase, Readiness};
 
 /// The view's margin, all round.
@@ -53,6 +59,11 @@ const CODE_INSET: i32 = 12;
 
 /// How far each list or quote level stands in.
 const LEVEL_INDENT: i32 = 22;
+
+/// How far down the view a line asked for is put, as a fraction of its
+/// height: near the top, with a little of what comes before it above —
+/// as the source editor puts a line it jumps to.
+const REVEAL_ALIGN: f32 = 0.1;
 
 /// What a click on a span does.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +81,8 @@ pub struct Rendering {
     actions: HashMap<gtk::TextTag, Action>,
     children: Vec<(gtk::TextChildAnchor, Column)>,
     styles: Styles,
+    /// Where the source's lines landed (`crate::doc_source`).
+    source: SourceMap,
 }
 
 /// The tags whose colours follow the style: set again when it turns dark
@@ -106,6 +119,16 @@ struct Shown {
     /// Each child's stand-in in the strip's view.
     mirrors: Vec<Mirror>,
     styles: Styles,
+    source: SourceMap,
+}
+
+/// A source line asked for before the rendering that has it is shown.
+struct Wanted {
+    /// 1-based, as a search result or a link's `#L12` gives it.
+    line: u32,
+    /// The text it is a line of is still to be presented: the rendering
+    /// shown now, or one on its way, is of an older text.
+    after_present: bool,
 }
 
 /// The preview's face: the text view and its map, side by side.
@@ -120,8 +143,16 @@ pub struct DocView {
     /// Which rendering is the latest: one overtaken by a newer edit before
     /// it was whole is dropped rather than shown late.
     generation: Cell<u64>,
+    /// Which rendering is on screen.
+    shown_generation: Cell<u64>,
     on_link: RefCell<Option<Rc<dyn Fn(&str)>>>,
     base: RefCell<Option<DocumentBase>>,
+    /// A line asked for that waits on its rendering.
+    wanted: RefCell<Option<Wanted>>,
+    /// The place a line asked for landed, held there while what is above
+    /// it is laid out again — a picture or a diagram come in, the column's
+    /// width settled — until the reader scrolls, clicks, or types.
+    target: RefCell<Option<gtk::TextMark>>,
 }
 
 impl DocView {
@@ -173,10 +204,14 @@ impl DocView {
             map,
             shown: RefCell::new(None),
             generation: Cell::new(0),
+            shown_generation: Cell::new(0),
             on_link: RefCell::new(None),
             base: RefCell::new(None),
+            wanted: RefCell::new(None),
+            target: RefCell::new(None),
         });
         this.install_links();
+        this.install_letting_go();
         // The pictures, diagrams, and tables are the column wide: when the
         // column's width changes they are measured again.
         {
@@ -233,6 +268,10 @@ impl DocView {
         let rendering = render(&self.view, text, &base, &readiness);
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
+        // A line asked of the text this is waits on this rendering now.
+        if let Some(wanted) = self.wanted.borrow_mut().as_mut() {
+            wanted.after_present = false;
+        }
         let first = self.shown.borrow().is_none();
         let pending = Rc::new(RefCell::new(Some(rendering)));
         let swap: Rc<dyn Fn()> = {
@@ -245,6 +284,8 @@ impl DocView {
                 }
                 if let Some(rendering) = pending.borrow_mut().take() {
                     this.swap(rendering, !first);
+                    this.shown_generation.set(generation);
+                    this.land_wanted();
                 }
             })
         };
@@ -261,9 +302,188 @@ impl DocView {
             });
         } else {
             let on_ready = swap.clone();
-            readiness.when_ready(move || on_ready());
+            let weak = Rc::downgrade(self);
+            readiness.when_ready(move || {
+                on_ready();
+                // Shown before it was whole, at the wait's end: what came
+                // in since may have moved a line asked for.
+                if let Some(this) = weak.upgrade() {
+                    if this.shown_generation.get() == generation {
+                        this.follow_target();
+                    }
+                }
+            });
             glib::timeout_add_local_once(wait, move || swap());
         }
+    }
+
+    /// Put 1-based source `line` of the document in view: the block it is
+    /// in — its own line of a paragraph or a code block, the table or the
+    /// picture it is part of — near the top, with a little above it. With
+    /// `after_present`, the line is of a text still to be presented (the
+    /// editor's restyle is on its way), and it lands when that rendering
+    /// is shown; otherwise it lands now, or when the rendering already on
+    /// its way is shown.
+    pub fn reveal_line(self: &Rc<Self>, line: u32, after_present: bool) {
+        let waiting = self.shown_generation.get() != self.generation.get();
+        if after_present || waiting || self.shown.borrow().is_none() {
+            *self.wanted.borrow_mut() = Some(Wanted {
+                line,
+                after_present,
+            });
+            return;
+        }
+        self.wanted.borrow_mut().take();
+        self.land(line);
+    }
+
+    /// The line asked for, landed, if its rendering is the one shown.
+    fn land_wanted(self: &Rc<Self>) {
+        let wanted = self.wanted.borrow_mut().take_if(|w| !w.after_present);
+        if let Some(wanted) = wanted {
+            self.land(wanted.line);
+        }
+    }
+
+    fn land(self: &Rc<Self>, line: u32) {
+        let offset = {
+            let shown = self.shown.borrow();
+            let Some(shown) = shown.as_ref() else { return };
+            shown.source.place(line.saturating_sub(1))
+        };
+        let buffer = self.view.buffer();
+        let mut iter = buffer.iter_at_offset(offset);
+        // A widget — a table, a picture, a diagram — is put with the end
+        // of the line before it where a line of text is put: a text view
+        // places a place's whole height in the view, and one taller than
+        // a tenth of it would otherwise come out at its top edge, flush,
+        // or wherever its height left it.
+        if iter.child_anchor().is_some() {
+            iter.backward_char();
+        }
+        let mark = buffer.create_mark(None, &iter, true);
+        self.let_go();
+        *self.target.borrow_mut() = Some(mark);
+        self.follow_target();
+        // Once the lines around it are laid out, as they are drawn: a
+        // widget measured at its column's width for the first time moves
+        // what is under it.
+        let frames = Cell::new(0);
+        let weak = Rc::downgrade(self);
+        self.view.add_tick_callback(move |_, _| {
+            frames.set(frames.get() + 1);
+            if frames.get() < 3 {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(this) = weak.upgrade() {
+                this.follow_target();
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Scroll to the held place again, if one is held: a text view puts a
+    /// mark where it asks once the lines around it are laid out, and what
+    /// is laid out later above it is what this answers.
+    fn follow_target(&self) {
+        if let Some(mark) = self.target.borrow().as_ref() {
+            if !mark.is_deleted() {
+                self.view
+                    .scroll_to_mark(mark, 0.0, true, 0.0, f64::from(REVEAL_ALIGN));
+            }
+        }
+    }
+
+    /// Stop holding a place.
+    fn let_go(&self) {
+        if let Some(mark) = self.target.borrow_mut().take() {
+            if let Some(buffer) = mark.buffer() {
+                buffer.delete_mark(&mark);
+            }
+        }
+    }
+
+    /// The reader's own scroll, click, or key — in the text or on the
+    /// strip — lets a held place go: where they move to is theirs.
+    fn install_letting_go(self: &Rc<Self>) {
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        scroll.connect_scroll(move |_, _, _| {
+            if let Some(this) = weak.upgrade() {
+                this.let_go();
+            }
+            glib::Propagation::Proceed
+        });
+        self.body.add_controller(scroll);
+        let click = gtk::GestureClick::new();
+        click.set_button(0);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        click.connect_pressed(move |_, _, _, _| {
+            if let Some(this) = weak.upgrade() {
+                this.let_go();
+            }
+        });
+        self.body.add_controller(click);
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        key.connect_key_pressed(move |_, _, _, _| {
+            if let Some(this) = weak.upgrade() {
+                this.let_go();
+            }
+            glib::Propagation::Proceed
+        });
+        self.body.add_controller(key);
+    }
+
+    /// TASTE_PROBE_LINK only: the display line at the top of the view, the
+    /// one where a line asked for is put, and where 1-based source `line`'s
+    /// place is in the view, as text and pixels.
+    #[doc(hidden)]
+    pub fn view_for_probe(&self, line: Option<u32>) -> String {
+        let rect = self.view.visible_rect();
+        let say = |iter: gtk::TextIter| {
+            let mut start = iter;
+            if !self.view.starts_display_line(&start) {
+                self.view.backward_display_line_start(&mut start);
+            }
+            let mut end = start;
+            self.view.forward_display_line_end(&mut end);
+            let text = start.slice(&end).replace('\u{fffc}', "[widget]");
+            let text: String = text.chars().take(60).collect();
+            format!("«{text}»")
+        };
+        let at_y = |y: i32| {
+            self.view
+                .iter_at_location(MARGIN, y)
+                .unwrap_or_else(|| self.view.line_at_y(y).0)
+        };
+        let aim = rect.y() + (rect.height() as f32 * REVEAL_ALIGN) as i32 + 1;
+        let place = line.and_then(|line| {
+            let shown = self.shown.borrow();
+            let offset = shown.as_ref()?.source.place(line.saturating_sub(1));
+            let iter = self.view.buffer().iter_at_offset(offset);
+            let y = self.view.iter_location(&iter).y() - rect.y();
+            Some(format!(
+                "; its place {} at {y}px of {}px ({:.0}%)",
+                say(iter),
+                rect.height(),
+                f64::from(y) * 100.0 / f64::from(rect.height().max(1))
+            ))
+        });
+        format!(
+            "scrolled {}px of {:.0}px; top {}; at {:.0}% {}{}",
+            rect.y(),
+            self.view
+                .vadjustment()
+                .map_or(0.0, |adjustment| adjustment.upper()),
+            say(at_y(rect.y())),
+            REVEAL_ALIGN * 100.0,
+            say(at_y(aim)),
+            place.unwrap_or_default()
+        )
     }
 
     /// Put `rendering` in place of what is shown, keeping the reader's
@@ -282,12 +502,15 @@ impl DocView {
                 self.ghost.remove(&mirror);
             }
         }
+        // A place held in the last rendering's buffer is that buffer's.
+        self.let_go();
         let Rendering {
             buffer,
             decor,
             actions,
             children,
             styles,
+            source,
         } = rendering;
         styles.paint();
         self.view.set_buffer(Some(&buffer));
@@ -307,6 +530,7 @@ impl DocView {
             children,
             mirrors,
             styles,
+            source,
         });
         if let Some(line) = place.filter(|line| *line > 0) {
             if let Some(iter) = buffer.iter_at_line(line) {
@@ -344,6 +568,12 @@ impl DocView {
     /// Have the view measure its widgets again: the column's width
     /// changed, or what they hold came in.
     fn measure_children(&self) {
+        self.measure_each_child();
+        // A held place stays where it was put as they take their sizes.
+        self.follow_target();
+    }
+
+    fn measure_each_child(&self) {
         let shown = self.shown.borrow();
         let Some(shown) = shown.as_ref() else { return };
         let buffer = self.view.buffer();
@@ -690,6 +920,18 @@ struct Writer<'a> {
     decor: Vec<Decor>,
     /// The lines each open quote began at.
     quote_starts: Vec<i32>,
+    /// Where the source's lines landed: (0-based source line, offset).
+    points: Vec<(u32, i32)>,
+    /// The source lines of blocks begun and not yet written to: they land
+    /// where their first line, or their widget, does.
+    opening: Vec<u32>,
+    /// The source line the event being written began on.
+    source_line: u32,
+    /// The last source line a run of text was written from.
+    text_line: Option<u32>,
+    /// A code block's lines by where they begin in its text: they land
+    /// once the block's head is written.
+    code_lines: Vec<(u32, i32)>,
 }
 
 /// The tags every rendering has, made once into its buffer's table.
@@ -815,11 +1057,28 @@ impl<'a> Writer<'a> {
             blank: true,
             decor: Vec::new(),
             quote_starts: Vec::new(),
+            points: Vec::new(),
+            opening: Vec::new(),
+            source_line: 0,
+            text_line: None,
+            code_lines: Vec::new(),
         }
+    }
+
+    /// The blocks begun since the last landed, landed where the buffer
+    /// ends now.
+    fn land_opening(&mut self) {
+        if self.opening.is_empty() {
+            return;
+        }
+        let offset = self.buffer.end_iter().offset();
+        self.points
+            .extend(self.opening.drain(..).map(|line| (line, offset)));
     }
 
     fn finish(mut self) -> Rendering {
         self.end_line();
+        self.land_opening();
         // The last line's end is no line of its own.
         let mut end = self.buffer.end_iter();
         let mut before = end;
@@ -834,6 +1093,7 @@ impl<'a> Writer<'a> {
             actions: self.actions,
             children: self.children,
             styles,
+            source: SourceMap::new(self.points),
         }
     }
 
@@ -866,6 +1126,7 @@ impl<'a> Writer<'a> {
         if self.line.is_some() {
             return;
         }
+        self.land_opening();
         let mut tags = Vec::new();
         let depth = self.lists.len();
         let quote_left = self.quote as i32 * LEVEL_INDENT;
@@ -943,6 +1204,13 @@ impl<'a> Writer<'a> {
         if text.is_empty() {
             return;
         }
+        // A source line's first run is where that line is: a paragraph's
+        // second line, or what follows a hard break.
+        if self.text_line != Some(self.source_line) {
+            self.text_line = Some(self.source_line);
+            let offset = self.buffer.end_iter().offset();
+            self.points.push((self.source_line, offset));
+        }
         self.begin_line();
         let mut tags = self.line.clone().unwrap_or_default();
         tags.extend(self.inline.iter().cloned());
@@ -989,6 +1257,7 @@ impl<'a> Writer<'a> {
         tags: Vec<gtk::TextTag>,
     ) {
         self.end_line();
+        self.land_opening();
         self.blank = false;
         self.line = Some(tags);
         let mut end = self.buffer.end_iter();
@@ -1011,7 +1280,12 @@ impl<'a> Writer<'a> {
         options.insert(Options::ENABLE_STRIKETHROUGH);
         options.insert(Options::ENABLE_TABLES);
         options.insert(Options::ENABLE_TASKLISTS);
-        for event in Parser::new_ext(text, options) {
+        let lines = LineIndex::new(text);
+        for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+            self.source_line = lines.line_of(range.start);
+            if crate::doc_source::opens_block(&event) {
+                self.opening.push(self.source_line);
+            }
             self.event(event);
         }
     }
@@ -1024,6 +1298,14 @@ impl<'a> Writer<'a> {
                 if let Some((_, alt)) = self.image.as_mut() {
                     alt.push_str(&text);
                 } else if let Some((_, code)) = self.code.as_mut() {
+                    // Each of its lines where it begins in the block's
+                    // text, which the block writes as it is.
+                    let mut chars = code.chars().count() as i32;
+                    for (index, piece) in text.split_inclusive('\n').enumerate() {
+                        self.code_lines
+                            .push((self.source_line + index as u32, chars));
+                        chars += piece.chars().count() as i32;
+                    }
                     code.push_str(&text);
                 } else if let Some(cell) = self.cell() {
                     cell.push_str(&text);
@@ -1269,6 +1551,7 @@ impl<'a> Writer<'a> {
     /// through it — and a little space after. A Mermaid block whose fence
     /// has closed is the diagram instead.
     fn code_block(&mut self, info: &str, code: &str) {
+        let code_lines = std::mem::take(&mut self.code_lines);
         if crate::mermaid::is_mermaid(info) {
             let card = crate::markdown_view::code_card(code, Ok(code.to_string()), true);
             let diagram = crate::mermaid::diagram(code, card, self.readiness.map(Readiness::hold));
@@ -1298,6 +1581,12 @@ impl<'a> Writer<'a> {
         let first = self.buffer.end_iter().line();
         self.block_widget(&head, 0, tags);
         self.line = Some(vec![self.tags.code.clone()]);
+        let start = self.buffer.end_iter().offset();
+        self.points.extend(
+            code_lines
+                .into_iter()
+                .map(|(line, chars)| (line, start + chars)),
+        );
         self.insert_plain(code);
         self.end_line();
         self.tag_last_line(&self.tags.code_last.clone());
@@ -1515,6 +1804,40 @@ mod tests {
             assert!(actions.contains(&&Action::Href("src/tree.rs".into())));
             // The code block's head is a widget: one, at its own line.
             assert_eq!(rendering.children.len(), 1);
+        });
+    }
+
+    /// A source line lands on what it wrote: a heading, a paragraph's
+    /// later line, a list's items, a code block's head and each of its
+    /// own lines, a table's widget from any of its rows, and a blank line
+    /// on the block before it.
+    #[test]
+    fn a_source_line_lands_on_what_it_wrote() {
+        crate::gtk_test::on_gtk_thread("doc text: no display — skipped", || {
+            let (_, rendering) = written(
+                "# Title\n\nA paragraph that runs\nover two lines.\n\n- one\n- two\n\n\
+                 ```\nfirst\nsecond\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nThe end.\n",
+            );
+            let buffer = &rendering.buffer;
+            let at = |line: u32| {
+                let start = buffer.iter_at_offset(rendering.source.place(line - 1));
+                let mut end = start;
+                end.forward_to_line_end();
+                start.slice(&end).to_string()
+            };
+            assert_eq!(at(1), "Title");
+            assert_eq!(at(3), "A paragraph that runs over two lines.");
+            assert_eq!(at(4), "over two lines.");
+            assert_eq!(at(5), "over two lines.");
+            assert_eq!(at(6), "• one");
+            assert_eq!(at(7), "• two");
+            assert_eq!(at(9), "\u{fffc}", "the fence is the block's head");
+            assert_eq!(at(10), "first");
+            assert_eq!(at(11), "second");
+            for row in 14..=16 {
+                assert_eq!(at(row), "\u{fffc}", "row {row} is the table");
+            }
+            assert_eq!(at(18), "The end.");
         });
     }
 

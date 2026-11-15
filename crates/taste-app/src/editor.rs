@@ -3263,12 +3263,39 @@ impl Editor {
     }
 
     /// TASTE_PROBE_LINK only: the page in view of the PDF in front, said
-    /// once its document is up.
+    /// once its document is up — or, for a Markdown document, the face
+    /// it is on, the source line `line` asked for, and what the preview
+    /// shows at its top and where a line asked for is put.
     #[doc(hidden)]
-    pub fn say_page_for_probe(self: &Rc<Self>) {
+    pub fn say_page_for_probe(self: &Rc<Self>, line: Option<u32>) {
+        // A line's place is said before the next link of a probe that
+        // opens several three seconds apart; a PDF's page once its
+        // document is up.
+        let wait = if line.is_some() { 2500 } else { 4000 };
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(std::time::Duration::from_millis(4000), move || {
+        glib::timeout_add_local_once(std::time::Duration::from_millis(wait), move || {
             let Some(editor) = weak.upgrade() else { return };
+            if let Some((path, page)) = editor.selected().filter(|(path, _)| is_markdown(path)) {
+                let asked = line
+                    .and_then(|line| {
+                        let start = page.buffer.iter_at_line(line as i32 - 1)?;
+                        let mut end = start;
+                        if !end.ends_line() {
+                            end.forward_to_line_end();
+                        }
+                        Some(start.slice(&end).chars().take(60).collect::<String>())
+                    })
+                    .unwrap_or_default();
+                let face = page.stack.visible_child_name().unwrap_or_default();
+                let cursor = page.buffer.iter_at_mark(&page.buffer.get_insert()).line() + 1;
+                println!(
+                    "link probe: {} L{} «{asked}» on {face}, source cursor L{cursor}; {}",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    line.unwrap_or(0),
+                    page.doc.view_for_probe(line)
+                );
+                return;
+            }
             let Some(surface) = editor.selected_surface() else {
                 println!("link probe: no viewer in front");
                 return;
@@ -4201,12 +4228,13 @@ impl Editor {
             encoding: Cell::new(None),
             // Markdown opens on its preview (David, 2026-11-09: "Open
             // markdown in preview by default"), and so does a notebook: the
-            // source is the face nobody reads first. Asked for at a line, it
-            // opens on its source, which is the face that has lines; and
-            // with nothing in it to preview, on the source to be written.
+            // source is the face nobody reads first. Asked for at a line —
+            // a search result, a link's `#L12` — it opens on its preview at
+            // that line's place (`reveal_in_preview`), as a tab already
+            // open on it goes there; with nothing in it to preview, on the
+            // source to be written.
             raw_source: Cell::new(
-                !is_notebook(path)
-                    && !(is_markdown(path) && line.is_none() && !content.trim().is_empty()),
+                !is_notebook(path) && !(is_markdown(path) && !content.trim().is_empty()),
             ),
             plain: Cell::new(!highlighting_ok(path, &content)),
             suggestion: RefCell::new(None),
@@ -4352,6 +4380,7 @@ impl Editor {
         self.sync_toggle_to_selection();
         if let Some(line) = line {
             jump_to_line(&page.view, &page.buffer, line);
+            self.reveal_in_preview(path, &page, line);
         }
         // Reopened by a restart: as it was left.
         let restored = self.restore_modes.borrow_mut().remove(path);
@@ -5386,16 +5415,28 @@ impl Editor {
             && page.buffer.char_count() <= MAX_WYSIWYG_CHARS
     }
 
-    /// Go to `line` of an open page: a document on its preview turns to
-    /// its source first, which is the face that has lines.
+    /// Go to `line` of an open page: the source's cursor there, and a
+    /// document on its preview the preview's place for it in view, the
+    /// preview kept — a search result clicked into a previewed document
+    /// turned it to its source, which is not where the reader was (David,
+    /// 2026-11-15: "Clicking on search results doesn't go the right part
+    /// of markdown files in preview mode").
     fn jump_in(self: &Rc<Self>, path: &Path, page: &Rc<EditorPage>, line: u32) {
-        if is_markdown(path) && !page.changes_view.get() && self.wysiwyg_active(path, page) {
-            page.raw_source.set(true);
-            self.set_changes_view(path, page, false);
-            self.refresh_markdown_mode(path, page);
-            self.sync_toggle_to_selection();
-        }
         jump_to_line(&page.view, &page.buffer, line);
+        self.reveal_in_preview(path, page, line);
+    }
+
+    /// `line` of a Markdown document on its preview face, put in view on
+    /// it (`doc_text::DocView::reveal_line`) — once the text read in, or
+    /// edited, is drawn, when its restyle is still on its way.
+    fn reveal_in_preview(&self, path: &Path, page: &EditorPage, line: u32) {
+        if is_markdown(path)
+            && !is_notebook(path)
+            && !page.changes_view.get()
+            && self.wysiwyg_active(path, page)
+        {
+            page.doc.reveal_line(line, page.restyle_queued.get());
+        }
     }
 
     /// Reconcile language + styling with the page's markdown mode.
