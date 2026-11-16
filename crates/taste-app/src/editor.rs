@@ -3470,6 +3470,17 @@ impl Editor {
                     }
                 });
             }
+            // `TASTE_PROBE_LISTS=1`: where each list item's marker, its
+            // period, its text, and its wrapped lines stand, once the
+            // preview is laid out (`DocView::lists_for_probe`).
+            if std::env::var_os("TASTE_PROBE_LISTS").is_some() && !is_notebook(&path) {
+                let doc = page.doc.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(3000), move || {
+                    for line in doc.lists_for_probe() {
+                        println!("{line}");
+                    }
+                });
+            }
             // `TASTE_PROBE_KEEP=<case,…>`: the reader's place through each
             // kind of refresh, before and after (`keep_probe`).
             if let Ok(cases) = std::env::var("TASTE_PROBE_KEEP") {

@@ -207,7 +207,10 @@ fn layout(
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
-    let parser = Parser::new_ext(text, options);
+    // The events whole, so each list is counted before it is drawn
+    // (`list_shapes`): its widest number is its last item's.
+    let events: Vec<Event> = Parser::new_ext(text, options).collect();
+    let mut shapes = list_shapes(&events).into_iter();
 
     // Inline accumulation: Pango markup plus the code-span texts backing
     // the clickable copy links.
@@ -217,7 +220,8 @@ fn layout(
     let mut code_block: Option<String> = None;
     // The fence's info string: `mermaid` makes the block a diagram.
     let mut code_info = String::new();
-    let mut list_stack: Vec<Option<u64>> = Vec::new();
+    // Each open list's next number, for an ordered one, and its widest.
+    let mut list_stack: Vec<(Option<u64>, Option<u64>)> = Vec::new();
     let mut quote_depth: usize = 0;
     // Tables: the column alignments and the rows, the first row the head,
     // rendered as a grid of labels (`table_card`).
@@ -300,7 +304,7 @@ fn layout(
         });
     };
 
-    for event in parser {
+    for event in events {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -322,14 +326,24 @@ fn layout(
                     // nested list belongs to — ends here; the list goes on
                     // in the same run.
                     end_block(&mut markup, &mut heading, Block::Item);
-                    list_stack.push(start);
+                    let widest = shapes.next().and_then(|shape| shape.widest());
+                    list_stack.push((start, widest));
                 }
                 Tag::Item => {
                     let depth = list_stack.len().saturating_sub(1);
                     markup.push_str(&"    ".repeat(depth));
                     match list_stack.last_mut() {
-                        Some(Some(n)) => {
-                            markup.push_str(&format!("{n}. "));
+                        Some((Some(n), widest)) => {
+                            // Right-aligned on the period, in tabular
+                            // figures, so the list's first lines start
+                            // their text at one place: 9 under 10 is a
+                            // figure space and a 9. A label cannot hang
+                            // an indent, so a wrapped line still starts
+                            // under the number.
+                            let pad = figure_pad(*n, widest.unwrap_or(*n));
+                            markup.push_str(&format!(
+                                "<span font_features=\"tnum\">{pad}{n}.</span> "
+                            ));
                             *n += 1;
                         }
                         _ => markup.push_str("• "),
@@ -931,6 +945,91 @@ fn heading_type(level: HeadingLevel) -> (&'static str, u16) {
     }
 }
 
+/// One list of a document, its items counted before any of them is drawn:
+/// an ordered list's numbers stand right-aligned on their periods and every
+/// item's text at one place, the widest marker's end, which is a number
+/// that only the list's last item says (`list_shapes`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ListShape {
+    /// The first number, for an ordered list.
+    pub start: Option<u64>,
+    /// Its own items, not a nested list's.
+    pub items: u64,
+    /// Of them, those that begin with a task's box, which takes the
+    /// number's or the bullet's place.
+    pub tasks: u64,
+}
+
+impl ListShape {
+    /// The numbers an ordered list's items are drawn with: a task's box
+    /// takes no number.
+    pub fn numbers(&self) -> Option<std::ops::Range<u64>> {
+        let start = self.start?;
+        Some(start..start.saturating_add(self.items.saturating_sub(self.tasks)))
+    }
+
+    /// Its widest number, which has the most digits of them: the last.
+    pub fn widest(&self) -> Option<u64> {
+        self.numbers()
+            .and_then(|numbers| numbers.end.checked_sub(1).filter(|n| *n >= numbers.start))
+    }
+}
+
+/// Every list in `events`, in the order the lists begin — a nested list
+/// after the item it is in has begun — so a writer takes the next at each
+/// `Tag::List`. One pass over events already parsed: no second parse.
+pub(crate) fn list_shapes<'e, 'a: 'e>(
+    events: impl IntoIterator<Item = &'e Event<'a>>,
+) -> Vec<ListShape> {
+    let mut shapes: Vec<ListShape> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    // An item has begun and nothing of it is written yet: a task marker
+    // now is its box.
+    let mut fresh = false;
+    for event in events {
+        match event {
+            Event::Start(Tag::List(start)) => {
+                open.push(shapes.len());
+                shapes.push(ListShape {
+                    start: *start,
+                    ..ListShape::default()
+                });
+                fresh = false;
+            }
+            Event::Start(Tag::Item) => {
+                if let Some(&list) = open.last() {
+                    shapes[list].items += 1;
+                }
+                fresh = true;
+            }
+            // A loose list's item begins with a paragraph.
+            Event::Start(Tag::Paragraph) => {}
+            Event::TaskListMarker(_) => {
+                if fresh {
+                    if let Some(&list) = open.last() {
+                        shapes[list].tasks += 1;
+                    }
+                }
+                fresh = false;
+            }
+            Event::End(TagEnd::List(_)) => {
+                open.pop();
+                fresh = false;
+            }
+            _ => fresh = false,
+        }
+    }
+    shapes
+}
+
+/// Figure spaces enough to stand `n` right-aligned under `widest`: a
+/// figure space is a digit's width (U+2007), so with tabular figures every
+/// number of the list ends at one place.
+pub(crate) fn figure_pad(n: u64, widest: u64) -> String {
+    let digits = |n: u64| n.checked_ilog10().unwrap_or(0) as usize + 1;
+    "\u{2007}".repeat(digits(widest).saturating_sub(digits(n)))
+}
+
 /// A code block: monospace card with a copy button that confirms itself.
 ///
 /// `reflow` is whether long lines may FOLD. A fenced code block may: at the
@@ -1337,6 +1436,151 @@ mod tests {
         assert_eq!(spans, &["cargo test".to_string()]);
         assert!(is_copy_span(spans, "cargo test"));
         assert!(!is_copy_span(spans, "https://example.org/a?b=1"));
+    }
+
+    /// Each list is counted as its own, in the order lists begin: a nested
+    /// list's items are not its parent's, and a task's box takes no number.
+    #[test]
+    fn lists_are_counted_before_they_are_drawn() {
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_TASKLISTS);
+        let text = "8. a\n9. b\n10. c\n    1. x\n    2. y\n11. d\n\n\
+                    - one\n- [ ] two\n- [x] three\n\n\
+                    1. [ ] boxed\n2. numbered\n\n\
+                    - loose\n\n- [ ] loose task\n";
+        let events: Vec<Event> = Parser::new_ext(text, options).collect();
+        let shape = |start, items, tasks| ListShape {
+            start,
+            items,
+            tasks,
+        };
+        assert_eq!(
+            list_shapes(&events),
+            vec![
+                shape(Some(8), 4, 0),
+                shape(Some(1), 2, 0),
+                shape(None, 3, 2),
+                shape(Some(1), 2, 1),
+                shape(None, 2, 1),
+            ]
+        );
+        assert_eq!(shape(Some(8), 4, 0).widest(), Some(11));
+        assert_eq!(shape(Some(1), 2, 1).numbers(), Some(1..2));
+        assert_eq!(shape(Some(3), 0, 0).widest(), None);
+        assert_eq!(shape(None, 3, 0).widest(), None);
+    }
+
+    /// What counting a document's lists costs the preview, which renders
+    /// on each edit: the events collected rather than streamed, and the
+    /// pass over them, beside the parse itself.
+    #[test]
+    #[ignore]
+    fn perf_list_shapes() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        for name in [
+            "build-aux/headless/fixtures/markdown-long.md",
+            "build-aux/headless/fixtures/markdown-lists.md",
+            "docs/ARCHITECTURE.md",
+        ] {
+            let text = std::fs::read_to_string(format!("{root}/{name}")).unwrap();
+            let mut options = Options::empty();
+            options.insert(Options::ENABLE_STRIKETHROUGH);
+            options.insert(Options::ENABLE_TABLES);
+            options.insert(Options::ENABLE_TASKLISTS);
+            let rounds = 50;
+            let started = std::time::Instant::now();
+            let mut streamed = 0;
+            for _ in 0..rounds {
+                streamed += Parser::new_ext(&text, options).into_offset_iter().count();
+            }
+            let parse = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            let mut lists = 0;
+            for _ in 0..rounds {
+                let events: Vec<_> = Parser::new_ext(&text, options).into_offset_iter().collect();
+                lists += list_shapes(events.iter().map(|(event, _)| event)).len();
+            }
+            let counted = started.elapsed() / rounds;
+            let events: Vec<_> = Parser::new_ext(&text, options).collect();
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(list_shapes(&events));
+            }
+            let pass = started.elapsed() / rounds;
+            println!(
+                "{name}: {} bytes, {} events, {} lists — parse streamed {parse:?}, \
+                 collected and counted {counted:?}, the pass alone {pass:?}",
+                text.len(),
+                streamed / rounds as usize,
+                lists / rounds as usize,
+            );
+        }
+    }
+
+    /// A number stands right-aligned under its list's widest: a figure
+    /// space for each digit it has fewer of.
+    #[test]
+    fn a_number_is_padded_to_its_lists_widest() {
+        assert_eq!(figure_pad(9, 12), "\u{2007}");
+        assert_eq!(figure_pad(10, 12), "");
+        assert_eq!(figure_pad(7, 100), "\u{2007}\u{2007}");
+        assert_eq!(figure_pad(0, 9), "");
+        assert_eq!(figure_pad(5, 5), "");
+    }
+
+    /// The chat's answer sets an ordered list's numbers in tabular figures,
+    /// right-aligned on their periods.
+    #[test]
+    fn an_ordered_lists_numbers_are_right_aligned() {
+        let items = layout("8. eight\n9. nine\n10. ten\n", None, None);
+        let Some(Item::Run { markup, .. }) = items.first() else {
+            panic!("a run: {items:?}");
+        };
+        assert!(
+            markup.contains("<span font_features=\"tnum\">\u{2007}8.</span> eight"),
+            "{markup}"
+        );
+        assert!(
+            markup.contains("<span font_features=\"tnum\">10.</span> ten"),
+            "{markup}"
+        );
+    }
+
+    /// In the chat's own font, a figure space is as wide as a tabular
+    /// digit, so a padded number ends where an unpadded one does: the
+    /// label's periods stand in one column, and its text starts at one
+    /// place on each item's first line.
+    #[test]
+    fn a_padded_number_ends_where_a_wider_one_does() {
+        crate::gtk_test::on_gtk_thread("markdown lists: no display — skipped", || {
+            let items = layout("8. eight\n9. nine\n10. ten\n11. eleven\n", None, None);
+            let Some(Item::Run { markup, .. }) = items.first() else {
+                panic!("a run: {items:?}");
+            };
+            let label = gtk::Label::new(None);
+            label.set_markup(markup);
+            let layout = label.layout();
+            let text = layout.text().to_string();
+            let x_of = |needle: &str| {
+                let index = text.find(needle).expect(needle) as i32;
+                let place = layout.index_to_pos(index);
+                f64::from(place.x()) / f64::from(gtk::pango::SCALE)
+            };
+            let periods: Vec<f64> = [". eight", ". nine", ". ten", ". eleven"]
+                .iter()
+                .map(|period| x_of(period))
+                .collect();
+            let texts: Vec<f64> = ["eight", "nine", "ten", "eleven"]
+                .iter()
+                .map(|word| x_of(word))
+                .collect();
+            println!("chat list: periods at {periods:?}, text at {texts:?}");
+            for column in [&periods, &texts] {
+                for x in column {
+                    assert!((x - column[2]).abs() < 0.5, "{periods:?} {texts:?}");
+                }
+            }
+        });
     }
 
     #[test]

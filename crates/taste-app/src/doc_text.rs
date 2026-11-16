@@ -49,7 +49,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::doc_source::{LineIndex, SourceMap};
-use crate::markdown_view::{DocumentBase, Readiness};
+use crate::markdown_view::{list_shapes, DocumentBase, ListShape, Readiness};
 
 /// The view's margin, all round.
 const MARGIN: i32 = 16;
@@ -779,6 +779,67 @@ impl DocView {
         )
     }
 
+    /// TASTE_PROBE_LISTS only: each list item's first line, as where its
+    /// marker begins, where the marker's last glyph before its space (an
+    /// ordered item's period) ends, and where its text begins, and where
+    /// each of its later display lines begins — every x in the view's own
+    /// pixels — so a list whose periods and text stand in one column says
+    /// so in numbers.
+    #[doc(hidden)]
+    pub fn lists_for_probe(&self) -> Vec<String> {
+        let buffer = self.view.buffer();
+        let Some(marker) = buffer.tag_table().lookup(MARKER) else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        let mut iter = buffer.start_iter();
+        loop {
+            if iter.starts_tag(Some(&marker)) {
+                let start = iter;
+                let mut text = start;
+                text.forward_to_tag_toggle(Some(&marker));
+                let mut period = text;
+                period.backward_chars(2);
+                let place = self.view.iter_location(&period);
+                let mut wraps = Vec::new();
+                let mut next = start;
+                while self.view.forward_display_line(&mut next)
+                    && next.line() == start.line()
+                    && !next.is_end()
+                {
+                    wraps.push(self.view.iter_location(&next).x());
+                }
+                let margin = start
+                    .tags()
+                    .iter()
+                    .filter(|tag| tag.is_left_margin_set())
+                    .map(|tag| (tag.left_margin(), tag.indent()))
+                    .collect::<Vec<_>>();
+                lines.push(format!(
+                    "list item «{}» margin {margin:?} marker x {} · its end {} · text x {} · wraps at {:?} · «{}»",
+                    start.slice(&text).trim_end(),
+                    self.view.iter_location(&start).x(),
+                    place.x() + place.width(),
+                    self.view.iter_location(&text).x(),
+                    wraps,
+                    {
+                        let mut end = text;
+                        end.forward_chars(24);
+                        text.slice(&end)
+                    }
+                ));
+            }
+            if !iter.forward_to_tag_toggle(Some(&marker)) {
+                break;
+            }
+            // Past the marker's end, on to the next one's start.
+            if iter.ends_tag(Some(&marker)) && !iter.forward_to_tag_toggle(Some(&marker)) {
+                break;
+            }
+        }
+        lines
+    }
+
     /// TASTE_PROBE_KEEP only: the 0-based source line at the view's top.
     #[doc(hidden)]
     pub fn top_line_for_probe(&self) -> Option<u32> {
@@ -1131,6 +1192,12 @@ impl DocView {
 /// The tag a line wears for a moment to be laid out again.
 const NUDGE: &str = "taste-doc-nudge";
 
+/// The tag a list item's marker wears (`Tags::marker`).
+const MARKER: &str = "taste-doc-marker";
+
+/// A marker's font features: tabular figures.
+const MARKER_FEATURES: &str = "tnum";
+
 /// Write `text` into a buffer of its own, as `view` will show it.
 fn render(view: &DocTextView, text: &str, base: &DocumentBase, readiness: &Readiness) -> Rendering {
     let buffer = gtk::TextBuffer::new(None);
@@ -1258,9 +1325,18 @@ struct Writer<'a> {
     last_line: Option<i32>,
     heading: Option<HeadingLevel>,
     lists: Vec<Option<u64>>,
-    /// How wide each open list's last marker was, for the lines of its
-    /// item after the first.
-    marker_widths: Vec<i32>,
+    /// Each open list's gutter, the markers' column: a level's indent, or
+    /// its widest marker's width when that is wider. Every item of a list,
+    /// and every line of an item, starts its text at the gutter's end, and
+    /// each marker ends there — an ordered list's numbers right-aligned on
+    /// their periods — so a document's lists put their text in one column
+    /// unless a number is too wide for it.
+    gutters: Vec<i32>,
+    /// The document's lists, counted before they are written
+    /// (`markdown_view::list_shapes`), the next to begin first.
+    shapes: std::vec::IntoIter<ListShape>,
+    /// Each marker's width as measured, for the next item that has it.
+    measured: HashMap<String, i32>,
     /// The item about to begin is a task, done or not.
     task: Option<bool>,
     /// An item has begun and its marker is not yet written.
@@ -1308,6 +1384,9 @@ struct Tags {
     code_last: gtk::TextTag,
     spacer: gtk::TextTag,
     widget_line: gtk::TextTag,
+    /// A list item's marker: its number in tabular figures, so numbers
+    /// of as many digits are as wide.
+    marker: gtk::TextTag,
     /// Margins by (left margin, indent): a list's levels and a quote's.
     margins: HashMap<(i32, i32), gtk::TextTag>,
 }
@@ -1367,6 +1446,10 @@ impl Tags {
             code_last: add(gtk::TextTag::builder().pixels_below_lines(10).build()),
             spacer: add(gtk::TextTag::builder().size_points(5.0).build()),
             widget_line: add(gtk::TextTag::builder().pixels_below_lines(10).build()),
+            marker: add(gtk::TextTag::builder()
+                .name(MARKER)
+                .font_features(MARKER_FEATURES)
+                .build()),
             margins: HashMap::new(),
         };
         add(gtk::TextTag::builder().name(NUDGE).build());
@@ -1402,7 +1485,9 @@ impl<'a> Writer<'a> {
             last_line: None,
             heading: None,
             lists: Vec::new(),
-            marker_widths: Vec::new(),
+            gutters: Vec::new(),
+            shapes: Vec::new().into_iter(),
+            measured: HashMap::new(),
             task: None,
             item_fresh: false,
             quote: 0,
@@ -1453,8 +1538,9 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// A margin tag for a line standing `left` from the view's edge with a
-    /// first line `indent` from that.
+    /// A margin tag for a line standing `left` from the view's edge. A
+    /// negative `indent` is Pango's hanging one: the paragraph's first line
+    /// starts at `left` and every line after it `-indent` further in.
     fn margin(&mut self, left: i32, indent: i32) -> gtk::TextTag {
         let table = self.buffer.tag_table();
         self.tags
@@ -1471,9 +1557,50 @@ impl<'a> Writer<'a> {
             .clone()
     }
 
-    /// How wide `marker` is set in the view's font.
-    fn width_of(&self, marker: &str) -> i32 {
-        self.view.create_pango_layout(Some(marker)).pixel_size().0
+    /// How wide `marker` is set in the view's font as a marker is, in
+    /// tabular figures, to the nearest pixel: a margin is whole pixels, and
+    /// the nearest puts the text after any marker within half of one of
+    /// where the list's text stands.
+    fn width_of(&mut self, marker: &str) -> i32 {
+        if let Some(width) = self.measured.get(marker) {
+            return *width;
+        }
+        // Measured where its text begins, before a letter, as the line
+        // sets it: alone, a task's box took its space into the fallback
+        // font it is drawn in and measured five pixels wider than drawn.
+        let layout = self.view.create_pango_layout(Some(&format!("{marker}x")));
+        let attributes = gtk::pango::AttrList::new();
+        let mut features = gtk::pango::AttrFontFeatures::new(MARKER_FEATURES);
+        features.set_end_index(marker.len() as u32);
+        attributes.insert(features);
+        layout.set_attributes(Some(&attributes));
+        let scale = gtk::pango::SCALE;
+        let width = (layout.index_to_pos(marker.len() as i32).x() + scale / 2) / scale;
+        self.measured.insert(marker.to_string(), width);
+        width
+    }
+
+    /// The widest marker a list shaped as `shape` has. Each of its
+    /// numbers is measured — the last has the most digits, but a font
+    /// without tabular figures need not make it the widest — and each
+    /// measure is kept for the item that writes it.
+    fn widest_marker(&mut self, shape: &ListShape) -> i32 {
+        let mut widest = 0;
+        if let Some(numbers) = shape.numbers() {
+            for n in numbers {
+                widest = widest.max(self.width_of(&format!("{n}. ")));
+            }
+        } else if shape.items > shape.tasks {
+            widest = self.width_of("• ");
+        }
+        if shape.tasks > 0 {
+            widest = widest.max(self.width_of("☐ ")).max(self.width_of("☑ "));
+        }
+        if widest > 0 {
+            widest
+        } else {
+            self.width_of("• ")
+        }
     }
 
     /// Open a line, if none is: its tags decided by where it stands, and
@@ -1488,7 +1615,12 @@ impl<'a> Writer<'a> {
         let quote_left = self.quote as i32 * LEVEL_INDENT;
         let mut marker = None;
         if depth > 0 {
-            let left = MARGIN + quote_left + (depth as i32 - 1) * LEVEL_INDENT;
+            // A nested list's gutter begins where the list it is in has
+            // its text.
+            let outer: i32 = self.gutters[..depth - 1].iter().sum();
+            let left = MARGIN + quote_left + outer;
+            // Where the list's text stands.
+            let text_x = left + self.gutters.last().copied().unwrap_or(LEVEL_INDENT);
             if self.item_fresh {
                 // A task's box is its item's marker, in the bullet's place.
                 let text = match (self.task.take(), self.lists.last_mut()) {
@@ -1500,21 +1632,16 @@ impl<'a> Writer<'a> {
                     }
                     _ => "• ".to_string(),
                 };
+                // The marker ends where the list's text stands, numbers
+                // right-aligned on their periods: the first line begins
+                // the marker's width before it, and the lines it wraps
+                // onto at it.
                 let width = self.width_of(&text);
-                if let Some(slot) = self.marker_widths.last_mut() {
-                    *slot = width;
-                }
-                tags.push(self.margin(left + width, -width));
+                tags.push(self.margin(text_x - width, -width));
                 marker = Some(text);
             } else {
-                // Under the item's text, past its own marker.
-                let width = self
-                    .marker_widths
-                    .last()
-                    .copied()
-                    .filter(|width| *width > 0)
-                    .unwrap_or_else(|| self.width_of("• "));
-                tags.push(self.margin(left + width, 0));
+                // Under the item's text, where the list's text stands.
+                tags.push(self.margin(text_x, 0));
             }
             tags.push(self.tags.item.clone());
         } else if self.quote > 0 {
@@ -1543,8 +1670,17 @@ impl<'a> Writer<'a> {
         self.item_fresh = false;
         self.line = Some(tags);
         if let Some(marker) = marker {
-            self.insert_plain(&marker);
+            self.insert_marker(&marker);
         }
+    }
+
+    /// Insert an item's `marker` with the line's tags and the marker's.
+    fn insert_marker(&mut self, marker: &str) {
+        let mut tags = self.line.clone().unwrap_or_default();
+        tags.push(self.tags.marker.clone());
+        let refs: Vec<&gtk::TextTag> = tags.iter().collect();
+        self.buffer
+            .insert_with_tags(&mut self.buffer.end_iter(), marker, &refs);
     }
 
     /// Insert `text` with the line's tags only.
@@ -1637,7 +1773,12 @@ impl<'a> Writer<'a> {
         options.insert(Options::ENABLE_TABLES);
         options.insert(Options::ENABLE_TASKLISTS);
         let lines = LineIndex::new(text);
-        for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        // The events whole, so each list is counted before it is written
+        // (`list_shapes`): where its text stands is its widest marker's
+        // end, and its widest number is its last item's.
+        let events: Vec<_> = Parser::new_ext(text, options).into_offset_iter().collect();
+        self.shapes = list_shapes(events.iter().map(|(event, _)| event)).into_iter();
+        for (event, range) in events {
             self.source_line = lines.line_of(range.start);
             if crate::doc_source::opens_block(&event) {
                 self.opening.push(self.source_line);
@@ -1762,8 +1903,13 @@ impl<'a> Writer<'a> {
                 // The text before a list — a paragraph, or the item a
                 // nested list belongs to — ends here.
                 self.end_line();
+                let shape = self.shapes.next().unwrap_or(ListShape {
+                    start,
+                    ..ListShape::default()
+                });
+                let gutter = LEVEL_INDENT.max(self.widest_marker(&shape));
                 self.lists.push(start);
-                self.marker_widths.push(0);
+                self.gutters.push(gutter);
             }
             Tag::Item => {
                 self.end_line();
@@ -1816,7 +1962,7 @@ impl<'a> Writer<'a> {
             TagEnd::List(_) => {
                 self.end_line();
                 self.lists.pop();
-                self.marker_widths.pop();
+                self.gutters.pop();
                 if self.lists.is_empty() {
                     self.tag_last_line(&self.tags.after_list.clone());
                 }
@@ -2219,27 +2365,101 @@ mod tests {
         });
     }
 
+    /// Where line `line` of `rendering` stands laid out in a view: where
+    /// it begins (an item's marker), where its text begins past the marker,
+    /// and where a line it wraps onto begins — Pango's hanging indent puts
+    /// every line after a paragraph's first `-indent` past its margin.
+    fn stands(rendering: &Rendering, line: i32) -> (i32, i32, i32) {
+        let buffer = &rendering.buffer;
+        let view = DocTextView::new();
+        view.set_buffer(Some(buffer));
+        let start = buffer.iter_at_line(line).unwrap();
+        let mut text = start;
+        let marker = buffer.tag_table().lookup(MARKER).unwrap();
+        if start.starts_tag(Some(&marker)) {
+            text.forward_to_tag_toggle(Some(&marker));
+        }
+        let (left, indent) = start
+            .tags()
+            .iter()
+            .find(|tag| tag.is_left_margin_set())
+            .map_or((MARGIN, 0), |tag| (tag.left_margin(), tag.indent()));
+        let wraps = if indent < 0 { left - indent } else { left };
+        (
+            view.iter_location(&start).x(),
+            view.iter_location(&text).x(),
+            wraps,
+        )
+    }
+
     /// A list item's lines after its first stand under its text, not under
     /// its marker: the marker hangs.
     #[test]
     fn an_item_hangs_its_marker() {
         crate::gtk_test::on_gtk_thread("doc text: no display — skipped", || {
-            let (_, rendering) = written("- one\n\n  more of one\n- two\n");
-            let buffer = &rendering.buffer;
-            let margin = |line: i32| {
-                let iter = buffer.iter_at_line(line).unwrap();
-                iter.tags()
-                    .iter()
-                    .find(|tag| tag.is_left_margin_set())
-                    .map(|tag| (tag.left_margin(), tag.indent()))
-            };
-            let (first, hang) = margin(0).expect("the first line has a margin");
-            assert!(hang < 0, "the marker hangs: {hang}");
+            let (_, rendering) = written("Before.\n\n- one\n\n  more of one\n- two\n");
+            let (paragraph, _, _) = stands(&rendering, 0);
+            let (marker, text, wraps) = stands(&rendering, 1);
+            assert!(marker < text, "the marker before the text: {marker} {text}");
+            assert!(
+                marker >= paragraph,
+                "within the column: {marker} {paragraph}"
+            );
+            assert_eq!(wraps, text, "a wrapped line stands under the text");
             assert_eq!(
-                margin(1),
-                Some((first, 0)),
+                stands(&rendering, 2),
+                (text, text, text),
                 "a second paragraph stands under the text"
             );
+        });
+    }
+
+    /// An ordered list that crosses from one digit to two stands every
+    /// item's text at one place, the widest number's end, and ends each
+    /// number there: right-aligned on the period, in tabular figures. A
+    /// nested list is a list of its own, its gutter beginning at its
+    /// parent's text.
+    #[test]
+    fn an_ordered_list_stands_its_text_at_one_place() {
+        crate::gtk_test::on_gtk_thread("doc text: no display — skipped", || {
+            let (text, rendering) = written(
+                "8. eight\n9. nine\n\n   more of nine\n10. ten\n    1. one\n    2. two\n11. eleven\n",
+            );
+            assert_eq!(
+                text,
+                "8. eight\n9. nine\nmore of nine\n10. ten\n1. one\n2. two\n11. eleven"
+            );
+            let (_, text_x, _) = stands(&rendering, 0);
+            let mut markers = Vec::new();
+            for line in [0, 1, 3, 6] {
+                let (marker, text, wraps) = stands(&rendering, line);
+                assert_eq!((text, wraps), (text_x, text_x), "line {line}");
+                markers.push(marker);
+            }
+            assert_eq!(markers[0], markers[1], "8 and 9 as wide");
+            assert!(markers[1] > markers[2], "9 stands in from 10: {markers:?}");
+            assert_eq!(markers[2], markers[3], "10 and 11 as wide");
+            assert_eq!(stands(&rendering, 2), (text_x, text_x, text_x));
+            let (nested, nested_text, _) = stands(&rendering, 4);
+            assert!(nested >= text_x, "{nested} {text_x}");
+            assert_eq!(stands(&rendering, 5).1, nested_text);
+            // The marker wears tabular figures.
+            let marker = rendering.buffer.tag_table().lookup(MARKER).unwrap();
+            assert!(rendering.buffer.iter_at_line(3).unwrap().has_tag(&marker));
+        });
+    }
+
+    /// Lists put their text in one column: a bullet's and a short ordered
+    /// list's both stand a level in, each marker ending there.
+    #[test]
+    fn lists_share_a_column() {
+        crate::gtk_test::on_gtk_thread("doc text: no display — skipped", || {
+            let (_, rendering) = written("- bullet\n\nBetween.\n\n1. one\n2. two\n");
+            let (bullet, bullet_text, _) = stands(&rendering, 0);
+            let (number, number_text, _) = stands(&rendering, 3);
+            assert_eq!(bullet_text, MARGIN + LEVEL_INDENT);
+            assert_eq!(number_text, bullet_text);
+            assert!(number < bullet, "a number is wider: {number} {bullet}");
         });
     }
 
@@ -2252,17 +2472,19 @@ mod tests {
             let (text, rendering) =
                 written("1. First\n2. Second:\n\n   more of it\n\n- [ ] to do\n- [x] done\n");
             assert_eq!(text, "1. First\n2. Second:\nmore of it\n☐ to do\n☑ done");
-            let buffer = &rendering.buffer;
-            let margin = |line: i32| {
-                let iter = buffer.iter_at_line(line).unwrap();
-                iter.tags()
-                    .iter()
-                    .find(|tag| tag.is_left_margin_set())
-                    .map(|tag| (tag.left_margin(), tag.indent()))
-            };
-            let (second, hang) = margin(1).unwrap();
-            assert_eq!(margin(2), Some((second, 0)), "{:?}", margin(2));
-            assert!(hang < 0);
+            let (marker, second, wraps) = stands(&rendering, 1);
+            assert!(marker < second);
+            assert_eq!(wraps, second);
+            assert_eq!(stands(&rendering, 2), (second, second, second));
+            // A box measured as it is drawn: alone, it took its space into
+            // its fallback font and its wrapped lines stood past its text.
+            let (_, to_do, to_do_wraps) = stands(&rendering, 3);
+            assert_eq!(to_do_wraps, to_do, "a box's wrapped lines under its text");
+            assert_eq!(
+                stands(&rendering, 4).1,
+                to_do,
+                "the boxes' text at one place"
+            );
         });
     }
 }
