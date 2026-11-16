@@ -4543,7 +4543,13 @@ impl Supervisor {
                 SupervisorState::Running { container_id } => {
                     format!("running ({container_id}), which this replaces")
                 }
-                other => format!("{other:?}").to_lowercase(),
+                SupervisorState::Preparing { what } => format!("getting ready ({what})"),
+                SupervisorState::NoConfig => "not yet configured".to_string(),
+                SupervisorState::ConfigDetected => "configured but not started".to_string(),
+                SupervisorState::Building => "building".to_string(),
+                SupervisorState::Starting => "starting".to_string(),
+                SupervisorState::Failed { message } => format!("failed ({message})"),
+                SupervisorState::Stopped => "stopped".to_string(),
             }
         ));
         // Nowhere to run: no VM was supplied, or the checkout is somewhere
@@ -4695,8 +4701,17 @@ impl Supervisor {
         self.set_state(SupervisorState::Building);
 
         // Tear down any previous instance (ignore "no such container").
+        // Each step of the teardown and the staging is said as it starts:
+        // the page's step reads "Build environment image" from here, and
+        // a log that said nothing until `podman build` began left 43
+        // seconds of that step with no line under it (David, 2026-11-16:
+        // "This log doesn't match the step"). The timestamps say which
+        // step took the time.
         self.exec.set_host();
         self.forget_agent_hosting();
+        self.log(format!(
+            "removing the previous container ({name}), if there is one"
+        ));
         let _ = self
             .run_captured(vec![
                 "rm".into(),
@@ -4726,6 +4741,10 @@ impl Supervisor {
                 // it. Staging closes that window by construction — walk it
                 // once, refuse symlinks on the way, build from bytes already
                 // ours.
+                self.log(format!(
+                    "copying the build files from {}",
+                    config.build_context().display()
+                ));
                 let staged = stage_build_context(&config.build_context(), &name)?;
                 let staged_dockerfile = dockerfile
                     .file_name()
@@ -5175,6 +5194,11 @@ impl Supervisor {
         if ids.is_empty() {
             return 0;
         }
+        self.log(format!(
+            "removing {} service container{} an earlier start left",
+            ids.len(),
+            if ids.len() == 1 { "" } else { "s" }
+        ));
         let mut args: Vec<String> = vec!["rm".into(), "-f".into(), "-t".into(), "2".into()];
         args.extend(ids.iter().cloned());
         let _ = self.run_captured(args).await;
