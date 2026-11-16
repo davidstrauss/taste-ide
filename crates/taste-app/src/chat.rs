@@ -1824,18 +1824,18 @@ fn parks_spawn(gate: Gate, stopped: bool) -> bool {
 }
 
 /// The transcript's line when an issue environment's container stopped
-/// under its agent, by why: one line, saying what a send now does.
+/// under its agent: why, and nothing more. What a send does is the line
+/// above the composer's to say ("… is stopped — sending will start it"),
+/// and this one stays in the transcript after the environment is started
+/// again, where advice about starting it would be stale; said here too, it
+/// was the half a narrow column cut off (2026-11-16).
 fn stopped_note(review: taste_core::ReviewState) -> &'static str {
     use taste_core::ReviewState as R;
     match review {
-        R::FlaggedForReview => {
-            "flagged for review, so its container stopped; sending a message starts it again"
-        }
-        R::Merged => "merged, so its container stopped; sending a message starts it again",
-        R::Rejected => "rejected, so its container stopped; sending a message starts it again",
-        R::Working => {
-            "its container stopped, and its agent with it; sending a message starts it again"
-        }
+        R::FlaggedForReview => "flagged for review, so its container stopped",
+        R::Merged => "merged, so its container stopped",
+        R::Rejected => "rejected, so its container stopped",
+        R::Working => "its container stopped, and its agent with it",
     }
 }
 
@@ -18864,17 +18864,18 @@ mod tests {
     }
 
     #[test]
-    fn the_stop_note_says_why_and_what_a_send_does() {
+    fn the_stop_note_says_why_in_one_line() {
         use taste_core::ReviewState as R;
         assert_eq!(
             stopped_note(R::FlaggedForReview),
-            "flagged for review, so its container stopped; sending a message starts it again"
+            "flagged for review, so its container stopped"
         );
         for review in [R::Working, R::FlaggedForReview, R::Merged, R::Rejected] {
             let note = stopped_note(review);
+            assert!(note.contains("stopped"), "{note}");
             assert!(
-                note.ends_with("sending a message starts it again"),
-                "{note}"
+                !note.contains("sending"),
+                "the composer's line says that: {note}"
             );
             assert!(!note.contains('\n'), "one line: {note}");
         }
