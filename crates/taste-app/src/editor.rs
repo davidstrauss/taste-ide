@@ -1387,9 +1387,9 @@ impl Editor {
     /// responsive ladder): between the full layout and gadget mode there is
     /// a width where four panes are still wanted and no longer fit as four
     /// *columns*, and **no nested tab sets** is what decides where they go
-    /// instead. The chat column's three views and the console's tabs stop
+    /// instead. The chat column's four views and the console's tabs stop
     /// being panes and become tabs here, so the window has exactly one
-    /// strip: `[file] … [chat] [usage] [settings] [environment]
+    /// strip: `[file] … [chat] [subagents] [usage] [settings] [environment]
     /// [resources] [terminal…]`.
     ///
     /// Reparented, not rebuilt — the same rule as a stowed tab set, and for
@@ -1623,8 +1623,9 @@ impl Editor {
 
     /// Bring the grafted chat tab to the front, if there is one.
     ///
-    /// Used by the probe, and by nothing else: in the running app the tab
-    /// is selected when it arrives and the user owns it after that.
+    /// Used by the probe, and by a subagent's "Show in Transcript", which
+    /// is the user asking for the conversation: otherwise the tab is
+    /// selected when it arrives and the user owns it after that.
     pub fn select_chat_tab(&self) -> bool {
         let Some(page) = self.pages_of(Family::Chat).first().cloned() else {
             return false;

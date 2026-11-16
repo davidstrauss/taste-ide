@@ -154,7 +154,13 @@ answered on the card, the first with words of the user's own and both of the
 second's boxes ticked, and AskUserQuestion's step keeping them, options and
 picks, once the card is gone —, `rebuild` — the agent's own rebuild call coming back as the connection closing, drawn finished rather than failed, the IDE's note under it —, `task` — two background subagents reporting back into a turn, one
 finished with its report one click away and one failed, which is what
-Claude Code's `<task-notification>` messages are drawn as —, `acts` — the coordinator's transcript, its
+Claude Code's `<task-notification>` messages are drawn as —, `subagents` — a
+turn that started three subagents, a foreground one finished, a background one
+still at work, and one whose launch failed, with the chat header's Subagents
+tab open over them (`chat/agents_tab.rs`; the list is the model's,
+`chat/subagents.rs`), `subagents-detail` with the running one's page open,
+`subagents-report` the finished one's, its report drawn, and `subagents-empty`
+the tab over a conversation that started none —, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,
 `permission-edit`, `permission-standing`, `standing`,
 `none` — no chat seeded at all —, and with any of them
@@ -183,7 +189,8 @@ conversation lived the way the event handler and a send live it, then its
 record read back and made into rows as a restore makes them, and the two
 compared row by row, widget by widget (text, what shows, its classes),
 printing `DIFFERS` with the first differences and whether they are the
-same, then the live turn carried on —; the three permission variants
+same — the Subagents tab's list as well, lived and read back, a stopped
+turn's among them —, then the live turn carried on —; the three permission variants
 are the permission card asking about a command (all four answers, which
 is the widest it gets), about a file edit, and about one of the IDE's own
 reads (the one whose "don't ask again" the PROJECT keeps, so the only one

@@ -849,16 +849,32 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // screen. One fact, one traffic dot, two slots.
         let editor_for_usage = editor.clone();
         chats.set_on_usage_severity(move |badge, tooltip| {
-            // Second of the chat family: [chat] [usage] [settings].
-            editor_for_usage.set_grafted_badge(Family::Chat, 1, badge, tooltip);
+            // Third of the chat family: [chat] [subagents] [usage]
+            // [settings].
+            editor_for_usage.set_grafted_badge(Family::Chat, 2, badge, tooltip);
         });
     }
     {
-        // ...and the agent link's dot on the third, the Settings tab, from
+        // ...and the agent link's dot on the fourth, the Settings tab, from
         // the same conversation.
         let editor_for_link = editor.clone();
         chats.set_on_link_state(move |badge, tooltip| {
-            editor_for_link.set_grafted_badge(Family::Chat, 2, badge, tooltip);
+            editor_for_link.set_grafted_badge(Family::Chat, 3, badge, tooltip);
+        });
+    }
+    {
+        // ...and the busy mark of its subagents on the second.
+        let editor_for_agents = editor.clone();
+        chats.set_on_agents_badge(move |badge, tooltip| {
+            editor_for_agents.set_grafted_badge(Family::Chat, 1, badge, tooltip);
+        });
+    }
+    {
+        // A subagent's "Show in Transcript" at the consolidated rung: the
+        // conversation is a tab of the strip, brought to the front.
+        let editor_for_transcript = editor.clone();
+        chats.set_on_show_transcript(move || {
+            editor_for_transcript.select_chat_tab();
         });
     }
     {
@@ -1903,7 +1919,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // views become tabs at the end of the editor's strip**, so the window
     // has exactly ONE tab strip in it:
     //
-    //   [file 1] … [chat] [usage] [settings] [environment] [resources]
+    //   [file 1] … [chat] [subagents] [usage] [settings] [environment] [resources]
     //   [terminal 1] [terminal 2]
     //
     // That is the whole rung, and the principle under it is **no nested tab
@@ -1969,6 +1985,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             title: "Chat".into(),
                             icon: "taste-chat-symbolic".into(),
                             tooltip: "The selected environment's conversation".into(),
+                        },
+                        GraftedTab {
+                            widget: faces.agents,
+                            title: "Subagents".into(),
+                            icon: "taste-subagents-symbolic".into(),
+                            tooltip: "The subagents this conversation's agent started".into(),
                         },
                         GraftedTab {
                             widget: faces.usage,

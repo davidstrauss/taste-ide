@@ -894,6 +894,14 @@ fn main() -> glib::ExitCode {
                     a file tree also has to live. */\n\
                  .backlog-panel .backlog-list > row { min-height: 40px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
+                 /* The chat's Subagents tab (chat/agents_tab.rs): a \
+                    sidebar's rows, each a title and two lines under it, \
+                    with a rich list's air between them rather than the \
+                    sidebar's single-line pitch, and their content 12 in \
+                    from the pane's edges, where the header's tabs and \
+                    gauges and every card in the transcript stand, rather \
+                    than the sidebar's 14. */\n\
+                 .subagent-list > row { padding: 8px 6px; }\n\
                  /* The intervention bar at the panel's foot: a strip \
                     that appears only when it has a subject, so it needs a \
                     top edge to say it is a band and not the last row of \

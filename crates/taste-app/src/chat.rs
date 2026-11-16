@@ -11,10 +11,13 @@
 //! devcontainer reloads. Conversations survive IDE restarts through ACP's
 //! own `session/load`; the IDE persists nothing but the session id.
 
+mod agents_tab;
 mod model;
 mod rail;
 mod rowbar;
 mod rows;
+mod shy;
+mod subagents;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1018,10 +1021,10 @@ pub struct ChatPane {
     /// (David, 2026-09-06).
     options_for_auth: Cell<bool>,
     chat_tab: gtk::ToggleButton,
-    /// The three-toggle strip, and the overlay the two shades hang in.
+    /// The four-toggle strip, and the overlay the three shades hang in.
     ///
     /// Both exist for the same reason: at the consolidated rung this pane
-    /// stops being a pane, its three views become three tabs in the
+    /// stops being a pane, its four views become four tabs in the
     /// window's one strip, and a toggle strip inside a tab would be the
     /// nested tab set the rung exists to abolish. So the strip hides and
     /// the shades are lifted out of the overlay into their own tabs — the
@@ -1036,6 +1039,13 @@ pub struct ChatPane {
     /// the grafted Settings tab at the narrow rung, as the utilization
     /// glyph tells its own.
     on_link_state: RefCell<Option<UsageSeverityHook>>,
+    /// The Subagents tab (`agents_tab`): its toggle, its face, and who
+    /// wears its badge and brings the transcript on screen once the toggle
+    /// is not.
+    agents_tab: gtk::ToggleButton,
+    agents: agents_tab::AgentsTab,
+    on_agents_badge: RefCell<Option<UsageSeverityHook>>,
+    on_show_transcript: RefCell<Option<Rc<dyn Fn()>>>,
     /// Names the conversation: the agent, and the environment it works in.
     identity_label: gtk::Label,
     /// The orchestrator mark beside it.
@@ -3601,6 +3611,17 @@ impl ChatPane {
             .css_classes(["flat"])
             .build();
         usage_tab.set_group(Some(&chat_tab));
+        // Subagents: the ones this conversation's agent has running or has
+        // run (`agents_tab`). Beside Chat, because it is about the same
+        // conversation's work, and badged as the others are — a green dot,
+        // the environment rows' "up", while any of them runs.
+        let agents_tab = gtk::ToggleButton::builder()
+            .icon_name(agents_tab::AGENTS_ICON)
+            .tooltip_text("Subagents")
+            .css_classes(["flat"])
+            .build();
+        agents_tab.set_group(Some(&chat_tab));
+        let agents = agents_tab::AgentsTab::new();
         // NOT `.linked`. Linking is for a group that wears a frame: it
         // rounds the outer corners and squares off every seam inside, so
         // with three FLAT toggles there was no frame to round and the
@@ -3614,6 +3635,7 @@ impl ChatPane {
             .orientation(gtk::Orientation::Horizontal)
             .build();
         tab_box.append(&chat_tab);
+        tab_box.append(&agents_tab);
         tab_box.append(&usage_tab);
         tab_box.append(&options_toggle);
         let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -3646,10 +3668,13 @@ impl ChatPane {
         // nothing), so neither tabs nor status shift when it runs.
         // Never ellipsized: in a squeezed header the box shortens every
         // ellipsizing child in proportion, and this one came out as
-        // "Clau… Code" beside a status that still had room. The status is
-        // the row's slack; the name is the one thing on it that must stay
-        // whole. A name's natural width is well inside the pane's minimum,
-        // so this pins nothing (TASTE_MEASURE_MIN).
+        // "Clau… Code" beside a status that still had room. The name is
+        // the one thing on the row that must stay whole — or go: with four
+        // tabs, it and the gauges asked for 360px of a column whose floor
+        // is 320, and what the column clipped was the Plan gauge. So it
+        // stands in a `shy::Shy`, drawn whole while there is room for it
+        // and not at all below that, and asks for none of the row's
+        // minimum (TASTE_MEASURE_MIN).
         let identity_label = gtk::Label::builder()
             .css_classes(["caption", "dim-label"])
             .build();
@@ -3690,8 +3715,10 @@ impl ChatPane {
         // transcript with no name on it could be anyone's. Quiet, and at
         // the end of the row, because it is an identity rather than a
         // status.
-        top_bar.append(&identity_glyph);
-        top_bar.append(&identity_label);
+        let identity = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        identity.append(&identity_glyph);
+        identity.append(&identity_label);
+        top_bar.append(&shy::Shy::new(&identity));
         top_bar.append(&usage_box);
 
         let controls_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -3897,6 +3924,7 @@ impl ChatPane {
         options_overlay.add_overlay(&jump.widget);
         options_overlay.add_overlay(&open_jump_up.widget);
         options_overlay.add_overlay(&open_jump_down.widget);
+        options_overlay.add_overlay(&agents.panel);
         options_overlay.add_overlay(&usage_panel);
         options_overlay.add_overlay(&controls_scroller);
 
@@ -3944,6 +3972,10 @@ impl ChatPane {
             grafted: Cell::new(false),
             on_usage_severity: RefCell::new(None),
             on_link_state: RefCell::new(None),
+            agents_tab: agents_tab.clone(),
+            agents,
+            on_agents_badge: RefCell::new(None),
+            on_show_transcript: RefCell::new(None),
             identity_label: identity_label.clone(),
             identity_glyph: identity_glyph.clone(),
             permission_bar,
@@ -4380,10 +4412,10 @@ impl ChatPane {
             }
         });
         let weak = Rc::downgrade(&pane);
-        // One handler for the whole group: with three tabs, each toggle
+        // One handler for the whole group: with four tabs, each toggle
         // firing its own half of the answer is how panels end up visible
         // together.
-        for toggle in [&chat_tab, &options_toggle, &usage_tab] {
+        for toggle in [&chat_tab, &options_toggle, &usage_tab, &agents_tab] {
             let weak = weak.clone();
             toggle.connect_toggled(move |_| {
                 let Some(pane) = weak.upgrade() else { return };
@@ -4543,6 +4575,7 @@ impl ChatPane {
         // The header says whose conversation this is from the first frame,
         // not from the first thing that happens to persist.
         *pane.weak_self.borrow_mut() = Rc::downgrade(&pane);
+        pane.wire_agents_tab();
         pane.refresh_identity();
         pane.sync_upstream_mark();
         // The ceiling on how long this environment's working copy may go
@@ -5384,6 +5417,7 @@ impl ChatPane {
         // holds never names a row of the next conversation.
         let next = self.model.borrow().next_id();
         *self.model.borrow_mut() = model::Model::starting_at(next);
+        self.reset_agents();
         self.keyed_notes.borrow_mut().clear();
         self.lit.borrow_mut().take();
         self.sync_placeholder();
@@ -6966,7 +7000,7 @@ impl ChatPane {
         verdict
     }
 
-    /// Hand the two shades over: they become tabs of their own.
+    /// Hand the three shades over: they become tabs of their own.
     ///
     /// ENVIRONMENTS.md → the responsive ladder. **Lifted, not copied.**
     /// The utilization figures and the session controls are this
@@ -6980,14 +7014,16 @@ impl ChatPane {
     /// The overlay they leave exists so the transcript stays allocated
     /// under a shade; with the shades gone the transcript is simply the
     /// whole of its own tab, which is the same guarantee by a shorter road.
-    pub fn take_faces(&self) -> (gtk::Widget, gtk::Widget) {
+    pub fn take_faces(&self) -> (gtk::Widget, gtk::Widget, gtk::Widget) {
         if !self.grafted.get() {
             self.grafted.set(true);
             self.tab_box.set_visible(false);
+            self.options_overlay.remove_overlay(&self.agents.panel);
             self.options_overlay.remove_overlay(&self.usage_panel);
             self.options_overlay.remove_overlay(&self.options_panel);
             // Out of the overlay they are nobody's shade: each is the
             // whole of a tab, and hidden widgets do not draw.
+            self.agents.panel.set_visible(true);
             self.usage_panel.set_visible(true);
             self.options_panel.set_visible(true);
             // The toggles keep answering for what the pane looks like when
@@ -7000,6 +7036,7 @@ impl ChatPane {
             self.refresh_plan_usage();
         }
         (
+            self.agents.panel.clone().upcast(),
             self.usage_panel.clone().upcast(),
             self.options_panel.clone().upcast(),
         )
@@ -7016,6 +7053,7 @@ impl ChatPane {
         }
         self.grafted.set(false);
         self.tab_box.set_visible(true);
+        self.options_overlay.add_overlay(&self.agents.panel);
         self.options_overlay.add_overlay(&self.usage_panel);
         self.options_overlay.add_overlay(&self.options_panel);
         self.sync_tabs();
@@ -7027,7 +7065,7 @@ impl ChatPane {
     /// Exactly one of the three tabs owns the pane.
     fn sync_tabs(&self) {
         if self.grafted.get() {
-            // Three tabs, three widgets: each face is on screen in its own
+            // Four tabs, four widgets: each face is on screen in its own
             // tab of the window's one strip, so none of them hides
             // another and the composer belongs to the transcript's tab
             // whatever the (hidden) toggles say.
@@ -7037,6 +7075,7 @@ impl ChatPane {
         let usage = self.usage_tab.is_active();
         self.options_panel.set_visible(settings);
         self.usage_panel.set_visible(usage);
+        self.agents.panel.set_visible(self.agents_tab.is_active());
         if settings {
             // Read when a reader arrives, like the ages on the Utilization
             // tab: the book behind this list is the project's, so another
@@ -8602,6 +8641,7 @@ impl ChatPane {
             self.pinned_prompt_label.set_label(&text);
             self.pinned_float.set_visible(false);
         }
+        self.follow_subagents();
     }
 
     /// `items` in at the end of the transcript, above the foot.
@@ -10330,7 +10370,7 @@ impl ChatPane {
                 // a transcript note.
                 match reason {
                     StopReason::EndTurn => {}
-                    StopReason::Cancelled => self.meta_row("stopped"),
+                    StopReason::Cancelled => self.meta_row(model::STOPPED_NOTE),
                     other => self.meta_row(&format!("turn ended early: {other:?}")),
                 }
                 self.set_status(if more_queued { "working…" } else { "ready" });
@@ -11793,6 +11833,7 @@ impl ChatPane {
         });
         let rows = items.len();
         *self.model.borrow_mut() = history;
+        self.reset_agents();
         // The mirror keeps its newest lines and counts the rest: only those
         // are written, and the rest are counted as it would have.
         let lines: Vec<(&'static str, String)> = lines
@@ -13015,6 +13056,15 @@ impl ChatPane {
             self.probe_roundtrip();
             return;
         }
+        // `TASTE_PROBE_CHAT=subagents` is a turn that started three: the
+        // Subagents tab open over them (`agents_tab`), `subagents-detail`
+        // with the running one's page, `subagents-empty` over none.
+        if let Ok(variant) = std::env::var("TASTE_PROBE_CHAT") {
+            if variant.starts_with("subagents") {
+                self.seed_subagents_for_probe(&variant);
+                return;
+            }
+        }
         // `TASTE_PROBE_CHAT=task` is a turn that two background subagents
         // report back into: one finished with a report, one failed.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("task") {
@@ -14083,6 +14133,15 @@ impl ChatPane {
             SessionUpdate::AgentMessageChunk(text("Done: both are kept across the rebuild.")),
         );
         end_turn(self);
+        // Turn 2½: subagents — one finished, one in the background whose
+        // turn ends under it, one that failed to start — and the user's
+        // Stop, noted after the turn's end settles them.
+        send(self, "Map item 22 and review enrollment in the background.");
+        for update in agents_tab::probe_subagent_updates() {
+            live(self, update);
+        }
+        end_turn(self);
+        self.meta_row(model::STOPPED_NOTE);
         // Turn 3: a step running across several that settle.
         send(self, "Now run the whole suite and fix what fails.");
         for n in 0..7 {
@@ -14319,6 +14378,22 @@ impl ChatPane {
                     .collect();
                 snapshot(&pane, &rows, &pane.items())
             };
+            // Row ids aside: a live pane's go on from rows a restore does
+            // not make (the markers a reseated prompt leaves).
+            let unrowed = |agents: &[subagents::Subagent]| -> Vec<subagents::Subagent> {
+                agents
+                    .iter()
+                    .cloned()
+                    .map(|mut agent| {
+                        agent.row = agent.row.map(|_| 0);
+                        for step in &mut agent.steps {
+                            step.row = step.row.map(|_| 0);
+                        }
+                        agent
+                    })
+                    .collect()
+            };
+            let live_agents = unrowed(pane.model.borrow().subagents().list());
             pane.flush_stash();
             glib::timeout_future(std::time::Duration::from_millis(500)).await;
             let archive = pane.chat_archive();
@@ -14363,7 +14438,26 @@ impl ChatPane {
                     }
                 }
             }
-            println!("probe roundtrip: the same: {}", live == drawn);
+            // The Subagents tab's list, as the live conversation has it and
+            // as its record reads back.
+            let drawn_agents = unrowed(restored.subagents().list());
+            let agents_same = live_agents == drawn_agents;
+            println!(
+                "probe roundtrip: {} subagents live, {} drawn back, the same: {agents_same}",
+                live_agents.len(),
+                drawn_agents.len()
+            );
+            if !agents_same {
+                for (was, is) in live_agents.iter().zip(&drawn_agents) {
+                    if was != is {
+                        println!("  live:  {was:?}\n  drawn: {is:?}");
+                    }
+                }
+            }
+            println!(
+                "probe roundtrip: the same: {}",
+                live == drawn && agents_same
+            );
             // The live turn goes on where it was.
             let mut fields = ToolCallUpdateFields::new();
             fields.status = Some(ToolCallStatus::Completed);
@@ -17724,6 +17818,8 @@ struct TaskNotification {
     summary: Option<String>,
     /// What the task handed back, the subagent's own Markdown.
     report: Option<String>,
+    /// The tool call that started it, when a subagent's launch did.
+    tool_use_id: Option<String>,
 }
 
 impl TaskNotification {
@@ -17806,6 +17902,7 @@ fn task_notification(block: &str) -> TaskNotification {
         status: field("status"),
         summary: field("summary"),
         report: report.filter(|report| !report.is_empty()),
+        tool_use_id: field("tool-use-id"),
     }
 }
 
@@ -18493,6 +18590,7 @@ mod tests {
                 status: Some("completed".into()),
                 summary: Some("Agent \"Review WIT and OIDC brokers\" finished".into()),
                 report: Some("## Findings\n\n- the broker trusts `<status>` blindly".into()),
+                tool_use_id: Some("toolu_01GHppHQNWZE4UtGrr1HdWKZ".into()),
             }]
         );
         assert_eq!(

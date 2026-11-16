@@ -29,6 +29,7 @@ use agent_client_protocol::schema::v1::{
     ContentBlock, Plan, PlanEntryStatus, SessionUpdate, ToolCallContent, ToolCallStatus, ToolKind,
 };
 
+use super::subagents::{Seen, Subagents};
 use super::{
     act_kind, act_output_json, briefing_notes, call_key, content_text, edit_title, ide_edit_shape,
     is_ide_edit_title, mcp_tool_name, replayed_attachment, step_title, task_notifications,
@@ -430,6 +431,9 @@ pub(super) struct Model {
     /// an answer's chunk there makes the answer it starts one whose start
     /// went.
     cut_through: Option<String>,
+    /// The subagents the conversation's agent started, read from the same
+    /// updates (`super::subagents`): the Subagents tab's list.
+    subagents: Subagents,
 }
 
 impl Model {
@@ -474,6 +478,16 @@ impl Model {
     /// The row of the newest prompt drawn from the record.
     pub fn last_prompt(&self) -> Option<RowId> {
         self.last_prompt
+    }
+
+    /// The conversation's subagents.
+    pub fn subagents(&self) -> &Subagents {
+        &self.subagents
+    }
+
+    /// The subagents that changed since the last time this was asked.
+    pub fn take_subagent_changes(&mut self) -> Vec<usize> {
+        self.subagents.take_changed()
     }
 
     /// The row a call's step is, if it has one.
@@ -729,6 +743,7 @@ impl Model {
         if !matches!(update, SessionUpdate::UserMessageChunk(_)) {
             self.flush_user();
         }
+        self.subagents.moved_on();
         match update {
             SessionUpdate::UserMessageChunk(chunk) => {
                 // A prompt the IDE sent says so in its `messageId`, and a
@@ -863,8 +878,11 @@ impl Model {
                 // Narration after this call starts a new block below it.
                 self.finalize();
                 self.note_terminal(&id, call.meta.as_ref());
+                let name = call.name.clone();
+                let input = call.raw_input.clone();
+                let content = call.content.clone();
                 self.upsert_step(
-                    id,
+                    id.clone(),
                     Some(call.title.clone()),
                     call.name,
                     Some(call.status),
@@ -873,6 +891,15 @@ impl Model {
                     call.raw_input,
                     call.raw_output,
                     in_transition,
+                );
+                self.subagent_tool(
+                    &id,
+                    name.as_deref(),
+                    Some(&call.title),
+                    Some(call.status),
+                    input.as_ref(),
+                    Some(&content),
+                    call.meta.as_ref(),
                 );
             }
             SessionUpdate::ToolCallUpdate(mut update) => {
@@ -904,8 +931,13 @@ impl Model {
                     }
                 }
                 self.note_terminal(&id, update.meta.as_ref());
+                let title = update.fields.title.clone();
+                let name = update.fields.name.clone();
+                let input = update.fields.raw_input.clone();
+                let content = update.fields.content.clone();
+                let status = update.fields.status;
                 self.upsert_step(
-                    id,
+                    id.clone(),
                     update.fields.title,
                     update.fields.name,
                     update.fields.status,
@@ -915,6 +947,15 @@ impl Model {
                     update.fields.raw_output,
                     in_transition,
                 );
+                self.subagent_tool(
+                    &id,
+                    name.as_deref(),
+                    title.as_deref(),
+                    status,
+                    input.as_ref(),
+                    content.as_deref(),
+                    update.meta.as_ref(),
+                );
             }
             SessionUpdate::Plan(plan) => {
                 self.finalize();
@@ -922,6 +963,40 @@ impl Model {
             }
             _ => {}
         }
+    }
+
+    /// A tool call's update, as the subagents read it: a launch, one of a
+    /// subagent's own calls, or neither. Read after its step, whose line
+    /// and row it carries.
+    #[allow(clippy::too_many_arguments)]
+    fn subagent_tool(
+        &mut self,
+        call: &str,
+        name: Option<&str>,
+        title: Option<&str>,
+        status: Option<ToolCallStatus>,
+        input: Option<&serde_json::Value>,
+        content: Option<&[ToolCallContent]>,
+        meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) {
+        let row = self.steps.get(call).copied();
+        // The line is a subagent's own step's, and worded only for one.
+        let line = self
+            .subagents
+            .may_be_child(call, meta)
+            .then(|| row.and_then(|id| self.row(id)).map(Row::text))
+            .flatten();
+        self.subagents.tool(Seen {
+            call,
+            name,
+            title,
+            status,
+            input,
+            content,
+            meta,
+            line,
+            row,
+        });
     }
 
     /// Keep what a shell call printed, when the update reports it.
@@ -1110,6 +1185,11 @@ impl Model {
     pub fn note(&mut self, text: &str) -> RowId {
         self.finalize();
         self.lines.push(("note", text.to_string()));
+        // The IDE's word that the user stopped the turn: what ran in it
+        // was stopped with it.
+        if text == STOPPED_NOTE {
+            self.subagents.stopped();
+        }
         self.push_step(Kind::Note(text.to_string()), Dot::Note)
     }
 
@@ -1457,6 +1537,11 @@ impl Model {
         // step of the agent's work, and drawn as one.
         if let Some((notes, rest)) = task_notifications(&text) {
             for note in &notes {
+                self.subagents.notified(
+                    note.tool_use_id.as_deref(),
+                    note.status.as_deref(),
+                    note.report.as_deref(),
+                );
                 self.lines.push(("note", note.title()));
                 let dot = note.tone().map_or(Dot::Plain, Dot::Tone);
                 self.push_step(
@@ -1564,6 +1649,7 @@ impl Model {
     /// Every step still marked running is settled: its turn, its session,
     /// or the history it came from is over, and the agent never said.
     pub fn settle_running(&mut self) {
+        self.subagents.settle();
         let ids: Vec<RowId> = self.steps.values().copied().collect();
         for id in ids {
             let settled = match self.row_mut(id) {
@@ -1792,6 +1878,7 @@ impl Model {
         model.finalize();
         model.settle_running();
         model.changes.clear();
+        model.subagents.forget_changes();
         model
     }
 }
@@ -1830,6 +1917,10 @@ pub(super) enum Record {
 /// An answer's chunk, by its `sessionUpdate`: what a trim that cut
 /// through one names.
 const ANSWER_CHUNK: &str = "agent_message_chunk";
+
+/// The IDE's note that the user stopped a turn (`StopReason::Cancelled`):
+/// what it says, and what the subagents read it by.
+pub(super) const STOPPED_NOTE: &str = "stopped";
 
 /// The key a record of a prompt's delivery is kept under, its id the value.
 pub(super) const DELIVERY_RECORD: &str = "tasteDelivery";
@@ -2019,6 +2110,174 @@ mod tests {
                 .collect()
         };
         assert_eq!(strip(live.rows()), strip(restored.rows()));
+    }
+
+    /// The updates the pinned adapter sends for subagents, as a session
+    /// recorded them: `turns`, each ending — the pane settles a turn's
+    /// running steps at its end, and notes a stopped one after that.
+    fn subagent_turns() -> Vec<(Vec<Record>, bool)> {
+        let update = |value: serde_json::Value| {
+            Record::update(serde_json::from_value::<SessionUpdate>(value).expect("an update"))
+        };
+        let child = |call: &str, parent: &str, title: &str, status: &str| {
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call", "toolCallId": call, "title": title,
+                "kind": "execute", "status": status, "name": "Bash",
+                "_meta": { "claudeCode": { "toolName": "Bash", "parentToolUseId": parent } },
+            }))
+        };
+        let turn1 = vec![
+            Record::update(SessionUpdate::UserMessageChunk(text("Review it."))),
+            // A foreground subagent, its input arriving in pieces.
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call", "toolCallId": "fg", "title": "Task",
+                "kind": "think", "status": "pending", "name": "Agent", "rawInput": {},
+                "_meta": { "claudeCode": { "toolName": "Agent" } },
+            })),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "fg",
+                "title": "Map the planner",
+                "rawInput": { "description": "Map the planner", "subagent_type": "Explore",
+                              "prompt": "Find the planner." },
+            })),
+            child("fg-1", "fg", "rg plan", "in_progress"),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "fg-1", "status": "completed",
+                "_meta": { "claudeCode": { "toolName": "Bash", "parentToolUseId": "fg" } },
+            })),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "fg",
+                "_meta": { "claudeCode": { "toolName": "Agent", "toolResponse": {
+                    "status": "completed", "agentType": "Explore", "totalDurationMs": 74125,
+                    "totalTokens": 41774, "totalToolUseCount": 11,
+                    "handbackReport": { "text": "The planner is in planner.rs." } } } },
+            })),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "fg", "status": "completed",
+                "content": [{ "type": "content", "content": { "type": "text",
+                    "text": "Its report was delivered as a message." } }],
+            })),
+            // A background one, which hands its report back.
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call", "toolCallId": "bg", "title": "Review the brokers",
+                "kind": "think", "status": "pending", "name": "Agent",
+                "rawInput": { "description": "Review the brokers",
+                              "subagent_type": "general-purpose", "prompt": "Read them.",
+                              "run_in_background": true },
+            })),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "bg", "status": "completed",
+                "_meta": { "claudeCode": { "toolResponse": {
+                    "isAsync": true, "status": "async_launched",
+                    "resolvedModel": "claude-opus-5-5" } } },
+            })),
+            child("bg-1", "bg", "cargo test", "in_progress"),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call", "toolCallId": "bg-h", "title": "SubagentHandback",
+                "kind": "other", "status": "pending", "name": "SubagentHandback",
+                "rawInput": { "message": "## Findings\n\nOne." },
+                "_meta": { "claudeCode": { "toolName": "SubagentHandback",
+                                           "parentToolUseId": "bg" } },
+            })),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "bg-h",
+                "_meta": { "claudeCode": { "toolName": "SubagentHandback",
+                    "parentToolUseId": "bg", "toolResponse": { "success": true } } },
+            })),
+            Record::update(SessionUpdate::AgentMessageChunk(text("Both are in."))),
+        ];
+        let turn2 = vec![
+            Record::update(SessionUpdate::UserMessageChunk(text(
+                "Again, in the background.",
+            ))),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call", "toolCallId": "bg2", "title": "Review again",
+                "kind": "think", "status": "completed", "name": "Agent",
+                "rawInput": { "description": "Review again", "run_in_background": true },
+            })),
+            child("bg2-1", "bg2", "cargo clippy", "in_progress"),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call", "toolCallId": "bad", "title": "Explore the wiki",
+                "kind": "think", "status": "failed", "name": "Agent",
+                "rawInput": { "description": "Explore the wiki", "subagent_type": "Nonesuch" },
+                "content": [{ "type": "content", "content": { "type": "text",
+                    "text": "Agent type 'Nonesuch' not found." } }],
+            })),
+        ];
+        let turn3 = vec![
+            Record::update(SessionUpdate::UserMessageChunk(text("One more."))),
+            update(serde_json::json!({
+                "sessionUpdate": "tool_call", "toolCallId": "bg3", "title": "Quiet one",
+                "kind": "think", "status": "completed", "name": "Agent",
+                "rawInput": { "description": "Quiet one", "run_in_background": true },
+            })),
+        ];
+        vec![(turn1, false), (turn2, true), (turn3, false)]
+    }
+
+    /// The subagents a conversation lived lists are the ones its record
+    /// read back lists — the turn ends the pane settles, the stopped turn's
+    /// note, and all.
+    #[test]
+    fn live_and_restored_list_the_same_subagents() {
+        let mut live = Model::default();
+        let mut record = Vec::new();
+        for (turn, stopped) in subagent_turns() {
+            for entry in turn {
+                record.push(entry.clone());
+                match entry {
+                    Record::Update(update) => live.apply(*update, false),
+                    other => live.read(other),
+                }
+            }
+            // `TurnEnded`: the stream closed, the running settled, and a
+            // cancelled turn noted (`chat.rs`).
+            live.finalize();
+            live.settle_running();
+            if stopped {
+                live.note(STOPPED_NOTE);
+                record.push(Record::note(STOPPED_NOTE));
+            }
+        }
+        let restored = Model::of_record(0, record);
+        assert_eq!(live.subagents().list(), restored.subagents().list());
+        let states: Vec<(String, super::super::subagents::State)> = restored
+            .subagents()
+            .list()
+            .iter()
+            .map(|agent| (agent.title(), agent.state))
+            .collect();
+        use super::super::subagents::State;
+        assert_eq!(
+            states,
+            vec![
+                ("Map the planner".to_string(), State::Finished),
+                ("Review the brokers".to_string(), State::Finished),
+                ("Review again".to_string(), State::Stopped),
+                ("Explore the wiki".to_string(), State::Failed),
+                ("Quiet one".to_string(), State::Ended),
+            ]
+        );
+        let planner = &restored.subagents().list()[0];
+        assert_eq!(planner.kind.as_deref(), Some("Explore"));
+        assert_eq!(planner.prompt.as_deref(), Some("Find the planner."));
+        assert_eq!(
+            planner.report.as_deref(),
+            Some("The planner is in planner.rs.")
+        );
+        assert_eq!(planner.duration_ms, Some(74125));
+        assert_eq!(planner.steps.len(), 1);
+        assert_eq!(planner.steps[0].line, "rg plan");
+        assert!(planner.row.is_some());
+        let brokers = &restored.subagents().list()[1];
+        assert!(brokers.background);
+        assert_eq!(brokers.report.as_deref(), Some("## Findings\n\nOne."));
+        assert_eq!(
+            restored.subagents().list()[3].why.as_deref(),
+            Some("Agent type 'Nonesuch' not found.")
+        );
+        // A subagent's steps are the transcript's steps too, not only its.
+        assert!(restored.step_row("bg-1").is_some());
     }
 
     /// The line: a step's runs up to the one before and down to the one

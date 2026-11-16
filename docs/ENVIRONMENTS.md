@@ -2034,20 +2034,20 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   stop being panes, and their views become tabs at the end of the editor's
   strip, so the window has exactly ONE tab strip in it —
 
-      [file 1] … [chat] [usage] [agent] [resources]
+      [file 1] … [chat] [subagents] [usage] [agent] [resources]
       [terminal 1] [terminal 2]
 
   — which is the same principle the console follows at every width: **no
   nested tab sets**, every leaf view a first-class tab in its region's one
-  strip, and down here there is one region. The chat's own three-toggle
-  strip hides and its three views become three tabs; the console's tabs are
+  strip, and down here there is one region. The chat's own four-toggle
+  strip hides and its four views become four tabs; the console's tabs are
   *transferred pages*, so a terminal's pty crosses the breakpoint without
   noticing. Whichever tab the user is reading takes the whole width.
 
   Everything is reparented, never rebuilt: the chat is the same widget the
-  column was, so switching environments keeps working, and the utilization
-  and settings shades are lifted out of its overlay rather than built a
-  second time — a second set would be a second answer to which agent this
+  column was, so switching environments keeps working, and the subagents,
+  utilization, and settings shades are lifted out of its overlay rather
+  than built a second time — a second set would be a second answer to which agent this
   conversation uses. A conversation stopped on the user lights its tab the
   way a tab strip says it: `needs-attention`. The utilization tab keeps
   its badge, which is the same badge its toggle wears at full width: the
@@ -2069,7 +2069,7 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   **A pane's tab is its icon and nothing else**, and it is `pinned` to be
   so. That is the one rendering `AdwTabBar` has for "icon alone, no title,
   no close button", and both halves are wanted: a pane is known by its
-  glyph everywhere else in this window — the chat's own three toggles at
+  glyph everywhere else in this window — the chat's own four toggles at
   full width, the console's fixtures in its own strip — so a labelled
   `[💬 Chat ×]` was the one place these views wore a label, and the × was a
   button that could only ever be refused. A shorter title is not an

@@ -104,6 +104,7 @@ pub struct Chats {
     /// Slots rather than the widgets themselves, because the tabs outlive
     /// the selection: an `AdwTabPage`'s child is fixed for the page's life,
     /// and which conversation's figures belong in it is not.
+    agents_slot: adw::Bin,
     usage_slot: adw::Bin,
     settings_slot: adw::Bin,
     /// The slots as the editor's strip sees them: each wrapped in a
@@ -112,6 +113,7 @@ pub struct Chats {
     /// shade or a usage face happens to contain (`AdwTabView` takes its
     /// minimum from its widest page, and the consolidated rung's floor is
     /// computed from it).
+    agents_face: crate::chat_column::ChatColumn,
     usage_face: crate::chat_column::ChatColumn,
     settings_face: crate::chat_column::ChatColumn,
     /// Whose faces are in those slots, so a selection change can put them
@@ -123,6 +125,11 @@ pub struct Chats {
     /// The agent link's badge for the grafted Settings tab, forwarded the
     /// same way as the utilization glyph.
     on_link_state: RefCell<Option<UsageSeverityHook>>,
+    /// The Subagents tab's busy mark for its grafted tab, the same way.
+    on_agents_badge: RefCell<Option<UsageSeverityHook>>,
+    /// Who brings the grafted Chat tab to the front, for a subagent's
+    /// "Show in Transcript".
+    on_show_transcript: RefCell<Option<Rc<dyn Fn()>>>,
     /// Who is told that what a send would meet may have changed — the
     /// chat on screen connected, lost its agent, or had its credential
     /// saved, or another environment came on screen — so the composer
@@ -142,9 +149,10 @@ pub struct Chats {
     on_inner_hits: RefCell<Option<Box<dyn Fn(HashMap<String, usize>)>>>,
 }
 
-/// The three views this column hands over when it stops being a column.
+/// The four views this column hands over when it stops being a column.
 pub struct ChatFaces {
     pub chat: gtk::Widget,
+    pub agents: gtk::Widget,
     pub usage: gtk::Widget,
     pub settings: gtk::Widget,
 }
@@ -206,8 +214,10 @@ impl Chats {
         column_body.append(&stack);
         column_body.append(&results.widget);
         let widget = crate::chat_column::ChatColumn::new(&column_body);
+        let agents_slot = adw::Bin::new();
         let usage_slot = adw::Bin::new();
         let settings_slot = adw::Bin::new();
+        let agents_face = crate::chat_column::ChatColumn::new(&agents_slot);
         let usage_face = crate::chat_column::ChatColumn::new(&usage_slot);
         let settings_face = crate::chat_column::ChatColumn::new(&settings_slot);
 
@@ -226,14 +236,18 @@ impl Chats {
             being_made: RefCell::new(None),
             live: Cell::new(false),
             on_activity: RefCell::new(None),
+            agents_slot,
             usage_slot,
             settings_slot,
+            agents_face,
             usage_face,
             settings_face,
             grafted_env: RefCell::new(None),
             grafted: Cell::new(false),
             on_usage_severity: RefCell::new(None),
             on_link_state: RefCell::new(None),
+            on_agents_badge: RefCell::new(None),
+            on_show_transcript: RefCell::new(None),
             on_readiness: RefCell::new(None),
             on_open_document: RefCell::new(None),
             on_focus_composer: RefCell::new(None),
@@ -510,12 +524,12 @@ impl Chats {
 
     // --- when the column stops being a column ------------------------------
 
-    /// Hand this pane's three views over as tabs.
+    /// Hand this pane's four views over as tabs.
     ///
     /// ENVIRONMENTS.md → the responsive ladder. Below
     /// `CONSOLIDATED_MAX_WIDTH_SP` the window has one strip and no chat
-    /// column: the conversation, its utilization and the agent's settings
-    /// become three tabs at the end of it. The toggle strip that switched
+    /// column: the conversation, its subagents, its utilization, and the
+    /// agent's settings become four tabs at the end of it. The toggle strip that switched
     /// between them inside this pane hides — a row of tab-shaped controls
     /// inside a tab is the nested tab set the rung exists to abolish.
     ///
@@ -528,6 +542,7 @@ impl Chats {
         self.fill_slots();
         ChatFaces {
             chat: self.widget.clone().upcast(),
+            agents: self.agents_face.clone().upcast(),
             usage: self.usage_face.clone().upcast(),
             settings: self.settings_face.clone().upcast(),
         }
@@ -535,7 +550,7 @@ impl Chats {
 
     /// The exact inverse: the faces go back into the selected pane's
     /// overlay and this is a column again. The caller has already taken the
-    /// three widgets out of their tabs.
+    /// four widgets out of their tabs.
     pub fn ungraft_faces(self: &Rc<Self>) {
         self.grafted.set(false);
         self.empty_slots();
@@ -549,6 +564,9 @@ impl Chats {
             // configure. The tabs say that rather than showing a void:
             // the invitation to start one is on the chat tab, where it
             // belongs.
+            self.agents_slot.set_child(Some(&nothing_here(
+                "Subagents are a conversation's, and this environment has none yet.",
+            )));
             self.usage_slot.set_child(Some(&nothing_here(
                 "Utilization is measured per conversation, and this \
                  environment has none yet.",
@@ -559,13 +577,15 @@ impl Chats {
             )));
             return;
         };
-        let (usage, settings) = pane.take_faces();
+        let (agents, usage, settings) = pane.take_faces();
+        self.agents_slot.set_child(Some(&agents));
         self.usage_slot.set_child(Some(&usage));
         self.settings_slot.set_child(Some(&settings));
         *self.grafted_env.borrow_mut() = Some(env);
         // The tint the toggle wore has nowhere to live now but the tab's
         // own icon, so ask the pane to say it again.
         pane.refresh_usage_badge();
+        pane.republish_agents_badge();
     }
 
     /// Say the utilization tint again.
@@ -580,12 +600,14 @@ impl Chats {
         if let Some(pane) = env.and_then(|env| self.pane_for(&env)) {
             pane.refresh_usage_badge();
             pane.sync_link_badge();
+            pane.republish_agents_badge();
         }
     }
 
     /// Take them out and give them back to whoever they belong to.
     fn empty_slots(self: &Rc<Self>) {
         let previous = self.grafted_env.borrow_mut().take();
+        self.agents_slot.set_child(gtk::Widget::NONE);
         self.usage_slot.set_child(gtk::Widget::NONE);
         self.settings_slot.set_child(gtk::Widget::NONE);
         if let Some(pane) = previous.and_then(|env| self.pane_for(&env)) {
@@ -764,6 +786,17 @@ impl Chats {
         *self.on_link_state.borrow_mut() = Some(Rc::new(hook));
     }
 
+    /// Who to tell when the grafted conversation's subagents start or stop
+    /// running — the grafted Subagents tab's badge.
+    pub fn set_on_agents_badge(&self, hook: impl Fn(&str, &str) + 'static) {
+        *self.on_agents_badge.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// Who brings the grafted Chat tab to the front.
+    pub fn set_on_show_transcript(&self, hook: impl Fn() + 'static) {
+        *self.on_show_transcript.borrow_mut() = Some(Rc::new(hook));
+    }
+
     /// Who opens the whole of a clipped prompt, response, command or edit
     /// in the editor — set once, forwarded from every pane with its
     /// environment, so the tab lands in that environment's set.
@@ -846,6 +879,30 @@ impl Chats {
                     let hook = chats.on_usage_severity.borrow().clone();
                     if let Some(hook) = hook {
                         hook(icon, tooltip);
+                    }
+                });
+            }
+            {
+                let weak = Rc::downgrade(self);
+                let env = env.clone();
+                pane.set_on_agents_badge(move |icon, tooltip| {
+                    let Some(chats) = weak.upgrade() else { return };
+                    if chats.grafted_env.borrow().as_ref() != Some(&env) {
+                        return;
+                    }
+                    let hook = chats.on_agents_badge.borrow().clone();
+                    if let Some(hook) = hook {
+                        hook(icon, tooltip);
+                    }
+                });
+            }
+            {
+                let weak = Rc::downgrade(self);
+                pane.set_on_show_transcript(move || {
+                    let Some(chats) = weak.upgrade() else { return };
+                    let hook = chats.on_show_transcript.borrow().clone();
+                    if let Some(hook) = hook {
+                        hook();
                     }
                 });
             }

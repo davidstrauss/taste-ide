@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Subagents: one agent handing work to two — a node above, two below,
+     joined — in the same one-colour 16px family as taste-chat-symbolic and
+     the utilization bars, for the chat header's Subagents tab. A fork
+     rather than a second robot's head, because what the tab lists is the
+     delegation, and at 16px two heads read as a crowd. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#241f31" d="M6.5 1 h3 a1.5 1.5 0 0 1 1.5 1.5 v2 A1.5 1.5 0 0 1 9.5 6 H8.75 v1.25 H12 a.75 .75 0 0 1 .75 .75 V10 h-1.5 V8.75 h-6.5 V10 h-1.5 V8 A.75 .75 0 0 1 4 7.25 h3.25 V6 H6.5 A1.5 1.5 0 0 1 5 4.5 v-2 A1.5 1.5 0 0 1 6.5 1 Z M2.5 10 h3 A1.5 1.5 0 0 1 7 11.5 v2 A1.5 1.5 0 0 1 5.5 15 h-3 A1.5 1.5 0 0 1 1 13.5 v-2 A1.5 1.5 0 0 1 2.5 10 Z M10.5 10 h3 a1.5 1.5 0 0 1 1.5 1.5 v2 a1.5 1.5 0 0 1 -1.5 1.5 h-3 A1.5 1.5 0 0 1 9 13.5 v-2 A1.5 1.5 0 0 1 10.5 10 Z"/>
+</svg>

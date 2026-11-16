@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Subagents, some running: the same fork, badged with the dot the
+     environment rows say "up" with, in the theme's own `success` colour —
+     the busy mark of the chat header's Subagents tab. Not a tint and not a
+     count: the glyph says which view this is, the dot that something in it
+     is under way, and the tooltip how many. Bottom-right, r=3.4, with the
+     hairline dark stroke the gear's and the utilization glyph's dots wear,
+     so the three badges on one row read as one kind of thing; it sits on
+     the right-hand child, as the utilization dot sits on its tall bar's
+     foot. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#241f31" d="M6.5 1 h3 a1.5 1.5 0 0 1 1.5 1.5 v2 A1.5 1.5 0 0 1 9.5 6 H8.75 v1.25 H12 a.75 .75 0 0 1 .75 .75 V10 h-1.5 V8.75 h-6.5 V10 h-1.5 V8 A.75 .75 0 0 1 4 7.25 h3.25 V6 H6.5 A1.5 1.5 0 0 1 5 4.5 v-2 A1.5 1.5 0 0 1 6.5 1 Z M2.5 10 h3 A1.5 1.5 0 0 1 7 11.5 v2 A1.5 1.5 0 0 1 5.5 15 h-3 A1.5 1.5 0 0 1 1 13.5 v-2 A1.5 1.5 0 0 1 2.5 10 Z M10.5 10 h3 a1.5 1.5 0 0 1 1.5 1.5 v2 a1.5 1.5 0 0 1 -1.5 1.5 h-3 A1.5 1.5 0 0 1 9 13.5 v-2 A1.5 1.5 0 0 1 10.5 10 Z"/>
+  <circle class="success" cx="12.5" cy="12.5" r="3.4"
+          stroke="#00000055" stroke-width="0.5"/>
+</svg>

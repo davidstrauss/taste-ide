@@ -753,8 +753,8 @@ The middle rung is a window tiled beside a browser, and it **consolidates
 tab sets — all of them**. The chat column and the console pane stop being
 panes: their views graft onto the end of the editor's `AdwTabView`
 (`Editor::graft`, `Editor::graft_pages`), so the window has exactly one
-tab strip — `[file 1] … [chat] [usage] [agent] [resources]
-[terminal…]` — and whichever tab the user is reading gets the
+tab strip — `[file 1] … [chat] [subagents] [usage] [agent]
+[resources] [terminal…]` — and whichever tab the user is reading gets the
 whole width.
 
 The principle is the one the console follows at every width: **no nested
@@ -766,8 +766,8 @@ terminals rather than pages of a switcher inside one tab.
 Everything is reparented, never rebuilt. The console's pages are
 `transfer_page`d between views, so a terminal's pty crosses the breakpoint
 untouched; the chat is the same widget the column was, so switching
-environments keeps working; its utilization and settings shades are lifted
-out of its overlay into slots that follow the selection. A chat stopped on
+environments keeps working; its subagents, utilization, and settings shades
+are lifted out of its overlay into slots that follow the selection. A chat stopped on
 the user sets `needs-attention` on its page, which is how a tab strip says
 what the panel says with a mark.
 
@@ -1507,6 +1507,47 @@ it, and carries its actions.
   answered, as the protocol asks. Every path that cancels a turn (Stop,
   Ctrl+Stop, a held Stop, a message fast-forwarded past the turn) does
   this, because the session reports each as `TurnCancelled`.
+- **The header's tabs** are Chat, Subagents, Utilization, and the gear's
+  Settings: four flat toggles in one group, the transcript under the other
+  three as an opaque shade (an overlay, never a stack, so the transcript
+  stays allocated at its width), each glyph in-tree and never tinted, a
+  state riding as a dot in its corner — the gear's link, the bars' room,
+  and the Subagents glyph's green "running". The agent's name beside the
+  gauges stands whole or not at all (`chat/shy.rs`): with four tabs the row
+  asked for more than the column's 320px floor, and the column clips.
+- **Subagents** (`chat/agents_tab.rs`, `chat/subagents.rs`): the
+  subagents this conversation's agent has running or has run, the running
+  first and then the rest, newest first — each with its description, its
+  type, how it stands, how long it ran (ticking while it runs, and once it
+  has ended only as Claude Code reported it), its latest step while it
+  runs, and what it spent where that is reported; a row opens onto a page
+  of its facts as property rows, its report (or why it failed, or what its
+  launch returned), its prompt, its own steps, each a click to its place in
+  the transcript, and Show in Transcript for the launch. It is the model's
+  (`Model::apply` reads every tool call into it), so a restore lists what
+  the live conversation did, and `TASTE_PROBE_CHAT=roundtrip` compares the
+  two. It shows what the pinned adapter reports and nothing it would have
+  to guess, which, to a client that takes none of its native-subagent
+  extensions, is: the `Agent` (once `Task`) call and its `rawInput`
+  (`description`, `subagent_type`, `prompt`, `run_in_background`); the
+  subagent's own tool calls, stamped `_meta.claudeCode.parentToolUseId`,
+  but not its prose; Claude Code's account of the launch in
+  `_meta.claudeCode.toolResponse` (for a foreground one `agentType`,
+  `resolvedModel`, `totalDurationMs`, `totalTokens`, `totalToolUseCount`,
+  `handbackReport`; for a background one `isAsync`, `agentId`,
+  `resolvedModel`), absent from a `session/load` replay; and
+  `_meta.claudeCode.nonExecutionKind` on a launch a cancel interrupted,
+  which reads as stopped. A background subagent's end is reported by
+  nothing but its `SubagentHandback` call (its `rawInput.message` the
+  report, its `toolResponse.success` the delivery): Claude Code's
+  `task_notification` frame reaches only a client of the adapter's native
+  subagent sessions, and the `<task-notification>` message is not sent —
+  one an older adapter's replay did send is still read. Since the adapter
+  holds a turn open until the subagents it started have ended, one still
+  unreported when its turn ends is listed as Ended, how unknown; one
+  running when the user stops the turn, as Stopped. No cost, and nothing to
+  stop one subagent with: ACP has no such request, and Stop cancels the
+  turn, which ends them.
 - **Utilization**: session-cumulative token usage (in/out/total/cached)
   from each turn's response renders in the pane footer. Account-level
   quotas (5-hour/weekly limits) are not modeled by ACP; agents announce
