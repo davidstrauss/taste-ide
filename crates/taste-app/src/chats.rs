@@ -651,6 +651,11 @@ impl Chats {
         }
     }
 
+    /// The environment on screen.
+    pub fn current(&self) -> EnvironmentId {
+        self.current.borrow().clone()
+    }
+
     /// The chat on screen, if the selected environment has one.
     pub fn selected(&self) -> Option<Rc<ChatPane>> {
         self.pane_for(&self.current.borrow())

@@ -43,12 +43,13 @@ use crate::environment::EnvironmentId;
 /// conversation.
 pub type ChatId = EnvironmentId;
 
-/// An issue as an agent's first prompt — the brief both Start buttons send,
-/// the user's in the backlog and the orchestrator's `issue_start`, so an
-/// environment begins from the same words whoever started it. The
-/// standing instructions are here rather than in a system prompt because
-/// they are about THIS environment's contract with the queue: publish to
-/// its one branch of record, and `ready: true` when the work is done.
+/// An issue as an agent's first prompt — the brief the orchestrator's
+/// `issue_start` sends, and the one the user's Start drafts in Dispatch
+/// ([`start_brief`]), so an environment handed to its agent begins from
+/// the same words whoever started it. The standing instructions are here
+/// rather than in a system prompt because they are about THIS
+/// environment's contract with the queue: publish to its one branch of
+/// record, and `ready: true` when the work is done.
 pub fn issue_brief(id: &str, title: &str, body: &str) -> String {
     let body = body.trim();
     let body_block = if body.is_empty() {
@@ -62,6 +63,85 @@ pub fn issue_brief(id: &str, title: &str, body: &str) -> String {
          goes. Publish with `publish` as often as you like, and call `publish` with \
          `ready: true` when the work is finished, which asks the user to review it. The \
          issue cannot close until that branch is merged.{body_block}"
+    )
+}
+
+/// Who pressed Start on an issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Starter {
+    /// The user, on the backlog's row, the file tree's play, or the
+    /// editor's call to action.
+    User,
+    /// The coordinator's `issue_start`.
+    Coordinator,
+}
+
+/// What a Start does with the issue's brief.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BriefDelivery {
+    /// Sent to the agent as its first prompt, held until it is up. The
+    /// coordinator's Start: supervision at the orchestrator level depends
+    /// on a started issue being worked without anyone typing.
+    Send(String),
+    /// Put in Dispatch as a draft aimed at the environment, its agent left
+    /// idle: Enter hands the issue over, and a draft deleted or ignored
+    /// leaves the environment the user's (David, 2026-11-15: "I want to be
+    /// able to work in these other environments without an agent taking
+    /// over"). The [`WithheldBrief`] is what the chat keeps until the draft
+    /// is sent, so its agent is told where it is all the same
+    /// ([`issue_assist_preamble`]).
+    Draft {
+        text: String,
+        withheld: WithheldBrief,
+    },
+}
+
+/// The brief a Start of issue `id` delivers, and how.
+pub fn start_brief(starter: Starter, id: &str, title: &str, body: &str) -> BriefDelivery {
+    let text = issue_brief(id, title, body);
+    match starter {
+        Starter::Coordinator => BriefDelivery::Send(text),
+        Starter::User => BriefDelivery::Draft {
+            text,
+            withheld: WithheldBrief {
+                issue: id.to_string(),
+                title: title.to_string(),
+                body: body.to_string(),
+            },
+        },
+    }
+}
+
+/// An issue environment whose brief was drafted and not sent: the user
+/// started it to work in themselves. Kept with the environment's chat in
+/// workspace state (`ChatEntry::withheld_brief`), so a restart and a
+/// `session/load` keep it, and taken off it when the drafted brief is
+/// sent, which hands the issue to the agent after all.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WithheldBrief {
+    pub issue: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+}
+
+/// What goes ahead of the first prompt of a session in an issue
+/// environment whose brief was withheld ([`WithheldBrief`]): where the
+/// agent is, and that the user is the one working the issue. The issue
+/// brief's counterpart, so it names the same branch and the same tool.
+pub fn issue_assist_preamble(id: &str, title: &str, body: &str) -> String {
+    let body = body.trim();
+    let body_block = if body.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nThe issue as filed:\n\n{body}")
+    };
+    format!(
+        "THE USER IS WORKING HERE. This environment is issue {id}'s — \"{title}\" — and its \
+         branch of record is agents/{id}, but the user started it to work in themselves: \
+         the issue was not handed to you. Do what they ask. Call `publish` when they ask \
+         you to publish, and `publish` with `ready: true` (which asks for review and stops \
+         this environment's container) only when they ask for that.{body_block}"
     )
 }
 
@@ -580,6 +660,62 @@ mod tests {
             other => panic!("unexpected reply: {other:?}"),
         }
         responder.join().unwrap();
+    }
+
+    #[test]
+    fn the_users_start_drafts_the_brief_and_the_coordinators_sends_it() {
+        let brief = issue_brief("i-0007", "Keep the place", "The body.");
+        assert_eq!(
+            start_brief(
+                Starter::Coordinator,
+                "i-0007",
+                "Keep the place",
+                "The body."
+            ),
+            BriefDelivery::Send(brief.clone()),
+            "issue_start hands the issue over at once"
+        );
+        match start_brief(Starter::User, "i-0007", "Keep the place", "The body.") {
+            BriefDelivery::Draft { text, withheld } => {
+                assert_eq!(text, brief, "the draft is exactly what Start used to send");
+                assert_eq!(withheld.issue, "i-0007");
+                assert_eq!(withheld.title, "Keep the place");
+                assert_eq!(withheld.body, "The body.");
+            }
+            other => panic!("the user's Start sent the brief: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_assist_preamble_names_the_issue_and_leaves_ready_to_the_user() {
+        let text = issue_assist_preamble("i-b0do6j", "Data provenance", "");
+        assert!(text.contains("i-b0do6j"));
+        assert!(text.contains("\"Data provenance\""));
+        assert!(text.contains("agents/i-b0do6j"));
+        assert!(text.contains("the user started it to work in themselves"));
+        assert!(text.contains("`ready: true`"));
+        assert!(text.contains("only when they ask"));
+        assert!(
+            !text.contains("The issue as filed"),
+            "no body, no body block"
+        );
+        let with_body = issue_assist_preamble("i-1", "T", "  Why it matters.\n");
+        assert!(with_body.ends_with("The issue as filed:\n\nWhy it matters."));
+    }
+
+    #[test]
+    fn a_withheld_brief_round_trips_and_omits_an_empty_body() {
+        let withheld = WithheldBrief {
+            issue: "i-1".into(),
+            title: "T".into(),
+            body: String::new(),
+        };
+        let json = serde_json::to_string(&withheld).unwrap();
+        assert!(!json.contains("body"));
+        assert_eq!(
+            serde_json::from_str::<WithheldBrief>(&json).unwrap(),
+            withheld
+        );
     }
 
     /// A minimal block_on (park/unpark): these futures only await channels.

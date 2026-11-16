@@ -934,6 +934,22 @@ composer's existing queued badge, and is handed over when the
 environment has an exec target — so it reaches an agent living beside
 the files rather than the topology the container is about to replace.
 
+**Until that send, nothing spawns the agent.** The agent dies with the
+container, and its chat used to treat that like a crash: it reconnected,
+and with no container to go into it spawned outside one, which a host
+with no `npx` refuses — so a review flag's stop was answered with two
+refused launches and a note about a container "started when it is
+started", under the line saying a send would start it (2026-11-15). An
+issue environment's chat whose container stopped — not rebuilt, not moved
+— now parks instead (`chat::parked_by_stop`), its conversation armed for
+whatever starts the environment, and every later spawn a settled state or
+a reconnect would make is parked the same way while the environment is
+stopped (`chat::parks_spawn`). Its note is one line saying why and what a
+send does: "flagged for review, so its container stopped; sending a
+message starts it again" (or merged, rejected, or plainly stopped,
+`chat::stopped_note`). The primary is exempt, as the container gate
+exempts it: its chat is the coordinator.
+
 It goes in **again** if it has to. This is the one send that builds its
 card before spawning the agent — every other calls `activate` first and
 builds the card afterwards — and spawning into a persisted session
@@ -2890,6 +2906,29 @@ the user declines what is not going to happen):
   issue is a new issue, filed with `issue_create` and either started as its
   own world or left queued for the user — which is what "issues are how
   work outlives a conversation" already asks for.
+- **The user's Start drafts the brief; the coordinator's sends it**
+  (`taste_core::orchestration::start_brief`). The coordinator's
+  `issue_start` hands the issue to the agent at once — supervision at the
+  orchestrator level is a started issue worked without anyone typing. The
+  user's Start (the backlog row's, the file tree's, the editor's play)
+  brings the environment up with its agent idle and puts the same brief in
+  Dispatch, aimed at that environment: Enter hands the issue over, two
+  keystrokes where there was one, and a draft deleted or ignored leaves
+  the environment the user's (David, 2026-11-15: "I want to be able to
+  work in these other environments without an agent taking over"). The
+  draft is in the box only while the panes are aimed at its environment,
+  parked while they are elsewhere, and never written over words the user
+  already has there — it waits for the next arrival with the box empty
+  (`compose::Handoffs`); the Dispatch header names it ("i-0007's brief,
+  unsent") while it is there. Until the draft is sent the chat keeps the
+  issue as withheld (`ChatEntry::withheld_brief`, in workspace state, so a
+  restart and a `session/load` keep it), and the first prompt of each
+  session there carries a short preamble instead of the brief: the issue,
+  its branch of record, and that the user is working here — do what they
+  ask, publish when asked, and `ready: true` only when they ask
+  (`issue_assist_preamble`). A message of the user's own sent there ends
+  the parked draft. Starting an environment that already exists — stopped,
+  or on the other side — drafts and sends nothing.
 
   An earlier round had environments with generated names that *claimed*
   issues, and two panels each drawing one end of the claim. The claim was

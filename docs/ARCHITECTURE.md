@@ -1138,7 +1138,11 @@ no-op at every other width.
   Refresh and New issue, which are not about a row
   at all ("The backlog is the single top-level control" above has the
   detail, and the row's `⋮` menu with it). Start on a queued row is how a
-  world gets made: write down what it is for, then start it.
+  world gets made: write down what it is for, then start it. The user's
+  Start leaves its agent idle and drafts the issue's brief in Dispatch,
+  where Enter hands the issue over and clearing it keeps the environment
+  the user's; the coordinator's `issue_start` sends the brief at once
+  (ENVIRONMENTS.md → "The user's Start drafts the brief").
   Ctrl+Shift+E focuses the panel and walks the rows; Enter switches. A
   single 1 Hz tick refreshes the fleet (pure, equality-guarded) and
   repaints the sparklines (guarded on their own samples), because a

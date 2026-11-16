@@ -135,7 +135,12 @@ spawn is now held for —, `agent`, or `conversation`; `chat.rs`'s
 `loading`) —, `loading-sent` — the same with a message sent while
 waiting, its held card and the `starting` line under it —,
 `loading-kept` — a conversation still on screen while its agent comes
-back, the phase said on the working line rather than over the rows —, `replies` — the turn over on a question, the agent's suggested replies
+back, the phase said on the working line rather than over the rows —,
+`reviewed` — an issue environment's chat after its agent flagged the work
+for review and the container stopped under it: the one-line note saying
+why and what a send does (`chat::stopped_note`), and the line above the
+composer saying the environment is stopped — nothing respawns the agent
+(`chat::parked_by_stop`) —, `replies` — the turn over on a question, the agent's suggested replies
 under it as the question card's radios and Send (`TASTE_PROBE_REPLIES=several`: replies that combine, as checkboxes) —, `restored` — the same conversation as a restore
 replays it, the buttons read back from the `suggest_replies` call's input
 because the IDE's own event is not part of any replay —, `answered` — the
@@ -442,6 +447,11 @@ the middle of the window (`Editor::set_call_to_action`);
 made, as Start does — its own tab set, its chat's page, its row lit, and
 the files area saying its files come with its checkout (`FileTree::
 aim_pending`) — pair it with `TASTE_PROBE_STARTUP=vm` for its start in front;
+`TASTE_PROBE_HANDOFF=1` poses the chat's environment as the user's Start
+leaves it: its agent idle and the issue's brief drafted in Dispatch, the
+header naming it unsent, by the same `hand_to_user` the Start calls
+(`compose::Handoffs`) — pair it with `TASTE_PROBE_VIEW=watching` (i-0007,
+a seeded issue) and `TASTE_PROBE_CHAT=loading` for the agent on its way;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;

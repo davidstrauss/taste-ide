@@ -23,6 +23,14 @@
 //! into it for as long as it is held, A sends to the chat, B held files,
 //! Y held commits. Ctrl+D is the keyboard's X.
 //!
+//! **An issue's brief, drafted.** The user's Start brings an issue's
+//! environment up with its agent idle and puts the brief Start used to send
+//! here instead, aimed at that environment ([`Handoffs`]): Enter hands the
+//! issue to the agent, and a draft deleted or ignored leaves the environment
+//! the user's (David, 2026-11-15: "I want to be able to work in these other
+//! environments without an agent taking over"). The header says whose brief
+//! the box holds while it does.
+//!
 //! Nothing here knows how a chat sends, how an issue is filed or how a
 //! commit is written: the window hands in three hooks.
 
@@ -33,6 +41,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use crate::composer::{Attachment, Composer};
+use taste_core::environment::EnvironmentId;
 use taste_core::{ControllerButton, Event, Workspace};
 
 /// The chat column's inset: where the transcript's cards stand, and so
@@ -188,6 +197,125 @@ pub fn availability(
     }
 }
 
+/// The briefs the user's Start drafted, and which one the box holds.
+///
+/// The box is one box for every environment, so a brief is aimed by where
+/// it is shown: it is in the box only while the panes are aimed at its
+/// environment. Going elsewhere parks it — as the user left it, edited or
+/// not — and arriving back with the box empty brings it back. It is never
+/// written over the user's own words: a brief drafted while the box holds
+/// something waits, parked, for the next arrival at its environment with
+/// the box empty. What ends a brief is the user's: emptying the box, which
+/// leaves the environment theirs, or sending it — to the chat, which hands
+/// the issue over, or anywhere else, which uses the words. A message of
+/// the user's own sent to that environment's chat ends a parked one, since
+/// they have chosen to work there.
+#[derive(Debug, Default)]
+pub struct Handoffs {
+    parked: std::collections::HashMap<EnvironmentId, String>,
+    in_box: Option<EnvironmentId>,
+    aim: Option<EnvironmentId>,
+}
+
+/// What [`Handoffs`] asks of the box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoxEdit {
+    Leave,
+    /// Put this brief in the empty box, the caret at its end.
+    Fill(String),
+    /// Take the parked brief out: the box is empty again.
+    Clear,
+}
+
+impl Handoffs {
+    /// Start drafted `text` for `env`; `box_text` is what the box holds.
+    pub fn offer(&mut self, env: &EnvironmentId, text: &str, box_text: &str) -> BoxEdit {
+        if self.in_box.as_ref() == Some(env) {
+            return BoxEdit::Leave;
+        }
+        self.parked.insert(env.clone(), text.to_string());
+        self.arrive(box_text)
+    }
+
+    /// The panes are aimed at `env` now.
+    pub fn aim(&mut self, env: &EnvironmentId, box_text: &str) -> BoxEdit {
+        if self.aim.as_ref() == Some(env) {
+            return BoxEdit::Leave;
+        }
+        self.aim = Some(env.clone());
+        if let Some(held) = self.in_box.take() {
+            if !box_text.trim().is_empty() {
+                self.parked.insert(held, box_text.to_string());
+            }
+            return match self.arrive("") {
+                BoxEdit::Leave => BoxEdit::Clear,
+                fill => fill,
+            };
+        }
+        self.arrive(box_text)
+    }
+
+    /// The parked brief for where the panes are, into an empty box.
+    fn arrive(&mut self, box_text: &str) -> BoxEdit {
+        let Some(aim) = self.aim.clone() else {
+            return BoxEdit::Leave;
+        };
+        if !box_text.trim().is_empty() {
+            return BoxEdit::Leave;
+        }
+        match self.parked.remove(&aim) {
+            Some(text) => {
+                self.in_box = Some(aim);
+                BoxEdit::Fill(text)
+            }
+            None => BoxEdit::Leave,
+        }
+    }
+
+    /// The box changed: emptied, the brief in it is gone.
+    pub fn edited(&mut self, box_text: &str) {
+        if box_text.trim().is_empty() {
+            self.in_box = None;
+        }
+    }
+
+    /// The environment whose brief the box holds, if it holds one.
+    pub fn in_box(&self) -> Option<&EnvironmentId> {
+        self.in_box.as_ref()
+    }
+
+    /// What the box held went to `destination`. Says which environment's
+    /// brief went to the chat, if one did; a send of the user's own to the
+    /// chat ends the brief parked for where the panes are.
+    pub fn sent(&mut self, destination: Destination) -> Option<EnvironmentId> {
+        let held = self.in_box.take();
+        if destination != Destination::Chat {
+            return None;
+        }
+        if held.is_none() {
+            if let Some(aim) = &self.aim {
+                self.parked.remove(aim);
+            }
+        }
+        held
+    }
+
+    /// `env` is gone: so is its brief.
+    pub fn forget(&mut self, env: &EnvironmentId) -> BoxEdit {
+        self.parked.remove(env);
+        if self.in_box.as_ref() == Some(env) {
+            self.in_box = None;
+            return BoxEdit::Clear;
+        }
+        BoxEdit::Leave
+    }
+}
+
+/// The header's words while the box holds `env`'s brief.
+pub fn handoff_caption(env: &EnvironmentId) -> String {
+    format!("{env}'s brief, unsent")
+}
+
 /// The button's words for the destination — fixed, so three buttons keep
 /// fitting the chat column's floor; the staged count is the tooltip's
 /// ([`staged_words`]).
@@ -340,6 +468,9 @@ impl Hold {
 pub type ChatHook = Box<dyn Fn(String, Vec<Attachment>) -> Result<(), String>>;
 pub type BacklogHook = Box<dyn Fn(String, String, Vec<Attachment>) -> Result<(), String>>;
 pub type CommitHook = Box<dyn Fn(String) -> Result<(), String>>;
+/// The brief drafted for an environment went to its chat (`true`), or that
+/// send was refused (`false`).
+pub type HandoffHook = Box<dyn Fn(&EnvironmentId, bool)>;
 
 pub struct Compose {
     /// The whole section: header, then the folding body.
@@ -354,6 +485,11 @@ pub struct Compose {
     on_chat: RefCell<Option<ChatHook>>,
     on_backlog: RefCell<Option<BacklogHook>>,
     on_commit: RefCell<Option<CommitHook>>,
+    on_handoff: RefCell<Option<HandoffHook>>,
+    /// The briefs the user's Start drafted, and which the box holds.
+    handoffs: RefCell<Handoffs>,
+    /// The header's word on a brief in the box: whose it is, unsent.
+    handoff_caption: gtk::Label,
     /// The last text sent, for Up in an empty box.
     last_sent: RefCell<Option<String>>,
     /// An input method is mid-composition in the box. Enter belongs to the
@@ -388,6 +524,20 @@ impl Compose {
                 crate::hover::full_text_on_hover(&label);
             }
         }
+        // Whose brief the box holds, at the header's end while it holds
+        // one: the draft is in the box to be read and edited, and this is
+        // what says it is a draft Start wrote and not words of the user's.
+        let handoff_caption = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .xalign(1.0)
+            .visible(false)
+            .tooltip_text(
+                "Start wrote the issue's brief here instead of sending it. Send it to hand \
+                 the issue to the agent, or clear the box to work in the environment yourself.",
+            )
+            .build();
+        header.append(&handoff_caption);
         // The three buttons, in the composer's action row: To backlog and
         // Commit between the microphone and the pill, Send to Chat the
         // pill itself, rightmost.
@@ -438,6 +588,9 @@ impl Compose {
             on_chat: RefCell::new(None),
             on_backlog: RefCell::new(None),
             on_commit: RefCell::new(None),
+            on_handoff: RefCell::new(None),
+            handoffs: RefCell::new(Handoffs::default()),
+            handoff_caption,
             last_sent: RefCell::new(None),
             preedit: Cell::new(false),
             provider: RefCell::new(None),
@@ -460,6 +613,9 @@ impl Compose {
             let weak = Rc::downgrade(&compose);
             composer.set_on_change(move || {
                 if let Some(compose) = weak.upgrade() {
+                    let text = compose.composer.text();
+                    compose.handoffs.borrow_mut().edited(&text);
+                    compose.sync_handoff();
                     compose.sync();
                 }
             });
@@ -540,6 +696,62 @@ impl Compose {
 
     pub fn set_on_commit(&self, hook: impl Fn(String) -> Result<(), String> + 'static) {
         *self.on_commit.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Who is told that a drafted brief went to its chat, or that the send
+    /// was refused.
+    pub fn set_on_handoff(&self, hook: impl Fn(&EnvironmentId, bool) + 'static) {
+        *self.on_handoff.borrow_mut() = Some(Box::new(hook));
+    }
+
+    // --- the drafted briefs -------------------------------------------------
+
+    /// The user's Start drafted `text` for `env` ([`Handoffs`]).
+    pub fn offer_handoff(&self, env: &EnvironmentId, text: &str) {
+        let edit = self
+            .handoffs
+            .borrow_mut()
+            .offer(env, text, &self.composer.text());
+        self.apply(edit);
+    }
+
+    /// The panes are aimed at `env` now: a brief follows its environment.
+    pub fn follow_aim(&self, env: &EnvironmentId) {
+        let edit = self.handoffs.borrow_mut().aim(env, &self.composer.text());
+        self.apply(edit);
+    }
+
+    /// `env` was destroyed: its brief goes with it.
+    pub fn forget_handoff(&self, env: &EnvironmentId) {
+        let edit = self.handoffs.borrow_mut().forget(env);
+        self.apply(edit);
+    }
+
+    /// Do what [`Handoffs`] asked of the box — outside its borrow, since
+    /// changing the text tells it of the edit.
+    fn apply(&self, edit: BoxEdit) {
+        match edit {
+            BoxEdit::Leave => {}
+            BoxEdit::Fill(text) => {
+                self.composer.set_text(&text);
+                // The caret at the end, where Enter sends it as it stands.
+                let buffer = self.composer.entry.buffer();
+                buffer.place_cursor(&buffer.end_iter());
+            }
+            BoxEdit::Clear => self.composer.set_text(""),
+        }
+        self.sync_handoff();
+    }
+
+    /// The header's caption, as the box stands.
+    fn sync_handoff(&self) {
+        match self.handoffs.borrow().in_box() {
+            Some(env) => {
+                self.handoff_caption.set_label(&handoff_caption(env));
+                self.handoff_caption.set_visible(true);
+            }
+            None => self.handoff_caption.set_visible(false),
+        }
     }
 
     /// Whether the chat on screen can take a message, asked at every
@@ -679,6 +891,16 @@ impl Compose {
             return false;
         }
         let attachments = self.composer.take_attachments();
+        // A drafted brief going to its chat hands the issue over, and the
+        // chat hears so first, so the brief goes without the preamble meant
+        // for an environment the user works in.
+        let handing = match destination {
+            Destination::Chat => self.handoffs.borrow().in_box().cloned(),
+            _ => None,
+        };
+        if let (Some(env), Some(hook)) = (&handing, self.on_handoff.borrow().as_ref()) {
+            hook(env, true);
+        }
         let result = match destination {
             Destination::Chat => match self.on_chat.borrow().as_ref() {
                 Some(hook) => hook(text.clone(), attachments.clone()),
@@ -702,12 +924,16 @@ impl Compose {
                 if !text.trim().is_empty() {
                     *self.last_sent.borrow_mut() = Some(text);
                 }
+                self.handoffs.borrow_mut().sent(destination);
                 self.composer.clear();
                 self.composer.entry.grab_focus();
                 self.sync();
                 true
             }
             Err(why) => {
+                if let (Some(env), Some(hook)) = (&handing, self.on_handoff.borrow().as_ref()) {
+                    hook(env, false);
+                }
                 // Nothing lost: the text is still in the box, and the
                 // attachments go back on it.
                 for attachment in attachments {
@@ -932,6 +1158,89 @@ mod tests {
         commit_blocked: false,
         chat: ChatReadiness::Ready,
     };
+
+    fn env(slug: &str) -> EnvironmentId {
+        EnvironmentId::parse(slug).unwrap()
+    }
+
+    #[test]
+    fn a_drafted_brief_fills_the_empty_box_of_its_environment() {
+        let mut drafts = Handoffs::default();
+        // Start aims the panes there first, then drafts.
+        assert_eq!(drafts.aim(&env("i-0007"), ""), BoxEdit::Leave);
+        assert_eq!(
+            drafts.offer(&env("i-0007"), "You are working issue i-0007", ""),
+            BoxEdit::Fill("You are working issue i-0007".into())
+        );
+        assert_eq!(drafts.in_box(), Some(&env("i-0007")));
+        // Sent to the chat: the issue is handed over, once.
+        assert_eq!(drafts.sent(Destination::Chat), Some(env("i-0007")));
+        assert_eq!(drafts.in_box(), None);
+        assert_eq!(drafts.sent(Destination::Chat), None);
+    }
+
+    #[test]
+    fn a_drafted_brief_never_overwrites_the_users_words() {
+        let mut drafts = Handoffs::default();
+        drafts.aim(&env("i-0007"), "my own words");
+        assert_eq!(
+            drafts.offer(&env("i-0007"), "brief", "my own words"),
+            BoxEdit::Leave
+        );
+        assert_eq!(drafts.in_box(), None);
+        // It waits for the next arrival with the box empty.
+        drafts.aim(&env("primary"), "my own words");
+        assert_eq!(
+            drafts.aim(&env("i-0007"), ""),
+            BoxEdit::Fill("brief".into())
+        );
+    }
+
+    #[test]
+    fn a_drafted_brief_follows_its_environment_and_ends_when_emptied() {
+        let mut drafts = Handoffs::default();
+        drafts.aim(&env("i-0007"), "");
+        drafts.offer(&env("i-0007"), "brief", "");
+        // Away, edited: parked as the user left it, and the box emptied.
+        assert_eq!(drafts.aim(&env("primary"), "brief, edited"), BoxEdit::Clear);
+        assert_eq!(drafts.in_box(), None);
+        // Back: there again.
+        assert_eq!(
+            drafts.aim(&env("i-0007"), ""),
+            BoxEdit::Fill("brief, edited".into())
+        );
+        // Deleted: gone, and the environment is the user's.
+        drafts.edited("   ");
+        assert_eq!(drafts.in_box(), None);
+        drafts.aim(&env("primary"), "");
+        assert_eq!(drafts.aim(&env("i-0007"), ""), BoxEdit::Leave);
+    }
+
+    #[test]
+    fn a_message_of_the_users_own_ends_the_parked_brief() {
+        let mut drafts = Handoffs::default();
+        drafts.aim(&env("i-0007"), "my own words");
+        drafts.offer(&env("i-0007"), "brief", "my own words");
+        // The user's words go to that environment's chat: they work there.
+        assert_eq!(drafts.sent(Destination::Chat), None);
+        drafts.aim(&env("primary"), "");
+        assert_eq!(drafts.aim(&env("i-0007"), ""), BoxEdit::Leave);
+        // A brief sent elsewhere is used up, and hands nothing over.
+        drafts.offer(&env("i-0007"), "brief", "");
+        assert_eq!(drafts.in_box(), Some(&env("i-0007")));
+        assert_eq!(drafts.sent(Destination::Backlog), None);
+        assert_eq!(drafts.in_box(), None);
+    }
+
+    #[test]
+    fn a_destroyed_environments_brief_goes_with_it() {
+        let mut drafts = Handoffs::default();
+        drafts.aim(&env("i-0007"), "");
+        drafts.offer(&env("i-0007"), "brief", "");
+        assert_eq!(drafts.forget(&env("i-0007")), BoxEdit::Clear);
+        assert_eq!(drafts.in_box(), None);
+        assert_eq!(handoff_caption(&env("i-0007")), "i-0007's brief, unsent");
+    }
 
     #[test]
     fn a_destination_refuses_a_draft_it_cannot_take_and_says_why() {

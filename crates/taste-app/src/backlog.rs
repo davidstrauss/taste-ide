@@ -3679,15 +3679,27 @@ impl BacklogPanel {
     /// environment made, or started where it is. For a call to action that
     /// is not the bar.
     pub fn start_issue_by_id(&self, id: &str, host: taste_core::environment::Host) {
-        let found = self
-            .issues
+        if let Some(issue) = self.started_issue(id, host) {
+            self.start(issue.id, issue.title, issue.body, host);
+        }
+    }
+
+    /// Issue `id` as a Start hands it to the window, if the backlog has it.
+    pub fn started_issue(
+        &self,
+        id: &str,
+        host: taste_core::environment::Host,
+    ) -> Option<StartedIssue> {
+        self.issues
             .borrow()
             .iter()
             .find(|issue| issue.id == id)
-            .map(|issue| (issue.id.clone(), issue.title.clone(), issue.body.clone()));
-        if let Some((id, title, body)) = found {
-            self.start(id, title, body, host);
-        }
+            .map(|issue| StartedIssue {
+                id: issue.id.clone(),
+                title: issue.title.clone(),
+                body: issue.body.clone(),
+                host,
+            })
     }
 
     /// Hand a written issue to the window to start.

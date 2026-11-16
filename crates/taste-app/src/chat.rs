@@ -1330,6 +1330,15 @@ pub struct ChatPane {
     /// The revision of the IDE's guidance this conversation was last given
     /// (`taste_mcp::GUIDANCE_REVISION`), kept with it in workspace state.
     guidance_seen: Cell<u32>,
+    /// The issue this environment is, while its brief is withheld: the
+    /// user's Start drafted it in Dispatch rather than sending it, so the
+    /// user is the one working here, and each session's first prompt says
+    /// so ([`first_brief`]). Kept with the chat in workspace state.
+    withheld_brief: RefCell<Option<taste_core::orchestration::WithheldBrief>>,
+    /// The withheld brief while the drafted brief is on its way to the
+    /// agent, given back if the send is refused
+    /// ([`ChatPane::brief_handed_over`]).
+    handing_brief: RefCell<Option<taste_core::orchestration::WithheldBrief>>,
     /// A resumed session's replay is about to arrive, and the transcript
     /// on screen is the previous rendering of the same record: cleared
     /// when the first replayed update lands, not when the spawn begins,
@@ -1753,6 +1762,80 @@ fn revive_wanted(state: &taste_devcontainer::SupervisorState, user_initiated: bo
         // a send holds for it rather than starting a second start.
         S::Running { .. } | S::Building | S::Starting | S::Preparing { .. } => false,
         S::NoConfig | S::ConfigDetected | S::Failed { .. } | S::Stopped => true,
+    }
+}
+
+/// Which of the IDE's own briefs goes ahead of a session's first prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstBrief {
+    /// The primary's chat: the coordinator's brief.
+    Coordinator,
+    /// An issue environment whose brief the user's Start withheld: the
+    /// agent is told it is there to help the user
+    /// (`taste_core::orchestration::issue_assist_preamble`).
+    Assistant,
+    Nothing,
+}
+
+/// What goes ahead of a prompt, by the facts it turns on: only the first
+/// prompt of a session is briefed — a resumed one replays its history
+/// first and already has content — and an issue environment's only while
+/// its brief is withheld. One handed the brief has it as its first prompt.
+fn first_brief(primary: bool, withheld: bool, session_has_content: bool) -> FirstBrief {
+    if session_has_content {
+        return FirstBrief::Nothing;
+    }
+    if primary {
+        FirstBrief::Coordinator
+    } else if withheld {
+        FirstBrief::Assistant
+    } else {
+        FirstBrief::Nothing
+    }
+}
+
+/// Whether an agent connection that just closed stays closed until its
+/// environment is started again, rather than being reconnected: an issue
+/// environment's agent died with its container (`closed_by_environment`)
+/// and nothing is bringing one back — no rebuild, no move. The container
+/// was stopped on purpose — flagged for review, the user's Stop — and a
+/// reconnect could only spawn the agent outside it, which a host with no
+/// `npx` refuses and one with it should not do (2026-11-15: a review flag's
+/// stop answered with two refused launches and a note about them). The
+/// primary is exempt, as [`container_gate`] exempts it: its chat is the
+/// coordinator, which has to be able to say why it is silent.
+fn parked_by_stop(
+    primary: bool,
+    closed_by_environment: bool,
+    in_transition: bool,
+    moving: bool,
+) -> bool {
+    !primary && closed_by_environment && !in_transition && !moving
+}
+
+/// Whether a spawn asked for outside [`ChatPane::activate`] — a reconnect,
+/// a settled state's `retopologize`, a sign-in finishing — is parked
+/// instead: the gate would start the container, which only `activate` may
+/// do, and the environment is stopped, so nothing is coming. It waits for
+/// what starts the environment — a send, Start — as a chat brought on
+/// screen does ([`ContainerWait::Parked`]).
+fn parks_spawn(gate: Gate, stopped: bool) -> bool {
+    gate == Gate::StartThenHold && stopped
+}
+
+/// The transcript's line when an issue environment's container stopped
+/// under its agent, by why: one line, saying what a send now does.
+fn stopped_note(review: taste_core::ReviewState) -> &'static str {
+    use taste_core::ReviewState as R;
+    match review {
+        R::FlaggedForReview => {
+            "flagged for review, so its container stopped; sending a message starts it again"
+        }
+        R::Merged => "merged, so its container stopped; sending a message starts it again",
+        R::Rejected => "rejected, so its container stopped; sending a message starts it again",
+        R::Working => {
+            "its container stopped, and its agent with it; sending a message starts it again"
+        }
     }
 }
 
@@ -3961,6 +4044,8 @@ impl ChatPane {
             channel_failed: Cell::new(false),
             session_has_content: Cell::new(false),
             guidance_seen: Cell::new(0),
+            withheld_brief: RefCell::new(None),
+            handing_brief: RefCell::new(None),
             clear_on_replay: Cell::new(false),
             replaying: Cell::new(false),
             stash_replayed: Cell::new(false),
@@ -5779,7 +5864,7 @@ impl ChatPane {
         // own state, which in a probe is not starting.
         if matches!(
             std::env::var("TASTE_PROBE_CHAT").as_deref(),
-            Ok("starting" | "loading-sent")
+            Ok("starting" | "loading-sent" | "reviewed")
         ) {
             return;
         }
@@ -6576,7 +6661,30 @@ impl ChatPane {
             restart_when_silent: self.restart_picker.is_active(),
             environment: self.environment.clone(),
             guidance_seen: self.guidance_seen.get(),
+            withheld_brief: self.withheld_brief.borrow().clone(),
         }
+    }
+
+    /// The user's Start drafted this issue environment's brief rather than
+    /// sending it: the user is working here until the draft is sent, and
+    /// the agent's first prompt of a session says so ([`first_brief`]).
+    pub fn withhold_brief(&self, withheld: taste_core::orchestration::WithheldBrief) {
+        *self.withheld_brief.borrow_mut() = Some(withheld);
+        self.notify_persist();
+    }
+
+    /// The drafted brief went to this chat (`true`), so the issue is the
+    /// agent's after all — or that send was refused (`false`), and the
+    /// environment is the user's again. Called before the send, so the
+    /// brief is not prefaced with the preamble that would contradict it.
+    pub fn brief_handed_over(&self, handed: bool) {
+        if handed {
+            let taken = self.withheld_brief.borrow_mut().take();
+            *self.handing_brief.borrow_mut() = taken;
+        } else if let Some(withheld) = self.handing_brief.borrow_mut().take() {
+            *self.withheld_brief.borrow_mut() = Some(withheld);
+        }
+        self.notify_persist();
     }
 
     /// The registry id of the agent this chat is set to.
@@ -6606,6 +6714,7 @@ impl ChatPane {
         *self.model_value.borrow_mut() = entry.model_value.clone();
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
         self.guidance_seen.set(entry.guidance_seen);
+        *self.withheld_brief.borrow_mut() = entry.withheld_brief.clone();
         *self.config_values.borrow_mut() = entry.config_values.clone();
         self.syncing.set(true);
         self.approval_picker.set_active(entry.auto_approve);
@@ -8098,9 +8207,30 @@ impl ChatPane {
         }
         let mut taken: Vec<String> = Vec::new();
         let mut front: Vec<String> = Vec::new();
-        if self.environment.is_primary() && !self.session_has_content.get() {
-            self.meta_row("briefed as the coordinator with this prompt");
-            front.push(taste_core::orchestration::coordinator_brief());
+        let withheld = self.withheld_brief.borrow().clone();
+        match first_brief(
+            self.environment.is_primary(),
+            withheld.is_some(),
+            self.session_has_content.get(),
+        ) {
+            FirstBrief::Coordinator => {
+                self.meta_row("briefed as the coordinator with this prompt");
+                front.push(taste_core::orchestration::coordinator_brief());
+            }
+            FirstBrief::Assistant => {
+                if let Some(withheld) = withheld {
+                    self.meta_row(&format!(
+                        "told it that {} is the user's to work, with this prompt",
+                        withheld.issue
+                    ));
+                    front.push(taste_core::orchestration::issue_assist_preamble(
+                        &withheld.issue,
+                        &withheld.title,
+                        &withheld.body,
+                    ));
+                }
+            }
+            FirstBrief::Nothing => {}
         }
         // What the MCP server holds back from this agent follows the model
         // its session runs on, said at every send since the model can change.
@@ -8190,6 +8320,13 @@ impl ChatPane {
                 "the primary environment, the user's own checkout at {root}. The editor \
                  and file tree show this tree, so your edits land in what they are \
                  looking at."
+            )
+        } else if self.withheld_brief.borrow().is_some() {
+            format!(
+                "environment {}, a clone of the user's checkout at {root} with its own \
+                 container. The user is working in it themselves; do what they ask here, \
+                 and publish when they ask.",
+                self.environment
             )
         } else {
             format!(
@@ -9673,7 +9810,26 @@ impl ChatPane {
         // refused" as the transcript's only rows while the container was
         // still being asked (David, 2026-11-15). Only a hold is acted on here:
         // starting a container, or parking for one, is `activate`'s to do.
-        if container_gate(self.gate_facts().1) == Gate::Hold {
+        let (supervisor, facts) = self.gate_facts();
+        let gate = container_gate(facts);
+        let stopped = supervisor
+            .as_ref()
+            .is_some_and(|s| s.state() == taste_devcontainer::SupervisorState::Stopped);
+        if parks_spawn(gate, stopped) {
+            tracing::info!(
+                "chat {}: its environment is stopped; its agent waits for a start (resume={})",
+                self.environment,
+                resume.as_deref().unwrap_or("none")
+            );
+            if resume.is_some() {
+                *self.pending_restore.borrow_mut() = resume;
+            }
+            self.container_wait.set(ContainerWait::Parked);
+            self.sync_revive_bar();
+            self.sync_loading();
+            return;
+        }
+        if gate == Gate::Hold {
             tracing::info!(
                 "chat {}: its agent waits for its container (resume={})",
                 self.environment,
@@ -10285,8 +10441,13 @@ impl ChatPane {
                 } else if self.closed_by_environment() {
                     // Stopped rather than rebuilt: the supervisor gives up
                     // the exec target before its teardown for exactly this
-                    // reading.
-                    self.note("the agent stopped with its container");
+                    // reading. An issue environment's says why, and what a
+                    // send does now; nothing reconnects it (below).
+                    if self.environment.is_primary() {
+                        self.note("the agent stopped with its container");
+                    } else {
+                        self.note(stopped_note(self.workspace.review.state(&self.environment)));
+                    }
                 } else if let Some(e) = error {
                     self.notify(crate::notify::Moment::AgentDisconnected {
                         chat: self.notify_chat(),
@@ -10357,10 +10518,32 @@ impl ChatPane {
                     .borrow()
                     .as_ref()
                     .map(|(_, session)| session.clone());
+                // Stopped on purpose: the conversation waits, armed, for
+                // whatever starts the environment again — a send, Start —
+                // and no agent is spawned before then (`parked_by_stop`).
+                let parked = parked_by_stop(
+                    self.environment.is_primary(),
+                    self.closed_by_environment(),
+                    self.environment_in_transition(),
+                    self.moving_words().is_some(),
+                );
                 // Disconnect is not a different agent: keep the controls
                 // on screen, just disabled.
                 self.reset_session(false);
-                self.schedule_reconnect(resume);
+                if parked {
+                    tracing::info!(
+                        "chat {}: its container stopped; its agent waits for a start",
+                        self.environment
+                    );
+                    if resume.is_some() {
+                        *self.pending_restore.borrow_mut() = resume;
+                    }
+                    self.container_wait.set(ContainerWait::Parked);
+                    self.set_status("");
+                    self.sync_revive_bar();
+                } else {
+                    self.schedule_reconnect(resume);
+                }
                 self.sync_loading();
             }
         }
@@ -12720,6 +12903,33 @@ impl ChatPane {
         self.sync_loading();
     }
 
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_CHAT=reviewed`. The turn that
+    /// flagged the work, then what the chat says once the container stopped
+    /// — the note the connection's close writes (`stopped_note`) and the
+    /// line `sync_revive_bar` draws for a stopped environment, posed since
+    /// a probe's environment has no supervisor to be stopped.
+    #[doc(hidden)]
+    fn seed_reviewed_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::ContentChunk;
+        self.render_update(SessionUpdate::UserMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new("That covers it. Publish it for review.")),
+        )));
+        self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(
+                "Published to agents/i-0007 and flagged it for your review: the \
+                 composer keeps a half-typed follow-up per environment now, and the \
+                 switch test covers it.",
+            )),
+        )));
+        self.finalize_stream();
+        self.note(stopped_note(taste_core::ReviewState::FlaggedForReview));
+        self.revive_label.set_label(&format!(
+            "{} is stopped — sending will start it",
+            self.environment
+        ));
+        self.revive_bar.set_reveal_child(true);
+    }
+
     pub fn seed_transcript_for_probe(self: &Rc<Self>) {
         // `TASTE_PROBE_CHAT=empty` leaves the transcript alone, so the other
         // face of the pane — the empty page, and the composer wearing the
@@ -12740,6 +12950,14 @@ impl ChatPane {
         let chat = std::env::var("TASTE_PROBE_CHAT").unwrap_or_default();
         if matches!(chat.as_str(), "loading" | "loading-sent" | "loading-kept") {
             self.seed_loading_for_probe(&chat);
+            return;
+        }
+        // `TASTE_PROBE_CHAT=reviewed` is an issue environment's chat after
+        // its agent flagged the work for review and the container stopped
+        // under it: the note saying why, and the line above the composer
+        // saying what a send does. Nothing tries to spawn the agent again.
+        if chat == "reviewed" {
+            self.seed_reviewed_for_probe();
             return;
         }
         // `TASTE_PROBE_CHAT=acts` is the coordinator's transcript: the
@@ -18599,6 +18817,82 @@ mod tests {
             Loading::Hosting.sentence(),
             "Asking the container whether it can run the agent"
         );
+    }
+
+    #[test]
+    fn a_stopped_issue_environments_chat_does_not_spawn() {
+        // Its container stopped on purpose, flagged for review: the
+        // agent's connection closing is not reconnected...
+        assert!(parked_by_stop(false, true, false, false));
+        // ...where a rebuild or a move brings it back on its own, and the
+        // coordinator speaks whatever its container is doing.
+        assert!(!parked_by_stop(false, true, true, false));
+        assert!(!parked_by_stop(false, true, false, true));
+        assert!(!parked_by_stop(true, true, false, false));
+        assert!(!parked_by_stop(false, false, false, false));
+        // ...and every later spawn — a settled state's, a reconnect's — is
+        // parked, never put outside the container it would have started.
+        let stopped = GateFacts {
+            outside_possible: true,
+            primary: false,
+            inside_container: false,
+            gave_up: false,
+            live_agent: false,
+            env: Some(EnvGate {
+                has_exec_target: false,
+                hosting_unknown: false,
+                in_transition: false,
+                can_start: true,
+                settled_down: true,
+            }),
+        };
+        assert_eq!(container_gate(stopped), Gate::StartThenHold);
+        assert!(parks_spawn(container_gate(stopped), true));
+        // Not stopped — never built, or failed — it goes as it always did.
+        assert!(!parks_spawn(container_gate(stopped), false));
+        // Up, it spawns.
+        let up = GateFacts {
+            env: Some(EnvGate {
+                has_exec_target: true,
+                can_start: false,
+                settled_down: false,
+                ..stopped.env.unwrap()
+            }),
+            ..stopped
+        };
+        assert!(!parks_spawn(container_gate(up), false));
+    }
+
+    #[test]
+    fn the_stop_note_says_why_and_what_a_send_does() {
+        use taste_core::ReviewState as R;
+        assert_eq!(
+            stopped_note(R::FlaggedForReview),
+            "flagged for review, so its container stopped; sending a message starts it again"
+        );
+        for review in [R::Working, R::FlaggedForReview, R::Merged, R::Rejected] {
+            let note = stopped_note(review);
+            assert!(
+                note.ends_with("sending a message starts it again"),
+                "{note}"
+            );
+            assert!(!note.contains('\n'), "one line: {note}");
+        }
+    }
+
+    #[test]
+    fn the_assist_preamble_goes_on_a_sessions_first_prompt_only_while_withheld() {
+        // An issue environment the user started to work in: its first
+        // prompt carries it.
+        assert_eq!(first_brief(false, true, false), FirstBrief::Assistant);
+        // ...and only its first.
+        assert_eq!(first_brief(false, true, true), FirstBrief::Nothing);
+        // One whose brief was sent has the brief, and nothing more.
+        assert_eq!(first_brief(false, false, false), FirstBrief::Nothing);
+        // The primary's is the coordinator's, as before.
+        assert_eq!(first_brief(true, false, false), FirstBrief::Coordinator);
+        assert_eq!(first_brief(true, true, false), FirstBrief::Coordinator);
+        assert_eq!(first_brief(true, false, true), FirstBrief::Nothing);
     }
 
     #[test]

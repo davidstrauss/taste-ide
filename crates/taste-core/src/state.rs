@@ -384,6 +384,14 @@ pub struct ChatEntry {
     /// from before the revisions were counted.
     #[serde(default)]
     pub guidance_seen: u32,
+    /// The issue this environment is, when the user's Start drafted its
+    /// brief rather than sending it and the draft has not been sent: the
+    /// user is working here, and the first prompt of each session tells
+    /// the agent so (`orchestration::issue_assist_preamble`). Absent for
+    /// an environment whose agent was handed its issue, and for every
+    /// chat from before Start drafted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld_brief: Option<crate::orchestration::WithheldBrief>,
 }
 
 impl Default for ChatEntry {
@@ -401,6 +409,7 @@ impl Default for ChatEntry {
             restart_when_silent: false,
             environment: EnvironmentId::primary(),
             guidance_seen: 0,
+            withheld_brief: None,
         }
     }
 }

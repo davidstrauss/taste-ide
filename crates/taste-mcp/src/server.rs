@@ -4989,7 +4989,18 @@ impl McpServer {
         //    repository's clone makes ordinary (php-src's took the whole two
         //    minutes, 2026-10-26). The strip then records the start and
         //    sends the brief itself, and this answers that it will.
-        let brief = taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body);
+        //    The coordinator's Start sends the brief, where the user's
+        //    drafts it (`start_brief`): supervision at the orchestrator
+        //    level is a started issue worked without anyone typing.
+        let brief = match taste_core::orchestration::start_brief(
+            taste_core::orchestration::Starter::Coordinator,
+            &issue.id,
+            &issue.title,
+            &issue.body,
+        ) {
+            taste_core::orchestration::BriefDelivery::Send(brief) => brief,
+            taste_core::orchestration::BriefDelivery::Draft { text, .. } => text,
+        };
         let request = if finishing {
             OrchestrationRequest::FinishIssue {
                 env: env.clone(),

@@ -1184,12 +1184,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             console_for_judgment.rule_on_review(&branch, action)
         });
     }
+    // The one box everything is written in (compose.rs): made before the
+    // user's Start is wired, which drafts an issue's brief in it.
+    let compose = crate::compose::Compose::new(&workspace);
     {
         // Start, on an issue: the environment that IS that issue's — a
-        // clone under the issue's id — a chat in it given the issue as its
-        // first prompt, the store told who started it, and the panes aimed
-        // there. The orchestrator's `issue_start` does the same through
-        // `orchestration.rs`; this is the user's hand on the same lever.
+        // clone under the issue's id — a chat in it with its agent idle and
+        // the issue's brief drafted in Dispatch, the store told who started
+        // it, and the panes aimed there. The orchestrator's `issue_start`
+        // does the same through `orchestration.rs`, and sends the brief;
+        // this is the user's hand on the same lever.
+        let compose = compose.clone();
         let environments = environments.clone();
         let chats = chats.clone();
         let workspace = workspace.clone();
@@ -1200,6 +1205,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             start_issue(
                 &environments,
                 &chats,
+                &compose,
                 &workspace,
                 &aim_panes,
                 &console,
@@ -1266,7 +1272,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // The right column: the chat, and under it the one box everything is
     // written in (compose.rs) — a section of its own, folded like the
     // flank's, whose width is the chat's to give.
-    let compose = crate::compose::Compose::new(&workspace);
     // The controller's Start held: speech to search (see the event loop).
     let start_hold = Rc::new(crate::compose::Hold::new());
     // The three panes that are neither the terminal nor the editor take
@@ -1318,8 +1323,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         compose.set_on_commit(move |message| filetree_for_commit.commit_staged(&message));
         let chats_for_probe = chats.clone();
         compose.set_chat_available(move || chats_for_probe.readiness());
+        // ...and a drafted brief follows the panes: in the box while they
+        // are aimed at its environment, parked while they are not.
         let compose_for_readiness = compose.clone();
-        chats.set_on_readiness(move || compose_for_readiness.resync());
+        let chats_for_aim = Rc::downgrade(&chats);
+        chats.set_on_readiness(move || {
+            if let Some(chats) = chats_for_aim.upgrade() {
+                compose_for_readiness.follow_aim(&chats.current());
+            }
+            compose_for_readiness.resync();
+        });
+        // A drafted brief sent to its chat hands the issue over.
+        let chats_for_handoff = chats.clone();
+        compose.set_on_handoff(move |env, handed| {
+            if let Some(pane) = chats_for_handoff.pane_for(env) {
+                pane.brief_handed_over(handed);
+            }
+        });
         let compose_for_staged = compose.clone();
         filetree.set_on_commit_state(move |staged, blocked| {
             compose_for_staged.set_staged(staged, blocked);
@@ -2916,37 +2936,65 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if std::env::var("TASTE_PROBE_CHAT").as_deref() != Ok("none") {
             chats.seed_for_probe(probe_env);
         }
+        // `TASTE_PROBE_HANDOFF=1`: the chat's environment as the user's
+        // Start leaves it — its agent idle, the issue's brief drafted in
+        // Dispatch by the same `hand_to_user` the Start calls, once the
+        // seeded backlog has the issue. Instead of the half-typed draft and
+        // its chips, which the brief would otherwise wait behind.
+        let handoff_pose = std::env::var_os("TASTE_PROBE_HANDOFF").is_some();
+        if let (true, Some(pane)) = (handoff_pose, chats.selected()) {
+            let (compose, chats, backlog) =
+                (compose.clone(), chats.clone(), filetree.backlog().clone());
+            glib::timeout_add_local_once(std::time::Duration::from_millis(2000), move || {
+                let env = chats.current();
+                let issue = backlog
+                    .started_issue(env.as_str(), taste_core::environment::Host::Local)
+                    .unwrap_or_else(|| crate::backlog::StartedIssue {
+                        id: env.to_string(),
+                        title: "The composer loses a half-typed follow-up on switch".into(),
+                        body: String::new(),
+                        host: taste_core::environment::Host::Local,
+                    });
+                // The aim the window's own path gives the box, which a
+                // probe's seeded chat skips.
+                compose.follow_aim(&env);
+                hand_to_user(&pane, &compose, &env, &issue);
+                compose.focus();
+            });
+        }
         if let Some(pane) = chats.selected() {
-            // A half-typed follow-up while a turn is still running — which
-            // is also why the send button reads "Queue" rather than "Send".
-            compose.seed_for_probe("Also keep the Dirty filter's place while you are in there");
-            // `TASTE_PROBE_DICTATING=1`: the words the microphone has heard
-            // so far, dimmed and slanted in the box, which is the only way
-            // to see that styling without a microphone and a model.
-            if std::env::var("TASTE_PROBE_DICTATING").is_ok() {
-                compose.seed_dictating_for_probe("and while you are at it check the gauge");
-            }
-            // Chips on the box: they wrap, and each one is removable.
-            for label in ["filetree.rs:4136–4152", "ENVIRONMENTS.md"] {
+            if !handoff_pose {
+                // A half-typed follow-up while a turn is still running — which
+                // is also why the send button reads "Queue" rather than "Send".
+                compose.seed_for_probe("Also keep the Dirty filter's place while you are in there");
+                // `TASTE_PROBE_DICTATING=1`: the words the microphone has heard
+                // so far, dimmed and slanted in the box, which is the only way
+                // to see that styling without a microphone and a model.
+                if std::env::var("TASTE_PROBE_DICTATING").is_ok() {
+                    compose.seed_dictating_for_probe("and while you are at it check the gauge");
+                }
+                // Chips on the box: they wrap, and each one is removable.
+                for label in ["filetree.rs:4136–4152", "ENVIRONMENTS.md"] {
+                    compose.add_attachment(
+                        label.into(),
+                        agent_client_protocol::schema::v1::ContentBlock::Text(
+                            agent_client_protocol::schema::v1::TextContent::new("…"),
+                        ),
+                    );
+                }
+                // ...and a picture among them, because an image chip is the one
+                // that is drawn differently — a stamp of itself before its
+                // name — and a fixture with no picture in it cannot show that.
                 compose.add_attachment(
-                    label.into(),
-                    agent_client_protocol::schema::v1::ContentBlock::Text(
-                        agent_client_protocol::schema::v1::TextContent::new("…"),
+                    "hillside.png".into(),
+                    agent_client_protocol::schema::v1::ContentBlock::Image(
+                        agent_client_protocol::schema::v1::ImageContent::new(
+                            PROBE_IMAGE.to_string(),
+                            "image/png".to_string(),
+                        ),
                     ),
                 );
             }
-            // ...and a picture among them, because an image chip is the one
-            // that is drawn differently — a stamp of itself before its
-            // name — and a fixture with no picture in it cannot show that.
-            compose.add_attachment(
-                "hillside.png".into(),
-                agent_client_protocol::schema::v1::ContentBlock::Image(
-                    agent_client_protocol::schema::v1::ImageContent::new(
-                        PROBE_IMAGE.to_string(),
-                        "image/png".to_string(),
-                    ),
-                ),
-            );
             // The queue first, because the transcript's issue pills read
             // their titles from it as they render (`issue_pill`): seeded
             // after, the coordinator's "Filed i-0012" would be a pill of
@@ -5250,6 +5298,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // ...and its conversation goes with it. A chat is
                         // an environment's; there is nowhere else for it.
                         chats.forget_environment(&env);
+                        // ...and a brief drafted for it.
+                        compose.forget_handoff(&env);
                         // Including the copy stashed on this machine: it is
                         // a record of work in a checkout that no longer
                         // exists. The seven-day sweep would take it
@@ -6316,6 +6366,7 @@ fn start_url_bridge(window: &adw::ApplicationWindow, root: &std::path::Path) {
 fn start_issue(
     environments: &std::sync::Arc<taste_devcontainer::EnvironmentRegistry>,
     chats: &std::rc::Rc<crate::chats::Chats>,
+    compose: &std::rc::Rc<crate::compose::Compose>,
     workspace: &taste_core::Workspace,
     aim_panes: &std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)>,
     console: &std::rc::Rc<crate::console::Console>,
@@ -6360,6 +6411,7 @@ fn start_issue(
     let events = workspace.events.clone();
     let root = workspace.root().to_path_buf();
     let chats = chats.clone();
+    let compose = compose.clone();
     let aim_panes = aim_panes.clone();
     let console = console.clone();
     let registry = environments.clone();
@@ -6455,15 +6507,13 @@ fn start_issue(
                     }
                 });
             }
-            // The chat, prompted with the issue: what Start means.
+            // The chat, its agent brought up idle, and the issue's brief
+            // drafted in Dispatch rather than sent (`start_brief`): Enter
+            // hands the issue over, and a draft deleted or ignored leaves
+            // the environment the user's.
             if let Some(pane) = pane {
-                let prompt = issue_prompt(&issue);
                 pane.activate();
-                pane.on_ready_once(Box::new(move |pane| {
-                    if let Err(e) = pane.submit_prompt(prompt) {
-                        tracing::warn!("the issue's first prompt was not taken: {e}");
-                    }
-                }));
+                hand_to_user(&pane, &compose, &env, &issue);
             }
             // Unless the user went somewhere else while it was being made,
             // or the created event got there first.
@@ -6483,11 +6533,30 @@ fn start_issue(
     );
 }
 
-/// An issue as a first prompt: the same words the orchestrator's
-/// `issue_start` sends, so a user-started and an agent-started environment
-/// begin from one brief.
-fn issue_prompt(issue: &crate::backlog::StartedIssue) -> String {
-    taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body)
+/// What the user's Start does with the issue's brief: drafts it in Dispatch,
+/// aimed at `env`, and tells the chat it is withheld, so a session the user
+/// opens there instead knows where it is. The words are the ones the
+/// orchestrator's `issue_start` sends (`start_brief`), so a brief handed
+/// over from the draft begins the environment as an agent-started one
+/// begins.
+fn hand_to_user(
+    pane: &Rc<crate::chat::ChatPane>,
+    compose: &crate::compose::Compose,
+    env: &taste_core::environment::EnvironmentId,
+    issue: &crate::backlog::StartedIssue,
+) {
+    use taste_core::orchestration::{start_brief, BriefDelivery, Starter};
+    match start_brief(Starter::User, &issue.id, &issue.title, &issue.body) {
+        BriefDelivery::Draft { text, withheld } => {
+            pane.withhold_brief(withheld);
+            compose.offer_handoff(env, &text);
+        }
+        BriefDelivery::Send(text) => {
+            if let Err(e) = pane.submit_prompt(text) {
+                tracing::warn!("the issue's first prompt was not taken: {e}");
+            }
+        }
+    }
 }
 
 /// The editor's call to action for `env` while it is not running: stopped,
@@ -6556,7 +6625,7 @@ fn call_to_action(
         None if !env.is_primary() && filetree.backlog().has_issue(env.as_str()) => (
             format!("{name} Has No Environment"),
             "Start makes one on this machine: a clone of the project, its own container, and \
-             an agent given the issue."
+             an agent beside it, the issue's brief drafted for you to send."
                 .to_string(),
             "Start",
         ),
