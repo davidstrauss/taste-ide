@@ -38,6 +38,7 @@ async fn full_session_roundtrip() {
             SessionEvent::TurnEnded { .. } => "TurnEnded".to_string(),
             SessionEvent::QueuedJoined { count } => format!("QueuedJoined({count})"),
             SessionEvent::QueuedDropped { count } => format!("QueuedDropped({count})"),
+            SessionEvent::TurnCancelled => "TurnCancelled".to_string(),
             SessionEvent::QueuedWithdrawn { ids } => format!("QueuedWithdrawn({ids:?})"),
             SessionEvent::QueuedTaken { ids } => format!("QueuedTaken({ids:?})"),
             SessionEvent::Ready { .. } => unreachable!(),
@@ -623,4 +624,61 @@ async fn a_waiting_prompt_is_withdrawn_or_sent_next_alone() {
         !said[1].contains("first") && !said[1].contains("second"),
         "{said:?}"
     );
+}
+
+/// Every way a turn is cancelled says so to the chat (`TurnCancelled`),
+/// which is what ends the turn's IDE tool calls with it: Stop, Ctrl+Stop,
+/// and a message fast-forwarded past it. Nothing in flight, nothing said.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_turn_says_so() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client =
+        AgentClient::spawn_unconfined_for_tests(fake_agent_spec(), workspace.path().to_path_buf());
+    assert!(matches!(
+        next_event(&client).await,
+        SessionEvent::Ready { .. }
+    ));
+    // Not mid-turn: a cancel goes nowhere and is not reported.
+    client.cancel().unwrap();
+
+    async fn cancels_in_turn(client: &AgentClient) -> usize {
+        let mut cancelled = 0;
+        loop {
+            match next_event(client).await {
+                SessionEvent::TurnCancelled => cancelled += 1,
+                SessionEvent::TurnEnded { .. } => return cancelled,
+                SessionEvent::Closed(error) => panic!("closed: {error:?}"),
+                _ => {}
+            }
+        }
+    }
+    for cancel in ["stop", "stop everything", "fast-forward"] {
+        client.prompt("/slow 0.8").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        match cancel {
+            "stop" => client.cancel().unwrap(),
+            "stop everything" => client.cancel_all().unwrap(),
+            _ => {
+                let written = taste_core::queued::Queued::new(
+                    taste_core::queued::Reference::TurnStart,
+                    &Default::default(),
+                );
+                client
+                    .prompt_blocks_queued(
+                        vec![ContentBlock::Text(
+                            agent_client_protocol::schema::v1::TextContent::new("next"),
+                        )],
+                        written,
+                        Some("n".into()),
+                    )
+                    .unwrap();
+                client.expedite("n").unwrap();
+            }
+        }
+        assert_eq!(cancels_in_turn(&client).await, 1, "{cancel}");
+        if cancel == "fast-forward" {
+            // The message brought forward has its own turn.
+            assert_eq!(cancels_in_turn(&client).await, 0);
+        }
+    }
 }

@@ -149,6 +149,18 @@ pub trait RemoteFiles: Send + Sync + fmt::Debug {
     fn remove(&self, path: &Path, recursive: bool) -> io::Result<()>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn exec(&self, cwd: &Path, argv: &[String]) -> io::Result<ExecOutput>;
+    /// [`Self::exec`], ended early once `stop` says so: the program is
+    /// killed where it runs, and the answer is an `Interrupted` error. One
+    /// that cannot be ended runs to its end.
+    fn exec_until(
+        &self,
+        cwd: &Path,
+        argv: &[String],
+        stop: &dyn Fn() -> bool,
+    ) -> io::Result<ExecOutput> {
+        let _ = stop;
+        self.exec(cwd, argv)
+    }
 }
 
 /// How to reach an environment's files.
@@ -419,6 +431,21 @@ impl Files {
                 })
             }
             Files::Remote(remote) => remote.exec(cwd, argv),
+        }
+    }
+
+    /// [`Self::exec`], ended early once `stop` says so, where the files
+    /// service can end it ([`RemoteFiles::exec_until`]). This machine's
+    /// own runs to its end: nothing here runs one long enough to matter.
+    pub fn exec_until(
+        &self,
+        cwd: &Path,
+        argv: &[String],
+        stop: &dyn Fn() -> bool,
+    ) -> io::Result<ExecOutput> {
+        match self {
+            Files::Local => self.exec(cwd, argv),
+            Files::Remote(remote) => remote.exec_until(cwd, argv, stop),
         }
     }
 }

@@ -124,6 +124,11 @@ impl Jobs {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
+            // Its own process group, so a kill reaches what it started on
+            // this machine too (`taste_core::exec::stop_child`): in a
+            // container the stopper reaches those by their mark, and with
+            // the IDE's own container as the environment there is none.
+            .process_group(0)
             .spawn()
             .with_context(|| format!("spawning {}", spec.program))?;
         let stopper = spec.stopper.clone();

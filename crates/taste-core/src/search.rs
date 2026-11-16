@@ -736,6 +736,18 @@ pub fn search_via(
     query: &str,
     max_hits: usize,
 ) -> Vec<SearchHit> {
+    search_via_until(files, root, query, max_hits, &|| false)
+}
+
+/// [`search_via`], ended early once `stop` says so: the `rg` killed where
+/// it runs, and no hits.
+pub fn search_via_until(
+    files: &crate::files::Files,
+    root: &Path,
+    query: &str,
+    max_hits: usize,
+    stop: &dyn Fn() -> bool,
+) -> Vec<SearchHit> {
     if files.is_local() {
         return search(root, query, max_hits);
     }
@@ -762,7 +774,7 @@ pub fn search_via(
     .into_iter()
     .map(str::to_string)
     .collect();
-    match files.exec(root, &argv) {
+    match files.exec_until(root, &argv, stop) {
         Ok(out) => parse_rg_hits(root, &out.stdout_utf8(), max_hits),
         Err(_) => Vec::new(),
     }

@@ -55,6 +55,11 @@ const MAX_IN_FLIGHT: usize = 8;
 /// the promise that *nothing* leaves an agent waiting forever.
 const TOOL_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(150);
 
+/// What a tool call the user's Stop ended answers (`taste_core::calls`).
+const STOPPED: &str = "Stopped: the user pressed Stop, which ended this call. A command or task \
+                       run this call started was stopped with it; ones started by earlier calls \
+                       run on. A file change it was making may or may not have landed.";
+
 /// How long an orchestration question may wait on the GTK main thread.
 /// Every one of these is answered from a glib task doing no IO, so this is
 /// a wedge detector rather than a working budget.
@@ -975,6 +980,14 @@ impl McpServer {
         // A misbehaving client must not turn one connection into unbounded
         // work; in-flight tool calls are capped, not queued in the kernel.
         let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        // Requests read and waiting for a permit, capped too: past this the
+        // read itself waits, which is the backpressure. Waiting here rather
+        // than on the read is what keeps a `notifications/cancelled` for a
+        // call that holds a permit readable while every permit is held.
+        let admitted = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT * 2));
+        // This connection's tool calls by request id, for the client's
+        // `notifications/cancelled` to end one.
+        let open: Arc<Mutex<HashMap<String, taste_core::calls::CallEnd>>> = Arc::default();
 
         let mut reader = BufReader::new(read);
         let mut line = String::new();
@@ -1009,25 +1022,82 @@ impl McpServer {
                 }
             };
             let Some(id) = request.id.clone() else {
-                continue; // notification — nothing requires action yet
+                // The client gave up on one of its requests: it ends here,
+                // unanswered, as the protocol asks, and what it started is
+                // stopped. An id that is not open — unknown, or already
+                // answered — is nothing to do.
+                if request.method == "notifications/cancelled" {
+                    let key = request.params["requestId"].to_string();
+                    if let Some(call) = open.lock().unwrap().get(&key) {
+                        call.end(taste_core::calls::Ended::Cancelled);
+                    }
+                }
+                continue;
             };
             // Taken BEFORE spawning: a client that floods the socket meets
             // backpressure on the read, rather than an unbounded pile of
-            // tasks waiting their turn. The watchdog below is what
-            // guarantees a permit always comes back.
-            let Ok(permit) = permits.clone().acquire_owned().await else {
+            // tasks waiting their turn. The run permit is taken in the
+            // task, and the watchdog below is what guarantees it always
+            // comes back.
+            let Ok(admission) = admitted.clone().acquire_owned().await else {
                 break Ok(());
             };
+            // A tool call is open from the moment it is read, so a Stop or a
+            // cancel reaches it while it waits for a permit too. Not the
+            // message hook's take: the messages it takes are the user's,
+            // and an answer dropped after the take would lose them.
+            let call = (request.method == "tools/call"
+                && request.params["name"].as_str() != Some(taste_core::nudge::TAKE_TOOL))
+            .then(|| {
+                let call = self.workspace.calls.begin(&env);
+                open.lock().unwrap().insert(id.to_string(), call.handle());
+                call
+            });
             let this = self.clone();
             let responses = responses_tx.clone();
             let env = env.clone();
             let tools = tools.clone();
+            let permits = permits.clone();
+            let open = open.clone();
             tokio::spawn(async move {
-                let _permit = permit;
-                let response = this.answer(&env, &tools, request, id).await;
-                if let Ok(mut payload) = serde_json::to_vec(&response) {
-                    payload.push(b'\n');
-                    let _ = responses.send(payload);
+                let _admission = admission;
+                let key = id.to_string();
+                let stateless =
+                    request.params["_meta"][VERSION_META].as_str() == Some(STATELESS_VERSION);
+                let answer = async {
+                    let Ok(_permit) = permits.acquire_owned().await else {
+                        return Response::err(id.clone(), -32603, "the connection is closing");
+                    };
+                    this.answer(&env, &tools, request, id.clone()).await
+                };
+                // Ended first, the answer is dropped where it stands, and
+                // with it what the call started (`ide_exec`'s job, a task's
+                // run, a search's `rg`): nothing of it can answer later.
+                let response = match call {
+                    None => Some(answer.await),
+                    Some(mut call) => {
+                        let response = tokio::select! {
+                            response = answer => Some(response),
+                            why = call.ended() => match why {
+                                taste_core::calls::Ended::Cancelled => None,
+                                taste_core::calls::Ended::Stop => {
+                                    let stopped = Response::ok(
+                                        id.clone(),
+                                        tool_result(&json!({ "error": STOPPED }), true),
+                                    );
+                                    Some(if stateless { framed(stopped) } else { stopped })
+                                }
+                            },
+                        };
+                        open.lock().unwrap().remove(&key);
+                        response
+                    }
+                };
+                if let Some(response) = response {
+                    if let Ok(mut payload) = serde_json::to_vec(&response) {
+                        payload.push(b'\n');
+                        let _ = responses.send(payload);
+                    }
                 }
             });
         };
@@ -1129,18 +1199,35 @@ impl McpServer {
                 }
             }))
         };
+        // Until it is a task, the work is this call's alone: a call ended
+        // (a Stop, the client's cancel) drops this future, and the work
+        // with it, which a spawned task would otherwise outlive.
+        let mut unclaimed = AbortOnDrop(Some(work.abort_handle()));
         let ended = match tokio::time::timeout(tasks::PROMOTE_AFTER, &mut work).await {
             Ok(ended) => ended,
             Err(_) => match self.tasks.create(env, &tool, work.abort_handle()) {
                 Some(task) => {
+                    unclaimed.0 = None;
                     let this = self.clone();
                     let finished = task.clone();
+                    let owner = env.clone();
+                    // A task is still the turn's work, followed by the
+                    // client within it, so the user's Stop cancels it as it
+                    // does a call (`taste_core::calls`).
+                    let mut call = self.workspace.calls.begin(env);
                     tokio::spawn(async move {
-                        match work.await {
-                            Ok(result) => this.tasks.complete(&finished, result),
-                            // Cancelled: the cancel already said so.
-                            Err(stopped) if stopped.is_cancelled() => {}
-                            Err(_) => this.tasks.fail(&finished, "the call stopped unexpectedly"),
+                        tokio::select! {
+                            ended = &mut work => match ended {
+                                Ok(result) => this.tasks.complete(&finished, result),
+                                // Cancelled: the cancel already said so.
+                                Err(stopped) if stopped.is_cancelled() => {}
+                                Err(_) => {
+                                    this.tasks.fail(&finished, "the call stopped unexpectedly")
+                                }
+                            },
+                            _ = call.ended() => {
+                                this.tasks.cancel(&owner, &finished);
+                            }
                         }
                     });
                     return Response::ok(id, tasks::created(&self.tasks, env, &task));
@@ -2999,6 +3086,11 @@ impl McpServer {
                     exec.container_id(),
                     exec.is_inside_container(),
                 )?;
+                // Until this call answers, the job is the call's own: a
+                // call ended before then (the user's Stop, the client's
+                // cancel, the watchdog) stops it where it runs. Once the
+                // answer carries its handle, it is the agent's to collect.
+                let mut owned = StopJobOnDrop(Some((services.clone(), handle)));
                 if let Some(before) = before {
                     let mut held = services.config_before.lock().unwrap();
                     // A job never collected leaves its entry behind; the
@@ -3011,7 +3103,9 @@ impl McpServer {
                 }
                 let snapshot = jobs
                     .wait(handle, std::time::Duration::from_secs(timeout))
-                    .await?;
+                    .await;
+                owned.0 = None;
+                let snapshot = snapshot?;
                 // Into the environment's runtime log: what ran in the
                 // container and how it ended is the container's story,
                 // and its main process (`sleep infinity`) tells none.
@@ -3399,11 +3493,21 @@ impl McpServer {
                 let root = self.checkout_path(env)?;
                 let files = self.supervisor(env)?.files();
                 // One past the page: how "more" is known without a full count.
+                // A call ended before the search answers ends its `rg` too.
+                let ended = FlagOnDrop::default();
+                let stop = ended.flag();
                 let hits = tokio::task::spawn_blocking(move || {
-                    taste_core::search::search_via(&files, &root, &query, offset + limit + 1)
+                    taste_core::search::search_via_until(
+                        &files,
+                        &root,
+                        &query,
+                        offset + limit + 1,
+                        &|| stop.load(std::sync::atomic::Ordering::Relaxed),
+                    )
                 })
                 .await
                 .context("the search did not finish; call ide_search again")?;
+                drop(ended);
                 let hits: Vec<Value> = hits
                     .into_iter()
                     .map(|hit| {
@@ -4186,12 +4290,21 @@ impl McpServer {
                     .tasks
                     .start(env, &name, supervisor.exec(), true, wrapper.as_deref())
                     .map_err(|why| anyhow::anyhow!("{name} was not run: {why}"))?;
+                // This call started the run, so until it answers the run is
+                // the call's: ended before then, it stops the run. Once the
+                // answer says it is running, it runs on as the agent's.
+                let mut owned = StopTaskOnDrop(Some((
+                    self.workspace.tasks.clone(),
+                    env.clone(),
+                    name.clone(),
+                )));
                 let board = &self.workspace.tasks;
                 let woke = self
                     .wait_for(env, std::time::Duration::from_secs(wait), || {
                         board.state(env, &name) != taste_core::tasks::RunState::Running
                     })
                     .await;
+                owned.0 = None;
                 let mut report = task_report(board, env, &name, 100);
                 if woke == Woke::Message {
                     report["next"] = json!(self.woken_by_message(env));
@@ -6638,6 +6751,72 @@ fn overran_task(tool: &str, ceiling: std::time::Duration) -> String {
          started may still be running: look before calling it again.",
         ceiling.as_secs() / 60
     )
+}
+
+/// Aborts a spawned task's work when dropped, unless something took the
+/// work over first (`.0 = None`).
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(work) = self.0.take() {
+            work.abort();
+        }
+    }
+}
+
+/// Stops an `ide_exec` job where it runs when dropped, unless its call
+/// answered first (`.0 = None`): the call ended before it could hand the
+/// job over (`taste_core::calls`). The job is then collected once it has
+/// stopped, since nobody else holds its handle.
+struct StopJobOnDrop(Option<(Arc<EnvServices>, u64)>);
+
+impl Drop for StopJobOnDrop {
+    fn drop(&mut self) {
+        let Some((services, handle)) = self.0.take() else {
+            return;
+        };
+        services.config_before.lock().unwrap().remove(&handle);
+        if services.jobs.kill(handle).is_err() {
+            return; // already collected
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                // Past the stopper's grace, when what is left is killed.
+                let collect = taste_core::exec::Stopper::GRACE * 3;
+                let _ = services.jobs.wait(handle, collect).await;
+            });
+        }
+    }
+}
+
+/// Stops a task run when dropped, unless the call that started it
+/// answered first (`.0 = None`).
+struct StopTaskOnDrop(Option<(taste_core::tasks::TaskBoard, EnvironmentId, String)>);
+
+impl Drop for StopTaskOnDrop {
+    fn drop(&mut self) {
+        if let Some((board, env, name)) = self.0.take() {
+            board.stop(&env, &name);
+        }
+    }
+}
+
+/// A flag that goes up when this is dropped: how a blocking call learns
+/// that the async call waiting on it was ended.
+#[derive(Default)]
+struct FlagOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl FlagOnDrop {
+    fn flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.0.clone()
+    }
+}
+
+impl Drop for FlagOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A result as the stateless revision has every one: saying what kind of
@@ -9540,6 +9719,280 @@ mod tests {
                 .contains("devcontainer_reload"),
             "{edited}"
         );
+    }
+
+    /// A server in the self-hosting shape — an exec target, no podman —
+    /// which is how a test runs `ide_exec` for real.
+    async fn self_hosted_server(root: &Path) -> (PathBuf, taste_core::Workspace) {
+        let mut workspace = taste_core::Workspace::open(root.to_path_buf());
+        workspace.exec = ExecContext::for_tests(true);
+        let environments = EnvironmentRegistry::new_for_tests(
+            root.to_path_buf(),
+            workspace.events.clone(),
+            workspace.exec.clone(),
+            root.join("state"),
+        );
+        let packager = Packager::new(root.to_path_buf(), workspace.events.clone());
+        let server = McpServer::new(environments, packager, workspace.clone());
+        let socket = serve_on(&server, EnvironmentId::primary(), root.join("mcp.sock")).await;
+        (socket, workspace)
+    }
+
+    /// One connection, read through one buffer: answers that arrive
+    /// together are not lost between reads.
+    struct Client {
+        read: BufReader<tokio::net::unix::OwnedReadHalf>,
+        write: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    impl Client {
+        async fn connect(socket: &Path) -> Self {
+            let (read, write) = UnixStream::connect(socket).await.unwrap().into_split();
+            Self {
+                read: BufReader::new(read),
+                write,
+            }
+        }
+
+        async fn send(&mut self, message: Value) {
+            let mut payload = serde_json::to_vec(&message).unwrap();
+            payload.push(b'\n');
+            self.write.write_all(&payload).await.unwrap();
+        }
+
+        async fn exec(&mut self, id: u64, command: String) {
+            self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "ide_exec",
+                           "arguments": {"command": command, "timeout_seconds": 120}}}))
+                .await;
+        }
+
+        async fn cancel(&mut self, id: Value) {
+            self.send(
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                             "params": {"requestId": id, "reason": "the user moved on"}}),
+            )
+            .await;
+        }
+
+        /// The next message, or `None` if none comes within `wait`.
+        async fn next(&mut self, wait: std::time::Duration) -> Option<Value> {
+            let mut line = String::new();
+            match tokio::time::timeout(wait, self.read.read_line(&mut line)).await {
+                Ok(Ok(n)) if n > 0 => Some(serde_json::from_str(&line).unwrap()),
+                _ => None,
+            }
+        }
+    }
+
+    /// Whether the process `pid` has ended: gone, or a zombie nobody reaps
+    /// (a test's container may have no init to).
+    fn ended(pid: &str) -> bool {
+        match std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A command that starts a child of its own, says its pid, and waits:
+    /// the shape of a build, whose compiler is not the shell the IDE ran.
+    fn sleeper(root: &Path, pids: &str) -> String {
+        format!("sleep 600 & echo $! >> {}/{pids}; wait", root.display())
+    }
+
+    fn pids(root: &Path, file: &str) -> Vec<String> {
+        std::fs::read_to_string(root.join(file))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The user's Stop ends an `ide_exec` in flight at once — answered,
+    /// saying so — and the command it started with it, children and all.
+    #[tokio::test]
+    async fn stop_ends_an_exec_in_flight_and_what_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (socket, workspace) = self_hosted_server(root).await;
+        let primary = EnvironmentId::primary();
+        let mut client = Client::connect(&socket).await;
+
+        client.exec(1, sleeper(root, "pids")).await;
+        until("the command started", || pids(root, "pids").len() == 1).await;
+        assert_eq!(workspace.calls.in_flight(&primary), 1);
+
+        let stopped_at = std::time::Instant::now();
+        assert_eq!(workspace.calls.stop(&primary), 1);
+        let answer = client
+            .next(std::time::Duration::from_secs(5))
+            .await
+            .expect("the stopped call answers at once");
+        assert!(stopped_at.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(answer["id"], 1, "{answer}");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+        let said = answer["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(said.contains("the user pressed Stop"), "{said}");
+        let child = pids(root, "pids").remove(0);
+        until("the command's child ended", || ended(&child)).await;
+        assert_eq!(workspace.calls.in_flight(&primary), 0);
+
+        // And the connection works on.
+        client.exec(2, "echo after".into()).await;
+        let after = client
+            .next(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        let text = after["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap()["exit_code"], 0);
+    }
+
+    /// The client's `notifications/cancelled` ends that one call, stops
+    /// what it started, and leaves it unanswered, as the protocol asks;
+    /// a call it does not name runs on.
+    #[tokio::test]
+    async fn a_cancelled_call_ends_unanswered_and_its_command_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (socket, workspace) = self_hosted_server(root).await;
+        let mut client = Client::connect(&socket).await;
+
+        client.exec(7, sleeper(root, "cancelled")).await;
+        client.exec(8, sleeper(root, "kept")).await;
+        until("both commands started", || {
+            pids(root, "cancelled").len() == 1 && pids(root, "kept").len() == 1
+        })
+        .await;
+        client.cancel(json!(7)).await;
+        let child = pids(root, "cancelled").remove(0);
+        until("the cancelled command's child ended", || ended(&child)).await;
+        until("the cancelled call closed", || {
+            workspace.calls.in_flight(&EnvironmentId::primary()) == 1
+        })
+        .await;
+        assert!(!ended(&pids(root, "kept")[0]), "the other call runs on");
+
+        client
+            .send(json!({"jsonrpc": "2.0", "id": 9, "method": "ping"}))
+            .await;
+        let next = client
+            .next(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            next["id"], 9,
+            "the cancelled call is never answered: {next}"
+        );
+        assert!(client
+            .next(std::time::Duration::from_millis(500))
+            .await
+            .is_none());
+        workspace.calls.stop(&EnvironmentId::primary());
+        let kept = pids(root, "kept").remove(0);
+        until("the other command stopped too", || ended(&kept)).await;
+    }
+
+    /// A cancel for an id that is not open — never sent, or already
+    /// answered — does nothing, and the connection goes on answering.
+    #[tokio::test]
+    async fn a_cancel_for_an_unknown_or_finished_call_is_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _workspace) = self_hosted_server(dir.path()).await;
+        let mut client = Client::connect(&socket).await;
+
+        client.cancel(json!(999)).await;
+        client.cancel(json!("never-sent")).await;
+        client.exec(1, "echo done".into()).await;
+        let done = client
+            .next(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(done["id"], 1, "{done}");
+        client.cancel(json!(1)).await;
+        client
+            .send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}))
+            .await;
+        let pong = client
+            .next(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(pong["id"], 2, "{pong}");
+        assert!(pong.get("error").is_none(), "{pong}");
+        assert!(client
+            .next(std::time::Duration::from_millis(300))
+            .await
+            .is_none());
+    }
+
+    /// Ended calls give their permits back: a Stop over more calls than
+    /// may run at once answers every one, the waiting ones included, stops
+    /// every command, and leaves the connection whole.
+    #[tokio::test]
+    async fn ended_calls_give_their_permits_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (socket, workspace) = self_hosted_server(root).await;
+        let primary = EnvironmentId::primary();
+        let mut client = Client::connect(&socket).await;
+
+        let calls = MAX_IN_FLIGHT + 2;
+        for id in 0..calls {
+            client.exec(100 + id as u64, sleeper(root, "pids")).await;
+        }
+        until("as many as may run started", || {
+            pids(root, "pids").len() == MAX_IN_FLIGHT
+        })
+        .await;
+        until("every call open", || {
+            workspace.calls.in_flight(&primary) == calls
+        })
+        .await;
+        assert_eq!(workspace.calls.stop(&primary), calls);
+        let mut answered = std::collections::BTreeSet::new();
+        for _ in 0..calls {
+            let answer = client
+                .next(std::time::Duration::from_secs(5))
+                .await
+                .expect("every stopped call answers");
+            assert_eq!(answer["result"]["isError"], true, "{answer}");
+            answered.insert(answer["id"].as_u64().unwrap());
+        }
+        assert_eq!(answered.len(), calls, "each once");
+        for child in pids(root, "pids") {
+            until("every command's child ended", || ended(&child)).await;
+        }
+        assert_eq!(
+            pids(root, "pids").len(),
+            MAX_IN_FLIGHT,
+            "the waiting calls never ran"
+        );
+
+        // Every permit back: as many again run, and answer.
+        for id in 0..MAX_IN_FLIGHT {
+            client.exec(200 + id as u64, "echo again".into()).await;
+        }
+        for _ in 0..MAX_IN_FLIGHT {
+            let again = client
+                .next(std::time::Duration::from_secs(10))
+                .await
+                .expect("the permits came back");
+            assert_eq!(again["result"]["isError"], false, "{again}");
+        }
+        assert!(client
+            .next(std::time::Duration::from_millis(300))
+            .await
+            .is_none());
     }
 
     /// Safe mode has no devcontainer, so an agent command has nowhere to

@@ -9,6 +9,7 @@ pub mod agent_runtime;
 pub mod agentedit;
 pub mod anchor;
 pub mod app_log;
+pub mod calls;
 pub mod capped;
 pub mod chatarchive;
 pub mod configprint;

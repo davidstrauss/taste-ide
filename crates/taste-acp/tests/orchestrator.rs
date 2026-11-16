@@ -75,6 +75,7 @@ fn describe(event: &SessionEvent) -> String {
         SessionEvent::TurnEnded { .. } => "TurnEnded".into(),
         SessionEvent::QueuedJoined { count } => format!("QueuedJoined({count})"),
         SessionEvent::QueuedDropped { count } => format!("QueuedDropped({count})"),
+        SessionEvent::TurnCancelled => "TurnCancelled".into(),
         SessionEvent::QueuedWithdrawn { ids } => format!("QueuedWithdrawn({ids:?})"),
         SessionEvent::QueuedTaken { ids } => format!("QueuedTaken({ids:?})"),
         SessionEvent::Permission { .. } => "Permission".into(),

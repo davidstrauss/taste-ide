@@ -216,6 +216,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// not answering. Long, because an `exec` may be a `git push` of a
 /// repository or an `rg` over one.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// How often a request that may be stopped asks whether it is
+/// ([`Keeper::collect_until`]).
+const STOP_POLL: Duration = Duration::from_millis(200);
 /// Payload per data frame, both ways.
 const CHUNK: usize = 64 * 1024;
 
@@ -529,10 +532,34 @@ impl Keeper {
 
     /// Drain a request's frames to its final one.
     fn collect(&self, rx: &mpsc::Receiver<Reply>) -> io::Result<(serde_json::Value, ExecOutput)> {
+        self.collect_until(rx, None)
+    }
+
+    /// [`Self::collect`], for a request that `stop` may end: asked every
+    /// [`STOP_POLL`], and once it says so, the request's process is killed
+    /// over there and the answer is `Interrupted`. What the keeper says
+    /// after that goes nowhere: its receiver is gone.
+    fn collect_until(
+        &self,
+        rx: &mpsc::Receiver<Reply>,
+        stop: Option<(u32, &dyn Fn() -> bool)>,
+    ) -> io::Result<(serde_json::Value, ExecOutput)> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        // Since the last frame, as a single wait for one was before.
+        let mut quiet_since = std::time::Instant::now();
         loop {
-            match rx.recv_timeout(REQUEST_TIMEOUT) {
+            let left = REQUEST_TIMEOUT.saturating_sub(quiet_since.elapsed());
+            let wait = if stop.is_some() {
+                left.min(STOP_POLL)
+            } else {
+                left
+            };
+            let frame = rx.recv_timeout(wait);
+            if frame.is_ok() {
+                quiet_since = std::time::Instant::now();
+            }
+            match frame {
                 Ok(Reply::Data(bytes)) => stdout.extend_from_slice(&bytes),
                 Ok(Reply::Stderr(bytes)) => stderr.extend_from_slice(&bytes),
                 // A watch's event on a request that is not a watch: nothing
@@ -553,6 +580,19 @@ impl Keeper {
                     ));
                 }
                 Ok(Reply::Error { code, message }) => return Err(map_error(&code, &message)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+                    if stop.as_ref().is_some_and(|(_, stop)| stop()) =>
+                {
+                    if let Some((id, _)) = stop {
+                        let _ = self.send(encode(id, 2, &[]));
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "stopped before it finished",
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if quiet_since.elapsed() < REQUEST_TIMEOUT => {
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -750,6 +790,22 @@ impl RemoteFiles for Keeper {
 
     fn exec(&self, cwd: &Path, argv: &[String]) -> io::Result<ExecOutput> {
         self.exec_with_env(cwd, argv, &[])
+    }
+
+    fn exec_until(
+        &self,
+        cwd: &Path,
+        argv: &[String],
+        stop: &dyn Fn() -> bool,
+    ) -> io::Result<ExecOutput> {
+        let (id, rx) = self.request(serde_json::json!({
+            "op": "exec",
+            "cwd": cwd,
+            "argv": argv,
+            "env": {},
+        }))?;
+        let (_, output) = self.collect_until(&rx, Some((id, stop)))?;
+        Ok(output)
     }
 }
 
@@ -1122,6 +1178,43 @@ mod tests {
         );
         drop(handle);
         // The keeper is still there for other requests.
+        keeper.ping().unwrap();
+    }
+
+    /// A run its caller stops ends at once, killed over there, and the
+    /// keeper answers the next request as before.
+    #[test]
+    fn a_stopped_exec_is_killed_where_it_runs() {
+        if !node_present() {
+            eprintln!("SKIP: no node on this machine");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let keeper = Keeper::local_node_for_tests().unwrap();
+        let started = std::time::Instant::now();
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            &format!("echo $$ > {}; exec sleep 30", pid_file.display()),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let stop = || pid_file.exists() && started.elapsed() > Duration::from_millis(300);
+        let ended = keeper.exec_until(dir.path(), &argv, &stop).unwrap_err();
+        assert_eq!(ended.kind(), io::ErrorKind::Interrupted, "{ended}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it ended at once"
+        );
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let proc = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while proc.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!proc.exists(), "the sleep was killed");
         keeper.ping().unwrap();
     }
 

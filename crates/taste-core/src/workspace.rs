@@ -104,6 +104,10 @@ pub struct Workspace {
     /// chat pane asks, and the MCP server tells at the agent's next tool
     /// result.
     pub nudges: crate::nudge::Nudges,
+    /// The IDE tool calls each environment's agent has in flight
+    /// ([`crate::calls`]): the MCP server opens them, and the chat's Stop
+    /// ends them.
+    pub calls: crate::calls::Calls,
     /// The model ids each agent has advertised here ([`crate::models`]):
     /// written by the chats as their sessions say, read by the MCP server's
     /// tool list and checked by a start.
@@ -144,6 +148,7 @@ impl Workspace {
             passkeys,
             tasks,
             nudges: crate::nudge::Nudges::default(),
+            calls: crate::calls::Calls::default(),
             models: crate::models::AdvertisedModels::default(),
         }
     }

@@ -106,12 +106,15 @@ impl Stopper {
 
 /// Stop `child` as its spec says: Ctrl+C where it runs, its exit waited for
 /// [`Stopper::GRACE`], then SIGKILL there and to the child. With no stopper
-/// the child is all there is, and is killed.
+/// the child is all there is, and is killed — with its process group, when
+/// it was started as one's leader (`process_group(0)`), so a shell's own
+/// children go with it rather than being left to run.
 pub async fn stop_child(
     stopper: Option<&Stopper>,
     child: &mut tokio::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
     let Some(stopper) = stopper else {
+        kill_group(child);
         let _ = child.start_kill();
         return child.wait().await;
     };
@@ -120,8 +123,21 @@ pub async fn stop_child(
         Ok(status) => status,
         Err(_) => {
             stopper.kill();
+            kill_group(child);
             let _ = child.start_kill();
             child.wait().await
+        }
+    }
+}
+
+/// SIGKILL to the process group `child` leads, if it leads one. A child
+/// that does not names no group: no group can have the id of a live process
+/// that is not its leader, so this then signals nothing.
+fn kill_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: killpg takes plain integers and touches no memory.
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
         }
     }
 }

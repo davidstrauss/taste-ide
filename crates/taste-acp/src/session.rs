@@ -141,6 +141,12 @@ pub enum SessionEvent {
     /// agent to read within it ([`Command::TakeWaiting`]), and will not be
     /// sent after it.
     QueuedTaken { ids: Vec<String> },
+    /// `session/cancel` went to the agent for the turn in flight — the
+    /// user's Stop, Ctrl+Stop, or a message fast-forwarded past it — so the
+    /// IDE ends that turn's own work too: its environment's IDE tool calls
+    /// in flight (`taste_core::calls`). The turn itself ends with
+    /// [`SessionEvent::TurnEnded`], when the agent says so.
+    TurnCancelled,
     /// A turn finished, with the agent's session-cumulative token usage
     /// when it reports one.
     TurnEnded {
@@ -1518,11 +1524,13 @@ async fn serve_commands(
                                 connection.send_notification(
                                     CancelNotification::new(session_id.clone()),
                                 )?;
+                                let _ = event_tx.send(SessionEvent::TurnCancelled).await;
                             }
                             Ok(Command::CancelAll) => {
                                 connection.send_notification(
                                     CancelNotification::new(session_id.clone()),
                                 )?;
+                                let _ = event_tx.send(SessionEvent::TurnCancelled).await;
                                 // What waits behind the turn goes too; a
                                 // mode or a setting changed meanwhile stays.
                                 let before = queued.len();
@@ -1574,6 +1582,7 @@ async fn serve_commands(
                                     connection.send_notification(CancelNotification::new(
                                         session_id.clone(),
                                     ))?;
+                                    let _ = event_tx.send(SessionEvent::TurnCancelled).await;
                                     if !dropped.is_empty() {
                                         let _ = event_tx
                                             .send(SessionEvent::QueuedWithdrawn { ids: dropped })

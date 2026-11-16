@@ -10004,6 +10004,19 @@ impl ChatPane {
             SessionEvent::QueuedDropped { count } => self.withdraw_queued(count),
             SessionEvent::QueuedWithdrawn { ids } => self.withdraw_prompts(&ids),
             SessionEvent::QueuedTaken { ids } => self.taken_within_turn(&ids),
+            // The turn's own work in the IDE ends with it, at once, rather
+            // than when its agent gets round to abandoning each call: a
+            // tool call in flight answers that it was stopped, and the
+            // command it started stops where it runs (`taste_core::calls`).
+            SessionEvent::TurnCancelled => {
+                let ended = self.workspace.calls.stop(&self.environment);
+                if ended > 0 {
+                    tracing::info!(
+                        "chat {}: Stop ended {ended} IDE tool call(s) in flight",
+                        self.environment
+                    );
+                }
+            }
             SessionEvent::QueuedJoined { count } => {
                 // The prompt that just went out carries the next `count`
                 // messages too: each is taken where the first was, in order.
@@ -14457,7 +14470,9 @@ impl ChatPane {
              conclusion was that the original had none. What they buy is structural, and it \
              matters for how you'd phrase it to the security team:\n\n",
         );
-        for n in 1..=8 {
+        // From 5, so the list crosses from one digit to two: its periods
+        // stand in one column (`markdown_view::figure_pad`).
+        for n in 5..=12 {
             text.push_str(&format!(
                 "{n}. A point about the rules' structure, long enough to wrap in a narrow \
                  column, number {n}.\n"
@@ -17595,6 +17610,7 @@ fn session_event_label(event: &SessionEvent) -> String {
         SessionEvent::Permission { .. } => "a permission request".into(),
         SessionEvent::Elicitation { .. } => "questions".into(),
         SessionEvent::Withdrawn => "a question taken back".into(),
+        SessionEvent::TurnCancelled => "the turn cancelled".into(),
         SessionEvent::PromptFailed { .. } => "a failed prompt".into(),
         SessionEvent::Closed(_) => "the session closing".into(),
         _ => "a session event".into(),

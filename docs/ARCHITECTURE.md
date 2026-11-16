@@ -1489,7 +1489,20 @@ it, and carries its actions.
   active file, any file (embedded text resource), or an image (base64) as
   prompt content blocks, shown as removable chips until sent.
 - **Stop** cancels the in-flight turn (`session/cancel`); the prompt
-  resolves with `Cancelled` rather than being torn down.
+  resolves with `Cancelled` rather than being torn down. The IDE ends the
+  turn's own work at the same moment rather than leaving it to the agent
+  (`taste_core::calls`): every IDE tool call that environment's agent has
+  in flight answers at once that the user stopped it, and what the call
+  started is stopped where it runs — an `ide_exec` command and its
+  children, by the run's mark in the container; a task run that `task_run`
+  started and is still waiting on; a search's `rg`. Work an earlier call
+  handed back to run on — an `ide_exec` that returned a handle, a task run
+  whose `task_run` answered — is the agent's, and Stop leaves it; the
+  console's Kill and the Tasks section stop those. The same ending follows
+  an MCP client's `notifications/cancelled` for one call, which is not
+  answered, as the protocol asks. Every path that cancels a turn (Stop,
+  Ctrl+Stop, a held Stop, a message fast-forwarded past the turn) does
+  this, because the session reports each as `TurnCancelled`.
 - **Utilization**: session-cumulative token usage (in/out/total/cached)
   from each turn's response renders in the pane footer. Account-level
   quotas (5-hour/weekly limits) are not modeled by ACP; agents announce
