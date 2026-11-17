@@ -493,6 +493,24 @@ fn reconnect_wanted(has_session: bool, something_owed: bool) -> bool {
     has_session || something_owed
 }
 
+/// Why a typed send was not taken, when this chat has no agent and nothing
+/// is bringing one up: the container's refusal to host it first, since
+/// that is the cause a launch outside the container only follows from,
+/// then the launch's own refusal. A send tries the launch again
+/// (`activate`), so a cause that has cleared is not reported.
+fn unsent_why(agent: &str, hosting_refusal: Option<&str>, launch_refused: Option<&str>) -> String {
+    match (hosting_refusal, launch_refused) {
+        (Some(hosting), Some(launch)) => format!(
+            "{agent} could not start: its container cannot host it ({hosting}), and {launch}"
+        ),
+        (None, Some(launch)) => format!("{agent} could not start: {launch}"),
+        (Some(hosting), None) => {
+            format!("{agent} is not running, and its container cannot host it: {hosting}")
+        }
+        (None, None) => format!("{agent} is not running, and nothing is starting it"),
+    }
+}
+
 /// What a held prompt's badge says, which is the whole of what a reader
 /// gets about why their message has not gone yet. It names the thing being
 /// waited for: "queued" alone is what a mid-turn send says, and none of
@@ -4873,11 +4891,7 @@ impl ChatPane {
                 });
             }
             Delivery::Refuse => {
-                return Err(format!(
-                    "{} has no live agent in this chat right now, and nothing is \
-                     bringing one up; it reconnects on its own, so try again shortly",
-                    self.agent_name()
-                ));
+                return Err(self.unsent_why());
             }
         }
         // Not a jump to the bottom: this is an orchestrator's message, not
@@ -6310,6 +6324,23 @@ impl ChatPane {
 
     /// The refused launch's note: what the spawn said about this machine,
     /// then where the container stands, read now.
+    /// [`unsent_why`], from what this chat knows now: the container's
+    /// refusal to host its agent, and a launch refused and not since
+    /// retried into a live agent.
+    fn unsent_why(&self) -> String {
+        let refused = self.refused_error.borrow();
+        let launch = self
+            .refused_launch
+            .borrow()
+            .is_some()
+            .then_some(refused.as_str());
+        unsent_why(
+            &self.agent_name(),
+            self.hosting_refusal.borrow().as_deref(),
+            launch,
+        )
+    }
+
     fn launch_refusal_note(&self) -> String {
         let error = self.refused_error.borrow().clone();
         match self.container_standing() {
@@ -9773,10 +9804,22 @@ impl ChatPane {
         // launch must not eat the prompt.
         self.activate();
         if self.client.borrow().is_none() {
-            return Err(format!(
-                "{} has no live agent right now; it reconnects on its own — try again shortly",
-                self.agent_name()
-            ));
+            // An agent on its way — a reconnect armed, its container coming
+            // up, the container being asked whether it can host one — takes
+            // the message when it is up, and the card says it is waiting.
+            if loading(&self.loading_facts()).is_some() {
+                let facts = self.send_facts();
+                let for_the_environment =
+                    facts.awaiting_container || facts.environment_in_transition;
+                self.hold_send(&text, attachments, for_the_environment, true);
+                return Ok(());
+            }
+            // Nothing is: say why, rather than promising a reconnect that
+            // nothing is going to make. This used to say "it reconnects on
+            // its own — try again shortly" whatever the reason, and over an
+            // agent whose launch had been refused it never did (David,
+            // 2026-11-17: "That's false.").
+            return Err(self.unsent_why());
         }
 
         // Sending returns you to the end of the conversation. Reading back
@@ -19461,6 +19504,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A send refused because nothing is bringing an agent up says why,
+    /// and never that one is on its way: it once said "it reconnects on
+    /// its own — try again shortly" over a launch refused for good
+    /// (2026-11-17, the IDE's node unable to run in the container and no
+    /// `npx` outside it).
+    #[test]
+    fn a_refused_send_says_why_and_promises_nothing() {
+        let hosting = "x has no node the agent can run on";
+        let launch = "this machine has no npx to run this agent outside a container";
+        let cases = [
+            unsent_why("Claude Code", Some(hosting), Some(launch)),
+            unsent_why("Claude Code", None, Some(launch)),
+            unsent_why("Claude Code", Some(hosting), None),
+            unsent_why("Claude Code", None, None),
+        ];
+        for said in &cases {
+            assert!(said.starts_with("Claude Code "), "{said}");
+            for promise in ["reconnect", "shortly", "try again"] {
+                assert!(!said.contains(promise), "promises a retry: {said}");
+            }
+        }
+        assert!(
+            cases[0].contains(hosting) && cases[0].contains(launch),
+            "{}",
+            cases[0]
+        );
+        assert!(cases[1].contains(launch), "{}", cases[1]);
+        assert!(cases[2].contains(hosting), "{}", cases[2]);
     }
 
     /// An edit through the IDE's tools is shaped as Claude Code's own: a

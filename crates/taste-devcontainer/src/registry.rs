@@ -2360,9 +2360,14 @@ impl EnvironmentRegistry {
                 &vm.domain,
                 format!(
                     "the agent's node is {build}, {} ({} ms)",
+                    // What the deploy said is whichever of Task, Compose,
+                    // and the adapter did not arrive, in its own words.
                     match said {
-                        None => format!("Task {} beside it", taste_core::tasks::IDE_TASK_VERSION),
-                        Some(said) => format!("and the IDE's Task is not: {said}"),
+                        None => format!(
+                            "with Task {}, Compose, and the adapter beside it",
+                            taste_core::tasks::IDE_TASK_VERSION
+                        ),
+                        Some(said) => format!("but not everything beside it arrived: {said}"),
                     },
                     deploying.elapsed().as_millis().max(1)
                 ),

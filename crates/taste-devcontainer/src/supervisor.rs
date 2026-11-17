@@ -3247,9 +3247,19 @@ impl Supervisor {
         let writable = format!("mkdir -p {home} 2>/dev/null; test -w {home}");
 
         // Our node first (`crate::agentnode`), the image's own after it.
-        let ours = self
-            .run_captured(sh(crate::agentnode::PROBE.into()))
-            .await
+        let probed = self.run_captured(sh(crate::agentnode::PROBE.into())).await;
+        // What our node said when it was there and would not run — the
+        // probe's last line, after podman's own words for a failed exec.
+        let ours_said = probed.as_ref().err().and_then(|e| {
+            let said = e.to_string();
+            let said = said
+                .strip_prefix("podman exec failed: ")
+                .unwrap_or(&said)
+                .trim()
+                .to_string();
+            (said != "no output" && !said.is_empty()).then_some(said)
+        });
+        let ours = probed
             .ok()
             .map(|bin| bin.trim().to_string())
             .filter(|bin| !bin.is_empty());
@@ -3284,11 +3294,16 @@ impl Supervisor {
                 .is_err()
         {
             AgentHosting::No {
-                reason: format!(
-                    "{name} has no node the agent can run on: the IDE's own did not run \
-                     there (an Alpine image's C library is not supported yet) and the image \
-                     carries none"
-                ),
+                reason: match ours_said {
+                    Some(said) => format!(
+                        "{name} has no node the agent can run on: the IDE's own would not \
+                         run there ({said}), and the image carries none"
+                    ),
+                    None => format!(
+                        "{name} has no node the agent can run on: the IDE's own is not \
+                         mounted there, and the image carries none"
+                    ),
+                },
             }
         } else {
             match self.run_captured(sh(writable)).await {

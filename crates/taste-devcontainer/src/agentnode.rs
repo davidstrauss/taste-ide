@@ -60,13 +60,24 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
-/// The node the agent runs on: the current LTS when pinned. Bump it with
-/// both sums below, from `https://nodejs.org/dist/v<version>/SHASUMS256.txt`.
-pub const NODE_VERSION: &str = "26.13.1";
-/// `node-v26.13.1-linux-x64.tar.gz`.
-const NODE_SHA256_X64: &str = "518674de2b621728a5e4486f5fb3b7d2900bb3cc4aa97969edaa463db99f9778";
-/// `node-v26.13.1-linux-arm64.tar.gz`.
-const NODE_SHA256_ARM64: &str = "80a330b35415382878df18d41afbd106ea89bfb3be0087d6608e289a14c5cc7d";
+/// The node the agent runs on: the newest LTS whose official build needs
+/// nothing a base system may lack. Bump it with both sums below, from
+/// `https://nodejs.org/dist/v<version>/SHASUMS256.txt` — and read the
+/// build's `readelf -d bin/node | grep NEEDED` first, against glibc,
+/// libstdc++, and libgcc_s, which are all it may ask for.
+///
+/// **Not Node 26.** Its x64 build links `libatomic.so.1` (24's does not),
+/// which Fedora CoreOS does not ship and many images do not either: in the
+/// VM, where `npm` installs the adapter, it would not start, so no adapter
+/// was installed; and in a container whose image lacked the library it was
+/// no node at all, so the agent could not move in and, with no `npx` on the
+/// host, did not start anywhere (26.13.1 from 2026-11-14 to 2026-11-17).
+/// Node 24 is in maintenance LTS until April 2028.
+pub const NODE_VERSION: &str = "24.22.3";
+/// `node-v24.22.3-linux-x64.tar.gz`.
+const NODE_SHA256_X64: &str = "061ec3e3062115705b56b51fa9cc330ab50d34b6969387d4e4b1a50c6809acc2";
+/// `node-v24.22.3-linux-arm64.tar.gz`.
+const NODE_SHA256_ARM64: &str = "261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8";
 
 /// Where the runtime directory is mounted in an environment's container.
 pub const IN_CONTAINER: &str = taste_core::agent_runtime::IN_CONTAINER;
@@ -168,8 +179,9 @@ echo "$name"
 
 /// Make sure the VM at `ssh_port` has the pinned node and Task in
 /// [`guest_dir`], fetching them the first time. Blocking; the node build's
-/// directory name back, and what the fetch said on its way — Task not
-/// arriving, which the node's deploy goes on without.
+/// directory name back, and what the fetch said on its way — Task,
+/// Compose, or the adapter not arriving, which the node's deploy goes on
+/// without.
 pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Option<String>)> {
     let keys = crate::keys::Keys::for_workspace(workspace_root);
     let dir = guest_dir().display().to_string();
@@ -246,10 +258,16 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Opt
 
 /// Run in an environment's container: the `bin` directory of the pinned
 /// node, when it is mounted and actually runs there, printed; exit 1
-/// otherwise. Running it is the test, because a build this C library
-/// cannot load is present and useless.
-pub const PROBE: &str = r#"for d in /opt/taste-agent/node-v26.13.1-linux-*; do
-  if [ -x "$d/bin/node" ] && "$d/bin/node" --version >/dev/null 2>&1; then echo "$d/bin"; exit 0; fi
+/// otherwise, with what the node said on stderr when it is there and would
+/// not run. Running it is the test, because a build this C library cannot
+/// load is present and useless — and what it said is the reason, which a
+/// guess at one (an Alpine image's C library) once stood in for while the
+/// real one was a library the image did not carry (2026-11-17).
+pub const PROBE: &str = r#"for d in /opt/taste-agent/node-v24.22.3-linux-*; do
+  if [ -x "$d/bin/node" ]; then
+    if said=$("$d/bin/node" --version 2>&1); then echo "$d/bin"; exit 0; fi
+    printf '%s\n' "$said" >&2
+  fi
 done
 exit 1"#;
 
