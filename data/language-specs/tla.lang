@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TLA+ (https://lamport.azurewebsites.net/tla/tla.html) for GtkSourceView,
+  which ships no definition of its own (David, 2026-11-16: "Can we get
+  syntax highlighting for TLA+ files?"). The module's frame, its keywords
+  and proof language, the ASCII forms of its operators (`\A`, `/\`, `\in`,
+  `[]`, `~>`), the names a line defines (`Next ==`, `Op(x) ==`), proof
+  steps (`<1>2.`), and a PlusCal algorithm inside the comment it is
+  written in, which is code and is drawn as code. The app
+  registers it with the language manager at startup
+  (crates/taste-app/src/languages.rs).
+-->
+<language id="tla" name="TLA+" version="2.0" _section="Scientific">
+  <metadata>
+    <property name="mimetypes">text/x-tla</property>
+    <property name="globs">*.tla</property>
+    <property name="line-comment-start">\*</property>
+    <property name="block-comment-start">(*</property>
+    <property name="block-comment-end">*)</property>
+  </metadata>
+
+  <styles>
+    <style id="comment" name="Comment" map-to="def:comment"/>
+    <style id="module" name="Module" map-to="def:preprocessor"/>
+    <style id="keyword" name="Keyword" map-to="def:keyword"/>
+    <style id="proof" name="Proof" map-to="def:keyword"/>
+    <style id="step" name="Proof Step" map-to="def:special-constant"/>
+    <style id="definition" name="Definition" map-to="def:function"/>
+    <style id="constant" name="Constant" map-to="def:special-constant"/>
+    <style id="string" name="String" map-to="def:string"/>
+    <style id="escape" name="Escape" map-to="def:special-char"/>
+    <style id="number" name="Number" map-to="def:number"/>
+    <style id="operator" name="Operator" map-to="def:operator"/>
+    <style id="pluscal" name="PlusCal Keyword" map-to="def:keyword"/>
+    <style id="label" name="Label" map-to="def:special-constant"/>
+  </styles>
+
+  <definitions>
+    <context id="line-comment" style-ref="comment" end-at-line-end="true" class="comment" class-disabled="no-spell-check">
+      <start>\\\*</start>
+      <include>
+        <context ref="def:in-comment"/>
+      </include>
+    </context>
+
+    <!-- Block comments nest in TLA+. -->
+    <context id="block-comment" style-ref="comment" class="comment" class-disabled="no-spell-check">
+      <start>\(\*</start>
+      <end>\*\)</end>
+      <include>
+        <context ref="def:in-comment"/>
+        <context ref="block-comment"/>
+      </include>
+    </context>
+
+    <!-- `- - - - MODULE Name - - - -` and the `====` that ends it, and the
+         `- - - -` lines that divide a module. -->
+    <context id="module-header" style-ref="module">
+      <match>^\s*-{4,}\s*MODULE\s+[A-Za-z0-9_]+\s*-{4,}\s*$</match>
+    </context>
+    <context id="module-rule" style-ref="module">
+      <match>^\s*(={4,}|-{4,})\s*$</match>
+    </context>
+
+    <context id="escape" style-ref="escape">
+      <match>\\[\\"ntfr]</match>
+    </context>
+
+    <context id="string" style-ref="string" class="string" class-disabled="no-spell-check">
+      <start>"</start>
+      <end>"</end>
+      <include>
+        <context ref="escape"/>
+      </include>
+    </context>
+
+    <!-- Decimal, and `\b1010`, `\o17`, `\hFF`. -->
+    <context id="number" style-ref="number">
+      <match>(?&lt;![A-Za-z0-9_])(\\[bB][01]+|\\[oO][0-7]+|\\[hH][0-9A-Fa-f]+|[0-9]+(\.[0-9]+)?)(?![A-Za-z0-9_])</match>
+    </context>
+
+    <!-- A name a line defines: `Next ==`, `Op(a, b) ==`, `f[x \in S] ==`,
+         `LOCAL Op ==`, and a named assumption or theorem's
+         `THEOREM Safety ==`; an infix operator's `a ++ b ==` is left as is. -->
+    <context id="definition">
+      <match>^\s*(?:(LOCAL|RECURSIVE|ASSUME|ASSUMPTION|AXIOM|THEOREM|LEMMA|COROLLARY|PROPOSITION)\s+)?([A-Za-z_][A-Za-z0-9_]*)(?=\s*(?:\([^()]*\)|\[[^\[\]]*\])?\s*==)</match>
+      <include>
+        <context sub-pattern="1" style-ref="keyword"/>
+        <context sub-pattern="2" style-ref="definition"/>
+      </include>
+    </context>
+
+    <!-- `<1>`, `<2>3.`, `<1>a`, `<*>`, `<+>`. -->
+    <context id="step" style-ref="step">
+      <match>&lt;([0-9]+|\*|\+)&gt;[A-Za-z0-9_]*\.*</match>
+    </context>
+
+    <context id="keywords" style-ref="keyword">
+      <keyword>ACTION</keyword>
+      <keyword>ASSUME</keyword>
+      <keyword>ASSUMPTION</keyword>
+      <keyword>AXIOM</keyword>
+      <keyword>CASE</keyword>
+      <keyword>CHOOSE</keyword>
+      <keyword>CONSTANT</keyword>
+      <keyword>CONSTANTS</keyword>
+      <keyword>DOMAIN</keyword>
+      <keyword>ELSE</keyword>
+      <keyword>ENABLED</keyword>
+      <keyword>EXCEPT</keyword>
+      <keyword>EXTENDS</keyword>
+      <keyword>IF</keyword>
+      <keyword>IN</keyword>
+      <keyword>INSTANCE</keyword>
+      <keyword>LAMBDA</keyword>
+      <keyword>LET</keyword>
+      <keyword>LOCAL</keyword>
+      <keyword>MODULE</keyword>
+      <keyword>OTHER</keyword>
+      <keyword>PARAMETER</keyword>
+      <keyword>PARAMETERS</keyword>
+      <keyword>RECURSIVE</keyword>
+      <keyword>STATE</keyword>
+      <keyword>SUBSET</keyword>
+      <keyword>TEMPORAL</keyword>
+      <keyword>THEN</keyword>
+      <keyword>UNCHANGED</keyword>
+      <keyword>UNION</keyword>
+      <keyword>VARIABLE</keyword>
+      <keyword>VARIABLES</keyword>
+      <keyword>WITH</keyword>
+    </context>
+
+    <!-- The proof language, TLAPS's. -->
+    <context id="proof" style-ref="proof">
+      <keyword>BY</keyword>
+      <keyword>COROLLARY</keyword>
+      <keyword>DEF</keyword>
+      <keyword>DEFINE</keyword>
+      <keyword>DEFS</keyword>
+      <keyword>HAVE</keyword>
+      <keyword>HIDE</keyword>
+      <keyword>LEMMA</keyword>
+      <keyword>NEW</keyword>
+      <keyword>OBVIOUS</keyword>
+      <keyword>OMITTED</keyword>
+      <keyword>ONLY</keyword>
+      <keyword>PICK</keyword>
+      <keyword>PROOF</keyword>
+      <keyword>PROPOSITION</keyword>
+      <keyword>PROVE</keyword>
+      <keyword>QED</keyword>
+      <keyword>SUFFICES</keyword>
+      <keyword>TAKE</keyword>
+      <keyword>THEOREM</keyword>
+      <keyword>USE</keyword>
+      <keyword>WITNESS</keyword>
+    </context>
+
+    <context id="constants" style-ref="constant">
+      <keyword>TRUE</keyword>
+      <keyword>FALSE</keyword>
+      <keyword>BOOLEAN</keyword>
+      <keyword>STRING</keyword>
+      <keyword>Nat</keyword>
+      <keyword>Int</keyword>
+      <keyword>Real</keyword>
+    </context>
+
+    <!-- Fairness, whose subscript follows without a space: `WF_vars(A)`. -->
+    <context id="fairness" style-ref="keyword">
+      <match>(?&lt;![A-Za-z0-9_])[WS]F_</match>
+    </context>
+
+    <!-- The backslash operators by name: `\A`, `\in`, `\subseteq`, `\X`. -->
+    <context id="named-operator" style-ref="operator">
+      <match>\\(AA|EE|A|E|in|notin|cup|cap|union|intersect|subseteq|subset|supseteq|supset|sqsubseteq|sqsupseteq|sqsubset|sqsupset|sqcup|sqcap|times|X|div|o|circ|cdot|oplus|ominus|otimes|oslash|odot|uplus|leq|geq|ll|gg|prec|preceq|succ|succeq|sim|simeq|approx|cong|asymp|doteq|propto|equiv|neg|lnot|land|lor|bigcirc|bullet|star|wr|leadsto)(?![A-Za-z0-9_])</match>
+    </context>
+
+    <!-- The symbolic ones: `/\`, `\/`, `=>`, `<=>`, `[]`, `<>`, `~>`,
+         `-+->`, `==`, `|->`, `->`, `<<`, `>>`, `#`, `/=`, `'`, `@`. -->
+    <context id="symbol-operator" style-ref="operator">
+      <match>/\\|\\/|-\+-&gt;|&lt;=&gt;|=&gt;|\|-&gt;|-&gt;|&lt;-|~&gt;|\[\]|&lt;&gt;|&lt;&lt;|&gt;&gt;|==|/=|#|=&lt;|&lt;=|&gt;=|:&gt;|@@|\.\.|[~'=&lt;&gt;+\-*/^%|&amp;@:]</match>
+    </context>
+
+    <!-- A PlusCal algorithm, written in a comment for the translator to
+         read: code, and drawn as code, its own statements and labels on
+         top of the TLA+ expressions it is made of. -->
+    <context id="pluscal-keywords" style-ref="pluscal">
+      <keyword>algorithm</keyword>
+      <keyword>assert</keyword>
+      <keyword>await</keyword>
+      <keyword>begin</keyword>
+      <keyword>call</keyword>
+      <keyword>define</keyword>
+      <keyword>do</keyword>
+      <keyword>either</keyword>
+      <keyword>else</keyword>
+      <keyword>elsif</keyword>
+      <keyword>end</keyword>
+      <keyword>fair</keyword>
+      <keyword>goto</keyword>
+      <keyword>if</keyword>
+      <keyword>macro</keyword>
+      <keyword>or</keyword>
+      <keyword>print</keyword>
+      <keyword>procedure</keyword>
+      <keyword>process</keyword>
+      <keyword>return</keyword>
+      <keyword>skip</keyword>
+      <keyword>then</keyword>
+      <keyword>variable</keyword>
+      <keyword>variables</keyword>
+      <keyword>when</keyword>
+      <keyword>while</keyword>
+      <keyword>with</keyword>
+    </context>
+
+    <!-- `Lbl:` at a statement's start, `Lbl:+` and `Lbl:-` too; not `x := …`. -->
+    <context id="pluscal-label">
+      <match>^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:(?![=:])[+-]?</match>
+      <include>
+        <context sub-pattern="1" style-ref="label"/>
+      </include>
+    </context>
+
+    <context id="pluscal">
+      <start>(\(\*)\s*(--(?:fair\s+)?algorithm)\b</start>
+      <end>\*\)</end>
+      <include>
+        <context sub-pattern="1" where="start" style-ref="comment"/>
+        <context sub-pattern="2" where="start" style-ref="pluscal"/>
+        <context sub-pattern="0" where="end" style-ref="comment"/>
+        <context ref="line-comment"/>
+        <context ref="block-comment"/>
+        <context ref="string"/>
+        <context ref="pluscal-label"/>
+        <context ref="pluscal-keywords"/>
+        <context ref="definition"/>
+        <context ref="keywords"/>
+        <context ref="constants"/>
+        <context ref="fairness"/>
+        <context ref="named-operator"/>
+        <context ref="number"/>
+        <context ref="symbol-operator"/>
+      </include>
+    </context>
+
+    <context id="tla" class="no-spell-check">
+      <include>
+        <context ref="pluscal"/>
+        <context ref="line-comment"/>
+        <context ref="block-comment"/>
+        <context ref="module-header"/>
+        <context ref="module-rule"/>
+        <context ref="string"/>
+        <context ref="step"/>
+        <context ref="definition"/>
+        <context ref="keywords"/>
+        <context ref="proof"/>
+        <context ref="constants"/>
+        <context ref="fairness"/>
+        <context ref="named-operator"/>
+        <context ref="number"/>
+        <context ref="symbol-operator"/>
+      </include>
+    </context>
+  </definitions>
+</language>

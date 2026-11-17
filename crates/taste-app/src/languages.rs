@@ -2,7 +2,8 @@
 //!
 //! GtkSourceView compiles its language definitions into the library, and
 //! has none for Typst (David, 2026-10-05: "Can I get syntax highlighting
-//! for .typ?"), and its JSON one is too slow for a notebook's pictures
+//! for .typ?") or TLA+ (2026-11-16: "Can we get syntax highlighting for
+//! TLA+ files?"), and its JSON one is too slow for a notebook's pictures
 //! (`ipynb.lang`). Ours live in `data/language-specs/`, are compiled into the
 //! binary, and are written at startup into a directory of the IDE's cache
 //! that goes first on the language manager's search path — so they work
@@ -14,6 +15,11 @@ const LANGUAGES: &[(&str, &str)] = &[
     (
         "typst.lang",
         include_str!("../../../data/language-specs/typst.lang"),
+    ),
+    // TLA+, and the PlusCal written in its comments.
+    (
+        "tla.lang",
+        include_str!("../../../data/language-specs/tla.lang"),
     ),
     // A notebook's JSON, with its picture lines highlighted in one match
     // each rather than a character at a time.
@@ -89,6 +95,17 @@ mod tests {
                 .guess_language(Some("slides.typ"), None)
                 .expect("a language for .typ");
             assert_eq!(language.id(), "typst");
+        });
+    }
+
+    #[test]
+    fn a_tla_file_is_tla_plus() {
+        crate::gtk_test::on_gtk_thread("languages: no display — skipped", || {
+            super::register();
+            let language = sourceview5::LanguageManager::default()
+                .guess_language(Some("Consensus.tla"), None)
+                .expect("a language for .tla");
+            assert_eq!(language.id(), "tla");
         });
     }
 
