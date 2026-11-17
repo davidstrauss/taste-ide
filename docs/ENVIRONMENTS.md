@@ -3275,9 +3275,29 @@ is shouted, but nothing runs either. The rows say what is missing, and
   grant is reserved on its VM whether or not it is running, so agents fill
   what is left and never what is its; and on a contended VM its container
   weighs four times an agent's for CPU (`--cpu-shares`), holds its whole
-  grant as a memory floor (`--memory-reservation`, cgroup `memory.low`),
-  and is never the first the OOM killer takes — agent containers carry
-  `--oom-score-adj 500`. A VM serves one workspace only.
+  grant as a memory floor (`--memory-reservation`, cgroup `memory.low`).
+  Agent containers carry `--oom-score-adj 500`, which reaches only their
+  first process, `sleep infinity`: everything a `podman exec` starts takes
+  the score the VM's podman service started with, not the container's
+  (measured 2026-11-17), so it is not what decides who the OOM killer
+  takes. A VM serves one workspace only.
+- **The OOM killer takes the work, never the IDE** (`taste_core::oom`;
+  David, 2026-11-17: "We should take measures to not have the agent and
+  IDE integrations OOM-killed"). The VM's user podman service runs at the
+  kernel's maximum score, 1000 (`provision::GUEST_PODMAN_OOM`), so every
+  process exec'd into a container starts as the killer's first choice:
+  the agent's commands, the user's, tasks, language servers, and anything
+  a later spawn site starts without knowing of this. The IDE's own
+  processes lower themselves to the floor the kernel allows an
+  unprivileged process — 100, which systemd writes for `user@.service` —
+  before they exec: the agent and its auth forwarder (and so the MCP
+  bridge it starts), the channel helper, and the keeper. In a 4 GiB
+  container that is 3.6 GiB of difference, so the agent is chosen over
+  the work only when the agent is what filled it. A VM that predates this
+  gets the drop-in at bring-up, its podman service restarted then, before
+  the IDE attaches anything, since podman reads its score once, when it
+  starts; until then, and in an environment whose agent started before
+  it, the old scores stand.
 - **The substrate is per environment.** The registry keeps one substrate
   per VM it has brought up (`EnvironmentRegistry::substrate_for`), and an
   environment's is its VM's; the workspace's "resolved" substrate is the

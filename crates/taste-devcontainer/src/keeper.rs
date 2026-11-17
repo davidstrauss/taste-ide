@@ -310,14 +310,15 @@ impl Keeper {
         container: &str,
         describe: impl Into<String>,
     ) -> Result<Arc<Self>> {
-        let command = substrate.std_command(&[
-            "exec".into(),
-            "-i".into(),
-            container.into(),
+        // Protected from the out-of-memory killer (`taste_core::oom`):
+        // every pane reads the checkout through it.
+        let mut args: Vec<String> = vec!["exec".into(), "-i".into(), container.into()];
+        args.extend(taste_core::oom::protected([
             "node".into(),
             "-e".into(),
             KEEPER.into(),
-        ]);
+        ]));
+        let command = substrate.std_command(&args);
         Self::start(command, describe.into())
     }
 

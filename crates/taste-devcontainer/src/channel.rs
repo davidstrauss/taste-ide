@@ -348,8 +348,12 @@ Promise.all(jobs).then(()=>{clearTimeout(deadline);console.log('reachable');proc
 /// no PATH, and the image's `node` otherwise. A bare `node` against an
 /// image with none failed every channel with `crun: executable file
 /// `node` not found` beside a node the probe had just run (2026-10-02).
+///
+/// Protected from the out-of-memory killer (`taste_core::oom`): every
+/// connection the container makes to the IDE — the agent's MCP, its
+/// credential, its tasks — runs through this one process.
 pub fn helper_command(env: &EnvironmentId, node: &str) -> Vec<String> {
-    vec![
+    taste_core::oom::protected(vec![
         node.into(),
         "-e".into(),
         HELPER.into(),
@@ -361,7 +365,7 @@ pub fn helper_command(env: &EnvironmentId, node: &str) -> Vec<String> {
         format!("{}:tasks.sock", Service::Tasks.code()),
         written("task-report.js", "644", &task_reporter()),
         written("bin/task", "755", TASK_WRAPPER),
-    ]
+    ])
 }
 
 /// A file for the helper to write into its directory at start: `w:` and
@@ -1311,10 +1315,14 @@ mod tests {
     fn the_helper_is_told_where_to_bind_and_what_to_call_it() {
         let env = EnvironmentId::parse("review").unwrap();
         let argv = helper_command(&env, "node");
+        // Out of the out-of-memory killer's way first.
+        let skip = taste_core::oom::PROTECTED_PREFIX;
+        assert_eq!(argv[..skip], taste_core::oom::protected([])[..]);
+        let argv = &argv[skip..];
         assert_eq!(argv[0], "node");
         // The IDE's own node, where the probe found it, by its path.
         let ours = helper_command(&env, "/opt/taste-agent/node/bin/node");
-        assert_eq!(ours[0], "/opt/taste-agent/node/bin/node");
+        assert_eq!(ours[skip], "/opt/taste-agent/node/bin/node");
         assert_eq!(argv[1], "-e");
         let dir = environment::container_channel_dir(&env);
         assert_eq!(argv[3], dir.display().to_string());

@@ -468,6 +468,20 @@ pub const GUEST_SSHD_CONF: (&str, &str) = (
      MaxSessions 100\n",
 );
 
+/// The guest's user podman service, at the out-of-memory killer's
+/// [`taste_core::oom::WORKLOAD_SCORE`]: every process a `podman exec`
+/// starts takes the score the service started with, so whatever an
+/// environment runs is what the killer takes first, and the IDE's own
+/// processes lower themselves out of its way (`taste_core::oom`). Written
+/// by Ignition for a new VM, and into one that predates it at bring-up
+/// ([`LibvirtSession::tune_guest_shutdown`]), the service restarted then
+/// — before the IDE has anything attached to it — since it reads the
+/// score once, when it starts.
+pub const GUEST_PODMAN_OOM: (&str, &str) = (
+    "/etc/systemd/user/podman.service.d/10-taste-oom.conf",
+    "[Service]\nOOMScoreAdjust=1000\n",
+);
+
 /// The guest's dead man's switch: a timer that powers the VM off once no
 /// ssh session has been established for a while. The IDE holds one for
 /// as long as it lives — the keeper's `podman exec` rides it — so the
@@ -673,10 +687,11 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
     // on the other side (David, 2026-09-22: "A ton of time gets wasted
     // waiting on this"). Ten seconds for a unit, fifteen for the user
     // manager that holds the containers.
-    for (path, contents) in GUEST_STOP_DROPINS
-        .into_iter()
-        .chain([GUEST_INOTIFY_SYSCTL, GUEST_SSHD_CONF])
-    {
+    for (path, contents) in GUEST_STOP_DROPINS.into_iter().chain([
+        GUEST_INOTIFY_SYSCTL,
+        GUEST_SSHD_CONF,
+        GUEST_PODMAN_OOM,
+    ]) {
         files.push(serde_json::json!({
             "path": path,
             "mode": 420,
@@ -1922,7 +1937,8 @@ impl LibvirtSession {
                 &vm.domain,
                 "guest tuned: stop timeouts of 10s per unit and 15s for the user manager, a \
                  power-off five minutes after the last ssh session, sshd's connection \
-                 limits sized for the IDE, cold page cache handed back and memory compacted every \
+                 limits sized for the IDE, what containers run first in the out-of-memory \
+                 killer's way, cold page cache handed back and memory compacted every \
                  minute, stale \
                  images collected and the disk trimmed every six hours, and zincati and \
                  Fedora's countme, firmware, and RAID timers masked",
@@ -2413,6 +2429,19 @@ fn guest_tuning_script() -> String {
             "cat > /tmp/taste-tune-{index} <<'TASTE_EOF'\n{contents}TASTE_EOF\nput /tmp/taste-tune-{index} {path} {mode}\n"
         ));
     }
+    // The podman service's score, apart from the rest because applying it
+    // means restarting the service, and only when it is new: this runs
+    // once podman answers and before the IDE attaches anything, so nothing
+    // of the IDE's rides the service it restarts.
+    script.push_str(&format!(
+        "podman_oom=0\ncat > /tmp/taste-tune-oom <<'TASTE_EOF'\n{contents}TASTE_EOF\n\
+         cmp -s /tmp/taste-tune-oom {path} || podman_oom=1\nput /tmp/taste-tune-oom {path} 644\n\
+         if [ \"$podman_oom\" = 1 ]; then systemctl --user -M {GUEST_USER}@ daemon-reload \
+         >/dev/null 2>&1 && systemctl --user -M {GUEST_USER}@ try-restart podman.service \
+         >/dev/null 2>&1 || true; fi\n",
+        path = GUEST_PODMAN_OOM.0,
+        contents = GUEST_PODMAN_OOM.1,
+    ));
     // The limits apply now, not at the next boot: a VM already running
     // is where an agent is hitting them. Idempotent, so every time.
     script.push_str(&format!(
@@ -2638,6 +2667,47 @@ mod tests {
             Some("44.20260829.3.1")
         );
         assert_eq!(super::release_from_base_name("/tmp/other.qcow2"), None);
+    }
+
+    /// What an environment runs is the out-of-memory killer's first
+    /// choice in a new VM and in an old one alike, and an old one's podman
+    /// service is restarted to take it only when the drop-in is new.
+    #[test]
+    fn the_guests_podman_starts_what_it_runs_at_the_workload_score() {
+        let (path, contents) = super::GUEST_PODMAN_OOM;
+        assert_eq!(
+            contents,
+            format!(
+                "[Service]\nOOMScoreAdjust={}\n",
+                taste_core::oom::WORKLOAD_SCORE
+            )
+        );
+        let text = super::ignition(&super::GuestSpec {
+            ssh_public_key: "ssh-ed25519 AAAA test".into(),
+            hostname: "taste-x".into(),
+            deny_private_networks: true,
+            host_key: None,
+            metadata_server: false,
+        })
+        .unwrap();
+        assert!(text.contains(path), "{path} missing from the Ignition");
+        let tuning = super::guest_tuning_script();
+        let restart = tuning.find("try-restart podman.service").unwrap();
+        let compared = tuning
+            .find(&format!("|| podman_oom=1\nput /tmp/taste-tune-oom {path}"))
+            .unwrap();
+        assert!(compared < restart, "{tuning}");
+        assert!(tuning.contains("if [ \"$podman_oom\" = 1 ]"), "{tuning}");
+        // And the whole script is one a shell can read.
+        let checked = std::process::Command::new("sh")
+            .args(["-n", "-c", &tuning])
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
     }
 
     #[test]

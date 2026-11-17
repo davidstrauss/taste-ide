@@ -165,8 +165,15 @@ const PREINSTALLED: &str =
     r#"run="$1"; shift; if [ -x "$run" ]; then shift 3; exec "$run" "$@"; fi; exec "$@""#;
 
 /// The command the agent runs under, inside the container: itself, or the
-/// forwarder wrapping itself.
+/// forwarder wrapping itself — protected from the out-of-memory killer
+/// first, so the agent, its forwarder, and the MCP bridge it starts are
+/// never what a build that filled the container costs
+/// (`taste_core::oom`).
 fn inner_command(spec: &AgentSpec, auth: Option<&AuthForward>) -> Vec<String> {
+    taste_core::oom::protected(unprotected_command(spec, auth))
+}
+
+fn unprotected_command(spec: &AgentSpec, auth: Option<&AuthForward>) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
     if let Some(auth) = auth {
         argv.push("node".into());
@@ -697,10 +704,19 @@ mod tests {
             .iter()
             .position(|a| a == "taste-abc123-review")
             .unwrap();
-        // Claude Code's settings prelude first, then the forwarder
-        // wrapping the agent.
+        // Claude Code's settings prelude first, then the out-of-memory
+        // killer's protection, then the forwarder wrapping the agent.
         assert_eq!(args[container + 3], CLAUDE_PRELUDE);
-        assert_eq!(args[container + 8], "node", "the forwarder wraps the agent");
+        let protected = container + 8;
+        assert_eq!(
+            args[protected..protected + taste_core::oom::PROTECTED_PREFIX],
+            taste_core::oom::protected([])[..]
+        );
+        assert_eq!(
+            args[protected + taste_core::oom::PROTECTED_PREFIX],
+            "node",
+            "the forwarder wraps the agent"
+        );
         assert!(args[container..].contains(&"npx".to_string()));
     }
 
@@ -792,6 +808,7 @@ mod tests {
                 socket: PathBuf::from("/tmp/taste-ide-review/auth.sock"),
             }),
         );
+        let argv = &argv[taste_core::oom::PROTECTED_PREFIX..];
         assert_eq!(argv[0], "node");
         assert_eq!(argv[1], "-e");
         assert_eq!(argv[3], "/tmp/taste-ide-review/auth.sock");
@@ -866,7 +883,10 @@ mod tests {
             },
         );
         let container = args.iter().position(|a| a == "c").unwrap();
-        assert_eq!(&args[container + 1..], ["npx", "acp"]);
+        assert_eq!(
+            args[container + 1..],
+            taste_core::oom::protected(["npx".into(), "acp".into()])[..]
+        );
         assert!(!args.iter().any(|a| a.contains("createServer")));
     }
 
@@ -1090,6 +1110,12 @@ mod tests {
             &[],
         );
         let argv = inner_command(&spec, None);
+        // Out of the out-of-memory killer's way first, whatever runs.
+        assert_eq!(
+            argv[..taste_core::oom::PROTECTED_PREFIX],
+            taste_core::oom::protected([])[..]
+        );
+        let argv = &argv[taste_core::oom::PROTECTED_PREFIX..];
         assert_eq!(&argv[..3], ["sh", "-c", PREINSTALLED]);
         assert_eq!(
             argv[4],
@@ -1106,7 +1132,10 @@ mod tests {
             ("adapter", vec!["-y", "x@1"]),
         ] {
             let spec = AgentSpec::new("a", "A", command, &args, &[]);
-            assert_eq!(inner_command(&spec, None)[0], command);
+            assert_eq!(
+                inner_command(&spec, None)[taste_core::oom::PROTECTED_PREFIX],
+                command
+            );
         }
     }
 
