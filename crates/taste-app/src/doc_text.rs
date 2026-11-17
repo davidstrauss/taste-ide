@@ -70,6 +70,11 @@ const REVEAL_ALIGN: f32 = 0.1;
 /// not export: drawing's, and five below it.
 const TEXT_VIEW_VALIDATE: i32 = gtk::gdk::PRIORITY_REDRAW as i32 + 5;
 
+/// The longest a kept place is put back as the text view lays the
+/// document out: past it, the layout still going, the view is left where
+/// the text view has it. A long document is laid out in a second or two.
+const SETTLE_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What a click on a span does.
 #[derive(Clone, Debug, PartialEq)]
 enum Action {
@@ -199,8 +204,15 @@ pub struct DocView {
     /// document's height changes, while the text view lays out the lines
     /// above it (`converge`).
     armed: Cell<bool>,
+    /// When `armed` was, for [`SETTLE_FOR`].
+    armed_at: Cell<Option<std::time::Instant>>,
     /// A kept place is being put: the view moving is this.
     settling: Cell<bool>,
+    /// A [`DocView::queue_settle`] is waiting to run.
+    settle_queued: Cell<bool>,
+    /// The waiting settle is a [`DocView::settle_soon`]'s, which ends
+    /// `fresh`.
+    unfresh: Cell<bool>,
     /// A kept place's mark is in a buffer just shown, whose first screen
     /// the text view is still to lay out: where anything stands in it is
     /// not yet known, so nothing is put until it is (`settle_soon`).
@@ -264,7 +276,10 @@ impl DocView {
             wanted: RefCell::new(None),
             target: RefCell::new(None),
             armed: Cell::new(false),
+            armed_at: Cell::new(None),
             settling: Cell::new(false),
+            settle_queued: Cell::new(false),
+            unfresh: Cell::new(false),
             fresh: Cell::new(false),
             wait_for_probe: Cell::new(None),
         });
@@ -272,16 +287,16 @@ impl DocView {
         this.install_letting_go();
         // While a kept place is being put (`converge`), wherever the text
         // view moves the view to — its first line on screen held in place
-        // as the lines above it are laid out, or not quite — the place is
-        // put back its pixels above the top edge in the same turn; and
-        // when what is laid out changes the document's height and not
-        // where the view is, before the next frame.
+        // as the lines above it are laid out, or not quite — and whenever
+        // what is laid out changes the document's height, the place is put
+        // back its pixels above the top edge before the next frame, once
+        // the text view's step of layout is over (`queue_settle`).
         {
             let weak = Rc::downgrade(&this);
             this.scroller.vadjustment().connect_value_changed(move |_| {
                 if let Some(this) = weak.upgrade() {
-                    if this.armed.get() {
-                        this.settle();
+                    if this.armed.get() && !this.settling.get() {
+                        this.queue_settle();
                     }
                 }
             });
@@ -569,11 +584,42 @@ impl DocView {
     /// does (`GTK_PRIORITY_RESIZE - 2`), before the frame clock's
     /// (`GDK_PRIORITY_REDRAW`).
     fn settle_soon(self: &Rc<Self>) {
+        self.unfresh.set(true);
+        self.queue_settle();
+    }
+
+    /// [`Self::settle`] at the same idle, and never inside the signal that
+    /// asks for it: the view moving and the document's height changing are
+    /// emitted from inside the text view's own layout, a step at a time,
+    /// and a settle there moved the view in the middle of that layout. A
+    /// resize once hung the app in it for good, every sample of the main
+    /// thread a settle under the text view's validation (2026-11-16; David:
+    /// "Resizing Taste seems to have crashed it"). Out here, the layout
+    /// runs a step, the main loop turns, and the place is put back before
+    /// the frame is drawn, as before. One idle however many ask.
+    fn queue_settle(self: &Rc<Self>) {
+        if self.settle_queued.replace(true) {
+            return;
+        }
         let weak = Rc::downgrade(self);
         let priority = glib::Priority::from(gtk::PRIORITY_RESIZE as i32 - 1);
         glib::idle_add_local_full(priority, move || {
             if let Some(this) = weak.upgrade() {
-                this.fresh.set(false);
+                this.settle_queued.set(false);
+                if this.unfresh.replace(false) {
+                    this.fresh.set(false);
+                }
+                // However long the layout takes, a place is held for
+                // `SETTLE_FOR` at most, and then the view is the text
+                // view's again.
+                if this.armed.get()
+                    && this
+                        .armed_at
+                        .get()
+                        .is_some_and(|at| at.elapsed() > SETTLE_FOR)
+                {
+                    this.armed.set(false);
+                }
                 this.settle();
             }
             glib::ControlFlow::Break
@@ -590,6 +636,7 @@ impl DocView {
         if self.armed.replace(true) {
             return;
         }
+        self.armed_at.set(Some(std::time::Instant::now()));
         // Done when the text view's layout is: an idle just below its own
         // (`GTK_TEXT_VIEW_PRIORITY_VALIDATE`) runs only once that has
         // nothing left to do.

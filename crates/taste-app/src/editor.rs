@@ -3506,7 +3506,8 @@ impl Editor {
     /// two blocks there, `below` inserts them well below it, `same` edits
     /// the source line at the view's top, `picture` and `diagram` insert a
     /// picture or a Mermaid diagram above it, shown before it is drawn and
-    /// coming in after, `width` narrows the window, `still` presents the
+    /// coming in after, `width` narrows the window, `drag` narrows it six
+    /// pixels a frame and widens it back, as a resize drag does, `still` presents the
     /// same text again, `top` inserts above the view scrolled to its top,
     /// and `grow` appends to the document with the view at its end. A
     /// case's `@0.6` scrolls that far down instead. The last case's change
@@ -3582,6 +3583,26 @@ impl Editor {
                     if let Some(window) = &window {
                         size = Some((window.width(), window.height()));
                         window.set_default_size(window.width() - 360, window.height());
+                    }
+                }
+                // A resize drag: a new width every frame, each laid out
+                // while the last is still being put back.
+                "drag" => {
+                    if let Some(window) = &window {
+                        let (width, height) = (window.width(), window.height());
+                        size = Some((width, height));
+                        let step = Cell::new(0);
+                        window.add_tick_callback(move |window, _| {
+                            let n = step.get() + 1;
+                            step.set(n);
+                            let narrower = if n <= 60 { n } else { 120 - n };
+                            window.set_default_size(width - narrower * 6, height);
+                            if n < 120 {
+                                glib::ControlFlow::Continue
+                            } else {
+                                glib::ControlFlow::Break
+                            }
+                        });
                     }
                 }
                 other => println!("keep probe: no case {other:?}"),

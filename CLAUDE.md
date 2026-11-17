@@ -346,7 +346,8 @@ inserts a heading and a paragraph a dozen source lines above the view,
 `same` edits the source line at the top (its text comes out changed, at
 the same pixel), `picture` and `diagram` insert a picture or a Mermaid
 diagram above the view and show the rendering before it comes in,
-`width` narrows the window, `still` presents the same text again, `top`
+`width` narrows the window, `drag` narrows it six pixels a frame and
+widens it back, as a resize drag does, `still` presents the same text again, `top`
 inserts above a view at its top, and `grow` appends to a view at its
 end; `case@0.7` scrolls that far down instead of 0.45, and the last
 case's change is left in place for the shot — give it
@@ -583,6 +584,22 @@ any run prints a Rust backtrace at every GLib warning and CRITICAL, C
 frames included — which is how you find out WHICH popup, tooltip or
 popover complained, since there is no gdb in the devcontainer and the
 message never says.
+
+A running app whose main thread is stuck (the stall log's "main thread
+stalled" with no "back after") is sampled with perf, never attached to:
+yama's `ptrace_scope=1` refuses gdb, and perf in a container is refused
+the host's processes by the user namespace. Install `perf` in a
+throwaway container of this image, `podman cp` its binary out (on this
+host it needs no libraries the host lacks), and run it on the host as
+the user: `perf record -e cpu-clock:u --call-graph fp --user-callchains
+-t <pid> -- sleep 3` (`:u` and `--user-callchains` are what
+`perf_event_paranoid=2` allows; dwarf unwinding is refused). GTK has
+frame pointers and our debug build does not, so a Rust frame comes out
+as the GTK call it made: copy `/proc/<pid>/exe` first, since a rebuild
+deletes the binary the process runs, and resolve the addresses with
+`addr2line -f -C -i` at the address less the mapping's start in
+`/proc/<pid>/maps`. That is how a resize that froze the app was found
+in the preview's kept place (2026-11-16, `doc_text::DocView::queue_settle`).
 
 ## House rules
 
