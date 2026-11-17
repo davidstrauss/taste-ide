@@ -861,6 +861,17 @@ pub fn ensure_container(
         );
     }
 
+    // The image first, whatever the keeper's state: a keeper already
+    // running keeps the image it was made from, but the VM still needs the
+    // current one — the agent's node is made self-contained in it
+    // (`agentnode::SELF_CONTAIN`), and the registry, having found it
+    // missing, says it was built. A keeper up for days through a change to
+    // the baseline returned here before it, and remise's deploy found no
+    // image at all (2026-11-17, "taste-img-e5d85151c9cb: image not known").
+    let config = crate::baseline::ensure_baseline_config()?;
+    let key = taste_core::environment::workspace_key(workspace_root);
+    let image = crate::image::ensure_image_kept(substrate, &config, &key, on_build_line)?;
+
     let name = container_name(workspace_root);
     let state = podman_capture(
         substrate,
@@ -893,9 +904,6 @@ pub fn ensure_container(
         }
     }
 
-    let config = crate::baseline::ensure_baseline_config()?;
-    let key = taste_core::environment::workspace_key(workspace_root);
-    let image = crate::image::ensure_image_kept(substrate, &config, &key, on_build_line)?;
     podman_capture(
         substrate,
         &[
