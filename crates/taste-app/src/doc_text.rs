@@ -976,8 +976,8 @@ impl DocView {
             }
         });
         styles.paint();
-        self.view.set_buffer(Some(&buffer));
-        self.ghost.set_buffer(Some(&buffer));
+        replace_buffer(&self.view, &buffer);
+        replace_buffer(&self.ghost, &buffer);
         self.follow_in_strip(&buffer);
         *self.view.imp().decor.borrow_mut() = decor.clone();
         *self.ghost.imp().decor.borrow_mut() = decor;
@@ -1246,6 +1246,35 @@ const MARKER: &str = "taste-doc-marker";
 const MARKER_FEATURES: &str = "tnum";
 
 /// Write `text` into a buffer of its own, as `view` will show it.
+/// Give `view` `buffer` in place of the one it has, with nothing of the
+/// old one left in the view's layout.
+///
+/// GTK 4.24's text layout keeps a cache of laid-out lines, and
+/// `set_buffer` does not empty it: a line's entry goes only as the old
+/// buffer's per-view line data is destroyed, and a line that was asked
+/// where it stands (`iter_location`, which the kept place asks of lines
+/// far from the view) before it was ever laid out has an entry and no
+/// line data. That entry outlives its buffer, and the next time the cache
+/// sorts a line in among its entries it asks the freed line its number:
+/// `gtk_text_btree_line_number couldn't find line`, and the abort the
+/// whole IDE goes down with (2026-11-17, a preview of remise's refreshed
+/// on disk; the core held a display whose line belonged to a buffer the
+/// view no longer had). A plain `GtkTextView` does it in a dozen lines of
+/// Python, and `set_buffer(None)` first does not help.
+///
+/// A change to a view's own style property invalidates the whole layout,
+/// and that walks every line of the buffer it has and drops each one's
+/// entry, laid out or not; so the margin is moved a pixel and back while
+/// the old buffer is still the view's. Nothing is drawn between the two,
+/// and the layout the new buffer gets is built from nothing either way.
+fn replace_buffer(view: &impl IsA<gtk::TextView>, buffer: &gtk::TextBuffer) {
+    let view = view.as_ref();
+    let below = view.pixels_below_lines();
+    view.set_pixels_below_lines(below + 1);
+    view.set_pixels_below_lines(below);
+    view.set_buffer(Some(buffer));
+}
+
 fn render(view: &DocTextView, text: &str, base: &DocumentBase, readiness: &Readiness) -> Rendering {
     let buffer = gtk::TextBuffer::new(None);
     buffer.set_enable_undo(false);
@@ -2352,6 +2381,57 @@ mod tests {
             .text(&buffer.start_iter(), &buffer.end_iter(), false)
             .to_string();
         (text, rendering)
+    }
+
+    /// A buffer replaced under a view takes nothing of itself into the
+    /// view's next layout: a far line asked where it stands before it was
+    /// laid out, then the buffer replaced and dropped, aborted GTK 4.24 in
+    /// a round or two with `set_buffer` alone (`replace_buffer`). Needs a
+    /// display, and a frame clock to validate on, so it is run under Xvfb
+    /// by hand when this is touched: `Xvfb :9 & DISPLAY=:9 cargo test -p
+    /// taste-app --bin taste-ide a_replaced_buffer`.
+    #[test]
+    fn a_replaced_buffer_leaves_nothing_behind() {
+        crate::gtk_test::on_gtk_thread("doc text: no display — skipped", || {
+            let window = gtk::Window::new();
+            window.set_default_size(700, 420);
+            let scroll = gtk::ScrolledWindow::new();
+            let view = gtk::TextView::new();
+            view.set_wrap_mode(gtk::WrapMode::Word);
+            scroll.set_child(Some(&view));
+            window.set_child(Some(&scroll));
+            window.present();
+            let build = |round: usize| {
+                let buffer = gtk::TextBuffer::new(None);
+                let lines: Vec<String> = (0..3000)
+                    .map(|i| format!("r{round} paragraph {i} {}", "words ".repeat(i % 40)))
+                    .collect();
+                buffer.set_text(&lines.join("\n"));
+                buffer
+            };
+            let pump = || {
+                let main_loop = glib::MainLoop::new(None, false);
+                let quit = main_loop.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(40), move || {
+                    quit.quit()
+                });
+                main_loop.run();
+            };
+            let mut buffer = build(0);
+            replace_buffer(&view, &buffer);
+            for round in 1..40 {
+                pump();
+                let far = buffer.iter_at_line(2500 + round as i32).unwrap();
+                let _ = view.iter_location(&far);
+                let next = build(round);
+                replace_buffer(&view, &next);
+                // The old buffer goes here, as the preview lets it go.
+                buffer = next;
+                scroll.vadjustment().set_value(((round * 37) % 2000) as f64);
+            }
+            pump();
+            window.destroy();
+        });
     }
 
     /// A document is one text: its blocks are its lines, a code block's
