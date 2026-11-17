@@ -228,10 +228,22 @@ impl Jobs {
 
     /// Whether the job has exited, without collecting it; an error for a
     /// handle that is not live.
+    ///
+    /// **No method here holds the registry's lock and a job's at once.**
+    /// This one took them registry-then-job while `wait` took them
+    /// job-then-registry, and an agent's subagents polling a command while
+    /// its own call collected it caught the two halfway (remise,
+    /// 2026-11-17): each held what the other wanted, on runtime threads
+    /// that a std lock blocks outright, and every `ide_exec` after it
+    /// waited on the registry forever — and with them every other call on
+    /// that agent's connection, once the stuck ones held all its permits.
     pub fn finished(&self, id: u64) -> Result<bool> {
-        let jobs = self.inner.lock().unwrap();
-        let job = jobs.get(&id).with_context(|| unknown_handle(id, &jobs))?;
-        let exited = job.state.lock().unwrap().exit_code.is_some();
+        let state = {
+            let jobs = self.inner.lock().unwrap();
+            let job = jobs.get(&id).with_context(|| unknown_handle(id, &jobs))?;
+            job.state.clone()
+        };
+        let exited = state.lock().unwrap().exit_code.is_some();
         Ok(exited)
     }
 
@@ -239,10 +251,10 @@ impl Jobs {
     /// way. A finished job is dropped from the registry on the way out —
     /// its output is in the snapshot, and nothing else will ever read it.
     pub async fn wait(&self, id: u64, timeout: std::time::Duration) -> Result<Snapshot> {
-        let (state, done) = {
+        let (state, done, command) = {
             let jobs = self.inner.lock().unwrap();
             let job = jobs.get(&id).with_context(|| unknown_handle(id, &jobs))?;
-            (job.state.clone(), job.done.clone())
+            (job.state.clone(), job.done.clone(), job.command.clone())
         };
         // Register interest BEFORE checking, or a job that finishes in
         // between leaves this waiting for a notification already sent.
@@ -252,9 +264,8 @@ impl Jobs {
         }
         let snapshot = {
             let state = state.lock().unwrap();
-            let jobs = self.inner.lock().unwrap();
             Snapshot {
-                command: jobs.get(&id).map(|j| j.command.clone()).unwrap_or_default(),
+                command,
                 stdout: state.stdout.render(),
                 stderr: state.stderr.render(),
                 exit_code: state.exit_code,
@@ -538,6 +549,57 @@ mod tests {
             .await
             .unwrap();
         assert!(snapshot.exit_code.is_some(), "the roster must reach it");
+    }
+
+    /// A job polled and collected at once never wedges the registry: the
+    /// `wait` tool's polling (`finished`) beside an `ide_exec_output` taking
+    /// a snapshot (`wait`) is a subagent and its parent on one command,
+    /// and the two once took the same two locks in opposite orders. Run on
+    /// threads of their own, so a deadlock fails here rather than hanging
+    /// the suite.
+    #[test]
+    fn polling_beside_collecting_never_deadlocks() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let jobs = jobs();
+        let id = runtime.block_on(async {
+            jobs.spawn(spec("sleep", &["30"]), "sleep 30", None, true)
+                .unwrap()
+        });
+        let (done, finished) = std::sync::mpsc::channel();
+        for poller in 0..4 {
+            let jobs = jobs.clone();
+            let handle = runtime.handle().clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    if poller % 2 == 0 {
+                        let _ = jobs.finished(id);
+                    } else {
+                        let _ = handle.block_on(jobs.wait(id, std::time::Duration::ZERO));
+                    }
+                }
+                let _ = done.send(());
+            });
+        }
+        drop(done);
+        let stuck = (0..4).any(|_| {
+            finished
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .is_err()
+        });
+        if stuck {
+            // Dropping a runtime waits on its threads, and a deadlocked
+            // one never comes back: left behind, so the failure is one.
+            std::mem::forget(runtime);
+            panic!(
+                "a poller is stuck: the registry and a job's state are locked in opposite orders"
+            );
+        }
+        jobs.kill(id).unwrap();
     }
 
     /// Without a roster the registry still works: a headless server has no
