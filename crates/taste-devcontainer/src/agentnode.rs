@@ -60,24 +60,68 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
-/// The node the agent runs on: the newest LTS whose official build needs
-/// nothing a base system may lack. Bump it with both sums below, from
-/// `https://nodejs.org/dist/v<version>/SHASUMS256.txt` — and read the
-/// build's `readelf -d bin/node | grep NEEDED` first, against glibc,
-/// libstdc++, and libgcc_s, which are all it may ask for.
+/// The node the agent runs on: the current LTS when pinned. Bump it with
+/// both sums below, from `https://nodejs.org/dist/v<version>/SHASUMS256.txt`.
+/// Whatever shared libraries the build asks for beyond the base a system
+/// can be counted on for ride along with it ([`SELF_CONTAIN`]), so a bump
+/// that brings a new one needs nothing from the VM or the image.
+pub const NODE_VERSION: &str = "26.13.1";
+/// `node-v26.13.1-linux-x64.tar.gz`.
+const NODE_SHA256_X64: &str = "518674de2b621728a5e4486f5fb3b7d2900bb3cc4aa97969edaa463db99f9778";
+/// `node-v26.13.1-linux-arm64.tar.gz`.
+const NODE_SHA256_ARM64: &str = "80a330b35415382878df18d41afbd106ea89bfb3be0087d6608e289a14c5cc7d";
+
+/// What makes a node build carry its own libraries, run as root in a
+/// throwaway container of the files service's image with the build's
+/// directory at `/n`: every library `bin/node` asks for outside glibc's
+/// own and the C++ runtime's is copied from the image into `shlib/`, and
+/// the binary's RUNPATH pointed there (`$ORIGIN/../shlib`), which is
+/// searched before the system's directories and is not inherited by
+/// anything the node runs — unlike `LD_LIBRARY_PATH`, which would have put
+/// these libraries in front of every program an agent starts.
 ///
-/// **Not Node 26.** Its x64 build links `libatomic.so.1` (24's does not),
-/// which Fedora CoreOS does not ship and many images do not either: in the
-/// VM, where `npm` installs the adapter, it would not start, so no adapter
-/// was installed; and in a container whose image lacked the library it was
-/// no node at all, so the agent could not move in and, with no `npx` on the
-/// host, did not start anywhere (26.13.1 from 2026-11-14 to 2026-11-17).
-/// Node 24 is in maintenance LTS until April 2028.
-pub const NODE_VERSION: &str = "24.22.3";
-/// `node-v24.22.3-linux-x64.tar.gz`.
-const NODE_SHA256_X64: &str = "061ec3e3062115705b56b51fa9cc330ab50d34b6969387d4e4b1a50c6809acc2";
-/// `node-v24.22.3-linux-arm64.tar.gz`.
-const NODE_SHA256_ARM64: &str = "261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8";
+/// Why: Node 26's official x64 build links `libatomic.so.1`, which Fedora
+/// CoreOS does not ship and neither do slim container bases — Fedora's own
+/// among them, where a desktop Fedora has it installed by something else.
+/// So in the VM, where `npm` installs the adapter, node would not start
+/// and no adapter was installed; and in a container from `fedora:44` the
+/// agent had no node to move in with, and started nowhere (2026-11-17).
+///
+/// glibc and the C++ runtime stay the system's. A newer glibc cannot be
+/// carried this way at all, and a libstdc++ from the files service's
+/// Fedora asks for a glibc as new as that Fedora's, which would refuse
+/// older images that run the official build today; the official build
+/// asks only for what its stated minimum (glibc 2.28) provides. What does
+/// ride along is checked for the same reason: `libatomic` asks for
+/// GLIBC_2.14.
+///
+/// The binary is patched as a copy and renamed into place, so a node
+/// already running (a container that had the library) keeps the file it
+/// has. `patchelf` and the libraries come from the files service's image
+/// (data/baseline-environment/Containerfile), which every VM builds before
+/// this deploy runs, and which the IDE pins the same way it pins the rest.
+pub const SELF_CONTAIN: &str = r#"set -eu
+cd /n
+mkdir -p shlib
+for so in $(patchelf --print-needed bin/node); do
+  case "$so" in
+    libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|ld-linux*|libstdc++.so.*|libgcc_s.so.*) continue ;;
+  esac
+  src=""
+  for p in /usr/lib64 /usr/lib /lib64 /lib; do
+    if [ -e "$p/$so" ]; then src="$p/$so"; break; fi
+  done
+  if [ -z "$src" ]; then
+    echo "node needs $so, and the files service image does not carry it" >&2
+    exit 1
+  fi
+  cp -L "$src" "shlib/$so"
+done
+if [ -n "$(ls shlib)" ] && [ "$(patchelf --print-rpath bin/node)" != '$ORIGIN/../shlib' ]; then
+  cp -p bin/node bin/.node.new
+  patchelf --set-rpath '$ORIGIN/../shlib' bin/.node.new
+  mv bin/.node.new bin/node
+fi"#;
 
 /// Where the runtime directory is mounted in an environment's container.
 pub const IN_CONTAINER: &str = taste_core::agent_runtime::IN_CONTAINER;
@@ -123,8 +167,13 @@ pub fn mount_arg() -> String {
 /// see it, but for the IDE, which brings a Compose environment up with it
 /// over ssh. One that does not arrive says so on stderr, as Task's does.
 const FETCH: &str = r#"set -eu
-dir="$1"; ver="$2"; tver="$5"; pkg="${8:-}"; key="${9:-}"; cver="${10:-}"
+dir="$1"; ver="$2"; tver="$5"; pkg="${8:-}"; key="${9:-}"; cver="${10:-}"; img="${13:-}"
 mkdir -p "$dir"
+runs() { "$1/bin/node" --version >/dev/null 2>&1; }
+contain() {
+  [ -n "$img" ] || { echo "no files service image to give node $ver its libraries from" >&2; return 1; }
+  podman run --rm --pull=never --network=none --user 0 -v "$1:/n:z" --entrypoint sh "$img" -c "$selfcontain"
+}
 case "$(uname -m)" in
   x86_64) arch=x64; sum="$3"; tarch=amd64; tsum="$6"; carch=x86_64; csum="${11:-}" ;;
   aarch64) arch=arm64; sum="$4"; tarch=arm64; tsum="$7"; carch=aarch64; csum="${12:-}" ;;
@@ -133,7 +182,7 @@ esac
 name="node-v$ver-linux-$arch"
 tname="task-v$tver-linux-$tarch"
 cname="compose-v$cver"
-if [ -x "$dir/$name/bin/node" ] && [ -x "$dir/$tname/task" ] &&
+if runs "$dir/$name" && [ -x "$dir/$tname/task" ] &&
   { [ -z "$key" ] || [ -x "$dir/agents/$key/run" ]; } &&
   { [ -z "$cver" ] || [ -x "$dir/$cname/docker-compose" ]; }; then echo "$name"; exit 0; fi
 tmp=$(mktemp -d "$dir/.fetch.XXXXXX")
@@ -142,8 +191,14 @@ if [ ! -x "$dir/$name/bin/node" ]; then
   curl -fsSL --retry 3 -o "$tmp/node.tar.gz" "https://nodejs.org/dist/v$ver/$name.tar.gz"
   echo "$sum  $tmp/node.tar.gz" | sha256sum -c --quiet -
   tar -xzf "$tmp/node.tar.gz" -C "$tmp"
+  runs "$tmp/$name" || contain "$tmp/$name" || true
   mv "$tmp/$name" "$dir/$name" || [ -x "$dir/$name/bin/node" ]
+elif ! runs "$dir/$name"; then
+  # Deployed before it carried its libraries: given them where it is.
+  contain "$dir/$name" || true
 fi
+nodesaid=$("$dir/$name/bin/node" --version 2>&1) ||
+  echo "node $ver does not run in the VM: $nodesaid" >&2
 if [ ! -x "$dir/$tname/task" ]; then
   mkdir -p "$tmp/$tname" &&
     curl -fsSL --retry 3 -o "$tmp/task.tar.gz" \
@@ -162,7 +217,7 @@ if [ -n "$cver" ] && [ ! -x "$dir/$cname/docker-compose" ]; then
     { mv "$tmp/$cname" "$dir/$cname" || [ -x "$dir/$cname/docker-compose" ]; } ||
     echo "compose $cver was not deployed" >&2
 fi
-if [ -n "$key" ] && [ ! -x "$dir/agents/$key/run" ]; then
+if [ -n "$key" ] && [ ! -x "$dir/agents/$key/run" ] && runs "$dir/$name"; then
   mkdir -p "$dir/agents" "$tmp/agent" &&
     PATH="$dir/$name/bin:$PATH" npm install --prefix "$tmp/agent" --cache "$tmp/npm-cache" \
       --no-audit --no-fund --omit=dev --loglevel=error "$pkg" >&2 &&
@@ -177,6 +232,21 @@ fi
 echo "$name"
 "#;
 
+/// What the VM's shell is fed: [`SELF_CONTAIN`] as `$selfcontain`, by a
+/// quoted heredoc, since a script cannot ride in ssh's one-line arguments,
+/// and then [`FETCH`].
+fn fetch_script() -> String {
+    format!("selfcontain=$(cat <<'SELF_CONTAIN'\n{SELF_CONTAIN}\nSELF_CONTAIN\n)\n{FETCH}")
+}
+
+/// The files service's image in the VM, by the tag a VM builds it under:
+/// where [`SELF_CONTAIN`] finds `patchelf` and the libraries.
+fn service_image() -> Result<String> {
+    let config = crate::baseline::ensure_baseline_config()?;
+    let hash = crate::hash::build_hash(&config)?;
+    Ok(taste_core::environment::env_image_tag(&hash))
+}
+
 /// Make sure the VM at `ssh_port` has the pinned node and Task in
 /// [`guest_dir`], fetching them the first time. Blocking; the node build's
 /// directory name back, and what the fetch said on its way — Task,
@@ -188,6 +258,7 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Opt
     let adapter = taste_core::orchestration::CLAUDE_CODE_ADAPTER;
     let key = taste_core::agent_runtime::agent_key(adapter)
         .context("the pinned adapter names no version")?;
+    let image = service_image().context("naming the files service's image")?;
     // ssh joins its arguments into one line for the guest's shell, so each
     // must be a token that shell leaves alone; all of them are ours.
     use taste_core::tasks::{IDE_TASK_SHA256_AMD64, IDE_TASK_SHA256_ARM64, IDE_TASK_VERSION};
@@ -204,6 +275,7 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Opt
         crate::compose::VERSION,
         crate::compose::SHA256_X86_64,
         crate::compose::SHA256_AARCH64,
+        &image,
     ] {
         if !token
             .chars()
@@ -230,6 +302,7 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Opt
             crate::compose::VERSION.into(),
             crate::compose::SHA256_X86_64.into(),
             crate::compose::SHA256_AARCH64.into(),
+            image,
         ],
     );
     let mut child = Command::new(program)
@@ -242,7 +315,7 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Opt
     {
         use std::io::Write;
         let mut stdin = child.stdin.take().context("ssh took no stdin")?;
-        stdin.write_all(FETCH.as_bytes())?;
+        stdin.write_all(fetch_script().as_bytes())?;
     }
     let out = child.wait_with_output()?;
     if !out.status.success() {
@@ -263,7 +336,7 @@ pub fn ensure_in_vm(ssh_port: u16, workspace_root: &Path) -> Result<(String, Opt
 /// load is present and useless — and what it said is the reason, which a
 /// guess at one (an Alpine image's C library) once stood in for while the
 /// real one was a library the image did not carry (2026-11-17).
-pub const PROBE: &str = r#"for d in /opt/taste-agent/node-v24.22.3-linux-*; do
+pub const PROBE: &str = r#"for d in /opt/taste-agent/node-v26.13.1-linux-*; do
   if [ -x "$d/bin/node" ]; then
     if said=$("$d/bin/node" --version 2>&1); then echo "$d/bin"; exit 0; fi
     printf '%s\n' "$said" >&2
@@ -396,7 +469,7 @@ mod tests {
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let out = Command::new("sh")
-            .args(["-c", FETCH, "fetch"])
+            .args(["-c", &fetch_script(), "fetch"])
             .args([
                 dir.path().to_str().unwrap(),
                 NODE_VERSION,

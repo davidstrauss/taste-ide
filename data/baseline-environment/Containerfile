@@ -27,6 +27,13 @@
 #   tesseract — a PDF page with no text in it, a scan or a slide that
 #            is a picture, is read by OCR for the universal find
 #            (viewer.rs, `ViewerPage::read_textless_pages`).
+#   patchelf, libatomic — the agent's own node is deployed into every
+#            VM beside this image, and a library its official build asks
+#            for that a base system may lack (Node 26's libatomic, which
+#            Fedora CoreOS and slim images do not carry) is copied from
+#            here into the node's directory, its RUNPATH pointed at it
+#            (taste_devcontainer::agentnode::SELF_CONTAIN). A library a
+#            future build asks for goes on this line; the deploy names it.
 #
 # The base is pinned by digest, not by tag: the baseline is the rung that
 # is supposed to always work, so it must not change under the user
@@ -43,6 +50,7 @@ RUN microdnf upgrade -y --setopt=install_weak_deps=0 --nodocs \
         git \
         coreutils findutils grep sed gawk diffutils ripgrep \
         poppler-utils tesseract tesseract-langpack-eng \
+        patchelf libatomic \
         tar gzip xz \
         procps-ng which less \
         ca-certificates \
