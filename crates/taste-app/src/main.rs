@@ -1103,7 +1103,8 @@ fn main() -> glib::ExitCode {
                     a rule with a filled part, which is all it needs to \
                     be. The colour is the traffic light the rows already \
                     speak — green with room, amber past three fifths, red \
-                    when nearly gone — stated here rather than left to the \
+                    only for a window the API has closed, since red is a \
+                    failure — stated here rather than left to the \
                     level bar's stock offsets, whose palette (green at \
                     FULL) says the opposite of running out. The class is \
                     set by gauge::set, so the thresholds live in one \
@@ -1122,6 +1123,12 @@ fn main() -> glib::ExitCode {
                    background-color: @warning_color; }\n\
                  levelbar.usage-gauge.spent block.filled { \
                    background-color: @error_color; }\n\
+                 /* The context window's: a level with no verdict, since \
+                    a full window is compacted, not spent \
+                    (gauge::set_level). */\n\
+                 levelbar.usage-gauge.level block.filled { \
+                   background-color: \
+                   color-mix(in srgb, currentColor 45%, transparent); }\n\
                  /* An hour-old reading is still true about the past and \
                     nothing about now. Faded rather than hidden: the \
                     level that was last seen is worth keeping on screen, \

@@ -15,16 +15,28 @@
 //! So: one widget, one width, no number (the number is in the tooltip,
 //! where a reader who wants it hovers), and the traffic light the rest of
 //! this UI already speaks — green while there is room, amber past three
-//! fifths, red past 85% or once the window is closed. The thresholds live
-//! here and nowhere else; the utilization tab's glyph reads them from here
-//! too, so no two surfaces can disagree about whether to worry.
+//! fifths, and red only once the window is closed. Red is for a failure
+//! and nothing else (David, 2026-11-18: "Red should only be for
+//! failures"): a plan nearly spent is a warning, and a plan the API has
+//! closed, which refuses the next request, is the failure. The threshold
+//! lives here and nowhere else; the utilization tab's glyph reads it from
+//! here too, so no two surfaces can disagree about whether to worry.
+//!
+//! **Only the plan runs out.** The context window fills, and a full one is
+//! compacted and the conversation goes on: that is the window working, not
+//! a pool spent (David, 2026-11-18: "Filling up a context window shouldn't
+//! result in a red status. It's still a normal, healthy state"). So its
+//! gauge is [`set_level`], the same bar in a neutral fill, and the traffic
+//! light is [`set`]'s, for the subscription's window alone.
 
 use gtk::prelude::*;
 
-/// Past this, the gauge turns amber: worth noticing.
+/// Past this, the gauge turns amber: worth noticing. It stays amber up to
+/// full; red is only a window the API has closed.
 pub const WARN_AT: f64 = 0.6;
-/// Past this, red: the pool is nearly gone.
-pub const SPENT_AT: f64 = 0.85;
+/// Past this, a context window's tooltip says the agent will compact soon:
+/// words for the reader, never a colour.
+pub const NEARLY_FULL: f64 = 0.85;
 /// One width for both. Wide enough that the fill's position reads at a
 /// glance, narrow enough for a 335px flank's header to keep its words —
 /// which is what took it from 48 to 40 when the backlog header gained
@@ -44,10 +56,11 @@ pub enum Severity {
 }
 
 impl Severity {
-    /// From a used fraction, or an explicit "closed" (a window the API has
-    /// refused, whatever the fraction said last).
+    /// From a used fraction, and whether the window is closed (a window
+    /// the API has refused, whatever the fraction said last), which alone
+    /// is `Spent`.
     pub fn of(used: f64, spent: bool) -> Self {
-        if spent || used >= SPENT_AT {
+        if spent {
             Self::Spent
         } else if used >= WARN_AT {
             Self::Warn
@@ -80,15 +93,13 @@ pub fn new() -> gtk::LevelBar {
         .build()
 }
 
-/// Show `used` (0..=1) on `bar`, coloured by severity. `spent` forces the
-/// full red bar for a window the API has closed; `stale` fades a reading
+/// Show `used` (0..=1) on `bar`, coloured by severity. `spent`, a window
+/// the API has closed, is the full red bar, and the only red one; `stale` fades a reading
 /// that is still true about the past and nothing about now.
 pub fn set(bar: &gtk::LevelBar, used: f64, spent: bool, stale: bool) {
     let used = used.clamp(0.0, 1.0);
     bar.set_value(if spent { 1.0 } else { used });
-    for class in ["ok", "warn", "spent", "stale"] {
-        bar.remove_css_class(class);
-    }
+    clear(bar);
     bar.add_css_class(Severity::of(used, spent).css());
     if stale {
         bar.add_css_class("stale");
@@ -96,19 +107,35 @@ pub fn set(bar: &gtk::LevelBar, used: f64, spent: bool, stale: bool) {
     bar.set_visible(true);
 }
 
+/// Show `used` (0..=1) on `bar` as a level, in a neutral fill: how full,
+/// and no verdict on it. The context window's, which fills as a
+/// conversation goes on and is compacted when it is full.
+pub fn set_level(bar: &gtk::LevelBar, used: f64) {
+    bar.set_value(used.clamp(0.0, 1.0));
+    clear(bar);
+    bar.add_css_class("level");
+    bar.set_visible(true);
+}
+
+fn clear(bar: &gtk::LevelBar) {
+    for class in ["ok", "warn", "spent", "stale", "level"] {
+        bar.remove_css_class(class);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The thresholds, stated once: green, then amber at three fifths,
-    /// red at 85%, and a closed window is red whatever the fraction says.
+    /// The threshold, stated once: green, then amber at three fifths up to
+    /// full, and red only for a closed window, whatever the fraction says.
     #[test]
-    fn severity_follows_the_two_thresholds_and_a_closed_window() {
+    fn red_is_a_closed_window_and_nothing_else() {
         assert_eq!(Severity::of(0.0, false), Severity::Ok);
         assert_eq!(Severity::of(0.59, false), Severity::Ok);
         assert_eq!(Severity::of(0.6, false), Severity::Warn);
-        assert_eq!(Severity::of(0.84, false), Severity::Warn);
-        assert_eq!(Severity::of(0.85, false), Severity::Spent);
+        assert_eq!(Severity::of(0.99, false), Severity::Warn);
+        assert_eq!(Severity::of(1.0, false), Severity::Warn);
         assert_eq!(Severity::of(0.1, true), Severity::Spent);
     }
 }

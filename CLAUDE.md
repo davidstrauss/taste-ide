@@ -897,6 +897,11 @@ to.
   video play in a WebKit view, whose web process is sandboxed — never
   GDK's `Texture::from_bytes` or a `GtkVideo` in the IDE's process.
 - Adapter packages fetched from registries stay version-pinned.
+- **Red is for failures and nothing else** (David, 2026-11-18: "Red
+  should only be for failures"). Something running low, nearly full, or
+  needing attention is amber; a full context window, which the agent
+  compacts, is not a status at all. Red is what has gone wrong: a failed
+  build, a refused request, a closed plan window.
 - **The interface must be beautiful — and the chat pane and prompt box
   are held to the highest bar in the app.** Beauty here means libadwaita
   HIG fluency (spacing, typography, focus, motion), streaming that never

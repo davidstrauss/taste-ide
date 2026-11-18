@@ -3391,9 +3391,10 @@ impl ChatPane {
         // out of room, which is what a set of attachments looks like.
 
         // Context-window fill, graphically; the numbers live in the
-        // tooltip. `crate::gauge` — one width, traffic-light colours —
-        // where this was a 90px bar recoloured by GTK's stock offsets,
-        // whose palette turns GREEN at full.
+        // tooltip. `crate::gauge`'s bar in its neutral fill
+        // (`gauge::set_level`): a full window is compacted and the
+        // conversation goes on, so it wears no traffic light; the plan's
+        // beside it is the pool that runs out.
         let usage_bar = crate::gauge::new();
         // ...and beside it the other pool this conversation runs down: the
         // account's subscription window, which used to sit in the backlog
@@ -6982,8 +6983,12 @@ impl ChatPane {
         *self.on_usage_severity.borrow_mut() = Some(Rc::new(hook));
     }
 
-    /// Re-badge the utilization glyph: how close this conversation is to
-    /// running out of room, said without opening anything.
+    /// Re-badge the utilization glyph: how close the plan this
+    /// conversation draws on is to running out, said without opening
+    /// anything. The plan's, not the context window's: a full window is
+    /// compacted and the conversation goes on, which is nothing to warn
+    /// about (`crate::gauge`). A conversation on Claude Code (Custom) draws
+    /// on no plan, and its glyph wears no dot.
     ///
     /// **One mechanism, one icon name, both slots.** The glyph is never
     /// tinted; it says which view this is, the way every other glyph in
@@ -7010,25 +7015,39 @@ impl ChatPane {
     /// saying that there is nothing to say (David: "This shouldn't be
     /// green. If you want to show the status of usage, use traffic light
     /// badges matching the other ones we already use").
-    pub fn refresh_usage_badge(&self) -> &'static str {
-        let limit = self.context_limit.get().max(1);
-        let fraction = (self.context_used.get() as f64 / limit as f64).min(1.0);
-        // The gauge's own thresholds (`crate::gauge`), so the badge and
-        // the bar can never disagree.
-        let (glyph, verdict) = match crate::gauge::Severity::of(fraction, false) {
-            crate::gauge::Severity::Spent => {
-                ("taste-utilization-full-symbolic", "very little room left")
+    pub fn refresh_usage_badge(&self) {
+        // The plan gauge's own reading and thresholds (`crate::gauge`), so
+        // the badge and the bar can never disagree.
+        let severity = if self.on_custom_upstream() {
+            None
+        } else {
+            let now = std::time::SystemTime::now();
+            let pool = self.pool.borrow();
+            pool.quota.headline(now).map(|headline| {
+                crate::gauge::Severity::of(
+                    headline.used,
+                    pool.quota.current_exhaustion(now).is_some(),
+                )
+            })
+        };
+        let (glyph, tooltip) = match severity {
+            Some(crate::gauge::Severity::Spent) => (
+                "taste-utilization-full-symbolic",
+                "Utilization — the plan is spent until it resets",
+            ),
+            Some(crate::gauge::Severity::Warn) => (
+                "taste-utilization-warn-symbolic",
+                "Utilization — the plan is filling up",
+            ),
+            Some(crate::gauge::Severity::Ok) | None => {
+                ("taste-utilization-symbolic", "Utilization")
             }
-            crate::gauge::Severity::Warn => ("taste-utilization-warn-symbolic", "filling up"),
-            crate::gauge::Severity::Ok => ("taste-utilization-symbolic", "plenty of room"),
         };
         self.usage_tab.set_icon_name(glyph);
-        let tooltip = format!("Utilization — {verdict}");
-        self.usage_tab.set_tooltip_text(Some(&tooltip));
+        self.usage_tab.set_tooltip_text(Some(tooltip));
         if let Some(hook) = self.on_usage_severity.borrow().as_ref() {
-            hook(glyph, &tooltip);
+            hook(glyph, tooltip);
         }
-        verdict
     }
 
     /// Hand the three shades over: they become tabs of their own.
@@ -7137,16 +7156,14 @@ impl ChatPane {
     fn set_context_gauge(&self, used: u64, session: Option<&Usage>) {
         let limit = self.context_limit.get().max(1);
         let fraction = (used as f64 / limit as f64).min(1.0);
-        crate::gauge::set(&self.usage_bar, fraction, false, false);
+        crate::gauge::set_level(&self.usage_bar, fraction);
         let mut details = format!(
             "Context window: {} of {} — {:.0}%{}",
             token_count(used),
             token_count(limit),
             fraction * 100.0,
-            if fraction >= crate::gauge::SPENT_AT {
-                " (nearly full — the agent will compact soon)"
-            } else if fraction >= crate::gauge::WARN_AT {
-                " (filling up)"
+            if fraction >= crate::gauge::NEARLY_FULL {
+                " — the agent will compact it soon"
             } else {
                 ""
             }
@@ -7160,14 +7177,21 @@ impl ChatPane {
     }
 
     /// The gauge beside it: the account's subscription window, drawn from
-    /// the pool this pane was handed. Same widget and same thresholds as
-    /// the context gauge, a different pool — which is what the mark beside
-    /// it says (see `new`).
+    /// the pool this pane was handed. Same widget as the context gauge, a
+    /// different pool — which is what the mark beside it says (see `new`) —
+    /// and the only one of the two with a traffic light, since only it runs
+    /// out.
     ///
     /// Hidden until something has been observed. An empty bar reads as
     /// "nothing spent"; nothing has been *asked* of the account yet, and
     /// only one of those is reassuring.
     fn draw_quota_gauge(self: &Rc<Self>) {
+        self.draw_quota_bar();
+        // The utilization glyph's dot is the plan's, so it moves with it.
+        self.refresh_usage_badge();
+    }
+
+    fn draw_quota_bar(self: &Rc<Self>) {
         // ...and not at all while this chat is Claude Code (Custom): the
         // subscription is a pool this conversation is not drawing on, and
         // the identity beside the slot already says so
@@ -7281,9 +7305,7 @@ impl ChatPane {
         let used = self.context_used.get();
         let fraction = (used as f64 / limit as f64).min(1.0);
 
-        // The badge and the row say the same thing about the same
-        // fraction, so the verdict is computed once and used twice.
-        let verdict = self.refresh_usage_badge();
+        self.refresh_usage_badge();
 
         while let Some(child) = self.usage_list.first_child() {
             self.usage_list.remove(&child);
@@ -7301,7 +7323,7 @@ impl ChatPane {
         row(
             "Context window",
             &format!(
-                "{} of {} — {:.0}% ({verdict})",
+                "{} of {} — {:.0}%",
                 token_count(used),
                 token_count(limit),
                 fraction * 100.0
