@@ -441,7 +441,7 @@ stopped passes (672,714 distinct states, under a minute):
 
 Two switches put the sync as it was into the same model: `CAS`, whether a
 write checks its side at the write, and `Fresh`, whether a pass observes
-the checkout itself. `build-aux/check-sync-model.sh` runs TLC (the
+the checkout itself. `build-aux/check-models.sh` runs TLC (the
 release's jar, digest checked, in a JRE image pinned by digest, neither
 installed on the host) on all four combinations and holds each to its
 outcome: the sync as it is holds every property; each of the other three
@@ -501,7 +501,7 @@ older cleanup of a stash's conflict leftovers does likewise.
 What it leaves out: rebases and other history rewrites (history here only
 grows), merges of divergent branches (said, and left to the user), more
 than one parent, a detached HEAD, submodules, and directories (Sync.tla's
-planner test covers kinds). `build-aux/check-sync-model.sh` runs all eight
+planner test covers kinds). `build-aux/check-models.sh` runs all eight
 configurations; `--quick` leaves out the long one.
 
 ## A damaged repository is repaired from its other copy

@@ -50,10 +50,34 @@ pub use taste_core::mcp::socket_path;
 /// IDE answers agents, it does not fork a task per byte they send.
 const MAX_IN_FLIGHT: usize = 8;
 
-/// Absolute ceiling on one tool call. Every slow path (rust-analyzer,
-/// the UI probe, podman) bounds itself well inside this; the watchdog is
-/// the promise that *nothing* leaves an agent waiting forever.
+/// Absolute ceiling on one tool call, counted from the moment it is read.
+/// Every slow path (rust-analyzer, the UI probe, podman) bounds itself well
+/// inside this; the watchdog is the promise that *nothing* leaves an agent
+/// waiting forever (docs/MCP-CALLS.md, checked in docs/models/Calls.tla).
 const TOOL_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// How long a call may wait for one of its connection's permits before it
+/// is refused, not started: inside [`TOOL_WATCHDOG`] by more than the
+/// longest a tool bounds itself ([`WAIT_MAX_SECS`] and its kin), so a call
+/// that starts late still has the time its own bound promises.
+const QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// A connection's two bounds: the deadline from the read, and the wait for
+/// a permit inside it. The constants, but for a test that cannot wait them.
+#[derive(Debug, Clone, Copy)]
+struct CallBounds {
+    deadline: std::time::Duration,
+    queue: std::time::Duration,
+}
+
+impl Default for CallBounds {
+    fn default() -> Self {
+        Self {
+            deadline: TOOL_WATCHDOG,
+            queue: QUEUE_WAIT,
+        }
+    }
+}
 
 /// What a tool call the user's Stop ended answers (`taste_core::calls`).
 const STOPPED: &str = "Stopped: the user pressed Stop, which ended this call. A command or task \
@@ -195,6 +219,8 @@ pub struct McpServer {
     /// that comes back on its socket after a rebuild finds the task it
     /// started before.
     tasks: Tasks,
+    /// How long a call may take and may queue ([`CallBounds`]).
+    bounds: Mutex<CallBounds>,
 }
 
 /// What a `git_fetch` came to, as the app's fetcher reports it.
@@ -236,6 +262,7 @@ impl McpServer {
             listeners: Mutex::new(BTreeMap::new()),
             git_fetcher: Mutex::new(None),
             tasks: Tasks::default(),
+            bounds: Mutex::default(),
         })
     }
 
@@ -946,6 +973,18 @@ impl McpServer {
     /// agent saw its tools hang. Each request now gets its own task, bounded
     /// by a permit count and a watchdog, and responses go out as they
     /// finish — JSON-RPC matches them by id, not by arrival order.
+    ///
+    /// Every call is answered, or refused, by its deadline, whatever the
+    /// calls beside it do (docs/MCP-CALLS.md; docs/models/Calls.tla checks
+    /// the design). The deadline counts from the read, so a call queued
+    /// for a permit is refused unstarted rather than left waiting behind
+    /// slow work. It is kept by the call's own task, on the runtime's
+    /// workers, while the work runs on a thread of its own, so work that
+    /// blocks its thread outright — a std lock two threads take in opposite
+    /// orders, as `ide_exec`'s registry did on 2026-11-17, wedging every
+    /// call of remise's agent — cannot hold the answer, nor take a worker.
+    /// And the work keeps its permit until it is gone, so blocked work
+    /// stays within the permits, however many calls are answered past it.
     async fn handle_connection<S>(self: Arc<Self>, env: EnvironmentId, stream: S) -> Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
@@ -1059,16 +1098,70 @@ impl McpServer {
             let tools = tools.clone();
             let permits = permits.clone();
             let open = open.clone();
+            let bounds = *self.bounds.lock().unwrap();
             tokio::spawn(async move {
                 let _admission = admission;
                 let key = id.to_string();
                 let stateless =
                     request.params["_meta"][VERSION_META].as_str() == Some(STATELESS_VERSION);
+                let framed_if = |response: Response| {
+                    if stateless {
+                        framed(response)
+                    } else {
+                        response
+                    }
+                };
                 let answer = async {
-                    let Ok(_permit) = permits.acquire_owned().await else {
-                        return Response::err(id.clone(), -32603, "the connection is closing");
+                    let deadline = tokio::time::Instant::now() + bounds.deadline;
+                    let permit = match tokio::time::timeout(bounds.queue, permits.acquire_owned())
+                        .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) => {
+                            return Response::err(id.clone(), -32603, "the connection is closing")
+                        }
+                        Err(_) => {
+                            let said = refused_busy(bounds.queue);
+                            return framed_if(Response::ok(
+                                id.clone(),
+                                tool_result(&json!({ "error": said }), true),
+                            ));
+                        }
                     };
-                    this.answer(&env, &tools, request, id.clone()).await
+                    let method = request.method.clone();
+                    let tool = request.params["name"].as_str().map(str::to_string);
+                    let (done, answered) = tokio::sync::oneshot::channel();
+                    // Dropped with this future — at the deadline, a Stop, or
+                    // a cancel — which drops the work at its next await.
+                    let (_dropping, dropped) = tokio::sync::oneshot::channel::<()>();
+                    let runtime = tokio::runtime::Handle::current();
+                    let (this, env, tools, work_id) =
+                        (this.clone(), env.clone(), tools.clone(), id.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        runtime.block_on(async move {
+                            tokio::select! {
+                                response = this.answer(&env, &tools, request, work_id) => {
+                                    let _ = done.send(response);
+                                }
+                                _ = dropped => {}
+                            }
+                        });
+                    });
+                    match tokio::time::timeout_at(deadline, answered).await {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(_)) => framed_if(Response::ok(
+                            id.clone(),
+                            tool_result(&json!({ "error": "the call stopped unexpectedly" }), true),
+                        )),
+                        Err(_) => framed_if(Response::ok(
+                            id.clone(),
+                            tool_result(
+                                &json!({ "error": overran(&method, tool.as_deref()) }),
+                                true,
+                            ),
+                        )),
+                    }
                 };
                 // Ended first, the answer is dropped where it stands, and
                 // with it what the call started (`ide_exec`'s job, a task's
@@ -1139,22 +1232,11 @@ impl McpServer {
         {
             return framed(self.call_as_task(env, tools, params, id).await);
         }
-        let tool = params["name"].as_str().map(str::to_string);
-        // A tool that never returns is a hung agent. Nothing here
-        // legitimately outlives this watchdog: the slow paths carry their
-        // own, smaller bounds.
-        let response = match tokio::time::timeout(
-            TOOL_WATCHDOG,
-            self.dispatch(env, tools, &method, params, id.clone(), stateless),
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(_) => Response::ok(
-                id,
-                tool_result(&json!({ "error": overran(&method, tool.as_deref()) }), true),
-            ),
-        };
+        // A tool that never returns is a hung agent: its deadline is kept
+        // by the call's own task, apart from this work ([`Self::handle_connection`]).
+        let response = self
+            .dispatch(env, tools, &method, params, id.clone(), stateless)
+            .await;
         // Discovery is the stateless revision's own question, so it is
         // answered in that revision whoever asks.
         if stateless || method == "server/discover" {
@@ -1302,6 +1384,14 @@ impl McpServer {
         stateless: bool,
     ) -> Response {
         match method {
+            // Work that blocks its thread outright, for as long as asked,
+            // as a deadlocked std lock does.
+            #[cfg(test)]
+            "test/block" => {
+                let ms = params["ms"].as_u64().unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                Response::ok(id, json!({}))
+            }
             "initialize" => Response::ok(
                 id,
                 json!({
@@ -6730,6 +6820,16 @@ fn is_config_path(root: &std::path::Path, path: &std::path::Path) -> bool {
     relative.starts_with(".devcontainer") || relative == std::path::Path::new(".devcontainer.json")
 }
 
+/// What a call that waited [`QUEUE_WAIT`] for a permit and never got one
+/// is answered with: nothing of it ran.
+fn refused_busy(waited: std::time::Duration) -> String {
+    format!(
+        "Not started: this connection's {MAX_IN_FLIGHT} calls in flight were all still running \
+         after {}s. Nothing was done. Call again once one of them has answered.",
+        waited.as_secs()
+    )
+}
+
 /// What a call that outlived [`TOOL_WATCHDOG`] is answered with. Its
 /// work is not stopped by the answer: a step running off the reactor
 /// finishes in the IDE whatever the agent is told. So the answer says not
@@ -9944,6 +10044,109 @@ mod tests {
             .next(std::time::Duration::from_millis(300))
             .await
             .is_none());
+    }
+
+    /// Every call is answered by its deadline, whatever the work beside it
+    /// does (docs/models/Calls.tla). Work that blocks its thread outright,
+    /// in every permit, is answered as overrunning at the deadline, long
+    /// before it ends; a call queued behind it is refused, not started;
+    /// neither takes the runtime's two workers, which go on answering; and
+    /// the permits come back with the work, not before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_call_is_answered_by_its_deadline_whatever_its_work_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut workspace = taste_core::Workspace::open(root.to_path_buf());
+        workspace.exec = ExecContext::for_tests(true);
+        let environments = EnvironmentRegistry::new_for_tests(
+            root.to_path_buf(),
+            workspace.events.clone(),
+            workspace.exec.clone(),
+            root.join("state"),
+        );
+        let packager = Packager::new(root.to_path_buf(), workspace.events.clone());
+        let server = McpServer::new(environments, packager, workspace.clone());
+        *server.bounds.lock().unwrap() = CallBounds {
+            deadline: std::time::Duration::from_millis(1000),
+            queue: std::time::Duration::from_millis(300),
+        };
+        let socket = serve_on(&server, EnvironmentId::primary(), root.join("mcp.sock")).await;
+        let mut client = Client::connect(&socket).await;
+
+        let started = std::time::Instant::now();
+        for id in 0..MAX_IN_FLIGHT as u64 {
+            client
+                .send(json!({"jsonrpc": "2.0", "id": id, "method": "test/block",
+                             "params": {"ms": 4000}}))
+                .await;
+        }
+        // Each call takes its permit in a task of its own, in no set order:
+        // the queued call goes in once every permit is the blocked work's.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        client
+            .send(json!({"jsonrpc": "2.0", "id": 100, "method": "tools/list"}))
+            .await;
+
+        let queued = client
+            .next(std::time::Duration::from_secs(2))
+            .await
+            .expect("the queued call is answered");
+        assert_eq!(queued["id"], 100, "{queued}");
+        assert_eq!(queued["result"]["isError"], true, "{queued}");
+        let said = queued["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(said.contains("Not started"), "{said}");
+
+        let mut overran = std::collections::BTreeSet::new();
+        for _ in 0..MAX_IN_FLIGHT {
+            let answer = client
+                .next(std::time::Duration::from_secs(2))
+                .await
+                .expect("every blocked call is answered at its deadline");
+            assert_eq!(answer["result"]["isError"], true, "{answer}");
+            overran.insert(answer["id"].as_u64().unwrap());
+        }
+        assert_eq!(overran.len(), MAX_IN_FLIGHT, "each once");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(3000),
+            "answered by the deadline, not by the work's end: {:?}",
+            started.elapsed()
+        );
+
+        // The permits are still the blocked work's: a call now is refused.
+        client
+            .send(json!({"jsonrpc": "2.0", "id": 101, "method": "tools/list"}))
+            .await;
+        let refused = client
+            .next(std::time::Duration::from_secs(2))
+            .await
+            .expect("answered");
+        assert_eq!(refused["id"], 101, "{refused}");
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+
+        // Once the work is gone, they are back.
+        tokio::time::sleep(
+            std::time::Duration::from_millis(4500).saturating_sub(started.elapsed()),
+        )
+        .await;
+        client
+            .send(json!({"jsonrpc": "2.0", "id": 102, "method": "tools/list"}))
+            .await;
+        let listed = client
+            .next(std::time::Duration::from_secs(5))
+            .await
+            .expect("answered");
+        assert_eq!(listed["id"], 102, "{listed}");
+        assert!(listed["result"]["tools"].is_array(), "{listed}");
+    }
+
+    /// The wait for a permit and the longest bound a tool sets itself fit
+    /// inside the deadline, so a call that starts late still has its own.
+    #[test]
+    fn a_late_start_keeps_the_time_its_tool_promises() {
+        let longest = std::time::Duration::from_secs(WAIT_MAX_SECS.max(RELOAD_WAIT_MAX_SECS))
+            .max(CONFIRM_WAIT)
+            .max(ORCHESTRATION_CREATE_TIMEOUT);
+        assert!(QUEUE_WAIT + longest < TOOL_WATCHDOG);
     }
 
     /// Ended calls give their permits back: a Stop over more calls than

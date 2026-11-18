@@ -1,6 +1,10 @@
 #!/bin/sh
-# Model-check the sync's pass, docs/models/Sync.tla, with TLC (docs/SYNC.md,
-# layer 4): every interleaving of edits on both sides with every step of
+# Model-check the designs under docs/models with TLC, each configuration
+# held to the outcome it must have: "holds", or the one invariant it must
+# break, which is how a model shows it can see the bug a design closed
+# rather than passing because it sees nothing.
+#
+# The sync's pass, docs/models/Sync.tla (docs/SYNC.md, layer 4): every interleaving of edits on both sides with every step of
 # every pass, over a small universe. Four configurations, each with the
 # outcome it must have:
 #
@@ -18,7 +22,7 @@
 #                 edit between the pass's look and its write is lost.
 #   SyncOld       neither: the sync before 2026-10-12. The edit is lost.
 #
-# The last three must FAIL Safety, which is how this shows that the model
+# The last three must break Safety, which is how this shows that the model
 # can see the bugs the redesign closed, rather than passing because it sees
 # nothing — and why the sync needs both halves of it.
 #
@@ -33,6 +37,20 @@
 #   SyncGitHardReset  a stash that will not pop back is cleaned with reset
 #                     --hard: an agent's edit made meanwhile is lost.
 #   SyncGitClean      reset --hard and git clean: likewise.
+#
+# Then docs/models/Calls.tla, how the MCP server answers a connection's
+# tool calls (docs/MCP-CALLS.md): every call answered, or refused, within
+# its deadline, whatever the calls beside it do.
+#
+#   Calls            as built: every property holds.
+#   CallsAsWas       the deadline inside the work, counted from the permit:
+#                    a call whose work blocks its thread is never answered.
+#   CallsFromPermit  the deadline apart, counted from the permit: a call
+#                    queued behind slow work waits past it.
+#   CallsBeside      the deadline a task beside the work, on its workers:
+#                    work blocked in all of them leaves none to answer.
+#   CallsFreeSlot    the permit given back at the answer: blocked work grows
+#                    past the permits.
 #
 # `--quick` leaves out the long run.
 #
@@ -68,10 +86,10 @@ check() {
     states=$(printf '%s\n' "$out" | grep -E 'distinct states found' | tail -1)
     if printf '%s\n' "$out" | grep -q 'No error has been found'; then
         got=holds
-    elif printf '%s\n' "$out" | grep -q 'Invariant Safety is violated'; then
-        got=loses-an-edit
     else
-        got=other
+        broke=$(printf '%s\n' "$out" | sed -n 's/^Error: Invariant \([A-Za-z]*\) is violated.*/\1/p' | head -1)
+        got=${broke:+breaks-$broke}
+        got=${got:-other}
     fi
     if [ "$got" = "$want" ]; then
         echo "ok    $config: $got ($states)"
@@ -83,11 +101,16 @@ check() {
 }
 
 check Sync holds
-check SyncNotFresh loses-an-edit
-check SyncNoCas loses-an-edit
-check SyncOld loses-an-edit
-check SyncGitIgnored loses-an-edit SyncGit
-check SyncGitHardReset loses-an-edit SyncGit
-check SyncGitClean loses-an-edit SyncGit
+check SyncNotFresh breaks-Safety
+check SyncNoCas breaks-Safety
+check SyncOld breaks-Safety
+check SyncGitIgnored breaks-Safety SyncGit
+check SyncGitHardReset breaks-Safety SyncGit
+check SyncGitClean breaks-Safety SyncGit
+check Calls holds Calls
+check CallsAsWas breaks-AnsweredInTime Calls
+check CallsFromPermit breaks-AnsweredInTime Calls
+check CallsBeside breaks-AnsweredInTime Calls
+check CallsFreeSlot breaks-Contained Calls
 [ "${1:-}" = "--quick" ] || check SyncGit holds SyncGit
 exit $failed
