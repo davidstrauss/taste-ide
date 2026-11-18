@@ -107,7 +107,8 @@ pub fn recheck_path(domain: &str) -> PathBuf {
 /// supposed to win when the VM diverges (including no shared history) and
 /// the VM was already marked as safe to delete"). Personal's old tip is
 /// kept either way.
-static CLEAN_RETURNS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static CLEAN_RETURNS: tracing_mutex::stdsync::Mutex<Vec<String>> =
+    tracing_mutex::stdsync::Mutex::new(Vec::new());
 
 /// `vm` is being brought into use: remember whether it comes back marked.
 /// Asked before its marker is withdrawn, which the bring-up does next.

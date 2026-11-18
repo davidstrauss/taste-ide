@@ -6,7 +6,8 @@
 //! the container id here and *new* executions land in the new container,
 //! while nothing holding the context is torn down.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tracing_mutex::stdsync::RwLock;
 
 /// A concrete command to spawn, already resolved against the current
 /// execution context.
@@ -345,6 +346,16 @@ impl ExecContext {
         };
     }
 
+    /// The target as it stands, read once. A resolve works from this copy
+    /// and holds no lock while it does: the target is a std `RwLock`, which
+    /// on Linux favours a waiting writer over a second read, so a resolve
+    /// that read it again while still holding its first read waited forever
+    /// on any retarget that came between the two (docs/LOCKS.md). One read
+    /// also means one resolve can never mix two targets.
+    fn target(&self) -> Target {
+        self.target.read().unwrap().clone()
+    }
+
     /// Point subsequent executions back at the host.
     pub fn set_host(&self) {
         *self.target.write().unwrap() = Target::Host;
@@ -479,9 +490,10 @@ impl ExecContext {
     /// cost is the terminal's: stderr arrives in stdout, and lines end in
     /// `\r\n`. Measured with a podman client that has no terminal itself.
     pub fn resolve_in_terminal(&self, program: &str, args: &[&str]) -> CommandSpec {
-        match &*self.target.read().unwrap() {
+        let target = self.target();
+        match &target {
             Target::Container { .. } => {
-                self.resolve_with_exec_flags(&["-t".to_string()], None, program, args)
+                self.resolve_with_exec_flags(&target, &["-t".to_string()], None, program, args)
             }
             Target::Host => self.host_spec(program, args),
         }
@@ -505,14 +517,15 @@ impl ExecContext {
         if for_agent {
             env.extend(crate::policy::agent_git_config_env());
         }
-        match &*self.target.read().unwrap() {
+        let target = self.target();
+        match &target {
             Target::Container { .. } => {
                 let mut flags: Vec<String> = vec!["-d".into()];
                 for (key, value) in &env {
                     flags.push("--env".into());
                     flags.push(format!("{key}={value}"));
                 }
-                self.resolve_with_exec_flags(&flags, None, program, args)
+                self.resolve_with_exec_flags(&target, &flags, None, program, args)
             }
             Target::Host => self.host_spec(program, args),
         }
@@ -533,7 +546,8 @@ impl ExecContext {
     ) -> CommandSpec {
         let mut env: Vec<(String, String)> = extra_env.to_vec();
         env.extend(crate::policy::agent_git_config_env());
-        match &*self.target.read().unwrap() {
+        let target = self.target();
+        match &target {
             Target::Container { .. } => {
                 let mut prefix: Vec<String> = Vec::new();
                 if terminal {
@@ -543,7 +557,7 @@ impl ExecContext {
                     prefix.push("--env".into());
                     prefix.push(format!("{key}={value}"));
                 }
-                self.resolve_with_exec_flags(&prefix, cwd, program, args)
+                self.resolve_with_exec_flags(&target, &prefix, cwd, program, args)
             }
             Target::Host => {
                 // No podman to carry the environment: `env` does it — and
@@ -556,7 +570,7 @@ impl ExecContext {
                 argv.push(program.to_string());
                 argv.extend(args.iter().map(|s| s.to_string()));
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                self.resolve("env", &refs, false)
+                self.resolve_on(&target, None, &[], "env", &refs, false)
             }
         }
     }
@@ -571,12 +585,13 @@ impl ExecContext {
     /// the wrong directory fails in ways nobody reads as a flag bug.
     fn resolve_with_exec_flags(
         &self,
+        target: &Target,
         exec_flags: &[String],
         workdir_override: Option<&str>,
         program: &str,
         args: &[&str],
     ) -> CommandSpec {
-        let (podman, stop) = match &*self.target.read().unwrap() {
+        let (podman, stop) = match target {
             Target::Host => return self.host_spec(program, args),
             Target::Container {
                 id, workdir, user, ..
@@ -674,7 +689,20 @@ impl ExecContext {
         args: &[&str],
         interactive: bool,
     ) -> CommandSpec {
-        let podman: Vec<String> = match &*self.target.read().unwrap() {
+        self.resolve_on(&self.target(), user, env, program, args, interactive)
+    }
+
+    /// [`Self::resolve_full`] against a target already read.
+    fn resolve_on(
+        &self,
+        target: &Target,
+        user: Option<&str>,
+        env: &[(String, String)],
+        program: &str,
+        args: &[&str],
+        interactive: bool,
+    ) -> CommandSpec {
+        let podman: Vec<String> = match target {
             Target::Host => return self.host_spec(program, args),
             Target::Container {
                 id,

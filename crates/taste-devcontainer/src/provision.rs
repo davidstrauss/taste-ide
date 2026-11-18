@@ -2314,8 +2314,8 @@ async fn disk_budget() -> Option<DiskBudget> {
 
 /// The VMs whose guest is short with no room to grow, already said so
 /// ([`LibvirtSession::grow_disk`]): said once, not at every check.
-static SHORT_TOLD: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static SHORT_TOLD: tracing_mutex::stdsync::Mutex<std::collections::BTreeMap<String, String>> =
+    tracing_mutex::stdsync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Why `domain`'s disk could not grow when its guest last ran short, while
 /// it still is: what a build that ran out of space quotes, since "no space

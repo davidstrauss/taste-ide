@@ -32,7 +32,8 @@
 //! page's script sends it, and so does the JSON it returns.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};

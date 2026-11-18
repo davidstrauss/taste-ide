@@ -19,8 +19,9 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing_mutex::stdsync::Mutex;
 
 /// The size a log is rotated at.
 pub const MAX_BYTES: u64 = 4 * 1024 * 1024;

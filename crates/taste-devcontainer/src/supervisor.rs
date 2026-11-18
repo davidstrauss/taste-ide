@@ -23,7 +23,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use taste_core::environment::{
@@ -8506,7 +8507,8 @@ mod tests {
     #[tokio::test]
     async fn a_relayed_connection_is_activated_then_joined_to_the_tunnel() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        static ASKED: std::sync::Mutex<Vec<(String, u16)>> = std::sync::Mutex::new(Vec::new());
+        static ASKED: tracing_mutex::stdsync::Mutex<Vec<(String, u16)>> =
+            tracing_mutex::stdsync::Mutex::new(Vec::new());
         crate::activation::set(std::sync::Arc::new(|env, port| {
             Box::pin(async move {
                 ASKED.lock().unwrap().push((env.to_string(), port));

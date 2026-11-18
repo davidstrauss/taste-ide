@@ -1,0 +1,15 @@
+# std's locks are spelled through tracing-mutex, whose debug build checks
+# the order every lock is taken in (docs/LOCKS.md). A std lock written
+# directly would be one the check cannot see.
+#
+# In a release build tracing_mutex::stdsync re-exports std's own types, so
+# `cargo clippy --release` reports every lock in the workspace here: the
+# gate's clippy is the debug one, and this list is for it.
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "use tracing_mutex::stdsync::Mutex, whose lock order is checked (docs/LOCKS.md)" },
+    { path = "std::sync::MutexGuard", reason = "use tracing_mutex::stdsync::MutexGuard (docs/LOCKS.md)" },
+    { path = "std::sync::RwLock", reason = "use tracing_mutex::stdsync::RwLock, whose lock order is checked (docs/LOCKS.md)" },
+    { path = "std::sync::RwLockReadGuard", reason = "use tracing_mutex::stdsync::RwLockReadGuard (docs/LOCKS.md)" },
+    { path = "std::sync::RwLockWriteGuard", reason = "use tracing_mutex::stdsync::RwLockWriteGuard (docs/LOCKS.md)" },
+    { path = "std::sync::Condvar", reason = "use tracing_mutex::stdsync::Condvar, which waits on a traced guard (docs/LOCKS.md)" },
+]

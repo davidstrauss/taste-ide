@@ -212,7 +212,7 @@ pub fn sweep() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use tracing_mutex::stdsync::Mutex;
 
     /// XDG_STATE_HOME is process-wide: the tests that set it take turns.
     static STATE: Mutex<()> = Mutex::new(());

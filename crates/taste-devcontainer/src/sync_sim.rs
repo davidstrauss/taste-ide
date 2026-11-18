@@ -1171,8 +1171,8 @@ const COVERAGE: [(&str, &str); 13] = [
     ("files moved aside", "aside"),
 ];
 
-static TALLY: std::sync::Mutex<[usize; COVERAGE.len()]> =
-    std::sync::Mutex::new([0; COVERAGE.len()]);
+static TALLY: tracing_mutex::stdsync::Mutex<[usize; COVERAGE.len()]> =
+    tracing_mutex::stdsync::Mutex::new([0; COVERAGE.len()]);
 
 fn run_seed(seed: u64, steps: usize) {
     let ran = std::panic::catch_unwind(|| {

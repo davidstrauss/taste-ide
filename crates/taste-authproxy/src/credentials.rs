@@ -72,8 +72,9 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{Context, Result};
 use http::header::{HeaderMap, HeaderValue, AUTHORIZATION};

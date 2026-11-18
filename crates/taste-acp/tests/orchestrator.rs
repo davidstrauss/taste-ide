@@ -39,8 +39,9 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+use tracing_mutex::stdsync::Mutex;
 
 use taste_core::environment::EnvironmentId;
 use taste_core::orchestration::{

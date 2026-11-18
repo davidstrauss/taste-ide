@@ -22,7 +22,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use crate::environment::EnvironmentId;
 use crate::event::{Event, EventBus};

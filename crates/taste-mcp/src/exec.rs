@@ -28,7 +28,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{Context, Result};
 use taste_core::shells::{ShellControl, ShellKind, ShellRoster, ShellSink, ShellState};

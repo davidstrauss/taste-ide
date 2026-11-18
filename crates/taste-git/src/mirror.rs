@@ -129,7 +129,7 @@ impl RulesSeen {
 
 /// The rules each working copy's last pass decided by, by its root.
 static RULES_SEEN: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, RulesSeen>>,
+    tracing_mutex::stdsync::Mutex<std::collections::HashMap<PathBuf, RulesSeen>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// The rules `root`'s last pass kept, taken: a pass that fails partway

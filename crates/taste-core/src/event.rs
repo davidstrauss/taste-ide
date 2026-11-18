@@ -624,7 +624,7 @@ pub enum DevcontainerStateEvent {
 /// Subscribers each get every event (clone-per-subscriber).
 #[derive(Clone)]
 pub struct EventBus {
-    senders: std::sync::Arc<std::sync::Mutex<Vec<async_channel::Sender<Event>>>>,
+    senders: std::sync::Arc<tracing_mutex::stdsync::Mutex<Vec<async_channel::Sender<Event>>>>,
 }
 
 impl Default for EventBus {
@@ -636,7 +636,7 @@ impl Default for EventBus {
 impl EventBus {
     pub fn new() -> Self {
         Self {
-            senders: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            senders: std::sync::Arc::new(tracing_mutex::stdsync::Mutex::new(Vec::new())),
         }
     }
 

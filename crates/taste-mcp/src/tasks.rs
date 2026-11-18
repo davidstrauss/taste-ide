@@ -28,8 +28,8 @@
 //! it started before is still its own.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tracing_mutex::stdsync::Mutex;
 
 use serde_json::{json, Value};
 use taste_core::EnvironmentId;

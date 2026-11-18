@@ -566,7 +566,7 @@ pub fn save(root: &Path, state: &WorkspaceState) -> Result<()> {
 /// back as it was before, and lost it; and with one temporary name per
 /// process, the second rename found the first had taken its file ("saving
 /// chats failed: installing …json: No such file or directory").
-static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static WRITING: tracing_mutex::stdsync::Mutex<()> = tracing_mutex::stdsync::Mutex::new(());
 
 /// Change the workspace's state in place: read it, `change` it, and write
 /// it back, with no other change of this process's in between. What it

@@ -15,7 +15,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use taste_core::environment::{self, EnvironmentId};
@@ -967,7 +968,7 @@ impl EnvironmentRegistry {
     /// soon as it is, before its boot rather than after.
     fn pool_naming(&self, leaving: Option<String>, named: VmNamed) -> crate::pool::Pool {
         let sink = self.vm_log_sink();
-        let told = std::sync::Mutex::new(None::<String>);
+        let told = tracing_mutex::stdsync::Mutex::new(None::<String>);
         crate::pool::Pool::new(&self.workspace_root).with_sink(Arc::new(
             move |domain: &str, line: String| {
                 if leaving.as_deref() != Some(domain) {
@@ -2267,7 +2268,7 @@ impl EnvironmentRegistry {
         // that follows a RUN while podman writes the layer — a clock, from
         // a ticker, since nothing prints then (David, 2026-10-05: "This
         // should show progress").
-        let progress = std::sync::Arc::new(std::sync::Mutex::new((
+        let progress = std::sync::Arc::new(tracing_mutex::stdsync::Mutex::new((
             crate::supervisor::BuildProgress::default(),
             std::time::Instant::now(),
         )));
@@ -3068,7 +3069,7 @@ impl EnvironmentRegistry {
         // One share at a time: a fetch's share runs on a thread of its own
         // now, and two at once would push the same refs twice and race on
         // each checkout's config.
-        static SHARING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static SHARING: tracing_mutex::stdsync::Mutex<()> = tracing_mutex::stdsync::Mutex::new(());
         let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
         let folder = self.workspace_root.clone();
         let Some(git) = taste_git::GitWorkspace::discover(&folder) else {

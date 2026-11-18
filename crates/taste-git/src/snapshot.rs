@@ -361,7 +361,7 @@ impl Stamp {
 /// changed within the last two seconds is not remembered, since a write in
 /// the same tick as the hash would leave its stat as it was.
 static HASHED: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, (Stamp, Oid)>>,
+    tracing_mutex::stdsync::Mutex<std::collections::HashMap<PathBuf, (Stamp, Oid)>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// How many files [`HASHED`] remembers before it starts over.

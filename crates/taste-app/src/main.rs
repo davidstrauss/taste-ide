@@ -55,6 +55,7 @@ mod issue_pill;
 mod kernel;
 mod kernels;
 mod languages;
+mod lock_order;
 mod logview;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
@@ -258,6 +259,8 @@ fn main() -> glib::ExitCode {
             default(info);
         }));
     }
+    // A lock taken out of order is logged here, not a panic (`lock_order`).
+    lock_order::report_cycles();
     // GLib's structured log (GTK CSS parse errors, missing icons,
     // unparented-widget warnings) is mirrored the same way, then handed to
     // the default writer so stderr behaves exactly as before.

@@ -32,7 +32,8 @@
 //! nearly everything an agent runs, and nothing here pretends otherwise.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use crate::capped::CappedOutput;
 use crate::environment::EnvironmentId;

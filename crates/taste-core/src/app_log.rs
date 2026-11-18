@@ -11,8 +11,9 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing_mutex::stdsync::Mutex;
 
 const CAPACITY: usize = 1000;
 

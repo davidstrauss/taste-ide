@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing-mutex.workspace = true
 taste-core = { path = "../taste-core" }
 anyhow.workspace = true
 serde.workspace = true

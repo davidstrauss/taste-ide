@@ -309,7 +309,8 @@ impl CommandProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use tracing_mutex::stdsync::Mutex;
 
     #[test]
     fn a_prompt_invokes_an_offered_command_by_its_first_word() {

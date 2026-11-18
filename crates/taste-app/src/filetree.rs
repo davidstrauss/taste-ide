@@ -6368,8 +6368,9 @@ impl FileTree {
                             // Once a minute, not once a query: the same
                             // sentence three times a second is noise over
                             // the line that would say when it changed.
-                            static LAST_WARNED: std::sync::Mutex<Option<std::time::Instant>> =
-                                std::sync::Mutex::new(None);
+                            static LAST_WARNED: tracing_mutex::stdsync::Mutex<
+                                Option<std::time::Instant>,
+                            > = tracing_mutex::stdsync::Mutex::new(None);
                             let mut last = LAST_WARNED.lock().unwrap();
                             if last
                                 .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60))
@@ -10170,7 +10171,9 @@ impl FileTree {
         }
         let files = self.worktree().files();
         let into = tree_drop::folder_name(&dir);
-        let tally = std::sync::Arc::new(std::sync::Mutex::new(tree_drop::Copied::default()));
+        let tally = std::sync::Arc::new(tracing_mutex::stdsync::Mutex::new(
+            tree_drop::Copied::default(),
+        ));
         let counted = tally.clone();
         self.file_op(
             "Copying in failed".to_string(),

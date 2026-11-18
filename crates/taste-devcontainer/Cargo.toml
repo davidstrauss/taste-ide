@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing-mutex.workspace = true
 taste-core.workspace = true
 taste-git.workspace = true
 taste-gcp.workspace = true

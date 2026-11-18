@@ -26,7 +26,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -8932,7 +8933,7 @@ mod tests {
         let (server, workspace, _environments) = build_test_server(root);
         // A window that shows the question and never answers it.
         let requests = workspace.ui.requests();
-        let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shown = std::sync::Arc::new(tracing_mutex::stdsync::Mutex::new(Vec::new()));
         {
             let shown = shown.clone();
             tokio::spawn(async move {

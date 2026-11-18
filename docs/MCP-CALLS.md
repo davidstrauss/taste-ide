@@ -117,4 +117,6 @@ fails as `CallsBeside` does.
   off the workers. A std lock that blocks in any other task on the runtime
   still takes a worker, and enough of those would stop every timer,
   including these. The model's promise covers what a call's work does,
-  not the rest of the IDE. That rest is why a lock-order bug is still a bug.
+  not the rest of the IDE. That rest is why a lock-order bug is still a bug,
+  and why the order every std lock is taken in is checked in tests and in
+  the debug IDE (`docs/LOCKS.md`).

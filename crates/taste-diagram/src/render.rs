@@ -18,7 +18,8 @@
 //! background is left transparent: the page is the diagram's canvas.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use tracing_mutex::stdsync::Mutex;
 
 use merman::svg::{
     CssOverridePolicy, HostMeasurementResult, HostTextMeasurement, HostTextMeasurementRequest,

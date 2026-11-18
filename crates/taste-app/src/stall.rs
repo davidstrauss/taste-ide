@@ -12,8 +12,8 @@
 //! anything for that long is logged too, past [`SLOW`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tracing_mutex::stdsync::Mutex;
 
 use gtk::glib;
 

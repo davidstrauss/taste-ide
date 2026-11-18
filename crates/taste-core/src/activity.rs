@@ -20,8 +20,9 @@
 //! rotation, saturation and the empty case testable without sleeping.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing_mutex::stdsync::Mutex;
 
 use crate::environment::EnvironmentId;
 use crate::event::Event;

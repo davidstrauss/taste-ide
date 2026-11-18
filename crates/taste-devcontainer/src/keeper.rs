@@ -54,8 +54,9 @@ use std::io::{self, Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use taste_core::files::{Entry, ExecOutput, Kind, RemoteFiles, Stat};

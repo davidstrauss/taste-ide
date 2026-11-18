@@ -5,9 +5,10 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tracing_mutex::stdsync::Mutex;
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode, Uri};

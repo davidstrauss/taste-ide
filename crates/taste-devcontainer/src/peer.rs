@@ -649,7 +649,7 @@ pub fn share_tracking(folder: &Path, files: &Files, path: &Path) -> Result<()> {
     // fetch's share without it, and two at once collide on the checkout's
     // `.git/config.lock`, or interleave their unsets and adds (review,
     // 2026-10-20).
-    static SHARING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SHARING: tracing_mutex::stdsync::Mutex<()> = tracing_mutex::stdsync::Mutex::new(());
     let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(git) = taste_git::GitWorkspace::discover(folder) else {
         return Ok(());

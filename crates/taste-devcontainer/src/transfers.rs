@@ -29,8 +29,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing_mutex::stdsync::Mutex;
 
 use taste_core::{Event, EventBus, SyncFile};
 

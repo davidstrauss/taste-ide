@@ -8,7 +8,8 @@
 //! no recorder exists: there is no always-on stream to mute.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use gstreamer as gst;

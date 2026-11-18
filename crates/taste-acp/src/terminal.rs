@@ -70,7 +70,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, TerminalExitStatus, TerminalId, TerminalOutputResponse,

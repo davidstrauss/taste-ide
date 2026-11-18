@@ -9,6 +9,7 @@ name = "taste-ide"
 path = "src/main.rs"
 
 [dependencies]
+tracing-mutex.workspace = true
 taste-core.workspace = true
 taste-acp.workspace = true
 taste-git.workspace = true

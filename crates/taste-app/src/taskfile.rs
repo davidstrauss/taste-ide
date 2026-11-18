@@ -26,8 +26,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::Duration;
+use tracing_mutex::stdsync::Mutex;
 
 use taste_core::tasks::{Allowed, Listing, Required};
 use taste_core::Files;

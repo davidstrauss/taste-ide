@@ -5202,6 +5202,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/tracing-mutex/tracing-mutex-0.3.3.crate",
+        "sha256": "64aed473bc9271d160dce1fda5daebec76bb740f9db452bf6c9682344a5e44c0",
+        "dest": "cargo/vendor/tracing-mutex-0.3.3"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"64aed473bc9271d160dce1fda5daebec76bb740f9db452bf6c9682344a5e44c0\", \"files\": {}}",
+        "dest": "cargo/vendor/tracing-mutex-0.3.3",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/tracing-subscriber/tracing-subscriber-0.3.23.crate",
         "sha256": "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319",
         "dest": "cargo/vendor/tracing-subscriber-0.3.23"

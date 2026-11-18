@@ -6,9 +6,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;

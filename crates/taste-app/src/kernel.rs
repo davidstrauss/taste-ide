@@ -152,7 +152,7 @@ impl Kernel {
         let mut stdin = child.stdin.take().context("the kernel's stdin")?;
         let stdout = child.stdout.take().context("the kernel's stdout")?;
         let stderr = child.stderr.take().context("the kernel's stderr")?;
-        let tail = std::sync::Arc::new(std::sync::Mutex::new(
+        let tail = std::sync::Arc::new(tracing_mutex::stdsync::Mutex::new(
             std::collections::VecDeque::<String>::new(),
         ));
 

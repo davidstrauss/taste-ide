@@ -16,7 +16,8 @@
 //! own, and with it its own plan.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 #[derive(Clone, Default)]
 pub struct AdvertisedModels {

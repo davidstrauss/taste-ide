@@ -31,7 +31,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use tracing_mutex::stdsync::Mutex;
 
 use adw::prelude::*;
 use gtk::glib;

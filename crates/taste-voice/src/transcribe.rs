@@ -16,7 +16,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{bail, Context, Result};
 

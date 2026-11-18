@@ -27,7 +27,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::Result;
 use git2::{BranchType, Oid};

@@ -6,8 +6,9 @@
 //! global, because two composers must not download the same 150 MB twice
 //! or run two copies of the model.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tracing_mutex::stdsync::Mutex;
 
 use gtk::glib;
 use taste_voice::{ModelSpec, Transcriber, BASE_EN};

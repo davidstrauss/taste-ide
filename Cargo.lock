@@ -3815,6 +3815,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -3857,6 +3858,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-mutex",
  "tracing-subscriber",
  "vte4",
  "webkit6",
@@ -3900,6 +3902,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -3929,6 +3932,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -3952,6 +3956,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -3967,6 +3972,7 @@ dependencies = [
  "serde_json",
  "skrifa",
  "taste-confine",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -3991,6 +3997,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -4025,6 +4032,7 @@ dependencies = [
  "taste-models",
  "tempfile",
  "tokio",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -4037,6 +4045,7 @@ dependencies = [
  "ignore",
  "tempfile",
  "tracing",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -4058,6 +4067,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -4090,6 +4100,7 @@ dependencies = [
  "taste-models",
  "tempfile",
  "tracing",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -4127,6 +4138,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -4387,6 +4399,15 @@ dependencies = [
  "log",
  "once_cell",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-mutex"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64aed473bc9271d160dce1fda5daebec76bb740f9db452bf6c9682344a5e44c0"
+dependencies = [
+ "autocfg",
 ]
 
 [[package]]

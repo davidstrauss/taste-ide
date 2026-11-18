@@ -900,7 +900,7 @@ mod tests {
         let uri: Uri = format!("http://127.0.0.1:{port}").parse().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = wake_path(&dir.path().join("custom-model.json"));
-        let said = std::sync::Mutex::new(Vec::new());
+        let said = tracing_mutex::stdsync::Mutex::new(Vec::new());
         let outcome = ensure_awake(
             &uri,
             &path,

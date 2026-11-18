@@ -57,7 +57,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
+use tracing_mutex::stdsync::Mutex;
 
 use anyhow::{Context, Result};
 use notify::{RecursiveMode, Watcher};

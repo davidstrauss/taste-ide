@@ -51,6 +51,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "i
 async-channel = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Every std lock in the workspace is this crate's: in a debug build each
+# lock taken while another is held is an edge of one graph, and an edge
+# that closes a cycle is reported where it is taken, whether or not the
+# two orders ever met (docs/LOCKS.md). A release build gets std's own.
+# `experimental` is for `set_cycle_handler`, which the app uses to log a
+# cycle rather than panic.
+tracing-mutex = { version = "0.3.3", features = ["experimental"] }
 sha2 = "0.11"
 notify = "8"
 json_comments = "0.2"

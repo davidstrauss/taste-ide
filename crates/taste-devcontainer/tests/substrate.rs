@@ -54,7 +54,8 @@
 //! → "Remote substrate".
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use taste_core::environment::EnvironmentId;
 use taste_core::{ConfigAuthority, EventBus, ExecContext};

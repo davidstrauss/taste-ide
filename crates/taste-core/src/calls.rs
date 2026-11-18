@@ -21,7 +21,8 @@
 //! pane stops from the GTK thread, and the MCP server waits from tokio.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use crate::environment::EnvironmentId;
 

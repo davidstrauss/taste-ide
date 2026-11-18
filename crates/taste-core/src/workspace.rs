@@ -2,7 +2,8 @@
 //! subsystem hangs off.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use crate::activity::Activity;
 use crate::environment::Checkout;

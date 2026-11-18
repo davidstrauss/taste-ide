@@ -10,7 +10,8 @@
 //! run there in turn, its panic carried back to fail the test that asked.
 
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use tracing_mutex::stdsync::Mutex;
 
 type Job = Box<dyn FnOnce() + Send>;
 

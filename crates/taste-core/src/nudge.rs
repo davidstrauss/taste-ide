@@ -30,7 +30,8 @@
 //! asks on the GTK thread and the MCP server delivers from tokio.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tracing_mutex::stdsync::Mutex;
 
 use crate::environment::EnvironmentId;
 

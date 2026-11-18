@@ -6697,10 +6697,11 @@ async fn activate_service(
     port: u16,
 ) {
     type Key = (taste_core::environment::EnvironmentId, u16);
-    static SERVED: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, std::time::Instant>>> =
-        std::sync::OnceLock::new();
+    static SERVED: std::sync::OnceLock<
+        tracing_mutex::stdsync::Mutex<HashMap<Key, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
     static GATES: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<Key, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+        tracing_mutex::stdsync::Mutex<HashMap<Key, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     > = std::sync::OnceLock::new();
     let key = (env.clone(), port);
     let served = SERVED.get_or_init(Default::default);

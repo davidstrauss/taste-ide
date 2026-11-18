@@ -790,6 +790,11 @@ to.
 
 - GTK objects never leave the main thread; tokio-side code communicates via
   `taste_core::EventBus` only.
+- **std locks are `tracing_mutex::stdsync`'s**, and clippy refuses std's
+  own: a debug build refuses a lock that closes a cycle in the order locks
+  are taken in, so a test fails on a deadlock that never had to happen
+  (docs/LOCKS.md). Never hold a lock across a call that may take it again,
+  an `RwLock`'s read included.
 - **The boundary is the host, not the agent.** The agent and the
   containers sit on one side; the host and `$HOME` sit on the other.
   Nothing an agent or a container runs reaches the user's home, their ssh

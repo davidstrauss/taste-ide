@@ -29,7 +29,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use tracing_mutex::stdsync::Mutex;
 
 /// A running agent and the socket it answers on.
 struct Agent {

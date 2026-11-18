@@ -12,7 +12,8 @@
 //! is also deleted unmerged.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use tracing_mutex::stdsync::Mutex;
 
 use git2::{BranchType, Oid};
 

@@ -5,7 +5,8 @@
 //! current selection — the way IDE-integrated agents expect.
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tracing_mutex::stdsync::RwLock;
 
 /// How a file's tab shows it: its text to edit, its rendering (Markdown,
 /// a notebook), or its changes since the last commit. Kept with the tab

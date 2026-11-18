@@ -568,7 +568,7 @@ pub(crate) mod mock {
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
-    use std::sync::Mutex;
+    use tracing_mutex::stdsync::Mutex;
 
     #[derive(Debug, Clone)]
     pub struct Asked {

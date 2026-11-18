@@ -2579,7 +2579,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("a.rs");
         std::fs::write(&file, "original\n").unwrap();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(tracing_mutex::stdsync::Mutex::new(Vec::new()));
 
         let probe = taste_core::ui_probe::UiProbe::new();
         let requests = probe.requests();
