@@ -821,6 +821,33 @@ pub fn container_name(workspace_root: &Path) -> String {
     )
 }
 
+/// The keeper container's state (`running`, `exited`, …, or empty when
+/// there is none) and the revision it was made at.
+fn keeper_state(substrate: &crate::substrate::Substrate, name: &str) -> Result<(String, String)> {
+    let state = podman_capture(
+        substrate,
+        &[
+            "ps".into(),
+            "-a".into(),
+            "--filter".into(),
+            format!("name=^{name}$"),
+            "--format".into(),
+            format!("{{{{.State}}}} {{{{.Label \"{KEEPER_LABEL}\"}}}}"),
+        ],
+    )?;
+    let (state, revision) = state.trim().split_once(' ').unwrap_or((state.trim(), ""));
+    Ok((state.to_string(), revision.to_string()))
+}
+
+/// Whether [`ensure_container`] will keep a keeper that is already there,
+/// running or stopped, rather than make one — and so needs no image. A
+/// question that cannot be put says no: the answer decides only what the
+/// startup page says before the keeper is ensured.
+pub fn will_keep(substrate: &crate::substrate::Substrate, workspace_root: &Path) -> bool {
+    keeper_state(substrate, &container_name(workspace_root))
+        .is_ok_and(|(state, revision)| !state.is_empty() && revision == KEEPER_REVISION)
+}
+
 /// Bring the keeper's container up in a VM's podman: the baseline image
 /// built over there if it is not yet, the workspace's guest directory
 /// made and mounted, the container running `sleep infinity` for the IDE
@@ -861,30 +888,9 @@ pub fn ensure_container(
         );
     }
 
-    // The image first, whatever the keeper's state: a keeper already
-    // running keeps the image it was made from, but the VM still needs the
-    // current one — the agent's node is made self-contained in it
-    // (`agentnode::SELF_CONTAIN`), and the registry, having found it
-    // missing, says it was built. A keeper up for days through a change to
-    // the baseline returned here before it, and remise's deploy found no
-    // image at all (2026-11-17, "taste-img-e5d85151c9cb: image not known").
-    let config = crate::baseline::ensure_baseline_config()?;
-    let key = taste_core::environment::workspace_key(workspace_root);
-    let image = crate::image::ensure_image_kept(substrate, &config, &key, on_build_line)?;
-
     let name = container_name(workspace_root);
-    let state = podman_capture(
-        substrate,
-        &[
-            "ps".into(),
-            "-a".into(),
-            "--filter".into(),
-            format!("name=^{name}$"),
-            "--format".into(),
-            format!("{{{{.State}}}} {{{{.Label \"{KEEPER_LABEL}\"}}}}"),
-        ],
-    )?;
-    let (state, revision) = state.trim().split_once(' ').unwrap_or((state.trim(), ""));
+    let (state, revision) = keeper_state(substrate, &name)?;
+    let (state, revision) = (state.as_str(), revision.as_str());
     // One made with other options than these is made again: its options
     // are set at `run` and nothing after changes them.
     let state = if !state.is_empty() && revision != KEEPER_REVISION {
@@ -904,6 +910,14 @@ pub fn ensure_container(
         }
     }
 
+    // Only a keeper being made needs the image: one that exists stays on
+    // the image it was made from, and is connected to without waiting on a
+    // build. A VM whose baseline changed under a running keeper builds the
+    // new image after the keeper is connected, out of the startup's way
+    // (`EnvironmentRegistry::keeper_for`).
+    let config = crate::baseline::ensure_baseline_config()?;
+    let key = taste_core::environment::workspace_key(workspace_root);
+    let image = crate::image::ensure_image_kept(substrate, &config, &key, on_build_line)?;
     podman_capture(
         substrate,
         &[

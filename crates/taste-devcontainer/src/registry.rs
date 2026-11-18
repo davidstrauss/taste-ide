@@ -447,6 +447,10 @@ pub struct EnvironmentRegistry {
     /// The domains whose serial console is being followed
     /// (`follow_vm_consoles`), so each is followed once.
     console_followers: Arc<Mutex<BTreeSet<String>>>,
+    /// The VMs building the current files service image behind a keeper
+    /// that runs on an older one (`Self::catch_up_service_image`), so each
+    /// builds it once.
+    catching_up: Arc<Mutex<BTreeSet<String>>>,
     /// What the IDE serves down every environment channel, once the window
     /// has said. Held here as well as on each supervisor so an environment
     /// created later inherits it.
@@ -579,6 +583,7 @@ impl EnvironmentRegistry {
             port_counters_last: Mutex::new(BTreeMap::new()),
             vm_logs: Arc::new(Mutex::new(BTreeMap::new())),
             console_followers: Arc::new(Mutex::new(BTreeSet::new())),
+            catching_up: Arc::new(Mutex::new(BTreeSet::new())),
         });
         let _ = registry.me.set(Arc::downgrade(&registry));
         let primary =
@@ -2210,7 +2215,16 @@ impl EnvironmentRegistry {
         // (David, 2026-09-22: "hanging on placing the checkout into the
         // VM").
         let baseline = crate::baseline::ensure_baseline_config()?;
-        let building = !crate::image::image_exists(&substrate, &baseline);
+        // A keeper already there is connected to as it is, on the image it
+        // was made from, so only a keeper being made waits on the image. A
+        // missing image under a kept keeper is built after the connect
+        // (below), not under this stage's words: it is not what the files
+        // service is waiting on (David, 2026-11-17, of a build drawn under
+        // "Start files service in VM" while the keeper ran: "That is not
+        // about connecting to the files service").
+        let kept = crate::keeper::will_keep(&substrate, &self.workspace_root);
+        let current = crate::image::image_exists(&substrate, &baseline);
+        let building = !kept && !current;
         // An earlier VM of this workspace left a copy of the image on this
         // machine (`image::ensure_image_kept`): loaded, not built.
         let key = environment::workspace_key(&self.workspace_root);
@@ -2325,6 +2339,8 @@ impl EnvironmentRegistry {
                     )
                 } else if building {
                     format!("Built in {}.", duration_words(started.elapsed()))
+                } else if kept {
+                    "Already running in this VM.".to_string()
                 } else {
                     "Already built in this VM.".to_string()
                 },
@@ -2354,6 +2370,16 @@ impl EnvironmentRegistry {
         // once per VM, since it lands on the VM's disk. A failure is not
         // the files service's: the containers still start, and their agent
         // runs on the image's own node or says why it cannot.
+        self.deploy_agent_node(vm);
+        if kept && !current {
+            self.catch_up_service_image(&substrate, vm);
+        }
+        Ok(keeper)
+    }
+
+    /// [`crate::agentnode::ensure_in_vm`] for `vm`, its outcome in the VM's
+    /// log. Blocking.
+    fn deploy_agent_node(&self, vm: &Vm) {
         let deploying = std::time::Instant::now();
         match crate::agentnode::ensure_in_vm(vm.ssh_port, &self.workspace_root) {
             Ok((build, said)) => self.note_vm(
@@ -2377,7 +2403,49 @@ impl EnvironmentRegistry {
                 format!("the agent's own node is not deployed: {e:#}"),
             ),
         }
-        Ok(keeper)
+    }
+
+    /// The current files service image, built in `vm` behind a keeper that
+    /// runs on an older one, and the agent's node deployed again over it.
+    /// The keeper stays on its image until it is next made, but the node
+    /// takes its libraries from the current one (`agentnode::SELF_CONTAIN`),
+    /// which a VM that outlived a change to the baseline does not have
+    /// (remise's, 2026-11-17: "taste-img-e5d85151c9cb: image not known").
+    /// On a thread of its own and said in the VM's log alone, since nothing
+    /// on the startup page waits on it: the containers start meanwhile, and
+    /// their agent runs on the node that runs.
+    fn catch_up_service_image(&self, substrate: &Arc<crate::substrate::Substrate>, vm: &Vm) {
+        let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        if !self.catching_up.lock().unwrap().insert(vm.domain.clone()) {
+            return;
+        }
+        let (substrate, vm) = (substrate.clone(), vm.clone());
+        std::thread::spawn(move || {
+            me.note_vm(
+                &vm.domain,
+                "building the current files service image, which the agent's node takes its \
+                 libraries from, while the files service runs on the one it started with",
+            );
+            let key = environment::workspace_key(&me.workspace_root);
+            let built = crate::baseline::ensure_baseline_config().and_then(|baseline| {
+                crate::image::ensure_image_kept(&substrate, &baseline, &key, &|line| {
+                    push_vm_log(&me.vm_logs, &me.events, &vm.domain, line)
+                })
+            });
+            match built {
+                Ok(_) => {
+                    me.note_vm(&vm.domain, "the current files service image is built");
+                    me.deploy_agent_node(&vm);
+                }
+                Err(e) => me.note_vm(
+                    &vm.domain,
+                    format!("the current files service image did not build: {e:#}"),
+                ),
+            }
+            me.catching_up.lock().unwrap().remove(&vm.domain);
+        });
     }
 
     /// What each VM of the pool has granted to the environments RUNNING on

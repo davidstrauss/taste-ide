@@ -98,8 +98,11 @@ const NODE_SHA256_ARM64: &str = "80a330b35415382878df18d41afbd106ea89bfb3be0087d
 /// The binary is patched as a copy and renamed into place, so a node
 /// already running (a container that had the library) keeps the file it
 /// has. `patchelf` and the libraries come from the files service's image
-/// (data/baseline-environment/Containerfile), which every VM builds before
-/// this deploy runs, and which the IDE pins the same way it pins the rest.
+/// (data/baseline-environment/Containerfile), which the IDE pins the same
+/// way it pins the rest. A VM builds it before this deploy runs, except
+/// one whose keeper outlived a change to it: there the deploy runs first,
+/// on whatever node runs, and again once the current image is built
+/// (`EnvironmentRegistry::catch_up_service_image`).
 pub const SELF_CONTAIN: &str = r#"set -eu
 cd /n
 mkdir -p shlib
