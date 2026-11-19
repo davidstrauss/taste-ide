@@ -637,6 +637,16 @@ apply "$@"
 echo changed
 "#;
 
+/// Held around every write the IDE makes to a checkout's own
+/// `.git/config`, one at a time. The peer's sync shares the tracking under
+/// its folder lock and a fetch shares it without, and two at once collided
+/// on the checkout's `.git/config.lock` or interleaved their unsets and
+/// adds (review, 2026-10-20); the project's author carried in
+/// (`supervisor::carry_identity`) met the same lock while an environment
+/// came up, and was not carried (2026-11-19).
+pub(crate) static CHECKOUT_CONFIG: tracing_mutex::stdsync::Mutex<()> =
+    tracing_mutex::stdsync::Mutex::new(());
+
 /// Make Personal's checkout at `path` track what the user's folder tracks:
 /// its remotes and its branches' upstreams, as the folder's config has them
 /// (`TRACKING_SCRIPT`). The IDE's to set and nobody else's — an upstream
@@ -645,12 +655,7 @@ echo changed
 /// folder (David, 2026-10-20: "I don't even want the agent to be able to
 /// set it; I just want it to be correct").
 pub fn share_tracking(folder: &Path, files: &Files, path: &Path) -> Result<()> {
-    // One at a time: the peer's sync runs this under its folder lock and a
-    // fetch's share without it, and two at once collide on the checkout's
-    // `.git/config.lock`, or interleave their unsets and adds (review,
-    // 2026-10-20).
-    static SHARING: tracing_mutex::stdsync::Mutex<()> = tracing_mutex::stdsync::Mutex::new(());
-    let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
+    let _sharing = CHECKOUT_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     let Some(git) = taste_git::GitWorkspace::discover(folder) else {
         return Ok(());
     };

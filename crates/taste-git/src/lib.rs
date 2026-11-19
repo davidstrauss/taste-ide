@@ -110,10 +110,47 @@ pub fn repo_identity(root: &Path) -> Option<GitIdentity> {
 /// author. Only ever on the user's say-so: the file tree's banner names the
 /// identity and asks before calling this (`taste-app`'s `author_bar.rs`).
 pub fn set_repo_identity(root: &Path, identity: &GitIdentity) -> Result<()> {
+    let _writing = IDENTITY_WRITES.lock().unwrap_or_else(|e| e.into_inner());
     let repo = git2::Repository::open(root)?;
     let mut config = repo.config()?.open_level(git2::ConfigLevel::Local)?;
-    config.set_str("user.name", &identity.name)?;
-    config.set_str("user.email", &identity.email)?;
+    write_identity(&mut config, identity)?;
+    Ok(())
+}
+
+/// Held around every write of a project's author this process makes: the
+/// banner's save, and [`project_identity`]'s record and restore, which the
+/// file tree's status refresh runs every time it looks — and refreshes
+/// come several a second while an environment is coming up. Two at once
+/// met at a file's `config.lock`, and the one that lost failed the save.
+static IDENTITY_WRITES: tracing_mutex::stdsync::Mutex<()> = tracing_mutex::stdsync::Mutex::new(());
+
+/// `user.name` and `user.email` written into `config`, each tried again for
+/// up to two seconds while the file is locked. libgit2 locks a config file
+/// for every key it sets, and the lock is git's own `config.lock`, so
+/// anything else writing the file — git run by the user, a fetch's
+/// bookkeeping, the IDE elsewhere — refuses a write for the moment it
+/// holds it, and a save that met one failed outright.
+fn write_identity(config: &mut git2::Config, identity: &GitIdentity) -> Result<(), git2::Error> {
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+    for (key, value) in [
+        ("user.name", &identity.name),
+        ("user.email", &identity.email),
+    ] {
+        let since = std::time::Instant::now();
+        let mut wait = std::time::Duration::from_millis(20);
+        loop {
+            match config.set_str(key, value) {
+                Err(e) if e.code() == git2::ErrorCode::Locked && since.elapsed() < PATIENCE => {
+                    std::thread::sleep(wait);
+                    wait = (wait * 2).min(std::time::Duration::from_millis(250));
+                }
+                done => {
+                    done?;
+                    break;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -124,13 +161,13 @@ pub fn set_repo_identity(root: &Path, identity: &GitIdentity) -> Result<()> {
 pub fn set_identity_in_file(path: &Path, identity: &GitIdentity) -> Result<()> {
     // Made empty first, without truncating one that is there, so that
     // opening it never depends on whether libgit2 makes a missing file.
+    let _writing = IDENTITY_WRITES.lock().unwrap_or_else(|e| e.into_inner());
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
     let mut config = git2::Config::open(path)?;
-    config.set_str("user.name", &identity.name)?;
-    config.set_str("user.email", &identity.email)?;
+    write_identity(&mut config, identity)?;
     Ok(())
 }
 
@@ -144,6 +181,7 @@ pub fn set_identity_in_file(path: &Path, identity: &GitIdentity) -> Result<()> {
 /// 2026-10-24, of `sb` re-cloned that morning). Never the host's identity:
 /// a folder and a record that both name nobody give `None`.
 pub fn project_identity(root: &Path, record: &Path) -> Option<GitIdentity> {
+    let _writing = IDENTITY_WRITES.lock().unwrap_or_else(|e| e.into_inner());
     let remembered = || -> Option<GitIdentity> {
         if !record.exists() {
             return None;
@@ -153,10 +191,7 @@ pub fn project_identity(root: &Path, record: &Path) -> Option<GitIdentity> {
         let email = config.get_string("user.email").ok()?;
         (!name.trim().is_empty() && !email.trim().is_empty()).then_some(GitIdentity { name, email })
     };
-    let write = |config: &mut git2::Config, identity: &GitIdentity| {
-        config.set_str("user.name", &identity.name)?;
-        config.set_str("user.email", &identity.email)
-    };
+    let write = write_identity;
     if let Some(identity) = repo_identity(root) {
         if remembered().as_ref() != Some(&identity) {
             let kept = record
@@ -460,6 +495,41 @@ mod identity_tests {
                 email: "t@example.org".into()
             })
         );
+    }
+
+    /// A save that meets the config file locked — git's own `config.lock`,
+    /// held by anything else writing it — waits for the lock to go rather
+    /// than failing, and one held past its patience still says so.
+    #[test]
+    fn a_save_waits_out_a_held_config_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let lock = dir.path().join(".git/config.lock");
+        let author = GitIdentity {
+            name: "tellmeyourstories".into(),
+            email: "t@example.org".into(),
+        };
+
+        std::fs::write(&lock, "").unwrap();
+        let release = {
+            let lock = lock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::remove_file(lock).unwrap();
+            })
+        };
+        set_repo_identity(dir.path(), &author).expect("saved once the lock went");
+        release.join().unwrap();
+        assert_eq!(repo_identity(dir.path()), Some(author.clone()));
+
+        std::fs::write(&lock, "").unwrap();
+        let other = GitIdentity {
+            name: "someone".into(),
+            email: "s@example.org".into(),
+        };
+        let refused = set_repo_identity(dir.path(), &other).expect_err("a lock never released");
+        assert!(format!("{refused:#}").contains("lock"), "{refused:#}");
+        assert_eq!(repo_identity(dir.path()), Some(author));
     }
 
     /// The folder's author is remembered, survives a re-clone that takes

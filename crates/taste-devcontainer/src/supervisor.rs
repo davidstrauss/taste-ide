@@ -6416,18 +6416,37 @@ fn carry_identity(
             .filter(|out| out.success())
             .map(|out| out.stdout_utf8().trim().to_string())
     };
+    let _writing = crate::peer::CHECKOUT_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if current("user.name").as_deref() == Some(identity.name.as_str())
         && current("user.email").as_deref() == Some(identity.email.as_str())
     {
         return Ok(false);
     }
+    // Tried again for a few seconds while the file is locked: the lock is
+    // git's own, so an agent's `git config` or `git remote` in the checkout
+    // holds it too, and nothing waits for it.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
     for (key, value) in [
         ("user.name", &identity.name),
         ("user.email", &identity.email),
     ] {
-        let out = git(&[key, value]).map_err(|e| format!("{key}: {e}"))?;
-        if !out.success() {
-            return Err(format!("{key}: {}", out.stderr_utf8().trim()));
+        let since = std::time::Instant::now();
+        loop {
+            let out = git(&[key, value]).map_err(|e| format!("{key}: {e}"))?;
+            if out.success() {
+                break;
+            }
+            let said = out.stderr_utf8().trim().to_string();
+            // "could not lock config file .git/config: File exists" is a
+            // lock someone holds; the same words ending in "Read-only file
+            // system" are a mount, which waiting does not change.
+            let held = said.contains("could not lock config file") && said.contains("File exists");
+            if !held || since.elapsed() >= PATIENCE {
+                return Err(format!("{key}: {said}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
     Ok(true)

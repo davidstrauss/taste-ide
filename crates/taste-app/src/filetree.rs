@@ -666,6 +666,14 @@ pub struct FileTree {
     /// Fired once the user has given the project an author from that
     /// banner, so running environments carry it in without a restart.
     on_author_set: RefCell<Option<Box<dyn Fn()>>>,
+    /// How many times the author banner has saved. A status query that
+    /// began before a save read the project as authorless, and applied
+    /// after the save it put the banner back over an author already
+    /// written — which read as the save not having worked, and refreshes
+    /// come several a second while an environment is coming up. A query
+    /// carries the count it began under, and one that a save has passed
+    /// since offers no author.
+    author_saves: Cell<u64>,
     submodule_busy: Cell<bool>,
     on_open: RefCell<Option<OpenCallback>>,
     /// The row a drag out of the tree began on, while the drag lasts: what
@@ -2286,6 +2294,7 @@ impl FileTree {
             on_review_ended: RefCell::new(None),
             author_bar,
             on_author_set: RefCell::new(None),
+            author_saves: Cell::new(0),
             logs_list,
             log_sparklines,
             ports_list,
@@ -2530,6 +2539,7 @@ impl FileTree {
                     match result {
                         Ok(Ok(())) => {
                             if let Some(tree) = weak.upgrade() {
+                                tree.author_saves.set(tree.author_saves.get() + 1);
                                 tree.author_bar.show(None);
                                 if let Some(hook) = tree.on_author_set.borrow().as_ref() {
                                     hook();
@@ -6340,6 +6350,7 @@ impl FileTree {
         // The answer belongs to the checkout it was asked about, and an
         // older answer must not be applied to a newer aim.
         let root_for_apply = root.clone();
+        let author_saves = self.author_saves.get();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
@@ -6455,7 +6466,12 @@ impl FileTree {
             let snapshot = handle.await;
             let Some(tree) = weak.upgrade() else { return };
             match snapshot {
-                Ok(Ok(snapshot)) => tree.apply_status(&root_for_apply, Some(snapshot)),
+                Ok(Ok(mut snapshot)) => {
+                    if tree.author_saves.get() != author_saves {
+                        snapshot.author_offer = None;
+                    }
+                    tree.apply_status(&root_for_apply, Some(snapshot))
+                }
                 Ok(Err(StatusFail::NotRepo)) => tree.apply_status(&root_for_apply, None),
                 Ok(Err(StatusFail::Unreachable)) => tree.apply_unreachable(&root_for_apply),
                 Ok(Err(StatusFail::Git(said))) => tree.apply_git_refused(&root_for_apply, &said),
