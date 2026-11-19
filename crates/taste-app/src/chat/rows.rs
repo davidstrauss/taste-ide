@@ -826,8 +826,12 @@ impl ChatPane {
     }
 
     /// A note: one dim line, an aside between two steps — and a note too
-    /// long for its line wears a disclosure, since an ellipsis in the
-    /// middle of a reason is half an error.
+    /// long for its line opens to the whole of it, since an ellipsis in
+    /// the middle of a reason is half an error. The whole line is the
+    /// click, as a step's header is: the chevron at its end only says it
+    /// opens. A button of its own there stood at the transcript's edge
+    /// under the scrollbar, and a click meant for one hit the other
+    /// (David, 2026-11-19).
     fn note_widget(&self, row: &Row, text: &str) -> Railed {
         let label = gtk::Label::builder()
             .label(text)
@@ -846,39 +850,44 @@ impl ChatPane {
         let content: gtk::Widget = if text.lines().count() <= 1 && text.chars().count() <= 80 {
             label.upcast()
         } else {
-            let disclose = gtk::ToggleButton::builder()
-                .icon_name("pan-down-symbolic")
-                .css_classes(["flat", "circular", "note-disclose", "dim-label"])
-                .valign(gtk::Align::Start)
-                .tooltip_text("Read the whole note")
-                .build();
+            let chevron = gtk::Image::from_icon_name("pan-end-symbolic");
+            chevron.set_valign(gtk::Align::Start);
+            chevron.set_margin_top(2);
+            chevron.add_css_class("dim-label");
             let line = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
                 .spacing(4)
                 .build();
             line.append(&label);
-            line.append(&disclose);
-            let toggled = label.clone();
-            disclose.connect_toggled(move |button| {
-                let open = button.is_active();
-                toggled.set_ellipsize(if open {
+            line.append(&chevron);
+            let toggle = gtk::Button::builder()
+                .child(&line)
+                .css_classes(["flat", "step-toggle"])
+                .hexpand(true)
+                .tooltip_text("Read the whole note")
+                .build();
+            let open = std::cell::Cell::new(false);
+            toggle.connect_clicked(move |button| {
+                let now = !open.get();
+                open.set(now);
+                label.set_ellipsize(if now {
                     gtk::pango::EllipsizeMode::None
                 } else {
                     gtk::pango::EllipsizeMode::End
                 });
-                toggled.set_lines(if open { -1 } else { 1 });
-                button.set_icon_name(if open {
-                    "pan-up-symbolic"
-                } else {
+                label.set_lines(if now { -1 } else { 1 });
+                chevron.set_icon_name(Some(if now {
                     "pan-down-symbolic"
-                });
-                button.set_tooltip_text(Some(if open {
+                } else {
+                    "pan-end-symbolic"
+                }));
+                button.set_tooltip_text(Some(if now {
                     "Fold this note back to one line"
                 } else {
                     "Read the whole note"
                 }));
             });
-            line.upcast()
+            toggle.upcast()
         };
         self.on_rail(&content, row.rail.unwrap_or_default(), row.dot)
     }

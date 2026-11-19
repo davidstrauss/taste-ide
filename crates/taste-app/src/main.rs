@@ -481,11 +481,6 @@ fn main() -> glib::ExitCode {
                  .composer-field > text, .composer-field textview, \
                  .composer-field textview > text { \
                    background: transparent; }\n\
-                 /* A note too long for one line carries a disclosure to \
-                    open it (chat.rs). Sized to the caption beside it, so \
-                    an aside does not grow a button's worth of chrome. */\n\
-                 button.note-disclose { min-width: 20px; min-height: 20px; \
-                   padding: 0; }\n\
                  /* 12 at the sides: the console's column. The environment \
                     tab's header and log stand 12 in, and a terminal tab \
                     beside them is the same region — text that jumped four \
