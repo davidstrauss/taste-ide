@@ -1363,6 +1363,7 @@ impl EnvironmentRegistry {
                     name: vm.domain.clone(),
                     id: vm.domain,
                     status,
+                    up_since: None,
                 }
             })
             .collect()

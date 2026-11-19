@@ -590,12 +590,14 @@ impl Substrate {
                     Some(facts) => facts.summary(),
                     None => "VM".into(),
                 },
+                up_since: None,
             }),
             Provider::Remote { connection } => Some(ResourceInfo {
                 kind: ResourceKind::Substrate,
                 name: connection.clone(),
                 id: connection.clone(),
                 status: "remote podman connection".into(),
+                up_since: None,
             }),
         }
     }

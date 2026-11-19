@@ -746,6 +746,9 @@ impl McpServer {
             }
         }
         if include.iter().any(|item| item == "resources") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
             let resources: Vec<Value> = supervisor
                 .list_resources()
                 .await
@@ -755,7 +758,7 @@ impl McpServer {
                         "kind": format!("{:?}", r.kind).to_lowercase(),
                         "name": r.name,
                         "id": r.id,
-                        "status": r.status,
+                        "status": r.status_at(now),
                     })
                 })
                 .collect();

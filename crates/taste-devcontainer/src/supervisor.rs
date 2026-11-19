@@ -48,7 +48,63 @@ pub struct ResourceInfo {
     pub kind: ResourceKind,
     pub name: String,
     pub id: String,
+    /// What the row says, as of when it was listed. For a running
+    /// container, [`Self::status_at`] says it as of any moment instead.
     pub status: String,
+    /// A running container's start, from which its uptime is worked out
+    /// whenever it is shown. podman's own `Status` is a relative phrase
+    /// ("Up Less than a second") frozen at the listing, and the Resources
+    /// list is listed again only when something about the environments
+    /// changes, so a container that had just started read as up less than
+    /// a second for as long as it ran (2026-11-19).
+    pub up_since: Option<UpSince>,
+}
+
+/// When a running container started, and what its row says after the
+/// uptime (the VM's grant to it, or nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpSince {
+    /// Unix seconds.
+    pub started: i64,
+    pub tail: String,
+}
+
+impl ResourceInfo {
+    /// What the row says at `now` (Unix seconds): a running container's
+    /// uptime as of then, and anything else as listed.
+    pub fn status_at(&self, now: i64) -> String {
+        match &self.up_since {
+            Some(up) => {
+                let up_for = format!("up {}", uptime(now - up.started));
+                if up.tail.is_empty() {
+                    up_for
+                } else {
+                    format!("{up_for} · {}", up.tail)
+                }
+            }
+            None => self.status.clone(),
+        }
+    }
+}
+
+/// How long something has been up, in the words a row uses: "less than a
+/// minute", "1 minute", "24 minutes", "1 hour", "6 hours", "3 days". A
+/// start in the future, which a clock stepped back makes, reads as just
+/// started rather than as a negative span.
+pub fn uptime(seconds: i64) -> String {
+    let plural = |n: i64, unit: &str| {
+        if n == 1 {
+            format!("1 {unit}")
+        } else {
+            format!("{n} {unit}s")
+        }
+    };
+    match seconds.max(0) {
+        s if s < 60 => "less than a minute".into(),
+        s if s < 3600 => plural(s / 60, "minute"),
+        s if s < 2 * 86400 => plural(s / 3600, "hour"),
+        s => plural(s / 86400, "day"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6266,6 +6322,7 @@ impl Supervisor {
                 name: "this container (self-hosted session)".into(),
                 id: "self".into(),
                 status: "running — manage from the host IDE".into(),
+                up_since: None,
             }];
         }
         let mut resources = Vec::new();
@@ -6294,27 +6351,55 @@ impl Supervisor {
                 "--filter".into(),
                 format!("label={LABEL_ENV}={}", self.env.id),
                 "--format".into(),
-                "{{.ID}}\t{{.Names}}\t{{.Status}}".into(),
+                "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.StartedAt}}\t{{.Status}}".into(),
             ])
             .await
         {
+            let grant = self
+                .applied_grant
+                .lock()
+                .unwrap()
+                .map(|grant| format!("{} granted", grant.describe()));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
             for line in out.lines() {
                 let mut fields = line.split('\t');
-                if let (Some(id), Some(name), Some(status)) =
-                    (fields.next(), fields.next(), fields.next())
-                {
+                if let (Some(id), Some(name), Some(state), Some(started), Some(status)) = (
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                ) {
+                    // A running container's uptime is worked out where it
+                    // is shown (`UpSince`); anything else keeps podman's
+                    // words, sentence-cased here ("Exited (0) About an
+                    // hour ago" capitalizes mid-sentence), so the IDE's own
+                    // text beside them keeps its case.
+                    let up_since = (state == "running")
+                        .then(|| started.trim().parse::<i64>().ok())
+                        .flatten()
+                        .filter(|&started| started > 0)
+                        .map(|started| UpSince {
+                            started,
+                            tail: grant.clone().unwrap_or_default(),
+                        });
                     // The grant beside the status, so the VM's arithmetic
                     // is visible where the VM's own numbers are.
-                    let status = match *self.applied_grant.lock().unwrap() {
-                        Some(grant) => format!("{status} · {} granted", grant.describe()),
-                        None => status.to_string(),
-                    };
-                    resources.push(ResourceInfo {
+                    let said = status.to_lowercase();
+                    let mut resource = ResourceInfo {
                         kind: ResourceKind::Container,
                         name: name.to_string(),
                         id: id.to_string(),
-                        status,
-                    });
+                        status: match &grant {
+                            Some(grant) => format!("{said} · {grant}"),
+                            None => said,
+                        },
+                        up_since,
+                    };
+                    resource.status = resource.status_at(now);
+                    resources.push(resource);
                 }
             }
         }
@@ -6340,6 +6425,7 @@ impl Supervisor {
                             name: repo.to_string(),
                             id: id.to_string(),
                             status: size.to_string(),
+                            up_since: None,
                         });
                     }
                 }
@@ -6363,6 +6449,7 @@ impl Supervisor {
                 name: volume,
                 id: String::new(),
                 status: if exists { "present" } else { "absent" }.to_string(),
+                up_since: None,
             });
         }
 
@@ -7752,6 +7839,47 @@ mod tests {
             ..complete
         }
         .partial());
+    }
+
+    /// A running container's row says how long it has been up as of
+    /// when it is read, not as of when it was listed, and its grant beside
+    /// that keeps the case it was written in.
+    #[test]
+    fn a_running_containers_uptime_moves_with_the_clock() {
+        let row = ResourceInfo {
+            kind: ResourceKind::Container,
+            name: "taste-x-primary".into(),
+            id: "abc".into(),
+            status: "up less than a minute · 4.0 GiB granted".into(),
+            up_since: Some(UpSince {
+                started: 1_000,
+                tail: "4.0 GiB granted".into(),
+            }),
+        };
+        assert_eq!(
+            row.status_at(1_000),
+            "up less than a minute · 4.0 GiB granted"
+        );
+        assert_eq!(
+            row.status_at(1_000 + 24 * 60),
+            "up 24 minutes · 4.0 GiB granted"
+        );
+        assert_eq!(
+            row.status_at(1_000 + 6 * 3600 + 5),
+            "up 6 hours · 4.0 GiB granted"
+        );
+        assert_eq!(
+            row.status_at(1_000 + 3 * 86400),
+            "up 3 days · 4.0 GiB granted"
+        );
+        // A clock stepped back reads as just started, not as a negative.
+        assert_eq!(
+            row.status_at(900),
+            "up less than a minute · 4.0 GiB granted"
+        );
+        assert_eq!(uptime(60), "1 minute");
+        assert_eq!(uptime(3600), "1 hour");
+        assert_eq!(uptime(47 * 3600), "47 hours");
     }
 
     fn make_env(_root: &std::path::Path, env: EnvironmentIdentity) -> Arc<Supervisor> {

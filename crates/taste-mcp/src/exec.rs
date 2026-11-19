@@ -567,7 +567,11 @@ mod tests {
             .unwrap();
         let jobs = jobs();
         let id = runtime.block_on(async {
-            jobs.spawn(spec("sleep", &["30"]), "sleep 30", None, true)
+            // Longer than the pollers can take: they are the polls of a
+            // running job, and their 80,000 calls, lock-order tracing and
+            // all, outlasted a 30-second sleep on a loaded machine, which
+            // failed the kill below rather than anything this checks.
+            jobs.spawn(spec("sleep", &["600"]), "sleep 600", None, true)
                 .unwrap()
         });
         let (done, finished) = std::sync::mpsc::channel();

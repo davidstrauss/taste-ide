@@ -425,6 +425,11 @@ pub struct Console {
     /// feed without redrawing the list (David, 2026-09-21: "The VM section
     /// should have graphs for resource usage").
     vm_graphs: RefCell<HashMap<String, VmGraphs>>,
+    /// The running containers' status labels, with what each says: their
+    /// uptime is worked out again on the tick (`age_resources`), since the
+    /// list is listed again only when something about the environments
+    /// changes.
+    aging: RefCell<Vec<(gtk::Label, ResourceInfo)>>,
     /// The Resources rows' hold-to-confirm buttons, alive as long as the
     /// rows are. A `HoldButton` is state beside a widget, and its gestures
     /// hold that state weakly; one dropped at the end of a render leaves
@@ -632,6 +637,7 @@ impl Console {
             waiting_shells: Cell::new(0),
             dead_shells: RefCell::new(Vec::new()),
             vm_graphs: RefCell::new(HashMap::new()),
+            aging: RefCell::new(Vec::new()),
             held_buttons: RefCell::new(Vec::new()),
             vm_usage_seed: RefCell::new(HashMap::new()),
             tab_bar: tab_bar.clone(),
@@ -2394,6 +2400,7 @@ impl Console {
             name: name.into(),
             id: name.into(),
             status: status.into(),
+            up_since: None,
         };
         // What the VM has been doing, posed: a build's CPU and disk in the
         // last two minutes, memory climbing to a plateau, a little network.
@@ -2540,8 +2547,20 @@ impl Console {
         }
     }
 
+    /// The tick's: each running container's uptime, as of now.
+    pub fn age_resources(&self) {
+        let now = unix_now();
+        for (label, resource) in self.aging.borrow().iter() {
+            let text = sentence_case(&resource.status_at(now));
+            if label.text() != text {
+                label.set_label(&text);
+            }
+        }
+    }
+
     fn render_resources(self: &Rc<Self>, resources: &[ResourceInfo]) {
         self.vm_graphs.borrow_mut().clear();
+        self.aging.borrow_mut().clear();
         self.held_buttons.borrow_mut().clear();
         while let Some(child) = self.resources_list.first_child() {
             self.resources_list.remove(&child);
@@ -2647,12 +2666,11 @@ impl Console {
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .build()
                 .full_text_on_hover();
-            // podman capitalizes mid-sentence ("Up About an hour"):
-            // sentence-case it for display.
-            let mut status_text = resource.status.to_lowercase();
-            if let Some(first) = status_text.get_mut(0..1) {
-                first.make_ascii_uppercase();
-            }
+            // Its first letter raised and nothing lowered: podman's own
+            // words come sentence-cased already (`list_resources`), and
+            // lowering the whole line made "4.0 GiB granted" read "4.0 gib"
+            // and an image's "3.42 GB" "3.42 gb".
+            let status_text = sentence_case(&resource.status_at(unix_now()));
             // Ellipsized, with the whole on hover: a VM's status is a long
             // sentence, and with four sparklines beside it the name was
             // squeezed to a dot and the sentence cut at the pane's edge.
@@ -2667,6 +2685,11 @@ impl Console {
                 })
                 .build()
                 .full_text_on_hover();
+            if resource.up_since.is_some() {
+                self.aging
+                    .borrow_mut()
+                    .push((status.clone(), resource.clone()));
+            }
             row.append(&icon);
             row.append(&name);
             // A VM's row has no room for its sentence beside four graphs
@@ -4245,6 +4268,22 @@ fn forget_in_workspace_state(root: &Path, env: &EnvironmentId) {
             tracing::warn!("forgetting environment {env}: {e:#}");
         }
     });
+}
+
+/// The time now, in Unix seconds, for a running container's uptime.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// `text` with its first letter raised, and the rest as written.
+fn sentence_case(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]

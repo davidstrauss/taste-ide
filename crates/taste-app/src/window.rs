@@ -2339,6 +2339,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             filetree.set_on_panel_tick(move || {
                 console.refresh_fleet();
                 console.set_vm_usage(&environments.vm_usage());
+                console.age_resources();
                 schedule();
                 // The IDE's own log, to its tab if one is open: the ring
                 // has no event, so its follower rides this clock.
