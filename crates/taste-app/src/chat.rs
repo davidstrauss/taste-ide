@@ -206,6 +206,37 @@ struct GateFacts {
 /// back for a container is an agent that never starts — so every "no"
 /// answer here has to end in a spawn (CLAUDE.md → "any new spawn site must
 /// refuse the no-container case itself").
+/// What a settled state means to a chat waiting for its container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// There is somewhere to run: the agent starts in it.
+    Up,
+    /// Not up, but on its way: keep waiting, and say nothing.
+    Coming,
+    /// Stopped or failed: nothing is coming, and the agent starts outside.
+    NotComing,
+}
+
+/// Whether the wait for a container is over. Only `Stopped` and `Failed`
+/// end it without one. `ConfigDetected` and `NoConfig` are what placing a
+/// checkout publishes on its way to a start — the window starts the
+/// primary's container on that very event (`window.rs`, its
+/// `reload_baseline`), and a chat that asked for a start started one — so
+/// reading them as "did not come up" told the user a container had failed
+/// a moment before it came up fine, and spawned an agent outside it to be
+/// moved in a minute later (David, 2026-11-18: "it looks like the container
+/// came up fine"). A start that fails ends in `Failed`, which ends the wait.
+fn waited_for(up: bool, state: &taste_core::event::DevcontainerStateEvent) -> Waited {
+    use taste_core::event::DevcontainerStateEvent as S;
+    if up {
+        Waited::Up
+    } else if matches!(state, S::Stopped | S::Failed { .. }) {
+        Waited::NotComing
+    } else {
+        Waited::Coming
+    }
+}
+
 fn container_gate(facts: GateFacts) -> Gate {
     // The user's own environment is exempt: its chat is the coordinator,
     // and one that cannot speak until a container is up cannot tell the
@@ -6509,19 +6540,35 @@ impl ChatPane {
                 .environments
                 .get(&self.environment)
                 .is_some_and(|s| s.exec().has_exec_target());
-            self.container_wait.set(if up {
-                ContainerWait::Idle
-            } else {
-                // It settled without an exec target: say so once, and let
-                // the agent start outside rather than never.
-                self.note(&format!(
-                    "{} did not come up, so this agent starts outside its container — \
-                     it can read, write and think, but has no shell there",
-                    self.environment
-                ));
-                ContainerWait::GaveUp
-            });
-            self.activate();
+            match waited_for(up, state) {
+                Waited::Up => {
+                    self.container_wait.set(ContainerWait::Idle);
+                    self.activate();
+                }
+                Waited::Coming => {}
+                Waited::NotComing => {
+                    // Nothing will come: say so once, and let the agent
+                    // start outside rather than never. What it may do
+                    // there is the safe-mode policy's, since with no
+                    // container its aim is safe mode (`AgentAim::new`):
+                    // writes only under `.devcontainer/`
+                    // (`policy::write_allowed`), and no shell, there being
+                    // nothing to run one in.
+                    let why = if matches!(state, S::Stopped) {
+                        "is stopped"
+                    } else {
+                        "did not come up"
+                    };
+                    self.note(&format!(
+                        "{} {why}, so this agent starts outside its container: no shell, \
+                         and it may write only .devcontainer/, enough to repair the setup. \
+                         It moves into the container once one is up",
+                        self.environment
+                    ));
+                    self.container_wait.set(ContainerWait::GaveUp);
+                    self.activate();
+                }
+            }
         }
         // ...and the first moment a message held while it was down has
         // somewhere real to go.
@@ -18911,6 +18958,29 @@ mod tests {
             }),
             Some(Loading::Again)
         );
+    }
+
+    /// A chat waiting for its container gives up only on a state that
+    /// says nothing is coming. Placing a checkout publishes `ConfigDetected`
+    /// (or `NoConfig`) on its way to a start, and the note once read that as
+    /// the container having failed, a moment before it came up.
+    #[test]
+    fn a_placed_checkout_is_still_coming() {
+        use taste_core::event::DevcontainerStateEvent as S;
+        for state in [S::ConfigDetected, S::NoConfig] {
+            assert_eq!(waited_for(false, &state), Waited::Coming, "{state:?}");
+        }
+        assert_eq!(waited_for(false, &S::Stopped), Waited::NotComing);
+        let failed = S::Failed {
+            message: "boom".into(),
+        };
+        assert_eq!(waited_for(false, &failed), Waited::NotComing);
+        let running = S::Running {
+            container_id: "abc".into(),
+        };
+        assert_eq!(waited_for(true, &running), Waited::Up);
+        // Running without an exec target yet is still on its way.
+        assert_eq!(waited_for(false, &running), Waited::Coming);
     }
 
     #[test]
