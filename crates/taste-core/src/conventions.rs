@@ -130,9 +130,10 @@ pub const STATE: &str = "Your environment's container is made again from its con
      starts empty: data already written inside the container is not moved into it, so dump it \
      first (mariadb-dump, pg_dump) and load the dump once the volume is in place. System \
      packages are the same: put them in the image, a RUN line in .devcontainer/'s \
-     Containerfile (the build runs as root), then devcontainer_reload. The container's own \
-     user is usually not root, so dnf, apt and the like fail inside it, and ide_exec refuses \
-     them there; even as root, what they install goes with the container. In a Compose \
+     Containerfile (the build runs as root), then devcontainer_reload. Where the container's \
+     user is not root (dev, in a single container), dnf, apt and the like fail inside it, and \
+     ide_exec refuses them there; as root (a Compose config), they run, but what they install \
+     goes with the container. In a Compose \
      config (\"dockerComposeFile\"), a database or cache runs as its own service from its \
      official image, and a named volume in the Compose file on that service keeps its data \
      the same way.";
@@ -199,7 +200,9 @@ pub fn conventions_via(files: &crate::files::Files, root: &Path) -> Vec<Conventi
             path: dir.join("devcontainer.json"),
             purpose: "devcontainer definition; the IDE builds and attaches to it \
                       (validated: privilege only as nested podman needs it, mounts stay in the workspace). \
-                      Run as a non-root user named dev, uid 1000: \"remoteUser\": \"dev\"",
+                      A single container runs as a non-root user named dev, uid 1000: \
+                      \"remoteUser\": \"dev\". A Compose config (\"dockerComposeFile\") \
+                      runs as root instead: \"remoteUser\": \"root\"",
             exists: has_devcontainer,
             // Inside the folder, ghost or real: a ghost folder's rows.
             ghost: true,
@@ -327,6 +330,26 @@ mod tests {
             "{SERVICES}"
         );
         assert!(SERVICES.contains("no longer reads"));
+    }
+
+    /// The config's purpose says which user for which kind of config, as
+    /// the VS Code text does, so an agent given both reads one rule rather
+    /// than two it has to rank: one said `dev` without exception while the
+    /// other said `root` for Compose, and an agent reported the second as
+    /// overriding the first (2026-11-19).
+    #[test]
+    fn the_user_rules_agree_on_compose() {
+        let root = Path::new("/nonexistent-workspace");
+        let config = conventions(root)
+            .into_iter()
+            .find(|c| c.path.ends_with(".devcontainer/devcontainer.json"))
+            .unwrap();
+        for text in [config.purpose, VS_CODE] {
+            assert!(text.contains("\"remoteUser\": \"root\""), "{text}");
+        }
+        assert!(config.purpose.contains("\"remoteUser\": \"dev\""));
+        assert!(config.purpose.contains("dockerComposeFile"));
+        assert!(!STATE.contains("usually not root"), "{STATE}");
     }
 
     #[test]
