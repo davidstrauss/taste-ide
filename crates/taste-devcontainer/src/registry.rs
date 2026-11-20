@@ -1595,6 +1595,21 @@ impl EnvironmentRegistry {
                 }
             });
         }
+        // A container the guest kernel stopped giving CPU to after the host
+        // slept, let go (`crate::stall`): everything in it, every exec into
+        // it, and the chat waiting on that exec stood still until it was.
+        {
+            let weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(crate::stall::CHECK_EVERY).await;
+                    let Some(registry) = weak.upgrade() else {
+                        break;
+                    };
+                    registry.unstick_containers().await;
+                }
+            });
+        }
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let libvirt = crate::provision::LibvirtSession::new();
@@ -5173,6 +5188,49 @@ impl EnvironmentRegistry {
             }
             if let Err(e) = pool.libvirt().grow_disk(&vm).await {
                 tracing::debug!("{domain}: its disk was not grown: {e:#}");
+            }
+        }
+    }
+
+    /// Let go of any container in this workspace's running local VMs that
+    /// its guest kernel has stopped giving CPU to (`crate::stall`), and say
+    /// so in the app log. A cloud host does not sleep with this one, so it
+    /// is not asked.
+    pub async fn unstick_containers(self: &Arc<Self>) {
+        let pool = self.pool();
+        for domain in self.vm_domains() {
+            let Some(vm) = self
+                .substrate_of_vm(&domain)
+                .and_then(|s| s.vm_details().cloned())
+            else {
+                continue;
+            };
+            if vm.is_cloud()
+                || pool.libvirt().state(&vm).await.ok()
+                    != Some(crate::provision::DomainState::Running)
+            {
+                continue;
+            }
+            let keys = crate::keys::Keys::for_workspace(&self.workspace_root);
+            let checked =
+                tokio::task::spawn_blocking(move || crate::stall::unstick(&keys, &vm)).await;
+            match checked {
+                Ok(Ok(scopes)) => {
+                    for scope in scopes {
+                        taste_core::app_log::push(
+                            "warn",
+                            "environments",
+                            &format!(
+                                "{scope} in VM {domain} had been given no CPU for its whole \
+                                 quota, period after period, as a guest's kernel can leave a \
+                                 container after the host sleeps; its CPU limit was written \
+                                 back as it was, which restarts it"
+                            ),
+                        );
+                    }
+                }
+                Ok(Err(e)) => tracing::debug!("{domain}: {e:#}"),
+                Err(e) => tracing::debug!("{domain}: the stall check did not finish: {e}"),
             }
         }
     }

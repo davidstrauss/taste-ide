@@ -37,6 +37,7 @@ pub mod repair;
 pub mod security;
 pub mod seed;
 pub mod sizing;
+pub mod stall;
 pub mod substrate;
 pub mod supervisor;
 #[cfg(test)]
