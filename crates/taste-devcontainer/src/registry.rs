@@ -3246,6 +3246,8 @@ impl EnvironmentRegistry {
         // with it; now the only thing that can let go is this.
         self.config_watch.forget(&repo);
         self.environments.lock().unwrap().remove(id);
+        // And its move, if one was pending: nothing is left to move.
+        self.forget_migration(id);
         // Said last, when the environment really is gone: the MCP server
         // unbinds its socket on this, and a socket that still answered
         // would be an identity with nothing behind it.
@@ -4561,6 +4563,17 @@ impl EnvironmentRegistry {
         });
     }
 
+    /// `env`'s pending move dropped, in memory and on disk, for an
+    /// environment that is gone. Its directory goes too when the record
+    /// was all that was left in it: the tick's write had made the
+    /// directory again after the destroy removed it.
+    fn forget_migration(&self, env: &EnvironmentId) {
+        self.migrations.lock().unwrap().remove(env);
+        let dir = self.env_dir(env);
+        crate::migration::Migration::clear(&dir);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     /// What the clock says is due for each pending move: its agent told,
     /// the coordinator told, or the move forced.
     fn tick_migrations(self: &Arc<Self>) {
@@ -4579,6 +4592,12 @@ impl EnvironmentRegistry {
             .map(|(id, m)| (id.clone(), m.clone()))
             .collect();
         for (id, mut migration) in pending {
+            // A move outlives nothing it was for: one whose environment
+            // was destroyed is forgotten, not tried every quarter hour.
+            if self.get(&id).is_none() {
+                self.forget_migration(&id);
+                continue;
+            }
             // One under way says nothing more until it ends: its agent
             // asked, or was made to, and is told how it went.
             if self.relocations_in_flight.lock().unwrap().contains(&id) {
@@ -4893,6 +4912,14 @@ impl EnvironmentRegistry {
         let Some(migration) = self.migration_of(env) else {
             return;
         };
+        // Destroyed while the move waited its turn: nothing to move, and
+        // nobody to tell. It once failed as "no environment", was tried
+        // again every fifteen minutes, and woke the coordinator each time
+        // (2026-11-19).
+        if self.get(env).is_none() {
+            self.forget_migration(env);
+            return;
+        }
         let outcome = match migration.kind {
             crate::migration::Kind::Guest => self.relocate_inner(env, self.host_of(env)).await,
             crate::migration::Kind::Packages => match self.get(env) {
@@ -6559,6 +6586,46 @@ mod tests {
     /// clock that nudges the agent says nothing — which once queued "your
     /// image is out of date" for an agent stopped by the rebuild it had
     /// asked for (2026-10-06).
+    #[test]
+    fn a_gone_environments_move_is_forgotten() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let events = EventBus::new();
+        let seen = events.subscribe();
+        let registry = EnvironmentRegistry::new_for_tests(
+            workspace.path(),
+            events.clone(),
+            ExecContext::host_unsandboxed_for_tests(),
+            state.path(),
+        );
+        // A move that failed, and is due to be tried again, of an
+        // environment destroyed since: its record is all that is left.
+        let gone = EnvironmentId::parse("i-b0do6j").unwrap();
+        let mut failed = crate::migration::Migration::new("vm", "44", "45", 0);
+        failed.failed_at = Some(1);
+        failed.write(&registry.env_dir(&gone)).unwrap();
+        registry
+            .migrations
+            .lock()
+            .unwrap()
+            .insert(gone.clone(), failed);
+        registry.tick_migrations_with(None);
+        assert!(registry.migration_of(&gone).is_none(), "forgotten");
+        assert!(
+            !registry.env_dir(&gone).exists(),
+            "and the directory its record had made again is gone"
+        );
+        while let Ok(event) = seen.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    Event::MigrationNotice { .. } | Event::MoveFailed { .. } | Event::Toast(_)
+                ),
+                "nobody is told about a move of nothing: {event:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_rebuild_under_way_is_not_nudged_about() {
         let workspace = tempfile::tempdir().unwrap();
