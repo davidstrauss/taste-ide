@@ -3362,6 +3362,12 @@ impl Console {
         // Name the shell by where it REALLY runs — "host" was ambiguous
         // when the IDE itself lives in a container.
         let in_devcontainer = exec.container_id().is_some();
+        // podman's own words, kept out of the terminal (`PodmanWords`).
+        let podman_words = in_devcontainer.then(PodmanWords::new);
+        let spec = match &podman_words {
+            Some(words) => words.wrap(spec),
+            None => spec,
+        };
         // Non-devcontainer shells carry a red warning badge: they run on
         // the host (or the IDE's own barely-confined container), outside
         // the environment work is supposed to happen in.
@@ -3484,69 +3490,30 @@ impl Console {
             let started_in = exec.container_id();
             let exec = exec.clone();
             terminal.connect_child_exited(move |terminal, status| {
-                // A shell whose container was stopped or rebuilt under it
-                // ends with podman's own last words — "no such exec
-                // session", "no container with ID" — which say what
-                // happened to podman and nothing to a person. Say it in
-                // the tab, and in the terminal above the dead prompt.
-                let tail = match terminal.vadjustment() {
-                    Some(adjustment) => {
-                        let hi = adjustment.upper() as i64;
-                        let lo = (adjustment.lower() as i64).max(hi - TAIL_ROWS);
-                        terminal_rows(terminal, lo, hi - 1)
-                    }
-                    None => String::new(),
-                };
-                // Asked of the environment first: a shell over the VM's
-                // podman connection can die with the container and print
-                // nothing at all, which left a dead prompt with no word of
-                // why and no shell to replace it (2026-10-09, a rebuild for
-                // updated packages). podman's words are the fallback.
-                let now_in = exec.container_id();
-                let moved = started_in.is_some() && now_in != started_in;
-                let container_gone = moved
-                    || tail.contains("no such exec session")
-                    || tail.contains("no container with ID")
-                    || tail.contains("no such container");
-                if container_gone {
-                    terminal.feed(
-                        b"\r\n\x1b[2mThe container this shell was in is gone: it was stopped \
-                          or rebuilt. A shell opens in the new one when it is up.\x1b[0m\r\n",
-                    );
-                    if let Some(console) = weak.upgrade() {
-                        if moved && now_in.is_some() {
-                            // The new one is up already, so the event that
-                            // revives dead shells has been and gone: the
-                            // replacement opens now — after this handler,
-                            // since the tab it replaces is the one whose
-                            // terminal is calling it.
-                            let (page, env) = (page.clone(), env.clone());
-                            glib::idle_add_local_once(move || {
-                                if console.tab_is_open(&page) {
-                                    console.host().close_page(&page);
-                                    console.add_terminal_tab_in(&env);
-                                }
-                            });
-                        } else {
-                            console
-                                .dead_shells
-                                .borrow_mut()
-                                .push((env.clone(), page.clone()));
-                        }
-                    }
-                }
-                sink.finish(taste_core::ShellState::Exited {
-                    code: Some(status),
-                    signal: None,
-                });
-                Self::mark_tab_exited(
-                    &page,
-                    if container_gone {
-                        "Shell exited — its container is gone"
-                    } else {
-                        "Shell exited"
-                    },
+                // What podman said on its own stderr, read off the main
+                // thread, then the rest of the ending with it.
+                let words = podman_words.clone();
+                let terminal = terminal.clone();
+                let (page, sink, weak, env, exec, started_in) = (
+                    page.clone(),
+                    sink.clone(),
+                    weak.clone(),
+                    env.clone(),
+                    exec.clone(),
+                    started_in.clone(),
                 );
+                glib::spawn_future_local(async move {
+                    let said = match words {
+                        Some(words) => crate::runtime::runtime()
+                            .spawn_blocking(move || words.take())
+                            .await
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    Self::shell_ended(
+                        &terminal, status, &said, started_in, &exec, &page, &sink, &weak, &env,
+                    );
+                });
             });
         }
         // Closing the tab is what ends it; the close handler above takes
@@ -3554,6 +3521,97 @@ impl Console {
         if !in_devcontainer && !exec.is_inside_container() {
             self.host_shells.borrow_mut().push(page);
         }
+    }
+
+    /// A shell's ending, told in its tab and above its dead prompt. `said`
+    /// is what podman wrote on its own stderr (`PodmanWords`), which never
+    /// reached the terminal.
+    #[allow(clippy::too_many_arguments)]
+    fn shell_ended(
+        terminal: &vte4::Terminal,
+        status: i32,
+        said: &str,
+        started_in: Option<String>,
+        exec: &taste_core::ExecContext,
+        page: &adw::TabPage,
+        sink: &ShellSink,
+        weak: &std::rc::Weak<Self>,
+        env: &EnvironmentId,
+    ) {
+        // A shell whose container was stopped or rebuilt under it
+        // ends with podman's own last words — "no such exec
+        // session", "no container with ID" — which say what
+        // happened to podman and nothing to a person. Say it in
+        // the tab, and in the terminal above the dead prompt.
+        let tail = match terminal.vadjustment() {
+            Some(adjustment) => {
+                let hi = adjustment.upper() as i64;
+                let lo = (adjustment.lower() as i64).max(hi - TAIL_ROWS);
+                terminal_rows(terminal, lo, hi - 1)
+            }
+            None => String::new(),
+        };
+        // Asked of the environment first: a shell over the VM's
+        // podman connection can die with the container and print
+        // nothing at all, which left a dead prompt with no word of
+        // why and no shell to replace it (2026-10-09, a rebuild for
+        // updated packages). podman's words are the fallback.
+        let now_in = exec.container_id();
+        let moved = started_in.is_some() && now_in != started_in;
+        let gone_words = |text: &str| {
+            text.contains("no such exec session")
+                || text.contains("no container with ID")
+                || text.contains("no such container")
+                || text.contains("container has already been removed")
+        };
+        let container_gone = moved || gone_words(said) || gone_words(&tail);
+        // podman's words, when they are about anything but the
+        // container having gone, are shown as it wrote them: they
+        // are the only account of a shell that would not start.
+        if !container_gone && !said.trim().is_empty() {
+            terminal.feed(b"\r\n");
+            terminal.feed(said.trim_end().replace('\n', "\r\n").as_bytes());
+            terminal.feed(b"\r\n");
+        }
+        if container_gone {
+            terminal.feed(
+                b"\r\n\x1b[2mThe container this shell was in is gone: it was stopped \
+                  or rebuilt. A shell opens in the new one when it is up.\x1b[0m\r\n",
+            );
+            if let Some(console) = weak.upgrade() {
+                if moved && now_in.is_some() {
+                    // The new one is up already, so the event that
+                    // revives dead shells has been and gone: the
+                    // replacement opens now — after this handler,
+                    // since the tab it replaces is the one whose
+                    // terminal is calling it.
+                    let (page, env) = (page.clone(), env.clone());
+                    glib::idle_add_local_once(move || {
+                        if console.tab_is_open(&page) {
+                            console.host().close_page(&page);
+                            console.add_terminal_tab_in(&env);
+                        }
+                    });
+                } else {
+                    console
+                        .dead_shells
+                        .borrow_mut()
+                        .push((env.clone(), page.clone()));
+                }
+            }
+        }
+        sink.finish(taste_core::ShellState::Exited {
+            code: Some(status),
+            signal: None,
+        });
+        Self::mark_tab_exited(
+            page,
+            if container_gone {
+                "Shell exited — its container is gone"
+            } else {
+                "Shell exited"
+            },
+        );
     }
 
     /// Open tabs for shells this console has not seen yet.
@@ -4270,6 +4328,63 @@ fn forget_in_workspace_state(root: &Path, env: &EnvironmentId) {
     });
 }
 
+/// Where a container shell's podman writes its own words — its stderr,
+/// kept out of the terminal.
+///
+/// A shell in a container is `podman exec -it`, and with a terminal the
+/// container's output, stdout and stderr both, reaches podman on one
+/// stream, which podman copies to ITS stdout, the terminal. Its stderr
+/// carries only what podman itself says. When a stop or a rebuild takes
+/// the container away under a shell, that is "Error: retrieving exec
+/// session … no such container" — certain, every time, and meaning
+/// nothing to anyone but podman (David, 2026-11-22: "I want these
+/// extremely predictable errors to not happen"). So podman's stderr goes
+/// to a file, and when the shell ends the console decides what to show:
+/// nothing of it when the container went, which its own note says, and
+/// all of it otherwise, since it is then the only account of a shell
+/// that would not start.
+#[derive(Debug, Clone)]
+struct PodmanWords {
+    path: PathBuf,
+}
+
+impl PodmanWords {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            path: glib::user_runtime_dir()
+                .join("taste-ide")
+                .join(format!("shell-{}-{n}.err", std::process::id())),
+        }
+    }
+
+    /// `spec` run with its stderr into the file, through `sh`, which makes
+    /// the file's folder first: the redirection cannot.
+    fn wrap(&self, spec: taste_core::CommandSpec) -> taste_core::CommandSpec {
+        let mut args = vec![
+            "-c".to_string(),
+            r#"mkdir -p "${1%/*}" 2>/dev/null; f="$1"; shift; exec "$@" 2>"$f""#.to_string(),
+            "taste-shell".to_string(),
+            self.path.display().to_string(),
+            spec.program,
+        ];
+        args.extend(spec.args);
+        taste_core::CommandSpec {
+            program: "sh".to_string(),
+            args,
+            ..spec
+        }
+    }
+
+    /// What podman wrote, and the file gone. Blocking: file IO.
+    fn take(self) -> String {
+        let said = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let _ = std::fs::remove_file(&self.path);
+        said
+    }
+}
+
 /// The time now, in Unix seconds, for a running container's uptime.
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -4288,6 +4403,26 @@ fn sentence_case(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A wrapped command's stderr goes to the file and its stdout to the
+    /// terminal, and taking the words removes the file.
+    #[test]
+    fn podmans_own_words_go_to_their_file() {
+        let words = PodmanWords::new();
+        let spec = words.wrap(taste_core::CommandSpec::plain(
+            "sh",
+            vec!["-c".into(), "echo shown; echo podman said this >&2".into()],
+        ));
+        let out = std::process::Command::new(&spec.program)
+            .args(&spec.args)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "shown\n");
+        assert!(out.stderr.is_empty());
+        let path = words.path.clone();
+        assert_eq!(words.take(), "podman said this\n");
+        assert!(!path.exists());
+    }
+
     use super::*;
 
     use crate::fleet::{EnvGit, FleetRow};
