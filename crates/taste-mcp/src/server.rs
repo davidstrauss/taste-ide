@@ -222,6 +222,13 @@ pub struct McpServer {
     tasks: Tasks,
     /// How long a call may take and may queue ([`CallBounds`]).
     bounds: Mutex<CallBounds>,
+    /// The waits running in the background, by environment and what each
+    /// watches (`wait_tool`). A second wait on the same set while one runs
+    /// answers at once rather than becoming a second task: every task that
+    /// ends wakes the agent, and an agent that waited again at the end of
+    /// each turn had a dozen stacked, each a turn of its own when it ended
+    /// (hetchy, 2026-11-24).
+    background_waits: Mutex<std::collections::BTreeSet<(EnvironmentId, String)>>,
 }
 
 /// What a `git_fetch` came to, as the app's fetcher reports it.
@@ -264,6 +271,7 @@ impl McpServer {
             git_fetcher: Mutex::new(None),
             tasks: Tasks::default(),
             bounds: Mutex::default(),
+            background_waits: Mutex::default(),
         })
     }
 
@@ -1529,7 +1537,13 @@ impl McpServer {
             if ready() {
                 return Woke::Ready;
             }
-            if self.workspace.nudges.should_wake(env) {
+            // A message ends a wait that is holding the agent, so the agent
+            // reads it. One answering as a task holds nothing: the message
+            // reaches the agent as its own turn, and ending the wait on it
+            // woke the agent a second time, per wait, to read "message"
+            // (hetchy, 2026-11-24). Nor does it take the message's ask,
+            // which is the next blocking call's to deliver.
+            if !tasks::as_task() && self.workspace.nudges.should_wake(env) {
                 return Woke::Message;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1589,6 +1603,28 @@ impl McpServer {
                 services.jobs.finished(*handle)?;
             }
         }
+        // One background wait per set (`background_waits`). A timer, which
+        // watches nothing, is not one: what it was asked for is the time.
+        let _watching = if tasks::as_task() && !(tasks.is_empty() && commands.is_empty()) {
+            let mut set: Vec<String> = tasks.clone();
+            set.sort();
+            let mut handles = commands.clone();
+            handles.sort_unstable();
+            let key = (env.clone(), format!("tasks={set:?} commands={handles:?}"));
+            match BackgroundWait::start(&self.background_waits, key) {
+                Some(guard) => Some(guard),
+                None => {
+                    return Ok(json!({
+                        "woke": "already_waiting",
+                        "next": "a wait on this same set is already running in the background, \
+                                 and its result comes to you when it ends: end your turn now, \
+                                 and do not wait again on this set",
+                    }));
+                }
+            }
+        } else {
+            None
+        };
         let started = std::time::Instant::now();
         let woke = self
             .wait_for(env, std::time::Duration::from_secs(seconds), || {
@@ -2382,8 +2418,10 @@ impl McpServer {
             "wait",
             "Wait for the first of: a task in `tasks` finishing, an ide_exec command in \
              `commands` exiting, `seconds` passing (default and most 120), or a message \
-             from the user, which always ends a wait at once. Returns which it was and \
-             where each task and command stands. Use it instead of sleep.",
+             from the user, which ends a wait you are held in at once. Returns which it \
+             was and where each task and command stands. Use it instead of sleep. A wait \
+             that runs in the background reports when it ends; do not start another on \
+             the same set meanwhile.",
             json!({
                 "type": "object",
                 "properties": {
@@ -6625,6 +6663,33 @@ enum Woke {
     Time,
 }
 
+/// A wait's place in [`McpServer::background_waits`], given up when the
+/// wait ends however it ends, a cancel's abort included.
+struct BackgroundWait<'a> {
+    set: &'a Mutex<std::collections::BTreeSet<(EnvironmentId, String)>>,
+    key: (EnvironmentId, String),
+}
+
+impl<'a> BackgroundWait<'a> {
+    /// The place, or `None` when a wait on the same set holds it.
+    fn start(
+        set: &'a Mutex<std::collections::BTreeSet<(EnvironmentId, String)>>,
+        key: (EnvironmentId, String),
+    ) -> Option<Self> {
+        let mut waits = set.lock().unwrap_or_else(|e| e.into_inner());
+        waits.insert(key.clone()).then(|| Self { set, key })
+    }
+}
+
+impl Drop for BackgroundWait<'_> {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
 fn task_report(
     board: &taste_core::tasks::TaskBoard,
     env: &EnvironmentId,
@@ -9188,6 +9253,47 @@ mod tests {
         assert!(
             refused.to_string().contains("has not been run here"),
             "{refused}"
+        );
+    }
+
+    /// A wait running in the background is not ended by a message, which
+    /// reaches the agent as its own turn, and leaves the message's ask for
+    /// the next call that holds the agent; a second background wait on a
+    /// set already watched answers at once, and the set is free again once
+    /// the first ends.
+    #[tokio::test]
+    async fn a_background_wait_ignores_messages_and_is_not_stacked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, workspace, _environments) = build_test_server(dir.path());
+        let env = EnvironmentId::primary();
+        workspace.nudges.message_waiting(&env);
+        let woke = crate::tasks::scope(server.wait_for(
+            &env,
+            std::time::Duration::from_millis(600),
+            || false,
+        ))
+        .await;
+        assert!(
+            matches!(woke, Woke::Time),
+            "a message ended a background wait"
+        );
+        assert!(
+            workspace.nudges.should_wake(&env),
+            "and the message's ask is still there for a call that holds the agent"
+        );
+        workspace.nudges.withdraw(&env);
+
+        let key = (env.clone(), "tasks=[] commands=[7]".to_string());
+        let first = BackgroundWait::start(&server.background_waits, key.clone());
+        assert!(first.is_some());
+        assert!(
+            BackgroundWait::start(&server.background_waits, key.clone()).is_none(),
+            "a second wait on the same set is not started"
+        );
+        drop(first);
+        assert!(
+            BackgroundWait::start(&server.background_waits, key).is_some(),
+            "and the set is free once the first ends"
         );
     }
 
