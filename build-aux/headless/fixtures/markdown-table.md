@@ -2,7 +2,7 @@
 
 | Tool | Where it runs | Notes |
 | --- | :---: | ---: |
-| Taste | A VM per workspace | Free software |
+| **Taste** | A VM per *workspace* | `GPL-3.0` software |
 | VS Code | The host kernel | Shares the kernel |
 
 The tree lives in [filetree.rs](../../../crates/taste-app/src/filetree.rs#L100), and the

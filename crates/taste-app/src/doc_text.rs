@@ -1881,14 +1881,14 @@ impl<'a> Writer<'a> {
                     }
                     code.push_str(&text);
                 } else if let Some(cell) = self.cell() {
-                    cell.push_str(&text);
+                    cell.push_str(&glib::markup_escape_text(&text));
                 } else {
                     self.text(&text);
                 }
             }
             Event::Code(code) => {
                 if let Some(cell) = self.cell() {
-                    cell.push_str(&code);
+                    cell.push_str(&crate::markdown_view::cell_code(&code));
                     return;
                 }
                 // A URL written as code is the URL: a link to it.
@@ -1996,9 +1996,19 @@ impl<'a> Writer<'a> {
                 self.quote += 1;
                 self.quote_starts.push(self.buffer.end_iter().line());
             }
+            // A table cell is markup of its own (`table_card`), and its
+            // styles go into it; the buffer's tags style the buffer's text.
+            Tag::Emphasis | Tag::Strong | Tag::Strikethrough if self.table.is_some() => {
+                let open = crate::markdown_view::cell_tag(&tag);
+                if let Some(cell) = self.cell() {
+                    cell.push_str(open);
+                }
+            }
             Tag::Emphasis => self.inline.push(self.tags.italic.clone()),
             Tag::Strong => self.inline.push(self.tags.bold.clone()),
             Tag::Strikethrough => self.inline.push(self.tags.strike.clone()),
+            // A link in a cell keeps its words, and is not one.
+            Tag::Link { .. } if self.table.is_some() => {}
             Tag::Link { dest_url, .. } => {
                 let identity = self.action_tag(Action::Href(dest_url.to_string()));
                 self.inline.push(self.tags.link.clone());
@@ -2066,9 +2076,16 @@ impl<'a> Writer<'a> {
                 }
                 self.quote = self.quote.saturating_sub(1);
             }
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough if self.table.is_some() => {
+                let close = crate::markdown_view::cell_end_tag(&tag);
+                if let Some(cell) = self.cell() {
+                    cell.push_str(close);
+                }
+            }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.inline.pop();
             }
+            TagEnd::Link if self.table.is_some() => {}
             TagEnd::Link => {
                 self.inline.pop();
                 self.inline.pop();

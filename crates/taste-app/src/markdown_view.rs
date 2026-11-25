@@ -353,9 +353,22 @@ fn layout(
                     flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     quote_depth += 1;
                 }
-                Tag::Emphasis => markup.push_str("<i>"),
-                Tag::Strong => markup.push_str("<b>"),
-                Tag::Strikethrough => markup.push_str("<s>"),
+                // In a table, the cell's: a cell is markup of its own, and
+                // its emphasis written into the paragraph instead left the
+                // cell plain and the tags outside the table.
+                Tag::Emphasis | Tag::Strong | Tag::Strikethrough => {
+                    let open = cell_tag(&tag);
+                    match table
+                        .as_mut()
+                        .and_then(|(_, r)| r.last_mut())
+                        .and_then(|r| r.last_mut())
+                    {
+                        Some(cell) => cell.push_str(open),
+                        None => markup.push_str(open),
+                    }
+                }
+                // A link in a cell keeps its words, and is not one.
+                Tag::Link { .. } if table.is_some() => in_link = true,
                 Tag::Link { dest_url, .. } => {
                     in_link = true;
                     markup.push_str(&format!(
@@ -424,9 +437,18 @@ fn layout(
                     flush(&mut markup, &mut spans, &mut heading, quote_depth);
                     quote_depth = quote_depth.saturating_sub(1);
                 }
-                TagEnd::Emphasis => markup.push_str("</i>"),
-                TagEnd::Strong => markup.push_str("</b>"),
-                TagEnd::Strikethrough => markup.push_str("</s>"),
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                    let close = cell_end_tag(&tag);
+                    match table
+                        .as_mut()
+                        .and_then(|(_, r)| r.last_mut())
+                        .and_then(|r| r.last_mut())
+                    {
+                        Some(cell) => cell.push_str(close),
+                        None => markup.push_str(close),
+                    }
+                }
+                TagEnd::Link if table.is_some() => in_link = false,
                 TagEnd::Link => {
                     in_link = false;
                     markup.push_str("</a>");
@@ -480,7 +502,7 @@ fn layout(
                     .and_then(|(_, r)| r.last_mut())
                     .and_then(|r| r.last_mut())
                 {
-                    cell.push_str(&text);
+                    cell.push_str(&glib::markup_escape_text(&text));
                 } else if let Some(index) = issues.filter(|_| !in_link) {
                     markup.push_str(&crate::issue_pill::pillify(&text, index));
                 } else {
@@ -498,7 +520,7 @@ fn layout(
                     .and_then(|(_, r)| r.last_mut())
                     .and_then(|r| r.last_mut())
                 {
-                    cell.push_str(&code);
+                    cell.push_str(&cell_code(&code));
                     continue;
                 }
                 // An issue id in backticks is the issue, not six characters
@@ -1191,8 +1213,9 @@ pub(crate) fn code_card(code: &str, copies: Result<String, String>, reflow: bool
 /// A table as a table: a grid of labels, the head row bold over a rule,
 /// each column aligned as the markdown said, cells wrapping in place of
 /// scrolling (David, 2026-09-22: "use a real table" — it was a monospace
-/// grid in a code card). Plain text in the cells, as the parser hands
-/// them over.
+/// grid in a code card). Each cell is Pango markup — its emphasis, its
+/// strong text, its struck text, and its code in the code face
+/// ([`cell_tag`], [`cell_code`]) — escaped as a paragraph's is.
 ///
 /// Laid out by [`crate::table::Table`], not a `GtkGrid`: the grid measured
 /// its height as though every column were a word wide, and a transcript row
@@ -1214,6 +1237,7 @@ pub(crate) fn table_card(
             };
             let label = gtk::Label::builder()
                 .label(text)
+                .use_markup(true)
                 .xalign(xalign)
                 .yalign(0.0)
                 .wrap(true)
@@ -1242,6 +1266,33 @@ pub(crate) fn table_card(
     table.upcast()
 }
 
+/// The markup a table cell opens for an inline style: the same as a
+/// paragraph's. Both renderers write cells with it, since both draw them
+/// with [`table_card`].
+pub(crate) fn cell_tag(tag: &pulldown_cmark::Tag) -> &'static str {
+    match tag {
+        pulldown_cmark::Tag::Emphasis => "<i>",
+        pulldown_cmark::Tag::Strong => "<b>",
+        pulldown_cmark::Tag::Strikethrough => "<s>",
+        _ => "",
+    }
+}
+
+/// [`cell_tag`]'s closing half.
+pub(crate) fn cell_end_tag(tag: &pulldown_cmark::TagEnd) -> &'static str {
+    match tag {
+        pulldown_cmark::TagEnd::Emphasis => "</i>",
+        pulldown_cmark::TagEnd::Strong => "</b>",
+        pulldown_cmark::TagEnd::Strikethrough => "</s>",
+        _ => "",
+    }
+}
+
+/// A code span in a table cell: the code face, escaped.
+pub(crate) fn cell_code(code: &str) -> String {
+    format!("<tt>{}</tt>", glib::markup_escape_text(code))
+}
+
 /// Whether a link's address is one of its run's code spans, which a click
 /// copies: their address is their own text ([`layout`]).
 fn is_copy_span(spans: &[String], href: &str) -> bool {
@@ -1261,6 +1312,40 @@ pub(crate) fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverl
 
 #[cfg(test)]
 mod tests {
+    /// A table cell keeps its strong, emphasised, and struck text and its
+    /// code, escaped, as markup of its own; none of it leaks into the prose
+    /// around the table, and a link in a cell keeps its words.
+    #[test]
+    fn a_cells_styles_are_the_cells() {
+        let doc = "Before.\n\n| **Name** | Kind |\n|---|---|\n| *x* & ~~y~~ | `a<b` [docs](https://e.org) |\n\nAfter.\n";
+        let items = super::layout(doc, None, None);
+        let rows = items
+            .iter()
+            .find_map(|item| match item {
+                super::Item::Table { rows, .. } => Some(rows.clone()),
+                _ => None,
+            })
+            .expect("a table");
+        assert_eq!(rows[0], vec!["<b>Name</b>", "Kind"]);
+        assert_eq!(
+            rows[1],
+            vec!["<i>x</i> &amp; <s>y</s>", "<tt>a&lt;b</tt> docs"]
+        );
+        for item in &items {
+            if let super::Item::Run { markup, .. } = item {
+                for tag in ["<b>", "<i>", "<s>", "<a "] {
+                    assert!(!markup.contains(tag), "{tag} leaked into {markup:?}");
+                }
+            }
+        }
+        for cell in rows.iter().flatten() {
+            assert!(
+                gtk::pango::parse_markup(cell, '\0').is_ok(),
+                "{cell:?} is not markup"
+            );
+        }
+    }
+
     /// A clipped answer's head that ends inside a code block copies the
     /// block whole; the blocks before it, already whole, copy themselves.
     #[test]
